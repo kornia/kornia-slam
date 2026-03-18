@@ -130,6 +130,9 @@ impl MapPoint {
 pub struct Map {
     keyframes: Vec<Keyframe>,
     map_points: Vec<MapPoint>,
+    /// Covisibility graph: keyframe idx → sorted list of (neighbor_idx, shared_point_count).
+    /// Sorted descending by weight so `get_best_covisibles(n)` is a slice.
+    covisibility: HashMap<usize, Vec<(usize, usize)>>,
 }
 
 impl Map {
@@ -226,7 +229,125 @@ impl Map {
         }
     }
 
+    /// Recompute covisibility edges for `kf_idx` and update symmetric neighbors.
+    ///
+    /// For each map point the keyframe observes, counts which other keyframes also
+    /// observe it. Edges with weight below `MIN_COVISIBILITY_WEIGHT` are dropped
+    /// unless no edge exceeds the threshold (in which case the strongest single
+    /// neighbor is kept — matching ORB-SLAM3 behaviour).
+    pub fn update_covisibility(&mut self, kf_idx: usize) {
+        const MIN_COVISIBILITY_WEIGHT: usize = 15;
+
+        // Collect map-point indices observed by this keyframe.
+        let observed: Vec<usize> = match self.get_keyframe(kf_idx) {
+            Some(kf) => kf.map_point_by_desc_idx.iter().flatten().copied().collect(),
+            None => return,
+        };
+
+        // Build an inverted index: for each observed map point, find which other
+        // keyframes observe it by scanning their associations.
+        let mut neighbor_counts: HashMap<usize, usize> = HashMap::new();
+        let observed_set: HashSet<usize> = observed.iter().copied().collect();
+
+        for kf in &self.keyframes {
+            if kf.frame.idx == kf_idx {
+                continue;
+            }
+            let shared = kf
+                .map_point_by_desc_idx
+                .iter()
+                .flatten()
+                .filter(|mp_idx| observed_set.contains(mp_idx))
+                .count();
+            if shared > 0 {
+                neighbor_counts.insert(kf.frame.idx, shared);
+            }
+        }
+
+        // Apply weight threshold (keep at least the best neighbor).
+        let mut neighbors: Vec<(usize, usize)> = neighbor_counts
+            .into_iter()
+            .filter(|&(_, w)| w >= MIN_COVISIBILITY_WEIGHT)
+            .collect();
+
+        if neighbors.is_empty() {
+            // Fallback: keep the single strongest neighbor (ORB-SLAM3 convention).
+            let mut best: Option<(usize, usize)> = None;
+            for kf in &self.keyframes {
+                if kf.frame.idx == kf_idx {
+                    continue;
+                }
+                let shared = kf
+                    .map_point_by_desc_idx
+                    .iter()
+                    .flatten()
+                    .filter(|mp_idx| observed_set.contains(mp_idx))
+                    .count();
+                match best {
+                    Some((_, w)) if shared > w => best = Some((kf.frame.idx, shared)),
+                    None if shared > 0 => best = Some((kf.frame.idx, shared)),
+                    _ => {}
+                }
+            }
+            if let Some((best_idx, best_w)) = best {
+                neighbors.push((best_idx, best_w));
+            }
+        }
+
+        // Sort descending by weight.
+        neighbors.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+
+        // Store edges for kf_idx.
+        self.covisibility.insert(kf_idx, neighbors.clone());
+
+        // Update symmetric edges on each neighbor.
+        for &(neighbor_idx, weight) in &neighbors {
+            let list = self.covisibility.entry(neighbor_idx).or_default();
+            list.retain(|&(idx, _)| idx != kf_idx);
+            list.push((kf_idx, weight));
+            list.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        }
+
+        // Remove stale symmetric edges: if a former neighbor no longer appears,
+        // clean its reference back to kf_idx.
+        let current_neighbor_set: HashSet<usize> =
+            neighbors.iter().map(|&(idx, _)| idx).collect();
+        let all_kf_indices: Vec<usize> = self.keyframes.iter().map(|kf| kf.frame.idx).collect();
+        for other_idx in all_kf_indices {
+            if other_idx == kf_idx || current_neighbor_set.contains(&other_idx) {
+                continue;
+            }
+            if let Some(list) = self.covisibility.get_mut(&other_idx) {
+                list.retain(|&(idx, _)| idx != kf_idx);
+            }
+        }
+    }
+
+    /// Returns up to `n` keyframe indices with the highest covisibility weight.
+    pub fn get_best_covisibles(&self, kf_idx: usize, n: usize) -> Vec<usize> {
+        self.covisibility
+            .get(&kf_idx)
+            .map(|list| list.iter().take(n).map(|&(idx, _)| idx).collect())
+            .unwrap_or_default()
+    }
+
+    /// Returns covisible keyframe indices with at least `min_weight` shared points.
+    pub fn get_covisibles_by_weight(&self, kf_idx: usize, min_weight: usize) -> Vec<usize> {
+        self.covisibility
+            .get(&kf_idx)
+            .map(|list| {
+                list.iter()
+                    .take_while(|&&(_, w)| w >= min_weight)
+                    .map(|&(idx, _)| idx)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Builds a local map of visible points from nearby keyframes.
+    ///
+    /// Selects keyframes by voting from tracked matches (top 10) plus the most
+    /// recent keyframes (last 10), then gathers all their map points.
     pub fn build_local_map_points(
         &self,
         tracked_matches: &[(usize, usize)],

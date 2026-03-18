@@ -182,8 +182,12 @@ impl Pipeline {
             added += 1;
         }
 
+        let ref_idx = reference_kf.frame.idx;
+        let cur_idx = current_kf.frame.idx;
         self.map.upsert_keyframe(reference_kf);
         self.map.upsert_keyframe(current_kf);
+        self.map.update_covisibility(ref_idx);
+        self.map.update_covisibility(cur_idx);
         added
     }
 
@@ -302,6 +306,7 @@ impl Pipeline {
         });
         kf.map_point_by_desc_idx = curr_kf_map_assoc;
         self.map.upsert_keyframe(kf);
+        self.map.update_covisibility(frame.idx);
         self.state.current_keyframe_idx = Some(frame.idx);
         self.state.last_keyframe_idx = Some(frame.idx);
 
