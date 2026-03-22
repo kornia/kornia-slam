@@ -8,6 +8,7 @@ pub struct PipelineConfig {
     pub map_projection: MapProjectionConfig,
     pub keyframe_policy: KeyframePolicy,
     pub enable_local_ba: bool,
+    pub mapping_queue_capacity: usize,
 }
 
 impl Default for PipelineConfig {
@@ -27,6 +28,7 @@ impl Default for PipelineConfig {
             map_projection: MapProjectionConfig::default(),
             keyframe_policy: KeyframePolicy::default(),
             enable_local_ba: true,
+            mapping_queue_capacity: 4,
         }
     }
 }

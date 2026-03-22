@@ -149,7 +149,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ref rec) = rec {
             log_trajectory_to_rerun(rec, &trajectory);
             log_camera_to_rerun(rec, &result.pose_world_to_cam, &camera, image_size);
-            log_map_points_to_rerun(rec, system.map_points());
+            let map_points = system.map_points();
+            log_map_points_to_rerun(rec, &map_points);
         }
     }
 
