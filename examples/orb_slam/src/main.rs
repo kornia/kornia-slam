@@ -7,9 +7,9 @@
 //! cargo run --manifest-path examples/orb_slam/Cargo.toml -- --data /path/to/euroc/V1_01_easy
 //! ```
 
+mod config;
 #[path = "../../common/datasets/mod.rs"]
 mod datasets;
-mod config;
 mod pipeline;
 mod utils;
 
@@ -108,8 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 image_size,
                 0.0f32,
                 kornia_tensor::CpuAllocator,
-            )
-            ?;
+            )?;
             gray_u8
                 .as_slice()
                 .iter()
@@ -124,20 +123,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             log_frame_to_rerun(rec, &gray_u8, &features.keypoints_xy);
         }
 
+        // Sample pixel colors at each keypoint location.
+        let keypoint_colors: Vec<[u8; 3]> = features
+            .keypoints_xy
+            .iter()
+            .map(|kp| {
+                let x = (kp[0] as usize).min(image_size.width.saturating_sub(1));
+                let y = (kp[1] as usize).min(image_size.height.saturating_sub(1));
+                let g = gray_u8.as_slice()[y * image_size.width + x];
+                [g, g, g]
+            })
+            .collect();
+
         // Run SLAM.
         let frame = Frame {
             idx,
             features,
             pose_world_to_cam: Pose3d::IDENTITY,
             image_size,
+            keypoint_colors,
         };
+        let t0 = std::time::Instant::now();
         let result = system.process_frame(frame);
+        let frame_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let keyframe_idx = system.current_keyframe_idx().unwrap_or(idx);
         let map_point_count = system.num_map_points();
 
         // Status line.
         let status_line = format!(
-            "[{idx:>5}] {:?}  kf={:<4} pts={:<5}",
+            "[{idx:>5}] {:?}  kf={:<4} pts={:<5} {frame_ms:>6.1}ms",
             result.status, keyframe_idx, map_point_count,
         );
         eprintln!("{status_line}");

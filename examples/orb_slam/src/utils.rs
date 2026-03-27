@@ -77,21 +77,26 @@ pub fn log_camera_to_rerun(
 
 /// Log active map points as a 3D point cloud.
 pub fn log_map_points_to_rerun(rec: &rerun::RecordingStream, map_points: &[MapPoint]) {
-    let positions: Vec<rerun::Position3D> = map_points
+    let (positions, colors): (Vec<_>, Vec<_>) = map_points
         .iter()
         .filter(|mp| !mp.culled)
         .map(|mp| {
-            rerun::Position3D::new(
-                mp.position.x as f32,
-                mp.position.y as f32,
-                mp.position.z as f32,
+            (
+                rerun::Position3D::new(
+                    mp.position.x as f32,
+                    mp.position.y as f32,
+                    mp.position.z as f32,
+                ),
+                rerun::Color::from_rgb(mp.color[0], mp.color[1], mp.color[2]),
             )
         })
-        .collect();
+        .unzip();
     if !positions.is_empty() {
         rec.log(
             "world/map_points",
-            &rerun::Points3D::new(positions).with_radii([rerun::Radius::new_scene_units(0.01)]),
+            &rerun::Points3D::new(positions)
+                .with_colors(colors)
+                .with_radii([rerun::Radius::new_scene_units(0.01)]),
         )
         .ok();
     }

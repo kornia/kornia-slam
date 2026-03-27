@@ -22,7 +22,7 @@
 //!      * push_map_point
 //!      * build_local_map_points
 //!      * cull
-//!      * optimize
+//!      * run_local_ba
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -81,6 +81,9 @@ impl Keyframe {
     }
 }
 
+/// A triangulated point ready for map insertion: (position, descriptor, color, prev_desc_idx, curr_desc_idx).
+pub type TriangulatedPoint = (Vec3F64, [u8; 32], [u8; 3], usize, usize);
+
 /// A persistent 3D landmark in the map.
 #[derive(Debug, Clone)]
 pub struct MapPoint {
@@ -88,6 +91,8 @@ pub struct MapPoint {
     pub position: Vec3F64,
     /// ORB descriptor used for projection-guided matching.
     pub descriptor: [u8; 32],
+    /// Pixel color sampled at the keypoint that created this point.
+    pub color: [u8; 3],
     /// Index of the keyframe that first observed this point.
     pub keyframe_idx: usize,
     /// Number of frames where this point was in the camera frustum.
@@ -100,10 +105,16 @@ pub struct MapPoint {
 
 impl MapPoint {
     /// Creates a fresh active map point.
-    pub fn new(position: Vec3F64, descriptor: [u8; 32], keyframe_idx: usize) -> Self {
+    pub fn new(
+        position: Vec3F64,
+        descriptor: [u8; 32],
+        color: [u8; 3],
+        keyframe_idx: usize,
+    ) -> Self {
         Self {
             position,
             descriptor,
+            color,
             keyframe_idx,
             n_visible: 1,
             n_found: 1,
@@ -169,6 +180,34 @@ impl Map {
         } else {
             self.keyframes.push(keyframe);
         }
+    }
+
+    /// Inserts triangulated 3D points as map points and associates them to keyframes.
+    ///
+    /// For each entry, creates a `MapPoint` and associates it with `curr_kf`.
+    /// If `prev_kf` is provided, associates it there too.
+    /// Inserts triangulated 3D points as map points and associates them to keyframes.
+    ///
+    /// For each entry, creates a `MapPoint` and associates it with `curr_kf`.
+    /// If `prev_kf` is provided, associates it there too.
+    pub fn add_triangulated_points(
+        &mut self,
+        prev_kf: Option<&mut Keyframe>,
+        curr_kf: &mut Keyframe,
+        points: &[TriangulatedPoint],
+        keyframe_idx: usize,
+    ) -> usize {
+        let first_mp_idx = self.map_points.len();
+        for (i, &(position, descriptor, color, _, curr_desc_idx)) in points.iter().enumerate() {
+            self.push_map_point(MapPoint::new(position, descriptor, color, keyframe_idx));
+            curr_kf.associate_map_point(curr_desc_idx, first_mp_idx + i);
+        }
+        if let Some(prev) = prev_kf {
+            for (i, &(_, _, _, prev_desc_idx, _)) in points.iter().enumerate() {
+                prev.associate_map_point(prev_desc_idx, first_mp_idx + i);
+            }
+        }
+        points.len()
     }
 
     /// Appends a map point and returns its index.
@@ -353,7 +392,7 @@ impl Map {
     /// Collects the last N active keyframes, gathers observations (undistorting keypoints
     /// via camera), calls `kornia_3d::ba::bundle_adjust`, and writes back optimized poses
     /// and point positions.
-    pub fn optimize(&mut self, camera: &PinholeCamera) {
+    pub fn run_local_ba(&mut self, camera: &PinholeCamera) {
         const MAX_ACTIVE_KFS: usize = 3;
         const MIN_OBSERVATIONS: usize = 8;
 
@@ -451,15 +490,12 @@ mod tests {
     use kornia_imgproc::features::OrbFeatures;
 
     fn test_frame(idx: usize, descriptors: Vec<[u8; 32]>) -> Frame {
+        let n = descriptors.len();
         Frame {
             idx,
             features: OrbFeatures {
-                keypoints_xy: descriptors
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| [i as f32, i as f32])
-                    .collect(),
-                orientations: vec![0.0; descriptors.len()],
+                keypoints_xy: (0..n).map(|i| [i as f32, i as f32]).collect(),
+                orientations: vec![0.0; n],
                 descriptors,
             },
             pose_world_to_cam: Pose3d::IDENTITY,
@@ -467,6 +503,7 @@ mod tests {
                 width: 640,
                 height: 480,
             },
+            keypoint_colors: vec![[0; 3]; n],
         }
     }
 
@@ -499,7 +536,7 @@ mod tests {
 
     #[test]
     fn map_point_new_sets_active_defaults() {
-        let mp = MapPoint::new(Vec3F64::new(1.0, 2.0, 3.0), [9u8; 32], 5);
+        let mp = MapPoint::new(Vec3F64::new(1.0, 2.0, 3.0), [9u8; 32], [0; 3], 5);
 
         assert_eq!(mp.position, Vec3F64::new(1.0, 2.0, 3.0));
         assert_eq!(mp.descriptor, [9u8; 32]);
@@ -511,7 +548,7 @@ mod tests {
 
     #[test]
     fn map_point_tracking_helpers_work() {
-        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0);
+        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], [0; 3], 0);
         mp.n_visible = 10;
         mp.n_found = 4;
 
@@ -548,10 +585,18 @@ mod tests {
     fn push_map_point_returns_sequential_index() {
         let mut map = Map::new();
 
-        let first_idx =
-            map.push_map_point(MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0));
-        let second_idx =
-            map.push_map_point(MapPoint::new(Vec3F64::new(1.0, 0.0, 1.0), [1u8; 32], 0));
+        let first_idx = map.push_map_point(MapPoint::new(
+            Vec3F64::new(0.0, 0.0, 1.0),
+            [0u8; 32],
+            [0; 3],
+            0,
+        ));
+        let second_idx = map.push_map_point(MapPoint::new(
+            Vec3F64::new(1.0, 0.0, 1.0),
+            [1u8; 32],
+            [0; 3],
+            0,
+        ));
 
         assert_eq!(first_idx, 0);
         assert_eq!(second_idx, 1);
@@ -562,10 +607,18 @@ mod tests {
     fn cull_map_points_removes_low_ratio() {
         let mut map = Map::new();
 
-        let first_idx =
-            map.push_map_point(MapPoint::new(Vec3F64::new(0.0, 0.0, 5.0), [0u8; 32], 0));
-        let second_idx =
-            map.push_map_point(MapPoint::new(Vec3F64::new(1.0, 0.0, 5.0), [1u8; 32], 0));
+        let first_idx = map.push_map_point(MapPoint::new(
+            Vec3F64::new(0.0, 0.0, 5.0),
+            [0u8; 32],
+            [0; 3],
+            0,
+        ));
+        let second_idx = map.push_map_point(MapPoint::new(
+            Vec3F64::new(1.0, 0.0, 5.0),
+            [1u8; 32],
+            [0; 3],
+            0,
+        ));
         map.map_points_mut()[first_idx].n_visible = 10;
         map.map_points_mut()[first_idx].n_found = 1;
         map.map_points_mut()[second_idx].n_visible = 10;

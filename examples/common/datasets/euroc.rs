@@ -344,7 +344,11 @@ mod tests {
         let cam0_dir = root.join("mav0").join("cam0");
         let data_dir = cam0_dir.join("data");
         fs::create_dir_all(&data_dir).unwrap();
-        fs::write(cam0_dir.join("data.csv"), "#timestamp [ns],filename\n1403636579763555584,1403636579763555584.png\n").unwrap();
+        fs::write(
+            cam0_dir.join("data.csv"),
+            "#timestamp [ns],filename\n1403636579763555584,1403636579763555584.png\n",
+        )
+        .unwrap();
         fs::write(data_dir.join("1403636579763555584.png"), []).unwrap();
 
         if include_sensor_yaml {
@@ -383,7 +387,10 @@ mod tests {
 
         match err {
             DatasetError::FileNotFound(path) => {
-                assert_eq!(path, dir.path().join("mav0").join("cam0").join("sensor.yaml"));
+                assert_eq!(
+                    path,
+                    dir.path().join("mav0").join("cam0").join("sensor.yaml")
+                );
             }
             other => panic!("expected FileNotFound for sensor.yaml, got {other:?}"),
         }

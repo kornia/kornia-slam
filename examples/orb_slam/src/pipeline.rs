@@ -7,26 +7,25 @@ use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
+use std::collections::HashSet;
 
 use crate::config::PipelineConfig;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-use kornia_3d::pose::{
-    TwoViewConfig, TwoViewModel, triangulate_matched_points, two_view_estimate,
-};
+use kornia_3d::pose::{TwoViewConfig, TwoViewModel, triangulate_matched_points, two_view_estimate};
 use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
+use kornia_slam::Frame;
 use kornia_slam::estimation::MapProjectionEstimator;
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use kornia_slam::map::{Keyframe, Map, MapPoint};
 use kornia_slam::system::{
     KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus,
 };
-use kornia_slam::{Frame, OrbFeatures};
 
 /// Top-level ORB-SLAM pipeline: orchestrates tracking, mapping, and state transitions.
 pub struct Pipeline {
-    // Camera intrinsics (shared across subsystems)
+    // Camera model
     camera: PinholeCamera,
     // Primary pose estimator
     estimator: MapProjectionEstimator,
@@ -58,8 +57,8 @@ impl Pipeline {
         );
 
         Self {
-            estimator: MapProjectionEstimator::new(camera.clone(), config.map_projection),
             camera,
+            estimator: MapProjectionEstimator::new(config.map_projection),
             two_view_init_config: config.two_view_init,
             keyframe_policy: config.keyframe_policy,
             map,
@@ -141,7 +140,10 @@ impl Pipeline {
         };
 
         let estimated_pose = two_view_estimate.estimate.pose;
-        self.state.velocity = Some(Pose3d::between(&curr_frame.pose_world_to_cam, &estimated_pose));
+        self.state.velocity = Some(Pose3d::between(
+            &curr_frame.pose_world_to_cam,
+            &estimated_pose,
+        ));
         self.state.pose_world_to_cam = estimated_pose;
         curr_frame.pose_world_to_cam = estimated_pose;
 
@@ -179,31 +181,30 @@ impl Pipeline {
         median_depth: Option<f64>,
     ) -> usize {
         let depth_scale = median_depth.filter(|&d| d > 1e-6).unwrap_or(1.0);
-        let cam_to_world_transform = reference_kf.frame.pose_world_to_cam.inverse();
-        let mut added = 0usize;
+        let reference_pose_inv = reference_kf.frame.pose_world_to_cam.inverse();
 
+        let mut triangulated = Vec::new();
         for (p_cam, &match_idx) in points3d.iter().zip(inlier_indices.iter()) {
-            let Some(&(reference_desc_idx, current_desc_idx)) = matches.get(match_idx) else {
+            let Some(&(ref_desc_idx, curr_desc_idx)) = matches.get(match_idx) else {
                 continue;
             };
-            if reference_desc_idx >= reference_kf.map_point_by_desc_idx.len()
-                || current_desc_idx >= current_kf.map_point_by_desc_idx.len()
+            if ref_desc_idx >= reference_kf.map_point_by_desc_idx.len()
+                || curr_desc_idx >= current_kf.map_point_by_desc_idx.len()
             {
                 continue;
             }
-
             let descriptor = current_kf
                 .frame
                 .features
                 .descriptors
-                .get(current_desc_idx)
+                .get(curr_desc_idx)
                 .copied()
                 .or_else(|| {
                     reference_kf
                         .frame
                         .features
                         .descriptors
-                        .get(reference_desc_idx)
+                        .get(ref_desc_idx)
                         .copied()
                 });
             let Some(descriptor) = descriptor else {
@@ -251,8 +252,7 @@ impl Pipeline {
 
         let (mut status, matches, tracked_inliers) = match result {
             Ok(estimate) => {
-                self.state.velocity =
-                    Some(Pose3d::between(&pose_before_tracking, &estimate.pose));
+                self.state.velocity = Some(Pose3d::between(&pose_before_tracking, &estimate.pose));
                 self.state.pose_world_to_cam = estimate.pose;
                 (TrackingStatus::Tracked, estimate.matches, estimate.inliers)
             }
@@ -319,11 +319,15 @@ impl Pipeline {
             return false;
         };
 
-        let mut curr_kf_map_assoc = vec![None; frame.features.descriptors.len()];
+        let mut curr_kf = Keyframe::from_frame(Frame {
+            idx: frame.idx,
+            features: frame.features.clone(),
+            pose_world_to_cam: self.state.pose_world_to_cam,
+            image_size: frame.image_size,
+            keypoint_colors: frame.keypoint_colors.clone(),
+        });
         for &(mp_idx, curr_idx) in matches {
-            if let Some(slot) = curr_kf_map_assoc.get_mut(curr_idx) {
-                *slot = Some(mp_idx);
-            }
+            curr_kf.associate_map_point(curr_idx, mp_idx);
         }
 
         let mut kf = Keyframe::from_frame(Frame {
@@ -356,15 +360,12 @@ impl Pipeline {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn grow_map_points_from_keyframe_pair(
         map: &mut Map,
         camera: &PinholeCamera,
         curr_kf_idx: usize,
         prev_kf: &Keyframe,
-        curr_features: &OrbFeatures,
-        curr_kf_map_assoc: &mut [Option<usize>],
-        pose_world_to_cam: &Pose3d,
+        curr_kf: &mut Keyframe,
         match_config: OrbMatchConfig,
         two_view_config: &TwoViewConfig,
     ) -> usize {
@@ -375,8 +376,8 @@ impl Pipeline {
         let matches = match_orb_descriptors(
             &prev_kf.frame.features.orientations,
             &prev_kf.frame.features.descriptors,
-            &curr_features.orientations,
-            &curr_features.descriptors,
+            &curr_kf.frame.features.orientations,
+            &curr_kf.frame.features.descriptors,
             match_config,
         );
         if matches.len() < MIN_GROWTH_MATCHES {
@@ -386,11 +387,11 @@ impl Pipeline {
         let mut pair_indices: Vec<(usize, usize)> = Vec::with_capacity(matches.len());
         for (prev_idx, curr_idx) in matches {
             if prev_idx >= prev_kf.frame.features.keypoints_xy.len()
-                || curr_idx >= curr_features.keypoints_xy.len()
+                || curr_idx >= curr_kf.frame.features.keypoints_xy.len()
             {
                 continue;
             }
-            if curr_kf_map_assoc.get(curr_idx).is_some_and(|m| m.is_some()) {
+            if curr_kf.map_point(curr_idx).is_some() {
                 continue;
             }
             if prev_kf.map_point(prev_idx).is_some() {
@@ -401,7 +402,7 @@ impl Pipeline {
 
         let (prev_pts, curr_pts) = camera.undistort_matched_pairs(
             &prev_kf.frame.features.keypoints_xy,
-            &curr_features.keypoints_xy,
+            &curr_kf.frame.features.keypoints_xy,
             &pair_indices,
         );
         if pair_indices.len() < 8 {
@@ -433,34 +434,34 @@ impl Pipeline {
             &inlier_prev,
             &inlier_curr,
             &prev_kf.frame.pose_world_to_cam,
-            pose_world_to_cam,
+            &curr_kf.frame.pose_world_to_cam,
             camera,
             triangulation_config,
         );
 
-        let mut n_added = 0usize;
+        let mut points = Vec::new();
+        let mut used_curr = HashSet::new();
         for tp in &triangulated {
             let inlier_idx = two_view.inlier_indices[tp.pair_index];
-            let Some(&(_prev_idx, curr_idx)) = pair_indices.get(inlier_idx) else {
+            let Some(&(prev_idx, curr_idx)) = pair_indices.get(inlier_idx) else {
                 continue;
             };
-            if curr_kf_map_assoc.get(curr_idx).is_some_and(|m: &Option<usize>| m.is_some()) {
+            if curr_kf.map_point(curr_idx).is_some() || !used_curr.insert(curr_idx) {
                 continue;
             }
 
             let mp_idx = map.push_map_point(MapPoint::new(
                 tp.position,
-                curr_features.descriptors[curr_idx],
-                curr_kf_idx,
+                curr_kf.frame.features.descriptors[curr_idx],
+                color,
+                prev_idx,
+                curr_idx,
             ));
-
-            if let Some(slot) = curr_kf_map_assoc.get_mut(curr_idx) {
-                *slot = Some(mp_idx);
-                n_added += 1;
-            }
         }
 
-        n_added
+        let kf_idx = curr_kf.frame.idx;
+        self.map
+            .add_triangulated_points(None, curr_kf, &points, kf_idx)
     }
 }
 

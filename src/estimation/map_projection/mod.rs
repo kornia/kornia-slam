@@ -111,17 +111,12 @@ pub enum MapProjectionRejectReason {
 /// Estimates the camera pose by projecting map points into the current frame,
 /// matching via ORB descriptors, and solving PnP.
 pub struct MapProjectionEstimator {
-    camera: PinholeCamera,
     config: MapProjectionConfig,
 }
 
 impl MapProjectionEstimator {
-    pub fn new(camera: PinholeCamera, config: MapProjectionConfig) -> Self {
-        Self { camera, config }
-    }
-
-    pub fn camera(&self) -> &PinholeCamera {
-        &self.camera
+    pub fn new(config: MapProjectionConfig) -> Self {
+        Self { config }
     }
 
     pub fn config(&self) -> &MapProjectionConfig {
@@ -135,12 +130,13 @@ impl MapProjectionEstimator {
         candidate_pose: &Pose3d,
         pose_before_tracking: &Pose3d,
         map: &Map,
+        camera: &PinholeCamera,
         current_keyframe_idx: Option<usize>,
     ) -> Result<Estimate, MapProjectionRejectReason> {
         let pnp = &self.config.pnp;
 
         let (projection_matches, curr_keypoints_undist, grid) =
-            self.match_map_to_frame(map.map_points(), frame, candidate_pose);
+            self.match_map_to_frame(map.map_points(), frame, candidate_pose, camera);
 
         // Shared logic: try_track → refine_pose → Estimate, or propagate rejection.
         let try_track_and_refine = |correspondences: Vec<(usize, usize)>,
@@ -151,6 +147,7 @@ impl MapProjectionEstimator {
                     map.map_points(),
                     &correspondences,
                     &curr_keypoints_undist,
+                    camera,
                     pose_init,
                 )
                 .ok_or(MapProjectionRejectReason::PnpFailed)?;
@@ -166,6 +163,7 @@ impl MapProjectionEstimator {
                 &frame.features.descriptors,
                 &grid,
                 frame.image_size,
+                camera,
                 &pose,
             ) {
                 matches = local.matches;
@@ -236,6 +234,7 @@ impl MapProjectionEstimator {
         curr_descriptors: &[[u8; 32]],
         grid: &KeypointGrid,
         image_size: ImageSize,
+        camera: &PinholeCamera,
         pose_init: &Pose3d,
     ) -> Option<Estimate> {
         let current_kf = current_kf_idx.and_then(|ki| map.get_keyframe(ki));
@@ -251,6 +250,7 @@ impl MapProjectionEstimator {
             curr_keypoints_undist,
             curr_descriptors,
             grid,
+            camera,
             pose_init,
             image_size,
             self.config.local_projection,
@@ -276,6 +276,7 @@ impl MapProjectionEstimator {
             map.map_points(),
             &global_matches,
             curr_keypoints_undist,
+            camera,
             pose_init,
         )?;
         Some(Estimate {
@@ -291,6 +292,7 @@ impl MapProjectionEstimator {
         map_points: &[MapPoint],
         correspondences: &[(usize, usize)],
         keypoints_undist: &[[f32; 2]],
+        camera: &PinholeCamera,
         pose_init: &Pose3d,
     ) -> Option<(Pose3d, usize)> {
         let mut points_world = Vec::with_capacity(correspondences.len());
@@ -304,7 +306,7 @@ impl MapProjectionEstimator {
         pnp::solve_pnp(
             &points_world,
             &points_image,
-            &self.camera,
+            camera,
             pose_init,
             &self.config.pnp,
         )
@@ -317,6 +319,7 @@ impl MapProjectionEstimator {
         map_points: &[MapPoint],
         frame: &Frame,
         pose: &Pose3d,
+        camera: &PinholeCamera,
     ) -> (Vec<(usize, usize)>, Vec<[f32; 2]>, KeypointGrid) {
         const KEYPOINT_GRID_CELL_SIZE: f32 = 64.0;
         const MIN_MATCHES_BEFORE_WIDE: usize = 20;
@@ -326,7 +329,7 @@ impl MapProjectionEstimator {
             .keypoints_xy
             .iter()
             .map(|kp| {
-                let p = self.camera.undistort(kp[0] as f64, kp[1] as f64);
+                let p = camera.undistort(kp[0] as f64, kp[1] as f64);
                 [p.x as f32, p.y as f32]
             })
             .collect();
@@ -344,6 +347,7 @@ impl MapProjectionEstimator {
             &keypoints_undist,
             &frame.features.descriptors,
             &grid,
+            camera,
             pose,
             frame.image_size,
             config,
@@ -355,6 +359,7 @@ impl MapProjectionEstimator {
                 &keypoints_undist,
                 &frame.features.descriptors,
                 &grid,
+                camera,
                 pose,
                 frame.image_size,
                 ProjectionMatchConfig {
@@ -374,6 +379,7 @@ impl MapProjectionEstimator {
         keypoints_xy: &[[f32; 2]],
         descriptors: &[[u8; 32]],
         grid: &KeypointGrid,
+        camera: &PinholeCamera,
         pose_world_to_cam: &Pose3d,
         image_size: ImageSize,
         config: ProjectionMatchConfig,
@@ -387,10 +393,7 @@ impl MapProjectionEstimator {
             }
 
             let p_cam = pose_world_to_cam.transform_point(&mp.position);
-            let Ok(pixel) = self
-                .camera
-                .project_to_image(&p_cam, config.min_depth, image_size)
-            else {
+            let Ok(pixel) = camera.project_to_image(&p_cam, config.min_depth, image_size) else {
                 continue;
             };
             let u = pixel.x as f32;
@@ -445,8 +448,8 @@ mod matching_tests {
     use super::*;
     use kornia_algebra::{Mat3F64, Vec3F64};
 
-    fn make_test_estimator(camera: PinholeCamera) -> MapProjectionEstimator {
-        MapProjectionEstimator::new(camera, MapProjectionConfig::default())
+    fn make_test_estimator() -> MapProjectionEstimator {
+        MapProjectionEstimator::new(MapProjectionConfig::default())
     }
 
     fn test_camera() -> PinholeCamera {
@@ -464,12 +467,14 @@ mod matching_tests {
 
     #[test]
     fn test_match_by_projection_simple() {
-        let estimator = make_test_estimator(test_camera());
+        let estimator = make_test_estimator();
+        let camera = test_camera();
 
         let desc_a = [0u8; 32];
         let map_points = vec![MapPoint {
             position: Vec3F64::new(0.0, 0.0, 5.0),
             descriptor: desc_a,
+            color: [0; 3],
             keyframe_idx: 0,
             n_visible: 0,
             n_found: 0,
@@ -487,6 +492,7 @@ mod matching_tests {
             &keypoints_xy,
             &descriptors,
             &grid,
+            &camera,
             &pose,
             ImageSize {
                 width: 640,
@@ -505,11 +511,13 @@ mod matching_tests {
 
     #[test]
     fn test_behind_camera_rejected() {
-        let estimator = make_test_estimator(test_camera());
+        let estimator = make_test_estimator();
+        let camera = test_camera();
 
         let map_points = vec![MapPoint {
             position: Vec3F64::new(0.0, 0.0, -5.0),
             descriptor: [0u8; 32],
+            color: [0; 3],
             keyframe_idx: 0,
             n_visible: 0,
             n_found: 0,
@@ -525,6 +533,7 @@ mod matching_tests {
             &keypoints_xy,
             &descriptors,
             &grid,
+            &camera,
             &Pose3d::new(Mat3F64::IDENTITY, Vec3F64::ZERO),
             ImageSize {
                 width: 640,
@@ -542,11 +551,13 @@ mod matching_tests {
 
     #[test]
     fn test_high_hamming_rejected() {
-        let estimator = make_test_estimator(test_camera());
+        let estimator = make_test_estimator();
+        let camera = test_camera();
 
         let map_points = vec![MapPoint {
             position: Vec3F64::new(0.0, 0.0, 5.0),
             descriptor: [0u8; 32],
+            color: [0; 3],
             keyframe_idx: 0,
             n_visible: 0,
             n_found: 0,
@@ -562,6 +573,7 @@ mod matching_tests {
             &keypoints_xy,
             &descriptors,
             &grid,
+            &camera,
             &Pose3d::new(Mat3F64::IDENTITY, Vec3F64::ZERO),
             ImageSize {
                 width: 640,

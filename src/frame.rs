@@ -19,4 +19,6 @@ pub struct Frame {
     pub pose_world_to_cam: Pose3d,
     /// Image dimensions.
     pub image_size: ImageSize,
+    /// Pixel color sampled at each keypoint location (one [u8; 3] per keypoint).
+    pub keypoint_colors: Vec<[u8; 3]>,
 }
