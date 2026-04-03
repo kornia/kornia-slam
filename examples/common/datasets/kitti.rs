@@ -1,0 +1,182 @@
+
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use super::euroc::{DatasetError, DatasetSample, GroundTruthPose};
+
+use kornia_3d::camera::PinholeCamera;
+
+/// EuRoC `cam0` calibration loaded from `sensor.yaml`.
+#[derive(Debug, Clone, Copy)]
+pub struct KittiCameraCalibration {
+    /// Focal length in x.
+    pub fx: f64,
+    /// Focal length in y.
+    pub fy: f64,
+    /// Principal point x.
+    pub cx: f64,
+    /// Principal point y.
+    pub cy: f64,
+    /// Radial distortion coefficient.
+    pub k1: f64,
+    /// Radial distortion coefficient.
+    pub k2: f64,
+    /// Tangential distortion coefficient.
+    pub p1: f64,
+    /// Tangential distortion coefficient.
+    pub p2: f64,
+}
+
+
+/// PNG images in `<root>/mav0/cam0/data/`.
+#[derive(Debug, Clone)]
+pub struct KittiDataset {
+    /// Base directory of the extracted dataset.
+    #[allow(dead_code)]
+    pub root: std::path::PathBuf,
+    /// Ordered camera samples.
+    pub cam0_samples: Vec<DatasetSample>,
+    /// Camera calibration for `cam0`.
+    pub cam0_calibration: KittiCameraCalibration,
+    // Ground-truth poses (empty if GT file not present).
+    // #[allow(dead_code)]
+    // pub ground_truth: Vec<GroundTruthPose>,
+}
+
+impl KittiDataset{
+    // pub fn open(root: impl AsRef<Path>) -> Result<Self, DatasetError> 
+    pub fn open(root: impl AsRef<Path>) -> Result<Self, DatasetError>{
+
+         println!("Kitti dataset open method called");
+        let root = root.as_ref().to_path_buf();
+
+        // let seq_dir = if root.join("image_0").is_dir() {
+        //     root.clone()
+        // }
+
+        
+        let image_dir = root.join("image_0");
+
+        if !image_dir.is_dir(){
+            return Err(DatasetError::FileNotFound(image_dir));
+        }
+
+
+        // load the camera
+        let camera = Self::load_camera_from_calib(&root)?;
+        // load timestamps
+        let timestamp = Self::load_times(&root);
+        // load sequesnces
+        // let samples = Self::load_image(&root, &timestamp)?;
+
+        let samples = match Self::load_image(&root, &timestamp){
+            Ok(s) => s,
+            Err(DatasetError) => return Err(DatasetError::FileNotFound(root)),
+        };
+
+        // let cam0_samples = match samples{
+        //     Ok(s) => s.unwrap(),
+        //     Err(_) => return Err(DatasetError::FileNotFound(root)),
+
+        // };
+
+        Ok(Self{
+            root,
+            cam0_samples: samples,
+            cam0_calibration: camera,
+        })
+    }
+
+    fn load_camera_from_calib(root: &Path) -> Result<KittiCameraCalibration, DatasetError>{
+        let calib_path = root.join("calib.txt");
+        if !calib_path.exists(){
+            return Err(DatasetError::FileNotFound(calib_path));
+        }
+
+        let calib_file = fs::read_to_string(&calib_path)?;
+
+        let p0 = calib_file.lines().find_map(|line|{
+            let line = line.trim();
+            let (key, value) = line.split_once(":")?;
+            if key.trim() != "P0"{
+                return None;
+            }
+            let values: Vec<f64> = value
+            .split_whitespace()
+            .filter_map(|v| v.parse::<f64>().ok())
+            .collect();
+            if values.len() != 12 {
+                return None;
+            }
+            Some(values)
+        })
+        .ok_or_else(||{
+            DatasetError::Parse(format!(
+                "Missing or Malformed P0 in {}",
+                calib_path.display()
+            ))
+        })?;
+
+
+        let fx = p0[0];
+        let fy = p0[5];
+        let cx = p0[2];
+        let cy = p0[6];
+
+
+
+        Ok(KittiCameraCalibration{
+            fx,
+            fy,
+            cx,
+            cy,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        })
+    }
+
+    fn load_times(root: &Path) -> Vec<f64>{
+        let times_file = root.join("times.txt");
+        
+        let times = match fs::read_to_string(&times_file){
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        return times.lines().filter_map(|t| t.trim().parse::<f64>().ok()).collect();
+    }
+
+    fn load_image(root: &Path, timestamp: &[f64]) -> Result<Vec<DatasetSample>, DatasetError>{
+
+        let mut paths: Vec<PathBuf> = Vec::new();
+        let image_dir = root.join("image_0");
+        for entry in fs::read_dir(&image_dir)?{
+            let entry = entry?;
+            let path = entry.path();
+            if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("png")) 
+            {
+                paths.push(path);
+            }
+        }
+
+        paths.sort();
+
+        let mut samples = Vec::with_capacity(paths.len());
+        for (i, image_path) in paths.into_iter().enumerate(){
+            let timestamp_sec = timestamp.get(i).copied().unwrap_or(i as f64);
+            samples.push(DatasetSample{
+                timestamp_sec,
+                image_path
+            });
+        }
+        Ok(samples)
+
+    }
+}
