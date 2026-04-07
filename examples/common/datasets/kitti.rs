@@ -29,6 +29,23 @@ pub struct KittiCameraCalibration {
     pub p2: f64,
 }
 
+impl KittiCameraCalibration{
+
+    /// Converts the parsed EuRoC calibration into a `PinholeCamera`.
+    pub fn to_pinhole_camera(self) -> PinholeCamera {
+        PinholeCamera {
+            fx: self.fx,
+            fy: self.fy,
+            cx: self.cx,
+            cy: self.cy,
+            k1: self.k1,
+            k2: self.k2,
+            p1: self.p1,
+            p2: self.p2,
+        }
+    } 
+}
+
 
 /// PNG images in `<root>/mav0/cam0/data/`.
 #[derive(Debug, Clone)]
@@ -178,5 +195,15 @@ impl KittiDataset{
         }
         Ok(samples)
 
+    }
+
+    /// Returns ordered cam0 samples.
+    pub fn samples(&self) -> &[DatasetSample] {
+        &self.cam0_samples
+    }
+
+    /// Returns the `cam0` camera model.
+    pub fn camera(&self) -> PinholeCamera {
+        self.cam0_calibration.to_pinhole_camera()
     }
 }
