@@ -260,7 +260,10 @@ impl Pipeline {
                     "[bootstrap] frame={} (ref={}) reject: {:?}",
                     curr_frame.idx, prev_bootstrap_frame.idx, reason,
                 ));
-                self.state.bootstrap_frame = Some(prev_bootstrap_frame);
+                // Keep bootstrap progressing on consecutive frames.
+                // Reusing the old frame as anchor drops the current input frame and can
+                // look like frame skipping when initialization is hard (e.g. KITTI motion).
+                self.state.bootstrap_frame = Some(curr_frame);
                 return TrackingResult {
                     pose_world_to_cam: self.state.pose_world_to_cam,
                     status: TrackingStatus::Skipped,
@@ -689,17 +692,14 @@ impl Pipeline {
             .map(|&i| curr_pts[i])
             .collect();
 
-        let triangulated = match triangulate_matched_points(
+        let triangulated = triangulate_matched_points(
             &inlier_prev,
             &inlier_curr,
             &prev_kf.frame.pose_world_to_cam,
             &curr_kf.frame.pose_world_to_cam,
             camera,
             triangulation_config,
-        ) {
-            Ok(pts) => pts,
-            Err(_) => return 0,
-        };
+        );
 
         let mut points = Vec::new();
         let mut used_curr = HashSet::new();
