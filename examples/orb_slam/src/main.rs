@@ -138,6 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Run SLAM.
         let frame = Frame {
             idx,
+            timestamp: sample.timestamp_sec,
             features,
             pose_world_to_cam: Pose3d::IDENTITY,
             image_size,

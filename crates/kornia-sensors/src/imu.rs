@@ -50,6 +50,7 @@ pub struct ImuCalib {
 /// Also propagates covariance matrices tracking how uncertainty grows:
 /// - 9×9 navigation covariance in tangent space [δrot(3), δvel(3), δpos(3)]
 /// - 6×6 bias covariance [δbias_gyro(3), δbias_accel(3)] (decoupled, grows linearly)
+#[derive(Debug, Clone)]
 pub struct PreintegratedImu {
     /// Accumulated rotation ∈ SO(3).
     pub delta_rotation: Mat3F64,
@@ -68,6 +69,17 @@ pub struct PreintegratedImu {
     /// 6×6 bias covariance [bias_gyro, bias_accel], stored column-major.
     /// Grows by σ²·dt each step (random walk).
     pub bias_covariance: [f64; 36],
+    /// Jacobian of ΔR w.r.t. gyro bias (3×3, column-major).
+    /// Used for first-order bias correction: ΔR' = ΔR · Exp(j_r_gyro · δb_g)
+    pub j_r_gyro: Mat3F64,
+    /// Jacobian of Δv w.r.t. gyro bias (3×3, column-major).
+    pub j_v_gyro: Mat3F64,
+    /// Jacobian of Δv w.r.t. accel bias (3×3, column-major).
+    pub j_v_accel: Mat3F64,
+    /// Jacobian of Δp w.r.t. gyro bias (3×3, column-major).
+    pub j_p_gyro: Mat3F64,
+    /// Jacobian of Δp w.r.t. accel bias (3×3, column-major).
+    pub j_p_accel: Mat3F64,
 }
 
 impl PreintegratedImu {
@@ -81,6 +93,11 @@ impl PreintegratedImu {
             calib,
             covariance: [0.0; 81],
             bias_covariance: [0.0; 36],
+            j_r_gyro: Mat3F64::ZERO,
+            j_v_gyro: Mat3F64::ZERO,
+            j_v_accel: Mat3F64::ZERO,
+            j_p_gyro: Mat3F64::ZERO,
+            j_p_accel: Mat3F64::ZERO,
         }
     }
 
@@ -184,6 +201,40 @@ impl PreintegratedImu {
             self.bias_covariance[i + i * 6] += ba_var;
         }
 
+        // --- Bias Jacobian update (before state update, uses old ΔR) ---
+        // Following ORB-SLAM3 ImuTypes.cc:213-231.
+        // Order matters: position depends on old velocity Jacobians, velocity on old rotation Jacobian.
+
+        // accel_hat is [a]× where a = bias-corrected accel in body frame
+        let wacc_jrg = Mat3F64(accel_hat.mul_mat3(&self.j_r_gyro));
+        let dr_wacc_jrg = Mat3F64(self.delta_rotation.mul_mat3(&wacc_jrg));
+
+        // JPa += JVa·dt - ½·ΔR·dt²
+        self.j_p_accel = Mat3F64(
+            self.j_p_accel.add_mat3(&Mat3F64(
+                mat3_scalar(&self.j_v_accel, dt)
+                    .add_mat3(&mat3_scalar(&self.delta_rotation, -0.5 * dt * dt)),
+            )),
+        );
+
+        // JPg += JVg·dt - ½·ΔR·dt²·[a]×·JRg
+        self.j_p_gyro = Mat3F64(
+            self.j_p_gyro.add_mat3(&Mat3F64(
+                mat3_scalar(&self.j_v_gyro, dt)
+                    .add_mat3(&mat3_scalar(&dr_wacc_jrg, -0.5 * dt * dt)),
+            )),
+        );
+
+        // JVa -= ΔR·dt
+        self.j_v_accel = Mat3F64(
+            self.j_v_accel.add_mat3(&mat3_scalar(&self.delta_rotation, -dt)),
+        );
+
+        // JVg -= ΔR·dt·[a]×·JRg
+        self.j_v_gyro = Mat3F64(
+            self.j_v_gyro.add_mat3(&mat3_scalar(&dr_wacc_jrg, -dt)),
+        );
+
         // --- State update ---
 
         // 1. Position (uses old Δv and ΔR)
@@ -197,7 +248,41 @@ impl PreintegratedImu {
         // prevent floating-point drift away from SO(3) over long windows.
         self.delta_rotation = normalize_rotation(&Mat3F64(self.delta_rotation.mul_mat3(&d_rot)));
 
+        // JRg = dRᵀ · JRg - Jr · dt  (must come after rotation update uses old values)
+        self.j_r_gyro = Mat3F64(
+            Mat3F64(d_rot_t.mul_mat3(&self.j_r_gyro))
+                .sub_mat3(&mat3_scalar(&jr, dt)),
+        );
+
         self.dt += dt;
+    }
+
+    /// Get the bias-corrected delta rotation for a given bias.
+    ///
+    /// ΔR' = ΔR · Exp(JRg · δb_g)
+    /// where δb_g = new_bias.gyro - self.bias.gyro
+    pub fn corrected_delta_rotation(&self, bias: &ImuBias) -> Mat3F64 {
+        let dbg = bias.gyro - self.bias.gyro;
+        let correction = mat3_mul_vec3(&self.j_r_gyro, &dbg);
+        Mat3F64(self.delta_rotation.mul_mat3(&so3::exp(&correction)))
+    }
+
+    /// Get the bias-corrected delta velocity for a given bias.
+    ///
+    /// Δv' = Δv + JVg · δb_g + JVa · δb_a
+    pub fn corrected_delta_velocity(&self, bias: &ImuBias) -> Vec3F64 {
+        let dbg = bias.gyro - self.bias.gyro;
+        let dba = bias.accel - self.bias.accel;
+        self.delta_velocity + mat3_mul_vec3(&self.j_v_gyro, &dbg) + mat3_mul_vec3(&self.j_v_accel, &dba)
+    }
+
+    /// Get the bias-corrected delta position for a given bias.
+    ///
+    /// Δp' = Δp + JPg · δb_g + JPa · δb_a
+    pub fn corrected_delta_position(&self, bias: &ImuBias) -> Vec3F64 {
+        let dbg = bias.gyro - self.bias.gyro;
+        let dba = bias.accel - self.bias.accel;
+        self.delta_position + mat3_mul_vec3(&self.j_p_gyro, &dbg) + mat3_mul_vec3(&self.j_p_accel, &dba)
     }
 
     /// Predict the state at camera frame k+1 given state at frame k.

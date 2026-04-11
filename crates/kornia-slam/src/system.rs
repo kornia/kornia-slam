@@ -1,6 +1,8 @@
 //! System runtime state, mode transitions, and tracking results.
 
 use kornia_3d::pose::Pose3d;
+use kornia_algebra::Vec3F64;
+use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 
 use crate::frame::Frame;
 
@@ -87,6 +89,16 @@ pub struct SystemState {
     pub max_consecutive_failures: usize,
     pub bootstrap_frame: Option<Frame>,
     pub mode: SystemMode,
+    /// IMU state: world-frame velocity (m/s). `None` when IMU is not active.
+    pub imu_velocity: Option<Vec3F64>,
+    /// IMU state: current bias estimates.
+    pub imu_bias: ImuBias,
+    /// Gravity vector in world frame (e.g. [0, 0, -9.81]).
+    pub gravity: Vec3F64,
+    /// Buffered IMU measurements since the last processed frame.
+    pub imu_buffer: Vec<ImuMeasurement>,
+    /// IMU calibration parameters. `None` when running visual-only.
+    pub imu_calib: Option<ImuCalib>,
 }
 
 /// Pipeline mode.
@@ -109,7 +121,41 @@ impl SystemState {
             max_consecutive_failures: 15,
             bootstrap_frame: None,
             mode: SystemMode::Bootstrap,
+            imu_velocity: None,
+            imu_bias: ImuBias::default(),
+            gravity: Vec3F64::new(0.0, 0.0, -9.81),
+            imu_buffer: Vec::new(),
+            imu_calib: None,
         }
+    }
+
+    /// Enable IMU fusion by providing calibration parameters.
+    pub fn enable_imu(&mut self, calib: ImuCalib) {
+        self.imu_calib = Some(calib);
+    }
+
+    /// Buffer an IMU measurement. Call this for each IMU sample between camera frames.
+    pub fn push_imu(&mut self, measurement: ImuMeasurement) {
+        self.imu_buffer.push(measurement);
+    }
+
+    /// Preintegrate buffered IMU measurements up to the given timestamp,
+    /// returning the preintegrated result and draining consumed samples.
+    ///
+    /// Samples with timestamp > `up_to` are kept in the buffer for the next frame.
+    pub fn preintegrate_imu(&mut self, up_to: f64) -> Option<PreintegratedImu> {
+        let calib = self.imu_calib?;
+
+        // Partition: consume samples with timestamp <= up_to
+        let split_idx = self.imu_buffer.partition_point(|m| m.timestamp <= up_to);
+        if split_idx < 2 {
+            return None;
+        }
+
+        let consumed: Vec<_> = self.imu_buffer.drain(..split_idx).collect();
+        let mut pre = PreintegratedImu::new(self.imu_bias, calib);
+        pre.integrate_batch(&consumed);
+        Some(pre)
     }
 
     pub fn reset(&mut self) {
@@ -119,6 +165,8 @@ impl SystemState {
         self.velocity = None;
         self.consecutive_failures = 0;
         self.bootstrap_frame = None;
+        self.imu_velocity = None;
+        self.imu_buffer.clear();
     }
 }
 

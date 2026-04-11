@@ -13,6 +13,8 @@ use kornia_imgproc::features::OrbFeatures;
 pub struct Frame {
     /// Frame index.
     pub idx: usize,
+    /// Capture timestamp in seconds.
+    pub timestamp: f64,
     /// Features extracted for this frame.
     pub features: OrbFeatures,
     /// Camera pose in world-to-camera convention.

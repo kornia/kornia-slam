@@ -1,6 +1,7 @@
 //! Visual odometry and SLAM building blocks for kornia-rs.
 
 pub mod estimation;
+pub mod factors;
 pub mod frame;
 pub mod map;
 pub mod system;

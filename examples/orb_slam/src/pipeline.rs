@@ -289,6 +289,7 @@ impl Pipeline {
 
         let mut curr_kf = Keyframe::from_frame(Frame {
             idx: frame.idx,
+            timestamp: frame.timestamp,
             features: frame.features.clone(),
             pose_world_to_cam: self.state.pose_world_to_cam,
             image_size: frame.image_size,

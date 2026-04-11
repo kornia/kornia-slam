@@ -4954,6 +4954,7 @@ dependencies = [
  "kornia-algebra",
  "kornia-image",
  "kornia-imgproc",
+ "kornia-sensors",
  "thiserror 2.0.18",
 ]
 

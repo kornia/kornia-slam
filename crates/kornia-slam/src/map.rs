@@ -30,6 +30,7 @@ use std::collections::{HashMap, HashSet};
 use kornia_3d::ba::{self, BaObservation, BaParams};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
+use kornia_sensors::imu::PreintegratedImu;
 use kornia_algebra::Vec3F64;
 use kornia_image::ImageSize;
 
@@ -41,6 +42,9 @@ pub struct Keyframe {
     pub frame: Frame,
     /// For each descriptor index in `frame.features`, associated map-point index.
     pub map_point_by_desc_idx: Vec<Option<usize>>,
+    /// Preintegrated IMU measurements from the previous keyframe to this one.
+    /// `None` for the first keyframe or when no IMU data is available.
+    pub preintegrated_imu: Option<PreintegratedImu>,
 }
 
 impl Keyframe {
@@ -50,6 +54,7 @@ impl Keyframe {
         Self {
             frame,
             map_point_by_desc_idx,
+            preintegrated_imu: None,
         }
     }
 
@@ -493,10 +498,12 @@ mod tests {
         let n = descriptors.len();
         Frame {
             idx,
+            timestamp: 0.0,
             features: OrbFeatures {
                 keypoints_xy: (0..n).map(|i| [i as f32, i as f32]).collect(),
                 orientations: vec![0.0; n],
                 descriptors,
+                scales: vec![1.0; n],
             },
             pose_world_to_cam: Pose3d::IDENTITY,
             image_size: ImageSize {
