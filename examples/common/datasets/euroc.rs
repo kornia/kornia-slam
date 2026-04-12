@@ -1,6 +1,8 @@
 //! Dataset readers for visual odometry benchmarks.
 
 use kornia_3d::camera::PinholeCamera;
+use kornia_sensors::imu::{ImuCalib, ImuMeasurement};
+use kornia_algebra::Vec3F64;
 use serde::Deserialize;
 use std::{fs::File, io::BufRead, io::BufReader, path::Path, path::PathBuf};
 
@@ -59,6 +61,28 @@ pub struct GroundTruthPose {
     pub qz: f64,
 }
 
+/// One raw IMU measurement from `mav0/imu0/data.csv`.
+#[derive(Debug, Clone, Copy)]
+pub struct ImuSample {
+    /// Timestamp in seconds.
+    pub timestamp_sec: f64,
+    /// Gyroscope [wx, wy, wz] in rad/s.
+    pub gyro: [f64; 3],
+    /// Accelerometer [ax, ay, az] in m/s².
+    pub accel: [f64; 3],
+}
+
+impl ImuSample {
+    /// Convert to a `kornia_sensors::imu::ImuMeasurement`.
+    pub fn to_imu_measurement(self) -> ImuMeasurement {
+        ImuMeasurement {
+            timestamp: self.timestamp_sec,
+            gyro: Vec3F64::new(self.gyro[0], self.gyro[1], self.gyro[2]),
+            accel: Vec3F64::new(self.accel[0], self.accel[1], self.accel[2]),
+        }
+    }
+}
+
 /// EuRoC `cam0` calibration loaded from `sensor.yaml`.
 #[derive(Debug, Clone, Copy)]
 pub struct EurocCameraCalibration {
@@ -104,6 +128,15 @@ struct EurocSensorYaml {
     distortion_coefficients: Vec<f64>,
 }
 
+/// IMU sensor.yaml from EuRoC `mav0/imu0/sensor.yaml`.
+#[derive(Debug, Deserialize)]
+struct EurocImuSensorYaml {
+    gyroscope_noise_density: f64,
+    accelerometer_noise_density: f64,
+    gyroscope_random_walk: f64,
+    accelerometer_random_walk: f64,
+}
+
 /// Reader for the EuRoC MAV dataset (ASL format).
 ///
 /// Expects `<root>/mav0/cam0/data.csv` with nanosecond timestamps and
@@ -120,6 +153,10 @@ pub struct EurocDataset {
     /// Ground-truth poses (empty if GT file not present).
     #[allow(dead_code)]
     pub ground_truth: Vec<GroundTruthPose>,
+    /// IMU samples from `imu0/data.csv` (empty if not present).
+    pub imu0_samples: Vec<ImuSample>,
+    /// IMU calibration from `imu0/sensor.yaml` (None if not present).
+    pub imu0_calibration: Option<ImuCalib>,
 }
 
 impl EurocDataset {
@@ -167,12 +204,16 @@ impl EurocDataset {
         }
 
         let ground_truth = Self::load_ground_truth(&root);
+        let imu0_samples = Self::load_imu_data(&root);
+        let imu0_calibration = Self::load_imu_calibration(&root);
 
         Ok(Self {
             root,
             cam0_samples: samples,
             cam0_calibration,
             ground_truth,
+            imu0_samples,
+            imu0_calibration,
         })
     }
 
@@ -190,6 +231,16 @@ impl EurocDataset {
     #[allow(dead_code)]
     pub fn ground_truth(&self) -> &[GroundTruthPose] {
         &self.ground_truth
+    }
+
+    /// Returns IMU samples sorted by timestamp (possibly empty).
+    pub fn imu_samples(&self) -> &[ImuSample] {
+        &self.imu0_samples
+    }
+
+    /// Returns IMU calibration if `imu0/sensor.yaml` was found.
+    pub fn imu_calib(&self) -> Option<ImuCalib> {
+        self.imu0_calibration
     }
 
     /// Loads ground-truth poses from `mav0/state_groundtruth_estimate0/data.csv`.
@@ -242,6 +293,65 @@ impl EurocDataset {
             });
         }
         poses
+    }
+
+    /// Loads IMU measurements from `mav0/imu0/data.csv`.
+    ///
+    /// CSV format: `timestamp_ns, w_x, w_y, w_z, a_x, a_y, a_z`
+    /// Returns an empty Vec if the file does not exist.
+    fn load_imu_data(root: &Path) -> Vec<ImuSample> {
+        let csv = root.join("mav0").join("imu0").join("data.csv");
+        let file = match File::open(&csv) {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+        let reader = BufReader::new(file);
+        let mut samples = Vec::new();
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let cols: Vec<&str> = line.split(',').collect();
+            if cols.len() < 7 {
+                continue;
+            }
+            let Ok(ts_ns) = cols[0].trim().parse::<u64>() else {
+                continue;
+            };
+            let f = |i: usize| cols[i].trim().parse::<f64>();
+            let (Ok(wx), Ok(wy), Ok(wz), Ok(ax), Ok(ay), Ok(az)) =
+                (f(1), f(2), f(3), f(4), f(5), f(6))
+            else {
+                continue;
+            };
+
+            samples.push(ImuSample {
+                timestamp_sec: ts_ns as f64 * 1e-9,
+                gyro: [wx, wy, wz],
+                accel: [ax, ay, az],
+            });
+        }
+        samples
+    }
+
+    /// Loads IMU calibration from `mav0/imu0/sensor.yaml`.
+    ///
+    /// Returns `None` if the file does not exist or cannot be parsed.
+    fn load_imu_calibration(root: &Path) -> Option<ImuCalib> {
+        let sensor_yaml = root.join("mav0").join("imu0").join("sensor.yaml");
+        let file = File::open(&sensor_yaml).ok()?;
+        let sensor: EurocImuSensorYaml = serde_yaml::from_reader(file).ok()?;
+        Some(ImuCalib {
+            gyro_noise: sensor.gyroscope_noise_density,
+            accel_noise: sensor.accelerometer_noise_density,
+            gyro_bias_noise: sensor.gyroscope_random_walk,
+            accel_bias_noise: sensor.accelerometer_random_walk,
+        })
     }
 
     fn load_cam0_calibration(root: &Path) -> Result<EurocCameraCalibration, DatasetError> {

@@ -6415,6 +6415,7 @@ dependencies = [
  "kornia-image",
  "kornia-imgproc",
  "kornia-io",
+ "kornia-sensors",
  "kornia-slam",
  "kornia-tensor",
  "rerun",

@@ -23,8 +23,8 @@ use pipeline::Pipeline;
 use datasets::EurocDataset;
 
 use utils::{
-    log_camera_to_rerun, log_frame_to_rerun, log_map_points_to_rerun, log_trajectory_to_rerun,
-    trajectory_point_from_pose,
+    log_camera_to_rerun, log_frame_to_rerun, log_imu_covariance_to_rerun, log_imu_to_rerun,
+    log_map_points_to_rerun, log_trajectory_to_rerun, trajectory_point_from_pose,
 };
 
 /// CLI arguments.
@@ -46,6 +46,10 @@ struct Args {
     /// skip this many initial frames
     #[argh(option, default = "0")]
     start_frame: usize,
+
+    /// enable IMU fusion (requires imu0/ in dataset)
+    #[argh(switch)]
+    imu: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -78,6 +82,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── SLAM config & system ───────────────────────────────────────────────
     let mut system = Pipeline::new(camera.clone(), PipelineConfig::default());
+
+    // ── IMU ────────────────────────────────────────────────────────────
+    // Always load IMU samples for visualization; only enable fusion with --imu.
+    let imu_samples = dataset.imu_samples();
+    if args.imu {
+        if let Some(imu_calib) = dataset.imu_calib() {
+            system.enable_imu(imu_calib);
+            eprintln!("IMU enabled: {} samples", imu_samples.len());
+        } else {
+            eprintln!("Warning: --imu requested but no imu0/sensor.yaml found");
+        }
+    } else if !imu_samples.is_empty() {
+        eprintln!("IMU data available ({} samples), pass --imu to enable fusion", imu_samples.len());
+    }
+    let mut imu_cursor = 0;
 
     // ── Rerun ──────────────────────────────────────────────────────────────
     let rec = if args.rerun_stream {
@@ -135,6 +154,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect();
 
+        // Advance IMU cursor up to this camera frame's timestamp.
+        let imu_batch_start = imu_cursor;
+        while imu_cursor < imu_samples.len()
+            && imu_samples[imu_cursor].timestamp_sec <= sample.timestamp_sec
+        {
+            imu_cursor += 1;
+        }
+
+        // Feed IMU samples to pipeline (only when fusion is enabled)
+        if args.imu {
+            for s in &imu_samples[imu_batch_start..imu_cursor] {
+                system.push_imu(s.to_imu_measurement());
+            }
+        }
+
+        // Log IMU data to Rerun
+        if let Some(ref rec) = rec {
+            log_imu_to_rerun(rec, &imu_samples[imu_batch_start..imu_cursor]);
+        }
+
         // Run SLAM.
         let frame = Frame {
             idx,
@@ -165,6 +204,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             log_trajectory_to_rerun(rec, &trajectory);
             log_camera_to_rerun(rec, &result.pose_world_to_cam, &camera, image_size);
             log_map_points_to_rerun(rec, system.map_points());
+            if args.imu {
+                if let Some(pre) = system.latest_preintegrated_imu() {
+                    log_imu_covariance_to_rerun(rec, pre);
+                }
+            }
         }
     }
 

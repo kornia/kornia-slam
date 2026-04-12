@@ -30,10 +30,14 @@ use std::collections::{HashMap, HashSet};
 use kornia_3d::ba::{self, BaObservation, BaParams};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-use kornia_sensors::imu::PreintegratedImu;
-use kornia_algebra::Vec3F64;
+use kornia_sensors::imu::{ImuBias, PreintegratedImu};
+use kornia_algebra::{Mat3F64, Vec3F64};
+use kornia_algebra::optim::{LevenbergMarquardt, Problem, Variable, VariableType};
 use kornia_image::ImageSize;
 
+use crate::factors::inertial::InertialFactor;
+use crate::factors::bias_random_walk::BiasRandomWalkFactor;
+use crate::factors::reprojection::ReprojectionFactor;
 use crate::frame::Frame;
 
 /// A frame promoted into the map, with descriptor-to-map-point associations.
@@ -485,6 +489,390 @@ impl Map {
             }
         }
     }
+}
+
+/// Result returned by `run_local_ba_inertial`.
+///
+/// Contains optimized velocities and biases for each active keyframe,
+/// so the caller can update its system state.
+pub struct InertialBaResult {
+    /// Optimized velocity for the most recent (active) keyframe.
+    pub latest_velocity: Vec3F64,
+    /// Optimized bias for the most recent (active) keyframe.
+    pub latest_bias: ImuBias,
+}
+
+impl Map {
+    /// Run local bundle adjustment with inertial factors.
+    ///
+    /// This extends the visual-only BA by adding:
+    ///   - Velocity (R³) and bias (R⁶) variables per keyframe
+    ///   - `InertialFactor` between consecutive keyframes
+    ///   - `BiasRandomWalkFactor` between consecutive keyframe biases
+    ///   - `ReprojectionFactor` for each map point observation
+    ///
+    /// Variables before the active window are fixed (pose, velocity, bias).
+    /// Returns `None` if there aren't enough keyframes with IMU data.
+    pub fn run_local_ba_inertial(
+        &mut self,
+        camera: &PinholeCamera,
+        gravity: &[f32; 3],
+        current_velocity: &Vec3F64,
+        current_bias: &ImuBias,
+    ) -> Option<InertialBaResult> {
+        const MAX_ACTIVE_KFS: usize = 5;
+        const MIN_OBSERVATIONS: usize = 8;
+
+        let n_kfs = self.keyframes.len();
+        if n_kfs < 2 {
+            return None;
+        }
+
+        let active_start = n_kfs.saturating_sub(MAX_ACTIVE_KFS);
+
+        // Check that active keyframes have IMU preintegration
+        let has_imu = self.keyframes[active_start..]
+            .iter()
+            .skip(1) // first KF in window won't have preintegration to its predecessor
+            .all(|kf| kf.preintegrated_imu.is_some());
+        if !has_imu {
+            return None;
+        }
+
+        // ── Build the optimization problem ──────────────────────────────
+
+        let mut problem = Problem::new();
+
+        // Collect map points observed by active keyframes
+        let mut mp_set: HashSet<usize> = HashSet::new();
+        for kf in &self.keyframes[active_start..] {
+            for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
+                if let Some(mp) = self.map_points.get(*mp_idx) {
+                    if !mp.culled {
+                        mp_set.insert(*mp_idx);
+                    }
+                }
+            }
+        }
+        if mp_set.is_empty() {
+            return None;
+        }
+
+        let mut mp_global_indices: Vec<usize> = mp_set.iter().copied().collect();
+        mp_global_indices.sort_unstable();
+        let mp_global_to_local: HashMap<usize, usize> = mp_global_indices
+            .iter()
+            .enumerate()
+            .map(|(local, &global)| (global, local))
+            .collect();
+
+        // ── Add variables ───────────────────────────────────────────────
+
+        // Pose, velocity, and bias variables for each keyframe
+        for (kf_idx, kf) in self.keyframes.iter().enumerate() {
+            let is_fixed = kf_idx < active_start;
+            let pose_name = format!("pose_{kf_idx}");
+            let vel_name = format!("vel_{kf_idx}");
+            let bias_name = format!("bias_{kf_idx}");
+
+            // Pose (SE3): [qw, qx, qy, qz, tx, ty, tz]
+            let se3_params = pose_to_se3_params(&kf.frame.pose_world_to_cam);
+            if !is_fixed {
+                problem
+                    .add_variable(
+                        Variable::new(pose_name, VariableType::SE3, vec![0.0; 7]),
+                        se3_params,
+                    )
+                    .ok()?;
+            }
+
+            // Velocity (R³)
+            let vel_init = if kf_idx == n_kfs - 1 {
+                // Most recent keyframe uses current velocity
+                vec![
+                    current_velocity.x as f32,
+                    current_velocity.y as f32,
+                    current_velocity.z as f32,
+                ]
+            } else {
+                // For intermediate keyframes, initialize to zero
+                // (the optimizer will find the right values)
+                vec![0.0; 3]
+            };
+            if !is_fixed {
+                problem
+                    .add_variable(Variable::euclidean(vel_name, 3), vel_init)
+                    .ok()?;
+            }
+
+            // Bias (R⁶): [bg_x, bg_y, bg_z, ba_x, ba_y, ba_z]
+            let bias_init = if kf_idx == n_kfs - 1 {
+                vec![
+                    current_bias.gyro.x as f32,
+                    current_bias.gyro.y as f32,
+                    current_bias.gyro.z as f32,
+                    current_bias.accel.x as f32,
+                    current_bias.accel.y as f32,
+                    current_bias.accel.z as f32,
+                ]
+            } else {
+                vec![0.0; 6]
+            };
+            if !is_fixed {
+                problem
+                    .add_variable(Variable::euclidean(bias_name, 6), bias_init)
+                    .ok()?;
+            }
+        }
+
+        // Fixed variables: add as separate variables with fixed values
+        // For fixed keyframes, we embed their values directly in the factors
+        // by using the same parameter values. However, the Problem API needs
+        // all referenced variables to exist, so add fixed ones too.
+        for kf_idx in 0..active_start {
+            let kf = &self.keyframes[kf_idx];
+            let pose_name = format!("pose_{kf_idx}");
+            let vel_name = format!("vel_{kf_idx}");
+            let bias_name = format!("bias_{kf_idx}");
+
+            let se3_params = pose_to_se3_params(&kf.frame.pose_world_to_cam);
+            problem
+                .add_variable(
+                    Variable::new(pose_name, VariableType::SE3, vec![0.0; 7]),
+                    se3_params,
+                )
+                .ok()?;
+
+            problem
+                .add_variable(Variable::euclidean(vel_name, 3), vec![0.0; 3])
+                .ok()?;
+
+            problem
+                .add_variable(Variable::euclidean(bias_name, 6), vec![0.0; 6])
+                .ok()?;
+        }
+
+        // Point variables
+        for (local_idx, &global_idx) in mp_global_indices.iter().enumerate() {
+            let pt = &self.map_points[global_idx].position;
+            let var = Variable::euclidean(format!("pt_{local_idx}"), 3);
+            let init = vec![pt.x as f32, pt.y as f32, pt.z as f32];
+            problem.add_variable(var, init).ok()?;
+        }
+
+        // ── Add factors ─────────────────────────────────────────────────
+
+        let intrinsics = [
+            camera.fx as f32,
+            camera.fy as f32,
+            camera.cx as f32,
+            camera.cy as f32,
+        ];
+
+        // Reprojection factors
+        let mut n_obs = 0usize;
+        for (kf_idx, kf) in self.keyframes.iter().enumerate() {
+            let pose_name = format!("pose_{kf_idx}");
+            for (desc_idx, mp_opt) in kf.map_point_by_desc_idx.iter().enumerate() {
+                if let Some(mp_idx) = mp_opt {
+                    let Some(&local_pt_idx) = mp_global_to_local.get(mp_idx) else {
+                        continue;
+                    };
+                    if let Some(kp) = kf.frame.features.keypoints_xy.get(desc_idx) {
+                        let scale = kf
+                            .frame
+                            .features
+                            .scales
+                            .get(desc_idx)
+                            .copied()
+                            .unwrap_or(1.0);
+                        let p = camera.undistort(kp[0] as f64, kp[1] as f64);
+                        let factor = Box::new(ReprojectionFactor::new(
+                            [p.x as f32, p.y as f32],
+                            intrinsics,
+                            scale,
+                        ));
+                        let pt_name = format!("pt_{local_pt_idx}");
+                        problem
+                            .add_factor(factor, vec![pt_name, pose_name.clone()])
+                            .ok()?;
+                        n_obs += 1;
+                    }
+                }
+            }
+        }
+
+        if n_obs < MIN_OBSERVATIONS {
+            return None;
+        }
+
+        // Inertial + bias random walk factors between consecutive keyframes
+        for kf_idx in 1..n_kfs {
+            let Some(ref pre) = self.keyframes[kf_idx].preintegrated_imu else {
+                continue;
+            };
+
+            let prev_idx = kf_idx - 1;
+            let pose_i = format!("pose_{prev_idx}");
+            let vel_i = format!("vel_{prev_idx}");
+            let pose_j = format!("pose_{kf_idx}");
+            let vel_j = format!("vel_{kf_idx}");
+            let bias_i = format!("bias_{prev_idx}");
+            let bias_j = format!("bias_{kf_idx}");
+
+            // Inertial factor: connects pose_i, vel_i, pose_j, vel_j, bias_i
+            let inertial = Box::new(InertialFactor::new(pre, *gravity));
+            problem
+                .add_factor(
+                    inertial,
+                    vec![
+                        pose_i,
+                        vel_i,
+                        pose_j,
+                        vel_j,
+                        bias_i.clone(),
+                    ],
+                )
+                .ok()?;
+
+            // Bias random walk: connects bias_i, bias_j
+            let bias_rw = Box::new(BiasRandomWalkFactor::new(pre));
+            problem
+                .add_factor(bias_rw, vec![bias_i, bias_j])
+                .ok()?;
+        }
+
+        // ── Optimize ────────────────────────────────────────────────────
+
+        let optimizer = LevenbergMarquardt {
+            lambda_init: 1.0,
+            lambda_max: 1e10,
+            lambda_factor: 10.0,
+            max_iterations: 10,
+            cost_tolerance: 1e-6,
+            gradient_tolerance: 1e-8,
+        };
+
+        if optimizer.optimize(&mut problem).is_err() {
+            return None;
+        }
+
+        // ── Read back results ───────────────────────────────────────────
+
+        let vars = problem.get_variables();
+
+        // Update active keyframe poses
+        for kf_idx in active_start..n_kfs {
+            let pose_name = format!("pose_{kf_idx}");
+            if let Some(var) = vars.get(&pose_name) {
+                self.keyframes[kf_idx].frame.pose_world_to_cam =
+                    se3_params_to_pose(&var.values);
+            }
+        }
+
+        // Update map points
+        for (local_idx, &global_idx) in mp_global_indices.iter().enumerate() {
+            let pt_name = format!("pt_{local_idx}");
+            if let Some(var) = vars.get(&pt_name) {
+                if let Some(mp) = self.map_points.get_mut(global_idx) {
+                    mp.position = Vec3F64::new(
+                        var.values[0] as f64,
+                        var.values[1] as f64,
+                        var.values[2] as f64,
+                    );
+                }
+            }
+        }
+
+        // Read latest velocity and bias
+        let last_kf_idx = n_kfs - 1;
+        let vel_name = format!("vel_{last_kf_idx}");
+        let bias_name = format!("bias_{last_kf_idx}");
+
+        let latest_velocity = vars.get(&vel_name).map(|v| {
+            Vec3F64::new(v.values[0] as f64, v.values[1] as f64, v.values[2] as f64)
+        }).unwrap_or(*current_velocity);
+
+        let latest_bias = vars.get(&bias_name).map(|v| {
+            ImuBias {
+                gyro: Vec3F64::new(v.values[0] as f64, v.values[1] as f64, v.values[2] as f64),
+                accel: Vec3F64::new(v.values[3] as f64, v.values[4] as f64, v.values[5] as f64),
+            }
+        }).unwrap_or(*current_bias);
+
+        Some(InertialBaResult {
+            latest_velocity,
+            latest_bias,
+        })
+    }
+}
+
+/// Convert a `Pose3d` (rotation matrix + translation) to SE3 parameters [qw, qx, qy, qz, tx, ty, tz].
+fn pose_to_se3_params(pose: &Pose3d) -> Vec<f32> {
+    let r = &pose.rotation;
+    // Rotation matrix to quaternion (Shepperd's method)
+    let trace = r.col(0).x + r.col(1).y + r.col(2).z;
+    let (qw, qx, qy, qz) = if trace > 0.0 {
+        let s = 0.5 / (trace + 1.0).sqrt();
+        let w = 0.25 / s;
+        let x = (r.col(1).z - r.col(2).y) * s;
+        let y = (r.col(2).x - r.col(0).z) * s;
+        let z = (r.col(0).y - r.col(1).x) * s;
+        (w, x, y, z)
+    } else if r.col(0).x > r.col(1).y && r.col(0).x > r.col(2).z {
+        let s = 2.0 * (1.0 + r.col(0).x - r.col(1).y - r.col(2).z).sqrt();
+        let w = (r.col(1).z - r.col(2).y) / s;
+        let x = 0.25 * s;
+        let y = (r.col(1).x + r.col(0).y) / s;
+        let z = (r.col(2).x + r.col(0).z) / s;
+        (w, x, y, z)
+    } else if r.col(1).y > r.col(2).z {
+        let s = 2.0 * (1.0 + r.col(1).y - r.col(0).x - r.col(2).z).sqrt();
+        let w = (r.col(2).x - r.col(0).z) / s;
+        let x = (r.col(1).x + r.col(0).y) / s;
+        let y = 0.25 * s;
+        let z = (r.col(2).y + r.col(1).z) / s;
+        (w, x, y, z)
+    } else {
+        let s = 2.0 * (1.0 + r.col(2).z - r.col(0).x - r.col(1).y).sqrt();
+        let w = (r.col(0).y - r.col(1).x) / s;
+        let x = (r.col(2).x + r.col(0).z) / s;
+        let y = (r.col(2).y + r.col(1).z) / s;
+        let z = 0.25 * s;
+        (w, x, y, z)
+    };
+    vec![
+        qw as f32, qx as f32, qy as f32, qz as f32,
+        pose.translation.x as f32,
+        pose.translation.y as f32,
+        pose.translation.z as f32,
+    ]
+}
+
+/// Convert SE3 parameters [qw, qx, qy, qz, tx, ty, tz] back to a `Pose3d`.
+fn se3_params_to_pose(params: &[f32]) -> Pose3d {
+    let (qw, qx, qy, qz) = (params[0] as f64, params[1] as f64, params[2] as f64, params[3] as f64);
+    // Normalize quaternion
+    let norm = (qw * qw + qx * qx + qy * qy + qz * qz).sqrt();
+    let (qw, qx, qy, qz) = (qw / norm, qx / norm, qy / norm, qz / norm);
+    // Quaternion to rotation matrix
+    let r00 = 1.0 - 2.0 * (qy * qy + qz * qz);
+    let r01 = 2.0 * (qx * qy - qw * qz);
+    let r02 = 2.0 * (qx * qz + qw * qy);
+    let r10 = 2.0 * (qx * qy + qw * qz);
+    let r11 = 1.0 - 2.0 * (qx * qx + qz * qz);
+    let r12 = 2.0 * (qy * qz - qw * qx);
+    let r20 = 2.0 * (qx * qz - qw * qy);
+    let r21 = 2.0 * (qy * qz + qw * qx);
+    let r22 = 1.0 - 2.0 * (qx * qx + qy * qy);
+    Pose3d::new(
+        Mat3F64::from_cols(
+            Vec3F64::new(r00, r10, r20),
+            Vec3F64::new(r01, r11, r21),
+            Vec3F64::new(r02, r12, r22),
+        ),
+        Vec3F64::new(params[4] as f64, params[5] as f64, params[6] as f64),
+    )
 }
 
 #[cfg(test)]

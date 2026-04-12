@@ -4,8 +4,11 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Mat3F64;
 use kornia_image::{Image, ImageSize};
+use kornia_sensors::imu::PreintegratedImu;
 use kornia_slam::map::MapPoint;
 use kornia_tensor::CpuAllocator;
+
+use crate::datasets::euroc::ImuSample;
 
 const CAMERA_IMAGE_PLANE_DISTANCE: f32 = 0.15;
 
@@ -100,6 +103,68 @@ pub fn log_map_points_to_rerun(rec: &rerun::RecordingStream, map_points: &[MapPo
         )
         .ok();
     }
+}
+
+/// Log a batch of IMU samples as scalar time series (gyro + accel, one point per axis).
+pub fn log_imu_to_rerun(rec: &rerun::RecordingStream, samples: &[ImuSample]) {
+    for s in samples {
+        rec.set_time(
+            "imu_time",
+            rerun::TimeCell::from_duration_nanos((s.timestamp_sec * 1e9) as i64),
+        );
+        rec.log("imu/gyro/x", &rerun::Scalars::new([s.gyro[0]])).ok();
+        rec.log("imu/gyro/y", &rerun::Scalars::new([s.gyro[1]])).ok();
+        rec.log("imu/gyro/z", &rerun::Scalars::new([s.gyro[2]])).ok();
+        rec.log("imu/accel/x", &rerun::Scalars::new([s.accel[0]])).ok();
+        rec.log("imu/accel/y", &rerun::Scalars::new([s.accel[1]])).ok();
+        rec.log("imu/accel/z", &rerun::Scalars::new([s.accel[2]])).ok();
+    }
+}
+
+/// Log IMU preintegration covariances as 2D heatmap tensors.
+///
+/// Two tensors are logged:
+///   - `imu/cov_nav`: 9×9 navigation covariance (tangent-space blocks: rot, vel, pos)
+///   - `imu/cov_bias`: 6×6 bias covariance (blocks: bias_gyro, bias_accel)
+///
+/// Raw covariance entries span many orders of magnitude, so we also log a
+/// signed-log version (`..._log`) which makes off-diagonal structure visible
+/// in the Rerun viewer's default linear colormap.
+pub fn log_imu_covariance_to_rerun(rec: &rerun::RecordingStream, pre: &PreintegratedImu) {
+    // Rerun tensors are row-major; our covariances are stored column-major.
+    // Since covariance matrices are symmetric the transpose equals itself,
+    // so the flat buffer can be used directly without reordering.
+    log_matrix_heatmap(rec, "imu/cov_nav", &pre.covariance, 9);
+    log_matrix_heatmap(rec, "imu/cov_bias", &pre.bias_covariance, 6);
+}
+
+fn log_matrix_heatmap(rec: &rerun::RecordingStream, entity: &str, data: &[f64], n: usize) {
+    let shape = vec![n as u64, n as u64];
+
+    // Raw values.
+    let raw = rerun::datatypes::TensorData::new(
+        shape.clone(),
+        rerun::datatypes::TensorBuffer::F64(data.to_vec().into()),
+    );
+    rec.log(entity, &rerun::Tensor::new(raw).with_dim_names(["row", "col"]))
+        .ok();
+
+    // Signed-log version: sign(x) * log10(1 + |x|/eps) — keeps sign but
+    // compresses the dynamic range so off-diagonal structure is visible.
+    const EPS: f64 = 1e-12;
+    let slog: Vec<f64> = data
+        .iter()
+        .map(|&x| x.signum() * (1.0 + x.abs() / EPS).log10())
+        .collect();
+    let log_data = rerun::datatypes::TensorData::new(
+        shape,
+        rerun::datatypes::TensorBuffer::F64(slog.into()),
+    );
+    rec.log(
+        format!("{entity}_log"),
+        &rerun::Tensor::new(log_data).with_dim_names(["row", "col"]),
+    )
+    .ok();
 }
 
 /// Convert a world-to-camera pose into a camera-to-world trajectory point.

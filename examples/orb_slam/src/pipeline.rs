@@ -18,6 +18,7 @@ use kornia_slam::map::{Keyframe, Map, MapPoint};
 use kornia_slam::system::{
     KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus,
 };
+use kornia_sensors::imu::{ImuCalib, ImuMeasurement, PreintegratedImu};
 
 /// Top-level ORB-SLAM pipeline: orchestrates tracking, mapping, and state transitions.
 pub struct Pipeline {
@@ -76,6 +77,25 @@ impl Pipeline {
         self.map.map_points().len()
     }
 
+    /// Enable IMU fusion by providing calibration parameters.
+    pub fn enable_imu(&mut self, calib: ImuCalib) {
+        self.state.enable_imu(calib);
+    }
+
+    /// Buffer an IMU measurement for preintegration.
+    pub fn push_imu(&mut self, measurement: ImuMeasurement) {
+        self.state.push_imu(measurement);
+    }
+
+    /// Returns the preintegrated IMU attached to the most recent keyframe, if any.
+    pub fn latest_preintegrated_imu(&self) -> Option<&PreintegratedImu> {
+        self.map
+            .keyframes()
+            .iter()
+            .rev()
+            .find_map(|kf| kf.preintegrated_imu.as_ref())
+    }
+
     fn bootstrap_step(&mut self, mut curr_frame: Frame) -> TrackingResult {
         // Stamp frames with current odometry pose so bootstrap builds
         // the new map in the existing coordinate frame.
@@ -118,7 +138,12 @@ impl Pipeline {
 
         // Promote to Keyframes
         let reference_kf = Keyframe::from_frame(prev_bootstrap_frame);
-        let current_kf = Keyframe::from_frame(curr_frame);
+        let mut current_kf = Keyframe::from_frame(curr_frame);
+
+        // Attach preintegrated IMU to the second bootstrap keyframe
+        current_kf.preintegrated_imu = self
+            .state
+            .preintegrate_imu(current_kf.frame.timestamp);
         let curr_idx = current_kf.frame.idx;
 
         self.build_initial_map(
@@ -299,6 +324,9 @@ impl Pipeline {
             curr_kf.associate_map_point(curr_idx, mp_idx);
         }
 
+        // Attach preintegrated IMU from the previous keyframe to this one
+        curr_kf.preintegrated_imu = self.state.preintegrate_imu(frame.timestamp);
+
         let enable_local_ba = self.enable_local_ba;
         let match_config = self.two_view_init_config.match_config;
         let estimation_config = self.two_view_init_config.estimation_config.clone();
@@ -314,7 +342,27 @@ impl Pipeline {
         self.state.last_keyframe_idx = Some(frame.idx);
 
         if enable_local_ba {
-            self.map.run_local_ba(&self.camera);
+            let imu_velocity = self.state.imu_velocity.unwrap_or(Vec3F64::ZERO);
+            let gravity = [
+                self.state.gravity.x as f32,
+                self.state.gravity.y as f32,
+                self.state.gravity.z as f32,
+            ];
+
+            if let Some(result) = self.map.run_local_ba_inertial(
+                &self.camera,
+                &gravity,
+                &imu_velocity,
+                &self.state.imu_bias,
+            ) {
+                // Update IMU state from optimized values
+                self.state.imu_velocity = Some(result.latest_velocity);
+                self.state.imu_bias = result.latest_bias;
+            } else {
+                // Fall back to visual-only BA
+                self.map.run_local_ba(&self.camera);
+            }
+
             if let Some(newest_kf) = self.map.keyframes().last() {
                 self.state.pose_world_to_cam = newest_kf.frame.pose_world_to_cam;
             }
