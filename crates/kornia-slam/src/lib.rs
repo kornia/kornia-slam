@@ -2,10 +2,12 @@
 
 pub mod estimation;
 pub mod frame;
+pub mod imu;
 pub mod map;
 pub mod system;
 
 pub use estimation::MapProjectionEstimator;
 pub use frame::Frame;
+pub use imu::{ImuMeasurement, ImuPreintegrationError, ImuPreintegrator, ImuState};
 pub use kornia_imgproc::features::OrbFeatures;
 pub use system::{KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus};
