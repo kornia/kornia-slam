@@ -4,7 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::euroc::{DatasetError, DatasetSample, GroundTruthPose};
+use super::euroc::{DatasetError, DatasetSample};
+
+use crate::config::PipelineConfig;
 
 use kornia_3d::camera::PinholeCamera;
 
@@ -57,9 +59,6 @@ pub struct KittiDataset {
     pub cam0_samples: Vec<DatasetSample>,
     /// Camera calibration for `cam0`.
     pub cam0_calibration: KittiCameraCalibration,
-    // Ground-truth poses (empty if GT file not present).
-    // #[allow(dead_code)]
-    // pub ground_truth: Vec<GroundTruthPose>,
 }
 
 impl KittiDataset{
@@ -104,6 +103,37 @@ impl KittiDataset{
             cam0_samples: samples,
             cam0_calibration: camera,
         })
+    }
+
+    pub fn pipeline_config()-> PipelineConfig{
+
+        let mut cfg = PipelineConfig::default();
+        // Two-view bootstrap: allow lower parallax / inlier counts.
+        cfg.two_view_init.acceptance_config.min_matches = 60;
+        cfg.two_view_init.acceptance_config.min_inliers = 18;
+        cfg.two_view_init.acceptance_config.min_triangulated = 24;
+        cfg.two_view_init.triangulation_config.min_parallax_deg = 0.5;
+        cfg.two_view_init.triangulation_config.max_reprojection_error = 5.0;
+
+        // Tracking/PnP: be more tolerant when motion or illumination changes.
+        cfg.map_projection.match_config.nn_ratio = 0.8;
+        cfg.map_projection.match_config.th_low = 60;
+        cfg.map_projection.projection.search_radius = 30.0;
+        cfg.map_projection.projection.max_hamming = 64;
+        cfg.map_projection.local_projection.search_radius = 42.0;
+        cfg.map_projection.local_projection.max_hamming = 80;
+        cfg.map_projection.pnp.final_reproj_threshold_px = 5.0;
+        cfg.map_projection.pnp.min_inliers = 15;
+
+        // Insert keyframes earlier so tracking remains anchored.
+        cfg.keyframe_policy.min_frames_between = 1;
+        cfg.keyframe_policy.max_frames_between = 5;
+        cfg.keyframe_policy.ref_ratio = 0.9;
+
+        cfg
+
+
+
     }
 
     fn load_camera_from_calib(root: &Path) -> Result<KittiCameraCalibration, DatasetError>{

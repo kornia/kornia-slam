@@ -3,6 +3,7 @@
 use kornia_3d::camera::PinholeCamera;
 use serde::Deserialize;
 use std::{fs::File, io::BufRead, io::BufReader, path::Path, path::PathBuf};
+use crate::config::PipelineConfig;
 
 /// Error type used by dataset readers.
 #[derive(thiserror::Error, Debug)]
@@ -213,6 +214,10 @@ impl EurocDataset {
             });
         }
         Ok(samples)
+    }
+
+    pub fn pipeline_config() -> PipelineConfig {
+        PipelineConfig::default()
     }
 
     /// Returns ordered left-camera samples.
