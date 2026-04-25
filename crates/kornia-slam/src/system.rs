@@ -17,16 +17,26 @@ pub struct KeyframePolicy {
 
 impl Default for KeyframePolicy {
     fn default() -> Self {
+        // ORB-SLAM3 mono uses min=0 with async local mapping + idle check; since
+        // our pipeline is synchronous we keep a small debounce.
         Self {
             min_frames_between: 3,
-            max_frames_between: 8,
-            ref_ratio: 0.6,
+            max_frames_between: 10,
+            ref_ratio: 0.75,
         }
     }
 }
 
 impl KeyframePolicy {
     /// Decide whether a new keyframe should be inserted.
+    ///
+    /// Approximation of ORB-SLAM3's `Tracking::NeedNewKeyFrame` for the
+    /// monocular case. ORB-SLAM3 gates `c1a` by `c2`, but that assumes local
+    /// mapping has already promoted enough 2-observation points into
+    /// `TrackedMapPoints(nMinObs=3)`. Until our local mapping has full parity,
+    /// forcing `c1a` prevents reference-keyframe starvation.
+    ///
+    /// `n_ref_map_points` is `TrackedMapPoints(nMinObs=3)` of the reference KF.
     pub fn should_insert(
         &self,
         curr_idx: usize,
@@ -38,20 +48,25 @@ impl KeyframePolicy {
             return true;
         };
 
-        let frames_since_last_kf = curr_idx.saturating_sub(last_kf_idx);
-        if frames_since_last_kf < self.min_frames_between {
+        let gap = curr_idx.saturating_sub(last_kf_idx);
+        if gap < self.min_frames_between {
             return false;
         }
-        if frames_since_last_kf >= self.max_frames_between {
+        if gap >= self.max_frames_between {
             return true;
         }
 
+        if tracked_inliers <= 15 {
+            return false;
+        }
+
+        // c2: ref_ratio acts as a lower bound on the allowed tracked fraction.
         if n_ref_map_points == 0 {
             return true;
         }
 
         let weak_threshold = (n_ref_map_points as f64 * self.ref_ratio) as usize;
-        tracked_inliers >= 15 && tracked_inliers < weak_threshold
+        tracked_inliers < weak_threshold
     }
 }
 

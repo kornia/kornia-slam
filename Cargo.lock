@@ -4900,6 +4900,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kornia-bow"
+version = "0.1.11"
+dependencies = [
+ "bincode 2.0.1",
+ "rand 0.9.2",
+ "rayon",
+ "serde",
+ "serde-big-array",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "kornia-image"
 version = "0.1.11"
 dependencies = [
@@ -4952,9 +4964,26 @@ version = "0.1.0"
 dependencies = [
  "kornia-3d",
  "kornia-algebra",
+ "kornia-bow",
  "kornia-image",
  "kornia-imgproc",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "kornia-slam-parity"
+version = "0.1.0"
+dependencies = [
+ "argh",
+ "kornia-3d",
+ "kornia-algebra",
+ "kornia-image",
+ "kornia-imgproc",
+ "kornia-io",
+ "kornia-slam",
+ "kornia-tensor",
+ "serde",
+ "serde_yaml",
 ]
 
 [[package]]
@@ -6411,6 +6440,7 @@ dependencies = [
  "argh",
  "kornia-3d",
  "kornia-algebra",
+ "kornia-bow",
  "kornia-image",
  "kornia-imgproc",
  "kornia-io",
@@ -9911,6 +9941,15 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde-big-array"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11fc7cc2c76d73e0f27ee52abbd64eec84d46f370c88371120433196934e4b7f"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

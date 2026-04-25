@@ -2,11 +2,14 @@
 
 pub mod map_projection;
 pub mod pnp;
+pub mod triangulation_search;
 pub mod two_view;
 
 use kornia_3d::pose::Pose3d;
 
-pub use map_projection::MapProjectionEstimator;
+pub use map_projection::{
+    MapProjectionEstimator, ProjectionDebugFrame, ProjectionDebugPoint, ProjectionOverridePoint,
+};
 
 /// Successful pose estimate returned by any estimator.
 #[derive(Debug, Clone)]

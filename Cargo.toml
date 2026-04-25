@@ -1,3 +1,12 @@
 [workspace]
-members = ["crates/*", "examples/orb_slam"]
+members = ["crates/*", "examples/orb_slam", "parity/rust"]
 resolver = "3"
+
+[patch."https://github.com/kornia/kornia-rs"]
+kornia-3d = { path = "/home/christie/projects/kornia-rs/crates/kornia-3d" }
+kornia-algebra = { path = "/home/christie/projects/kornia-rs/crates/kornia-algebra" }
+kornia-bow = { path = "/home/christie/projects/kornia-rs/crates/kornia-bow" }
+kornia-image = { path = "/home/christie/projects/kornia-rs/crates/kornia-image" }
+kornia-imgproc = { path = "/home/christie/projects/kornia-rs/crates/kornia-imgproc" }
+kornia-io = { path = "/home/christie/projects/kornia-rs/crates/kornia-io" }
+kornia-tensor = { path = "/home/christie/projects/kornia-rs/crates/kornia-tensor" }

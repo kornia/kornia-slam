@@ -8,11 +8,26 @@ pub struct PipelineConfig {
     pub map_projection: MapProjectionConfig,
     pub keyframe_policy: KeyframePolicy,
     pub enable_local_ba: bool,
+    pub enable_neighbor_fusion: bool,
+    pub mapping_cooldown_frames: usize,
+    pub tracking_orb_keypoints: usize,
+    pub initial_orb_keypoint_multiplier: usize,
+    pub initial_orb_window_frames: usize,
+}
+
+impl PipelineConfig {
+    pub fn initial_orb_keypoints(&self) -> usize {
+        self.tracking_orb_keypoints * self.initial_orb_keypoint_multiplier
+    }
 }
 
 impl Default for PipelineConfig {
     fn default() -> Self {
         let mut two_view_init = TwoViewInitConfig::default();
+        two_view_init
+            .estimation_config
+            .triangulation
+            .min_parallax_deg = (0.99998_f64).acos().to_degrees();
         two_view_init
             .estimation_config
             .triangulation
@@ -27,6 +42,11 @@ impl Default for PipelineConfig {
             map_projection: MapProjectionConfig::default(),
             keyframe_policy: KeyframePolicy::default(),
             enable_local_ba: true,
+            enable_neighbor_fusion: true,
+            mapping_cooldown_frames: 0,
+            tracking_orb_keypoints: 1000,
+            initial_orb_keypoint_multiplier: 5,
+            initial_orb_window_frames: 20,
         }
     }
 }
