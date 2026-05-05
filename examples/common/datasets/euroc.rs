@@ -2,34 +2,9 @@
 
 use kornia_3d::camera::PinholeCamera;
 use serde::Deserialize;
-use std::{fs::File, io::BufRead, io::BufReader, path::Path, path::PathBuf};
+use std::{fs::File, io::BufRead, io::BufReader, path::Path};
 use crate::config::PipelineConfig;
-
-/// Error type used by dataset readers.
-#[derive(thiserror::Error, Debug)]
-pub enum DatasetError {
-    /// Generic I/O error.
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-
-    /// Parse failure with contextual message.
-    #[error("parse error: {0}")]
-    Parse(String),
-
-    /// Referenced file does not exist.
-    #[error("file not found: {0}")]
-    FileNotFound(PathBuf),
-}
-
-/// One dataset image sample.
-#[derive(Debug, Clone)]
-pub struct DatasetSample {
-    /// Timestamp in seconds.
-    #[allow(dead_code)]
-    pub timestamp_sec: f64,
-    /// Path to the image file.
-    pub image_path: PathBuf,
-}
+use super::types::{DatasetError, DatasetSample};
 
 /// One ground-truth pose from `state_groundtruth_estimate0/data.csv`.
 #[derive(Debug, Clone, Copy)]

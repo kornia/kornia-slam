@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::euroc::{DatasetError, DatasetSample};
+use super::{DatasetError, DatasetSample};
 
 use crate::config::PipelineConfig;
 
@@ -49,7 +49,7 @@ impl KittiCameraCalibration{
 }
 
 
-/// PNG images in `<root>/mav0/cam0/data/`.
+/// PNG images in `<root>/image_0/`.
 #[derive(Debug, Clone)]
 pub struct KittiDataset {
     /// Base directory of the extracted dataset.
