@@ -10,7 +10,7 @@ use crate::config::PipelineConfig;
 
 use kornia_3d::camera::PinholeCamera;
 
-/// EuRoC `cam0` calibration loaded from `sensor.yaml`.
+/// Kitti `cam0` calibration loaded from `calib.txt`.
 #[derive(Debug, Clone, Copy)]
 pub struct KittiCameraCalibration {
     /// Focal length in x.
@@ -33,7 +33,7 @@ pub struct KittiCameraCalibration {
 
 impl KittiCameraCalibration{
 
-    /// Converts the parsed EuRoC calibration into a `PinholeCamera`.
+    /// Converts the parsed Kitti calibration into a `PinholeCamera`.
     pub fn to_pinhole_camera(self) -> PinholeCamera {
         PinholeCamera {
             fx: self.fx,
@@ -62,16 +62,9 @@ pub struct KittiDataset {
 }
 
 impl KittiDataset{
-    // pub fn open(root: impl AsRef<Path>) -> Result<Self, DatasetError> 
     pub fn open(root: impl AsRef<Path>) -> Result<Self, DatasetError>{
 
-         println!("Kitti dataset open method called");
         let root = root.as_ref().to_path_buf();
-
-        // let seq_dir = if root.join("image_0").is_dir() {
-        //     root.clone()
-        // }
-
         
         let image_dir = root.join("image_0");
 
@@ -92,11 +85,6 @@ impl KittiDataset{
             Err(DatasetError) => return Err(DatasetError::FileNotFound(root)),
         };
 
-        // let cam0_samples = match samples{
-        //     Ok(s) => s.unwrap(),
-        //     Err(_) => return Err(DatasetError::FileNotFound(root)),
-
-        // };
 
         Ok(Self{
             root,
