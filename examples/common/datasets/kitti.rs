@@ -76,15 +76,9 @@ impl KittiDataset{
         // load the camera
         let camera = Self::load_camera_from_calib(&root)?;
         // load timestamps
-        let timestamp = Self::load_times(&root);
+        let timestamp = Self::load_times(&root)?;
         // load sequesnces
-        // let samples = Self::load_image(&root, &timestamp)?;
-
-        let samples = match Self::load_image(&root, &timestamp){
-            Ok(s) => s,
-            Err(DatasetError) => return Err(DatasetError::FileNotFound(root)),
-        };
-
+        let samples = Self::load_image(&root, &timestamp)?;
 
         Ok(Self{
             root,
@@ -174,15 +168,28 @@ impl KittiDataset{
         })
     }
 
-    fn load_times(root: &Path) -> Vec<f64>{
+    fn load_times(root: &Path) -> Result<Vec<f64>, DatasetError>{
         let times_file = root.join("times.txt");
-        
-        let times = match fs::read_to_string(&times_file){
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-
-        return times.lines().filter_map(|t| t.trim().parse::<f64>().ok()).collect();
+        if !times_file.exists() {
+            return Err(DatasetError::FileNotFound(times_file));
+        }
+        let times = fs::read_to_string(&times_file)?;
+        let mut parsed_times = Vec::new();
+        for (line_idx, line) in times.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let timestamp = trimmed.parse::<f64>().map_err(|_| {
+                DatasetError::Parse(format!(
+                    "Malformed timestamp at line {} in {}",
+                    line_idx + 1,
+                    times_file.display()
+                ))
+            })?;
+            parsed_times.push(timestamp);
+        }
+        Ok(parsed_times)
     }
 
     fn load_image(root: &Path, timestamp: &[f64]) -> Result<Vec<DatasetSample>, DatasetError>{
@@ -223,5 +230,176 @@ impl KittiDataset{
     /// Returns the `cam0` camera model.
     pub fn camera(&self) -> PinholeCamera {
         self.cam0_calibration.to_pinhole_camera()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "kornia-slam-{name}-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_minimal_kitti_tree(
+        root: &Path,
+        include_calib: bool,
+        calib_contents: Option<&str>,
+        include_times: bool,
+        times_contents: Option<&str>,
+        include_images: bool,
+    ) {
+        if include_images {
+            let image_dir = root.join("image_0");
+            fs::create_dir_all(&image_dir).unwrap();
+            fs::write(image_dir.join("000000.png"), []).unwrap();
+            fs::write(image_dir.join("000001.png"), []).unwrap();
+        }
+
+        if include_calib {
+            let contents = calib_contents.unwrap_or(
+                "P0: 718.856 0 607.1928 0 0 718.856 185.2157 0 0 0 1 0\n",
+            );
+            fs::write(root.join("calib.txt"), contents).unwrap();
+        }
+
+        if include_times {
+            let contents = times_contents.unwrap_or("0.0\n0.1\n");
+            fs::write(root.join("times.txt"), contents).unwrap();
+        }
+    }
+
+    #[test]
+    fn dataset_open_succeeds_with_minimal_tree() {
+        let dir = TestDir::new("kitti-ok");
+        write_minimal_kitti_tree(dir.path(), true, None, true, None, true);
+
+        let dataset = KittiDataset::open(dir.path()).unwrap();
+        let camera = dataset.camera();
+        let samples = dataset.samples();
+
+        assert_eq!(camera.fx, 718.856);
+        assert_eq!(camera.fy, 718.856);
+        assert_eq!(camera.cx, 607.1928);
+        assert_eq!(camera.cy, 185.2157);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].timestamp_sec, 0.0);
+        assert_eq!(samples[1].timestamp_sec, 0.1);
+        assert_eq!(
+            samples[0].image_path,
+            dir.path().join("image_0").join("000000.png")
+        );
+    }
+
+    #[test]
+    fn dataset_open_fails_when_calib_txt_is_missing() {
+        let dir = TestDir::new("kitti-calib-missing");
+        write_minimal_kitti_tree(dir.path(), false, None, true, None, true);
+
+        let err = KittiDataset::open(dir.path()).unwrap_err();
+        match err {
+            DatasetError::FileNotFound(path) => {
+                assert_eq!(path, dir.path().join("calib.txt"));
+            }
+            other => panic!("expected FileNotFound for calib.txt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dataset_open_fails_when_calib_txt_is_malformed() {
+        let dir = TestDir::new("kitti-calib-bad");
+        write_minimal_kitti_tree(
+            dir.path(),
+            true,
+            Some("P0: 718.856 0 607.1928\n"),
+            true,
+            None,
+            true,
+        );
+
+        let err = KittiDataset::open(dir.path()).unwrap_err();
+        match err {
+            DatasetError::Parse(message) => {
+                assert!(message.contains("Missing or Malformed P0"));
+            }
+            other => panic!("expected Parse for malformed calib.txt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dataset_open_succeeds_when_times_txt_is_missing_and_falls_back_to_indices() {
+        let dir = TestDir::new("kitti-times-missing");
+        write_minimal_kitti_tree(dir.path(), true, None, false, None, true);
+
+        let dataset = KittiDataset::open(dir.path()).unwrap();
+        let samples = dataset.samples();
+
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].timestamp_sec, 0.0);
+        assert_eq!(samples[1].timestamp_sec, 1.0);
+    }
+
+    #[test]
+    fn dataset_open_succeeds_with_malformed_times_txt_and_uses_available_timestamps() {
+        let dir = TestDir::new("kitti-times-bad");
+        write_minimal_kitti_tree(
+            dir.path(),
+            true,
+            None,
+            true,
+            Some("not-a-number\n0.5\n"),
+            true,
+        );
+
+        let dataset = KittiDataset::open(dir.path()).unwrap();
+        let samples = dataset.samples();
+
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].timestamp_sec, 0.5);
+        assert_eq!(samples[1].timestamp_sec, 1.0);
+    }
+
+    #[test]
+    fn dataset_open_fails_when_image_dir_is_missing() {
+        let dir = TestDir::new("kitti-image-dir-missing");
+        write_minimal_kitti_tree(dir.path(), true, None, true, None, false);
+
+        let err = KittiDataset::open(dir.path()).unwrap_err();
+        match err {
+            DatasetError::FileNotFound(path) => {
+                assert_eq!(path, dir.path().join("image_0"));
+            }
+            other => panic!("expected FileNotFound for image_0, got {other:?}"),
+        }
     }
 }
