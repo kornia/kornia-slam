@@ -692,14 +692,17 @@ impl Pipeline {
             .map(|&i| curr_pts[i])
             .collect();
 
-        let triangulated = triangulate_matched_points(
+        let triangulated = match triangulate_matched_points(
             &inlier_prev,
             &inlier_curr,
             &prev_kf.frame.pose_world_to_cam,
             &curr_kf.frame.pose_world_to_cam,
             camera,
             triangulation_config,
-        );
+        ) {
+            Ok(pts) => pts,
+            Err(_) => return 0,
+        };
 
         let mut points = Vec::new();
         let mut used_curr = HashSet::new();
