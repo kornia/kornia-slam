@@ -1,0 +1,20 @@
+[package]
+name = "kornia-slam-py"
+version = "0.1.0"
+edition = "2021"
+description = "PyO3 Python bindings for kornia-slam (high-level ORB-SLAM)."
+publish = false
+
+[lib]
+name = "_kornia_slam"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+numpy = "0.22"
+ndarray = "0.16"
+kornia-slam = { path = "../kornia-slam" }
+kornia-3d = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
+kornia-algebra = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
+kornia-image = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
+kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", branch = "main" }

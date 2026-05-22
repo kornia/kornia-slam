@@ -1,3 +1,4 @@
 [workspace]
 members = ["crates/*", "examples/orb_slam"]
+exclude = ["crates/kornia-slam-py"]
 resolver = "3"

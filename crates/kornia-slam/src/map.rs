@@ -753,6 +753,8 @@ impl Map {
                             pixel: [p.x as f32, p.y as f32],
                             fixed_pose: is_fixed,
                             fixed_point: false,
+                            depth_meas: None,
+                            depth_sigma: 0.0,
                         });
                     }
                 }
@@ -896,6 +898,8 @@ impl Map {
                             pixel: [p.x as f32, p.y as f32],
                             fixed_pose: is_fixed,
                             fixed_point: false,
+                            depth_meas: None,
+                            depth_sigma: 0.0,
                         });
                     }
                 }
