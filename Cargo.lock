@@ -5609,7 +5609,8 @@ dependencies = [
 
 [[package]]
 name = "kornia-3d"
-version = "0.1.12"
+version = "0.1.14"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#7c55a260bc7a18a5754782ef2647d8b828eef5e8"
 dependencies = [
  "bincode 2.0.1",
  "faer",
@@ -5627,7 +5628,8 @@ dependencies = [
 
 [[package]]
 name = "kornia-algebra"
-version = "0.1.12"
+version = "0.1.14"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#7c55a260bc7a18a5754782ef2647d8b828eef5e8"
 dependencies = [
  "glam 0.30.10",
  "nalgebra 0.32.6",
@@ -5637,7 +5639,8 @@ dependencies = [
 
 [[package]]
 name = "kornia-image"
-version = "0.1.12"
+version = "0.1.14"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#7c55a260bc7a18a5754782ef2647d8b828eef5e8"
 dependencies = [
  "kornia-tensor",
  "num-traits",
@@ -5647,7 +5650,8 @@ dependencies = [
 
 [[package]]
 name = "kornia-imgproc"
-version = "0.1.12"
+version = "0.1.14"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#7c55a260bc7a18a5754782ef2647d8b828eef5e8"
 dependencies = [
  "kornia-algebra",
  "kornia-image",
@@ -5660,7 +5664,8 @@ dependencies = [
 
 [[package]]
 name = "kornia-io"
-version = "0.1.12"
+version = "0.1.14"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#7c55a260bc7a18a5754782ef2647d8b828eef5e8"
 dependencies = [
  "image-webp",
  "jpeg-encoder",
@@ -5694,7 +5699,8 @@ dependencies = [
 
 [[package]]
 name = "kornia-tensor"
-version = "0.1.12"
+version = "0.1.14"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#7c55a260bc7a18a5754782ef2647d8b828eef5e8"
 dependencies = [
  "num-traits",
  "rayon",

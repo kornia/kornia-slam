@@ -5,5 +5,5 @@ edition = "2024"
 description = "Physical sensor processing for kornia: IMU preintegration, noise models, and calibration."
 
 [dependencies]
-kornia-algebra = { git = "https://github.com/kornia/kornia-rs", branch = "feat/slam-utils" }
+kornia-algebra = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
 glam = "0.30"
