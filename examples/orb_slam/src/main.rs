@@ -5,6 +5,11 @@
 //! cargo run --release -p orb_slam -- euroc --data /path/to/V1_01_easy
 //! ```
 //!
+//! Run on a KITTI odometry sequence:
+//! ```text
+//! cargo run --release -p orb_slam -- kitti --data /path/to/sequence
+//! ```
+//!
 //! Run on a bubbaloop MCAP recording (defaults to the mono_left channel):
 //! ```text
 //! cargo run --release -p orb_slam -- mcap --path /path/to/recording.mcap
@@ -46,7 +51,8 @@ use pipeline::Pipeline;
 use source::OakdSource;
 #[cfg(feature = "uvc")]
 use source::UvcSource;
-use source::{EurocSource, FrameItem, FrameSource, McapSource};
+use datasets::KittiDataset;
+use source::{EurocSource, FrameItem, FrameSource, KittiSource, McapSource};
 use utils::trajectory_point_from_pose;
 #[cfg(feature = "viz")]
 use utils::{
@@ -54,7 +60,7 @@ use utils::{
 };
 /// CLI arguments.
 #[derive(argh::FromArgs)]
-#[argh(description = "Monocular ORB-SLAM (EuRoC dataset or live OAK-D)")]
+#[argh(description = "Monocular ORB-SLAM (EuRoC/KITTI datasets or live cameras)")]
 struct Args {
     #[argh(subcommand)]
     source: SourceCmd,
@@ -78,6 +84,7 @@ struct Args {
 #[argh(subcommand)]
 enum SourceCmd {
     Euroc(EurocCmd),
+    Kitti(KittiCmd),
     Mcap(McapCmd),
     #[cfg(feature = "oakd")]
     Oakd(OakdCmd),
@@ -113,6 +120,23 @@ struct EurocCmd {
     /// directory for the evaluation CSVs (created if missing; default: current dir)
     #[argh(option, default = "String::from(\".\")")]
     eval_out: String,
+}
+
+/// Run on a KITTI odometry sequence (`image_0/`, `calib.txt`, optional `times.txt`).
+#[derive(argh::FromArgs)]
+#[argh(subcommand, name = "kitti")]
+struct KittiCmd {
+    /// path to KITTI sequence root (directory containing `image_0/`)
+    #[argh(option)]
+    data: String,
+
+    /// maximum number of frames to process (0 = all)
+    #[argh(option, default = "0")]
+    max_frames: usize,
+
+    /// skip this many initial frames
+    #[argh(option, default = "0")]
+    start_frame: usize,
 }
 
 /// Run on a bubbaloop MCAP recording.
@@ -290,8 +314,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Source ─────────────────────────────────────────────────────────────
     let mut evaluate = false;
     let mut eval_out = String::from(".");
-    let (mut source, euroc_gt): (Box<dyn FrameSource>, Option<Vec<GroundTruthPose>>) =
-        match args.source {
+    let (mut source, euroc_gt, is_kitti): (
+        Box<dyn FrameSource>,
+        Option<Vec<GroundTruthPose>>,
+        bool,
+    ) = match args.source {
             SourceCmd::Euroc(e) => {
                 evaluate = e.evaluate;
                 eval_out = e.eval_out.clone();
@@ -311,7 +338,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 // Clone the GT poses before the source is moved into the box.
                 let gt = src.ground_truth_poses_cloned();
-                (Box::new(src), Some(gt))
+                (Box::new(src), Some(gt), false)
+            }
+            SourceCmd::Kitti(k) => {
+                let src = KittiSource::open(&k.data, k.start_frame, k.max_frames)?;
+                if !tui_active {
+                    let total = src.dataset_len();
+                    let n = src.n_frames_hint().unwrap_or(0);
+                    eprintln!(
+                        "KITTI: {total} frames (processing {}..{})",
+                        k.start_frame,
+                        k.start_frame + n,
+                    );
+                }
+                (Box::new(src), None, true)
             }
             SourceCmd::Mcap(m) => {
                 let path = std::path::Path::new(&m.path);
@@ -334,7 +374,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !tui_active && let Some(n) = src.n_frames_hint() {
                     eprintln!("MCAP: {n} frames from /{}", m.channel);
                 }
-                (Box::new(src), None)
+                (Box::new(src), None, false)
             }
             #[cfg(feature = "oakd")]
             SourceCmd::Oakd(o) => {
@@ -347,7 +387,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     OakdSource::open(o.width, o.height, o.fps, o.max_frames)?
                 };
-                (Box::new(src), None)
+                (Box::new(src), None, false)
             }
             #[cfg(feature = "uvc")]
             SourceCmd::Uvc(w) => {
@@ -370,6 +410,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         w.max_frames,
                     )?),
                     None,
+                    false,
                 )
             }
         };
@@ -399,16 +440,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── ORB detector ───────────────────────────────────────────────────────
     let detector = kornia_imgproc::features::OrbDetector {
-        n_keypoints: 1000,
+        // KITTI generally needs a denser feature set to keep tracking stable.
+        n_keypoints: if is_kitti { 2000 } else { 1000 },
         ..Default::default()
     };
 
     // ── SLAM system ────────────────────────────────────────────────────────
-    let pipeline_config = PipelineConfig {
-        debug: args.debug,
-        stereo_close_depth_m,
-        ..PipelineConfig::default()
+    let mut pipeline_config = if is_kitti {
+        KittiDataset::pipeline_config()
+    } else {
+        PipelineConfig::default()
     };
+    pipeline_config.debug = args.debug;
+    pipeline_config.stereo_close_depth_m = stereo_close_depth_m;
     let mut system = Pipeline::new(camera.clone(), pipeline_config);
 
     // ── Rerun ──────────────────────────────────────────────────────────────

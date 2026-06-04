@@ -5,6 +5,7 @@
 //! so the main binary can stay source-agnostic.
 
 pub mod euroc;
+pub mod kitti;
 pub mod mcap;
 #[cfg(feature = "oakd")]
 pub mod oakd;
@@ -16,6 +17,7 @@ use kornia_image::Image;
 use kornia_tensor::CpuAllocator;
 
 pub use euroc::EurocSource;
+pub use kitti::KittiSource;
 pub use mcap::McapSource;
 #[cfg(feature = "oakd")]
 pub use oakd::OakdSource;
