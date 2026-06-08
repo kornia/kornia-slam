@@ -3,6 +3,7 @@
 use kornia_3d::pose::Pose3d;
 
 use crate::frame::Frame;
+use kornia_algebra::Vec3F64;
 
 /// Keyframe insertion heuristics.
 #[derive(Debug, Clone)]
@@ -80,6 +81,9 @@ pub struct TrackingResult {
 pub struct SystemState {
     pub pose_world_to_cam: Pose3d,
     pub velocity: Option<Pose3d>,
+    pub velocity_world: Vec3F64,           // ADD: metric m/s in world frame
+    pub last_frame_timestamp_sec: f64,     // ADD: for per-frame preint window
+    pub imu_initialized: bool,             // ADD: gate for VI prediction path
     pub current_keyframe_idx: Option<usize>,
     pub last_keyframe_idx: Option<usize>,
     pub consecutive_failures: usize,
@@ -94,6 +98,8 @@ pub struct SystemState {
 pub enum SystemMode {
     /// Bootstrap from two-view geometry before any map exists.
     Bootstrap,
+    /// IMU initialization for scale and gravity
+    InertialInit,
     /// Track against the existing map and insert keyframes when needed.
     Tracking,
 }
@@ -103,11 +109,14 @@ impl SystemState {
         Self {
             pose_world_to_cam: Pose3d::IDENTITY,
             velocity: None,
+            velocity_world:Vec3F64 { x: (0.0), y: (0.0), z: (0.0) },
             current_keyframe_idx: None,
             last_keyframe_idx: None,
             consecutive_failures: 0,
             max_consecutive_failures: 15,
             bootstrap_frame: None,
+            imu_initialized: false,
+            last_frame_timestamp_sec: 0.0,
             mode: SystemMode::Bootstrap,
         }
     }

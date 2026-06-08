@@ -15,6 +15,8 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_image::Image;
 use kornia_tensor::CpuAllocator;
 
+use crate::datasets::euroc::ImuSample;
+
 pub use euroc::EurocSource;
 pub use mcap::McapSource;
 #[cfg(feature = "oakd")]
@@ -33,6 +35,9 @@ pub struct FrameItem {
     pub image: Image<u8, 1, CpuAllocator>,
     /// Rectified right view, when the source provides a stereo pair.
     pub right_image: Option<Image<u8, 1, CpuAllocator>>,
+    /// IMU samples between the previous yielded camera frame and this one.
+    #[allow(dead_code)]
+    pub imu_samples: Vec<ImuSample>,
 }
 
 /// Pull-based interface for monocular SLAM frame producers.

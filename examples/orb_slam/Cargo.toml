@@ -8,6 +8,7 @@ description = "ORB-SLAM example for kornia-slam (EuRoC dataset or live OAK-D)"
 [dependencies]
 argh = "0.1"
 kornia-slam = { path = "../../crates/kornia-slam" }
+kornia-sensors = { path = "../../crates/kornia-sensors" }
 kornia-3d = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
 kornia-algebra = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
 kornia-image = { git = "https://github.com/kornia/kornia-rs", branch = "main" }

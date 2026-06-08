@@ -5850,6 +5850,7 @@ dependencies = [
  "kornia-algebra",
  "kornia-image",
  "kornia-imgproc",
+ "kornia-sensors",
 ]
 
 [[package]]
@@ -7641,6 +7642,7 @@ dependencies = [
  "kornia-image",
  "kornia-imgproc",
  "kornia-io",
+ "kornia-sensors",
  "kornia-slam",
  "kornia-tensor",
  "libc",

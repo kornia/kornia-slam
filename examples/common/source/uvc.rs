@@ -143,6 +143,7 @@ impl FrameSource for UvcSource {
             timestamp_sec,
             image,
             right_image: None,
+            imu_samples: Vec::new(),
         }))
     }
 }

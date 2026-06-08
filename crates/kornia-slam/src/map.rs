@@ -27,6 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::frame::Frame;
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::bundle_adjust_schur;
 use kornia_3d::camera::PinholeCamera;
@@ -35,15 +36,24 @@ use kornia_3d::ransac::RobustKernelKind;
 use kornia_algebra::Vec3F64;
 use kornia_image::ImageSize;
 use kornia_imgproc::features::hamming_distance;
-
-use crate::frame::Frame;
+use kornia_sensors::imu::{ImuBias, PreintegratedImu};
 
 /// A frame promoted into the map, with descriptor-to-map-point associations.
+#[derive(Debug, Clone)]
+pub struct ImuEdge {
+    pub prev_kf_idx: usize,
+    pub curr_kf_idx: usize,
+    pub preintegrated: PreintegratedImu,
+}
 #[derive(Debug, Clone)]
 pub struct Keyframe {
     pub frame: Frame,
     /// For each descriptor index in `frame.features`, associated map-point index.
     pub map_point_by_desc_idx: Vec<Option<usize>>,
+    /// Metric linear velocity in world frame, initialized by visual-inertial bootstrap.
+    pub velocity_world: Vec3F64,
+    /// IMU bias estimate associated with this keyframe.
+    pub imu_bias: ImuBias,
 }
 
 impl Keyframe {
@@ -53,6 +63,8 @@ impl Keyframe {
         Self {
             frame,
             map_point_by_desc_idx,
+            velocity_world: Vec3F64::ZERO,
+            imu_bias: ImuBias::default(),
         }
     }
 
@@ -266,6 +278,7 @@ pub struct InitialMapHealth {
 pub struct Map {
     keyframes: Vec<Keyframe>,
     map_points: Vec<MapPoint>,
+    imu_edges: Vec<ImuEdge>,
 }
 
 impl Map {
@@ -277,6 +290,41 @@ impl Map {
     /// Returns all keyframes.
     pub fn keyframes(&self) -> &[Keyframe] {
         &self.keyframes
+    }
+
+    /// Returns mutable access to all keyframes.
+    pub fn keyframes_mut(&mut self) -> &mut [Keyframe] {
+        &mut self.keyframes
+    }
+
+    pub fn add_imu_edge(
+        &mut self,
+        prev_kf_idx: usize,
+        curr_kf_idx: usize,
+        preintegrated: PreintegratedImu,
+    ) {
+        self.imu_edges.push(ImuEdge {
+            prev_kf_idx,
+            curr_kf_idx,
+            preintegrated,
+        });
+    }
+
+    pub fn imu_edges(&self) -> &[ImuEdge] {
+        &self.imu_edges
+    }
+
+    /// Applies a metric scale to camera centers and map points.
+    pub fn scale_world(&mut self, scale: f64) {
+        for kf in &mut self.keyframes {
+            let mut cam_to_world = kf.frame.pose_world_to_cam.inverse();
+            cam_to_world.translation *= scale;
+            kf.frame.pose_world_to_cam = cam_to_world.inverse();
+        }
+
+        for mp in &mut self.map_points {
+            mp.position *= scale;
+        }
     }
 
     /// Returns all map points.
@@ -298,6 +346,7 @@ impl Map {
     pub fn clear_active(&mut self) {
         self.keyframes.clear();
         self.map_points.clear();
+        self.imu_edges.clear();
     }
 
     /// Health metrics for the just-bootstrapped pair of keyframes.

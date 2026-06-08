@@ -48,6 +48,7 @@ pub struct ImuCalib {
 /// Also propagates covariance matrices tracking how uncertainty grows:
 /// - 9×9 navigation covariance in tangent space [δrot(3), δvel(3), δpos(3)]
 /// - 6×6 bias covariance [δbias_gyro(3), δbias_accel(3)] (decoupled, grows linearly)
+#[derive(Debug, Clone)]
 pub struct PreintegratedImu {
     /// Accumulated rotation ∈ SO(3).
     pub delta_rotation: Mat3F64,

@@ -8,7 +8,7 @@ use kornia_io::png::read_image_png_mono8;
 use super::{FrameItem, FrameSource, SourceError};
 use crate::datasets::EurocDataset;
 use crate::datasets::StereoRectifier;
-use crate::datasets::euroc::GroundTruthPose;
+use crate::datasets::euroc::{GroundTruthPose, ImuSample};
 /// Reads left-camera (and optionally rectified left+right) PNG frames from an
 /// EuRoC dataset in order.
 pub struct EurocSource {
@@ -18,6 +18,8 @@ pub struct EurocSource {
     end: usize,
     /// When `Some`, the source rectifies the left+right pair and yields stereo.
     rectifier: Option<StereoRectifier>,
+    with_imu: bool,
+    imu_cursor: usize,
 }
 
 impl EurocSource {
@@ -31,7 +33,7 @@ impl EurocSource {
         start_frame: usize,
         max_frames: usize,
     ) -> Result<Self, SourceError> {
-        Self::open_inner(root, start_frame, max_frames, false)
+        Self::open_inner(root, start_frame, max_frames, false, false)
     }
 
     /// Like [`Self::open`], but rectifies the left+right pair and yields stereo
@@ -41,7 +43,23 @@ impl EurocSource {
         start_frame: usize,
         max_frames: usize,
     ) -> Result<Self, SourceError> {
-        Self::open_inner(root, start_frame, max_frames, true)
+        Self::open_inner(root, start_frame, max_frames, true, false)
+    }
+
+    pub fn open_imu(
+        root: impl AsRef<Path>,
+        start_frame: usize,
+        max_frames: usize,
+    ) -> Result<Self, SourceError> {
+        Self::open_inner(root, start_frame, max_frames, false, true)
+    }
+
+    pub fn open_imu_stereo(
+        root: impl AsRef<Path>,
+        start_frame: usize,
+        max_frames: usize,
+    ) -> Result<Self, SourceError> {
+        Self::open_inner(root, start_frame, max_frames, true, true)
     }
 
     fn open_inner(
@@ -49,6 +67,7 @@ impl EurocSource {
         start_frame: usize,
         max_frames: usize,
         stereo: bool,
+        imu: bool,
     ) -> Result<Self, SourceError> {
         let dataset = EurocDataset::open(root).map_err(SourceError::other)?;
         let n = dataset.samples().len();
@@ -73,12 +92,37 @@ impl EurocSource {
             None
         };
 
+        if imu && !dataset.is_imu() {
+            return Err(SourceError::other(
+                "IMU requested but dataset has no IMU samples",
+            ));
+        }
+
+        let imu_cursor = if imu {
+            if start == 0 {
+                0
+            } else {
+                let boundary_ts = dataset
+                    .left_samples
+                    .get(start - 1)
+                    .map(|sample| sample.timestamp_sec)
+                    .unwrap_or(f64::INFINITY);
+                dataset
+                    .imu_samples
+                    .partition_point(|sample| sample.timestamp_sec <= boundary_ts)
+            }
+        } else {
+            0
+        };
+
         Ok(Self {
             dataset,
             cursor: start,
             start,
             end,
             rectifier,
+            with_imu: imu,
+            imu_cursor,
         })
     }
 
@@ -132,6 +176,7 @@ impl FrameSource for EurocSource {
             }
             None => (left_raw, None),
         };
+        let imu_samples = self.imu_samples_until(timestamp_sec);
 
         self.cursor += 1;
         Ok(Some(FrameItem {
@@ -139,6 +184,22 @@ impl FrameSource for EurocSource {
             timestamp_sec,
             image,
             right_image,
+            imu_samples,
         }))
+    }
+}
+
+impl EurocSource {
+    fn imu_samples_until(&mut self, timestamp_sec: f64) -> Vec<ImuSample> {
+        if !self.with_imu {
+            return Vec::new();
+        }
+
+        let start = self.imu_cursor;
+        let rel_end = self.dataset.imu_samples[start..]
+            .partition_point(|sample| sample.timestamp_sec <= timestamp_sec);
+        let end = start + rel_end;
+        self.imu_cursor = end;
+        self.dataset.imu_samples[start..end].to_vec()
     }
 }

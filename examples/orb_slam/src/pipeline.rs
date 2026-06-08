@@ -13,6 +13,7 @@ use kornia_3d::pose::{
 };
 use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
+use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_slam::Frame;
 use kornia_slam::estimation::MapProjectionEstimator;
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
@@ -21,6 +22,19 @@ use kornia_slam::stereo::unproject_stereo;
 use kornia_slam::system::{
     KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus,
 };
+
+struct InertialInitConfig {
+    min_keyframes: usize,
+    min_time_sec: f64,
+    min_motion: f64,
+}
+
+struct ImuInitResult {
+    scale: f64,
+    gravity_world: Vec3F64,
+    velocities_world: Vec<Vec3F64>,
+    bias: ImuBias,
+}
 
 /// Top-level ORB-SLAM pipeline: orchestrates tracking, mapping, and state transitions.
 pub struct Pipeline {
@@ -43,6 +57,16 @@ pub struct Pipeline {
     debug_messages: Vec<String>,
     // Map object
     map: Map,
+    // IMU states
+    imu_calib: ImuCalib,
+    imu_bias: ImuBias,
+    pending_imu: Vec<ImuMeasurement>,
+    gravity_world: Vec3F64,
+    bootstrap_timestamp_sec: Option<f64>,
+    last_keyframe_timestamp_sec: Option<f64>,
+    inertial_init_start_kf_idx: Option<usize>,
+    inertial_init_config: InertialInitConfig,
+
     // System state
     state: SystemState,
 }
@@ -61,14 +85,39 @@ impl Pipeline {
             debug_messages: Vec::new(),
             map: Map::new(),
             state: SystemState::new(),
+            imu_calib: ImuCalib {
+                gyro_noise: 1.6968e-4,
+                accel_noise: 2.0e-3,
+                gyro_bias_noise: 1.9393e-5,
+                accel_bias_noise: 3.0e-3,
+            },
+            imu_bias: ImuBias::default(),
+            pending_imu: Vec::new(),
+            gravity_world: Vec3F64::new(0.0, 0.0, -9.81),
+            bootstrap_timestamp_sec: None,
+            last_keyframe_timestamp_sec: None,
+            inertial_init_start_kf_idx: None,
+            inertial_init_config: InertialInitConfig {
+                min_keyframes: 30,
+                min_time_sec: 1.0,
+                min_motion: 0.05,
+            },
         }
     }
 
     /// Processes one frame (pre-extracted features) and returns the tracking result.
-    pub fn process_frame(&mut self, frame: Frame) -> TrackingResult {
+    pub fn process_frame(
+        &mut self,
+        frame: Frame,
+        timestamp_sec: f64,
+        imu_samples: Vec<ImuMeasurement>,
+    ) -> TrackingResult {
+        self.pending_imu.extend(imu_samples);
+
         match self.state.mode {
-            SystemMode::Bootstrap => self.bootstrap_step(frame),
-            SystemMode::Tracking => self.tracking_step(frame),
+            SystemMode::Bootstrap => self.bootstrap_step(frame, timestamp_sec),
+            SystemMode::InertialInit => self.inertial_init_step(frame, timestamp_sec),
+            SystemMode::Tracking => self.tracking_step(frame, timestamp_sec),
         }
     }
 
@@ -108,14 +157,14 @@ impl Pipeline {
         }
     }
 
-    fn bootstrap_step(&mut self, curr_frame: Frame) -> TrackingResult {
+    fn bootstrap_step(&mut self, curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
         // Stereo frames carry metric per-keypoint depth, so we can build a
         // metric map from a single keyframe (ORB-SLAM3's StereoInitialization)
         // instead of waiting for two-view parallax.
         if curr_frame.is_stereo() {
             return self.bootstrap_stereo(curr_frame);
         }
-        self.bootstrap_mono(curr_frame)
+        self.bootstrap_mono(curr_frame, timestamp_sec)
     }
 
     /// Single-frame metric initialization from stereo depth.
@@ -210,7 +259,7 @@ impl Pipeline {
         self.map.add_triangulated_points(None, curr_kf, &points)
     }
 
-    fn bootstrap_mono(&mut self, mut curr_frame: Frame) -> TrackingResult {
+    fn bootstrap_mono(&mut self, mut curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
         // Stamp frames with current odometry pose so bootstrap builds
         // the new map in the existing coordinate frame.
         curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
@@ -240,6 +289,7 @@ impl Pipeline {
                 curr_frame.idx,
             ));
             self.state.bootstrap_frame = Some(curr_frame);
+            self.bootstrap_timestamp_sec = Some(timestamp_sec);
             return TrackingResult {
                 pose_world_to_cam: self.state.pose_world_to_cam,
                 status: TrackingStatus::Skipped,
@@ -283,6 +333,7 @@ impl Pipeline {
         curr_frame.pose_world_to_cam = estimated_pose;
 
         // Promote to Keyframes
+        let prev_idx = prev_bootstrap_frame.idx;
         let reference_kf = Keyframe::from_frame(prev_bootstrap_frame);
         let current_kf = Keyframe::from_frame(curr_frame);
         let curr_idx = current_kf.frame.idx;
@@ -319,6 +370,14 @@ impl Pipeline {
         if let Some(kf) = self.map.get_keyframe(curr_idx) {
             self.state.pose_world_to_cam = kf.frame.pose_world_to_cam;
         }
+
+        if let Some(prev_ts) = self.bootstrap_timestamp_sec {
+            let preint = self.preintegrate_pending_imu(prev_ts, timestamp_sec);
+            if preint.dt > 0.0 {
+                self.map.add_imu_edge(prev_idx, curr_idx, preint);
+            }
+        }
+
         self.state.velocity = Some(Pose3d::between(
             &prev_pose_world_to_cam,
             &self.state.pose_world_to_cam,
@@ -326,7 +385,9 @@ impl Pipeline {
 
         self.state.current_keyframe_idx = Some(curr_idx);
         self.state.last_keyframe_idx = Some(curr_idx);
-        self.state.mode = SystemMode::Tracking;
+        self.state.mode = SystemMode::InertialInit;
+        self.inertial_init_start_kf_idx = Some(curr_idx);
+        self.last_keyframe_timestamp_sec = Some(timestamp_sec);
 
         TrackingResult {
             pose_world_to_cam: self.state.pose_world_to_cam,
@@ -397,20 +458,315 @@ impl Pipeline {
         added
     }
 
-    fn tracking_step(&mut self, frame: Frame) -> TrackingResult {
-        let pose_before_tracking = self.state.pose_world_to_cam;
-        let image_size = frame.image_size;
+    fn preintegrate_pending_imu(&mut self, t0: f64, t1: f64) -> PreintegratedImu {
+        let mut pre = PreintegratedImu::new(self.imu_bias, self.imu_calib);
 
-        let candidate_pose = if let Some(vel) = self.state.velocity {
-            vel.compose(&self.state.pose_world_to_cam)
-        } else {
-            self.state.pose_world_to_cam
+        self.pending_imu
+            .sort_by(|a, b| a.timestamp.total_cmp(&b.timestamp));
+
+        let samples: Vec<ImuMeasurement> = self
+            .pending_imu
+            .iter()
+            .copied()
+            .filter(|m| m.timestamp >= t0 && m.timestamp <= t1)
+            .collect();
+
+        if samples.is_empty() {
+            return pre;
+        }
+
+        let mut last_t = t0;
+
+        for sample in &samples {
+            let dt = sample.timestamp - last_t;
+            if dt > 0.0 {
+                pre.integrate(sample, dt);
+                last_t = sample.timestamp;
+            }
+        }
+
+        if last_t < t1 {
+            if let Some(last_sample) = samples.last() {
+                pre.integrate(last_sample, t1 - last_t);
+            }
+        }
+
+        self.pending_imu.retain(|m| m.timestamp > t1);
+
+        pre
+    }
+
+    fn inertial_init_ready(&self) -> bool {
+        let Some(start_idx) = self.inertial_init_start_kf_idx else {
+            return false;
         };
+
+        let init_kfs: Vec<&Keyframe> = self
+            .map
+            .keyframes()
+            .iter()
+            .filter(|kf| kf.frame.idx >= start_idx)
+            .collect();
+        if init_kfs.len() < self.inertial_init_config.min_keyframes {
+            return false;
+        }
+
+        let imu_time: f64 = self
+            .map
+            .imu_edges()
+            .iter()
+            .filter(|edge| edge.curr_kf_idx >= start_idx)
+            .map(|edge| edge.preintegrated.dt)
+            .sum();
+        if imu_time < self.inertial_init_config.min_time_sec {
+            return false;
+        }
+
+        let Some(first) = init_kfs.first() else {
+            return false;
+        };
+        let Some(last) = init_kfs.last() else {
+            return false;
+        };
+        let first_center = first.frame.pose_world_to_cam.inverse().translation;
+        let last_center = last.frame.pose_world_to_cam.inverse().translation;
+        (last_center - first_center).length() >= self.inertial_init_config.min_motion
+    }
+
+    fn try_initialize_imu(&self) -> Option<ImuInitResult> {
+        let Some(start_idx) = self.inertial_init_start_kf_idx else {
+            return None;
+        };
+
+        let keyframes: Vec<&Keyframe> = self
+            .map
+            .keyframes()
+            .iter()
+            .filter(|kf| kf.frame.idx >= start_idx)
+            .collect();
+        let n = keyframes.len();
+        if n < self.inertial_init_config.min_keyframes {
+            return None;
+        }
+
+        let mut frame_to_local = std::collections::HashMap::new();
+        for (local_idx, kf) in keyframes.iter().enumerate() {
+            frame_to_local.insert(kf.frame.idx, local_idx);
+        }
+
+        let unknowns = 3 * n + 4;
+        let mut rows: Vec<Vec<f64>> = Vec::new();
+        let mut rhs: Vec<f64> = Vec::new();
+
+        let vel_col = |kf_local: usize, axis: usize| -> usize { 3 * kf_local + axis };
+        let gravity_col = |axis: usize| -> usize { 3 * n + axis };
+        let scale_col = 3 * n + 3;
+
+        for edge in self.map.imu_edges() {
+            let Some(&i) = frame_to_local.get(&edge.prev_kf_idx) else {
+                continue;
+            };
+            let Some(&j) = frame_to_local.get(&edge.curr_kf_idx) else {
+                continue;
+            };
+
+            let kf_i = keyframes[i];
+            let kf_j = keyframes[j];
+            let cam_i_world = kf_i.frame.pose_world_to_cam.inverse();
+            let cam_j_world = kf_j.frame.pose_world_to_cam.inverse();
+            let r_i = cam_i_world.rotation;
+            let p_i = cam_i_world.translation;
+            let p_j = cam_j_world.translation;
+            let dt = edge.preintegrated.dt;
+            if dt <= 0.0 {
+                continue;
+            }
+
+            let delta_p_world = r_i * edge.preintegrated.delta_position;
+            let delta_v_world = r_i * edge.preintegrated.delta_velocity;
+            let visual_dp = p_j - p_i;
+
+            for axis in 0..3 {
+                let mut row = vec![0.0; unknowns];
+                row[vel_col(i, axis)] = dt;
+                row[gravity_col(axis)] = 0.5 * dt * dt;
+                row[scale_col] = -vec_axis(visual_dp, axis);
+                rows.push(row);
+                rhs.push(-vec_axis(delta_p_world, axis));
+            }
+
+            for axis in 0..3 {
+                let mut row = vec![0.0; unknowns];
+                row[vel_col(j, axis)] = 1.0;
+                row[vel_col(i, axis)] = -1.0;
+                row[gravity_col(axis)] = -dt;
+                rows.push(row);
+                rhs.push(vec_axis(delta_v_world, axis));
+            }
+        }
+
+        if rows.len() < unknowns {
+            return None;
+        }
+
+        let solution = solve_least_squares(&rows, &rhs)?;
+        let scale = solution[scale_col];
+        if !scale.is_finite() || scale <= 1e-6 {
+            return None;
+        }
+
+        let mut gravity_world = Vec3F64::new(
+            solution[gravity_col(0)],
+            solution[gravity_col(1)],
+            solution[gravity_col(2)],
+        );
+        let gravity_norm = gravity_world.length();
+        if !gravity_norm.is_finite() || gravity_norm < 1e-6 {
+            return None;
+        }
+        gravity_world *= 9.81 / gravity_norm;
+
+        let velocities_world = (0..n)
+            .map(|i| {
+                Vec3F64::new(
+                    solution[vel_col(i, 0)],
+                    solution[vel_col(i, 1)],
+                    solution[vel_col(i, 2)],
+                )
+            })
+            .collect();
+
+        Some(ImuInitResult {
+            scale,
+            gravity_world,
+            velocities_world,
+            bias: self.imu_bias,
+        })
+    }
+
+    fn apply_imu_initialization(&mut self, init: ImuInitResult) {
+        let Some(start_idx) = self.inertial_init_start_kf_idx else {
+            return;
+        };
+
+        self.map.scale_world(init.scale);
+        let mut velocity_iter = init.velocities_world.into_iter();
+        for kf in self
+            .map
+            .keyframes_mut()
+            .iter_mut()
+            .filter(|kf| kf.frame.idx >= start_idx)
+        {
+            if let Some(velocity) = velocity_iter.next() {
+                kf.velocity_world = velocity;
+                kf.imu_bias = init.bias;
+            }
+        }
+
+        if let Some(last_kf) = self.map.keyframes().iter()
+            .filter(|kf| kf.frame.idx >= start_idx).last()
+        {
+            self.state.velocity_world = last_kf.velocity_world;
+        }
+        self.state.imu_initialized = true;
+        self.gravity_world = init.gravity_world;
+        self.imu_bias = init.bias;
+    }
+
+    fn inertial_init_step(&mut self, frame: Frame, timestamp_sec: f64) -> TrackingResult {
+        let result = self.tracking_step(frame, timestamp_sec);
+
+        if result.status == TrackingStatus::KeyframeAccepted && self.inertial_init_ready() {
+            match self.try_initialize_imu() {
+                Some(init) => {
+                    let scale = init.scale;
+                    let gravity = init.gravity_world;
+                    self.apply_imu_initialization(init);
+                    self.state.mode = SystemMode::Tracking;
+                    self.dbg(format!(
+                        "[imu_init] accepted: scale={scale:.4} gravity=({:.3},{:.3},{:.3})",
+                        gravity.x, gravity.y, gravity.z
+                    ));
+                }
+                None => {
+                    self.dbg("[imu_init] rejected: solve failed or invalid scale/gravity".into());
+                }
+            }
+        }
+
+        result
+    }
+
+    fn predict_pose_imu(&mut self, pose_w2c: Pose3d, vel_world: Vec3F64, gravity_world: Vec3F64, preint: &PreintegratedImu,) -> (Pose3d, Vec3F64) {
+        let dt = preint.dt;
+        
+        // Camera center and rotation in world frame
+        let cam_to_world = pose_w2c.inverse();
+        let p_i = cam_to_world.translation;     // camera center
+        let r_i = cam_to_world.rotation;        // world←camera rotation
+
+        // Predicted camera center via IMU kinematics:
+        // p_j = p_i + v_i*dt + 0.5*g*dt² + R_i * Δp_imu
+        let p_j = p_i 
+            + vel_world * dt 
+            + gravity_world * 0.5 * dt * dt
+            + r_i * preint.delta_position;
+
+        // Predicted rotation: R_j = R_i * ΔR_imu
+        let r_j = r_i * preint.delta_rotation;
+
+        // Predicted velocity: v_j = v_i + g*dt + R_i * Δv_imu
+        let v_j = vel_world 
+            + gravity_world * dt 
+            + r_i * preint.delta_velocity;
+
+        // Convert back to world-to-camera convention
+        let pred_pose = Pose3d::from_rt(r_j, p_j).inverse();
+        (pred_pose, v_j)
+    }
+
+    fn tracking_step(&mut self, frame: Frame, timestamp_sec: f64) -> TrackingResult {
+        let image_size = frame.image_size;
+        let pose_before = self.state.pose_world_to_cam;
+        // let candidate_pose = if let Some(vel) = self.state.velocity {
+        //     vel.compose(&self.state.pose_world_to_cam)
+        // } else {
+        //     self.state.pose_world_to_cam
+        // };
+        let candidate_pose = if self.state.imu_initialized 
+            && self.state.last_frame_timestamp_sec > 0.0 
+        {
+            let preint = self.preintegrate_pending_imu(
+                self.state.last_frame_timestamp_sec, 
+                timestamp_sec
+            );
+            if preint.dt > 0.0 {
+                let (pred_pose, pred_vel) = self.predict_pose_imu(
+                    pose_before,
+                    self.state.velocity_world,
+                    self.gravity_world,
+                    &preint,
+                );
+                self.state.velocity_world = pred_vel; // propagate for next frame
+                pred_pose
+            } else {
+                // IMU stalled, fall back to visual constant velocity
+                self.state.velocity
+                    .map(|v| v.compose(&pose_before))
+                    .unwrap_or(pose_before)
+            }
+        } else {
+            self.state.velocity
+                .map(|v| v.compose(&pose_before))
+                .unwrap_or(pose_before)
+        };
+        
+        self.state.last_frame_timestamp_sec = timestamp_sec;
 
         let result = self.estimator.estimate_pose(
             &frame,
             &candidate_pose,
-            &pose_before_tracking,
+            &pose_before,
             &self.map,
             &self.camera,
             self.state.current_keyframe_idx,
@@ -418,8 +774,27 @@ impl Pipeline {
 
         let (mut status, matches, tracked_inliers, reject_reason) = match result {
             Ok(estimate) => {
-                self.state.velocity = Some(Pose3d::between(&pose_before_tracking, &estimate.pose));
                 self.state.pose_world_to_cam = estimate.pose;
+
+                if self.state.imu_initialized {
+                    let cam_before = pose_before.inverse().translation;
+                    let cam_after  = estimate.pose.inverse().translation;
+
+                    let dt =
+                        timestamp_sec - self.state.last_frame_timestamp_sec;
+
+                    if dt > 1e-6 {
+                        self.state.velocity_world =
+                            (cam_after - cam_before) / dt;
+                    }
+                } else {
+                    self.state.velocity =
+                        Some(Pose3d::between(
+                            &pose_before,
+                            &estimate.pose,
+                        ));
+                }
+
                 (
                     TrackingStatus::Tracked,
                     estimate.matches,
@@ -448,7 +823,7 @@ impl Pipeline {
                 .map_points_in_frustum(&self.camera, &candidate_pose, image_size);
             self.map.update_observation_counts(&visible, &matches);
 
-            if self.try_insert_keyframe(&frame, tracked_inliers, &matches) {
+            if self.try_insert_keyframe(&frame, timestamp_sec, tracked_inliers, &matches) {
                 status = TrackingStatus::KeyframeAccepted;
             }
         }
@@ -457,7 +832,7 @@ impl Pipeline {
             self.state.consecutive_failures += 1;
             if self.state.consecutive_failures >= self.state.max_consecutive_failures {
                 self.state.reset();
-                return self.bootstrap_step(frame);
+                return self.bootstrap_step(frame, timestamp_sec);
             }
         } else {
             self.state.consecutive_failures = 0;
@@ -472,6 +847,7 @@ impl Pipeline {
     fn try_insert_keyframe(
         &mut self,
         frame: &Frame,
+        timestamp_sec: f64,
         tracked_inliers: usize,
         matches: &[(usize, usize)],
     ) -> bool {
@@ -566,6 +942,18 @@ impl Pipeline {
         ));
 
         self.map.upsert_keyframe(curr_kf);
+        if let Some(prev_kf_idx) = self.state.last_keyframe_idx {
+            if let Some(prev_ts) = self.last_keyframe_timestamp_sec {
+                let preint = self.preintegrate_pending_imu(prev_ts, timestamp_sec);
+
+                if preint.dt > 0.0 {
+                    self.map.add_imu_edge(prev_kf_idx, frame.idx, preint);
+                }
+            }
+        }
+
+        self.last_keyframe_timestamp_sec = Some(timestamp_sec);
+
         self.state.current_keyframe_idx = Some(frame.idx);
         self.state.last_keyframe_idx = Some(frame.idx);
 
@@ -885,4 +1273,85 @@ impl Pipeline {
 
         n_fused
     }
+}
+
+fn vec_axis(v: Vec3F64, axis: usize) -> f64 {
+    match axis {
+        0 => v.x,
+        1 => v.y,
+        2 => v.z,
+        _ => unreachable!("Vec3F64 has three axes"),
+    }
+}
+
+fn solve_least_squares(rows: &[Vec<f64>], rhs: &[f64]) -> Option<Vec<f64>> {
+    let n = rows.first()?.len();
+    if rows.len() != rhs.len() {
+        return None;
+    }
+
+    let mut normal = vec![vec![0.0; n]; n];
+    let mut normal_rhs = vec![0.0; n];
+
+    for (row, &b) in rows.iter().zip(rhs.iter()) {
+        if row.len() != n {
+            return None;
+        }
+        for i in 0..n {
+            normal_rhs[i] += row[i] * b;
+            for j in 0..n {
+                normal[i][j] += row[i] * row[j];
+            }
+        }
+    }
+
+    solve_linear_system(normal, normal_rhs)
+}
+
+fn solve_linear_system(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
+    let n = b.len();
+    if a.len() != n || a.iter().any(|row| row.len() != n) {
+        return None;
+    }
+
+    for col in 0..n {
+        let mut pivot = col;
+        let mut pivot_abs = a[col][col].abs();
+        for row in (col + 1)..n {
+            let value = a[row][col].abs();
+            if value > pivot_abs {
+                pivot = row;
+                pivot_abs = value;
+            }
+        }
+        if pivot_abs < 1e-9 || !pivot_abs.is_finite() {
+            return None;
+        }
+        if pivot != col {
+            a.swap(col, pivot);
+            b.swap(col, pivot);
+        }
+
+        let diag = a[col][col];
+        for j in col..n {
+            a[col][j] /= diag;
+        }
+        b[col] /= diag;
+
+        for row in 0..n {
+            if row == col {
+                continue;
+            }
+            let factor = a[row][col];
+            if factor == 0.0 {
+                continue;
+            }
+            for j in col..n {
+                a[row][j] -= factor * a[col][j];
+            }
+            b[row] -= factor * b[col];
+        }
+    }
+
+    Some(b)
 }

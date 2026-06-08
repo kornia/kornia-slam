@@ -38,6 +38,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use kornia_image::{Image, ImageSize, InterpolationMode};
 use kornia_imgproc::resize::resize_fast_mono;
+use kornia_sensors::imu::ImuMeasurement;
 use kornia_slam::Frame;
 use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches};
 use kornia_tensor::CpuAllocator;
@@ -296,9 +297,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 evaluate = e.evaluate;
                 eval_out = e.eval_out.clone();
                 let src = if e.stereo {
-                    EurocSource::open_stereo(&e.data, e.start_frame, e.max_frames)?
+                    EurocSource::open_imu_stereo(&e.data, e.start_frame, e.max_frames)?
                 } else {
-                    EurocSource::open(&e.data, e.start_frame, e.max_frames)?
+                    EurocSource::open_imu(&e.data, e.start_frame, e.max_frames)?
                 };
                 if !tui_active {
                     let total = src.dataset_len();
@@ -443,8 +444,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             timestamp_sec,
             image: gray_u8,
             right_image,
+            imu_samples,
         } = item;
         let image_size = gray_u8.size();
+        let imu_measurements: Vec<ImuMeasurement> = imu_samples
+            .into_iter()
+            .map(|s| ImuMeasurement {
+                timestamp: s.timestamp_sec,
+                gyro: Vec3F64::new(s.gyro[0], s.gyro[1], s.gyro[2]),
+                accel: Vec3F64::new(s.accel[0], s.accel[1], s.accel[2]),
+            })
+            .collect();
 
         // Extract ORB features.
         let features = detector.detect_and_extract_u8(&gray_u8)?;
@@ -502,7 +512,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             depth,
         };
         let t0 = std::time::Instant::now();
-        let result = system.process_frame(frame);
+        let result = system.process_frame(frame, timestamp_sec, imu_measurements);
         let frame_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let keyframe_idx = system.current_keyframe_idx().unwrap_or(idx);
         let map_point_count = system.num_active_map_points();
