@@ -728,16 +728,13 @@ impl Pipeline {
     fn tracking_step(&mut self, frame: Frame, timestamp_sec: f64) -> TrackingResult {
         let image_size = frame.image_size;
         let pose_before = self.state.pose_world_to_cam;
-        // let candidate_pose = if let Some(vel) = self.state.velocity {
-        //     vel.compose(&self.state.pose_world_to_cam)
-        // } else {
-        //     self.state.pose_world_to_cam
-        // };
+        let prev_timestamp = self.state.last_frame_timestamp_sec;
+
         let candidate_pose = if self.state.imu_initialized 
-            && self.state.last_frame_timestamp_sec > 0.0 
+            && prev_timestamp > 0.0 
         {
             let preint = self.preintegrate_pending_imu(
-                self.state.last_frame_timestamp_sec, 
+                prev_timestamp, 
                 timestamp_sec
             );
             if preint.dt > 0.0 {
@@ -761,8 +758,6 @@ impl Pipeline {
                 .unwrap_or(pose_before)
         };
         
-        self.state.last_frame_timestamp_sec = timestamp_sec;
-
         let result = self.estimator.estimate_pose(
             &frame,
             &candidate_pose,
@@ -781,7 +776,7 @@ impl Pipeline {
                     let cam_after  = estimate.pose.inverse().translation;
 
                     let dt =
-                        timestamp_sec - self.state.last_frame_timestamp_sec;
+                        timestamp_sec - prev_timestamp;
 
                     if dt > 1e-6 {
                         self.state.velocity_world =
@@ -837,7 +832,7 @@ impl Pipeline {
         } else {
             self.state.consecutive_failures = 0;
         }
-
+        self.state.last_frame_timestamp_sec = timestamp_sec;
         TrackingResult {
             pose_world_to_cam: self.state.pose_world_to_cam,
             status,
