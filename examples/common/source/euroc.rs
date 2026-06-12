@@ -4,6 +4,7 @@ use std::path::Path;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_io::png::read_image_png_mono8;
+use kornia_algebra::Mat4F64;
 
 use super::{FrameItem, FrameSource, SourceError};
 use crate::datasets::EurocDataset;
@@ -34,6 +35,32 @@ impl EurocSource {
         max_frames: usize,
     ) -> Result<Self, SourceError> {
         Self::open_inner(root, start_frame, max_frames, false, false)
+    }
+
+    /// return left camera extrinsics
+    pub fn cam0_extr(&self) -> Mat4F64 {
+        let m = &self.dataset.left_calibration.t_bs;
+
+        Mat4F64::from_cols_array(&[
+            m[0],  m[4],  m[8],  m[12],
+            m[1],  m[5],  m[9],  m[13],
+            m[2],  m[6],  m[10], m[14],
+            m[3],  m[7],  m[11], m[15],
+        ])
+    }
+
+    /// return right camera extrinsics
+    pub fn cam1_extr(&self) -> Option<Mat4F64> {
+        self.dataset.right_calibration.as_ref().map(|calib| {
+            let m = &calib.t_bs;
+
+            Mat4F64::from_cols_array(&[
+                m[0],  m[4],  m[8],  m[12],
+                m[1],  m[5],  m[9],  m[13],
+                m[2],  m[6],  m[10], m[14],
+                m[3],  m[7],  m[11], m[15],
+            ])
+        })
     }
 
     /// Like [`Self::open`], but rectifies the left+right pair and yields stereo
@@ -146,6 +173,10 @@ impl FrameSource for EurocSource {
 
     fn stereo_bf(&self) -> Option<f64> {
         self.rectifier.as_ref().map(|r| r.bf())
+    }
+
+    fn cam_extrinsic(&self) -> Mat4F64 {
+        self.cam0_extr()
     }
 
     fn n_frames_hint(&self) -> Option<usize> {

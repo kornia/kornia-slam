@@ -23,6 +23,7 @@ pub use mcap::McapSource;
 pub use oakd::OakdSource;
 #[cfg(feature = "uvc")]
 pub use uvc::UvcSource;
+use kornia_algebra::Mat4F64;
 
 /// One frame yielded by a source.
 pub struct FrameItem {
@@ -56,6 +57,9 @@ pub trait FrameSource {
         None
     }
 
+    fn cam_extrinsic(&self) -> Mat4F64 {
+        Mat4F64::IDENTITY
+    }
     /// Total frames the source will yield, if known.
     ///
     /// Live sources without a cap return `None`. The TUI uses this to render

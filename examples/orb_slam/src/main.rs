@@ -410,7 +410,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stereo_close_depth_m,
         ..PipelineConfig::default()
     };
-    let mut system = Pipeline::new(camera.clone(), pipeline_config);
+    let cam_extr = source.cam_extrinsic();
+    let mut system = Pipeline::new(camera.clone(), pipeline_config, cam_extr);
 
     // ── Rerun ──────────────────────────────────────────────────────────────
     #[cfg(feature = "viz")]

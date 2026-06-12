@@ -36,7 +36,7 @@ use kornia_3d::ransac::RobustKernelKind;
 use kornia_algebra::Vec3F64;
 use kornia_image::ImageSize;
 use kornia_imgproc::features::hamming_distance;
-use kornia_sensors::imu::{ImuBias, PreintegratedImu};
+use kornia_sensors::imu::{ImuBias, PreintegratedImu, ImuMeasurement};
 
 /// A frame promoted into the map, with descriptor-to-map-point associations.
 #[derive(Debug, Clone)]
@@ -44,6 +44,7 @@ pub struct ImuEdge {
     pub prev_kf_idx: usize,
     pub curr_kf_idx: usize,
     pub preintegrated: PreintegratedImu,
+    pub imu_measurements: Vec<ImuMeasurement>,
 }
 #[derive(Debug, Clone)]
 pub struct Keyframe {
@@ -302,16 +303,22 @@ impl Map {
         prev_kf_idx: usize,
         curr_kf_idx: usize,
         preintegrated: PreintegratedImu,
+        imu_measurements: Vec<ImuMeasurement>,
     ) {
         self.imu_edges.push(ImuEdge {
             prev_kf_idx,
             curr_kf_idx,
             preintegrated,
+            imu_measurements,
         });
     }
 
     pub fn imu_edges(&self) -> &[ImuEdge] {
         &self.imu_edges
+    }
+
+    pub fn imu_edges_mut(&mut self) -> &mut [ImuEdge] {
+        &mut self.imu_edges
     }
 
     /// Applies a metric scale to camera centers and map points.

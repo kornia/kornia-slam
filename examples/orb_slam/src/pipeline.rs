@@ -22,6 +22,7 @@ use kornia_slam::stereo::unproject_stereo;
 use kornia_slam::system::{
     KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus,
 };
+use kornia_algebra::{Mat4F64, Mat3F64, SO3F64};
 
 struct InertialInitConfig {
     min_keyframes: usize,
@@ -34,6 +35,41 @@ struct ImuInitResult {
     gravity_world: Vec3F64,
     velocities_world: Vec<Vec3F64>,
     bias: ImuBias,
+}
+
+#[inline]
+fn vec3_cross(
+    a: &Vec3F64,
+    b: &Vec3F64,
+) -> Vec3F64 {
+    Vec3F64::new(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x,
+    )
+}
+
+#[inline]
+fn vec3_dot(
+    a: &Vec3F64,
+    b: &Vec3F64,
+) -> f64 {
+    a.x * b.x
+    + a.y * b.y
+    + a.z * b.z
+}
+
+#[inline]
+fn vec3_normalize(
+    v: &Vec3F64,
+) -> Vec3F64 {
+    let n = v.length();
+
+    if n < 1e-12 {
+        return *v;
+    }
+
+    *v / n
 }
 
 /// Top-level ORB-SLAM pipeline: orchestrates tracking, mapping, and state transitions.
@@ -66,14 +102,15 @@ pub struct Pipeline {
     last_keyframe_timestamp_sec: Option<f64>,
     inertial_init_start_kf_idx: Option<usize>,
     inertial_init_config: InertialInitConfig,
-
+    t_bc: Mat4F64,   // body <- left camera
+    t_cb: Mat4F64,   // left camera <- body
     // System state
     state: SystemState,
 }
 
 impl Pipeline {
     /// Creates a new pipeline with identity pose.
-    pub fn new(camera: PinholeCamera, config: PipelineConfig) -> Self {
+    pub fn new(camera: PinholeCamera, config: PipelineConfig, T_bc: Mat4F64) -> Self {
         Self {
             camera,
             estimator: MapProjectionEstimator::new(config.map_projection),
@@ -102,6 +139,8 @@ impl Pipeline {
                 min_time_sec: 1.0,
                 min_motion: 0.05,
             },
+            t_bc: T_bc,
+            t_cb: T_bc.inverse(),
         }
     }
 
@@ -372,9 +411,9 @@ impl Pipeline {
         }
 
         if let Some(prev_ts) = self.bootstrap_timestamp_sec {
-            let preint = self.preintegrate_pending_imu(prev_ts, timestamp_sec);
+            let (preint,imu_samples) = self.preintegrate_pending_imu(prev_ts, timestamp_sec);
             if preint.dt > 0.0 {
-                self.map.add_imu_edge(prev_idx, curr_idx, preint);
+                self.map.add_imu_edge(prev_idx, curr_idx, preint, imu_samples);
             }
         }
 
@@ -458,7 +497,7 @@ impl Pipeline {
         added
     }
 
-    fn preintegrate_pending_imu(&mut self, t0: f64, t1: f64) -> PreintegratedImu {
+    fn preintegrate_pending_imu(&mut self, t0: f64, t1: f64) -> (PreintegratedImu, Vec<ImuMeasurement>) {
         let mut pre = PreintegratedImu::new(self.imu_bias, self.imu_calib);
 
         self.pending_imu
@@ -472,7 +511,7 @@ impl Pipeline {
             .collect();
 
         if samples.is_empty() {
-            return pre;
+            return (pre, samples);
         }
 
         let mut last_t = t0;
@@ -493,7 +532,7 @@ impl Pipeline {
 
         self.pending_imu.retain(|m| m.timestamp > t1);
 
-        pre
+        (pre, samples)
     }
 
     fn inertial_init_ready(&self) -> bool {
@@ -533,144 +572,711 @@ impl Pipeline {
         (last_center - first_center).length() >= self.inertial_init_config.min_motion
     }
 
-    fn try_initialize_imu(&self) -> Option<ImuInitResult> {
-        let Some(start_idx) = self.inertial_init_start_kf_idx else {
-            return None;
-        };
+    fn estimate_gyro_bias(&mut self) -> Vec3F64 {
 
-        let keyframes: Vec<&Keyframe> = self
-            .map
-            .keyframes()
-            .iter()
-            .filter(|kf| kf.frame.idx >= start_idx)
-            .collect();
-        let n = keyframes.len();
-        if n < self.inertial_init_config.min_keyframes {
-            return None;
-        }
-
-        let mut frame_to_local = std::collections::HashMap::new();
-        for (local_idx, kf) in keyframes.iter().enumerate() {
-            frame_to_local.insert(kf.frame.idx, local_idx);
-        }
-
-        let unknowns = 3 * n + 4;
-        let mut rows: Vec<Vec<f64>> = Vec::new();
-        let mut rhs: Vec<f64> = Vec::new();
-
-        let vel_col = |kf_local: usize, axis: usize| -> usize { 3 * kf_local + axis };
-        let gravity_col = |axis: usize| -> usize { 3 * n + axis };
-        let scale_col = 3 * n + 3;
+        let mut sum = Vec3F64::ZERO;
+        let mut total_dt = 0.0;
 
         for edge in self.map.imu_edges() {
-            let Some(&i) = frame_to_local.get(&edge.prev_kf_idx) else {
+
+            let Some(kf_i) =
+                self.map.get_keyframe(edge.prev_kf_idx)
+            else {
                 continue;
             };
-            let Some(&j) = frame_to_local.get(&edge.curr_kf_idx) else {
+
+            let Some(kf_j) =
+                self.map.get_keyframe(edge.curr_kf_idx)
+            else {
                 continue;
             };
 
-            let kf_i = keyframes[i];
-            let kf_j = keyframes[j];
-            let cam_i_world = kf_i.frame.pose_world_to_cam.inverse();
-            let cam_j_world = kf_j.frame.pose_world_to_cam.inverse();
-            let r_i = cam_i_world.rotation;
-            let p_i = cam_i_world.translation;
-            let p_j = cam_j_world.translation;
-            let dt = edge.preintegrated.dt;
-            if dt <= 0.0 {
-                continue;
-            }
+            let cam_i_world =
+                kf_i.frame.pose_world_to_cam.inverse();
 
-            let delta_p_world = r_i * edge.preintegrated.delta_position;
-            let delta_v_world = r_i * edge.preintegrated.delta_velocity;
-            let visual_dp = p_j - p_i;
+            let cam_j_world =
+                kf_j.frame.pose_world_to_cam.inverse();
 
-            for axis in 0..3 {
-                let mut row = vec![0.0; unknowns];
-                row[vel_col(i, axis)] = dt;
-                row[gravity_col(axis)] = 0.5 * dt * dt;
-                row[scale_col] = -vec_axis(visual_dp, axis);
-                rows.push(row);
-                rhs.push(-vec_axis(delta_p_world, axis));
-            }
-
-            for axis in 0..3 {
-                let mut row = vec![0.0; unknowns];
-                row[vel_col(j, axis)] = 1.0;
-                row[vel_col(i, axis)] = -1.0;
-                row[gravity_col(axis)] = -dt;
-                rows.push(row);
-                rhs.push(vec_axis(delta_v_world, axis));
-            }
-        }
-
-        if rows.len() < unknowns {
-            return None;
-        }
-
-        let solution = solve_least_squares(&rows, &rhs)?;
-        let scale = solution[scale_col];
-        if !scale.is_finite() || scale <= 1e-6 {
-            return None;
-        }
-
-        let mut gravity_world = Vec3F64::new(
-            solution[gravity_col(0)],
-            solution[gravity_col(1)],
-            solution[gravity_col(2)],
-        );
-        let gravity_norm = gravity_world.length();
-        if !gravity_norm.is_finite() || gravity_norm < 1e-6 {
-            return None;
-        }
-        gravity_world *= 9.81 / gravity_norm;
-
-        let velocities_world = (0..n)
-            .map(|i| {
+            let t_cb_cols = self.t_cb.to_cols_array();
+            let r_cb = Mat3F64::from_cols(
                 Vec3F64::new(
-                    solution[vel_col(i, 0)],
-                    solution[vel_col(i, 1)],
-                    solution[vel_col(i, 2)],
-                )
-            })
-            .collect();
+                    t_cb_cols[0],
+                    t_cb_cols[1],
+                    t_cb_cols[2],
+                ),
+                Vec3F64::new(
+                    t_cb_cols[4],
+                    t_cb_cols[5],
+                    t_cb_cols[6],
+                ),
+                Vec3F64::new(
+                    t_cb_cols[8],
+                    t_cb_cols[9],
+                    t_cb_cols[10],
+                ),
+            );
 
-        Some(ImuInitResult {
-            scale,
-            gravity_world,
-            velocities_world,
-            bias: self.imu_bias,
-        })
+            let r_i_wb =
+                cam_i_world.rotation * r_cb;
+
+            let r_j_wb =
+                cam_j_world.rotation * r_cb;
+
+            let r_vis =
+                SO3F64::from_matrix(
+                    &(r_i_wb.inverse() * r_j_wb)
+                );
+
+            let r_imu =
+                SO3F64::from_matrix(
+                    &edge.preintegrated.delta_rotation
+                );
+
+            let e = r_imu.rminus(&r_vis);
+
+            sum += e;
+
+            total_dt += edge.preintegrated.dt;
+        }
+
+        if total_dt < 1e-6 {
+            return Vec3F64::ZERO;
+        }
+        // self.imu_bias.gyro = sum / total_dt;
+        sum / total_dt
     }
 
-    fn apply_imu_initialization(&mut self, init: ImuInitResult) {
-        let Some(start_idx) = self.inertial_init_start_kf_idx else {
+    fn reintegrate_all_edges(
+        &mut self,
+        gyro_bias: Vec3F64,
+        accel_bias: Vec3F64,
+    )
+    {
+        for edge in self.map.imu_edges_mut() {
+
+            let bias =
+                ImuBias {
+                    gyro: gyro_bias,
+                    accel: accel_bias,
+                };
+
+            let mut pre =
+                PreintegratedImu::new(
+                    bias,
+                    self.imu_calib,
+                );
+
+            if edge.imu_measurements.is_empty() {
+                continue;
+            }
+
+            let mut last_t =
+                edge.imu_measurements[0].timestamp;
+
+            for m in &edge.imu_measurements {
+
+                let dt =
+                    m.timestamp - last_t;
+
+                if dt > 0.0 {
+                    pre.integrate(m, dt);
+                }
+
+                last_t = m.timestamp;
+            }
+
+            edge.preintegrated = pre;
+        }
+    }
+
+    fn solve_scale_gravity(
+        &self,
+        keyframes: &[&Keyframe],
+    ) -> Option<(f64, Vec3F64)>
+    {
+        if keyframes.len() < 3 {
+            return None;
+        }
+
+        let t_cb_cols = self.t_cb.to_cols_array();
+
+        let p_cb = Vec3F64::new(
+            t_cb_cols[12],
+            t_cb_cols[13],
+            t_cb_cols[14],
+        );
+
+        let r_cb = Mat3F64::from_cols(
+            Vec3F64::new(
+                t_cb_cols[0],
+                t_cb_cols[1],
+                t_cb_cols[2],
+            ),
+            Vec3F64::new(
+                t_cb_cols[4],
+                t_cb_cols[5],
+                t_cb_cols[6],
+            ),
+            Vec3F64::new(
+                t_cb_cols[8],
+                t_cb_cols[9],
+                t_cb_cols[10],
+            ),
+        );
+
+        let mut edge_map = std::collections::HashMap::new();
+        for edge in self.map.imu_edges() {
+            edge_map.insert(
+                (edge.prev_kf_idx, edge.curr_kf_idx),
+                edge,
+            );
+        }
+
+        // Build matrices A and B for A * [s; gx; gy; gz] = B
+        // Following equation (12) and (13) from the paper
+        let mut a_rows: Vec<Vec<f64>> = Vec::new();
+        let mut b_vals: Vec<f64> = Vec::new();
+
+        for i in 0..(keyframes.len() - 2) {
+            let kf1 = keyframes[i];
+            let kf2 = keyframes[i + 1];
+            let kf3 = keyframes[i + 2];
+
+            let edge12 = match edge_map.get(&(kf1.frame.idx, kf2.frame.idx)) {
+                Some(e) => *e,
+                None => continue,
+            };
+
+            let edge23 = match edge_map.get(&(kf2.frame.idx, kf3.frame.idx)) {
+                Some(e) => *e,
+                None => continue,
+            };
+
+            let dt12 = edge12.preintegrated.dt;
+            let dt23 = edge23.preintegrated.dt;
+
+            if dt12 <= 1e-6 || dt23 <= 1e-6 {
+                continue;
+            }
+
+            let t1 = kf1.frame.pose_world_to_cam.inverse();
+            let t2 = kf2.frame.pose_world_to_cam.inverse();
+            let t3 = kf3.frame.pose_world_to_cam.inverse();
+
+            let p1 = t1.translation;  // p_C^1 in world frame (scaled)
+            let p2 = t2.translation;  // p_C^2 in world frame (scaled)
+            let p3 = t3.translation;  // p_C^3 in world frame (scaled)
+
+            let r1_wc = t1.rotation;
+            let r2_wc = t2.rotation;
+            let r3_wc = t3.rotation;
+
+            let r1_wb = r1_wc * r_cb;
+            let r2_wb = r2_wc * r_cb;
+            // let r3_wb = r3_wc * r_cb;
+
+            let dp12 = edge12.preintegrated.delta_position;
+            let dv12 = edge12.preintegrated.delta_velocity;
+            let dp23 = edge23.preintegrated.delta_position;
+
+            // Compute λ(i) from equation (13)
+            let lambda = (p2 - p1) * dt23 - (p3 - p2) * dt12;
+
+            // Compute β(i) from equation (13)
+            let beta = 0.5 * (dt12 * dt12 * dt23 + dt23 * dt23 * dt12);
+
+            // Compute γ(i) from equation (13)
+            let gamma = (r2_wc * p_cb - r1_wc * p_cb) * dt23
+                - (r3_wc * p_cb - r2_wc * p_cb) * dt12
+                + (r2_wb * dp23) * dt12
+                + (r1_wb * dv12) * dt12 * dt23
+                - (r1_wb * dp12) * dt23;
+
+            // Each triple gives 3 equations (x, y, z)
+            // Equation: s * λ + β * g = γ
+            // Rearranged: λ * s + β * gx = γ.x (for x component)
+            // etc.
+            
+            // x equation: λ.x * s + β * gx = γ.x
+            a_rows.push(vec![lambda.x, beta, 0.0, 0.0]);
+            b_vals.push(gamma.x);
+
+            // y equation: λ.y * s + β * gy = γ.y
+            a_rows.push(vec![lambda.y, 0.0, beta, 0.0]);
+            b_vals.push(gamma.y);
+
+            // z equation: λ.z * s + β * gz = γ.z
+            a_rows.push(vec![lambda.z, 0.0, 0.0, beta]);
+            b_vals.push(gamma.z);
+        }
+
+        if a_rows.len() < 4 {
+            println!("[scale_gravity] insufficient equations: {}", a_rows.len());
+            return None;
+        }
+
+        // Solve least squares: A * x = B
+        let solution = solve_least_squares(&a_rows, &b_vals)?;
+        
+        let scale = solution[0];
+        let gravity = Vec3F64::new(solution[1], solution[2], solution[3]);
+        let gravity_norm = gravity.length();
+
+        println!("[scale_gravity] scale={:.6}, gravity=({:.6}, {:.6}, {:.6}), |g|={:.6}", 
+                scale, gravity.x, gravity.y, gravity.z, gravity_norm);
+
+        // The issue: your gravity vector should have magnitude ~9.81
+        // If it doesn't, you need to constrain the solution
+        if gravity_norm < 1e-6 || !gravity_norm.is_finite() {
+            println!("[scale_gravity] invalid gravity magnitude");
+            return None;
+        }
+
+        // Normalize gravity to standard magnitude (optional, but helps)
+        let standard_g = 9.81;
+        let gravity_corrected = gravity * (standard_g / gravity_norm);
+        
+        println!("[scale_gravity] corrected gravity magnitude: {}", gravity_corrected.length());
+
+        Some((scale, gravity_corrected))
+    }
+
+    fn solve_velocities(
+        &self,
+        scale: f64,
+        gravity: &Vec3F64,
+        keyframes: &[&Keyframe],
+    ) -> Option<Vec<Vec3F64>>
+    {
+        let n = keyframes.len();
+
+        if n < 2 {
+            return None;
+        }
+
+        let mut velocities =
+            vec![Vec3F64::ZERO; n];
+
+        let mut edge_map =
+            std::collections::HashMap::new();
+
+        for edge in self.map.imu_edges() {
+            edge_map.insert(
+                (edge.prev_kf_idx, edge.curr_kf_idx),
+                edge,
+            );
+        }
+
+        let t_cb_cols =
+            self.t_cb.to_cols_array();
+
+        let p_cb =
+            Vec3F64::new(
+                t_cb_cols[12],
+                t_cb_cols[13],
+                t_cb_cols[14],
+            );
+
+        let r_cb =
+            Mat3F64::from_cols(
+                Vec3F64::new(
+                    t_cb_cols[0],
+                    t_cb_cols[1],
+                    t_cb_cols[2],
+                ),
+                Vec3F64::new(
+                    t_cb_cols[4],
+                    t_cb_cols[5],
+                    t_cb_cols[6],
+                ),
+                Vec3F64::new(
+                    t_cb_cols[8],
+                    t_cb_cols[9],
+                    t_cb_cols[10],
+                ),
+            );
+
+        for i in 0..(n - 1) {
+
+            let kf_i = keyframes[i];
+            let kf_j = keyframes[i + 1];
+
+            let edge =
+                edge_map.get(
+                    &(kf_i.frame.idx,
+                    kf_j.frame.idx)
+                )?;
+
+            let dt =
+                edge.preintegrated.dt;
+
+            if dt <= 1e-6 {
+                continue;
+            }
+
+            let T_i =
+                kf_i.frame.pose_world_to_cam.inverse();
+
+            let T_j =
+                kf_j.frame.pose_world_to_cam.inverse();
+
+            let p_i =
+                T_i.translation;
+
+            let p_j =
+                T_j.translation;
+
+            let r_wc_i =
+                T_i.rotation;
+
+            let r_wc_j =
+                T_j.rotation;
+
+            let r_wb_i =
+                r_wc_i * r_cb;
+
+            velocities[i] =
+                (
+                    scale * (p_j - p_i)
+
+                    +
+
+                    (r_wc_j * p_cb
+                    -
+                    r_wc_i * p_cb)
+
+                    -
+
+                    *gravity
+                    * (0.5 * dt * dt)
+
+                    -
+
+                    r_wb_i
+                    * edge.preintegrated.delta_position
+
+                ) / dt;
+        }
+
+        //
+        // last velocity
+        //
+        {
+            let i = n - 2;
+
+            let edge =
+                edge_map.get(
+                    &(keyframes[i].frame.idx,
+                    keyframes[i+1].frame.idx)
+                )?;
+
+            let T_i =
+                keyframes[i]
+                .frame
+                .pose_world_to_cam
+                .inverse();
+
+            let r_wb_i =
+                T_i.rotation * r_cb;
+
+            velocities[n - 1] =
+                velocities[n - 2]
+                +
+                *gravity
+                * edge.preintegrated.dt
+                +
+                r_wb_i
+                * edge.preintegrated.delta_velocity;
+        }
+
+        Some(velocities)
+    }
+
+    fn try_initialize_imu(
+        &mut self,
+    ) -> Option<ImuInitResult>
+    {
+        let start_idx =
+            self.inertial_init_start_kf_idx?;
+
+        //
+        // Store ids instead of references.
+        //
+        let keyframe_ids: Vec<usize> =
+            self.map
+                .keyframes()
+                .iter()
+                .filter(|kf| kf.frame.idx >= start_idx)
+                .map(|kf| kf.frame.idx)
+                .collect();
+
+        if keyframe_ids.len()
+            < self.inertial_init_config.min_keyframes
+        {
+            return None;
+        }
+
+        //
+        // 1. Gyro bias
+        //
+        let gyro_bias =
+            self.estimate_gyro_bias();
+
+        println!(
+            "[imu-init] gyro bias {:?}",
+            gyro_bias
+        );
+
+        //
+        // 2. Reintegrate using gyro bias
+        //
+        // self.reintegrate_all_edges(
+        //     Vec3F64::ZERO,
+        //     Vec3F64::ZERO,
+        // );
+
+        //
+        // Reacquire keyframe refs AFTER reintegration.
+        //
+        let keyframes: Vec<&Keyframe> =
+            keyframe_ids
+                .iter()
+                .filter_map(|idx|
+                    self.map.get_keyframe(*idx)
+                )
+                .collect();
+
+        //
+        // 3. Scale + gravity
+        //
+        println!(
+            "[scale_gravity] keyframes={}",
+            keyframes.len()
+        );
+        let (scale, gravity_world) =
+            self.solve_scale_gravity(
+                &keyframes,
+            )?;
+
+        println!(
+            "[imu-init] scale={} gravity={:?} |g|={}",
+            scale,
+            gravity_world,
+            gravity_world.length(),
+        );
+
+        //
+        // 4. Accelerometer bias
+        //
+        // Placeholder until Jacobian-based solve exists.
+        //
+        let accel_bias =
+            Vec3F64::ZERO;
+
+        //
+        // 5. Reintegrate again using both biases.
+        //
+        self.reintegrate_all_edges(
+            gyro_bias,
+            accel_bias,
+        );
+
+        //
+        // Reacquire keyframe refs again because map
+        // was mutably borrowed.
+        //
+        let keyframes: Vec<&Keyframe> =
+            keyframe_ids
+                .iter()
+                .filter_map(|idx|
+                    self.map.get_keyframe(*idx)
+                )
+                .collect();
+
+        //
+        // 6. Velocities
+        //
+        let velocities_world =
+            self.solve_velocities(
+                scale,
+                &gravity_world,
+                &keyframes,
+            )?;
+        
+        println!(
+            "gravity = {:?}, |g|={}",
+            gravity_world,
+            gravity_world.length()
+        );
+
+        Some(
+            ImuInitResult {
+                scale,
+                gravity_world,
+                velocities_world,
+
+                bias: ImuBias {
+                    gyro: gyro_bias,
+                    accel: accel_bias,
+                },
+            }
+        )
+    }
+
+    fn apply_imu_initialization(
+        &mut self,
+        init: ImuInitResult,
+    ) 
+    {
+        let Some(start_idx) =
+            self.inertial_init_start_kf_idx
+        else {
             return;
         };
 
-        self.map.scale_world(init.scale);
-        let mut velocity_iter = init.velocities_world.into_iter();
+        //
+        // 1. scale
+        //
+        self.map.scale_world(
+            init.scale
+        );
+
+        //
+        // 2. compute gravity alignment
+        //
+
+        let g_est =
+    vec3_normalize(
+        &init.gravity_world
+    );
+
+        let g_target =
+            Vec3F64::new(
+                0.0,
+                0.0,
+                -1.0,
+            );
+
+        let axis =
+            vec3_cross(
+                &g_est,
+                &g_target,
+            );
+
+        let dot =
+            vec3_dot(
+                &g_est,
+                &g_target,
+            )
+            .clamp(-1.0, 1.0);
+
+        let angle =
+            dot.acos();
+
+        let axis_norm =
+            axis.length();
+
+        let r_align =
+            if axis_norm > 1e-8 {
+
+                let angle =
+                    g_est
+                        .dot(g_target)
+                        .clamp(-1.0, 1.0)
+                        .acos();
+
+                SO3F64::exp(
+                    axis.normalize()
+                    * angle
+                )
+            }
+            else {
+                // exp(0) == identity
+                SO3F64::exp(Vec3F64::ZERO)
+            };
+
+        //
+        // 3. rotate keyframes
+        //
+        let mut velocity_iter =
+            init.velocities_world.into_iter();
+
         for kf in self
             .map
             .keyframes_mut()
             .iter_mut()
-            .filter(|kf| kf.frame.idx >= start_idx)
+            .filter(|kf|
+                kf.frame.idx >= start_idx
+            )
         {
-            if let Some(velocity) = velocity_iter.next() {
-                kf.velocity_world = velocity;
-                kf.imu_bias = init.bias;
+            let mut T_wc =
+                kf.frame
+                    .pose_world_to_cam
+                    .inverse();
+
+            T_wc.translation =
+                r_align.matrix()
+                * T_wc.translation;
+
+            T_wc.rotation =
+                r_align.matrix()
+                * T_wc.rotation;
+
+            kf.frame.pose_world_to_cam =
+                T_wc.inverse();
+
+            if let Some(v) =
+                velocity_iter.next()
+            {
+                kf.velocity_world =
+                    r_align.matrix() * v;
             }
+
+            kf.imu_bias =
+                init.bias;
         }
 
-        if let Some(last_kf) = self.map.keyframes().iter()
-            .filter(|kf| kf.frame.idx >= start_idx).last()
+        //
+        // 4. rotate map points
+        //
+        for mp in self.map.map_points_mut()
         {
-            self.state.velocity_world = last_kf.velocity_world;
+            mp.position =
+                r_align.matrix()
+                * mp.position;
         }
-        self.state.imu_initialized = true;
-        self.gravity_world = init.gravity_world;
-        self.imu_bias = init.bias;
+
+        //
+        // 5. state velocity
+        //
+        if let Some(last_kf) =
+            self.map
+                .keyframes()
+                .iter()
+                .filter(|kf|
+                    kf.frame.idx >= start_idx
+                )
+                .last()
+        {
+            self.state.velocity_world =
+                last_kf.velocity_world;
+        }
+
+        //
+        // 6. final state
+        //
+        self.state.imu_initialized =
+            true;
+
+        self.gravity_world =
+            Vec3F64::new(
+                0.0,
+                0.0,
+                -9.81,
+            );
+
+        self.imu_bias =
+            init.bias;
     }
 
     fn inertial_init_step(&mut self, frame: Frame, timestamp_sec: f64) -> TrackingResult {
@@ -733,7 +1339,7 @@ impl Pipeline {
         let candidate_pose = if self.state.imu_initialized 
             && prev_timestamp > 0.0 
         {
-            let preint = self.preintegrate_pending_imu(
+            let (preint, imu_measurements) = self.preintegrate_pending_imu(
                 prev_timestamp, 
                 timestamp_sec
             );
@@ -939,10 +1545,10 @@ impl Pipeline {
         self.map.upsert_keyframe(curr_kf);
         if let Some(prev_kf_idx) = self.state.last_keyframe_idx {
             if let Some(prev_ts) = self.last_keyframe_timestamp_sec {
-                let preint = self.preintegrate_pending_imu(prev_ts, timestamp_sec);
+                let (preint, imu_measurements) = self.preintegrate_pending_imu(prev_ts, timestamp_sec);
 
                 if preint.dt > 0.0 {
-                    self.map.add_imu_edge(prev_kf_idx, frame.idx, preint);
+                    self.map.add_imu_edge(prev_kf_idx, frame.idx, preint, imu_measurements);
                 }
             }
         }

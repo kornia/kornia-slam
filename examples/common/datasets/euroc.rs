@@ -3,6 +3,7 @@
 use kornia_3d::camera::PinholeCamera;
 use serde::Deserialize;
 use std::{fs::File, io::BufRead, io::BufReader, path::Path, path::PathBuf};
+use kornia_algebra::Mat4F64;
 
 /// Error type used by dataset readers.
 #[derive(thiserror::Error, Debug)]
