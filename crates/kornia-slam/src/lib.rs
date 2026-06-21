@@ -3,6 +3,7 @@
 pub mod estimation;
 pub mod frame;
 pub mod map;
+pub mod place_recognition;
 pub mod stereo;
 pub mod system;
 pub mod vi_ba_schur;

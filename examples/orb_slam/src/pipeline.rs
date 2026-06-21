@@ -21,6 +21,9 @@ use kornia_slam::estimation::optical_flow::{
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use kornia_slam::estimation::{ImuInitConfig, ImuInitializer, MapProjectionEstimator};
 use kornia_slam::map::{Keyframe, KeyframeJob, LocalMapping, Map, MapPoint, ORB_SCALE_FACTOR};
+use kornia_slam::place_recognition::{
+    Candidate, KeyFrameDatabase, Vocabulary, compute_bow,
+};
 use kornia_slam::stereo::unproject_stereo;
 use kornia_slam::system::{
     KeyframePolicy, SystemMode, SystemState, TrackingLossRecoveryPolicy, TrackingResult,
@@ -83,8 +86,24 @@ pub struct Pipeline {
     local_mapping: LocalMapping,
     klt_tracker: KltTracker,
     track_set: TrackSet,
+    // Place recognition: bag-of-words vocabulary (None disables loop detection)
+    // and the inverted-index keyframe database queried at each keyframe insert.
+    vocabulary: Option<Vocabulary>,
+    kf_database: KeyFrameDatabase,
+    // Loop candidates surfaced since the last drain (query KF → matched KF).
+    loop_candidates: Vec<LoopCandidate>,
     // System state
     state: SystemState,
+}
+
+/// A loop-closure candidate from place recognition: the just-inserted
+/// `query_kf_idx` matched an earlier keyframe by bag-of-words appearance.
+#[derive(Debug, Clone, Copy)]
+pub struct LoopCandidate {
+    /// Frame index of the keyframe that triggered the query.
+    pub query_kf_idx: usize,
+    /// The retrieved earlier keyframe and its similarity score.
+    pub candidate: Candidate,
 }
 
 impl Pipeline {
@@ -136,7 +155,21 @@ impl Pipeline {
             imu_viba2_done: false,
             klt_tracker: KltTracker::default(),
             track_set: TrackSet::new(),
+            vocabulary: None,
+            kf_database: KeyFrameDatabase::new(),
+            loop_candidates: Vec::new(),
         }
+    }
+
+    /// Enables appearance-based loop detection with a bag-of-words vocabulary.
+    /// Without it, keyframes are not indexed and no loop candidates are emitted.
+    pub fn set_vocabulary(&mut self, vocabulary: Vocabulary) {
+        self.vocabulary = Some(vocabulary);
+    }
+
+    /// Drains loop candidates accumulated since the last call.
+    pub fn drain_loop_candidates(&mut self) -> Vec<LoopCandidate> {
+        std::mem::take(&mut self.loop_candidates)
     }
 
     /// Enables the inertial path by providing the camera-to-body extrinsic
@@ -575,10 +608,17 @@ impl Pipeline {
             &triangulated,
         );
 
+        let reference_kf_idx = reference_kf.frame.idx;
+        let current_kf_idx = current_kf.frame.idx;
         self.map.lock().unwrap().upsert_keyframe(reference_kf);
         self.map.lock().unwrap().upsert_keyframe(current_kf);
 
         self.map.lock().unwrap().run_initial_ba(&self.camera);
+
+        // Seed the place-recognition database with the two bootstrap keyframes so
+        // a later revisit of the start can match them.
+        self.register_place_recognition(reference_kf_idx);
+        self.register_place_recognition(current_kf_idx);
 
         added
     }
@@ -1150,6 +1190,10 @@ impl Pipeline {
         // asynchronous mode will deliver it at a later frame boundary.
         self.apply_local_mapping_results();
 
+        // Index this keyframe for appearance-based place recognition and surface
+        // any loop candidates (no-op unless a vocabulary was provided).
+        self.register_place_recognition(frame.idx);
+
         true
     }
 
@@ -1221,6 +1265,63 @@ impl Pipeline {
             self.imu_viba1_done = true;
         } else {
             self.imu_viba2_done = true;
+        }
+    }
+
+    /// Indexes a freshly inserted keyframe for place recognition and queries the
+    /// database for appearance-based loop candidates.
+    ///
+    /// Mirrors ORB-SLAM3's `LoopClosing::DetectLoop`: the acceptance threshold is
+    /// the lowest bag-of-words similarity between this keyframe and its covisible
+    /// neighbours, and the keyframe's own covisibility set is excluded so only a
+    /// genuinely revisited place (not the local neighbourhood) can match. The
+    /// query runs against keyframes already in the database, then this keyframe
+    /// is added so it can never match itself.
+    fn register_place_recognition(&mut self, kf_idx: usize) {
+        let Some(vocabulary) = self.vocabulary.as_ref() else {
+            return;
+        };
+        const MIN_COVIS_WEIGHT: usize = 15;
+        let (bow, neighbors) = {
+            let map = self.map.lock().unwrap();
+            let Some(kf) = map.get_keyframe(kf_idx) else {
+                return;
+            };
+            let bow = compute_bow(vocabulary, &kf.frame.features.descriptors);
+            if bow.0.is_empty() {
+                return;
+            }
+            let neighbors = map.covisible_keyframes(kf_idx, MIN_COVIS_WEIGHT);
+            (bow, neighbors)
+        };
+
+        let mut exclude: HashSet<usize> = HashSet::new();
+        exclude.insert(kf_idx);
+        let mut min_score = 1.0f32;
+        for &(nb_idx, _w) in &neighbors {
+            exclude.insert(nb_idx);
+            if let Some(nb_bow) = self.kf_database.bow(nb_idx) {
+                min_score = min_score.min(bow.l1_similarity(nb_bow));
+            }
+        }
+
+        let candidates = self.kf_database.detect_candidates(&bow, &exclude, min_score);
+        self.kf_database.add(kf_idx, bow);
+
+        if let Some(best) = candidates.first().copied() {
+            self.dbg(format!(
+                "[loop] kf={kf_idx} matched kf={} score={:.3} shared_words={} min_score={min_score:.3} ({} candidates)",
+                best.kf_idx,
+                best.score,
+                best.shared_words,
+                candidates.len()
+            ));
+            for candidate in candidates {
+                self.loop_candidates.push(LoopCandidate {
+                    query_kf_idx: kf_idx,
+                    candidate,
+                });
+            }
         }
     }
 

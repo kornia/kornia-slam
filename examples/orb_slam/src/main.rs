@@ -84,6 +84,11 @@ struct Args {
     /// frames need ~3000 to bootstrap)
     #[argh(option, default = "1000")]
     n_keypoints: usize,
+
+    /// path to a bag-of-words vocabulary (`.bin` from `convert_orbvoc`, or a
+    /// DBoW2 `ORBvoc.txt`) to enable appearance-based loop detection
+    #[argh(option)]
+    vocab: Option<String>,
 }
 
 #[derive(argh::FromArgs)]
@@ -492,6 +497,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..PipelineConfig::default()
     };
     let mut system = Pipeline::new(camera.clone(), pipeline_config);
+    if let Some(vocab_path) = args.vocab.as_deref() {
+        use kornia_slam::place_recognition::{Vocabulary, load_orb_slam3_vocabulary};
+        let vocab = if vocab_path.ends_with(".txt") {
+            load_orb_slam3_vocabulary(vocab_path)
+                .map_err(|e| format!("failed to load text vocabulary {vocab_path}: {e}"))?
+        } else {
+            Vocabulary::load(vocab_path)
+                .map_err(|e| format!("failed to load vocabulary {vocab_path}: {e}"))?
+        };
+        eprintln!("[place-recognition] loaded vocabulary from {vocab_path}");
+        system.set_vocabulary(vocab);
+    }
     if imu_enabled {
         match source.imu_extrinsics() {
             Some(t_bc) => system.set_imu_extrinsics(t_bc),
@@ -530,6 +547,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut trajectory: Vec<[f32; 3]> = Vec::new();
     let mut processed: usize = 0;
     let mut previous_image: Option<Image<u8, 1>> = None;
+    let mut total_loop_candidates: usize = 0;
 
     while let Some(item) = source.next_frame()? {
         let now = Instant::now();
@@ -639,6 +657,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let debug_msgs = system.drain_debug_messages();
         processed += 1;
 
+        // Surface loop-closure candidates from place recognition regardless of
+        // --debug; they are the headline signal of this stage.
+        for lc in system.drain_loop_candidates() {
+            total_loop_candidates += 1;
+            eprintln!(
+                "[loop] kf={} ~ kf={} score={:.3} shared_words={}",
+                lc.query_kf_idx, lc.candidate.kf_idx, lc.candidate.score, lc.candidate.shared_words
+            );
+        }
+
         // Status line.
         if !tui_active {
             for line in &debug_msgs {
@@ -734,6 +762,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
     );
+    eprintln!("Place recognition: {total_loop_candidates} loop candidate(s) detected");
     // ── Trajectory evaluation (EuRoC, --evaluate only) ─────────────────────
     if evaluate {
         evaluation::report(
