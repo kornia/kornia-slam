@@ -21,9 +21,7 @@ use kornia_slam::estimation::optical_flow::{
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use kornia_slam::estimation::{ImuInitConfig, ImuInitializer, MapProjectionEstimator};
 use kornia_slam::map::{Keyframe, KeyframeJob, LocalMapping, Map, MapPoint, ORB_SCALE_FACTOR};
-use kornia_slam::place_recognition::{
-    Candidate, KeyFrameDatabase, Vocabulary, compute_bow,
-};
+use kornia_slam::place_recognition::{Candidate, KeyFrameDatabase, Vocabulary, compute_bow};
 use kornia_slam::stereo::unproject_stereo;
 use kornia_slam::system::{
     KeyframePolicy, SystemMode, SystemState, TrackingLossRecoveryPolicy, TrackingResult,
@@ -91,7 +89,7 @@ pub struct Pipeline {
     vocabulary: Option<Vocabulary>,
     kf_database: KeyFrameDatabase,
     // Loop candidates surfaced since the last drain (query KF → matched KF).
-    loop_candidates: Vec<LoopCandidate>,
+    loop_candidates: Vec<LoopClosureCandidate>,
     // System state
     state: SystemState,
 }
@@ -99,7 +97,7 @@ pub struct Pipeline {
 /// A loop-closure candidate from place recognition: the just-inserted
 /// `query_kf_idx` matched an earlier keyframe by bag-of-words appearance.
 #[derive(Debug, Clone, Copy)]
-pub struct LoopCandidate {
+pub struct LoopClosureCandidate {
     /// Frame index of the keyframe that triggered the query.
     pub query_kf_idx: usize,
     /// The retrieved earlier keyframe and its similarity score.
@@ -168,7 +166,7 @@ impl Pipeline {
     }
 
     /// Drains loop candidates accumulated since the last call.
-    pub fn drain_loop_candidates(&mut self) -> Vec<LoopCandidate> {
+    pub fn drain_loop_candidates(&mut self) -> Vec<LoopClosureCandidate> {
         std::mem::take(&mut self.loop_candidates)
     }
 
@@ -1272,11 +1270,9 @@ impl Pipeline {
     /// database for appearance-based loop candidates.
     ///
     /// Mirrors ORB-SLAM3's `LoopClosing::DetectLoop`: the acceptance threshold is
-    /// the lowest bag-of-words similarity between this keyframe and its covisible
-    /// neighbours, and the keyframe's own covisibility set is excluded so only a
-    /// genuinely revisited place (not the local neighbourhood) can match. The
-    /// query runs against keyframes already in the database, then this keyframe
-    /// is added so it can never match itself.
+    /// the lowest BoW similarity to a covisible neighbour, and the covisibility
+    /// set is excluded so only a revisited place can match. The query runs before
+    /// this keyframe is added, so it never matches itself.
     fn register_place_recognition(&mut self, kf_idx: usize) {
         let Some(vocabulary) = self.vocabulary.as_ref() else {
             return;
@@ -1294,30 +1290,23 @@ impl Pipeline {
             let neighbors = map.covisible_keyframes(kf_idx, MIN_COVIS_WEIGHT);
             (bow, neighbors)
         };
-
-        let mut exclude: HashSet<usize> = HashSet::new();
-        exclude.insert(kf_idx);
-        let mut min_score = 1.0f32;
-        for &(nb_idx, _w) in &neighbors {
-            exclude.insert(nb_idx);
-            if let Some(nb_bow) = self.kf_database.bow(nb_idx) {
-                min_score = min_score.min(bow.l1_similarity(nb_bow));
-            }
-        }
-
-        let candidates = self.kf_database.detect_candidates(&bow, &exclude, min_score);
+        let candidates = self.kf_database.detect_loop_candidates(
+            kf_idx,
+            &bow,
+            neighbors.iter().map(|&(nb_idx, _w)| nb_idx),
+        );
         self.kf_database.add(kf_idx, bow);
 
         if let Some(best) = candidates.first().copied() {
             self.dbg(format!(
-                "[loop] kf={kf_idx} matched kf={} score={:.3} shared_words={} min_score={min_score:.3} ({} candidates)",
+                "[loop] kf={kf_idx} matched kf={} score={:.3} shared_words={} ({} candidates)",
                 best.kf_idx,
                 best.score,
                 best.shared_words,
                 candidates.len()
             ));
             for candidate in candidates {
-                self.loop_candidates.push(LoopCandidate {
+                self.loop_candidates.push(LoopClosureCandidate {
                     query_kf_idx: kf_idx,
                     candidate,
                 });

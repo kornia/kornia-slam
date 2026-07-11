@@ -9,9 +9,8 @@
 //! candidates are scored by [`BoW::l1_similarity`] exactly as DBoW2 does.
 //!
 //! Covisibility-group score accumulation (ORB-SLAM3's second pass over each
-//! candidate's best-covisible neighbours) is left to the loop-closing layer,
-//! which has the map's covisibility graph at hand; this database returns the
-//! per-keyframe shared-word-filtered, L1-scored candidates that feed it.
+//! candidate's neighbours) is left to the loop-closing layer; this database
+//! returns the per-keyframe shared-word-filtered, L1-scored candidates.
 
 use std::collections::{HashMap, HashSet};
 
@@ -105,20 +104,13 @@ impl KeyFrameDatabase {
         self.bows.get(&kf_idx)
     }
 
-    /// Retrieves place-recognition candidates for a query BoW.
+    /// Retrieves place-recognition candidates for a query BoW, sorted by
+    /// descending score. `exclude` skips the query's own neighbours; only
+    /// keyframes scoring at least `min_score` are returned.
     ///
     /// Mirrors the first phase of ORB-SLAM3's `DetectLoopCandidates` /
-    /// `DetectRelocalizationCandidates`:
-    /// 1. gather keyframes sharing at least one word with the query (via the
-    ///    inverted index), skipping any in `exclude` (the query's own
-    ///    covisible/temporal neighbours);
-    /// 2. keep only those whose shared-word count exceeds
-    ///    `0.8 × max_shared_words` (the most discriminative matches);
-    /// 3. score the survivors by L1 BoW similarity and drop scores below
-    ///    `min_score`.
-    ///
-    /// Results are sorted by descending score. Covisibility-group accumulation
-    /// is the caller's responsibility.
+    /// `DetectRelocalizationCandidates`; covisibility-group accumulation is the
+    /// caller's responsibility.
     pub fn detect_candidates(
         &self,
         query: &BoW,
@@ -167,6 +159,28 @@ impl KeyFrameDatabase {
         });
         candidates
     }
+
+    /// ORB-SLAM3 `LoopClosing::DetectLoop` retrieval: excludes the query
+    /// keyframe and its covisible neighbours, and uses the lowest BoW
+    /// similarity to those neighbours as the score floor, so only a genuine
+    /// revisit (not the local neighbourhood) can match.
+    pub fn detect_loop_candidates(
+        &self,
+        query_kf_idx: usize,
+        query: &BoW,
+        covisible: impl IntoIterator<Item = usize>,
+    ) -> Vec<Candidate> {
+        let mut exclude = HashSet::new();
+        exclude.insert(query_kf_idx);
+        let mut min_score = 1.0f32;
+        for nb in covisible {
+            exclude.insert(nb);
+            if let Some(nb_bow) = self.bow(nb) {
+                min_score = min_score.min(query.l1_similarity(nb_bow));
+            }
+        }
+        self.detect_candidates(query, &exclude, min_score)
+    }
 }
 
 #[cfg(test)]
@@ -211,6 +225,20 @@ mod tests {
 
         let exclude: HashSet<usize> = [1].into_iter().collect();
         assert!(db.detect_candidates(&query, &exclude, 0.0).is_empty());
+    }
+
+    #[test]
+    fn detect_loop_excludes_query_and_neighbours() {
+        let mut db = KeyFrameDatabase::new();
+        db.add(1, bow(&[(10, 0.5), (20, 0.5)])); // covisible neighbour of the query
+        db.add(2, bow(&[(10, 0.5), (20, 0.5)])); // a genuine revisit
+
+        let query = bow(&[(10, 0.5), (20, 0.5)]);
+        // kf 3 is the query; kf 1 is its covisible neighbour → both excluded.
+        let cands = db.detect_loop_candidates(3, &query, [1]);
+
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].kf_idx, 2);
     }
 
     #[test]
