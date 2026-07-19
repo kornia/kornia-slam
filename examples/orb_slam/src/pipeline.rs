@@ -4,6 +4,8 @@
 //! to bottom in the same order frames move through the system.
 
 use std::collections::HashSet;
+use std::io::Write as _;
+use std::path::PathBuf;
 
 use crate::config::PipelineConfig;
 use kornia_3d::camera::PinholeCamera;
@@ -14,7 +16,7 @@ use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descr
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_slam::Frame;
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
-use kornia_slam::estimation::{ImuInitConfig, ImuInitializer, MapProjectionEstimator};
+use kornia_slam::estimation::{ImuInitConfig, ImuInitResult, ImuInitializer, MapProjectionEstimator};
 use kornia_slam::map::{Keyframe, Map, MapPoint, ORB_SCALE_FACTOR};
 use kornia_slam::stereo::unproject_stereo;
 use kornia_slam::system::{
@@ -76,6 +78,12 @@ pub struct Pipeline {
     imu_viba1_done: bool,
     imu_viba2_done: bool,
 
+    // Optional CSV sink for VIBA telemetry. When the env var `KORNIA_VIBA_CSV`
+    // is set, every VIBA0/VIBA1/VIBA2 attempt (accepted or rejected) appends one
+    // row with the full solved state vector + scheduling meta, for offline
+    // plotting and ORB-SLAM3 comparison. `None` in normal runs — zero overhead.
+    viba_csv_path: Option<PathBuf>,
+
     // System state
     state: SystemState,
 }
@@ -122,6 +130,87 @@ impl Pipeline {
             imu_init_window_start_sec: None,
             imu_viba1_done: false,
             imu_viba2_done: false,
+            viba_csv_path: Self::init_viba_csv(),
+        }
+    }
+
+    /// If `KORNIA_VIBA_CSV` is set, (re)create the file with a header row and
+    /// return its path; otherwise `None`. One row per VIBA attempt is appended
+    /// later by `log_viba`.
+    fn init_viba_csv() -> Option<PathBuf> {
+        let path = PathBuf::from(std::env::var_os("KORNIA_VIBA_CSV")?);
+        match std::fs::File::create(&path) {
+            Ok(mut f) => {
+                let _ = writeln!(
+                    f,
+                    "stage,t_sec,mtinit,n_kf,imu_time,prior_g,prior_a,accepted,\
+                     scale,g_x,g_y,g_z,g_mag,bg_x,bg_y,bg_z,ba_x,ba_y,ba_z"
+                );
+                eprintln!("[viba_csv] logging VIBA telemetry to {}", path.display());
+                Some(path)
+            }
+            Err(e) => {
+                eprintln!("[viba_csv] could not open {}: {e}", path.display());
+                None
+            }
+        }
+    }
+
+    /// Append one row of VIBA telemetry. `result` is `Some` for an accepted
+    /// solve, `None` for a rejected one (state columns written as NaN). Meta
+    /// (mtinit / n_kf / imu_time) is recomputed from the current window so the
+    /// row is self-describing regardless of which VIBA stage fired.
+    fn log_viba(
+        &self,
+        stage: &str,
+        timestamp_sec: f64,
+        prior_g: f64,
+        prior_a: f64,
+        result: Option<&ImuInitResult>,
+    ) {
+        let Some(path) = &self.viba_csv_path else {
+            return;
+        };
+        let Some(start_idx) = self.inertial_init_start_kf_idx else {
+            return;
+        };
+        let mtinit = self
+            .imu_init_window_start_sec
+            .map(|w| timestamp_sec - w)
+            .unwrap_or(f64::NAN);
+        let n_kf = self
+            .map
+            .keyframes()
+            .iter()
+            .filter(|kf| kf.frame.idx >= start_idx)
+            .count();
+        let imu_time: f64 = self
+            .map
+            .imu_factors()
+            .iter()
+            .filter(|f| f.curr_kf_idx >= start_idx)
+            .map(|f| f.preintegrated.dt)
+            .sum();
+        let row = match result {
+            Some(r) => {
+                let g = r.gravity_world;
+                let bg = r.bias.gyro;
+                let ba = r.bias.accel;
+                format!(
+                    "{stage},{timestamp_sec:.6},{mtinit:.4},{n_kf},{imu_time:.4},\
+                     {prior_g:e},{prior_a:e},1,{:.6},{:.6},{:.6},{:.6},{:.6},\
+                     {:.8},{:.8},{:.8},{:.8},{:.8},{:.8}",
+                    r.scale, g.x, g.y, g.z, g.length(),
+                    bg.x, bg.y, bg.z, ba.x, ba.y, ba.z,
+                )
+            }
+            None => format!(
+                "{stage},{timestamp_sec:.6},{mtinit:.4},{n_kf},{imu_time:.4},\
+                 {prior_g:e},{prior_a:e},0,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan"
+            ),
+        };
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
+            let _ = writeln!(f, "{row}");
         }
     }
 
@@ -668,6 +757,7 @@ impl Pipeline {
                     let scale = init.scale;
                     let gravity = init.gravity_world;
                     let bg = init.bias.gyro;
+                    self.log_viba("VIBA0", timestamp_sec, 1e2, prior_a0, Some(&init));
                     self.inertial_init.apply_initialization(
                         &mut self.map,
                         &mut self.state,
@@ -690,6 +780,7 @@ impl Pipeline {
                     ));
                 }
                 None => {
+                    self.log_viba("VIBA0", timestamp_sec, 1e2, prior_a0, None);
                     self.dbg("[imu_init] VIBA0 rejected: solve failed or invalid scale".into());
                 }
             }
@@ -1040,7 +1131,21 @@ impl Pipeline {
         let (prior_g, prior_a, stage) = if !self.imu_viba1_done && mtinit > 5.0 {
             (1.0, 1e5, "VIBA1")
         } else if self.imu_viba1_done && !self.imu_viba2_done && mtinit > 15.0 {
-            (0.0, 0.0, "VIBA2")
+            // Experiment (exp1): VIBA2's `priorA=0` (no accel-bias regularizer)
+            // lets kornia's accel bias run away — unlike ORB-SLAM3, which
+            // re-solves on a FullInertialBA-conditioned map. Allow A/B via env:
+            //   KORNIA_VIBA2=off            → skip VIBA2 entirely (keep VIBA1)
+            //   KORNIA_VIBA2_PRIOR_A=<f64>  → override the accel-bias prior
+            // Default (both unset) reproduces ORB's (0, 0) schedule.
+            if std::env::var("KORNIA_VIBA2").as_deref() == Ok("off") {
+                self.imu_viba2_done = true;
+                return;
+            }
+            let prior_a = std::env::var("KORNIA_VIBA2_PRIOR_A")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            (0.0, prior_a, "VIBA2")
         } else {
             return;
         };
@@ -1057,6 +1162,7 @@ impl Pipeline {
             Some(init) => {
                 let scale = init.scale;
                 let bg = init.bias.gyro;
+                self.log_viba(stage, timestamp_sec, prior_g, prior_a, Some(&init));
                 self.inertial_init.apply_initialization(
                     &mut self.map,
                     &mut self.state,
@@ -1071,6 +1177,7 @@ impl Pipeline {
                 ));
             }
             None => {
+                self.log_viba(stage, timestamp_sec, prior_g, prior_a, None);
                 self.dbg(format!(
                     "[imu_init] {stage} rejected: solve failed or invalid scale"
                 ));
