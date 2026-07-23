@@ -5996,6 +5996,7 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 [[package]]
 name = "kornia-3d"
 version = "0.1.15-rc.5"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#f8b45b84bc308e039b98a448e90ea22ad9ee08a1"
 dependencies = [
  "bincode 2.0.1",
  "faer 0.24.4",
@@ -6014,6 +6015,7 @@ dependencies = [
 [[package]]
 name = "kornia-algebra"
 version = "0.1.15-rc.5"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#f8b45b84bc308e039b98a448e90ea22ad9ee08a1"
 dependencies = [
  "glam 0.33.2",
  "nalgebra 0.35.0",
@@ -6022,8 +6024,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kornia-bow"
+version = "0.1.15-rc.5"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#f8b45b84bc308e039b98a448e90ea22ad9ee08a1"
+dependencies = [
+ "bincode 2.0.1",
+ "rand 0.10.2",
+ "rayon",
+ "serde",
+ "serde-big-array",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "kornia-image"
 version = "0.1.15-rc.5"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#f8b45b84bc308e039b98a448e90ea22ad9ee08a1"
 dependencies = [
  "kornia-tensor",
  "num-traits",
@@ -6034,6 +6050,7 @@ dependencies = [
 [[package]]
 name = "kornia-imgproc"
 version = "0.1.15-rc.5"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#f8b45b84bc308e039b98a448e90ea22ad9ee08a1"
 dependencies = [
  "kornia-algebra",
  "kornia-image",
@@ -6047,6 +6064,7 @@ dependencies = [
 [[package]]
 name = "kornia-io"
 version = "0.1.15-rc.5"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#f8b45b84bc308e039b98a448e90ea22ad9ee08a1"
 dependencies = [
  "image-webp",
  "jpeg-encoder",
@@ -6075,6 +6093,7 @@ dependencies = [
  "faer 0.22.6",
  "kornia-3d",
  "kornia-algebra",
+ "kornia-bow",
  "kornia-image",
  "kornia-imgproc",
  "kornia-sensors",
@@ -6084,6 +6103,7 @@ dependencies = [
 [[package]]
 name = "kornia-tensor"
 version = "0.1.15-rc.5"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#f8b45b84bc308e039b98a448e90ea22ad9ee08a1"
 dependencies = [
  "num-traits",
  "rayon",
@@ -11730,6 +11750,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-big-array"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11fc7cc2c76d73e0f27ee52abbd64eec84d46f370c88371120433196934e4b7f"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "serde-wasm-bindgen"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14873,7 +14902,3 @@ dependencies = [
  "syn 2.0.119",
  "winnow",
 ]
-
-[[patch.unused]]
-name = "kornia-bow"
-version = "0.1.15-rc.5"
