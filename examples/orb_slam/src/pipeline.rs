@@ -1019,6 +1019,10 @@ impl Pipeline {
         true
     }
 
+    /// Kept at VIBA2 because this pipeline lacks the intervening pose-adjusting
+    /// inertial BA that lets ORB-SLAM3 safely remove the prior (kornia-slam#51).
+    const VIBA_PRIOR_A: f64 = 1e5;
+
     /// VIBA1 (mTinit>5s) / VIBA2 (mTinit>15s): progressive re-solves with
     /// relaxed priors over the same (now-growing) window that VIBA0 used,
     /// mirroring LocalMapping.cc:200-228. Each fires at most once and refines
@@ -1038,9 +1042,9 @@ impl Pipeline {
         }
 
         let (prior_g, prior_a, stage) = if !self.imu_viba1_done && mtinit > 5.0 {
-            (1.0, 1e5, "VIBA1")
+            (1.0, Self::VIBA_PRIOR_A, "VIBA1")
         } else if self.imu_viba1_done && !self.imu_viba2_done && mtinit > 15.0 {
-            (0.0, 0.0, "VIBA2")
+            (0.0, Self::VIBA_PRIOR_A, "VIBA2")
         } else {
             return;
         };
