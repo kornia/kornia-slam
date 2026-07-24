@@ -416,6 +416,26 @@ impl ImuInitializer {
             println!("[imu_init] rejected: non-finite bias");
             return None;
         }
+        // Physical plausibility floor on the accel bias. ORB-SLAM3 has no such
+        // gate (see the note above about the |bg|>0.05 gate that broke real-data
+        // init) — this one is deliberately far looser than any calibrated MEMS
+        // accelerometer's bias, so it cannot reject a solution a healthy solve
+        // would produce. It exists only to stop a genuinely diverged refinement
+        // from being applied to the map: the failure mode in kornia-slam#51
+        // reached 0.57 and 0.94 m/s^2 on the gravity-aligned axis, against
+        // EuRoC's true |ba| of ~0.16. Rejecting leaves the previous stage's
+        // bias in place, which is the safe fallback.
+        const MAX_PLAUSIBLE_ACCEL_BIAS: f64 = 1.0; // m/s^2, ~10% of gravity
+        if ba_out.length() > MAX_PLAUSIBLE_ACCEL_BIAS {
+            println!(
+                "[imu_init] rejected: implausible accel bias |ba|={:.3} > {MAX_PLAUSIBLE_ACCEL_BIAS} m/s^2 ({:.3},{:.3},{:.3})",
+                ba_out.length(),
+                ba_out.x,
+                ba_out.y,
+                ba_out.z,
+            );
+            return None;
+        }
         // Reconstruct the PHYSICAL gravity vector using the *same* gI the factor
         // used internally — do not reuse rwg_out assuming any other convention.
         let gravity_world = rwg_out * Vec3F64::new(0.0, 0.0, -GRAVITY_MAGNITUDE);
@@ -516,6 +536,14 @@ mod tests {
 
     const RADIUS: f64 = 2.0;
     const OMEGA: f64 = 0.5;
+    /// Yaw rate for the weak-excitation regime the accel-bias blowup lives in:
+    /// ~66 deg of body rotation over the 5.8 s window, against OMEGA's 166 deg.
+    /// Only body rotation separates a body-fixed accel bias from world-fixed
+    /// gravity, so this is the knob that sets how observable `ba` is. Measured
+    /// on the map built below: at OMEGA the bias is recovered with or without
+    /// the prior; here it is recovered only with it; below ~33 deg the window is
+    /// too degenerate for either to hold.
+    const WEAK_YAW_RATE: f64 = 0.2;
 
     /// True trajectory: circular translation *plus* the body yawing in sync
     /// with it (like a vehicle banking into the turn) — needed so `R_wb(t)`
@@ -525,15 +553,15 @@ mod tests {
     /// bias stays observable either way since it only needs rotation-only
     /// consistency, which is why `bg` recovered correctly even with the
     /// bug below.
-    fn circular_trajectory(t: f64) -> (Vec3F64, Vec3F64, Vec3F64, Mat3F64) {
-        let theta = OMEGA * t;
+    fn circular_trajectory(t: f64, omega: f64) -> (Vec3F64, Vec3F64, Vec3F64, Mat3F64) {
+        let theta = omega * t;
         let (s, c) = theta.sin_cos();
         let p = Vec3F64::new(RADIUS * c, 0.0, RADIUS * s);
-        let v = Vec3F64::new(-RADIUS * OMEGA * s, 0.0, RADIUS * OMEGA * c);
+        let v = Vec3F64::new(-RADIUS * omega * s, 0.0, RADIUS * omega * c);
         let a = Vec3F64::new(
-            -RADIUS * OMEGA * OMEGA * c,
+            -RADIUS * omega * omega * c,
             0.0,
-            -RADIUS * OMEGA * OMEGA * s,
+            -RADIUS * omega * omega * s,
         );
         // Rotation about the (world) Y axis by theta — angular velocity is
         // exactly (0, OMEGA, 0) in both body and world frame since Y is a
@@ -585,10 +613,12 @@ mod tests {
     /// so it integrates the biased signal uncorrected, exactly like a real
     /// biased sensor (`PreintegratedImu::integrate` subtracts `self.bias`,
     /// which is zero here — see `imu.rs:140-143`).
+    #[allow(clippy::too_many_arguments)]
     fn integrate_true_imu(
         t0: f64,
         t1: f64,
         imu_rate_hz: f64,
+        omega: f64,
         gravity_true: Vec3F64,
         bias_gyro_true: Vec3F64,
         bias_accel_true: Vec3F64,
@@ -598,8 +628,8 @@ mod tests {
         let dt = 1.0 / imu_rate_hz;
         let mut t = t0;
         while t < t1 - 1e-9 {
-            let (_, _, a_true, r_wb_true) = circular_trajectory(t + 0.5 * dt);
-            let gyro_meas = Vec3F64::new(0.0, OMEGA, 0.0) + bias_gyro_true; // true body-frame ω + bias
+            let (_, _, a_true, r_wb_true) = circular_trajectory(t + 0.5 * dt, omega);
+            let gyro_meas = Vec3F64::new(0.0, omega, 0.0) + bias_gyro_true; // true body-frame ω + bias
             let accel_meas = r_wb_true.transpose() * (a_true - gravity_true) + bias_accel_true; // specific force in body frame + bias
             pim.integrate(
                 &ImuMeasurement {
@@ -612,6 +642,234 @@ mod tests {
             t += dt;
         }
         pim
+    }
+
+    /// Builds the synthetic circular-trajectory map at an arbitrary vision-map
+    /// scale `s_true` (see `recovers_scale_bias_gravity_from_synthetic_trajectory`
+    /// for the geometry).
+    fn synth_map(s_true: f64, r_arb: Mat3F64) -> Map {
+        synth_map_with_calib(
+            s_true,
+            r_arb,
+            ImuCalib {
+                gyro_noise: 1e-3,
+                accel_noise: 1e-2,
+                gyro_bias_noise: 1e-5,
+                accel_bias_noise: 1e-4,
+            },
+            OMEGA,
+        )
+    }
+
+    /// `omega` is the body yaw rate: it sets how much the body frame rotates
+    /// across the window, which is *the* thing that makes the accel bias
+    /// observable at all (gravity is world-fixed, bias is body-fixed, so only
+    /// rotation separates them).
+    fn synth_map_with_calib(s_true: f64, r_arb: Mat3F64, calib: ImuCalib, omega: f64) -> Map {
+        let bias_gyro_true = Vec3F64::new(0.01, -0.02, 0.005);
+        let bias_accel_true = Vec3F64::new(0.05, -0.03, 0.02);
+        let gravity_true = Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0);
+        let n_keyframes = 30;
+        let kf_dt = 0.2;
+        let imu_rate = 200.0;
+
+        let mut map = Map::new();
+        for k in 0..n_keyframes {
+            let t = k as f64 * kf_dt;
+            let (p_true, _, _, r_wb_true) = circular_trajectory(t, omega);
+            let pose = synth_pose_world_to_cam(r_arb, s_true, p_true, r_wb_true);
+            map.upsert_keyframe(Keyframe::from_frame(synth_frame(k, pose)));
+            if k > 0 {
+                let pim = integrate_true_imu(
+                    t - kf_dt,
+                    t,
+                    imu_rate,
+                    omega,
+                    gravity_true,
+                    bias_gyro_true,
+                    bias_accel_true,
+                    calib,
+                );
+                map.add_imu_factor(k - 1, k, pim, Vec::new(), t - kf_dt, t);
+            }
+        }
+        map
+    }
+
+    /// The VIBA0 residual is *exactly* invariant under `t -> k·t`, `v -> k·v`,
+    /// `s -> s/k`: gravity, both biases and the preintegrated deltas are
+    /// untouched by a rescaling of the visual map, and the velocities that
+    /// absorb it are free variables. So `s_recovered · s_true` must be the
+    /// same constant for every `s_true` — whatever bias the pinned accel prior
+    /// introduces, it introduces identically at every map size.
+    ///
+    /// A drift in that product is not a modelling error, it is the solver
+    /// failing to reach the optimum, which is what makes the estimated scale
+    /// stop tracking map size on real data (kornia/kornia-slam#51).
+    #[test]
+    fn viba0_scale_is_invariant_to_vision_map_scale() {
+        let r_arb = SO3F64::exp(Vec3F64::new(0.3, -0.5, 0.2)).matrix();
+        let initializer = ImuInitializer::new(ImuInitConfig {
+            min_keyframes: 10,
+            min_time_sec: 1.0,
+            min_motion: 0.1,
+        });
+
+        let mut products = Vec::new();
+        for s_true in [0.25, 0.5, 1.0, 2.0, 4.0] {
+            let map = synth_map(s_true, r_arb);
+            let init = initializer
+                .try_initialize(
+                    &map,
+                    Some(Pose3d::IDENTITY),
+                    ImuBias::default(),
+                    0,
+                    1e2,
+                    1e10,
+                    false,
+                )
+                .expect("VIBA0 should solve on clean synthetic data at any map scale");
+            println!(
+                "[scale-invariance] s_true={s_true:<5} s_recovered={:<10.5} product={:.5}",
+                init.scale,
+                init.scale * s_true
+            );
+            products.push(init.scale * s_true);
+        }
+
+        let mean = products.iter().sum::<f64>() / products.len() as f64;
+        let max_rel_dev = products
+            .iter()
+            .map(|p| (p - mean).abs() / mean)
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_rel_dev < 0.02,
+            "VIBA0 scale does not track map size: products {products:?} (mean {mean:.5}, \
+             max deviation {:.1}%)",
+            max_rel_dev * 100.0,
+        );
+    }
+
+    /// Regression test for the accel-bias blowup of kornia-slam#51.
+    ///
+    /// The VIBA refinement solves hold the visual keyframe poses *fixed*, so any
+    /// disagreement between those poses and the preintegrated IMU has to be
+    /// absorbed by the free variables. With EuRoC's tight noise densities even
+    /// millimetre-level pose error is tens of sigma, and the softest direction
+    /// available is the accel bias along gravity — degenerate with gravity
+    /// magnitude (pinned at 9.81) traded against map scale. Drop the accel-bias
+    /// prior, as ORB-SLAM3 does at VIBA2, and that direction runs away.
+    ///
+    /// ORB-SLAM3 can afford `priorA=0` because it runs a `FullInertialBA` between
+    /// stages, which moves the poses into agreement with the IMU first. We do
+    /// not, so we keep the prior (see `Pipeline::VIBA_PRIOR_A`). This test pins
+    /// both halves of that reasoning: the prior keeps the bias physical, and
+    /// removing it does not.
+    #[test]
+    fn viba2_accel_bias_stays_bounded_under_pose_inconsistency() {
+        let r_arb = SO3F64::exp(Vec3F64::new(0.3, -0.5, 0.2)).matrix();
+        let bias_accel_true = Vec3F64::new(0.05, -0.03, 0.02);
+        // Real EuRoC IMU noise densities — the information magnitude is what
+        // turns small pose error into a huge whitened residual.
+        let euroc_calib = ImuCalib {
+            gyro_noise: 1.6968e-4,
+            accel_noise: 2.0e-3,
+            gyro_bias_noise: 1.9393e-5,
+            accel_bias_noise: 3.0e-3,
+        };
+        let initializer = ImuInitializer::new(ImuInitConfig {
+            min_keyframes: 10,
+            min_time_sec: 1.0,
+            min_motion: 0.1,
+        });
+
+        // Deterministic, zero-mean-ish millimetre pose perturbation standing in
+        // for a real front-end's keyframe noise (a real map's disagreement with
+        // the IMU is of this order: MH_01 sits at ~40 sigma per residual).
+        let mut map = synth_map_with_calib(0.5, r_arb, euroc_calib, WEAK_YAW_RATE);
+        for (k, kf) in map.keyframes_mut().iter_mut().enumerate() {
+            let f = k as f64;
+            let jitter = Vec3F64::new(
+                (3.7 * f).sin(),
+                (5.1 * f + 1.3).sin(),
+                (2.3 * f + 0.7).sin(),
+            ) * 2e-3;
+            let cam_to_world = kf.frame.pose_world_to_cam.inverse();
+            kf.frame.pose_world_to_cam =
+                Pose3d::new(cam_to_world.rotation, cam_to_world.translation + jitter).inverse();
+        }
+
+        // VIBA0 is unaffected by the choice below: it pins the accel bias with
+        // prior_a=1e10 either way.
+        let viba0 = initializer
+            .try_initialize(
+                &map,
+                Some(Pose3d::IDENTITY),
+                ImuBias::default(),
+                0,
+                1e2,
+                1e10,
+                false,
+            )
+            .expect("VIBA0 should solve");
+        let mut state = SystemState::new();
+        let mut bias = ImuBias::default();
+        let mut gravity_world = Vec3F64::ZERO;
+        initializer.apply_initialization(
+            &mut map,
+            &mut state,
+            &mut bias,
+            &mut gravity_world,
+            viba0,
+            0,
+        );
+
+        let solve_viba2 = |prior_a: f64| -> Vec3F64 {
+            initializer
+                .try_initialize(
+                    &map.clone(),
+                    Some(Pose3d::IDENTITY),
+                    bias,
+                    0,
+                    0.0,
+                    prior_a,
+                    true,
+                )
+                .map(|init| init.bias.accel)
+                // A diverged solve can now also be rejected outright by the
+                // plausibility gate in `try_initialize`; report that as the
+                // gate's own threshold so the comparison below still holds.
+                .unwrap_or(Vec3F64::new(0.0, 1.0, 0.0))
+        };
+
+        let ba_with_prior = solve_viba2(1e5);
+        let ba_no_prior = solve_viba2(0.0);
+        let err_with_prior = (ba_with_prior - bias_accel_true).length();
+        let err_no_prior = (ba_no_prior - bias_accel_true).length();
+        println!(
+            "[viba2] prior_a=1e5 ba=({:+.4},{:+.4},{:+.4}) err={err_with_prior:.4}\n\
+             [viba2] prior_a=0   ba=({:+.4},{:+.4},{:+.4}) err={err_no_prior:.4}",
+            ba_with_prior.x,
+            ba_with_prior.y,
+            ba_with_prior.z,
+            ba_no_prior.x,
+            ba_no_prior.y,
+            ba_no_prior.z,
+        );
+
+        assert!(
+            err_with_prior < 0.1,
+            "accel bias should stay near truth with the prior retained: \
+             got {ba_with_prior:?}, want ~{bias_accel_true:?}"
+        );
+        assert!(
+            err_no_prior > err_with_prior,
+            "dropping the accel-bias prior is what lets the bias run away; if this \
+             ever stops holding, the poses have become IMU-consistent (e.g. a \
+             FullInertialBA equivalent landed) and `VIBA_PRIOR_A` can be revisited. \
+             with prior: {ba_with_prior:?} ({err_with_prior:.4}), \
+             without: {ba_no_prior:?} ({err_no_prior:.4})"
+        );
     }
 
     #[test]
@@ -636,7 +894,7 @@ mod tests {
         let mut map = Map::new();
         for k in 0..n_keyframes {
             let t = k as f64 * kf_dt;
-            let (p_true, _, _, r_wb_true) = circular_trajectory(t);
+            let (p_true, _, _, r_wb_true) = circular_trajectory(t, OMEGA);
             let pose = synth_pose_world_to_cam(r_arb, s_true, p_true, r_wb_true);
             map.upsert_keyframe(Keyframe::from_frame(synth_frame(k, pose)));
 
@@ -645,6 +903,7 @@ mod tests {
                     t - kf_dt,
                     t,
                     imu_rate,
+                    OMEGA,
                     gravity_true,
                     bias_gyro_true,
                     bias_accel_true,
@@ -751,7 +1010,7 @@ mod tests {
         // `result.velocities_world` here).
         for k in 0..n_keyframes {
             let t = k as f64 * kf_dt;
-            let (_, v_true, _, _) = circular_trajectory(t);
+            let (_, v_true, _, _) = circular_trajectory(t, OMEGA);
             let expected_v = rwg_viba0 * ((r_arb * v_true) * s_true * viba0_scale);
             let err = (result.velocities_world[k] - expected_v).length();
             assert!(
