@@ -1,5 +1,5 @@
-//! EuRoC trajectory evaluation: ground-truth association, Sim3 alignment,
-//! ATE/RPE/drift metrics, and CSV reporting.
+//! EuRoC trajectory evaluation: ground-truth association, SE3 (rigid,
+//! no-scale) alignment, ATE/RPE/drift metrics, and CSV reporting.
 
 use std::io::Write;
 use std::path::Path;
@@ -21,17 +21,20 @@ pub fn associate_gt(t: f64, gt: &[GroundTruthPose]) -> Option<&GroundTruthPose> 
     })
 }
 
-// ── Sim3 alignment ───────────────────────────────────────────────────────
+// ── SE3 (rigid) alignment ────────────────────────────────────────────────
 
-pub struct Sim3Alignment {
-    pub scale: f64,
+pub struct Se3Alignment {
     pub rotation: Mat3F64,
     pub translation: Vec3F64,
 }
 
-/// Umeyama Sim3 fit mapping `est` onto `gt` (least-squares scale, rotation,
-/// translation).
-pub fn align_sim3(est: &[Vec3F64], gt: &[Vec3F64]) -> Sim3Alignment {
+/// Umeyama fit mapping `est` onto `gt`, rotation and translation only — scale
+/// fixed at 1.0. Deliberately does *not* correct for a scale mismatch: this
+/// pipeline is a metric visual-inertial system, so a scale error here is a
+/// real error in IMU-based scale recovery, not an alignment artifact to
+/// factor out. Sim3 (scale-correcting) alignment would hide that error by
+/// absorbing it into the fitted scale before ATE/RPE are computed.
+pub fn align_se3(est: &[Vec3F64], gt: &[Vec3F64]) -> Se3Alignment {
     let n = est.len() as f64;
 
     // Centroids.
@@ -44,21 +47,17 @@ pub fn align_sim3(est: &[Vec3F64], gt: &[Vec3F64]) -> Sim3Alignment {
     mu_est /= n;
     mu_gt /= n;
 
-    // Cross-covariance and estimated variance.
+    // Cross-covariance.
     let mut sigma = Mat3F64::ZERO;
-    let mut var_est = 0.0_f64;
     for i in 0..est.len() {
         let pe = est[i] - mu_est;
         let pg = gt[i] - mu_gt;
         sigma += Mat3F64::from_cols(pg * pe.x, pg * pe.y, pg * pe.z);
-        var_est += pe.dot(pe);
     }
     *sigma /= n;
-    var_est /= n;
 
     let svd = svd3_f64(&sigma);
     let u = *svd.u();
-    let s = *svd.s();
     let v = *svd.v();
 
     // Reflection correction: ensure det(U * V^T) > 0.
@@ -68,16 +67,9 @@ pub fn align_sim3(est: &[Vec3F64], gt: &[Vec3F64]) -> Sim3Alignment {
     }
 
     let r = u * diag_s * v.transpose();
+    let translation = mu_gt - r * mu_est;
 
-    // Scale: trace(S * diag_s) / var_est (S is diagonal).
-    let trace =
-        s.x_axis.x * diag_s.x_axis.x + s.y_axis.y * diag_s.y_axis.y + s.z_axis.z * diag_s.z_axis.z;
-    let scale = trace / var_est;
-
-    let translation = mu_gt - (r * mu_est) * scale;
-
-    Sim3Alignment {
-        scale,
+    Se3Alignment {
         rotation: r,
         translation,
     }
@@ -124,10 +116,10 @@ pub fn compute_drift(est: &[Vec3F64], gt: &[Vec3F64]) -> f64 {
 
 // ── Reporting ────────────────────────────────────────────────────────────
 
-/// Aligns the estimated trajectory to ground truth (Sim3), writes the raw and
-/// aligned trajectories as CSVs under `out_dir` (created if missing), and
-/// prints ATE/RPE/drift. A no-op for fewer than two samples or a length
-/// mismatch.
+/// Aligns the estimated trajectory to ground truth (SE3: rotation +
+/// translation only, no scale correction), writes the raw and aligned
+/// trajectories as CSVs under `out_dir` (created if missing), and prints
+/// ATE/RPE/drift. A no-op for fewer than two samples or a length mismatch.
 pub fn report(est: &[Vec3F64], gt: &[Vec3F64], out_dir: &Path) -> std::io::Result<()> {
     if est.len() < 2 || gt.len() != est.len() {
         return Ok(());
@@ -141,11 +133,8 @@ pub fn report(est: &[Vec3F64], gt: &[Vec3F64], out_dir: &Path) -> std::io::Resul
         writeln!(raw, "{i},{:.9},{:.9},{:.9}", p.x, p.y, p.z)?;
     }
 
-    let a = align_sim3(est, gt);
-    let aligned: Vec<Vec3F64> = est
-        .iter()
-        .map(|p| a.translation + (a.rotation * *p) * a.scale)
-        .collect();
+    let a = align_se3(est, gt);
+    let aligned: Vec<Vec3F64> = est.iter().map(|p| a.translation + a.rotation * *p).collect();
 
     let mut af = std::fs::File::create(out_dir.join("kornia_slam_aligned.csv"))?;
     writeln!(af, "idx,x,y,z,gt_x,gt_y,gt_z")?;
@@ -158,15 +147,14 @@ pub fn report(est: &[Vec3F64], gt: &[Vec3F64], out_dir: &Path) -> std::io::Resul
     }
 
     eprintln!();
-    eprintln!("================ Trajectory Evaluation ================");
+    eprintln!("================ Trajectory Evaluation (SE3, no scale correction) ================");
     eprintln!("Frames evaluated : {}", aligned.len());
-    eprintln!("Scale            : {:.6}", a.scale);
     eprintln!("ATE RMSE         : {:.4} m", compute_ate(&aligned, gt));
     eprintln!("RPE RMSE         : {:.4} m", compute_rpe(&aligned, gt));
     eprintln!(
         "Final Drift      : {:.4} %",
         compute_drift(&aligned, gt) * 100.0
     );
-    eprintln!("=======================================================");
+    eprintln!("===================================================================================");
     Ok(())
 }

@@ -22,13 +22,14 @@
 //!      * push_map_point
 //!      * build_local_map_points
 //!      * cull
-//!      * run_local_ba
+//!      * snapshot_local_ba / apply_local_ba_result
+//!      * snapshot_local_inertial_ba / apply_local_inertial_ba_result
 //! ```
 
 use std::collections::{HashMap, HashSet};
 
 use crate::frame::Frame;
-use kornia_3d::ba::{BaObservation, BaParams};
+use kornia_3d::ba::{BaObservation, BaParams, BaResult};
 use kornia_3d::ba_schur::bundle_adjust_schur;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
@@ -292,6 +293,47 @@ pub struct Map {
     keyframes: Vec<Keyframe>,
     map_points: Vec<MapPoint>,
     imu_factors: Vec<ImuFactor>,
+    /// Bumped by any global coordinate-system transform (`scale_world`,
+    /// `rotate_world`). A `LocalBaSnapshot`/`LocalInertialBaSnapshot` records
+    /// the generation it was captured at; `apply_local_ba_result`/
+    /// `apply_local_inertial_ba_result` refuses to write back a result whose
+    /// generation doesn't match the map's current one. Without this, a BA
+    /// solve running on a background thread with no lock held could finish
+    /// after IMU initialization rescales/rotates the whole map and silently
+    /// overwrite the freshly-transformed keyframes with stale poses/points
+    /// still in the old (pre-transform) coordinate frame.
+    generation: u64,
+}
+
+/// Inputs for one visual-only local BA solve, captured by
+/// [`Map::snapshot_local_ba`] under a brief lock. The actual solve
+/// (`kornia_3d::ba_schur::bundle_adjust_schur`) runs on this owned data with
+/// no lock held; the result is written back via
+/// [`Map::apply_local_ba_result`]. Splitting the gather/solve/write-back
+/// phases this way keeps the Map lock held only for the two cheap phases,
+/// not for the solve itself, which is what actually lets tracking keep
+/// running while BA is in progress on another thread.
+pub struct LocalBaSnapshot {
+    generation: u64,
+    active_start: usize,
+    mp_global_indices: Vec<usize>,
+    pub poses: Vec<Pose3d>,
+    pub points: Vec<Vec3F64>,
+    pub observations: Vec<BaObservation>,
+}
+
+/// Inputs for one VI-BA solve, captured by
+/// [`Map::snapshot_local_inertial_ba`] under a brief lock. See
+/// [`LocalBaSnapshot`] for why the solve itself is split out of the snapshot.
+pub struct LocalInertialBaSnapshot {
+    generation: u64,
+    active_start: usize,
+    n_kfs: usize,
+    mp_global_indices: Vec<usize>,
+    pub vi_keyframes: Vec<crate::vi_ba_schur::ViBaKeyframe>,
+    pub points: Vec<Vec3F64>,
+    pub observations: Vec<BaObservation>,
+    pub imu_edges: Vec<crate::vi_ba_schur::ImuFactor>,
 }
 
 impl Map {
@@ -339,6 +381,7 @@ impl Map {
 
     /// Applies a metric scale to camera centers and map points.
     pub fn scale_world(&mut self, scale: f64) {
+        self.generation += 1;
         for kf in &mut self.keyframes {
             let mut cam_to_world = kf.frame.pose_world_to_cam.inverse();
             cam_to_world.translation *= scale;
@@ -351,6 +394,7 @@ impl Map {
     }
 
     pub fn rotate_world(&mut self, r: &SO3F64) {
+        self.generation += 1;
         for kf in self.keyframes_mut() {
             let cam_to_world = kf.frame.pose_world_to_cam.inverse();
             let new_translation = *r * cam_to_world.translation;
@@ -1010,18 +1054,18 @@ impl Map {
         true
     }
 
-    /// Run local bundle adjustment over recent keyframes and their observed map points.
-    ///
-    /// Collects the last N active keyframes, gathers observations (undistorting keypoints
-    /// via camera), calls `kornia_3d::ba::bundle_adjust`, and writes back optimized poses
-    /// and point positions.
-    pub fn run_local_ba(&mut self, camera: &PinholeCamera) {
+    /// Captures poses/points/observations for the active keyframe window,
+    /// for the caller to run `bundle_adjust_schur` on and pass the result to
+    /// [`Map::apply_local_ba_result`]. Returns `None` where the old
+    /// `run_local_ba` used to bail out early (too few keyframes, no active
+    /// map points, or too few observations to constrain the solve).
+    pub fn snapshot_local_ba(&self, camera: &PinholeCamera) -> Option<LocalBaSnapshot> {
         const MAX_ACTIVE_KFS: usize = 3;
         const MIN_OBSERVATIONS: usize = 8;
 
         let n_kfs = self.keyframes.len();
         if n_kfs < 2 {
-            return;
+            return None;
         }
 
         let active_start = n_kfs.saturating_sub(MAX_ACTIVE_KFS);
@@ -1037,7 +1081,7 @@ impl Map {
             }
         }
         if mp_set.is_empty() {
-            return;
+            return None;
         }
 
         let mut mp_global_indices: Vec<usize> = mp_set.iter().copied().collect();
@@ -1085,48 +1129,66 @@ impl Map {
         }
 
         if observations.len() < MIN_OBSERVATIONS {
-            return;
+            return None;
         }
 
-        let ba_result =
-            match bundle_adjust_schur(&poses, &points, &observations, camera, &BaParams::default())
-            {
-                Ok(r) => r,
-                Err(_) => return,
-            };
+        Some(LocalBaSnapshot {
+            generation: self.generation,
+            active_start,
+            mp_global_indices,
+            poses,
+            points,
+            observations,
+        })
+    }
 
-        for (kf_idx, pose) in ba_result.poses.iter().enumerate() {
-            if kf_idx >= active_start {
+    /// Writes a solved `BaResult` (from running `bundle_adjust_schur` on a
+    /// [`LocalBaSnapshot`]) back onto the active keyframes/map points it was
+    /// built from. Returns `false` without writing anything if the map's
+    /// generation has moved on since the snapshot was taken (a global
+    /// transform like `scale_world`/`rotate_world` ran while this solve was
+    /// in flight) — applying a stale result in that case would silently
+    /// revert the transform for whichever keyframes/points this window
+    /// covers.
+    pub fn apply_local_ba_result(&mut self, snapshot: &LocalBaSnapshot, result: &BaResult) -> bool {
+        if snapshot.generation != self.generation {
+            return false;
+        }
+        for (kf_idx, pose) in result.poses.iter().enumerate() {
+            if kf_idx >= snapshot.active_start {
                 self.keyframes[kf_idx].frame.pose_world_to_cam = *pose;
             }
         }
 
-        for (local_idx, &global_idx) in mp_global_indices.iter().enumerate() {
+        for (local_idx, &global_idx) in snapshot.mp_global_indices.iter().enumerate() {
             if let Some(mp) = self.map_points.get_mut(global_idx) {
-                mp.position = ba_result.points[local_idx];
+                mp.position = result.points[local_idx];
             }
         }
-        for &global_idx in &mp_global_indices {
+        for &global_idx in &snapshot.mp_global_indices {
             self.update_map_point_geometry(global_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
         }
+        true
     }
 
-    pub fn run_local_inertial_ba(
+    /// Captures VI-BA inputs for the active keyframe window (including a
+    /// bias-repropagation pass over IMU factors touching that window — see
+    /// the comment on the repropagation loop below), for the caller to run
+    /// `visual_inertial_bundle_adjust` on and pass the result to
+    /// [`Map::apply_local_inertial_ba_result`]. Returns `None` where the old
+    /// `run_local_inertial_ba` used to bail out early.
+    pub fn snapshot_local_inertial_ba(
         &mut self,
         camera: &PinholeCamera,
-        imu_t_bc: Option<Pose3d>,
-        gravity_world: Vec3F64,
-    ) {
-        use crate::vi_ba_schur::{
-            ImuFactor as ViBaImuFactor, ViBaKeyframe, ViBaParams, visual_inertial_bundle_adjust,
-        };
+    ) -> Option<LocalInertialBaSnapshot> {
+        use crate::vi_ba_schur::{ImuFactor as ViBaImuFactor, ViBaKeyframe};
 
         const MAX_ACTIVE_KFS: usize = 3;
         const MIN_OBSERVATIONS: usize = 8;
 
         let n_kfs = self.keyframes.len();
         if n_kfs < 2 {
-            return;
+            return None;
         }
 
         let active_start = n_kfs.saturating_sub(MAX_ACTIVE_KFS);
@@ -1142,7 +1204,7 @@ impl Map {
             }
         }
         if mp_set.is_empty() {
-            return;
+            return None;
         }
 
         let mut mp_global_indices: Vec<usize> = mp_set.iter().copied().collect();
@@ -1197,7 +1259,7 @@ impl Map {
         }
 
         if observations.len() < MIN_OBSERVATIONS {
-            return;
+            return None;
         }
 
         // Map global frame.idx → local keyframe slot (0..n_kfs).
@@ -1258,47 +1320,49 @@ impl Map {
             })
             .collect();
 
-        // 15-DOF-per-keyframe state (pose+velocity+bias) with information
-        // entries spanning many more orders of magnitude than the pure
-        // visual 6-DOF problem (see the Marquardt-damping note in
-        // visual_inertial_bundle_adjust) converges more slowly to the same
-        // strict cost_tolerance: over half of non-converged calls were
-        // hitting the default max_iterations=20 cap while still making
-        // small, steady progress (final residuals *smaller* than many calls
-        // that did converge), not diverging. Give it more room.
-        let vi_result = match visual_inertial_bundle_adjust(
-            &vi_keyframes,
-            &points,
-            &observations,
-            &imu_edges,
-            camera,
-            &ViBaParams {
-                imu_t_bc,
-                gravity: gravity_world,
-                max_iterations: 50,
-                ..ViBaParams::default()
-            },
-        ) {
-            Ok(r) => r,
-            Err(_) => return,
-        };
+        Some(LocalInertialBaSnapshot {
+            generation: self.generation,
+            active_start,
+            n_kfs,
+            mp_global_indices,
+            vi_keyframes,
+            points,
+            observations,
+            imu_edges,
+        })
+    }
 
-        // Write back optimised poses, velocities, and biases for active keyframes.
-        for kf_idx in active_start..n_kfs {
-            let vi_kf = &vi_result.keyframes[kf_idx];
+    /// Writes a solved `ViBaResult` (from running `visual_inertial_bundle_adjust`
+    /// on a [`LocalInertialBaSnapshot`] — using 15-DOF-per-keyframe state with
+    /// `max_iterations: 50`; see the note that used to live on the old
+    /// `run_local_inertial_ba` call site, now the caller's responsibility)
+    /// back onto the active keyframes/map points it was built from. Returns
+    /// `false` without writing anything if the map's generation has moved on
+    /// since the snapshot was taken — see [`Map::apply_local_ba_result`].
+    pub fn apply_local_inertial_ba_result(
+        &mut self,
+        snapshot: &LocalInertialBaSnapshot,
+        result: &crate::vi_ba_schur::ViBaResult,
+    ) -> bool {
+        if snapshot.generation != self.generation {
+            return false;
+        }
+        for kf_idx in snapshot.active_start..snapshot.n_kfs {
+            let vi_kf = &result.keyframes[kf_idx];
             self.keyframes[kf_idx].frame.pose_world_to_cam = vi_kf.pose;
             self.keyframes[kf_idx].velocity_world = vi_kf.velocity;
             self.keyframes[kf_idx].imu_bias = vi_kf.bias;
         }
 
-        for (local_idx, &global_idx) in mp_global_indices.iter().enumerate() {
+        for (local_idx, &global_idx) in snapshot.mp_global_indices.iter().enumerate() {
             if let Some(mp) = self.map_points.get_mut(global_idx) {
-                mp.position = vi_result.points[local_idx];
+                mp.position = result.points[local_idx];
             }
         }
-        for &global_idx in &mp_global_indices {
+        for &global_idx in &snapshot.mp_global_indices {
             self.update_map_point_geometry(global_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
         }
+        true
     }
 }
 

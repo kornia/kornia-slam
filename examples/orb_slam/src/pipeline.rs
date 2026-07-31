@@ -77,6 +77,13 @@ pub struct Pipeline {
     imu_viba1_done: bool,
     imu_viba2_done: bool,
     local_mapping: LocalMappingHandle,
+    // Reference keyframe (idx, pose) as of the last time tracking_step synced
+    // against it. Local BA runs asynchronously now, so the reference
+    // keyframe's pose can be corrected by the worker thread at any point
+    // while several tracking frames go by with the same reference keyframe;
+    // this lets tracking_step detect that and propagate the same correction
+    // onto the live tracked pose instead of silently drifting away from it.
+    last_synced_ref_kf: Option<(usize, Pose3d)>,
     // System state
     state: SystemState,
 }
@@ -126,6 +133,7 @@ impl Pipeline {
             imu_init_window_start_sec: None,
             imu_viba1_done: false,
             imu_viba2_done: false,
+            last_synced_ref_kf: None,
         }
     }
 
@@ -721,13 +729,12 @@ impl Pipeline {
 
     fn tracking_step(&mut self, frame: Frame, timestamp_sec: f64) -> TrackingResult {
         let image_size = frame.image_size;
-        let pose_before = self.state.pose_world_to_cam;
         let prev_timestamp = self.state.last_frame_timestamp_sec;
 
         // Local BA now runs on a background thread (see try_insert_keyframe),
-        // so it may correct the reference keyframe's velocity/bias at any
-        // point, not just synchronously after this call. Read the current
-        // values fresh off the map every frame — mirrors ORB-SLAM3's
+        // so it may correct the reference keyframe's velocity/bias/pose at
+        // any point, not just synchronously after this call. Read the
+        // current values fresh off the map every frame — mirrors ORB-SLAM3's
         // Tracking::PredictStateIMU, which always reads
         // mpLastKeyFrame->GetImuBias()/GetVelocity() rather than caching a
         // local copy — instead of a Pipeline-owned copy that could go stale
@@ -735,9 +742,38 @@ impl Pipeline {
         if let Some(kf_idx) = self.state.current_keyframe_idx
             && let Some(kf) = self.map.lock().unwrap().get_keyframe(kf_idx)
         {
+            let kf_pose = kf.frame.pose_world_to_cam;
+
+            // If the same keyframe is still our reference and its pose has
+            // moved since we last looked, local BA corrected it in the
+            // background. Propagate that same rigid correction onto the live
+            // tracked pose — mirrors ORB-SLAM3's practice of updating every
+            // frame tracked since the last keyframe once Local Mapping's BA
+            // completes, adapted for an async worker instead of a
+            // synchronous call. Without this, tracking's own live pose never
+            // gets corrected back toward what BA has established, and new
+            // keyframes/points keep getting built from that increasingly
+            // uncorrected pose — a slow, compounding drift rather than a
+            // one-time error, which is exactly what mono (no per-frame
+            // absolute depth to anchor against) is vulnerable to and stereo
+            // (depth-constrained BA) mostly isn't.
+            if let Some((last_idx, last_pose)) = self.last_synced_ref_kf
+                && last_idx == kf_idx
+                && last_pose != kf_pose
+            {
+                let correction = Pose3d::between(&last_pose, &kf_pose);
+                self.state.pose_world_to_cam = correction.compose(&self.state.pose_world_to_cam);
+            }
+            self.last_synced_ref_kf = Some((kf_idx, kf_pose));
+
             self.state.velocity_world = kf.velocity_world;
             self.imu_bias = kf.imu_bias;
         }
+
+        // Captured after the sync block above so a pose correction applied
+        // there is reflected in this frame's prediction baseline, not just
+        // the next frame's.
+        let pose_before = self.state.pose_world_to_cam;
 
         let candidate_pose = if self.state.imu_initialized && prev_timestamp > 0.0 {
             let (preint, _) = self.preintegrate_window(prev_timestamp, timestamp_sec);
