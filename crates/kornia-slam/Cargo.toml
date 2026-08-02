@@ -3,6 +3,8 @@ name = "kornia-slam"
 version = "0.1.0"
 edition = "2024"
 description = "Spatial runtime for real-time pose estimation, mapping, and agent interaction."
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 kornia-3d = { git = "https://github.com/kornia/kornia-rs", branch = "main" }

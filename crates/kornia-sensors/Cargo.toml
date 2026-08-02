@@ -3,6 +3,8 @@ name = "kornia-sensors"
 version = "0.1.0"
 edition = "2024"
 description = "Physical sensor processing for kornia: IMU preintegration, noise models, and calibration."
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 kornia-algebra = { git = "https://github.com/kornia/kornia-rs", branch = "main" }

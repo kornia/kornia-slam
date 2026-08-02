@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 description = "ORB-SLAM example for kornia-slam (EuRoC dataset or live OAK-D)"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 argh = "0.1"
