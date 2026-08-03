@@ -17,7 +17,9 @@ use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descr
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_slam::Frame;
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
-use kornia_slam::estimation::{ImuInitConfig, ImuInitResult, ImuInitializer, MapProjectionEstimator};
+use kornia_slam::estimation::{
+    ImuInitConfig, ImuInitResult, ImuInitializer, MapProjectionEstimator,
+};
 use kornia_slam::map::{Keyframe, Map, MapPoint, ORB_SCALE_FACTOR};
 use kornia_slam::stereo::unproject_stereo;
 use kornia_slam::system::{
@@ -213,8 +215,17 @@ impl Pipeline {
                     "{stage},{timestamp_sec:.6},{mtinit:.4},{n_kf},{imu_time:.4},\
                      {prior_g:e},{prior_a:e},1,{:.6},{:.6},{:.6},{:.6},{:.6},\
                      {:.8},{:.8},{:.8},{:.8},{:.8},{:.8}",
-                    r.scale, g.x, g.y, g.z, g.length(),
-                    bg.x, bg.y, bg.z, ba.x, ba.y, ba.z,
+                    r.scale,
+                    g.x,
+                    g.y,
+                    g.z,
+                    g.length(),
+                    bg.x,
+                    bg.y,
+                    bg.z,
+                    ba.x,
+                    ba.y,
+                    ba.z,
                 )
             }
             None => format!(
@@ -1182,6 +1193,36 @@ impl Pipeline {
         true
     }
 
+    /// Accel-bias prior information for the VIBA1/VIBA2 refinement solves.
+    ///
+    /// ORB-SLAM3 relaxes this to 0 at VIBA2 (`InitializeIMU(0.f, 0.f, true)`,
+    /// LocalMapping.cc:213). We deliberately do NOT: ORB-SLAM3 runs a
+    /// `FullInertialBA` after *every* `InitializeIMU` stage, so by the time its
+    /// VIBA2 solve runs, the keyframe poses it holds fixed have already been
+    /// pulled into agreement with the IMU. Ours have not — the VIBA2 solve sits
+    /// at ~40 sigma per residual on MH_01 (cost 1.3e6 over 729 residual dims),
+    /// and with the accel-bias prior removed the least-squares compromise dumps
+    /// that pose/IMU inconsistency into the one weakly observable direction:
+    /// accel bias along gravity, which is degenerate with gravity magnitude
+    /// (pinned at 9.81) traded against map scale.
+    ///
+    /// Measured at VIBA2 on MH_01 (500 frames) against the dataset's own bias
+    /// ground truth `ba = (-0.026, 0.137, 0.076)`:
+    ///
+    /// | prior_a | ba                        | gravity err |
+    /// |---------|---------------------------|-------------|
+    /// | 0       | (-0.041, **0.386**, 0.041)| 2.2 deg     |
+    /// | 1e4     | (-0.038, 0.207, 0.068)    | 1.2 deg     |
+    /// | 1e5     | (-0.042, 0.047, 0.076)    | 0.26 deg    |
+    ///
+    /// 1e5 is VIBA1's own value (and ORB-SLAM3's at that stage), so keeping it
+    /// for VIBA2 adds no new tuned constant. The blown accel bias also corrupts
+    /// gravity, since the two are coupled in `InertialInitFactor`.
+    ///
+    /// The real fix is a `FullInertialBA` equivalent between stages; until then
+    /// this prior is what stands in for it. See kornia-slam#51.
+    const VIBA_PRIOR_A: f64 = 1e5;
+
     /// VIBA1 (mTinit>5s) / VIBA2 (mTinit>15s): progressive re-solves with
     /// relaxed priors over the same (now-growing) window that VIBA0 used,
     /// mirroring LocalMapping.cc:200-228. Each fires at most once and refines
@@ -1201,14 +1242,12 @@ impl Pipeline {
         }
 
         let (prior_g, prior_a, stage) = if !self.imu_viba1_done && mtinit > 5.0 {
-            (1.0, 1e5, "VIBA1")
+            (1.0, Self::VIBA_PRIOR_A, "VIBA1")
         } else if self.imu_viba1_done && !self.imu_viba2_done && mtinit > 15.0 {
-            // Experiment (exp1): VIBA2's `priorA=0` (no accel-bias regularizer)
-            // lets kornia's accel bias run away — unlike ORB-SLAM3, which
-            // re-solves on a FullInertialBA-conditioned map. Allow A/B via env:
+            // A/B knobs for the accel-bias investigation (kornia-slam#51):
             //   KORNIA_VIBA2=off            → skip VIBA2 entirely (keep VIBA1)
             //   KORNIA_VIBA2_PRIOR_A=<f64>  → override the accel-bias prior
-            // Default (both unset) reproduces ORB's (0, 0) schedule.
+            //                                 (0 reproduces ORB-SLAM3's schedule)
             if std::env::var("KORNIA_VIBA2").as_deref() == Ok("off") {
                 self.imu_viba2_done = true;
                 return;
@@ -1216,7 +1255,7 @@ impl Pipeline {
             let prior_a = std::env::var("KORNIA_VIBA2_PRIOR_A")
                 .ok()
                 .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0);
+                .unwrap_or(Self::VIBA_PRIOR_A);
             (0.0, prior_a, "VIBA2")
         } else {
             return;
