@@ -1,127 +1,103 @@
-# kornia-slam 📷🧭🗺️📍🤖
+# 🚧 kornia-slam 📷🧭🗺️📍🤖
 
 Spatial runtime for real-time pose estimation, mapping, and agent interaction.
 
-> **Work in progress**
+> **Early stage, active development.** Today this is an ORB-based visual (and visual-inertial)
+> SLAM pipeline that runs end-to-end on EuRoC, Hilti, MCAP recordings, and live cameras.
+> System orchestration still lives in the example layer rather than behind a stable library
+> abstraction; the API and module layout are still moving. Expect breaking changes, and treat
+> the roadmap below as a direction that is subject to change rather than a commitment.
+> Contributions and feedback welcome.
 
-> **Early stage.** This README describes the long-term vision for kornia-slam, while the current implementation is a much narrower slice: monocular ORB-based odometry that runs end-to-end on EuRoC datasets, OAK-D mono cameras, and any UVC-class device (laptop webcam, USB cam, CSI-to-UVC adapter). The current codebase is not yet a general SLAM framework: it is an ORB-specific monocular pipeline whose system orchestration still lives in the example layer rather than behind a stable library abstraction. The API, module layout, and internal abstractions are still taking shape, and broader multi-sensor SLAM, map serving, and agent integration remain roadmap work. Expect breaking changes. Contributions and feedback welcome.
+## What works today
 
-kornia-slam is a modular SLAM framework that estimates poses in real time from cameras, IMU, LiDAR, and GNSS, builds a persistent map of the environment, and makes that spatial state available to agents through MCP.
+- **ORB front end** — extraction, matching, two-view bootstrap (essential matrix + triangulation)
+- **Tracking** — map-projection PnP with RANSAC against a local map built from the covisibility graph
+- **Mapping** — keyframe insertion, map-point triangulation and fusion into neighbors, map-point culling
+- **Optimization** — initial and local bundle adjustment via Schur complement (`kornia-3d`), plus a
+  visual-inertial local BA (`vi_ba_schur`)
+- **Stereo** — rectification, row-wise stereo matching, metric depth into initialization and BA
+- **IMU** — preintegration and ORB-SLAM3-style inertial initialization (gyro bias, gravity, and
+  scale in monocular mode)
+- **Frame sources** — EuRoC, Hilti-Trimble (fisheye), MCAP recordings, OAK-D, UVC webcams,
+  behind a common `FrameSource` trait
+- **Tooling** — default terminal UI with live BEV and debug panel, optional Rerun streaming,
+  ATE/RPE evaluation against ground truth
 
-## Vision
+Not yet: relocalization, loop closure, place recognition, map serving over MCP.
 
-kornia-slam is taking shape as a spatial runtime within a larger robotics system. The intended direction is to consume sensor streams, estimate pose, build and maintain a persistent 3D map, and serve that spatial state to agent runtimes through an MCP-facing control layer.
-
-### High-Level Architecture
-
-```
- Sensors / Nodes         Zenoh data plane          Agent control plane
-┌──────────────┐   pub/sub   ┌─────────────┐        ┌──────────────┐
-│ Camera / IMU │────────────>│ kornia-slam │───────>│ MCP / Agents │
-│ LiDAR / GNSS │             │ spatial node│        │              │
-└──────────────┘             └──────┬──────┘        └──────────────┘
-                                    │
-                                    v
-                              Persistent Map
-```
-
-### Odometry
-
-Odometry is the real-time state estimation layer of kornia-slam. It turns incoming sensor observations into a continuous pose stream, using the map both as a source of geometric constraints and as the persistent context that keeps localization grounded over time.
-
-```
- Visual tracking   ──┐
- Inertial updates  ──┤
- Geometric cues    ──┼──> Odometry ──> Pose stream
- Learned priors    ──┤
- Map constraints   ──┘
-```
-
-Odometry can combine multiple estimation strategies across cameras, IMU, LiDAR, and other sensors. Rather than treating each estimator as an isolated output, kornia-slam uses them as complementary sources of motion and structure that contribute to a shared spatial state.
-
-### Map
-
-The map is a persistent 3D representation of the environment — points, poses, and spatial relationships. Odometry and other estimators update this 3D map as they track, while the surrounding system can expose spatial queries and actions to agents through an MCP layer.
-
-- **Odometry** reads the map to localize against known structure and writes new observations as it tracks.
-- **Agents** query the spatial state through MCP — nearby landmarks, current pose, environment geometry.
-
-### Integration with bubbaloop
-
-kornia-slam is intended to integrate with [bubbaloop](https://github.com/kornia/bubbaloop) as a spatial service within a broader robotics runtime. In that direction, kornia-slam would consume sensor streams, maintain its own map and localization state, and expose them through an MCP server. bubbaloop agents could then connect to that spatial interface as part of the surrounding system.
-
-```
- Sensors / nodes        Zenoh pub/sub        Spatial service        MCP clients
-┌──────────────┐   ┌──────────────────┐   ┌─────────────┐   ┌──────────────┐
-│ cameras/IMU/ │──>│ sensor streams   │──>│ kornia-slam │<──│ bubbaloop    │
-│ LiDAR/GNSS   │   │ and commands     │   │             │   │ agents/tools │
-└──────────────┘   └──────────────────┘   └─────────────┘   └──────────────┘
-```
-
-- **Sensor access** — kornia-slam should be able to subscribe to camera, IMU, LiDAR, and other streams as part of the system data plane.
-- **Spatial state via MCP** — kornia-slam should expose pose, map, and spatial query tools through an MCP server.
-- **Agent-facing spatial tools** — bubbaloop agents should be able to connect to that MCP interface to inspect the live 3D map, query current pose and nearby structure, and invoke higher-level spatial computations such as localization, landmark lookup, geometric relationships, and map-based reasoning.
-
-### Agentic SLAM — rethinking SLAM in the age of agents
-
-Beyond serving spatial state to external agents, kornia-slam is exploring the idea of agents operating *within* the SLAM system itself — monitoring and improving subsystems at runtime. For example, an agent that detects degraded feature matching in low-texture scenes and switches extraction strategy, or one that tunes bundle adjustment parameters based on observed residuals. This treats SLAM not as a fixed pipeline but as a system whose components can be inspected, tuned, and swapped by agents operating in sandboxed environments.
-
-## Setup
-
-The current runnable package is the standalone ORB-SLAM example in [examples/orb_slam/README.md](examples/orb_slam/README.md). Quick taste, with the default TUI:
+## Quick start
 
 ```bash
-# Offline (no extra deps):
-cargo run --release -p orb_slam -- euroc --data /path/to/V1_01_easy
+# EuRoC, monocular (no extra deps)
+cargo run --release -p orb_slam -- euroc --data /path/to/MH_01_easy
 
-# Live UVC camera (laptop webcam, USB cam, …):
-cargo run --release -p orb_slam --features uvc -- \
-    uvc --index 0 --fx 600 --fy 600 --cx 320 --cy 240
+# EuRoC, stereo + IMU, with trajectory evaluation
+cargo run --release -p orb_slam -- euroc --data /path/to/MH_01_easy --stereo --imu --evaluate
+
+# Live UVC camera (laptop webcam, USB cam, …)
+cargo run --release -p orb_slam --features uvc -- uvc --fx 600 --fy 600 --cx 320 --cy 240
 ```
 
-Press `d` in the TUI to toggle the debug panel. Pass `--rerun-stream` for a Rerun viewer instead, or `--no-tui` for plain stderr.
+Press `d` in the TUI to toggle the debug panel. Use `--rerun-stream` for a Rerun viewer,
+`--no-tui` for plain stderr.
 
-### Local checks
+Full source, calibration, and stereo docs: [examples/orb_slam/README.md](examples/orb_slam/README.md).
 
-The current baseline checks for this repository are:
+## Layout
+
+```text
+crates/kornia-slam     library: frame, map, estimation (two-view, PnP, map projection, IMU init),
+                       stereo, visual-inertial BA
+crates/kornia-sensors  sensor types (IMU)
+examples/orb_slam      runnable pipeline: CLI, frame sources, orchestration, TUI, evaluation
+```
+
+The library provides building blocks; each example wires them into a concrete pipeline.
+
+## Local checks
 
 ```bash
-cargo fmt -- --check
+cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo test --workspace
 ```
 
 ## Roadmap
 
-**Now — monocular ORB odometry**
-- [x] ORB feature extraction and matching
-- [x] Two-view bootstrap (essential matrix + triangulation)
-- [x] Map-projection tracking (PnP with RANSAC)
-- [x] Keyframe insertion and map point triangulation
-- [x] Local bundle adjustment
-- [x] Map point culling
-- [x] Live frame sources (EuRoC offline, OAK-D, UVC) behind a common `FrameSource` trait
-- [x] Default terminal UI with live BEV + togglable debug panel
+Everything below is a roadmap entry, not a shipped capability. Design notes live in
+[docs/plans](docs/plans).
 
-**Next — complete monocular SLAM ideas**
-- [ ] Rich keyframe and map-point observation model
-- [ ] Covisibility graph and local map maintenance
-- [ ] Neighbor search, landmark fusion, and redundant keyframe culling
+**Next — complete the SLAM stack**
 - [ ] Relocalization on tracking loss
-- [ ] Loop closing (place recognition + pose graph optimization)
+- [ ] Place recognition and loop closure (Sim3 + pose graph optimization)
+- [ ] Redundant keyframe culling
+- [ ] Robust visual-inertial initialization and scale stability
 
-**After that — robustness and evaluation**
-- [ ] Match a strong monocular ORB baseline on trajectory quality and tracking robustness
-- [ ] Trajectory evaluation (ATE/RPE against ground truth)
-- [ ] Comprehensive testing across multiple datasets (EuRoC, TUM-VI, etc.) and challenging scenarios
+**Structure — turn the pipeline into a library API**
+- [ ] Pluggable feature frontend: a `FeatureFrontend`/`Descriptor` seam so non-ORB and learned
+      descriptors (and their matchers) drop in, with an async, device-capable variant
+- [ ] Move temporal orchestration (state machine, keyframe policy, map-update ordering) into the
+      library; examples become composition roots rather than a second pipeline
+- [ ] Telemetry contract: one canonical per-frame outcome, a stable diagnostic vocabulary, and
+      versioned run artifacts that tooling and agents can read
+- [ ] Crate split — `kornia-slam-telemetry`, `kornia-slam-eval`, and an isolated crate for
+      GPU/TensorRT frontends so the default build stays CPU-only
+- [ ] Upstream anything not SLAM-specific (camera models, solvers, image ops) to
+      [kornia-rs](https://github.com/kornia/kornia-rs)
 
-**Later — multi-sensor and real-time**
-- [ ] IMU preintegration
-- [ ] Stereo and RGB-D estimators
-- [ ] Estimator fusion in odometry
-- [ ] Map server (MCP)
-- [ ] bubbaloop node integration
-- [ ] Agentic SLAM (subsystem monitoring, strategy switching, parameter tuning)
+**Robustness and evaluation**
+- [ ] Profiles — one example binary with `--profile`, where a profile is earned by a
+      composition-root recipe, a CI-gated dataset metric, and a stated compute budget
+- [ ] Match a strong ORB-SLAM baseline on trajectory quality and tracking robustness
+- [ ] Evaluation across datasets (EuRoC, TUM-VI, Hilti) and challenging scenarios
+
+**Later — sensors, maps, agents**
+- [ ] RGB-D, LiDAR and GNSS estimators, estimator fusion in odometry
+- [ ] Map representations beyond sparse landmarks — dense, TSDF, voxel, Gaussian splats
+- [ ] Embedded compute targets alongside desktop/server
+- [ ] Map server exposing pose and map queries over MCP
+- [ ] Agentic SLAM — agents monitoring subsystems at runtime, switching strategies and tuning parameters
 
 ## License
 
