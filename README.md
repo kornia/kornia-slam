@@ -63,6 +63,12 @@ cargo clippy --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+## Branching
+
+`develop` is the working default branch and takes all PRs for now. It is temporary: when
+v0.1.0 is tagged it folds into `main`, which then becomes the only long-lived branch, with
+short-lived `feat/*` and `fix/*` branches on top and tags for releases.
+
 ## Roadmap
 
 Everything below is a roadmap entry, not a shipped capability. Design notes live in
