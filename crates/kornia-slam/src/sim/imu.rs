@@ -8,19 +8,15 @@
 //!
 //! # Measurement model
 //!
-//! For body-to-world rotation `R_wb`, world acceleration `a` and gravity vector
-//! `g`:
+//! The sensor equations themselves live in
+//! [`ImuMeasurement::simulate`][kornia_sensors::imu::ImuMeasurement::simulate],
+//! next to the preintegration they invert, and are not restated here — one copy
+//! of a sign convention is the most this codebase should have. This module
+//! supplies the kinematics to feed it, the sampling schedule, and the noise.
 //!
-//! ```text
-//! gyro(t)  = ω_body(t)              + b_g + n_g
-//! accel(t) = R_wbᵀ · (a(t) − g)     + b_a + n_a
-//! ```
-//!
-//! The accelerometer measures **specific force**, not acceleration: a body in
-//! free fall reads zero. The sign convention here is fixed by the IMU residual
-//! in [`crate::vi_ba_schur`], which propagates `v_j = v_i + g·Δt + R_wb_i·Δv` —
-//! subtracting `g` on generation is what makes that residual vanish on
-//! noiseless ground truth.
+//! Noise is drawn at the **discrete** standard deviation `density / √dt`, which
+//! is the discretization [`PreintegratedImu::integrate`] assumes when it forms
+//! `density² / dt` as the per-sample variance.
 
 use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 
@@ -29,7 +25,7 @@ use super::rng::SimRng;
 use super::trajectory::{DEFAULT_GRAVITY, Trajectory};
 use crate::vi_ba_schur::ImuFactor;
 
-use kornia_algebra::{Mat3F64, Vec3F64};
+use kornia_algebra::Vec3F64;
 
 /// EuRoC's ADIS16448 noise densities, used as the simulator's default.
 ///
@@ -110,21 +106,23 @@ pub fn generate_imu(
         let t = t.min(trajectory.t_end());
         let state = trajectory.state(t)?;
 
-        let r_bw = Mat3F64(*state.rotation.matrix().transpose());
-        let specific_force = r_bw * (state.acceleration - gravity);
-
-        let mut gyro = state.angular_velocity + config.bias.gyro;
-        let mut accel = specific_force + config.bias.accel;
+        // The measurement model itself lives in kornia-sensors, beside the
+        // preintegration it inverts. This loop only supplies the kinematics and
+        // the noise; it does not restate the sensor equations.
+        let mut measurement = ImuMeasurement::simulate(
+            t,
+            &state.rotation.matrix(),
+            state.acceleration,
+            state.angular_velocity,
+            gravity,
+            &config.bias,
+        );
         if config.add_noise {
-            gyro += rng.normal_vec3(gyro_std);
-            accel += rng.normal_vec3(accel_std);
+            measurement.gyro += rng.normal_vec3(gyro_std);
+            measurement.accel += rng.normal_vec3(accel_std);
         }
 
-        out.push(ImuMeasurement {
-            timestamp: t,
-            gyro,
-            accel,
-        });
+        out.push(measurement);
     }
 
     Ok(out)
@@ -186,7 +184,7 @@ pub fn generate_imu_default_gravity(
 mod tests {
     use super::*;
     use crate::sim::trajectory::ArcConfig;
-    use kornia_algebra::SO3F64;
+    use kornia_algebra::{Mat3F64, SO3F64};
 
     fn traj() -> Trajectory {
         Trajectory::arc(&ArcConfig {

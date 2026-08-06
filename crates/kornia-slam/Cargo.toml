@@ -12,7 +12,7 @@ repository.workspace = true
 # with default features — actually cover it. Downstream consumers who don't
 # want the simulator compiled in can opt out with `default-features = false`.
 default = ["sim"]
-sim = []
+sim = ["dep:rand"]
 
 [dependencies]
 kornia-3d = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
@@ -23,4 +23,7 @@ kornia-sensors = { path = "../kornia-sensors" }
 # Dense Cholesky solver for the reduced camera system in Schur-complement BA
 # (see vi_ba_schur.rs / ba_schur.rs).
 faer = "0.22"
+# Seeded RNG for the simulator, matching kornia-3d's StdRng usage.
+# Optional so `--no-default-features` does not pull it in.
+rand = { version = "0.10", optional = true }
 thiserror = "1"

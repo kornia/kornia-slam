@@ -14,6 +14,50 @@ pub struct ImuMeasurement {
     pub accel: Vec3F64,
 }
 
+impl ImuMeasurement {
+    /// The reading an ideal IMU produces for a known kinematic state.
+    ///
+    /// This is the **forward sensor model** — the inverse of what
+    /// [`PreintegratedImu`] does, which is why it belongs here rather than in a
+    /// consumer. Integrating a stream produced by this function must reproduce
+    /// the motion it was generated from; that round trip is the sharpest
+    /// available check on [`PreintegratedImu::integrate`], and
+    /// `preintegration_inverts_the_forward_model` below runs it.
+    ///
+    /// ```text
+    /// gyro  = ω_body            + b_g
+    /// accel = R_wbᵀ · (a − g)   + b_a
+    /// ```
+    ///
+    /// The accelerometer measures **specific force**, not acceleration: a body
+    /// in free fall (`a == g`) reads zero, and one at rest reads `−R_wbᵀ·g`.
+    ///
+    /// # Arguments
+    ///
+    /// - `rotation_wb` — body-to-world rotation at `timestamp`.
+    /// - `accel_world` — world-frame acceleration, **excluding** gravity.
+    /// - `angular_velocity_body` — body-frame angular velocity.
+    /// - `gravity` — world-frame gravity vector (e.g. `[0, 9.81, 0]` with
+    ///   OpenCV Y-down axes).
+    /// - `bias` — bias to add. Noise, if wanted, is the caller's business:
+    ///   this function stays deterministic so it can be used in exact tests.
+    pub fn simulate(
+        timestamp: f64,
+        rotation_wb: &Mat3F64,
+        accel_world: Vec3F64,
+        angular_velocity_body: Vec3F64,
+        gravity: Vec3F64,
+        bias: &ImuBias,
+    ) -> Self {
+        let r_bw = Mat3F64(*rotation_wb.transpose());
+        Self {
+            timestamp,
+            gyro: angular_velocity_body + bias.gyro,
+            accel: r_bw * (accel_world - gravity) + bias.accel,
+        }
+    }
+}
+
 /// Accelerometer and gyroscope biases.
 #[derive(Debug, Clone, Copy)]
 pub struct ImuBias {
@@ -679,5 +723,214 @@ mod tests {
                 "diagonal {i} should not decrease"
             );
         }
+    }
+
+    /// Preintegration must invert the forward sensor model **exactly** on a
+    /// closed-form trajectory: constant body-frame angular velocity and constant
+    /// world-frame acceleration.
+    ///
+    /// ```text
+    /// R_wb(t) = R0·Exp(ω·t)    v(t) = v0 + a·t    p(t) = p0 + v0·t + ½a·t²
+    /// ⇒  ΔR = Exp(ω·Δt)   Δv = R_bw0·(a−g)·Δt   Δp = R_bw0·½(a−g)·Δt²
+    /// ```
+    ///
+    /// Exactness here is not an accident, and it is the point of the test. At
+    /// step `k` the integrator forms `ΔR_k · accel_k`, and since
+    /// `ΔR_k = R_bw0·R_wb(t_k)` while `accel_k = R_wb(t_k)ᵀ·(a−g)`, the two
+    /// rotations cancel to leave the constant `R_bw0·(a−g)`. Summing a constant
+    /// has no discretization error, so the result is exact to machine precision
+    /// at any rate.
+    ///
+    /// That cancellation is fragile in exactly the useful way: it only holds if
+    /// the rotation handling is right. A transposed `ΔR`, a flipped gyro sign,
+    /// or `hat(ΔR·a)` in place of `ΔR·hat(a)` all break it and show up as a
+    /// large error rather than a subtle one. First-order convergence is checked
+    /// separately by `preintegration_converges_at_first_order`, which uses a
+    /// trajectory where the cancellation does not occur.
+    #[test]
+    fn preintegration_inverts_the_forward_model() {
+        let gravity = Vec3F64::new(0.0, 9.81, 0.0);
+        let omega = Vec3F64::new(0.3, -0.5, 0.2); // body-frame, constant
+        let accel_world = Vec3F64::new(0.4, -0.25, 0.6); // excludes gravity
+        let r0 = SO3F64::exp(Vec3F64::new(0.2, 0.1, -0.3));
+        let total = 0.5;
+
+        for rate_hz in [100.0f64, 400.0, 1600.0] {
+            let dt = 1.0 / rate_hz;
+            let n = (total / dt).round() as usize;
+
+            let mut pre = PreintegratedImu::new(ImuBias::default(), default_calib());
+            for k in 0..n {
+                let t = k as f64 * dt;
+                let r_wb = r0 * SO3F64::exp(omega * t);
+                let m = ImuMeasurement::simulate(
+                    t,
+                    &r_wb.matrix(),
+                    accel_world,
+                    omega,
+                    gravity,
+                    &ImuBias::default(),
+                );
+                pre.integrate(&m, dt);
+            }
+
+            let r_bw0 = Mat3F64(*r0.matrix().transpose());
+            let net = accel_world - gravity;
+
+            let rot = (SO3F64::exp(omega * total).inverse()
+                * SO3F64::from_matrix(&pre.delta_rotation))
+            .log()
+            .length();
+            let vel = (pre.delta_velocity - r_bw0 * net * total).length();
+            let pos = (pre.delta_position - r_bw0 * net * (0.5 * total * total)).length();
+
+            assert!(rot < 1e-12, "rotation error {rot} rad at {rate_hz} Hz");
+            assert!(vel < 1e-10, "velocity error {vel} m/s at {rate_hz} Hz");
+            assert!(pos < 1e-10, "position error {pos} m at {rate_hz} Hz");
+        }
+    }
+
+    /// Preintegration error must fall at first order once the exact
+    /// cancellation of `preintegration_inverts_the_forward_model` is broken.
+    ///
+    /// Adding a constant jerk makes world acceleration time-varying, so
+    /// `ΔR_k · accel_k` is no longer constant and the rectangular rule in
+    /// `integrate` — which advances `Δv += ΔR·a·dt` using `ΔR` from the start of
+    /// each step — leaves a genuine `O(dt)` residual. Ground truth stays closed
+    /// form:
+    ///
+    /// ```text
+    /// a(t) = a0 + j·t   v(t) = v0 + a0·t + ½j·t²   p(t) = p0 + v0·t + ½a0·t² + ⅙j·t³
+    /// ```
+    ///
+    /// Halving the timestep must halve the error. This is what discriminates a
+    /// discretization residual from a modelling error: a wrong frame or sign
+    /// gives a constant error that no rate increase removes.
+    #[test]
+    fn preintegration_converges_at_first_order() {
+        let gravity = Vec3F64::new(0.0, 9.81, 0.0);
+        let omega = Vec3F64::new(0.3, -0.5, 0.2);
+        let a0 = Vec3F64::new(0.4, -0.25, 0.6);
+        let jerk = Vec3F64::new(1.5, 2.0, -1.2);
+        let r0 = SO3F64::exp(Vec3F64::new(0.2, 0.1, -0.3));
+        let total = 0.5;
+
+        let error_at = |rate_hz: f64| -> (f64, f64) {
+            let dt = 1.0 / rate_hz;
+            let n = (total / dt).round() as usize;
+
+            let mut pre = PreintegratedImu::new(ImuBias::default(), default_calib());
+            for k in 0..n {
+                let t = k as f64 * dt;
+                let r_wb = r0 * SO3F64::exp(omega * t);
+                let m = ImuMeasurement::simulate(
+                    t,
+                    &r_wb.matrix(),
+                    a0 + jerk * t,
+                    omega,
+                    gravity,
+                    &ImuBias::default(),
+                );
+                pre.integrate(&m, dt);
+            }
+
+            let r_bw0 = Mat3F64(*r0.matrix().transpose());
+            let (t1, t2, t3) = (total, total * total, total * total * total);
+
+            // Δv = R_bw0·(v1 − v0 − g·Δt), with v1 − v0 = a0·Δt + ½j·Δt².
+            let expected_dv = r_bw0 * (a0 * t1 + jerk * (0.5 * t2) - gravity * t1);
+            // Δp = R_bw0·(p1 − p0 − v0·Δt − ½g·Δt²).
+            let expected_dp = r_bw0 * (a0 * (0.5 * t2) + jerk * (t3 / 6.0) - gravity * (0.5 * t2));
+
+            (
+                (pre.delta_velocity - expected_dv).length(),
+                (pre.delta_position - expected_dp).length(),
+            )
+        };
+
+        let coarse = error_at(200.0);
+        let fine = error_at(400.0);
+        let finer = error_at(800.0);
+
+        for (name, c, f, ff) in [
+            ("velocity", coarse.0, fine.0, finer.0),
+            ("position", coarse.1, fine.1, finer.1),
+        ] {
+            assert!(ff > 0.0, "{name} error vanished — trajectory is degenerate");
+            let (r1, r2) = (c / f, f / ff);
+            assert!(
+                (1.6..2.6).contains(&r1),
+                "{name} error ratio 200->400 Hz is {r1}, expected ~2 (first order)"
+            );
+            assert!(
+                (1.6..2.6).contains(&r2),
+                "{name} error ratio 400->800 Hz is {r2}, expected ~2 (first order)"
+            );
+        }
+    }
+
+    /// A level, stationary body reads `-g`, and bias adds straight through.
+    #[test]
+    fn forward_model_matches_hand_computed_readings() {
+        let gravity = Vec3F64::new(0.0, 9.81, 0.0);
+        let level = Mat3F64::IDENTITY;
+
+        let at_rest = ImuMeasurement::simulate(
+            0.0,
+            &level,
+            Vec3F64::ZERO,
+            Vec3F64::ZERO,
+            gravity,
+            &ImuBias::default(),
+        );
+        assert!((at_rest.accel - Vec3F64::new(0.0, -9.81, 0.0)).length() < EPS);
+        assert!(at_rest.gyro.length() < EPS);
+
+        // Free fall: specific force is zero.
+        let falling = ImuMeasurement::simulate(
+            0.0,
+            &level,
+            gravity,
+            Vec3F64::ZERO,
+            gravity,
+            &ImuBias::default(),
+        );
+        assert!(falling.accel.length() < EPS, "free fall should read zero");
+
+        // Bias is additive in both channels.
+        let bias = ImuBias {
+            gyro: Vec3F64::new(0.01, -0.02, 0.03),
+            accel: Vec3F64::new(0.1, 0.2, -0.3),
+        };
+        let biased =
+            ImuMeasurement::simulate(0.0, &level, Vec3F64::ZERO, Vec3F64::ZERO, gravity, &bias);
+        assert!((biased.accel - at_rest.accel - bias.accel).length() < EPS);
+        assert!((biased.gyro - at_rest.gyro - bias.gyro).length() < EPS);
+    }
+
+    /// Rotating the body rotates the measured gravity vector into the body
+    /// frame — the property a wrong transpose would silently invert.
+    #[test]
+    fn forward_model_expresses_gravity_in_the_body_frame() {
+        let gravity = Vec3F64::new(0.0, 9.81, 0.0);
+        // Roll 90 degrees about body x: world +Y (down) maps to body -Z.
+        let r_wb = SO3F64::exp(Vec3F64::new(std::f64::consts::FRAC_PI_2, 0.0, 0.0));
+        let m = ImuMeasurement::simulate(
+            0.0,
+            &r_wb.matrix(),
+            Vec3F64::ZERO,
+            Vec3F64::ZERO,
+            gravity,
+            &ImuBias::default(),
+        );
+        // accel = R_bw·(0 − g) = R_wbᵀ·(−g)
+        let expected = Mat3F64(*r_wb.matrix().transpose()) * -gravity;
+        assert!(
+            (m.accel - expected).length() < EPS,
+            "got {:?}, expected {expected:?}",
+            m.accel
+        );
+        // Concretely: −g along world +Y becomes +Z in the rolled body frame.
+        assert!((m.accel.z - 9.81).abs() < 1e-6, "got {:?}", m.accel);
     }
 }

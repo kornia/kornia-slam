@@ -4,24 +4,31 @@
 //! recovery test that fails on one run and passes on the next is worse than no
 //! test, because it teaches you to ignore it.
 //!
-//! This is a self-contained xoshiro256++ rather than a `rand` dependency.
-//! kornia-slam has no RNG dependency today, and the simulator needs exactly
-//! three primitives (uniform, Gaussian, unit vector); pulling in `rand` plus
-//! `rand_distr` to get them would be a poor trade. The generator is a standard,
-//! well-tested design, not an invention — see the reference implementation by
-//! Blackman and Vigna (<https://prng.di.unimi.it/>).
+//! The generator itself is `rand`'s [`StdRng`] (ChaCha12), seeded via
+//! [`SeedableRng::seed_from_u64`], which is reproducible across platforms and
+//! across runs. That is the same pattern kornia-3d already uses in its RANSAC
+//! drivers, so the simulator does not introduce a second notion of "seeded
+//! randomness" into the stack.
+//!
+//! What this type adds on top is only the **distributions** the simulator needs
+//! and `rand` does not carry in its core crate: a Gaussian and a uniform
+//! direction on the sphere. Those are a dozen lines; `rand_distr` is not in the
+//! workspace and is not worth adding for them.
 
 use kornia_algebra::Vec3F64;
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 
 /// A seeded, reproducible random source.
 ///
-/// The same seed always yields the same sequence, on every platform: the state
-/// update is pure integer arithmetic and the float conversion is an exact
-/// power-of-two scaling, so there is no dependence on the host's floating-point
-/// rounding mode or on libm.
-#[derive(Debug, Clone)]
+/// The same seed always yields the same sequence, on every platform.
+///
+/// Deliberately not `Clone`: `StdRng` is not, and a cloned generator would
+/// silently replay the same stream into two places — a way to make a "seeded"
+/// run quietly non-independent.
+#[derive(Debug)]
 pub struct SimRng {
-    state: [u64; 4],
+    inner: StdRng,
     /// Box-Muller produces two independent normals per call; the spare is kept
     /// here so no sample is wasted.
     spare_normal: Option<f64>,
@@ -29,54 +36,26 @@ pub struct SimRng {
 
 impl SimRng {
     /// Creates a generator from a seed.
-    ///
-    /// The seed is expanded through SplitMix64, so even low-entropy seeds
-    /// (`0`, `1`, `2`, …) produce well-separated streams — which matters
-    /// because test seeds are almost always small integers.
     pub fn new(seed: u64) -> Self {
-        let mut z = seed;
-        let mut next = || {
-            z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut x = z;
-            x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            x ^ (x >> 31)
-        };
         Self {
-            state: [next(), next(), next(), next()],
+            inner: StdRng::seed_from_u64(seed),
             spare_normal: None,
         }
     }
 
-    /// Raw 64-bit output (xoshiro256++).
+    /// Raw 64-bit output.
     pub fn next_u64(&mut self) -> u64 {
-        let result = self.state[0]
-            .wrapping_add(self.state[3])
-            .rotate_left(23)
-            .wrapping_add(self.state[0]);
-
-        let t = self.state[1] << 17;
-        self.state[2] ^= self.state[0];
-        self.state[3] ^= self.state[1];
-        self.state[1] ^= self.state[2];
-        self.state[0] ^= self.state[3];
-        self.state[2] ^= t;
-        self.state[3] = self.state[3].rotate_left(45);
-
-        result
+        self.inner.random()
     }
 
     /// Uniform sample in `[0, 1)`.
-    ///
-    /// Takes the top 53 bits — the full mantissa width of an `f64` — so every
-    /// representable value in the range is reachable with uniform probability.
     pub fn uniform(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+        self.inner.random()
     }
 
     /// Uniform sample in `[lo, hi)`.
     pub fn uniform_range(&mut self, lo: f64, hi: f64) -> f64 {
-        lo + (hi - lo) * self.uniform()
+        self.inner.random_range(lo..hi)
     }
 
     /// Standard normal sample, `N(0, 1)`, via the polar Box-Muller transform.
@@ -146,8 +125,8 @@ mod tests {
     fn different_seeds_diverge() {
         let mut a = SimRng::new(1);
         let mut b = SimRng::new(2);
-        // Small seeds must not produce correlated streams; this is what the
-        // SplitMix64 expansion in `new` is for.
+        // Small seeds must not produce correlated streams — `seed_from_u64`
+        // runs the seed through a hash before keying the generator.
         let differing = (0..100).filter(|_| a.next_u64() != b.next_u64()).count();
         assert_eq!(differing, 100);
     }
