@@ -44,6 +44,29 @@
 //! - [`scene`] — assembles the above into estimator inputs, plus the
 //!   perturbation used by recovery tests.
 //!
+//! # Upstreaming
+//!
+//! Parts of this module are general enough to belong in kornia-rs rather than
+//! here, and are expected to move once this has settled. Nothing below is
+//! required for kornia-slam to work — the case is reuse, plus deleting
+//! duplication that already exists upstream. Each module carries its own note
+//! with the details; this is the index.
+//!
+//! | Piece | Destination | Why |
+//! |---|---|---|
+//! | [`landmarks`] + the pose helpers from [`trajectory`] | `kornia-3d`, beside `ba.rs` | Needs only symbols already there. Deletes a triplicated hand-rolled `Lcg` in `ba_schur.rs`, widens a 4-point/2-pose recovery test, gives `pgo.rs` its first tests |
+//! | [`spline`] + the algebra-only core of [`trajectory`] | `kornia-algebra` (→ `kornia-manifold`), beside the Lie groups | Nothing comparable exists in kornia-rs; a manifold construct, not a domain factor. Needs `SO3F64` only — no `SE3F64` |
+//!
+//! Staying here: [`scene`] (needs `ViBaKeyframe`), [`imu`] (needs `ImuFactor`,
+//! which is solver window-slot bookkeeping rather than sensor data), and
+//! [`rng`] (a thin wrapper over `rand::StdRng`, nothing to move).
+//!
+//! Note the friction, since it shapes the sequencing: kornia-slam consumes
+//! kornia-rs via a git branch, so each upstream move is a land-wait-bump round
+//! trip. Worth batching into two PRs — one per destination crate — rather than
+//! going piecemeal, and worth coordinating the `kornia-algebra` one with the
+//! Phase 0 rename to `kornia-manifold`.
+//!
 //! # Example
 //!
 //! ```

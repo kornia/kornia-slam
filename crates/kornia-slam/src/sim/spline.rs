@@ -22,6 +22,28 @@
 //! the measurements are generated from, so there is no modelling error between
 //! ground truth and what the estimator is asked to recover. That is the whole
 //! point of generating measurements analytically.
+//!
+//! # Upstreaming
+//!
+//! **This module is intended to move to `kornia-algebra`, beside the Lie
+//! groups.** A split R³ + SO(3) B-spline is a general trajectory primitive,
+//! kornia-rs has nothing like it (checked across all its crates), and it is a
+//! manifold construct rather than a domain factor — so it sits on the right side
+//! of the kornia-manifold roadmap's rule that domain factors stay in domain
+//! crates.
+//!
+//! Dependencies are already satisfied upstream: this needs only `SO3F64` (landed
+//! in kornia-rs PR #931) and `Vec3F64`. It deliberately does **not** need
+//! `SE3F64`, which still does not exist — see §4.1 of the plan.
+//!
+//! Two things to handle when moving it:
+//!
+//! 1. It returns [`SimError`] for `TimeOutOfRange`, `TooFewControlPoints` and
+//!    `InvalidKnotSpacing`. Those need a local error type upstream; they are the
+//!    only coupling to kornia-slam.
+//! 2. `kornia-algebra` is being renamed to `kornia-manifold` in Phase 0 of the
+//!    manifold roadmap. Coordinate rather than race it — a new module landing
+//!    mid-rename is avoidable churn.
 
 use kornia_algebra::{SO3F64, Vec3F64};
 
@@ -133,7 +155,7 @@ impl RSpline3 {
     /// Builds a spline from control points on a uniform knot vector starting at
     /// `t_start` with spacing `knot_dt`.
     ///
-    /// A cubic spline needs at least [`SPLINE_ORDER`] control points to define
+    /// A cubic spline needs at least `SPLINE_ORDER` control points to define
     /// even one segment.
     pub fn new(control: Vec<Vec3F64>, t_start: f64, knot_dt: f64) -> Result<Self, SimError> {
         if control.len() < SPLINE_ORDER {

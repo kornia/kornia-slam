@@ -19,6 +19,22 @@
 //!
 //! [`ViBaParams::gravity`]: crate::vi_ba_schur::ViBaParams::gravity
 //! [`ViBaParams::imu_t_bc`]: crate::vi_ba_schur::ViBaParams::imu_t_bc
+//!
+//! # Upstreaming
+//!
+//! **This module splits across two crates when it moves.** Only two methods
+//! touch `kornia-3d` at all:
+//!
+//! - [`Trajectory`], [`TrajectoryState`]'s fields, [`Trajectory::sample_uniform`],
+//!   [`Trajectory::arc`] and `look_along` are `kornia-algebra`-only, and travel
+//!   with [`super::spline`] to `kornia-algebra`/`kornia-manifold`.
+//! - [`TrajectoryState::body_pose`] and [`TrajectoryState::camera_pose`] need
+//!   `Pose3d`, and belong in `kornia-3d` alongside [`super::landmarks`].
+//!
+//! The frame conventions documented above are the part most worth carrying over
+//! verbatim: they are what keeps the simulator and the estimators agreeing, and
+//! a mismatch introduced during a move would be invisible in exactly the way
+//! this whole module exists to prevent.
 
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};

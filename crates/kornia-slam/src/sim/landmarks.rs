@@ -4,6 +4,24 @@
 //! [`kornia_3d::ba_schur::bundle_adjust_schur`] and
 //! [`crate::vi_ba_schur::visual_inertial_bundle_adjust`] with no adapter layer
 //! and nothing mocked.
+//!
+//! # Upstreaming
+//!
+//! **This module is intended to move to `kornia-3d`, beside `ba.rs`.** Every
+//! symbol it needs — `BaObservation`, `PinholeCamera`, `project_point`,
+//! `Pose3d` — already lives there, so the move adds no dependencies.
+//!
+//! It is the piece with a concrete debt to pay upstream. As of this writing
+//! `kornia-3d/src/ba_schur.rs` carries an identical hand-rolled `Lcg` struct
+//! **copy-pasted three times** (around lines 1195, 1415 and 1641) — same LCG
+//! constants, same Box-Muller, seeded `state = seed` with no scrambling, which
+//! is a poor generator to be driving perturbation tests. Alongside it,
+//! `schur_ba_recovers_perturbed_poses` runs on four hand-placed points and two
+//! poses: the same shape of test as `tests/sim_recovery.rs`, written narrower.
+//! `pgo.rs` has no tests at all and would get its first ones.
+//!
+//! Moving this also wants the pose helpers from [`super::trajectory`] to
+//! generate the poses to project from — see that module's note.
 
 use kornia_3d::ba::BaObservation;
 use kornia_3d::camera::{PinholeCamera, project_point};
