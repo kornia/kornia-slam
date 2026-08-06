@@ -1,4 +1,5 @@
 use kornia_slam::estimation::map_projection::MapProjectionConfig;
+use kornia_slam::estimation::optical_flow::OpticalFlowConfig;
 use kornia_slam::estimation::two_view::TwoViewInitConfig;
 use kornia_slam::system::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
@@ -17,6 +18,12 @@ pub struct PipelineConfig {
     /// Emit per-frame diagnostics: skip reasons in bootstrap, reject reasons
     /// in tracking, keyframe-growth and fuse counters.
     pub debug: bool,
+    /// Seed `estimate_pose`'s correspondence search with KLT-tracked points
+    /// (see `estimation::optical_flow`), tried before the pose-dependent
+    /// projection search. A single toggle so a run can be A/B'd against the
+    /// pre-existing projection-only path without a rebuild.
+    pub enable_optical_flow_tracking: bool,
+    pub optical_flow: OpticalFlowConfig,
 }
 
 impl Default for PipelineConfig {
@@ -33,6 +40,8 @@ impl Default for PipelineConfig {
             enable_local_ba: true,
             stereo_close_depth_m: None,
             debug: false,
+            enable_optical_flow_tracking: true,
+            optical_flow: OpticalFlowConfig::default(),
         }
     }
 }

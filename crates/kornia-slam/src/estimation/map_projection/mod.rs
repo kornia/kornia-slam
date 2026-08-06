@@ -22,9 +22,12 @@
 
 mod keypoint_grid;
 
+use std::collections::HashMap;
+
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::Vec2F32;
+use kornia_3d::pose::{RansacParams, ransac_fundamental};
+use kornia_algebra::{Vec2F32, Vec2F64};
 use kornia_image::ImageSize;
 use kornia_imgproc::features::hamming_distance;
 
@@ -32,7 +35,7 @@ use super::pnp::{self, PnpConfig};
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
 use crate::frame::Frame;
-use crate::map::{Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
+use crate::map::{Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
 
 use super::Estimate;
 use keypoint_grid::KeypointGrid;
@@ -79,6 +82,12 @@ pub struct MapProjectionConfig {
     pub search_widen_per_sec: f32,
     /// Upper bound on `search_scale` (see `search_scale_for`).
     pub max_search_scale: f32,
+    /// Inlier threshold (pixels) for the fundamental-matrix RANSAC geometric
+    /// consistency check applied to reference-keyframe/current-frame
+    /// correspondence pairs before PnP (see
+    /// [`MapProjectionEstimator::geometric_consistency_filter`]). Matches
+    /// lightweight_vio's own tuned `F_threshold` default.
+    pub geometric_filter_threshold_px: f64,
 }
 
 impl Default for MapProjectionConfig {
@@ -99,6 +108,7 @@ impl Default for MapProjectionConfig {
             },
             search_widen_per_sec: 1.0,
             max_search_scale: 4.0,
+            geometric_filter_threshold_px: 1.0,
         }
     }
 }
@@ -165,6 +175,12 @@ impl MapProjectionEstimator {
         camera: &PinholeCamera,
         current_keyframe_idx: Option<usize>,
         search_scale: f32,
+        // KLT-seeded correspondences (see `optical_flow::klt_correspondences`,
+        // called by `Pipeline::tracking_step`), tried before anything below.
+        // Unlike `projection_matches`, generating these doesn't depend on
+        // `candidate_pose` at all, so a degraded prediction can't starve this
+        // path the way it can the projection search.
+        pre_seeded: Option<Vec<(usize, usize)>>,
     ) -> Result<Estimate, MapProjectionRejectReason> {
         let pnp = &self.config.pnp;
 
@@ -188,6 +204,18 @@ impl MapProjectionEstimator {
         let try_track_and_refine = |correspondences: Vec<(usize, usize)>,
                                     pose_init: &Pose3d|
          -> Result<Estimate, MapProjectionRejectReason> {
+            // Independent 2D geometric-consistency check, ahead of PnP and
+            // independent of any 3D map-point position or pose estimate: a
+            // correspondence whose reference-keyframe/current-frame pixel
+            // pair doesn't fit *any* fundamental matrix that the bulk of the
+            // other pairs agree on is very likely a bad match, regardless of
+            // whether the map/pose happens to also think it's consistent.
+            let correspondences = self.geometric_consistency_filter(
+                current_kf,
+                &correspondences,
+                &curr_keypoints_undist,
+                camera,
+            );
             let (mut pose, mut inliers) = self
                 .solve_pnp(
                     map.map_points(),
@@ -227,6 +255,16 @@ impl MapProjectionEstimator {
                 matches,
             })
         };
+
+        // KLT-seeded correspondences, tried first when available — see the
+        // `pre_seeded` doc above for why this jumps the queue ahead of the
+        // pose-dependent projection search.
+        if let Some(seeded) = pre_seeded
+            && seeded.len() >= pnp.min_correspondences
+            && let Ok(estimate) = try_track_and_refine(seeded, candidate_pose)
+        {
+            return Ok(estimate);
+        }
 
         // PnP from projection matches.
         let last_reject = if projection_matches.len() >= pnp.min_correspondences {
@@ -327,6 +365,97 @@ impl MapProjectionEstimator {
             inliers,
             matches: global_matches,
         })
+    }
+
+    /// Filters `correspondences` (map-point-index, current-frame-keypoint-index
+    /// pairs) by fundamental-matrix RANSAC between each map point's pixel
+    /// observation in the reference keyframe and its matched pixel in the
+    /// current frame — mirrors lightweight_vio's per-frame
+    /// `apply_fundamental_matrix_filter`, adapted to kornia-slam's
+    /// reference-keyframe-centric tracking (lightweight_vio checks against
+    /// the immediately previous frame; here the reference keyframe plays
+    /// that role, since that's what per-frame correspondences are already
+    /// matched against).
+    ///
+    /// Unlike the PnP inlier check this runs *before* it and needs neither a
+    /// 3D map-point position nor a pose estimate — it only asks whether the
+    /// bulk of the 2D-2D pixel pairs agree on *some* consistent epipolar
+    /// geometry. A pair that doesn't is very likely a bad match regardless
+    /// of what the map/pose currently believe, so this catches a class of
+    /// outlier the existing Hamming-distance + reprojection-radius gates
+    /// don't: one that's a plausible descriptor match and a plausible
+    /// reprojection under a *wrong* pose, but geometrically inconsistent
+    /// with where the rest of the frame's matches say the camera actually
+    /// moved.
+    ///
+    /// A correspondence whose map point has no observation in
+    /// `current_kf` (e.g. it's only observed by covisible neighbors) can't
+    /// be checked this way and is kept unfiltered, same as
+    /// lightweight_vio's own `tracked_id < 0` skip. Also a no-op (returns
+    /// `correspondences` unchanged) if there are too few checkable pairs for
+    /// an 8-point solve, or if RANSAC itself can't find a confident fit —
+    /// in both cases there's no basis to reject anything.
+    fn geometric_consistency_filter(
+        &self,
+        current_kf: Option<&Keyframe>,
+        correspondences: &[(usize, usize)],
+        curr_keypoints_undist: &[[f32; 2]],
+        camera: &PinholeCamera,
+    ) -> Vec<(usize, usize)> {
+        const MIN_PAIRS_FOR_FILTER: usize = 8;
+
+        let Some(current_kf) = current_kf else {
+            return correspondences.to_vec();
+        };
+
+        let mp_to_desc: HashMap<usize, usize> = current_kf
+            .map_point_by_desc_idx
+            .iter()
+            .enumerate()
+            .filter_map(|(desc_idx, mp_opt)| mp_opt.map(|mp_idx| (mp_idx, desc_idx)))
+            .collect();
+
+        let mut checkable_indices = Vec::new();
+        let mut x1 = Vec::new();
+        let mut x2 = Vec::new();
+        for (i, &(mp_idx, kp_idx)) in correspondences.iter().enumerate() {
+            let Some(&desc_idx) = mp_to_desc.get(&mp_idx) else {
+                continue;
+            };
+            let Some(ref_pt) = current_kf.frame.undistorted_xy(desc_idx, camera) else {
+                continue;
+            };
+            let Some(&cur_pt) = curr_keypoints_undist.get(kp_idx) else {
+                continue;
+            };
+            checkable_indices.push(i);
+            x1.push(Vec2F64::new(ref_pt[0] as f64, ref_pt[1] as f64));
+            x2.push(Vec2F64::new(cur_pt[0] as f64, cur_pt[1] as f64));
+        }
+
+        if checkable_indices.len() < MIN_PAIRS_FOR_FILTER {
+            return correspondences.to_vec();
+        }
+
+        let params = RansacParams {
+            threshold: self.config.geometric_filter_threshold_px,
+            ..RansacParams::default()
+        };
+        let Ok(result) = ransac_fundamental(&x1, &x2, &params) else {
+            return correspondences.to_vec();
+        };
+
+        let mut keep = vec![true; correspondences.len()];
+        for (&i, &is_inlier) in checkable_indices.iter().zip(result.inliers.iter()) {
+            if !is_inlier {
+                keep[i] = false;
+            }
+        }
+        correspondences
+            .iter()
+            .zip(keep.iter())
+            .filter_map(|(&c, &k)| k.then_some(c))
+            .collect()
     }
 
     /// Gather 3D-2D correspondences from map points and keypoints, then solve PnP.

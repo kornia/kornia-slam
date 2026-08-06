@@ -172,7 +172,7 @@ impl Default for ViBaParams {
             // constraint that fights legitimate, well-observed bias updates
             // (those edges carry ~1e9 information when nav residuals are
             // healthy, per the LM-damping note below).
-            accel_bias_prior_weight: 1e2,
+            accel_bias_prior_weight: 1e5,
         }
     }
 }

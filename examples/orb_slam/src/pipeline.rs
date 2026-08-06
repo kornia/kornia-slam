@@ -13,9 +13,11 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
 use kornia_algebra::{Mat3F64, Vec2F64, Vec3F64};
+use kornia_image::Image;
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_slam::Frame;
+use kornia_slam::estimation::optical_flow::{OpticalFlowConfig, TrackState, klt_correspondences};
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use kornia_slam::estimation::{
     ImuInitConfig, ImuInitResult, ImuInitializer, MapProjectionEstimator,
@@ -27,6 +29,7 @@ use kornia_slam::system::{
     TrackingStatus,
 };
 use crate::local_mapping::{KeyframeJob, LocalMappingHandle};
+use crate::source::FrameItem;
 /// Top-level ORB-SLAM pipeline: orchestrates tracking, mapping, and state transitions.
 pub struct Pipeline {
     // Camera model
@@ -88,6 +91,15 @@ pub struct Pipeline {
     // this lets tracking_step detect that and propagate the same correction
     // onto the live tracked pose instead of silently drifting away from it.
     last_synced_ref_kf: Option<(usize, Pose3d)>,
+    // Points carried forward frame-to-frame via optical flow (see
+    // `estimation::optical_flow`), independent of the candidate pose. Reset
+    // to empty on any tracking-loss reset — a fresh bootstrap means a fresh
+    // map, so any old `map_point_idx` in here would be dangling.
+    track_state: TrackState,
+    optical_flow_config: OpticalFlowConfig,
+    // A/B toggle: seed `estimate_pose` with KLT correspondences (`true`) or
+    // rely solely on the pre-existing projection-search path (`false`).
+    enable_optical_flow: bool,
 
     // Optional CSV sink for VIBA telemetry. When the env var `KORNIA_VIBA_CSV`
     // is set, every VIBA0/VIBA1/VIBA2 attempt (accepted or rejected) appends one
@@ -145,6 +157,9 @@ impl Pipeline {
             imu_viba1_done: false,
             imu_viba2_done: false,
             last_synced_ref_kf: None,
+            track_state: TrackState::new(),
+            optical_flow_config: config.optical_flow,
+            enable_optical_flow: config.enable_optical_flow_tracking,
             viba_csv_path: Self::init_viba_csv(),
         }
     }
@@ -245,9 +260,26 @@ impl Pipeline {
     }
 
     /// Processes one frame (pre-extracted features) and returns the tracking result.
+    ///
+    /// `prev_frame` is the raw source frame immediately preceding this one —
+    /// `None` only on the very first frame ever received, which always
+    /// routes to `bootstrap_step` below and so never needs it. Carries the
+    /// grayscale image `Frame` itself doesn't store, for optical-flow
+    /// tracking (see `estimation::optical_flow`); it's the previous *source*
+    /// frame regardless of tracking state (e.g. a re-init in progress), not
+    /// the previous frame of the current tracking segment — optical flow
+    /// only needs pixel continuity, not SLAM-internal continuity.
     pub fn process_frame(
         &mut self,
         mut frame: Frame,
+        prev_frame: Option<FrameItem>,
+        // This frame's own raw (distorted) grayscale image — same one
+        // `frame`'s keypoints were extracted from. Needed alongside
+        // `prev_frame`'s image for optical-flow tracking (KLT tracks *into*
+        // this image); `Frame` itself carries no pixel data, only `FrameItem`
+        // does, which is why this is a separate parameter rather than a
+        // `Frame` field.
+        curr_image: &Image<u8, 1>,
         timestamp_sec: f64,
         imu_samples: Vec<ImuMeasurement>,
     ) -> TrackingResult {
@@ -258,8 +290,10 @@ impl Pipeline {
 
         match self.state.mode {
             SystemMode::Bootstrap => self.bootstrap_step(frame, timestamp_sec),
-            SystemMode::ImuInit => self.inertial_init_step(frame, timestamp_sec),
-            SystemMode::Tracking => self.tracking_step(frame, timestamp_sec),
+            SystemMode::ImuInit => {
+                self.inertial_init_step(frame, prev_frame, curr_image, timestamp_sec)
+            }
+            SystemMode::Tracking => self.tracking_step(frame, prev_frame, curr_image, timestamp_sec),
         }
     }
 
@@ -697,8 +731,14 @@ impl Pipeline {
         (pred_cam_to_world.inverse(), v_j)
     }
 
-    fn inertial_init_step(&mut self, frame: Frame, timestamp_sec: f64) -> TrackingResult {
-        let result = self.tracking_step(frame, timestamp_sec);
+    fn inertial_init_step(
+        &mut self,
+        frame: Frame,
+        prev_frame: Option<FrameItem>,
+        curr_image: &Image<u8, 1>,
+        timestamp_sec: f64,
+    ) -> TrackingResult {
+        let result = self.tracking_step(frame, prev_frame, curr_image, timestamp_sec);
 
         if result.status == TrackingStatus::KeyframeAccepted
             && let Some(start_idx) = self.inertial_init_start_kf_idx
@@ -830,7 +870,13 @@ impl Pipeline {
         result
     }
 
-    fn tracking_step(&mut self, frame: Frame, timestamp_sec: f64) -> TrackingResult {
+    fn tracking_step(
+        &mut self,
+        frame: Frame,
+        prev_frame: Option<FrameItem>,
+        curr_image: &Image<u8, 1>,
+        timestamp_sec: f64,
+    ) -> TrackingResult {
         let image_size = frame.image_size;
         let prev_timestamp = self.state.last_frame_timestamp_sec;
 
@@ -909,6 +955,30 @@ impl Pipeline {
             .map_or(0.0, |t0| timestamp_sec - t0);
         let search_scale = self.estimator.config().search_scale_for(currently_lost_for);
 
+        // KLT-seeded correspondences: track points already in `track_state`
+        // from the previous frame's image into this one, then snap each
+        // survivor onto the nearest freshly-detected keypoint here. Entirely
+        // independent of `candidate_pose` — unlike the projection search
+        // `estimate_pose` falls back to, a degraded prediction can't starve
+        // this path. `None` (not attempted, or attempt failed) just means
+        // `estimate_pose` falls through to its existing behavior unchanged.
+        const KLT_SNAP_RADIUS_PX: f32 = 3.0;
+        let pre_seeded = if self.enable_optical_flow && !self.track_state.is_empty() {
+            prev_frame.as_ref().and_then(|prev| {
+                klt_correspondences(
+                    &self.track_state,
+                    &prev.image,
+                    curr_image,
+                    &frame.features.keypoints_xy,
+                    &self.optical_flow_config,
+                    KLT_SNAP_RADIUS_PX,
+                )
+                .ok()
+            })
+        } else {
+            None
+        };
+
         let result = self.estimator.estimate_pose(
             &frame,
             &candidate_pose,
@@ -917,6 +987,7 @@ impl Pipeline {
             &self.camera,
             self.state.current_keyframe_idx,
             search_scale,
+            pre_seeded,
         );
 
         let (mut status, matches, tracked_inliers, reject_reason) = match result {
@@ -933,6 +1004,17 @@ impl Pipeline {
                     self.state.velocity = Some(Pose3d::between(&pose_before, &estimate.pose));
                 }
 
+                // Rebuild track_state from *this* frame's winning matches —
+                // regardless of whether they came from the KLT-seeded path
+                // above or the pre-existing projection-search/reference-
+                // keyframe fallback. This is what lets optical-flow tracking
+                // recover instead of being a one-way ratchet: any map point
+                // the fallback finds (one KLT lost, or newly visible) is
+                // trackable again starting next frame. See
+                // `TrackState::refresh_from_matches`.
+                self.track_state
+                    .refresh_from_matches(&estimate.matches, &frame.features.keypoints_xy);
+
                 (
                     TrackingStatus::Tracked,
                     estimate.matches,
@@ -941,6 +1023,15 @@ impl Pipeline {
                 )
             }
             Err(reason) => {
+                // No winning correspondence set this frame, so there's
+                // nothing to refresh `track_state` from. Clear it rather
+                // than leaving stale pixels in place: next frame's
+                // `prev_frame.image` will be *this* frame's image, so any
+                // track still holding a pixel from an earlier frame would
+                // seed KLT from the wrong starting image entirely, not just
+                // a stale one.
+                self.track_state = TrackState::new();
+
                 // Carry the predicted pose forward instead of freezing at
                 // pose_before. state.velocity_world was already advanced by
                 // predict_pose_imu above regardless of visual outcome, so

@@ -524,6 +524,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Main loop ──────────────────────────────────────────────────────────
     let mut trajectory: Vec<[f32; 3]> = Vec::new();
     let mut processed: usize = 0;
+    let mut prev_frame: Option<FrameItem> = None;
 
     while let Some(item) = source.next_frame()? {
         let now = Instant::now();
@@ -545,7 +546,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let image_size = gray_u8.size();
         let imu_measurements: Vec<ImuMeasurement> = if imu_enabled {
             imu_samples
-                .into_iter()
+                .iter()
                 .map(|s| ImuMeasurement {
                     timestamp: s.timestamp_sec,
                     gyro: Vec3F64::new(s.gyro[0], s.gyro[1], s.gyro[2]),
@@ -620,7 +621,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             keypoints_undist: Vec::new(),
         };
         let t0 = std::time::Instant::now();
-        let result = system.process_frame(frame, timestamp_sec, imu_measurements);
+        let result =
+            system.process_frame(frame, prev_frame, &gray_u8, timestamp_sec, imu_measurements);
         let frame_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let keyframe_idx = system.current_keyframe_idx().unwrap_or(idx);
         let map_point_count = system.num_active_map_points();
@@ -692,6 +694,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tui::TuiAction::None => {}
             }
         }
+        prev_frame = Some(FrameItem {
+            idx,
+            timestamp_sec,
+            image: gray_u8,
+            right_image,
+            imu_samples,
+        });
     }
 
     // Restore terminal before printing the final summary.
