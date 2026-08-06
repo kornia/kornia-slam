@@ -1,6 +1,7 @@
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use kornia_3d::ba::BaParams;
 use kornia_3d::ba_schur::bundle_adjust_schur;
@@ -15,6 +16,54 @@ pub struct KeyframeJob {
     pub imu_initialized: bool,
     pub imu_t_bc: Option<Pose3d>,
     pub gravity_world: Vec3F64,
+    /// Set by the tracking thread right before `submit`, so the worker can
+    /// report how long the job sat in the channel before it got picked up.
+    pub submitted_at: Instant,
+}
+
+/// Running queue-wait / solve-time stats for the local mapping worker,
+/// printed per job and summarized when the worker shuts down — the signal
+/// for whether offloading BA to this thread is actually keeping up with
+/// tracking, not just deferring the cost.
+#[derive(Default)]
+struct LocalMappingStats {
+    jobs: usize,
+    total_queue_wait: std::time::Duration,
+    total_solve: std::time::Duration,
+}
+
+impl LocalMappingStats {
+    fn record(
+        &mut self,
+        kf_idx: usize,
+        queue_wait: std::time::Duration,
+        solve: std::time::Duration,
+    ) {
+        self.jobs += 1;
+        self.total_queue_wait += queue_wait;
+        self.total_solve += solve;
+        let avg_queue_ms = self.total_queue_wait.as_secs_f64() * 1000.0 / self.jobs as f64;
+        let avg_solve_ms = self.total_solve.as_secs_f64() * 1000.0 / self.jobs as f64;
+        println!(
+            "[local_mapping] kf={kf_idx} queue={:.1}ms solve={:.1}ms  (avg queue={avg_queue_ms:.1}ms solve={avg_solve_ms:.1}ms over {} jobs)",
+            queue_wait.as_secs_f64() * 1000.0,
+            solve.as_secs_f64() * 1000.0,
+            self.jobs,
+        );
+    }
+
+    fn report_final(&self) {
+        if self.jobs == 0 {
+            return;
+        }
+        let avg_queue_ms = self.total_queue_wait.as_secs_f64() * 1000.0 / self.jobs as f64;
+        let avg_solve_ms = self.total_solve.as_secs_f64() * 1000.0 / self.jobs as f64;
+        println!(
+            "[local_mapping] done. {} jobs, avg queue={avg_queue_ms:.1}ms avg solve={avg_solve_ms:.1}ms total_solve={:.2}s",
+            self.jobs,
+            self.total_solve.as_secs_f64(),
+        );
+    }
 }
 pub struct LocalMappingHandle {
     sender: Option<mpsc::Sender<KeyframeJob>>,
@@ -24,8 +73,11 @@ impl LocalMappingHandle {
     pub fn spawn(map: Arc<Mutex<Map>>, camera: PinholeCamera) -> Self {
         let (sender, receiver) = mpsc::channel::<KeyframeJob>();
 
+        let mut stats = LocalMappingStats::default();
         let join_handle = thread::spawn(move || {
             for job in receiver {
+                let queue_wait = job.submitted_at.elapsed();
+                let solve_t0 = Instant::now();
                 if job.imu_initialized {
                     // Snapshot phase: brief lock, just copying out the
                     // window's poses/velocities/biases/observations.
@@ -55,6 +107,7 @@ impl LocalMappingHandle {
                             ..ViBaParams::default()
                         },
                     );
+                    stats.record(job.kf_idx, queue_wait, solve_t0.elapsed());
 
                     // Write-back phase: brief lock again.
                     if let Ok(result) = result {
@@ -95,6 +148,7 @@ impl LocalMappingHandle {
                         &camera,
                         &BaParams::default(),
                     );
+                    stats.record(job.kf_idx, queue_wait, solve_t0.elapsed());
 
                     if let Ok(result) = result {
                         let mut map_guard = map.lock().unwrap();
@@ -109,6 +163,7 @@ impl LocalMappingHandle {
                     }
                 }
             }
+            stats.report_final();
         });
 
         Self {

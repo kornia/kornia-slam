@@ -1273,6 +1273,7 @@ impl Pipeline {
                 imu_initialized,
                 imu_t_bc: self.imu_t_bc,
                 gravity_world: self.gravity_world,
+                submitted_at: std::time::Instant::now(),
             });
         }
 
