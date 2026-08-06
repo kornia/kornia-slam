@@ -6,6 +6,14 @@ description = "Spatial runtime for real-time pose estimation, mapping, and agent
 license.workspace = true
 repository.workspace = true
 
+[features]
+# The measurement simulator (`sim` module). On by default so CI's
+# `cargo test --workspace` and `cargo clippy --all-targets` — both of which run
+# with default features — actually cover it. Downstream consumers who don't
+# want the simulator compiled in can opt out with `default-features = false`.
+default = ["sim"]
+sim = []
+
 [dependencies]
 kornia-3d = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
 kornia-algebra = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
