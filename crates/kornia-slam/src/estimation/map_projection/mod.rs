@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{RansacParams, ransac_fundamental};
-use kornia_algebra::{Vec2F32, Vec2F64};
+use kornia_algebra::{Vec2F32, Vec2F64, Vec3F64};
 use kornia_image::ImageSize;
 use kornia_imgproc::features::hamming_distance;
 
@@ -181,6 +181,13 @@ impl MapProjectionEstimator {
         // `candidate_pose` at all, so a degraded prediction can't starve this
         // path the way it can the projection search.
         pre_seeded: Option<Vec<(usize, usize)>>,
+        // Per-stage correspondence counts for whichever source(s) get
+        // attempted this call, appended here rather than returned as part of
+        // `MapProjectionRejectReason` — this is purely for diagnosing *why*
+        // a source failed (starved by the prior-reprojection gate vs. an
+        // outright LM failure vs. never having enough input matches to try),
+        // not part of the tracking contract itself.
+        debug_log: &mut Vec<String>,
     ) -> Result<Estimate, MapProjectionRejectReason> {
         let pnp = &self.config.pnp;
 
@@ -202,8 +209,11 @@ impl MapProjectionEstimator {
 
         // Shared logic: try_track → refine_pose → Estimate, or propagate rejection.
         let try_track_and_refine = |correspondences: Vec<(usize, usize)>,
-                                    pose_init: &Pose3d|
+                                    pose_init: &Pose3d,
+                                    source: &'static str,
+                                    debug_log: &mut Vec<String>|
          -> Result<Estimate, MapProjectionRejectReason> {
+            let input_n = correspondences.len();
             // Independent 2D geometric-consistency check, ahead of PnP and
             // independent of any 3D map-point position or pose estimate: a
             // correspondence whose reference-keyframe/current-frame pixel
@@ -216,17 +226,71 @@ impl MapProjectionEstimator {
                 &curr_keypoints_undist,
                 camera,
             );
-            let (mut pose, mut inliers) = self
-                .solve_pnp(
-                    map.map_points(),
-                    &correspondences,
-                    &curr_keypoints_undist,
-                    camera,
-                    pose_init,
-                    search_scale,
-                )
-                .ok_or(MapProjectionRejectReason::PnpFailed)?;
+            let after_geom_n = correspondences.len();
+
+            // Two attempts at making this source-aware for `source == "klt"`
+            // have been tried and reverted, both measured via V103
+            // `--evaluate` against repeated baselines:
+            //   1. Solve via `solve_pnp_ransac` (EPnP+RANSAC, no dependency
+            //      on `pose_init`): ATE RMSE ~1.1m -> ~936m, map diverging
+            //      into the hundreds of meters, repeated full resets.
+            //      EPnP-via-RANSAC has no way to reject a pose that's
+            //      self-consistent with a small, weakly-conditioned
+            //      correspondence set (common here — many KLT attempts had
+            //      only 10-30 points) but globally wrong.
+            //   2. Keep `pose_init` as the seed, but widen the coarse prior
+            //      gate (unbounded, then 120px) and add a Huber loss to the
+            //      LM solve itself. Unbounded: ATE RMSE 1.8-4.1m / 1-3
+            //      resets across repeats. 120px: 1.5-2.3m / 1 reset, and
+            //      V101 regressed separately (3.4m ATE / 14% drift vs. a
+            //      0.68m baseline). Huber only protects against a *minority*
+            //      outlier fraction within an otherwise-good correspondence
+            //      set; it doesn't stop the LM solve (a local method) from
+            //      confidently converging to a pose that fits the surviving
+            //      correspondences well locally without being the true
+            //      global pose when `pose_init` is far off — that's a
+            //      quieter failure than RANSAC's divergence but still a net
+            //      accuracy regression, and tuning the gate width alone
+            //      didn't fix it.
+            // Both reverted; `source` is solved identically to the other
+            // sources via `self.config.pnp` below. `PnpConfig` now also has
+            // `outlier_rounds` (multi-round hard-exclusion refit, mirroring
+            // lightweight_vio's `PnPOptimizer::optimize_pose`) and a
+            // `converged` check on the LM result (mirrors their "only
+            // commit if Ceres reports CONVERGENCE, else keep previous
+            // pose") — see `pnp::solve_pnp_with_diagnostics`. Both default
+            // to today's single-pass behavior (`outlier_rounds: 1`) for
+            // every existing caller; re-verify via `--evaluate` on all six
+            // sequences before turning `outlier_rounds` up or revisiting a
+            // widened `klt_pnp` gate with this in place.
+            let (pnp_result, diag) = self.solve_pnp(
+                map.map_points(),
+                &correspondences,
+                &curr_keypoints_undist,
+                camera,
+                pose_init,
+                search_scale,
+            );
+            let diag_msg = format!(
+                "prior_survivors={}/{} (need {}) last_round_active={} converged={:?}",
+                diag.prior_survivors,
+                diag.input,
+                pnp.min_correspondences,
+                diag.last_round_active,
+                diag.converged
+            );
+            let Some((mut pose, mut inliers)) = pnp_result else {
+                debug_log.push(format!(
+                    "[track_diag] {source}: in={input_n} after_geom={after_geom_n} {diag_msg}"
+                ));
+                return Err(MapProjectionRejectReason::PnpFailed);
+            };
             if inliers < pnp.min_inliers_early {
+                debug_log.push(format!(
+                    "[track_diag] {source}: in={input_n} after_geom={after_geom_n} {diag_msg} \
+                     early_inliers={inliers} (need {})",
+                    pnp.min_inliers_early
+                ));
                 return Err(MapProjectionRejectReason::LowPnpInliers);
             }
             let mut matches = correspondences;
@@ -259,20 +323,39 @@ impl MapProjectionEstimator {
         // KLT-seeded correspondences, tried first when available — see the
         // `pre_seeded` doc above for why this jumps the queue ahead of the
         // pose-dependent projection search.
-        if let Some(seeded) = pre_seeded
-            && seeded.len() >= pnp.min_correspondences
-            && let Ok(estimate) = try_track_and_refine(seeded, candidate_pose)
-        {
-            return Ok(estimate);
+        match pre_seeded {
+            Some(seeded) if seeded.len() >= pnp.min_correspondences => {
+                if let Ok(estimate) = try_track_and_refine(seeded, candidate_pose, "klt", debug_log)
+                {
+                    return Ok(estimate);
+                }
+            }
+            Some(seeded) => {
+                debug_log.push(format!(
+                    "[track_diag] klt: seeded={} below min_correspondences={}",
+                    seeded.len(),
+                    pnp.min_correspondences
+                ));
+            }
+            None => debug_log.push(
+                "[track_diag] klt: not attempted (disabled, no prev frame, or empty track_state)"
+                    .to_string(),
+            ),
         }
 
         // PnP from projection matches.
         let last_reject = if projection_matches.len() >= pnp.min_correspondences {
-            match try_track_and_refine(projection_matches, candidate_pose) {
+            match try_track_and_refine(projection_matches, candidate_pose, "projection", debug_log)
+            {
                 Ok(estimate) => return Ok(estimate),
                 Err(reason) => reason,
             }
         } else {
+            debug_log.push(format!(
+                "[track_diag] projection: matches={} below min_correspondences={}",
+                projection_matches.len(),
+                pnp.min_correspondences
+            ));
             MapProjectionRejectReason::LowProjectionMatches
         };
 
@@ -291,6 +374,10 @@ impl MapProjectionEstimator {
 
         const MIN_REF_MATCHES: usize = 15;
         if ref_matches.len() < MIN_REF_MATCHES {
+            debug_log.push(format!(
+                "[track_diag] reference: ref_matches={} below MIN_REF_MATCHES={MIN_REF_MATCHES}",
+                ref_matches.len()
+            ));
             return Err(MapProjectionRejectReason::LowReferenceMatches);
         }
 
@@ -304,10 +391,15 @@ impl MapProjectionEstimator {
         }
 
         if ref_correspondences.len() < pnp.min_correspondences {
+            debug_log.push(format!(
+                "[track_diag] reference: correspondences={} below min_correspondences={}",
+                ref_correspondences.len(),
+                pnp.min_correspondences
+            ));
             return Err(MapProjectionRejectReason::LowReferenceCorrespondences);
         }
 
-        try_track_and_refine(ref_correspondences, pose_before_tracking)
+        try_track_and_refine(ref_correspondences, pose_before_tracking, "reference", debug_log)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -352,14 +444,16 @@ impl MapProjectionEstimator {
             return None;
         }
 
-        let (new_pose, inliers) = self.solve_pnp(
-            map.map_points(),
-            &global_matches,
-            curr_keypoints_undist,
-            camera,
-            pose_init,
-            search_scale,
-        )?;
+        let (new_pose, inliers) = self
+            .solve_pnp(
+                map.map_points(),
+                &global_matches,
+                curr_keypoints_undist,
+                camera,
+                pose_init,
+                search_scale,
+            )
+            .0?;
         Some(Estimate {
             pose: new_pose,
             inliers,
@@ -472,15 +566,9 @@ impl MapProjectionEstimator {
         camera: &PinholeCamera,
         pose_init: &Pose3d,
         search_scale: f32,
-    ) -> Option<(Pose3d, usize)> {
-        let mut points_world = Vec::with_capacity(correspondences.len());
-        let mut points_image = Vec::with_capacity(correspondences.len());
-        for &(mp_idx, kp_idx) in correspondences {
-            if let (Some(mp), Some(&kp)) = (map_points.get(mp_idx), keypoints_undist.get(kp_idx)) {
-                points_world.push(mp.position);
-                points_image.push(Vec2F32::new(kp[0], kp[1]));
-            }
-        }
+    ) -> (Option<(Pose3d, usize)>, pnp::PnpDiagnostics) {
+        let (points_world, points_image) =
+            Self::gather_points(map_points, correspondences, keypoints_undist);
         let pnp_config = if search_scale > 1.0 {
             PnpConfig {
                 prior_reproj_threshold_px: self.config.pnp.prior_reproj_threshold_px
@@ -490,7 +578,26 @@ impl MapProjectionEstimator {
         } else {
             self.config.pnp.clone()
         };
-        pnp::solve_pnp(&points_world, &points_image, camera, pose_init, &pnp_config)
+        pnp::solve_pnp_with_diagnostics(&points_world, &points_image, camera, pose_init, &pnp_config)
+    }
+
+    /// Resolves correspondences (map-point-index, keypoint-index pairs) into
+    /// parallel 3D-world / 2D-image point arrays, dropping any pair whose
+    /// index is out of range.
+    fn gather_points(
+        map_points: &[MapPoint],
+        correspondences: &[(usize, usize)],
+        keypoints_undist: &[[f32; 2]],
+    ) -> (Vec<Vec3F64>, Vec<Vec2F32>) {
+        let mut points_world = Vec::with_capacity(correspondences.len());
+        let mut points_image = Vec::with_capacity(correspondences.len());
+        for &(mp_idx, kp_idx) in correspondences {
+            if let (Some(mp), Some(&kp)) = (map_points.get(mp_idx), keypoints_undist.get(kp_idx)) {
+                points_world.push(mp.position);
+                points_image.push(Vec2F32::new(kp[0], kp[1]));
+            }
+        }
+        (points_world, points_image)
     }
 
     /// Undistorts keypoints, builds a spatial grid, and runs projection matching

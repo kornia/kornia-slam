@@ -2,6 +2,14 @@
 members = ["crates/*", "examples/orb_slam"]
 resolver = "3"
 
-[workspace.package]
-license = "Apache-2.0"
-repository = "https://github.com/kornia/kornia-slam"
+# Astik-2002/kornia-rs@huber-pnp-refine (Huber/Cauchy robust-loss support
+# added to kornia-3d's PnP LM refine, not yet upstream). Pinned to a rev,
+# not the branch, so this doesn't silently change if more commits land on
+# that branch without re-verification. Remove once merged/released upstream.
+[patch."https://github.com/kornia/kornia-rs"]
+kornia-3d = { git = "https://github.com/Astik-2002/kornia-rs", rev = "7f9248a25650de6c6660dee0928bb22245df5c28" }
+kornia-algebra = { git = "https://github.com/Astik-2002/kornia-rs", rev = "7f9248a25650de6c6660dee0928bb22245df5c28" }
+kornia-image = { git = "https://github.com/Astik-2002/kornia-rs", rev = "7f9248a25650de6c6660dee0928bb22245df5c28" }
+kornia-imgproc = { git = "https://github.com/Astik-2002/kornia-rs", rev = "7f9248a25650de6c6660dee0928bb22245df5c28" }
+kornia-io = { git = "https://github.com/Astik-2002/kornia-rs", rev = "7f9248a25650de6c6660dee0928bb22245df5c28" }
+kornia-tensor = { git = "https://github.com/Astik-2002/kornia-rs", rev = "7f9248a25650de6c6660dee0928bb22245df5c28" }

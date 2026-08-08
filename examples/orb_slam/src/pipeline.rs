@@ -17,7 +17,7 @@ use kornia_image::Image;
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_slam::Frame;
-use kornia_slam::estimation::optical_flow::{OpticalFlowConfig, TrackState, klt_correspondences};
+use kornia_slam::estimation::optical_flow::{OpticalFlowConfig, TrackState, snap_survivors};
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use kornia_slam::estimation::{
     ImuInitConfig, ImuInitResult, ImuInitializer, MapProjectionEstimator,
@@ -962,23 +962,27 @@ impl Pipeline {
         // `estimate_pose` falls back to, a degraded prediction can't starve
         // this path. `None` (not attempted, or attempt failed) just means
         // `estimate_pose` falls through to its existing behavior unchanged.
+        //
+        // `klt_survivors` (the raw tracked points, before snapping to a
+        // detected keypoint) is kept around separately from `pre_seeded` so
+        // it can be committed back to `track_state` below even if this
+        // frame's tracking attempt doesn't win — see the rationale at the
+        // `Err` arm below.
         const KLT_SNAP_RADIUS_PX: f32 = 3.0;
-        let pre_seeded = if self.enable_optical_flow && !self.track_state.is_empty() {
+        let klt_survivors = if self.enable_optical_flow && !self.track_state.is_empty() {
             prev_frame.as_ref().and_then(|prev| {
-                klt_correspondences(
-                    &self.track_state,
-                    &prev.image,
-                    curr_image,
-                    &frame.features.keypoints_xy,
-                    &self.optical_flow_config,
-                    KLT_SNAP_RADIUS_PX,
-                )
-                .ok()
+                self.track_state
+                    .track(&prev.image, curr_image, &self.optical_flow_config)
+                    .ok()
             })
         } else {
             None
         };
+        let pre_seeded = klt_survivors
+            .as_ref()
+            .map(|survivors| snap_survivors(survivors, &frame.features.keypoints_xy, KLT_SNAP_RADIUS_PX));
 
+        let mut track_diag_log = Vec::new();
         let result = self.estimator.estimate_pose(
             &frame,
             &candidate_pose,
@@ -988,7 +992,11 @@ impl Pipeline {
             self.state.current_keyframe_idx,
             search_scale,
             pre_seeded,
+            &mut track_diag_log,
         );
+        if self.debug {
+            self.debug_messages.extend(track_diag_log);
+        }
 
         let (mut status, matches, tracked_inliers, reject_reason) = match result {
             Ok(estimate) => {
@@ -1024,13 +1032,28 @@ impl Pipeline {
             }
             Err(reason) => {
                 // No winning correspondence set this frame, so there's
-                // nothing to refresh `track_state` from. Clear it rather
-                // than leaving stale pixels in place: next frame's
-                // `prev_frame.image` will be *this* frame's image, so any
-                // track still holding a pixel from an earlier frame would
-                // seed KLT from the wrong starting image entirely, not just
-                // a stale one.
+                // nothing to refresh `track_state` from via
+                // `refresh_from_matches`. But the KLT points themselves
+                // (`klt_survivors`, computed above) were still tracked
+                // successfully into *this* frame's image regardless of
+                // whether PnP/the prior-reprojection gate accepted them —
+                // e.g. a single bad IMU-predicted `candidate_pose` (common
+                // during the fast rotations V-room sequences have and MH
+                // mostly doesn't) can reject an otherwise-good KLT
+                // correspondence set. Committing `klt_survivors` here keeps
+                // those physical tracks alive so KLT can try again next
+                // frame; unconditionally wiping to empty made `pre_seeded`
+                // permanently unavailable for the rest of the loss episode
+                // (it requires `!self.track_state.is_empty()`), turning one
+                // bad frame into a multi-second tracking loss recoverable
+                // only by the weaker, pose-agnostic reference-keyframe
+                // fallback. Only fall back to a full reset when there was
+                // nothing to carry (KLT disabled, no previous frame, or
+                // every point failed to track).
                 self.track_state = TrackState::new();
+                if let Some(survivors) = klt_survivors {
+                    self.track_state.set_tracks(survivors);
+                }
 
                 // Carry the predicted pose forward instead of freezing at
                 // pose_before. state.velocity_world was already advanced by
