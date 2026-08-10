@@ -2,6 +2,10 @@
 members = ["crates/*", "examples/orb_slam"]
 resolver = "3"
 
+[workspace.package]
+license = "Apache-2.0"
+repository = "https://github.com/kornia/kornia-slam"
+
 # Astik-2002/kornia-rs@huber-pnp-refine (Huber/Cauchy robust-loss support
 # added to kornia-3d's PnP LM refine, not yet upstream). Pinned to a rev,
 # not the branch, so this doesn't silently change if more commits land on

@@ -399,7 +399,12 @@ impl MapProjectionEstimator {
             return Err(MapProjectionRejectReason::LowReferenceCorrespondences);
         }
 
-        try_track_and_refine(ref_correspondences, pose_before_tracking, "reference", debug_log)
+        try_track_and_refine(
+            ref_correspondences,
+            pose_before_tracking,
+            "reference",
+            debug_log,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -578,7 +583,13 @@ impl MapProjectionEstimator {
         } else {
             self.config.pnp.clone()
         };
-        pnp::solve_pnp_with_diagnostics(&points_world, &points_image, camera, pose_init, &pnp_config)
+        pnp::solve_pnp_with_diagnostics(
+            &points_world,
+            &points_image,
+            camera,
+            pose_init,
+            &pnp_config,
+        )
     }
 
     /// Resolves correspondences (map-point-index, keypoint-index pairs) into

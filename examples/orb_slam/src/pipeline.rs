@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::config::PipelineConfig;
+use crate::local_mapping::{KeyframeJob, LocalMappingHandle};
+use crate::source::FrameItem;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
@@ -28,8 +30,6 @@ use kornia_slam::system::{
     KeyframePolicy, SystemMode, SystemState, TrackingLossRecoveryPolicy, TrackingResult,
     TrackingStatus,
 };
-use crate::local_mapping::{KeyframeJob, LocalMappingHandle};
-use crate::source::FrameItem;
 /// Top-level ORB-SLAM pipeline: orchestrates tracking, mapping, and state transitions.
 pub struct Pipeline {
     // Camera model
@@ -293,7 +293,9 @@ impl Pipeline {
             SystemMode::ImuInit => {
                 self.inertial_init_step(frame, prev_frame, curr_image, timestamp_sec)
             }
-            SystemMode::Tracking => self.tracking_step(frame, prev_frame, curr_image, timestamp_sec),
+            SystemMode::Tracking => {
+                self.tracking_step(frame, prev_frame, curr_image, timestamp_sec)
+            }
         }
     }
 
@@ -307,9 +309,13 @@ impl Pipeline {
 
     /// Returns the index of the current reference keyframe, if tracking has one.
     pub fn current_keyframe_idx(&self) -> Option<usize> {
-        self.state
-            .current_keyframe_idx
-            .and_then(|ki| self.map.lock().unwrap().get_keyframe(ki).map(|kf| kf.frame.idx))
+        self.state.current_keyframe_idx.and_then(|ki| {
+            self.map
+                .lock()
+                .unwrap()
+                .get_keyframe(ki)
+                .map(|kf| kf.frame.idx)
+        })
     }
 
     /// Returns the number of active (non-culled) map points.
@@ -386,7 +392,9 @@ impl Pipeline {
 
         let added = self
             .map
-            .lock().unwrap().add_triangulated_points(None, &mut keyframe, &points);
+            .lock()
+            .unwrap()
+            .add_triangulated_points(None, &mut keyframe, &points);
         self.map.lock().unwrap().upsert_keyframe(keyframe);
 
         self.dbg(format!(
@@ -448,7 +456,10 @@ impl Pipeline {
             points.push((p_world, descriptor, color, *desc_idx, *desc_idx));
         }
 
-        self.map.lock().unwrap().add_triangulated_points(None, curr_kf, &points)
+        self.map
+            .lock()
+            .unwrap()
+            .add_triangulated_points(None, curr_kf, &points)
     }
 
     fn bootstrap_mono(&mut self, mut curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
@@ -756,7 +767,9 @@ impl Pipeline {
                 .collect();
             let imu_time: f64 = self
                 .map
-                .lock().unwrap().imu_factors()
+                .lock()
+                .unwrap()
+                .imu_factors()
                 .iter()
                 .filter(|f| f.curr_kf_idx >= start_idx)
                 .map(|f| f.preintegrated.dt)
@@ -797,10 +810,7 @@ impl Pipeline {
             .inertial_init
             .ready(&self.map.lock().unwrap(), self.inertial_init_start_kf_idx);
 
-        if result.status == TrackingStatus::KeyframeAccepted
-            && due_for_retry
-            && imu_init_ready
-        {
+        if result.status == TrackingStatus::KeyframeAccepted && due_for_retry && imu_init_ready {
             let Some(start_idx) = self.inertial_init_start_kf_idx else {
                 return result;
             };
@@ -811,7 +821,9 @@ impl Pipeline {
             // window can't yet observe it; stereo uses priorA=1e5.
             let is_mono = !self
                 .map
-                .lock().unwrap().keyframes()
+                .lock()
+                .unwrap()
+                .keyframes()
                 .iter()
                 .find(|kf| kf.frame.idx >= start_idx)
                 .map(|kf| kf.frame.is_stereo())
@@ -825,7 +837,7 @@ impl Pipeline {
             // lifetime) — deadlocking against apply_initialization's own
             // self.map.lock() call in the Some(..) arm below.
             let init_result = self.inertial_init.try_initialize(
-                &*self.map.lock().unwrap(),
+                &self.map.lock().unwrap(),
                 self.imu_t_bc,
                 self.imu_bias,
                 start_idx,
@@ -835,12 +847,9 @@ impl Pipeline {
             );
             match init_result {
                 Some(init) => {
-                    let scale = init.scale;
-                    let gravity = init.gravity_world;
-                    let bg = init.bias.gyro;
                     self.log_viba("VIBA0", timestamp_sec, 1e2, prior_a0, Some(&init));
                     self.inertial_init.apply_initialization(
-                        &mut *self.map.lock().unwrap(),
+                        &mut self.map.lock().unwrap(),
                         &mut self.state,
                         &mut self.imu_bias,
                         &mut self.gravity_world,
@@ -854,11 +863,6 @@ impl Pipeline {
                     // resuming tracking.
                     self.state.mode = SystemMode::Tracking;
                     self.state.imu_init_timestamp_sec = Some(timestamp_sec);
-                    // self.dbg(format!(
-                    //     "[imu_init] VIBA0 accepted: scale={scale:.4} gravity=({:.3},{:.3},{:.3}) \
-                    //      gyro_bias=({:.4},{:.4},{:.4})",
-                    //     gravity.x, gravity.y, gravity.z, bg.x, bg.y, bg.z
-                    // ));
                 }
                 None => {
                     self.log_viba("VIBA0", timestamp_sec, 1e2, prior_a0, None);
@@ -978,9 +982,9 @@ impl Pipeline {
         } else {
             None
         };
-        let pre_seeded = klt_survivors
-            .as_ref()
-            .map(|survivors| snap_survivors(survivors, &frame.features.keypoints_xy, KLT_SNAP_RADIUS_PX));
+        let pre_seeded = klt_survivors.as_ref().map(|survivors| {
+            snap_survivors(survivors, &frame.features.keypoints_xy, KLT_SNAP_RADIUS_PX)
+        });
 
         let mut track_diag_log = Vec::new();
         let result = self.estimator.estimate_pose(
@@ -1094,8 +1098,7 @@ impl Pipeline {
                     .state
                     .current_keyframe_idx
                     .and_then(|ki| map_guard.get_keyframe(ki));
-                let local_indices =
-                    map_guard.build_local_map_point_indices(&matches, current_kf);
+                let local_indices = map_guard.build_local_map_point_indices(&matches, current_kf);
                 let visible = map_guard.map_points_in_frustum(
                     &local_indices,
                     &self.camera,
@@ -1122,7 +1125,8 @@ impl Pipeline {
                     .imu_init_timestamp_sec
                     .is_some_and(|t0| timestamp_sec - t0 >= policy.min_imu_confidence_sec);
             let grace_period_sec = policy.grace_period_sec(imu_confident);
-            let map_established = self.map.lock().unwrap().keyframes().len() > policy.min_keyframes_for_grace;
+            let map_established =
+                self.map.lock().unwrap().keyframes().len() > policy.min_keyframes_for_grace;
 
             if !map_established || recently_lost_for >= grace_period_sec {
                 self.dbg(format!(
@@ -1201,7 +1205,10 @@ impl Pipeline {
         }
         for &(mp_idx, curr_idx) in matches {
             curr_kf.associate_map_point(curr_idx, mp_idx);
-            self.map.lock().unwrap().register_observation(mp_idx, &curr_kf, curr_idx);
+            self.map
+                .lock()
+                .unwrap()
+                .register_observation(mp_idx, &curr_kf, curr_idx);
         }
 
         // Stereo densification: back-project this keyframe's unassociated
@@ -1227,7 +1234,9 @@ impl Pipeline {
         const MAX_COVIS_KFS: usize = 10;
         let neighbor_kf_indices: Vec<usize> = self
             .map
-            .lock().unwrap().keyframes()
+            .lock()
+            .unwrap()
+            .keyframes()
             .iter()
             .rev()
             .take(MAX_COVIS_KFS)
@@ -1381,7 +1390,7 @@ impl Pipeline {
         // lifetime extended to cover the whole match (which would deadlock
         // against apply_initialization's self.map.lock() below).
         let init_result = self.inertial_init.try_initialize(
-            &*self.map.lock().unwrap(),
+            &self.map.lock().unwrap(),
             self.imu_t_bc,
             self.imu_bias,
             start_idx,
@@ -1395,7 +1404,7 @@ impl Pipeline {
                 let bg = init.bias.gyro;
                 self.log_viba(stage, timestamp_sec, prior_g, prior_a, Some(&init));
                 self.inertial_init.apply_initialization(
-                    &mut *self.map.lock().unwrap(),
+                    &mut self.map.lock().unwrap(),
                     &mut self.state,
                     &mut self.imu_bias,
                     &mut self.gravity_world,
@@ -1636,7 +1645,11 @@ impl Pipeline {
         // Write phase: create the new map points; curr_kf is registered as
         // the first observer inside add_triangulated_points.
         let first_mp_idx = self.map.lock().unwrap().num_map_points();
-        let added = self.map.lock().unwrap().add_triangulated_points(None, curr_kf, &points);
+        let added = self
+            .map
+            .lock()
+            .unwrap()
+            .add_triangulated_points(None, curr_kf, &points);
 
         // Register the neighbor as a second observer on each new map point.
         // This is the SearchInNeighbors-equivalent piece for the
@@ -1646,7 +1659,9 @@ impl Pipeline {
         for (i, &(_, _, _, prev_desc_idx, _)) in points.iter().take(added).enumerate() {
             let mp_idx = first_mp_idx + i;
             self.map
-                .lock().unwrap().register_observation_at(mp_idx, prev_kf_idx, prev_desc_idx);
+                .lock()
+                .unwrap()
+                .register_observation_at(mp_idx, prev_kf_idx, prev_desc_idx);
             if let Some(prev_live) = self.map.lock().unwrap().get_keyframe_mut(prev_kf_idx) {
                 prev_live.associate_map_point(prev_desc_idx, mp_idx);
             }
@@ -1768,13 +1783,18 @@ impl Pipeline {
                 // call associating a different mp).
                 let already = self
                     .map
-                    .lock().unwrap().get_keyframe(nb_kf_idx)
+                    .lock()
+                    .unwrap()
+                    .get_keyframe(nb_kf_idx)
                     .and_then(|kf| kf.map_point(kp_idx))
                     .is_some();
                 if already {
                     continue;
                 }
-                self.map.lock().unwrap().register_observation_at(mp_idx, nb_kf_idx, kp_idx);
+                self.map
+                    .lock()
+                    .unwrap()
+                    .register_observation_at(mp_idx, nb_kf_idx, kp_idx);
                 if let Some(nb_live) = self.map.lock().unwrap().get_keyframe_mut(nb_kf_idx) {
                     nb_live.associate_map_point(kp_idx, mp_idx);
                 }

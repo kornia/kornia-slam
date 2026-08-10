@@ -134,7 +134,10 @@ pub fn report(est: &[Vec3F64], gt: &[Vec3F64], out_dir: &Path) -> std::io::Resul
     }
 
     let a = align_se3(est, gt);
-    let aligned: Vec<Vec3F64> = est.iter().map(|p| a.translation + a.rotation * *p).collect();
+    let aligned: Vec<Vec3F64> = est
+        .iter()
+        .map(|p| a.translation + a.rotation * *p)
+        .collect();
 
     let mut af = std::fs::File::create(out_dir.join("kornia_slam_aligned.csv"))?;
     writeln!(af, "idx,x,y,z,gt_x,gt_y,gt_z")?;
@@ -155,6 +158,8 @@ pub fn report(est: &[Vec3F64], gt: &[Vec3F64], out_dir: &Path) -> std::io::Resul
         "Final Drift      : {:.4} %",
         compute_drift(&aligned, gt) * 100.0
     );
-    eprintln!("===================================================================================");
+    eprintln!(
+        "==================================================================================="
+    );
     Ok(())
 }

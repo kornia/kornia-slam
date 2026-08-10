@@ -23,10 +23,10 @@
 //! ```
 
 mod config;
-mod local_mapping;
 #[path = "../../common/datasets/mod.rs"]
 mod datasets;
 mod evaluation;
+mod local_mapping;
 mod pipeline;
 #[path = "../../common/source/mod.rs"]
 mod source;
