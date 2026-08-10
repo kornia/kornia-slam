@@ -7,9 +7,9 @@ resolver = "3"
 # not the branch, so this doesn't silently change if more commits land on
 # that branch without re-verification. Remove once merged/released upstream.
 [patch."https://github.com/kornia/kornia-rs"]
-kornia-3d = { git = "https://github.com/Astik-2002/kornia-rs", rev = "7f9248a25650de6c6660dee0928bb22245df5c28" }
-kornia-algebra = { git = "https://github.com/Astik-2002/kornia-rs", rev = "7f9248a25650de6c6660dee0928bb22245df5c28" }
-kornia-image = { git = "https://github.com/Astik-2002/kornia-rs", rev = "7f9248a25650de6c6660dee0928bb22245df5c28" }
-kornia-imgproc = { git = "https://github.com/Astik-2002/kornia-rs", rev = "7f9248a25650de6c6660dee0928bb22245df5c28" }
-kornia-io = { git = "https://github.com/Astik-2002/kornia-rs", rev = "7f9248a25650de6c6660dee0928bb22245df5c28" }
-kornia-tensor = { git = "https://github.com/Astik-2002/kornia-rs", rev = "7f9248a25650de6c6660dee0928bb22245df5c28" }
+kornia-3d = { git = "https://github.com/Astik-2002/kornia-rs", rev = "8207ad0279c26a205ddad26e763d0aaabb0057f6" }
+kornia-algebra = { git = "https://github.com/Astik-2002/kornia-rs", rev = "8207ad0279c26a205ddad26e763d0aaabb0057f6" }
+kornia-image = { git = "https://github.com/Astik-2002/kornia-rs", rev = "8207ad0279c26a205ddad26e763d0aaabb0057f6" }
+kornia-imgproc = { git = "https://github.com/Astik-2002/kornia-rs", rev = "8207ad0279c26a205ddad26e763d0aaabb0057f6" }
+kornia-io = { git = "https://github.com/Astik-2002/kornia-rs", rev = "8207ad0279c26a205ddad26e763d0aaabb0057f6" }
+kornia-tensor = { git = "https://github.com/Astik-2002/kornia-rs", rev = "8207ad0279c26a205ddad26e763d0aaabb0057f6" }
