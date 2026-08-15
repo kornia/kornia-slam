@@ -33,9 +33,9 @@
 //!   * Point parameters are the 3-dim world coordinates.
 //!   * z is clamped to `MIN_Z` to handle mid-iteration cheirality flips.
 //!
-//! Currently supports: identity loss only, fixed-pose anchors, fixed-point
-//! gauge (motion-only BA). Robust kernels and full LM-with-backtracking
-//! are TODO.
+//! Currently supports: Huber-robustified reprojection and IMU-nav
+//! residuals, fixed-pose anchors, fixed-point gauge (motion-only BA).
+//! Full LM-with-backtracking is still TODO.
 
 use faer::Mat;
 use faer::prelude::Solve;
@@ -45,6 +45,7 @@ use thiserror::Error;
 use kornia_3d::ba::{BaError, BaObservation};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
+use kornia_3d::ransac::{HuberKernel, RobustKernel};
 use kornia_sensors::imu::{ImuBias, PreintegratedImu};
 
 const MIN_Z: f32 = 1e-3;
@@ -130,6 +131,20 @@ pub struct ViBaParams {
     /// (weight = 1.0, full metric constraint) but strongly suppresses the
     /// large residuals that arise from rough post-init velocity estimates.
     pub huber_imu_chi2: f64,
+    /// Squared-pixel Huber scale for reprojection residuals: chi2 = du² + dv².
+    /// Weight is 1.0 (full quadratic) for chi2 ≤ this, else `sqrt(this / chi2)`
+    /// — same bounded-influence kernel as `huber_imu_chi2`, applied here so one
+    /// mismatched track (wrong data-association, moving object, culled-but-not-
+    /// yet-removed outlier) can't dominate the reduced camera system the way an
+    /// unweighted quadratic residual would. Default 25.0 = 5px, matching the
+    /// `robust_scale_sq` default already used for PnP (`estimation/pnp.rs`).
+    pub huber_reproj_px_sq: f64,
+    /// Huber scale (in sigma² units — `depth_residual_and_jacobian` already
+    /// divides by `depth_sigma`, so `r_z` is a unitless standard-score) for the
+    /// stereo depth anchor term. Same kernel/rationale as `huber_reproj_px_sq`;
+    /// separate field because the two residuals live in different units.
+    /// Default 9.0 = 3σ.
+    pub huber_depth_sigma_sq: f64,
     /// Scale applied to the IMU edge whose "from" endpoint is a permanently-fixed
     /// keyframe (the one boundary edge linking the active window to the frozen
     /// past). Full-strength coupling to a value that can never be corrected again
@@ -164,6 +179,8 @@ impl Default for ViBaParams {
             imu_t_bc: None,
             imu_weight: 1.0,
             huber_imu_chi2: 16.9, // 9-DOF chi-square at 95 %
+            huber_reproj_px_sq: 25.0, // 5px Huber delta
+            huber_depth_sigma_sq: 9.0, // 3σ Huber delta
             boundary_imu_info_scale: 1e-2,
             // sigma = 0.1 m/s²: comfortably above real MEMS accel-bias
             // magnitude, so it's a floor that only bites once the
@@ -899,11 +916,21 @@ pub fn visual_inertial_bundle_adjust(
             // residual_and_jacobians is f32 internally; cast results to f64.
             let (r_f32, jp_f32, jx_f32) = residual_and_jacobians(pose, point, obs.pixel, camera);
 
-            let r = [r_f32[0] as f64, r_f32[1] as f64];
-            let jp: [f64; 12] = std::array::from_fn(|i| jp_f32[i] as f64);
-            let jx: [f64; 6] = std::array::from_fn(|i| jx_f32[i] as f64);
+            let r_raw = [r_f32[0] as f64, r_f32[1] as f64];
+            let jp_raw: [f64; 12] = std::array::from_fn(|i| jp_f32[i] as f64);
+            let jx_raw: [f64; 6] = std::array::from_fn(|i| jx_f32[i] as f64);
 
-            cost_vis += 0.5 * (r[0] * r[0] + r[1] * r[1]);
+            // Huber-robustify the pixel term via IRLS: pre-scale r, jp, jx by
+            // sqrt(weight) so every outer product / accumulation below (A, B,
+            // C blocks and gradients) reproduces hw·(JᵀJ) and -hw·(Jᵀr)
+            // without any further changes to the accumulation code.
+            let chi2_vis = r_raw[0] * r_raw[0] + r_raw[1] * r_raw[1];
+            let hw_vis = HuberKernel.weight(chi2_vis, params.huber_reproj_px_sq);
+            cost_vis += 0.5 * hw_vis * chi2_vis;
+            let sqrt_hw_vis = hw_vis.sqrt();
+            let r = [r_raw[0] * sqrt_hw_vis, r_raw[1] * sqrt_hw_vis];
+            let jp: [f64; 12] = std::array::from_fn(|i| jp_raw[i] * sqrt_hw_vis);
+            let jx: [f64; 6] = std::array::from_fn(|i| jx_raw[i] * sqrt_hw_vis);
 
             let pli = kf_local[obs.pose_idx];
             let xli = point_local[obs.point_idx];
@@ -953,9 +980,17 @@ pub fn visual_inertial_bundle_adjust(
             // depth_residual_and_jacobian for why this matters here.
             if let Some(d_meas) = obs.depth_meas {
                 let sigma = (obs.depth_sigma as f64).max(1e-6);
-                let (r_z, jpd, jxd) =
+                let (r_z_raw, jpd_raw, jxd_raw) =
                     depth_residual_and_jacobian(pose, point, d_meas as f64, sigma);
-                cost_vis += 0.5 * r_z * r_z;
+
+                // Same IRLS pre-scaling as the pixel term above.
+                let chi2_depth = r_z_raw * r_z_raw;
+                let hw_depth = HuberKernel.weight(chi2_depth, params.huber_depth_sigma_sq);
+                cost_vis += 0.5 * hw_depth * chi2_depth;
+                let sqrt_hw_depth = hw_depth.sqrt();
+                let r_z = r_z_raw * sqrt_hw_depth;
+                let jpd: [f64; 6] = std::array::from_fn(|i| jpd_raw[i] * sqrt_hw_depth);
+                let jxd: [f64; 3] = std::array::from_fn(|i| jxd_raw[i] * sqrt_hw_depth);
 
                 if pli >= 0 {
                     let p = pli as usize;
@@ -1323,7 +1358,9 @@ pub fn visual_inertial_bundle_adjust(
                 obs.pixel,
                 camera,
             );
-            new_cost_vis += 0.5 * (r_f32[0] * r_f32[0] + r_f32[1] * r_f32[1]) as f64;
+            let chi2_vis = (r_f32[0] * r_f32[0] + r_f32[1] * r_f32[1]) as f64;
+            let hw_vis = HuberKernel.weight(chi2_vis, params.huber_reproj_px_sq);
+            new_cost_vis += 0.5 * hw_vis * chi2_vis;
 
             if let Some(d_meas) = obs.depth_meas {
                 let sigma = (obs.depth_sigma as f64).max(1e-6);
@@ -1333,7 +1370,9 @@ pub fn visual_inertial_bundle_adjust(
                     d_meas as f64,
                     sigma,
                 );
-                new_cost_vis += 0.5 * r_z * r_z;
+                let chi2_depth = r_z * r_z;
+                let hw_depth = HuberKernel.weight(chi2_depth, params.huber_depth_sigma_sq);
+                new_cost_vis += 0.5 * hw_depth * chi2_depth;
             }
         }
         let mut new_cost_imu = 0.0f64;
