@@ -178,8 +178,8 @@ impl Default for ViBaParams {
             gravity: Vec3F64::new(0.0, 9.81, 0.0), // OpenCV Y-down: gravity = +Y
             imu_t_bc: None,
             imu_weight: 1.0,
-            huber_imu_chi2: 16.9, // 9-DOF chi-square at 95 %
-            huber_reproj_px_sq: 25.0, // 5px Huber delta
+            huber_imu_chi2: 16.9,      // 9-DOF chi-square at 95 %
+            huber_reproj_px_sq: 25.0,  // 5px Huber delta
             huber_depth_sigma_sq: 9.0, // 3σ Huber delta
             boundary_imu_info_scale: 1e-2,
             // sigma = 0.1 m/s²: comfortably above real MEMS accel-bias
