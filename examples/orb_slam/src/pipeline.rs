@@ -11,9 +11,13 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
 use kornia_algebra::{Mat3F64, Vec2F64, Vec3F64};
+use kornia_image::Image;
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_slam::Frame;
+use kornia_slam::estimation::optical_flow::{
+    FlowSurvivor, KltTracker, MapKeypointMatch, TrackSet, snap_unique,
+};
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use kornia_slam::estimation::{ImuInitConfig, ImuInitializer, MapProjectionEstimator};
 use kornia_slam::map::{Keyframe, KeyframeJob, LocalMapping, Map, MapPoint, ORB_SCALE_FACTOR};
@@ -77,6 +81,8 @@ pub struct Pipeline {
     imu_viba1_done: bool,
     imu_viba2_done: bool,
     local_mapping: LocalMapping,
+    klt_tracker: KltTracker,
+    track_set: TrackSet,
     // System state
     state: SystemState,
 }
@@ -128,6 +134,8 @@ impl Pipeline {
             imu_init_window_start_sec: None,
             imu_viba1_done: false,
             imu_viba2_done: false,
+            klt_tracker: KltTracker::default(),
+            track_set: TrackSet::new(),
         }
     }
 
@@ -141,6 +149,8 @@ impl Pipeline {
     pub fn process_frame(
         &mut self,
         mut frame: Frame,
+        previous_image: Option<&Image<u8, 1>>,
+        current_image: &Image<u8, 1>,
         timestamp_sec: f64,
         imu_samples: Vec<ImuMeasurement>,
     ) -> TrackingResult {
@@ -158,8 +168,12 @@ impl Pipeline {
 
         match self.state.mode {
             SystemMode::Bootstrap => self.bootstrap_step(frame, timestamp_sec),
-            SystemMode::ImuInit => self.inertial_init_step(frame, timestamp_sec),
-            SystemMode::Tracking => self.tracking_step(frame, timestamp_sec),
+            SystemMode::ImuInit => {
+                self.inertial_init_step(frame, previous_image, current_image, timestamp_sec)
+            }
+            SystemMode::Tracking => {
+                self.tracking_step(frame, previous_image, current_image, timestamp_sec)
+            }
         }
     }
 
@@ -631,8 +645,14 @@ impl Pipeline {
         (pred_cam_to_world.inverse(), v_j)
     }
 
-    fn inertial_init_step(&mut self, frame: Frame, timestamp_sec: f64) -> TrackingResult {
-        let result = self.tracking_step(frame, timestamp_sec);
+    fn inertial_init_step(
+        &mut self,
+        frame: Frame,
+        previous_image: Option<&Image<u8, 1>>,
+        current_image: &Image<u8, 1>,
+        timestamp_sec: f64,
+    ) -> TrackingResult {
+        let result = self.tracking_step(frame, previous_image, current_image, timestamp_sec);
 
         if result.status == TrackingStatus::KeyframeAccepted
             && let Some(start_idx) = self.inertial_init_start_kf_idx
@@ -754,7 +774,13 @@ impl Pipeline {
         result
     }
 
-    fn tracking_step(&mut self, frame: Frame, timestamp_sec: f64) -> TrackingResult {
+    fn tracking_step(
+        &mut self,
+        frame: Frame,
+        previous_image: Option<&Image<u8, 1>>,
+        current_image: &Image<u8, 1>,
+        timestamp_sec: f64,
+    ) -> TrackingResult {
         let image_size = frame.image_size;
         let pose_before = self.state.pose_world_to_cam;
         let prev_timestamp = self.state.last_frame_timestamp_sec;
@@ -798,6 +824,33 @@ impl Pipeline {
             .map_or(0.0, |t0| timestamp_sec - t0);
         let search_scale = self.estimator.config().search_scale_for(currently_lost_for);
 
+        let klt_survivors = if self.track_set.is_empty() {
+            None
+        } else {
+            previous_image.and_then(|previous_image| {
+                self.klt_tracker
+                    .track(self.track_set.tracks(), previous_image, current_image)
+                    .ok()
+            })
+        };
+        let pre_seeded = klt_survivors
+            .as_ref()
+            .and_then(|survivors| {
+                snap_unique(
+                    &self.track_set,
+                    survivors,
+                    &frame.features.keypoints_xy,
+                    3.0,
+                )
+                .ok()
+            })
+            .map(|matches| {
+                matches
+                    .into_iter()
+                    .map(|matched| (matched.map_point_idx, matched.keypoint_idx))
+                    .collect()
+            });
+
         let result = self.estimator.estimate_pose(
             &frame,
             &candidate_pose,
@@ -806,6 +859,7 @@ impl Pipeline {
             &self.camera,
             self.state.current_keyframe_idx,
             search_scale,
+            pre_seeded,
         );
 
         let (mut status, matches, tracked_inliers, reject_reason) = match result {
@@ -822,6 +876,22 @@ impl Pipeline {
                     self.state.velocity = Some(Pose3d::between(&pose_before, &estimate.pose));
                 }
 
+                let track_matches: Vec<MapKeypointMatch> = estimate
+                    .matches
+                    .iter()
+                    .map(|&(map_point_idx, keypoint_idx)| MapKeypointMatch {
+                        map_point_idx,
+                        keypoint_idx,
+                    })
+                    .collect();
+                if self
+                    .track_set
+                    .reconcile_from_matches(&track_matches, &frame.features.keypoints_xy)
+                    .is_err()
+                {
+                    self.track_set = TrackSet::new();
+                }
+
                 (
                     TrackingStatus::Tracked,
                     estimate.matches,
@@ -830,6 +900,8 @@ impl Pipeline {
                 )
             }
             Err(reason) => {
+                carry_klt_survivors(&mut self.track_set, klt_survivors);
+
                 // Carry the predicted pose forward instead of freezing at
                 // pose_before. state.velocity_world was already advanced by
                 // predict_pose_imu above regardless of visual outcome, so
@@ -901,6 +973,7 @@ impl Pipeline {
                     "[lost] frame={} giving up after {:.2}s (map_established={}): resetting",
                     frame.idx, recently_lost_for, map_established,
                 ));
+                self.track_set = TrackSet::new();
                 self.state.reset();
                 return self.bootstrap_step(frame, timestamp_sec);
             }
@@ -1527,6 +1600,12 @@ impl Pipeline {
     }
 }
 
+fn carry_klt_survivors(track_set: &mut TrackSet, survivors: Option<Vec<FlowSurvivor>>) {
+    if survivors.is_none_or(|survivors| track_set.advance(survivors).is_err()) {
+        *track_set = TrackSet::new();
+    }
+}
+
 fn format_imu_init_gate(
     start_idx: usize,
     first_idx: Option<usize>,
@@ -1554,9 +1633,10 @@ fn apply_reference_pose_correction(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_reference_pose_correction, format_imu_init_gate};
+    use super::{apply_reference_pose_correction, carry_klt_survivors, format_imu_init_gate};
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::{SO3F64, Vec3F64};
+    use kornia_slam::estimation::optical_flow::{FlowSurvivor, MapKeypointMatch, TrackSet};
 
     fn assert_pose_close(actual: Pose3d, expected: Pose3d) {
         assert!((actual.translation - expected.translation).length() < 1e-10);
@@ -1598,5 +1678,38 @@ mod tests {
             format_imu_init_gate(12, Some(12), Some(32), 7, 10, 1.05, 1.0),
             "[imu_init_gate] start_idx=12 first_idx=Some(12) last_idx=Some(32) kfs=7/10 imu_time=1.05/1.0s"
         );
+    }
+
+    #[test]
+    fn klt_tracks_survive_skipped_frame_and_clear_without_survivors() {
+        let mut tracks = TrackSet::new();
+        tracks
+            .reconcile_from_matches(
+                &[MapKeypointMatch {
+                    map_point_idx: 42,
+                    keypoint_idx: 0,
+                }],
+                &[[10.0, 20.0]],
+            )
+            .unwrap();
+        let track_id = tracks.tracks()[0].id();
+
+        carry_klt_survivors(
+            &mut tracks,
+            Some(vec![FlowSurvivor {
+                track_id,
+                pixel: [12.0, 21.0],
+                error: 0.5,
+            }]),
+        );
+
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks.tracks()[0].id(), track_id);
+        assert_eq!(tracks.tracks()[0].map_point_idx(), Some(42));
+        assert_eq!(tracks.tracks()[0].pixel(), [12.0, 21.0]);
+        assert_eq!(tracks.tracks()[0].age(), 2);
+
+        carry_klt_survivors(&mut tracks, None);
+        assert!(tracks.is_empty());
     }
 }

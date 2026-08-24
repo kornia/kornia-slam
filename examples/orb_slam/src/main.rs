@@ -529,6 +529,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Main loop ──────────────────────────────────────────────────────────
     let mut trajectory: Vec<[f32; 3]> = Vec::new();
     let mut processed: usize = 0;
+    let mut previous_image: Option<Image<u8, 1>> = None;
 
     while let Some(item) = source.next_frame()? {
         let now = Instant::now();
@@ -625,7 +626,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             keypoints_undist: Vec::new(),
         };
         let t0 = std::time::Instant::now();
-        let result = system.process_frame(frame, timestamp_sec, imu_measurements);
+        let result = system.process_frame(
+            frame,
+            previous_image.as_ref(),
+            &gray_u8,
+            timestamp_sec,
+            imu_measurements,
+        );
         let frame_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let keyframe_idx = system.current_keyframe_idx().unwrap_or(idx);
         let map_point_count = system.num_active_map_points();
@@ -697,6 +704,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tui::TuiAction::None => {}
             }
         }
+        previous_image = Some(gray_u8);
     }
 
     // Restore terminal before printing the final summary.

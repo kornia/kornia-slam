@@ -170,6 +170,7 @@ impl MapProjectionEstimator {
         camera: &PinholeCamera,
         current_keyframe_idx: Option<usize>,
         search_scale: f32,
+        pre_seeded: Option<Vec<(usize, usize)>>,
     ) -> Result<Estimate, MapProjectionRejectReason> {
         let pnp = &self.config.pnp;
 
@@ -239,6 +240,12 @@ impl MapProjectionEstimator {
             })
         };
 
+        if let Some(seeded) = Self::eligible_pre_seeded(pre_seeded, pnp.min_correspondences)
+            && let Ok(estimate) = try_track_and_refine(seeded, candidate_pose)
+        {
+            return Ok(estimate);
+        }
+
         // PnP from projection matches.
         let last_reject = if projection_matches.len() >= pnp.min_correspondences {
             match try_track_and_refine(projection_matches, candidate_pose) {
@@ -281,6 +288,13 @@ impl MapProjectionEstimator {
         }
 
         try_track_and_refine(ref_correspondences, pose_before_tracking)
+    }
+
+    fn eligible_pre_seeded(
+        pre_seeded: Option<Vec<(usize, usize)>>,
+        min_correspondences: usize,
+    ) -> Option<Vec<(usize, usize)>> {
+        pre_seeded.filter(|correspondences| correspondences.len() >= min_correspondences)
     }
 
     /// Reject matches that disagree with reference-to-current epipolar geometry.
@@ -747,6 +761,21 @@ mod matching_tests {
             estimator.geometric_consistency_filter(None, &correspondences, &current, &camera),
             correspondences
         );
+    }
+
+    #[test]
+    fn klt_source_is_eligible_at_minimum_size() {
+        let seeded = vec![(0, 0), (1, 1), (2, 2), (3, 3)];
+
+        assert_eq!(
+            MapProjectionEstimator::eligible_pre_seeded(Some(seeded.clone()), 4),
+            Some(seeded)
+        );
+        assert_eq!(
+            MapProjectionEstimator::eligible_pre_seeded(Some(vec![(0, 0); 3]), 4),
+            None
+        );
+        assert_eq!(MapProjectionEstimator::eligible_pre_seeded(None, 4), None);
     }
 
     #[test]
