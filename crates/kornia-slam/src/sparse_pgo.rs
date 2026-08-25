@@ -4,7 +4,7 @@ use faer::prelude::Solve;
 use faer::sparse::linalg::solvers::{Llt, SymbolicLlt};
 use faer::sparse::{SparseColMat, Triplet};
 use faer::{Mat, Side};
-use kornia_3d::pgo::PgoEdge;
+use kornia_3d::pgo::{PgoEdge, PgoParams};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3AF32, Mat3F64, SE3F32, SO3F32, SO3F64, Vec3AF32, Vec3F64};
 use thiserror::Error;
@@ -16,6 +16,11 @@ const RESIDUAL_DIM: usize = 6;
 
 #[allow(dead_code)]
 const NUM_JACOBIAN_EPS: f32 = 1e-3;
+
+const STEP_SIZE_TOLERANCE: f32 = 1e-6;
+const LAMBDA_FACTOR: f32 = 10.0;
+const LAMBDA_MIN: f32 = 1e-10;
+const LAMBDA_MAX: f32 = 1e10;
 
 #[allow(dead_code)]
 pub(crate) trait PoseManifold<const DOF: usize> {
@@ -35,6 +40,12 @@ struct NormalSystem<const DOF: usize> {
     pose_to_block: Vec<Option<usize>>,
     blocks: BTreeMap<(usize, usize), Vec<f32>>,
     gradient: Vec<f32>,
+}
+
+struct SparseSolveCache {
+    symbolic: SymbolicLlt<usize>,
+    col_ptr: Vec<usize>,
+    row_idx: Vec<usize>,
 }
 
 #[allow(dead_code)]
@@ -92,6 +103,14 @@ impl<const DOF: usize> NormalSystem<DOF> {
     }
 
     fn solve_damped(&self, damping: f32) -> Result<Vec<f32>, SparsePgoError> {
+        self.solve_damped_with_cache(damping, &mut None)
+    }
+
+    fn solve_damped_with_cache(
+        &self,
+        damping: f32,
+        cache: &mut Option<SparseSolveCache>,
+    ) -> Result<Vec<f32>, SparsePgoError> {
         let scalar_dim = self.scalar_dim()?;
         validate_damping(damping)?;
         if scalar_dim == 0 {
@@ -104,15 +123,35 @@ impl<const DOF: usize> NormalSystem<DOF> {
         let matrix =
             SparseColMat::<usize, f32>::try_new_from_triplets(scalar_dim, scalar_dim, &triplets)
                 .map_err(|error| SparsePgoError::SparseMatrix(error.to_string()))?;
-        let symbolic = SymbolicLlt::try_new(matrix.symbolic(), Side::Lower)
-            .map_err(|error| SparsePgoError::SparseMatrix(error.to_string()))?;
+        let symbolic = match cache {
+            Some(cache) => {
+                if matrix.symbolic().col_ptr() != cache.col_ptr
+                    || matrix.symbolic().row_idx() != cache.row_idx
+                {
+                    return Err(SparsePgoError::SparseMatrix(
+                        "damped Hessian structure changed during optimization".into(),
+                    ));
+                }
+                cache.symbolic.clone()
+            }
+            None => {
+                let symbolic = SymbolicLlt::try_new(matrix.symbolic(), Side::Lower)
+                    .map_err(|error| SparsePgoError::SparseMatrix(error.to_string()))?;
+                *cache = Some(SparseSolveCache {
+                    symbolic: symbolic.clone(),
+                    col_ptr: matrix.symbolic().col_ptr().to_vec(),
+                    row_idx: matrix.symbolic().row_idx().to_vec(),
+                });
+                symbolic
+            }
+        };
         let factor = Llt::try_new_with_symbolic(symbolic, matrix.as_ref(), Side::Lower)
             .map_err(|error| SparsePgoError::Factorization(format!("{error:?}")))?;
         let mut rhs = Mat::from_fn(scalar_dim, 1, |row, _| -self.gradient[row]);
         factor.solve_in_place(&mut rhs);
         let step = (0..scalar_dim).map(|row| rhs[(row, 0)]).collect::<Vec<_>>();
         if step.iter().any(|value| !value.is_finite()) {
-            return Err(SparsePgoError::Factorization(
+            return Err(SparsePgoError::InvalidInput(
                 "sparse solve produced a non-finite step".into(),
             ));
         }
@@ -365,6 +404,290 @@ pub(crate) fn weighted_relative_residual(
         ));
     }
     Ok(residual)
+}
+
+#[allow(dead_code)]
+pub(crate) fn sparse_pose_graph_optimize<const DOF: usize>(
+    poses: &[Pose3d],
+    edges: &[PgoEdge],
+    fixed_pose_indices: &[usize],
+    params: &PgoParams,
+    manifold: &impl PoseManifold<DOF>,
+) -> Result<SparsePgoResult, SparsePgoError> {
+    validate_optimizer_inputs(poses, edges, fixed_pose_indices, params)?;
+
+    let mut accepted_poses = poses.to_vec();
+    let mut current_cost = total_squared_residual_cost(&accepted_poses, edges)?;
+    let mut damping = params.initial_lambda;
+    let mut iterations = 0usize;
+    let mut solve_cache = None;
+
+    loop {
+        if iterations >= params.max_iterations {
+            return Ok(SparsePgoResult {
+                poses: accepted_poses,
+                iterations,
+                converged: false,
+            });
+        }
+
+        let normal = build_normal_system(&accepted_poses, edges, fixed_pose_indices, manifold)?;
+        let gradient_norm = finite_l2_norm(&normal.gradient, "normal-system gradient")?;
+        if gradient_norm < params.gradient_tolerance {
+            return Ok(SparsePgoResult {
+                poses: accepted_poses,
+                iterations,
+                converged: true,
+            });
+        }
+
+        let step = match normal.solve_damped_with_cache(damping, &mut solve_cache) {
+            Ok(step) => step,
+            Err(SparsePgoError::Factorization(error)) => {
+                iterations += 1;
+                damping = increased_damping(damping);
+                if damping > LAMBDA_MAX {
+                    return Err(SparsePgoError::Factorization(format!(
+                        "{error}; LM damping exceeded {LAMBDA_MAX:e}"
+                    )));
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let step_norm = finite_l2_norm(&step, "sparse LM step")?;
+        if step_norm < STEP_SIZE_TOLERANCE {
+            return Ok(SparsePgoResult {
+                poses: accepted_poses,
+                iterations,
+                converged: true,
+            });
+        }
+
+        match evaluate_trial(
+            &accepted_poses,
+            edges,
+            &normal.pose_to_block,
+            manifold,
+            &step,
+            current_cost,
+        )? {
+            TrialOutcome::Accepted { poses, cost } => {
+                let relative_cost_change = if current_cost > 0.0 {
+                    (current_cost - cost) / current_cost
+                } else {
+                    current_cost - cost
+                };
+                accepted_poses = poses;
+                current_cost = cost;
+                damping = decreased_damping(damping);
+                iterations += 1;
+                if relative_cost_change < params.cost_tolerance {
+                    return Ok(SparsePgoResult {
+                        poses: accepted_poses,
+                        iterations,
+                        converged: true,
+                    });
+                }
+            }
+            TrialOutcome::Rejected => {
+                iterations += 1;
+                damping = increased_damping(damping);
+                if damping > LAMBDA_MAX {
+                    return Ok(SparsePgoResult {
+                        poses: accepted_poses,
+                        iterations,
+                        converged: false,
+                    });
+                }
+            }
+        }
+    }
+}
+
+enum TrialOutcome {
+    Accepted { poses: Vec<Pose3d>, cost: f32 },
+    Rejected,
+}
+
+fn evaluate_trial<const DOF: usize>(
+    poses: &[Pose3d],
+    edges: &[PgoEdge],
+    pose_to_block: &[Option<usize>],
+    manifold: &impl PoseManifold<DOF>,
+    step: &[f32],
+    current_cost: f32,
+) -> Result<TrialOutcome, SparsePgoError> {
+    if pose_to_block.len() != poses.len() {
+        return Err(SparsePgoError::InvalidInput(
+            "pose-to-block map has an invalid dimension".into(),
+        ));
+    }
+    let expected_step_len = pose_to_block.iter().flatten().count() * DOF;
+    if step.len() != expected_step_len {
+        return Err(SparsePgoError::InvalidInput(
+            "sparse LM step has an invalid dimension".into(),
+        ));
+    }
+    if !current_cost.is_finite() {
+        return Err(SparsePgoError::InvalidInput(
+            "pose-graph cost must be finite".into(),
+        ));
+    }
+
+    let mut trial_poses = poses.to_vec();
+    for (pose_index, block) in pose_to_block.iter().copied().enumerate() {
+        if let Some(block) = block {
+            let delta = std::array::from_fn(|index| step[block * DOF + index]);
+            validate_delta(&delta)?;
+            let trial_pose = manifold.retract(&poses[pose_index], &delta)?;
+            validate_pose(&trial_pose)?;
+            trial_poses[pose_index] = trial_pose;
+        }
+    }
+    let trial_cost = total_squared_residual_cost(&trial_poses, edges)?;
+    if trial_cost < current_cost {
+        Ok(TrialOutcome::Accepted {
+            poses: trial_poses,
+            cost: trial_cost,
+        })
+    } else {
+        Ok(TrialOutcome::Rejected)
+    }
+}
+
+#[cfg(test)]
+fn evaluate_trial_for_test<const DOF: usize>(
+    poses: &[Pose3d],
+    edges: &[PgoEdge],
+    fixed_pose_indices: &[usize],
+    manifold: &impl PoseManifold<DOF>,
+    step: &[f32],
+    damping: f32,
+) -> Result<(Vec<Pose3d>, f32, bool), SparsePgoError> {
+    let normal = build_normal_system(poses, edges, fixed_pose_indices, manifold)?;
+    let current_cost = total_squared_residual_cost(poses, edges)?;
+    match evaluate_trial(
+        poses,
+        edges,
+        &normal.pose_to_block,
+        manifold,
+        step,
+        current_cost,
+    )? {
+        TrialOutcome::Accepted { poses, .. } => Ok((poses, decreased_damping(damping), true)),
+        TrialOutcome::Rejected => Ok((poses.to_vec(), increased_damping(damping), false)),
+    }
+}
+
+fn increased_damping(damping: f32) -> f32 {
+    damping * LAMBDA_FACTOR
+}
+
+fn decreased_damping(damping: f32) -> f32 {
+    (damping / LAMBDA_FACTOR).max(LAMBDA_MIN)
+}
+
+fn validate_optimizer_inputs(
+    poses: &[Pose3d],
+    edges: &[PgoEdge],
+    fixed_pose_indices: &[usize],
+    params: &PgoParams,
+) -> Result<(), SparsePgoError> {
+    if poses.is_empty() {
+        return Err(SparsePgoError::InvalidInput("empty poses".into()));
+    }
+    if edges.is_empty() {
+        return Err(SparsePgoError::InvalidInput("empty edges".into()));
+    }
+    for pose in poses {
+        validate_pose(pose)?;
+    }
+    for edge in edges {
+        if edge.pose_a >= poses.len() || edge.pose_b >= poses.len() {
+            return Err(SparsePgoError::InvalidInput(
+                "pose-graph edge index is out of range".into(),
+            ));
+        }
+        if edge.pose_a == edge.pose_b {
+            return Err(SparsePgoError::InvalidInput(
+                "pose-graph edge endpoints must be distinct".into(),
+            ));
+        }
+        if !edge.weight.is_finite() {
+            return Err(SparsePgoError::InvalidInput(
+                "pose-graph edge weight must be finite".into(),
+            ));
+        }
+        validate_se3(&edge.t_ab_meas)?;
+    }
+    let fixed = fixed_pose_indices.iter().copied().collect::<HashSet<_>>();
+    if fixed.iter().any(|&pose_index| pose_index >= poses.len()) {
+        return Err(SparsePgoError::InvalidInput(
+            "fixed pose index is out of range".into(),
+        ));
+    }
+    if fixed.len() == poses.len() {
+        return Err(SparsePgoError::InvalidInput(
+            "pose graph has no free poses".into(),
+        ));
+    }
+    if params.max_iterations == 0 {
+        return Err(SparsePgoError::InvalidInput(
+            "maximum iterations must be greater than zero".into(),
+        ));
+    }
+    if !params.cost_tolerance.is_finite() || params.cost_tolerance < 0.0 {
+        return Err(SparsePgoError::InvalidInput(
+            "cost tolerance must be finite and non-negative".into(),
+        ));
+    }
+    if !params.gradient_tolerance.is_finite() || params.gradient_tolerance < 0.0 {
+        return Err(SparsePgoError::InvalidInput(
+            "gradient tolerance must be finite and non-negative".into(),
+        ));
+    }
+    if !params.initial_lambda.is_finite()
+        || params.initial_lambda <= 0.0
+        || params.initial_lambda > LAMBDA_MAX
+    {
+        return Err(SparsePgoError::InvalidInput(format!(
+            "initial LM damping must be finite and in (0, {LAMBDA_MAX:e}]"
+        )));
+    }
+    Ok(())
+}
+
+fn total_squared_residual_cost(poses: &[Pose3d], edges: &[PgoEdge]) -> Result<f32, SparsePgoError> {
+    let mut cost = 0.0f32;
+    for edge in edges {
+        let residual = weighted_relative_residual(
+            &poses[edge.pose_a],
+            &poses[edge.pose_b],
+            &edge.t_ab_meas,
+            edge.weight,
+        )?;
+        for value in residual {
+            cost += value * value;
+            if !cost.is_finite() {
+                return Err(SparsePgoError::InvalidInput(
+                    "pose-graph cost must be finite".into(),
+                ));
+            }
+        }
+    }
+    Ok(cost)
+}
+
+fn finite_l2_norm(values: &[f32], name: &str) -> Result<f32, SparsePgoError> {
+    let squared_norm = values.iter().map(|value| value * value).sum::<f32>();
+    let norm = squared_norm.sqrt();
+    if !norm.is_finite() {
+        return Err(SparsePgoError::InvalidInput(format!(
+            "{name} norm must be finite"
+        )));
+    }
+    Ok(norm)
 }
 
 #[allow(dead_code)]
@@ -671,13 +994,13 @@ fn vec3_f64_is_finite(value: Vec3F64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use kornia_3d::pgo::PgoEdge;
+    use kornia_3d::pgo::{PgoEdge, PgoParams};
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 
     use super::{
-        GravityManifold, PoseManifold, Se3Manifold, build_normal_system, pose_to_se3,
-        weighted_relative_residual,
+        GravityManifold, PoseManifold, Se3Manifold, build_normal_system, evaluate_trial_for_test,
+        pose_to_se3, sparse_pose_graph_optimize, weighted_relative_residual,
     };
 
     fn assert_near(actual: f64, expected: f64, tolerance: f64) {
@@ -769,6 +1092,35 @@ mod tests {
                 .sum::<f64>()
             })
             .sum()
+    }
+
+    fn drifting_loop_graph() -> (Vec<Pose3d>, Vec<PgoEdge>) {
+        let expected = (0..4)
+            .map(|index| Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(index as f64, 0.0, 0.0)))
+            .collect::<Vec<_>>();
+        let poses = vec![
+            expected[0],
+            Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(1.1, 0.1, 0.0)),
+            Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(2.25, 0.15, -0.05)),
+            Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(3.45, 0.2, -0.1)),
+        ];
+        let mut edges = (0..3)
+            .map(|pose_a| PgoEdge {
+                pose_a,
+                pose_b: pose_a + 1,
+                t_ab_meas: pose_to_se3(&expected[pose_a + 1]).unwrap()
+                    * pose_to_se3(&expected[pose_a]).unwrap().inverse(),
+                weight: 1.0,
+            })
+            .collect::<Vec<_>>();
+        edges.push(PgoEdge {
+            pose_a: 3,
+            pose_b: 0,
+            t_ab_meas: pose_to_se3(&expected[0]).unwrap()
+                * pose_to_se3(&expected[3]).unwrap().inverse(),
+            weight: 1.0,
+        });
+        (poses, edges)
     }
 
     #[test]
@@ -896,5 +1248,64 @@ mod tests {
             / (2.0 * epsilon as f64);
 
         assert_near(normal.gradient[0] as f64, cost_derivative, 2e-4);
+    }
+
+    #[test]
+    fn sparse_lm_reduces_loop_graph_cost() {
+        let (poses, edges) = drifting_loop_graph();
+        let initial_cost = normal_cost(&poses, &edges);
+
+        let result =
+            sparse_pose_graph_optimize(&poses, &edges, &[0], &PgoParams::default(), &Se3Manifold)
+                .unwrap();
+
+        assert!(normal_cost(&result.poses, &edges) < initial_cost * 0.01);
+        assert!(result.iterations > 0);
+        assert!(result.converged);
+    }
+
+    #[test]
+    fn sparse_lm_keeps_fixed_pose_unchanged() {
+        let (poses, edges) = drifting_loop_graph();
+        let fixed = poses[0];
+
+        let result =
+            sparse_pose_graph_optimize(&poses, &edges, &[0], &PgoParams::default(), &Se3Manifold)
+                .unwrap();
+
+        assert_eq!(result.poses[0].rotation, fixed.rotation);
+        assert_eq!(result.poses[0].translation, fixed.translation);
+    }
+
+    #[test]
+    fn rejected_step_increases_damping_without_mutating_poses() {
+        let expected = [
+            Pose3d::IDENTITY,
+            Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(1.0, 0.0, 0.0)),
+        ];
+        let edges = [PgoEdge {
+            pose_a: 0,
+            pose_b: 1,
+            t_ab_meas: pose_to_se3(&expected[1]).unwrap(),
+            weight: 1.0,
+        }];
+        let initial_damping = 1e-3;
+
+        let (poses, damping, accepted) = evaluate_trial_for_test(
+            &expected,
+            &edges,
+            &[0],
+            &Se3Manifold,
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            initial_damping,
+        )
+        .unwrap();
+
+        assert!(!accepted);
+        assert_eq!(damping, initial_damping * 10.0);
+        assert_eq!(poses[0].rotation, expected[0].rotation);
+        assert_eq!(poses[0].translation, expected[0].translation);
+        assert_eq!(poses[1].rotation, expected[1].rotation);
+        assert_eq!(poses[1].translation, expected[1].translation);
     }
 }
