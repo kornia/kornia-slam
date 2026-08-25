@@ -263,7 +263,16 @@ impl Default for ShadowPgoConfig {
     }
 }
 
-/// Output of a shadow PGO run. No values are written back to the map.
+/// Live-map changes made after an explicitly enabled, usable PGO result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PgoApplicationStats {
+    pub keyframes_corrected: usize,
+    pub map_points_corrected: usize,
+    pub observations_added: usize,
+    pub map_points_merged: usize,
+}
+
+/// Output of a PGO run and its optional live-map application statistics.
 #[derive(Debug, Clone)]
 pub struct ShadowPgoDiagnostic {
     pub keyframe_indices: Vec<usize>,
@@ -283,6 +292,7 @@ pub struct ShadowPgoDiagnostic {
     pub solve_time_ms: f64,
     pub median_translation_correction: f64,
     pub max_translation_correction: f64,
+    pub application: Option<PgoApplicationStats>,
 }
 
 /// Shadow-graph construction or solve failure.
@@ -754,6 +764,7 @@ pub fn run_shadow_pgo(
         solve_time_ms,
         median_translation_correction,
         max_translation_correction,
+        application: None,
     })
 }
 
