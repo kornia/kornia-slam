@@ -3,7 +3,9 @@
 use std::collections::{HashMap, HashSet};
 
 use kornia_3d::camera::PinholeCamera;
-use kornia_3d::pgo::{PgoEdge, PgoParams, pose_graph_optimize};
+#[cfg(test)]
+use kornia_3d::pgo::pose_graph_optimize;
+use kornia_3d::pgo::{PgoEdge, PgoParams};
 use kornia_3d::pnp::{PnPMethod, RansacParams, solve_pnp_ransac};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3AF32, Mat3F64, SE3F32, SO3F32, Vec2F32, Vec3AF32, Vec3F64};
@@ -12,6 +14,7 @@ use thiserror::Error;
 
 use crate::gravity_pgo::gravity_pose_graph_optimize;
 use crate::map::Map;
+use crate::sparse_pgo::{Se3Manifold, sparse_pose_graph_optimize};
 
 /// Acceptance thresholds for geometric loop verification.
 #[derive(Debug, Clone)]
@@ -698,8 +701,9 @@ pub fn optimize_pose_graph(
         .map_err(|error| PgoError::Solver(error.to_string()))?;
         (result.poses, result.converged)
     } else {
-        let result = pose_graph_optimize(&original_poses, &edges, &[0], &params)
-            .map_err(|error| PgoError::Solver(error.to_string()))?;
+        let result =
+            sparse_pose_graph_optimize(&original_poses, &edges, &[0], &params, &Se3Manifold)
+                .map_err(|error| PgoError::Solver(error.to_string()))?;
         (result.poses, result.converged)
     };
     let final_cost = pose_graph_cost(&optimized_poses, &edges);
@@ -834,6 +838,7 @@ mod tests {
     use super::*;
     use crate::Frame;
     use crate::map::{Keyframe, MapPoint};
+    use kornia_algebra::SO3F64;
     use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbFeatures;
 
@@ -1052,6 +1057,66 @@ mod tests {
 
     fn direct_loop_edge() -> VerifiedLoopEdge {
         verified_edge(10, 0, 35, 0.8, 1.0, 8)
+    }
+
+    #[test]
+    fn sparse_se3_pgo_matches_dense_on_rotated_drifting_loop() {
+        let poses = (0..5)
+            .map(|index| {
+                let progress = index as f64;
+                let rotation = SO3F64::exp(Vec3F64::new(
+                    0.015 * progress,
+                    -0.01 * progress,
+                    0.04 * progress,
+                ))
+                .matrix();
+                let center = Vec3F64::new(progress * 0.8, progress * 0.12, progress * -0.05);
+                Pose3d::new(rotation, -(rotation * center))
+            })
+            .collect::<Vec<_>>();
+        let mut edges = (0..poses.len() - 1)
+            .map(|index| {
+                let measurement = Pose3d::between(&poses[index], &poses[index + 1]);
+                PgoEdge {
+                    pose_a: index,
+                    pose_b: index + 1,
+                    t_ab_meas: pose_to_se3(&measurement),
+                    weight: 1.0,
+                }
+            })
+            .collect::<Vec<_>>();
+        edges.push(PgoEdge {
+            pose_a: 0,
+            pose_b: poses.len() - 1,
+            t_ab_meas: pose_to_se3(&Pose3d::IDENTITY),
+            weight: 0.5,
+        });
+        let params = PgoParams::default();
+        let initial_cost = pose_graph_cost(&poses, &edges);
+
+        let dense = pose_graph_optimize(&poses, &edges, &[0], &params).unwrap();
+        let sparse =
+            sparse_pose_graph_optimize(&poses, &edges, &[0], &params, &Se3Manifold).unwrap();
+
+        assert!(pose_graph_cost(&dense.poses, &edges) < initial_cost);
+        assert!(pose_graph_cost(&sparse.poses, &edges) < initial_cost);
+        assert_eq!(dense.poses[0], poses[0]);
+        assert_eq!(sparse.poses[0], poses[0]);
+        for (dense_pose, sparse_pose) in dense.poses.iter().zip(&sparse.poses) {
+            let translation_difference =
+                (dense_pose.translation - sparse_pose.translation).length();
+            let dense_rotation = SO3F64::from_matrix(&dense_pose.rotation);
+            let sparse_rotation = SO3F64::from_matrix(&sparse_pose.rotation);
+            let rotation_difference = dense_rotation.rminus(&sparse_rotation).length();
+            assert!(
+                translation_difference <= 2e-3,
+                "translation difference {translation_difference} exceeds tolerance"
+            );
+            assert!(
+                rotation_difference <= 2e-3,
+                "rotation difference {rotation_difference} exceeds tolerance"
+            );
+        }
     }
 
     #[test]
