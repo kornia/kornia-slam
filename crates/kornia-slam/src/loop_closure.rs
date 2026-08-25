@@ -1,7 +1,6 @@
-//! Geometric loop verification and pose-graph diagnostics.
+//! Geometric loop verification and pose-graph optimization.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pgo::{PgoEdge, PgoParams, pose_graph_optimize};
@@ -242,9 +241,9 @@ fn edge_quality_better(candidate: &VerifiedLoopEdge, current: &VerifiedLoopEdge)
         .is_gt()
 }
 
-/// Configuration for the read-only PGO solve.
+/// Configuration for pose-graph optimization.
 #[derive(Debug, Clone)]
-pub struct ShadowPgoConfig {
+pub struct PgoConfig {
     pub loop_edge_weight: f32,
     pub max_iterations: usize,
     pub cost_tolerance: f32,
@@ -252,7 +251,7 @@ pub struct ShadowPgoConfig {
     pub initial_lambda: f32,
 }
 
-impl Default for ShadowPgoConfig {
+impl Default for PgoConfig {
     fn default() -> Self {
         Self {
             loop_edge_weight: 0.5,
@@ -264,59 +263,24 @@ impl Default for ShadowPgoConfig {
     }
 }
 
-/// Live-map changes made after an explicitly enabled, usable PGO result.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PgoApplicationStats {
-    pub keyframes_corrected: usize,
-    pub map_points_corrected: usize,
-    pub observations_added: usize,
-    pub map_points_merged: usize,
-}
-
-/// Manifold used for a pose-graph solve.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PgoMode {
-    Se3,
-    Gravity4Dof,
-}
-
-/// Runtime inertial frame needed by gravity-preserving PGO diagnostics.
+/// Runtime inertial frame needed by gravity-preserving PGO.
 #[derive(Debug, Clone, Copy)]
 pub struct InertialPgoContext {
     pub gravity_world: Vec3F64,
-    pub imu_t_bc: Option<Pose3d>,
 }
 
-/// Output of a PGO run and its optional live-map application statistics.
+/// Pose snapshot and optimized poses required for safe live-map writeback.
 #[derive(Debug, Clone)]
-pub struct ShadowPgoDiagnostic {
-    pub mode: PgoMode,
+pub struct PgoResult {
     pub keyframe_indices: Vec<usize>,
     pub original_poses: Vec<Pose3d>,
     pub optimized_poses: Vec<Pose3d>,
-    pub verified_loop: VerifiedLoopEdge,
-    pub iterations: usize,
-    pub converged: bool,
     pub usable: bool,
-    pub node_count: usize,
-    pub sequential_edge_count: usize,
-    pub loop_edge_count: usize,
-    pub initial_cost: f64,
-    pub final_cost: f64,
-    pub new_loop_residual_before: f64,
-    pub new_loop_residual_after: f64,
-    pub solve_time_ms: f64,
-    pub median_translation_correction: f64,
-    pub max_translation_correction: f64,
-    pub max_gravity_alignment_error_rad: Option<f64>,
-    pub imu_residual_rms_before: Option<f64>,
-    pub imu_residual_rms_after: Option<f64>,
-    pub application: Option<PgoApplicationStats>,
 }
 
-/// Shadow-graph construction or solve failure.
+/// Pose-graph construction or solve failure.
 #[derive(Debug, Error)]
-pub enum ShadowPgoError {
+pub enum PgoError {
     #[error("pose graph needs at least two keyframes")]
     TooFewKeyframes,
     #[error("loop edge references a keyframe outside the map snapshot")]
@@ -665,16 +629,16 @@ fn fuse_loop_direction(
     }
 }
 
-/// Run PGO against a read-only keyframe snapshot and return diagnostic poses.
-pub fn run_shadow_pgo(
+/// Optimize a read-only keyframe snapshot for safe live-map writeback.
+pub fn optimize_pose_graph(
     map: &Map,
     verified_loops: &[VerifiedLoopEdge],
-    config: &ShadowPgoConfig,
+    config: &PgoConfig,
     inertial: Option<InertialPgoContext>,
-) -> Result<ShadowPgoDiagnostic, ShadowPgoError> {
+) -> Result<PgoResult, PgoError> {
     let keyframes = map.keyframes();
     if keyframes.len() < 2 {
-        return Err(ShadowPgoError::TooFewKeyframes);
+        return Err(PgoError::TooFewKeyframes);
     }
     let keyframe_indices: Vec<_> = keyframes
         .iter()
@@ -701,10 +665,10 @@ pub fn run_shadow_pgo(
     }
     for verified in verified_loops {
         let Some(&candidate_node) = node_by_keyframe.get(&verified.candidate_kf_idx) else {
-            return Err(ShadowPgoError::MissingLoopKeyframe);
+            return Err(PgoError::MissingLoopKeyframe);
         };
         let Some(&query_node) = node_by_keyframe.get(&verified.query_kf_idx) else {
-            return Err(ShadowPgoError::MissingLoopKeyframe);
+            return Err(PgoError::MissingLoopKeyframe);
         };
         edges.push(PgoEdge {
             pose_a: candidate_node,
@@ -713,21 +677,17 @@ pub fn run_shadow_pgo(
             weight: config.loop_edge_weight,
         });
     }
-    let node_count = original_poses.len();
-    let sequential_edge_count = node_count - 1;
-    let loop_edge_count = verified_loops.len();
     let initial_cost = pose_graph_cost(&original_poses, &edges);
-    let new_loop_edge = edges.last().ok_or(ShadowPgoError::MissingLoopKeyframe)?;
+    let new_loop_edge = edges.last().ok_or(PgoError::MissingLoopKeyframe)?;
     let new_loop_residual_before = weighted_edge_residual_norm(&original_poses, new_loop_edge)
-        .ok_or(ShadowPgoError::MissingLoopKeyframe)?;
-    let solve_started = Instant::now();
+        .ok_or(PgoError::MissingLoopKeyframe)?;
     let params = PgoParams {
         max_iterations: config.max_iterations,
         cost_tolerance: config.cost_tolerance,
         gradient_tolerance: config.gradient_tolerance,
         initial_lambda: config.initial_lambda,
     };
-    let (mode, optimized_poses, iterations, converged) = if let Some(context) = inertial {
+    let (optimized_poses, converged) = if let Some(context) = inertial {
         let result = gravity_pose_graph_optimize(
             &original_poses,
             &edges,
@@ -735,60 +695,28 @@ pub fn run_shadow_pgo(
             context.gravity_world,
             &params,
         )
-        .map_err(|error| ShadowPgoError::Solver(error.to_string()))?;
-        (
-            PgoMode::Gravity4Dof,
-            result.poses,
-            result.iterations,
-            result.converged,
-        )
+        .map_err(|error| PgoError::Solver(error.to_string()))?;
+        (result.poses, result.converged)
     } else {
         let result = pose_graph_optimize(&original_poses, &edges, &[0], &params)
-            .map_err(|error| ShadowPgoError::Solver(error.to_string()))?;
-        (
-            PgoMode::Se3,
-            result.poses,
-            result.iterations,
-            result.converged,
-        )
+            .map_err(|error| PgoError::Solver(error.to_string()))?;
+        (result.poses, result.converged)
     };
-    let solve_time_ms = solve_started.elapsed().as_secs_f64() * 1000.0;
     let final_cost = pose_graph_cost(&optimized_poses, &edges);
     let new_loop_residual_after = weighted_edge_residual_norm(&optimized_poses, new_loop_edge)
-        .ok_or(ShadowPgoError::MissingLoopKeyframe)?;
+        .ok_or(PgoError::MissingLoopKeyframe)?;
     let max_gravity_alignment_error_rad = inertial.map(|context| {
         max_gravity_alignment_error(&original_poses, &optimized_poses, context.gravity_world)
-    });
-    let imu_residual_rms_before = inertial.and_then(|context| {
-        map.inertial_residual_rms(
-            &keyframe_indices,
-            &original_poses,
-            context.gravity_world,
-            context.imu_t_bc,
-        )
-    });
-    let imu_residual_rms_after = inertial.and_then(|context| {
-        map.inertial_residual_rms(
-            &keyframe_indices,
-            &optimized_poses,
-            context.gravity_world,
-            context.imu_t_bc,
-        )
     });
     let metrics_finite = [
         initial_cost,
         final_cost,
         new_loop_residual_before,
         new_loop_residual_after,
-        solve_time_ms,
     ]
     .into_iter()
     .all(f64::is_finite);
-    let inertial_metrics_finite = max_gravity_alignment_error_rad
-        .into_iter()
-        .chain(imu_residual_rms_before)
-        .chain(imu_residual_rms_after)
-        .all(f64::is_finite);
+    let inertial_metrics_finite = max_gravity_alignment_error_rad.is_none_or(f64::is_finite);
     let gravity_preserved = max_gravity_alignment_error_rad.is_none_or(|error| error <= 1e-4);
     let usable = converged
         && metrics_finite
@@ -797,44 +725,11 @@ pub fn run_shadow_pgo(
         && final_cost < initial_cost
         && new_loop_residual_after <= new_loop_residual_before;
 
-    let mut corrections: Vec<f64> = original_poses
-        .iter()
-        .zip(&optimized_poses)
-        .map(|(before, after)| {
-            (before.inverse().translation - after.inverse().translation).length()
-        })
-        .collect();
-    corrections.sort_by(f64::total_cmp);
-    let median_translation_correction = corrections[corrections.len() / 2];
-    let max_translation_correction = corrections.last().copied().unwrap_or(0.0);
-    let verified_loop = verified_loops
-        .last()
-        .cloned()
-        .ok_or(ShadowPgoError::MissingLoopKeyframe)?;
-
-    Ok(ShadowPgoDiagnostic {
-        mode,
+    Ok(PgoResult {
         keyframe_indices,
         original_poses,
         optimized_poses,
-        verified_loop,
-        iterations,
-        converged,
         usable,
-        node_count,
-        sequential_edge_count,
-        loop_edge_count,
-        initial_cost,
-        final_cost,
-        new_loop_residual_before,
-        new_loop_residual_after,
-        solve_time_ms,
-        median_translation_correction,
-        max_translation_correction,
-        max_gravity_alignment_error_rad,
-        imu_residual_rms_before,
-        imu_residual_rms_after,
-        application: None,
     })
 }
 
@@ -1352,7 +1247,7 @@ mod tests {
     }
 
     #[test]
-    fn shadow_pgo_reduces_terminal_loop_gap_without_moving_anchor() {
+    fn pgo_reduces_terminal_loop_gap_without_moving_anchor() {
         let mut map = Map::new();
         for index in 0..5 {
             let pose = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(-(index as f64), 0.0, 0.0));
@@ -1368,31 +1263,16 @@ mod tests {
             reprojection_rmse_px: 1.0,
             occupied_cells: 8,
         };
-        let diagnostic =
-            run_shadow_pgo(&map, &[verified], &ShadowPgoConfig::default(), None).unwrap();
-        assert_eq!(diagnostic.optimized_poses[0], diagnostic.original_poses[0]);
-        assert_eq!(diagnostic.node_count, 5);
-        assert_eq!(diagnostic.sequential_edge_count, 4);
-        assert_eq!(diagnostic.loop_edge_count, 1);
-        assert!(diagnostic.initial_cost.is_finite());
-        assert!(diagnostic.final_cost < diagnostic.initial_cost);
-        assert!(
-            diagnostic.new_loop_residual_after < diagnostic.new_loop_residual_before,
-            "expected loop residual {} < {}",
-            diagnostic.new_loop_residual_after,
-            diagnostic.new_loop_residual_before,
-        );
-        assert!(diagnostic.solve_time_ms.is_finite());
-        assert!(diagnostic.solve_time_ms >= 0.0);
-        assert_eq!(diagnostic.usable, diagnostic.converged);
-        let before = diagnostic.original_poses[4].inverse().translation.length();
-        let after = diagnostic.optimized_poses[4].inverse().translation.length();
+        let result = optimize_pose_graph(&map, &[verified], &PgoConfig::default(), None).unwrap();
+        assert_eq!(result.optimized_poses[0], result.original_poses[0]);
+        assert!(result.usable);
+        let before = result.original_poses[4].inverse().translation.length();
+        let after = result.optimized_poses[4].inverse().translation.length();
         assert!(after < before, "expected {after} < {before}");
-        assert!(diagnostic.max_translation_correction > 0.0);
     }
 
     #[test]
-    fn inertial_shadow_pgo_uses_four_dof_and_preserves_gravity() {
+    fn inertial_pgo_uses_four_dof_and_preserves_gravity() {
         let gravity = Vec3F64::new(0.3, -9.4, 1.1);
         let gravity_axis = gravity.normalize();
         let tilt = kornia_algebra::SO3F64::exp(Vec3F64::new(0.2, -0.1, 0.05)).matrix();
@@ -1416,22 +1296,21 @@ mod tests {
             occupied_cells: 8,
         };
 
-        let diagnostic = run_shadow_pgo(
+        let result = optimize_pose_graph(
             &map,
             &[verified],
-            &ShadowPgoConfig::default(),
+            &PgoConfig::default(),
             Some(InertialPgoContext {
                 gravity_world: gravity,
-                imu_t_bc: None,
             }),
         )
         .unwrap();
 
-        assert_eq!(diagnostic.mode, PgoMode::Gravity4Dof);
-        assert_eq!(diagnostic.optimized_poses[0], diagnostic.original_poses[0]);
-        assert!(diagnostic.final_cost < diagnostic.initial_cost);
-        assert!(diagnostic.max_gravity_alignment_error_rad.unwrap() <= 1e-4);
-        assert_eq!(diagnostic.imu_residual_rms_before, None);
-        assert_eq!(diagnostic.imu_residual_rms_after, None);
+        assert_eq!(result.optimized_poses[0], result.original_poses[0]);
+        assert!(result.usable);
+        assert!(
+            max_gravity_alignment_error(&result.original_poses, &result.optimized_poses, gravity,)
+                <= 1e-4
+        );
     }
 }

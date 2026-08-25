@@ -29,7 +29,6 @@ pub(crate) enum GravityPgoError {
 
 pub(crate) struct GravityPgoResult {
     pub poses: Vec<Pose3d>,
-    pub iterations: usize,
     pub converged: bool,
 }
 
@@ -331,7 +330,6 @@ pub(crate) fn gravity_pose_graph_optimize(
     }
     Ok(GravityPgoResult {
         poses: optimized_poses,
-        iterations: result.iterations,
         converged: matches!(
             result.termination_reason,
             TerminationReason::CostConverged | TerminationReason::GradientConverged

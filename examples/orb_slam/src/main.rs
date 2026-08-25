@@ -32,7 +32,7 @@ mod source;
 mod tui;
 mod utils;
 use crate::datasets::euroc::GroundTruthPose;
-use config::{PipelineConfig, ShadowPgoPipelineConfig};
+use config::{PgoPipelineConfig, PipelineConfig};
 use evaluation::associate_gt;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
@@ -42,7 +42,7 @@ use kornia_sensors::imu::ImuMeasurement;
 use kornia_slam::Frame;
 use kornia_slam::map::LocalMappingMode;
 use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches};
-use pipeline::{LoopGeometryEvent, Pipeline};
+use pipeline::{LoopClosureEvent, Pipeline};
 #[cfg(feature = "oakd")]
 use source::OakdSource;
 #[cfg(feature = "uvc")]
@@ -53,8 +53,7 @@ use utils::trajectory_point_from_pose;
 
 #[cfg(feature = "viz")]
 use utils::{
-    log_camera_to_rerun, log_frame_to_rerun, log_map_points_to_rerun, log_shadow_pgo_to_rerun,
-    log_trajectory_to_rerun,
+    log_camera_to_rerun, log_frame_to_rerun, log_map_points_to_rerun, log_trajectory_to_rerun,
 };
 /// CLI arguments.
 #[derive(argh::FromArgs)]
@@ -91,12 +90,7 @@ struct Args {
     #[argh(option)]
     vocab: Option<String>,
 
-    /// geometrically verify loop candidates and run read-only pose-graph
-    /// optimization diagnostics (requires --vocab and stereo or IMU input)
-    #[argh(switch)]
-    shadow_pgo: bool,
-
-    /// apply usable pose-graph corrections to the live stereo map; initialized
+    /// apply usable pose-graph corrections to the live metric map; initialized
     /// IMU input uses gravity-preserving four-degree-of-freedom optimization
     #[argh(switch)]
     apply_pgo: bool,
@@ -353,7 +347,6 @@ fn build_u8_pyramid(img: &Image<u8, 1>) -> Vec<Image<u8, 1>> {
 }
 
 fn validate_pgo_mode(
-    shadow_pgo: bool,
     apply_pgo: bool,
     has_vocabulary: bool,
     has_stereo: bool,
@@ -362,14 +355,8 @@ fn validate_pgo_mode(
     if apply_pgo && !has_vocabulary {
         return Err("--apply-pgo requires --vocab");
     }
-    if shadow_pgo && !has_vocabulary {
-        return Err("--shadow-pgo requires --vocab");
-    }
-    if apply_pgo && !has_stereo {
-        return Err("--apply-pgo requires stereo input");
-    }
-    if shadow_pgo && !has_stereo && !has_imu {
-        return Err("--shadow-pgo requires stereo or IMU input");
+    if apply_pgo && !has_stereo && !has_imu {
+        return Err("--apply-pgo requires stereo or IMU input");
     }
     Ok(())
 }
@@ -517,7 +504,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     if let Err(error) = validate_pgo_mode(
-        args.shadow_pgo,
         args.apply_pgo,
         args.vocab.is_some(),
         stereo_config.is_some(),
@@ -537,10 +523,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         debug: args.debug,
         local_mapping: args.local_mapping,
         stereo_close_depth_m,
-        shadow_pgo: (args.shadow_pgo || args.apply_pgo).then(|| ShadowPgoPipelineConfig {
-            require_imu_initialized: imu_enabled && (args.apply_pgo || stereo_config.is_none()),
-            apply: args.apply_pgo,
-            ..ShadowPgoPipelineConfig::default()
+        pgo: args.apply_pgo.then(|| PgoPipelineConfig {
+            require_imu_initialized: imu_enabled,
+            ..PgoPipelineConfig::default()
         }),
         ..PipelineConfig::default()
     };
@@ -595,7 +580,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut trajectory: Vec<[f32; 3]> = Vec::new();
     let mut processed: usize = 0;
     let mut previous_image: Option<Image<u8, 1>> = None;
-    let mut total_loop_candidates: usize = 0;
 
     while let Some(item) = source.next_frame()? {
         let now = Instant::now();
@@ -710,105 +694,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let debug_msgs = system.drain_debug_messages();
         processed += 1;
 
-        // Surface loop-closure candidates from place recognition regardless of
-        // --debug; they are the headline signal of this stage.
-        for lc in system.drain_loop_candidates() {
-            total_loop_candidates += 1;
-            eprintln!(
-                "[loop] kf={} ~ kf={} score={:.3} shared_words={}",
-                lc.query_kf_idx, lc.candidate.kf_idx, lc.candidate.score, lc.candidate.shared_words
-            );
-        }
-        for event in system.drain_loop_geometry_events() {
+        for event in system.drain_loop_closure_events() {
             match event {
-                LoopGeometryEvent::EpisodePending {
-                    edge,
-                    hits,
-                    required,
-                } => eprintln!(
-                    "[loop-episode] pending kf={} ~ kf={} consistency={hits}/{required} inliers={} rmse={:.2}px",
+                LoopClosureEvent::Accepted { edge, applied } => eprintln!(
+                    "[loop-closure] accepted kf={} ~ kf={} inliers={} rmse={:.2}px applied={applied}",
                     edge.query_kf_idx,
                     edge.candidate_kf_idx,
                     edge.inliers,
                     edge.reprojection_rmse_px,
                 ),
-                LoopGeometryEvent::Accepted(edge) => eprintln!(
-                    "[loop-geometry] accepted kf={} ~ kf={} correspondences={} inliers={} ratio={:.3} rmse={:.2}px coverage={}",
-                    edge.query_kf_idx,
-                    edge.candidate_kf_idx,
-                    edge.correspondences,
-                    edge.inliers,
-                    edge.inlier_ratio,
-                    edge.reprojection_rmse_px,
-                    edge.occupied_cells,
-                ),
-                LoopGeometryEvent::EpisodeSuppressed {
-                    edge,
-                    representative_query_kf_idx,
-                    representative_candidate_kf_idx,
-                } => eprintln!(
-                    "[loop-episode] suppressed kf={} ~ kf={} representative={} ~ {}",
-                    edge.query_kf_idx,
-                    edge.candidate_kf_idx,
-                    representative_query_kf_idx,
-                    representative_candidate_kf_idx,
-                ),
-                LoopGeometryEvent::Rejected {
+                LoopClosureEvent::PgoFailed {
                     query_kf_idx,
                     candidate_kf_idx,
                     reason,
-                } => eprintln!(
-                    "[loop-geometry] rejected kf={query_kf_idx} ~ kf={candidate_kf_idx} reason={reason:?}"
-                ),
-                LoopGeometryEvent::PgoFailed {
-                    query_kf_idx,
-                    candidate_kf_idx,
-                    reason,
-                } => eprintln!(
-                    "[shadow-pgo] failed kf={query_kf_idx} ~ kf={candidate_kf_idx}: {reason}"
-                ),
-            }
-        }
-        for diagnostic in system.drain_shadow_pgo_diagnostics() {
-            eprintln!(
-                "[shadow-pgo] mode={:?} kf={} ~ kf={} nodes={} edges={}/{} iterations={} converged={} usable={} cost={:.6}->{:.6} loop_residual={:.6}->{:.6} solve={:.1}ms median_correction={:.4}m max_correction={:.4}m",
-                diagnostic.mode,
-                diagnostic.verified_loop.query_kf_idx,
-                diagnostic.verified_loop.candidate_kf_idx,
-                diagnostic.node_count,
-                diagnostic.sequential_edge_count,
-                diagnostic.loop_edge_count,
-                diagnostic.iterations,
-                diagnostic.converged,
-                diagnostic.usable,
-                diagnostic.initial_cost,
-                diagnostic.final_cost,
-                diagnostic.new_loop_residual_before,
-                diagnostic.new_loop_residual_after,
-                diagnostic.solve_time_ms,
-                diagnostic.median_translation_correction,
-                diagnostic.max_translation_correction,
-            );
-            if let Some(gravity_error) = diagnostic.max_gravity_alignment_error_rad {
-                eprintln!(
-                    "[pgo-imu] gravity_error={gravity_error:.3e}rad imu_residual_rms={:?}->{:?}",
-                    diagnostic.imu_residual_rms_before, diagnostic.imu_residual_rms_after,
-                );
-            }
-            if let Some(application) = diagnostic.application {
-                eprintln!(
-                    "[pgo-apply] kf={} ~ kf={} keyframes={} map_points={} observations_added={} map_points_merged={}",
-                    diagnostic.verified_loop.query_kf_idx,
-                    diagnostic.verified_loop.candidate_kf_idx,
-                    application.keyframes_corrected,
-                    application.map_points_corrected,
-                    application.observations_added,
-                    application.map_points_merged,
-                );
-            }
-            #[cfg(feature = "viz")]
-            if let Some(ref rec) = rec {
-                log_shadow_pgo_to_rerun(rec, &diagnostic);
+                } => eprintln!("[pgo] failed kf={query_kf_idx} ~ kf={candidate_kf_idx}: {reason}"),
             }
         }
 
@@ -907,7 +806,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
     );
-    eprintln!("Place recognition: {total_loop_candidates} loop candidate(s) detected");
     // ── Trajectory evaluation (EuRoC, --evaluate only) ─────────────────────
     if evaluate {
         evaluation::report(
@@ -924,27 +822,18 @@ mod pgo_mode_tests {
     use super::validate_pgo_mode;
 
     #[test]
-    fn apply_pgo_requires_vocabulary_and_stereo_and_accepts_imu() {
+    fn apply_pgo_requires_metric_input_and_accepts_mono_imu() {
         assert_eq!(
-            validate_pgo_mode(false, true, false, true, false).unwrap_err(),
+            validate_pgo_mode(true, false, true, false).unwrap_err(),
             "--apply-pgo requires --vocab"
         );
         assert_eq!(
-            validate_pgo_mode(false, true, true, false, false).unwrap_err(),
-            "--apply-pgo requires stereo input"
+            validate_pgo_mode(true, true, false, false).unwrap_err(),
+            "--apply-pgo requires stereo or IMU input"
         );
-        assert!(validate_pgo_mode(false, true, true, true, true).is_ok());
-        assert!(validate_pgo_mode(false, true, true, true, false).is_ok());
-    }
-
-    #[test]
-    fn shadow_pgo_keeps_existing_metric_input_rules() {
-        assert!(validate_pgo_mode(true, false, true, true, false).is_ok());
-        assert!(validate_pgo_mode(true, false, true, false, true).is_ok());
-        assert!(validate_pgo_mode(false, false, false, false, false).is_ok());
-        assert_eq!(
-            validate_pgo_mode(true, false, true, false, false).unwrap_err(),
-            "--shadow-pgo requires stereo or IMU input"
-        );
+        assert!(validate_pgo_mode(true, true, false, true).is_ok());
+        assert!(validate_pgo_mode(true, true, true, true).is_ok());
+        assert!(validate_pgo_mode(true, true, true, false).is_ok());
+        assert!(validate_pgo_mode(false, false, false, false).is_ok());
     }
 }
