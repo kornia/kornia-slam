@@ -31,10 +31,10 @@ pub(crate) struct SparsePgoResult {
 }
 
 #[allow(dead_code)]
-pub(crate) struct NormalSystem<const DOF: usize> {
-    pub(crate) pose_to_block: Vec<Option<usize>>,
-    pub(crate) blocks: BTreeMap<(usize, usize), Vec<f32>>,
-    pub(crate) gradient: Vec<f32>,
+struct NormalSystem<const DOF: usize> {
+    pose_to_block: Vec<Option<usize>>,
+    blocks: BTreeMap<(usize, usize), Vec<f32>>,
+    gradient: Vec<f32>,
 }
 
 #[allow(dead_code)]
@@ -91,7 +91,7 @@ impl<const DOF: usize> NormalSystem<DOF> {
         Ok(scalar_dim)
     }
 
-    pub(crate) fn solve_damped(&self, damping: f32) -> Result<Vec<f32>, SparsePgoError> {
+    fn solve_damped(&self, damping: f32) -> Result<Vec<f32>, SparsePgoError> {
         let scalar_dim = self.scalar_dim()?;
         validate_damping(damping)?;
         if scalar_dim == 0 {
@@ -368,7 +368,7 @@ pub(crate) fn weighted_relative_residual(
 }
 
 #[allow(dead_code)]
-pub(crate) fn build_normal_system<const DOF: usize>(
+fn build_normal_system<const DOF: usize>(
     poses: &[Pose3d],
     edges: &[PgoEdge],
     fixed_pose_indices: &[usize],
@@ -717,6 +717,60 @@ mod tests {
         (poses, edges)
     }
 
+    fn rotated_gravity_chain() -> (Vec<Pose3d>, Vec<PgoEdge>, GravityManifold) {
+        let gravity_axis = Vec3F64::new(0.3, -0.8, 0.4).normalize();
+        let manifold = GravityManifold::new(gravity_axis).unwrap();
+        let base_rotation = SO3F64::exp(Vec3F64::new(0.2, -0.1, 0.15)).matrix();
+        let poses = vec![
+            Pose3d::new(base_rotation, Vec3F64::new(0.1, -0.2, 0.3)),
+            Pose3d::new(
+                base_rotation * SO3F64::exp(gravity_axis * 0.25).matrix(),
+                Vec3F64::new(1.0, 0.15, -0.2),
+            ),
+            Pose3d::new(
+                base_rotation * SO3F64::exp(gravity_axis * -0.18).matrix(),
+                Vec3F64::new(2.1, -0.25, 0.35),
+            ),
+        ];
+        let expected = [
+            poses[0],
+            manifold
+                .retract(&poses[1], &[-0.08, 0.04, 0.03, 0.05])
+                .unwrap(),
+            manifold
+                .retract(&poses[2], &[-0.12, -0.02, 0.07, -0.04])
+                .unwrap(),
+        ];
+        let edges = (0..2)
+            .map(|pose_a| PgoEdge {
+                pose_a,
+                pose_b: pose_a + 1,
+                t_ab_meas: pose_to_se3(&expected[pose_a + 1]).unwrap()
+                    * pose_to_se3(&expected[pose_a]).unwrap().inverse(),
+                weight: 0.8,
+            })
+            .collect();
+        (poses, edges, manifold)
+    }
+
+    fn normal_cost(poses: &[Pose3d], edges: &[PgoEdge]) -> f64 {
+        edges
+            .iter()
+            .map(|edge| {
+                weighted_relative_residual(
+                    &poses[edge.pose_a],
+                    &poses[edge.pose_b],
+                    &edge.t_ab_meas,
+                    edge.weight,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|value| 0.5 * (value as f64).powi(2))
+                .sum::<f64>()
+            })
+            .sum()
+    }
+
     #[test]
     fn relative_residual_is_zero_for_matching_measurement() {
         let pose_a = Pose3d::new(
@@ -813,5 +867,34 @@ mod tests {
         for (sparse, dense) in sparse.into_iter().zip(dense) {
             assert_near(sparse as f64, dense as f64, 1e-4);
         }
+    }
+
+    #[test]
+    fn gravity_normal_blocks_are_symmetric_and_gradient_matches_cost_change() {
+        let (poses, edges, manifold) = rotated_gravity_chain();
+        let normal = build_normal_system(&poses, &edges, &[0], &manifold).unwrap();
+        let h_ab = &normal.blocks[&(0, 1)];
+        let h_ba = &normal.blocks[&(1, 0)];
+
+        for row in 0..4 {
+            for col in 0..4 {
+                assert_near(h_ab[row * 4 + col] as f64, h_ba[col * 4 + row] as f64, 1e-6);
+            }
+        }
+
+        let epsilon = 1e-3;
+        let mut delta_plus = [0.0; 4];
+        let mut delta_minus = [0.0; 4];
+        delta_plus[0] = epsilon;
+        delta_minus[0] = -epsilon;
+        let mut poses_plus = poses.clone();
+        let mut poses_minus = poses.clone();
+        poses_plus[1] = manifold.retract(&poses[1], &delta_plus).unwrap();
+        poses_minus[1] = manifold.retract(&poses[1], &delta_minus).unwrap();
+        let cost_derivative = (normal_cost(&poses_plus, &edges)
+            - normal_cost(&poses_minus, &edges))
+            / (2.0 * epsilon as f64);
+
+        assert_near(normal.gradient[0] as f64, cost_derivative, 2e-4);
     }
 }
