@@ -2,6 +2,7 @@
 
 pub mod estimation;
 pub mod frame;
+pub mod loop_closure;
 pub mod map;
 pub mod place_recognition;
 pub mod stereo;
