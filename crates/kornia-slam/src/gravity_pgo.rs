@@ -41,7 +41,7 @@ mod tests {
     use kornia_algebra::{SE3F32, SO3F64, Vec3F64};
 
     use super::gravity_pose_graph_optimize;
-    use crate::sparse_pgo::{GravityManifold, PoseManifold, pose_to_se3 as sparse_pose_to_se3};
+    use crate::sparse_pgo::pose_to_se3 as sparse_pose_to_se3;
 
     fn assert_vec3_near(actual: Vec3F64, expected: Vec3F64, tolerance: f64) {
         assert!(
@@ -52,58 +52,6 @@ mod tests {
 
     fn pose_to_se3(pose: &Pose3d) -> SE3F32 {
         sparse_pose_to_se3(pose).unwrap()
-    }
-
-    #[test]
-    fn gravity_retraction_identity_preserves_original_pose() {
-        let original = Pose3d::new(
-            SO3F64::exp(Vec3F64::new(0.2, -0.1, 0.3)).matrix(),
-            Vec3F64::new(1.0, -2.0, 0.5),
-        );
-
-        let reconstructed = GravityManifold::new(Vec3F64::new(0.0, 1.0, 0.0))
-            .unwrap()
-            .retract(&original, &[0.0; 4])
-            .unwrap();
-
-        assert_vec3_near(reconstructed.translation, original.translation, 1e-6);
-        for column in 0..3 {
-            assert_vec3_near(
-                reconstructed.rotation.col(column).into(),
-                original.rotation.col(column).into(),
-                1e-6,
-            );
-        }
-    }
-
-    #[test]
-    fn gravity_retraction_changes_center_without_changing_gravity_alignment() {
-        let gravity_axis = Vec3F64::new(0.3, -0.8, 0.4).normalize();
-        let original = Pose3d::new(
-            SO3F64::exp(Vec3F64::new(-0.2, 0.15, 0.35)).matrix(),
-            Vec3F64::new(0.4, -0.7, 1.1),
-        );
-        let original_center = original.inverse().translation;
-        let expected_center = Vec3F64::new(2.0, -3.0, 1.5);
-        let center_delta = expected_center - original_center;
-        let delta = [
-            center_delta.x as f32,
-            center_delta.y as f32,
-            center_delta.z as f32,
-            0.7,
-        ];
-
-        let reconstructed = GravityManifold::new(gravity_axis)
-            .unwrap()
-            .retract(&original, &delta)
-            .unwrap();
-
-        assert_vec3_near(reconstructed.inverse().translation, expected_center, 1e-5);
-        assert_vec3_near(
-            reconstructed.rotation * gravity_axis,
-            original.rotation * gravity_axis,
-            1e-6,
-        );
     }
 
     fn world_to_camera(center: Vec3F64, yaw: f64, gravity_axis: Vec3F64) -> Pose3d {

@@ -9,12 +9,8 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3AF32, Mat3F64, SE3F32, SO3F32, SO3F64, Vec3AF32, Vec3F64};
 use thiserror::Error;
 
-// The primitives become production-reachable as the sparse assembly and
-// optimizer are added in Tasks 2-5. Keep the temporary allowances item-local.
-#[allow(dead_code)]
 const RESIDUAL_DIM: usize = 6;
 
-#[allow(dead_code)]
 const NUM_JACOBIAN_EPS: f32 = 1e-3;
 
 const STEP_SIZE_TOLERANCE: f32 = 1e-6;
@@ -22,20 +18,17 @@ const LAMBDA_FACTOR: f32 = 10.0;
 const LAMBDA_MIN: f32 = 1e-10;
 const LAMBDA_MAX: f32 = 1e10;
 
-#[allow(dead_code)]
 pub(crate) trait PoseManifold<const DOF: usize> {
     fn retract(&self, pose: &Pose3d, delta: &[f32; DOF]) -> Result<Pose3d, SparsePgoError>;
 }
 
-// Populated by the optimizer driver added in Task 3.
-#[allow(dead_code)]
 pub(crate) struct SparsePgoResult {
     pub poses: Vec<Pose3d>,
+    #[allow(dead_code)]
     pub iterations: usize,
     pub converged: bool,
 }
 
-#[allow(dead_code)]
 struct NormalSystem<const DOF: usize> {
     pose_to_block: Vec<Option<usize>>,
     blocks: BTreeMap<(usize, usize), Vec<f32>>,
@@ -48,7 +41,6 @@ struct SparseSolveCache {
     row_idx: Vec<usize>,
 }
 
-#[allow(dead_code)]
 impl<const DOF: usize> NormalSystem<DOF> {
     fn scalar_dim(&self) -> Result<usize, SparsePgoError> {
         if DOF == 0 {
@@ -102,15 +94,9 @@ impl<const DOF: usize> NormalSystem<DOF> {
         Ok(scalar_dim)
     }
 
+    #[cfg(test)]
     fn solve_damped(&self, damping: f32) -> Result<Vec<f32>, SparsePgoError> {
-        #[cfg(test)]
-        {
-            self.solve_damped_with_cache(damping, &mut None, &mut SparsePgoTestHooks::default())
-        }
-        #[cfg(not(test))]
-        {
-            self.solve_damped_with_cache(damping, &mut None)
-        }
+        self.solve_damped_with_cache(damping, &mut None, &mut SparsePgoTestHooks::default())
     }
 
     fn solve_damped_with_cache(
@@ -288,7 +274,6 @@ impl<const DOF: usize> NormalSystem<DOF> {
 }
 
 #[derive(Debug, Error)]
-#[allow(dead_code)]
 pub(crate) enum SparsePgoError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
@@ -336,7 +321,6 @@ impl PoseManifold<4> for GravityManifold {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn pose_to_se3(pose: &Pose3d) -> Result<SE3F32, SparsePgoError> {
     validate_pose(pose)?;
     let rotation = Mat3AF32::from_cols(
@@ -368,7 +352,6 @@ pub(crate) fn pose_to_se3(pose: &Pose3d) -> Result<SE3F32, SparsePgoError> {
     Ok(se3)
 }
 
-#[allow(dead_code)]
 pub(crate) fn se3_to_pose(se3: &SE3F32) -> Result<Pose3d, SparsePgoError> {
     validate_se3(se3)?;
     let rotation = se3.r.matrix();
@@ -396,7 +379,6 @@ pub(crate) fn se3_to_pose(se3: &SE3F32) -> Result<Pose3d, SparsePgoError> {
     Ok(pose)
 }
 
-#[allow(dead_code)]
 pub(crate) fn weighted_relative_residual(
     pose_a: &Pose3d,
     pose_b: &Pose3d,
@@ -726,11 +708,6 @@ fn validate_optimizer_inputs(
             "fixed pose index is out of range".into(),
         ));
     }
-    if fixed.len() == poses.len() {
-        return Err(SparsePgoError::InvalidInput(
-            "pose graph has no free poses".into(),
-        ));
-    }
     if params.max_iterations == 0 {
         return Err(SparsePgoError::InvalidInput(
             "maximum iterations must be greater than zero".into(),
@@ -792,7 +769,6 @@ fn finite_l2_norm(values: &[f32], name: &str) -> Result<f64, SparsePgoError> {
     Ok(norm)
 }
 
-#[allow(dead_code)]
 fn build_normal_system<const DOF: usize>(
     poses: &[Pose3d],
     edges: &[PgoEdge],
@@ -816,10 +792,29 @@ fn build_normal_system<const DOF: usize>(
             "fixed pose index is out of range".into(),
         ));
     }
+    let mut is_free = vec![false; poses.len()];
+    for edge in edges {
+        if edge.pose_a >= poses.len() || edge.pose_b >= poses.len() {
+            return Err(SparsePgoError::InvalidInput(
+                "pose-graph edge index is out of range".into(),
+            ));
+        }
+        if edge.pose_a == edge.pose_b {
+            return Err(SparsePgoError::InvalidInput(
+                "pose-graph edge endpoints must be distinct".into(),
+            ));
+        }
+        if !fixed.contains(&edge.pose_a) {
+            is_free[edge.pose_a] = true;
+        }
+        if !fixed.contains(&edge.pose_b) {
+            is_free[edge.pose_b] = true;
+        }
+    }
     let mut pose_to_block = vec![None; poses.len()];
     let mut block_count = 0usize;
     for (pose_index, block) in pose_to_block.iter_mut().enumerate() {
-        if !fixed.contains(&pose_index) {
+        if is_free[pose_index] {
             *block = Some(block_count);
             block_count += 1;
         }
@@ -839,16 +834,6 @@ fn build_normal_system<const DOF: usize>(
     };
 
     for edge in edges {
-        if edge.pose_a >= poses.len() || edge.pose_b >= poses.len() {
-            return Err(SparsePgoError::InvalidInput(
-                "pose-graph edge index is out of range".into(),
-            ));
-        }
-        if edge.pose_a == edge.pose_b {
-            return Err(SparsePgoError::InvalidInput(
-                "pose-graph edge endpoints must be distinct".into(),
-            ));
-        }
         let residual = weighted_relative_residual(
             &poses[edge.pose_a],
             &poses[edge.pose_b],
@@ -1049,7 +1034,6 @@ fn normalized_gravity(gravity_axis: Vec3F64) -> Result<Vec3F64, SparsePgoError> 
     Ok(gravity_axis / norm)
 }
 
-#[allow(dead_code)]
 fn validate_delta<const DOF: usize>(delta: &[f32; DOF]) -> Result<(), SparsePgoError> {
     if delta.iter().any(|value| !value.is_finite()) {
         return Err(SparsePgoError::InvalidInput(
@@ -1059,7 +1043,6 @@ fn validate_delta<const DOF: usize>(delta: &[f32; DOF]) -> Result<(), SparsePgoE
     Ok(())
 }
 
-#[allow(dead_code)]
 fn validate_pose(pose: &Pose3d) -> Result<(), SparsePgoError> {
     let rotation_is_finite = (0..3).all(|column| {
         let value = pose.rotation.col(column);
@@ -1073,7 +1056,6 @@ fn validate_pose(pose: &Pose3d) -> Result<(), SparsePgoError> {
     Ok(())
 }
 
-#[allow(dead_code)]
 fn validate_se3(se3: &SE3F32) -> Result<(), SparsePgoError> {
     let rotation = se3.r.matrix();
     let rotation_is_finite = (0..3).all(|column| {
@@ -1088,7 +1070,6 @@ fn validate_se3(se3: &SE3F32) -> Result<(), SparsePgoError> {
     Ok(())
 }
 
-#[allow(dead_code)]
 fn vec3_f64_is_finite(value: Vec3F64) -> bool {
     [value.x, value.y, value.z].into_iter().all(f64::is_finite)
 }
@@ -1100,8 +1081,8 @@ mod tests {
     use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 
     use super::{
-        GravityManifold, PoseManifold, Se3Manifold, SparsePgoTestHooks, build_normal_system,
-        finite_l2_norm, pose_to_se3, sparse_pose_graph_optimize,
+        GravityManifold, PoseManifold, Se3Manifold, SparsePgoError, SparsePgoTestHooks,
+        build_normal_system, finite_l2_norm, pose_to_se3, sparse_pose_graph_optimize,
         sparse_pose_graph_optimize_with_test_hooks, weighted_relative_residual,
     };
 
@@ -1275,12 +1256,19 @@ mod tests {
         let center = Vec3F64::new(1.0, -2.0, 0.5);
         let pose = Pose3d::new(rotation, -(rotation * center));
         let delta = [0.25, -0.1, 0.4, 0.35];
+        let manifold = GravityManifold::new(gravity_axis).unwrap();
+        let unchanged = manifold.retract(&pose, &[0.0; 4]).unwrap();
 
-        let retracted = GravityManifold::new(gravity_axis)
-            .unwrap()
-            .retract(&pose, &delta)
-            .unwrap();
+        let retracted = manifold.retract(&pose, &delta).unwrap();
 
+        assert_vec3_near(unchanged.translation, pose.translation, 1e-9);
+        for column in 0..3 {
+            assert_vec3_near(
+                unchanged.rotation.col(column).into(),
+                pose.rotation.col(column).into(),
+                1e-9,
+            );
+        }
         assert_vec3_near(
             retracted.inverse().translation,
             center + Vec3F64::new(delta[0] as f64, delta[1] as f64, delta[2] as f64),
@@ -1295,17 +1283,46 @@ mod tests {
 
     #[test]
     fn normal_system_contains_only_edge_induced_blocks() {
-        let (poses, edges) = three_pose_chain();
+        let (mut poses, edges) = three_pose_chain();
+        poses.push(Pose3d::new(
+            Mat3F64::IDENTITY,
+            Vec3F64::new(20.0, -4.0, 3.0),
+        ));
 
         let normal = build_normal_system(&poses, &edges, &[0], &Se3Manifold).unwrap();
 
-        assert_eq!(normal.pose_to_block, vec![None, Some(0), Some(1)]);
+        assert_eq!(normal.pose_to_block, vec![None, Some(0), Some(1), None]);
         assert_eq!(normal.gradient.len(), 12);
         assert_eq!(
             normal.blocks.keys().copied().collect::<Vec<_>>(),
             vec![(0, 0), (0, 1), (1, 0), (1, 1)]
         );
         assert!(normal.blocks.values().all(|block| block.len() == 36));
+    }
+
+    #[test]
+    fn sparse_lm_rejects_graph_with_only_fixed_edge_endpoints() {
+        let poses = vec![Pose3d::IDENTITY; 3];
+        let edges = [PgoEdge {
+            pose_a: 0,
+            pose_b: 1,
+            t_ab_meas: pose_to_se3(&Pose3d::IDENTITY).unwrap(),
+            weight: 1.0,
+        }];
+
+        let result = sparse_pose_graph_optimize(
+            &poses,
+            &edges,
+            &[0, 1],
+            &PgoParams::default(),
+            &Se3Manifold,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SparsePgoError::InvalidInput(message))
+                if message == "pose graph has no free poses"
+        ));
     }
 
     #[test]
@@ -1375,9 +1392,14 @@ mod tests {
     }
 
     #[test]
-    fn sparse_lm_keeps_fixed_pose_unchanged() {
-        let (poses, edges) = drifting_loop_graph();
+    fn sparse_lm_keeps_fixed_and_isolated_poses_unchanged() {
+        let (mut poses, edges) = drifting_loop_graph();
+        poses.push(Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.1, -0.2, 0.3)).matrix(),
+            Vec3F64::new(20.0, -4.0, 3.0),
+        ));
         let fixed = poses[0];
+        let isolated = poses[4];
 
         let result =
             sparse_pose_graph_optimize(&poses, &edges, &[0], &PgoParams::default(), &Se3Manifold)
@@ -1385,6 +1407,8 @@ mod tests {
 
         assert_eq!(result.poses[0].rotation, fixed.rotation);
         assert_eq!(result.poses[0].translation, fixed.translation);
+        assert_eq!(result.poses[4].rotation, isolated.rotation);
+        assert_eq!(result.poses[4].translation, isolated.translation);
     }
 
     #[test]
