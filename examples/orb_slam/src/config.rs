@@ -1,5 +1,6 @@
 use kornia_slam::estimation::map_projection::MapProjectionConfig;
 use kornia_slam::estimation::two_view::TwoViewInitConfig;
+use kornia_slam::loop_closure::{LoopVerificationConfig, ShadowPgoConfig};
 use kornia_slam::map::LocalMappingMode;
 use kornia_slam::system::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
@@ -18,6 +19,17 @@ pub struct PipelineConfig {
     /// Emit per-frame diagnostics: skip reasons in bootstrap, reject reasons
     /// in tracking, keyframe-growth and fuse counters.
     pub debug: bool,
+    /// Optional read-only geometric loop verification and PGO diagnostics.
+    pub shadow_pgo: Option<ShadowPgoPipelineConfig>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ShadowPgoPipelineConfig {
+    /// Mono+IMU maps become metric only after inertial initialization. Stereo
+    /// maps are metric from bootstrap and leave this disabled.
+    pub require_imu_initialized: bool,
+    pub verification: LoopVerificationConfig,
+    pub pgo: ShadowPgoConfig,
 }
 
 impl Default for PipelineConfig {
@@ -34,6 +46,7 @@ impl Default for PipelineConfig {
             local_mapping: LocalMappingMode::Asynchronous,
             stereo_close_depth_m: None,
             debug: false,
+            shadow_pgo: None,
         }
     }
 }

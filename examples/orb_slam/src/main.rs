@@ -32,7 +32,7 @@ mod source;
 mod tui;
 mod utils;
 use crate::datasets::euroc::GroundTruthPose;
-use config::PipelineConfig;
+use config::{PipelineConfig, ShadowPgoPipelineConfig};
 use evaluation::associate_gt;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
@@ -42,7 +42,7 @@ use kornia_sensors::imu::ImuMeasurement;
 use kornia_slam::Frame;
 use kornia_slam::map::LocalMappingMode;
 use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches};
-use pipeline::Pipeline;
+use pipeline::{LoopGeometryEvent, Pipeline};
 #[cfg(feature = "oakd")]
 use source::OakdSource;
 #[cfg(feature = "uvc")]
@@ -53,7 +53,8 @@ use utils::trajectory_point_from_pose;
 
 #[cfg(feature = "viz")]
 use utils::{
-    log_camera_to_rerun, log_frame_to_rerun, log_map_points_to_rerun, log_trajectory_to_rerun,
+    log_camera_to_rerun, log_frame_to_rerun, log_map_points_to_rerun, log_shadow_pgo_to_rerun,
+    log_trajectory_to_rerun,
 };
 /// CLI arguments.
 #[derive(argh::FromArgs)]
@@ -89,6 +90,11 @@ struct Args {
     /// DBoW2 `ORBvoc.txt`) to enable appearance-based loop detection
     #[argh(option)]
     vocab: Option<String>,
+
+    /// geometrically verify loop candidates and run read-only SE(3) pose-graph
+    /// optimization diagnostics (requires --vocab and stereo or IMU input)
+    #[argh(switch)]
+    shadow_pgo: bool,
 }
 
 #[derive(argh::FromArgs)]
@@ -483,6 +489,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         StereoMatchConfig::new(baseline as f32, camera.fx as f32, ORB_SCALE, ORB_LEVELS)
     });
 
+    if args.shadow_pgo && args.vocab.is_none() {
+        return Err("--shadow-pgo requires --vocab".into());
+    }
+    if args.shadow_pgo && stereo_config.is_none() && !imu_enabled {
+        return Err("--shadow-pgo requires stereo or IMU input".into());
+    }
+
     // ── ORB detector ───────────────────────────────────────────────────────
     let detector = kornia_imgproc::features::OrbDetector {
         n_keypoints: args.n_keypoints,
@@ -494,6 +507,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         debug: args.debug,
         local_mapping: args.local_mapping,
         stereo_close_depth_m,
+        shadow_pgo: args.shadow_pgo.then(|| ShadowPgoPipelineConfig {
+            require_imu_initialized: stereo_config.is_none() && imu_enabled,
+            ..ShadowPgoPipelineConfig::default()
+        }),
         ..PipelineConfig::default()
     };
     let mut system = Pipeline::new(camera.clone(), pipeline_config);
@@ -567,6 +584,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             imu_samples,
         } = item;
         let image_size = gray_u8.size();
+        #[cfg(feature = "viz")]
+        if let Some(ref rec) = rec {
+            rec.set_time_sequence("frame", idx as i64);
+            rec.set_duration_secs("timestamp", timestamp_sec);
+        }
         let imu_measurements: Vec<ImuMeasurement> = if imu_enabled {
             imu_samples
                 .into_iter()
@@ -665,6 +687,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "[loop] kf={} ~ kf={} score={:.3} shared_words={}",
                 lc.query_kf_idx, lc.candidate.kf_idx, lc.candidate.score, lc.candidate.shared_words
             );
+        }
+        for event in system.drain_loop_geometry_events() {
+            match event {
+                LoopGeometryEvent::Accepted(edge) => eprintln!(
+                    "[loop-geometry] accepted kf={} ~ kf={} correspondences={} inliers={} ratio={:.3} rmse={:.2}px coverage={}",
+                    edge.query_kf_idx,
+                    edge.candidate_kf_idx,
+                    edge.correspondences,
+                    edge.inliers,
+                    edge.inlier_ratio,
+                    edge.reprojection_rmse_px,
+                    edge.occupied_cells,
+                ),
+                LoopGeometryEvent::Rejected {
+                    query_kf_idx,
+                    candidate_kf_idx,
+                    reason,
+                } => eprintln!(
+                    "[loop-geometry] rejected kf={query_kf_idx} ~ kf={candidate_kf_idx} reason={reason:?}"
+                ),
+                LoopGeometryEvent::PgoFailed {
+                    query_kf_idx,
+                    candidate_kf_idx,
+                    reason,
+                } => eprintln!(
+                    "[shadow-pgo] failed kf={query_kf_idx} ~ kf={candidate_kf_idx}: {reason}"
+                ),
+            }
+        }
+        for diagnostic in system.drain_shadow_pgo_diagnostics() {
+            eprintln!(
+                "[shadow-pgo] kf={} ~ kf={} iterations={} converged={} median_correction={:.4}m max_correction={:.4}m",
+                diagnostic.verified_loop.query_kf_idx,
+                diagnostic.verified_loop.candidate_kf_idx,
+                diagnostic.iterations,
+                diagnostic.converged,
+                diagnostic.median_translation_correction,
+                diagnostic.max_translation_correction,
+            );
+            #[cfg(feature = "viz")]
+            if let Some(ref rec) = rec {
+                log_shadow_pgo_to_rerun(rec, &diagnostic);
+            }
         }
 
         // Status line.

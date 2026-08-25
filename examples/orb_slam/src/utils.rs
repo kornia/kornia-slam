@@ -8,6 +8,8 @@ use kornia_algebra::Mat3F64;
 #[cfg(feature = "viz")]
 use kornia_image::{Image, ImageSize};
 #[cfg(feature = "viz")]
+use kornia_slam::loop_closure::ShadowPgoDiagnostic;
+#[cfg(feature = "viz")]
 use kornia_slam::map::MapPoint;
 
 #[cfg(feature = "viz")]
@@ -107,6 +109,89 @@ pub fn log_map_points_to_rerun(rec: &rerun::RecordingStream, map_points: &[MapPo
             &rerun::Points3D::new(positions)
                 .with_colors(colors)
                 .with_radii([rerun::Radius::new_scene_units(0.01)]),
+        )
+        .ok();
+    }
+}
+
+/// Log a read-only pose-graph solve alongside the live (unmodified) SLAM state.
+#[cfg(feature = "viz")]
+pub fn log_shadow_pgo_to_rerun(rec: &rerun::RecordingStream, diagnostic: &ShadowPgoDiagnostic) {
+    let original: Vec<_> = diagnostic
+        .original_poses
+        .iter()
+        .map(trajectory_point_from_pose)
+        .collect();
+    let optimized: Vec<_> = diagnostic
+        .optimized_poses
+        .iter()
+        .map(trajectory_point_from_pose)
+        .collect();
+
+    if original.len() >= 2 {
+        rec.log(
+            "world/shadow_pgo/original",
+            &rerun::LineStrips3D::new([original.as_slice()])
+                .with_colors([rerun::Color::from_rgb(160, 160, 160)])
+                .with_radii([rerun::Radius::new_ui_points(1.5)])
+                .with_labels(["original keyframes"]),
+        )
+        .ok();
+    }
+    if optimized.len() >= 2 {
+        rec.log(
+            "world/shadow_pgo/optimized",
+            &rerun::LineStrips3D::new([optimized.as_slice()])
+                .with_colors([rerun::Color::from_rgb(60, 220, 100)])
+                .with_radii([rerun::Radius::new_ui_points(2.5)])
+                .with_labels(["shadow optimized"]),
+        )
+        .ok();
+    }
+
+    let index_of = |kf_idx| {
+        diagnostic
+            .keyframe_indices
+            .iter()
+            .position(|&index| index == kf_idx)
+    };
+    if let (Some(query), Some(candidate)) = (
+        index_of(diagnostic.verified_loop.query_kf_idx),
+        index_of(diagnostic.verified_loop.candidate_kf_idx),
+    ) {
+        let edge = [original[candidate], original[query]];
+        rec.log(
+            "world/shadow_pgo/verified_loop_edge",
+            &rerun::LineStrips3D::new([edge])
+                .with_colors([rerun::Color::from_rgb(255, 80, 180)])
+                .with_radii([rerun::Radius::new_ui_points(4.0)])
+                .with_labels([format!(
+                    "verified loop {} ↔ {}",
+                    diagnostic.verified_loop.candidate_kf_idx,
+                    diagnostic.verified_loop.query_kf_idx,
+                )]),
+        )
+        .ok();
+    }
+
+    let edge = &diagnostic.verified_loop;
+    for (path, value) in [
+        ("inliers", edge.inliers as f64),
+        ("inlier_ratio", edge.inlier_ratio as f64),
+        ("reprojection_rmse_px", edge.reprojection_rmse_px as f64),
+        ("iterations", diagnostic.iterations as f64),
+        (
+            "median_translation_correction_m",
+            diagnostic.median_translation_correction,
+        ),
+        (
+            "max_translation_correction_m",
+            diagnostic.max_translation_correction,
+        ),
+    ] {
+        rec.log(
+            format!("shadow_pgo/metrics/{path}"),
+            &rerun::Scalars::single(value),
         )
         .ok();
     }

@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use crate::config::PipelineConfig;
+use crate::config::{PipelineConfig, ShadowPgoPipelineConfig};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
@@ -20,6 +20,10 @@ use kornia_slam::estimation::optical_flow::{
 };
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use kornia_slam::estimation::{ImuInitConfig, ImuInitializer, MapProjectionEstimator};
+use kornia_slam::loop_closure::{
+    LoopVerificationReject, ShadowPgoDiagnostic, VerifiedLoopEdge, run_shadow_pgo,
+    verify_loop_candidate,
+};
 use kornia_slam::map::{Keyframe, KeyframeJob, LocalMapping, Map, MapPoint, ORB_SCALE_FACTOR};
 use kornia_slam::place_recognition::{Candidate, KeyFrameDatabase, Vocabulary, compute_bow};
 use kornia_slam::stereo::unproject_stereo;
@@ -90,6 +94,11 @@ pub struct Pipeline {
     kf_database: KeyFrameDatabase,
     // Loop candidates surfaced since the last drain (query KF → matched KF).
     loop_candidates: Vec<LoopClosureCandidate>,
+    shadow_pgo_config: Option<ShadowPgoPipelineConfig>,
+    verified_loops: Vec<VerifiedLoopEdge>,
+    verified_loop_pairs: HashSet<(usize, usize)>,
+    loop_geometry_events: Vec<LoopGeometryEvent>,
+    shadow_pgo_diagnostics: Vec<ShadowPgoDiagnostic>,
     // System state
     state: SystemState,
 }
@@ -102,6 +111,22 @@ pub struct LoopClosureCandidate {
     pub query_kf_idx: usize,
     /// The retrieved earlier keyframe and its similarity score.
     pub candidate: Candidate,
+}
+
+/// Result of attempting to turn an appearance match into a metric loop edge.
+#[derive(Debug, Clone)]
+pub enum LoopGeometryEvent {
+    Accepted(VerifiedLoopEdge),
+    Rejected {
+        query_kf_idx: usize,
+        candidate_kf_idx: usize,
+        reason: LoopVerificationReject,
+    },
+    PgoFailed {
+        query_kf_idx: usize,
+        candidate_kf_idx: usize,
+        reason: String,
+    },
 }
 
 impl Pipeline {
@@ -156,6 +181,11 @@ impl Pipeline {
             vocabulary: None,
             kf_database: KeyFrameDatabase::new(),
             loop_candidates: Vec::new(),
+            shadow_pgo_config: config.shadow_pgo,
+            verified_loops: Vec::new(),
+            verified_loop_pairs: HashSet::new(),
+            loop_geometry_events: Vec::new(),
+            shadow_pgo_diagnostics: Vec::new(),
         }
     }
 
@@ -168,6 +198,14 @@ impl Pipeline {
     /// Drains loop candidates accumulated since the last call.
     pub fn drain_loop_candidates(&mut self) -> Vec<LoopClosureCandidate> {
         std::mem::take(&mut self.loop_candidates)
+    }
+
+    pub fn drain_loop_geometry_events(&mut self) -> Vec<LoopGeometryEvent> {
+        std::mem::take(&mut self.loop_geometry_events)
+    }
+
+    pub fn drain_shadow_pgo_diagnostics(&mut self) -> Vec<ShadowPgoDiagnostic> {
+        std::mem::take(&mut self.shadow_pgo_diagnostics)
     }
 
     /// Enables the inertial path by providing the camera-to-body extrinsic
@@ -1305,11 +1343,73 @@ impl Pipeline {
                 best.shared_words,
                 candidates.len()
             ));
-            for candidate in candidates {
+            for candidate in candidates.iter().copied() {
                 self.loop_candidates.push(LoopClosureCandidate {
                     query_kf_idx: kf_idx,
                     candidate,
                 });
+            }
+        }
+
+        let Some(shadow_config) = self.shadow_pgo_config.as_ref() else {
+            return;
+        };
+        if shadow_config.require_imu_initialized && !self.state.imu_initialized {
+            return;
+        }
+        let (events, accepted, diagnostic) = {
+            let map = self.map.lock().unwrap();
+            let mut events = Vec::new();
+            let mut accepted = None;
+            let mut diagnostic = None;
+            for candidate in &candidates {
+                let pair = normalized_loop_pair(kf_idx, candidate.kf_idx);
+                if self.verified_loop_pairs.contains(&pair) {
+                    continue;
+                }
+                match verify_loop_candidate(
+                    &map,
+                    &self.camera,
+                    kf_idx,
+                    candidate.kf_idx,
+                    &shadow_config.verification,
+                ) {
+                    Ok(edge) => {
+                        let mut loops = self.verified_loops.clone();
+                        loops.push(edge.clone());
+                        match run_shadow_pgo(&map, &loops, &shadow_config.pgo) {
+                            Ok(result) => diagnostic = Some(Ok(result)),
+                            Err(error) => diagnostic = Some(Err(error.to_string())),
+                        }
+                        events.push(LoopGeometryEvent::Accepted(edge.clone()));
+                        accepted = Some((pair, edge));
+                        break;
+                    }
+                    Err(reason) => events.push(LoopGeometryEvent::Rejected {
+                        query_kf_idx: kf_idx,
+                        candidate_kf_idx: candidate.kf_idx,
+                        reason,
+                    }),
+                }
+            }
+            (events, accepted, diagnostic)
+        };
+        self.loop_geometry_events.extend(events);
+        if let Some((pair, edge)) = accepted {
+            let query_kf_idx = edge.query_kf_idx;
+            let candidate_kf_idx = edge.candidate_kf_idx;
+            self.verified_loop_pairs.insert(pair);
+            self.verified_loops.push(edge);
+            match diagnostic {
+                Some(Ok(result)) => self.shadow_pgo_diagnostics.push(result),
+                Some(Err(reason)) => self
+                    .loop_geometry_events
+                    .push(LoopGeometryEvent::PgoFailed {
+                        query_kf_idx,
+                        candidate_kf_idx,
+                        reason,
+                    }),
+                None => {}
             }
         }
     }
@@ -1688,6 +1788,10 @@ impl Pipeline {
 
         n_fused
     }
+}
+
+fn normalized_loop_pair(a: usize, b: usize) -> (usize, usize) {
+    if a <= b { (a, b) } else { (b, a) }
 }
 
 fn carry_klt_survivors(track_set: &mut TrackSet, survivors: Option<Vec<FlowSurvivor>>) {
