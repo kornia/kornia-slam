@@ -414,6 +414,67 @@ pub(crate) fn sparse_pose_graph_optimize<const DOF: usize>(
     params: &PgoParams,
     manifold: &impl PoseManifold<DOF>,
 ) -> Result<SparsePgoResult, SparsePgoError> {
+    #[cfg(test)]
+    {
+        let mut test_hooks = SparsePgoTestHooks::default();
+        sparse_pose_graph_optimize_impl(
+            poses,
+            edges,
+            fixed_pose_indices,
+            params,
+            manifold,
+            &mut test_hooks,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        sparse_pose_graph_optimize_impl(poses, edges, fixed_pose_indices, params, manifold)
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SparsePgoTestHooks {
+    factorization_failures_remaining: usize,
+    forced_step: Option<Vec<f32>>,
+    normal_assemblies: usize,
+    solve_dampings: Vec<f32>,
+    iterations: Vec<SparsePgoTestIteration>,
+}
+
+#[cfg(test)]
+struct SparsePgoTestIteration {
+    damping: f32,
+    accepted: bool,
+}
+
+#[cfg(test)]
+fn sparse_pose_graph_optimize_with_test_hooks<const DOF: usize>(
+    poses: &[Pose3d],
+    edges: &[PgoEdge],
+    fixed_pose_indices: &[usize],
+    params: &PgoParams,
+    manifold: &impl PoseManifold<DOF>,
+    test_hooks: &mut SparsePgoTestHooks,
+) -> Result<SparsePgoResult, SparsePgoError> {
+    sparse_pose_graph_optimize_impl(
+        poses,
+        edges,
+        fixed_pose_indices,
+        params,
+        manifold,
+        test_hooks,
+    )
+}
+
+fn sparse_pose_graph_optimize_impl<const DOF: usize>(
+    poses: &[Pose3d],
+    edges: &[PgoEdge],
+    fixed_pose_indices: &[usize],
+    params: &PgoParams,
+    manifold: &impl PoseManifold<DOF>,
+    #[cfg(test)] test_hooks: &mut SparsePgoTestHooks,
+) -> Result<SparsePgoResult, SparsePgoError> {
     validate_optimizer_inputs(poses, edges, fixed_pose_indices, params)?;
 
     let mut accepted_poses = poses.to_vec();
@@ -432,6 +493,10 @@ pub(crate) fn sparse_pose_graph_optimize<const DOF: usize>(
         }
 
         let normal = build_normal_system(&accepted_poses, edges, fixed_pose_indices, manifold)?;
+        #[cfg(test)]
+        {
+            test_hooks.normal_assemblies += 1;
+        }
         let gradient_norm = finite_l2_norm(&normal.gradient, "normal-system gradient")?;
         if gradient_norm < params.gradient_tolerance {
             return Ok(SparsePgoResult {
@@ -441,20 +506,35 @@ pub(crate) fn sparse_pose_graph_optimize<const DOF: usize>(
             });
         }
 
-        let step = match normal.solve_damped_with_cache(damping, &mut solve_cache) {
-            Ok(step) => step,
-            Err(SparsePgoError::Factorization(error)) => {
-                iterations += 1;
-                damping = increased_damping(damping);
-                if damping > LAMBDA_MAX {
-                    return Err(SparsePgoError::Factorization(format!(
-                        "{error}; LM damping exceeded {LAMBDA_MAX:e}"
-                    )));
+        let step = loop {
+            #[cfg(test)]
+            test_hooks.solve_dampings.push(damping);
+            let solve_result = normal.solve_damped_with_cache(damping, &mut solve_cache);
+            #[cfg(test)]
+            let solve_result =
+                if solve_result.is_ok() && test_hooks.factorization_failures_remaining > 0 {
+                    test_hooks.factorization_failures_remaining -= 1;
+                    Err(SparsePgoError::Factorization(
+                        "forced test factorization failure".into(),
+                    ))
+                } else {
+                    solve_result
+                };
+            match solve_result {
+                Ok(step) => break step,
+                Err(SparsePgoError::Factorization(error)) => {
+                    damping = increased_damping(damping);
+                    if damping > LAMBDA_MAX {
+                        return Err(SparsePgoError::Factorization(format!(
+                            "{error}; LM damping exceeded {LAMBDA_MAX:e}"
+                        )));
+                    }
                 }
-                continue;
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         };
+        #[cfg(test)]
+        let step = test_hooks.forced_step.take().unwrap_or(step);
         let step_norm = finite_l2_norm(&step, "sparse LM step")?;
         if step_norm < STEP_SIZE_TOLERANCE {
             return Ok(SparsePgoResult {
@@ -482,6 +562,11 @@ pub(crate) fn sparse_pose_graph_optimize<const DOF: usize>(
                 current_cost = cost;
                 damping = decreased_damping(damping);
                 iterations += 1;
+                #[cfg(test)]
+                test_hooks.iterations.push(SparsePgoTestIteration {
+                    damping,
+                    accepted: true,
+                });
                 if relative_cost_change < params.cost_tolerance {
                     return Ok(SparsePgoResult {
                         poses: accepted_poses,
@@ -493,6 +578,11 @@ pub(crate) fn sparse_pose_graph_optimize<const DOF: usize>(
             TrialOutcome::Rejected => {
                 iterations += 1;
                 damping = increased_damping(damping);
+                #[cfg(test)]
+                test_hooks.iterations.push(SparsePgoTestIteration {
+                    damping,
+                    accepted: false,
+                });
                 if damping > LAMBDA_MAX {
                     return Ok(SparsePgoResult {
                         poses: accepted_poses,
@@ -553,30 +643,6 @@ fn evaluate_trial<const DOF: usize>(
         })
     } else {
         Ok(TrialOutcome::Rejected)
-    }
-}
-
-#[cfg(test)]
-fn evaluate_trial_for_test<const DOF: usize>(
-    poses: &[Pose3d],
-    edges: &[PgoEdge],
-    fixed_pose_indices: &[usize],
-    manifold: &impl PoseManifold<DOF>,
-    step: &[f32],
-    damping: f32,
-) -> Result<(Vec<Pose3d>, f32, bool), SparsePgoError> {
-    let normal = build_normal_system(poses, edges, fixed_pose_indices, manifold)?;
-    let current_cost = total_squared_residual_cost(poses, edges)?;
-    match evaluate_trial(
-        poses,
-        edges,
-        &normal.pose_to_block,
-        manifold,
-        step,
-        current_cost,
-    )? {
-        TrialOutcome::Accepted { poses, .. } => Ok((poses, decreased_damping(damping), true)),
-        TrialOutcome::Rejected => Ok((poses.to_vec(), increased_damping(damping), false)),
     }
 }
 
@@ -999,8 +1065,9 @@ mod tests {
     use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 
     use super::{
-        GravityManifold, PoseManifold, Se3Manifold, build_normal_system, evaluate_trial_for_test,
-        pose_to_se3, sparse_pose_graph_optimize, weighted_relative_residual,
+        GravityManifold, PoseManifold, Se3Manifold, SparsePgoTestHooks, build_normal_system,
+        pose_to_se3, sparse_pose_graph_optimize, sparse_pose_graph_optimize_with_test_hooks,
+        weighted_relative_residual,
     };
 
     fn assert_near(actual: f64, expected: f64, tolerance: f64) {
@@ -1278,34 +1345,69 @@ mod tests {
     }
 
     #[test]
-    fn rejected_step_increases_damping_without_mutating_poses() {
-        let expected = [
-            Pose3d::IDENTITY,
-            Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(1.0, 0.0, 0.0)),
-        ];
-        let edges = [PgoEdge {
-            pose_a: 0,
-            pose_b: 1,
-            t_ab_meas: pose_to_se3(&expected[1]).unwrap(),
-            weight: 1.0,
-        }];
-        let initial_damping = 1e-3;
+    fn factorization_failure_retries_same_iteration() {
+        let (poses, edges) = drifting_loop_graph();
+        let mut hooks = SparsePgoTestHooks {
+            factorization_failures_remaining: 1,
+            ..SparsePgoTestHooks::default()
+        };
+        let params = PgoParams {
+            max_iterations: 1,
+            ..PgoParams::default()
+        };
 
-        let (poses, damping, accepted) = evaluate_trial_for_test(
-            &expected,
+        let result = sparse_pose_graph_optimize_with_test_hooks(
+            &poses,
             &edges,
             &[0],
+            &params,
             &Se3Manifold,
-            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            initial_damping,
+            &mut hooks,
         )
         .unwrap();
 
-        assert!(!accepted);
-        assert_eq!(damping, initial_damping * 10.0);
-        assert_eq!(poses[0].rotation, expected[0].rotation);
-        assert_eq!(poses[0].translation, expected[0].translation);
-        assert_eq!(poses[1].rotation, expected[1].rotation);
-        assert_eq!(poses[1].translation, expected[1].translation);
+        assert_eq!(hooks.normal_assemblies, 1);
+        assert_eq!(
+            hooks.solve_dampings,
+            vec![params.initial_lambda, params.initial_lambda * 10.0]
+        );
+        assert_eq!(hooks.factorization_failures_remaining, 0);
+        assert_eq!(result.iterations, 1);
+        assert!(normal_cost(&result.poses, &edges) < normal_cost(&poses, &edges));
+    }
+
+    #[test]
+    fn rejected_step_increases_damping_without_mutating_poses() {
+        let (poses, edges) = drifting_loop_graph();
+        let mut forced_step = vec![0.0; 18];
+        forced_step[0] = 100.0;
+        let mut hooks = SparsePgoTestHooks {
+            forced_step: Some(forced_step),
+            ..SparsePgoTestHooks::default()
+        };
+        let params = PgoParams {
+            max_iterations: 1,
+            ..PgoParams::default()
+        };
+
+        let result = sparse_pose_graph_optimize_with_test_hooks(
+            &poses,
+            &edges,
+            &[0],
+            &params,
+            &Se3Manifold,
+            &mut hooks,
+        )
+        .unwrap();
+
+        assert_eq!(hooks.iterations.len(), 1);
+        assert!(!hooks.iterations[0].accepted);
+        assert_eq!(hooks.iterations[0].damping, params.initial_lambda * 10.0);
+        assert_eq!(result.iterations, 1);
+        assert!(!result.converged);
+        for (actual, expected) in result.poses.iter().zip(&poses) {
+            assert_eq!(actual.rotation, expected.rotation);
+            assert_eq!(actual.translation, expected.translation);
+        }
     }
 }
