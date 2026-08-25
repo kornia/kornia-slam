@@ -3,6 +3,8 @@
 pub mod estimation;
 pub mod frame;
 pub mod map;
+#[cfg(feature = "sim")]
+pub mod sim;
 pub mod stereo;
 pub mod system;
 pub mod vi_ba_schur;
