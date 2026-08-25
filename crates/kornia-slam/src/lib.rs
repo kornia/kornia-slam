@@ -6,6 +6,7 @@ mod gravity_pgo;
 pub mod loop_closure;
 pub mod map;
 pub mod place_recognition;
+mod sparse_pgo;
 pub mod stereo;
 pub mod system;
 pub mod vi_ba_schur;
