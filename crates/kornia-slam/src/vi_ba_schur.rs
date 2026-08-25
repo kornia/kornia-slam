@@ -549,6 +549,19 @@ fn imu_residual_and_jacobians(
     (residual, j_i, j_j)
 }
 
+/// Evaluate one retained preintegration edge without exposing the optimizer's
+/// Jacobian implementation. Used by loop-closure diagnostics to compare the
+/// live inertial consistency before and after a proposed world correction.
+pub(crate) fn imu_residual(
+    kf_i: &ViBaKeyframe,
+    kf_j: &ViBaKeyframe,
+    pim: &PreintegratedImu,
+    gravity: &Vec3F64,
+    imu_t_bc: Option<&Pose3d>,
+) -> [f64; 15] {
+    imu_residual_and_jacobians(kf_i, kf_j, pim, gravity, imu_t_bc).0
+}
+
 /// Accumulate J_a^T · Ω · J_b into m_mat[row_base:, col_base:] (15×15 block).
 /// If `update_rhs`, also subtract J_a^T · Ω · r from m_vec[row_base:].
 #[allow(clippy::too_many_arguments)]

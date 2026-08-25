@@ -2,6 +2,7 @@
 
 pub mod estimation;
 pub mod frame;
+mod gravity_pgo;
 pub mod loop_closure;
 pub mod map;
 pub mod place_recognition;

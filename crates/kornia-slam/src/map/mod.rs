@@ -716,6 +716,70 @@ impl Map {
         &self.imu_factors
     }
 
+    /// Root-mean-square unweighted IMU residual for a proposed pose-graph
+    /// snapshot. Velocities are transported by the same per-keyframe world
+    /// correction that live writeback uses; gravity and biases remain fixed.
+    pub(crate) fn inertial_residual_rms(
+        &self,
+        keyframe_indices: &[usize],
+        proposed_poses: &[Pose3d],
+        gravity_world: Vec3F64,
+        imu_t_bc: Option<Pose3d>,
+    ) -> Option<f64> {
+        use crate::vi_ba_schur::{ViBaKeyframe, imu_residual};
+
+        if keyframe_indices.len() != proposed_poses.len() {
+            return None;
+        }
+        let node_by_keyframe: HashMap<_, _> = keyframe_indices
+            .iter()
+            .enumerate()
+            .map(|(node, &idx)| (idx, node))
+            .collect();
+        let states: Vec<_> = self
+            .keyframes
+            .iter()
+            .map(|keyframe| {
+                let &node = node_by_keyframe.get(&keyframe.frame.idx)?;
+                let pose = proposed_poses[node];
+                let correction = pose.inverse().compose(&keyframe.frame.pose_world_to_cam);
+                Some(ViBaKeyframe {
+                    pose,
+                    velocity: correction.rotation * keyframe.velocity_world,
+                    bias: keyframe.imu_bias,
+                    fixed: false,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+
+        let slot_by_keyframe: HashMap<_, _> = self
+            .keyframes
+            .iter()
+            .enumerate()
+            .map(|(slot, keyframe)| (keyframe.frame.idx, slot))
+            .collect();
+        let mut squared_sum = 0.0;
+        let mut component_count = 0usize;
+        for factor in &self.imu_factors {
+            let Some(&from) = slot_by_keyframe.get(&factor.prev_kf_idx) else {
+                continue;
+            };
+            let Some(&to) = slot_by_keyframe.get(&factor.curr_kf_idx) else {
+                continue;
+            };
+            let residual = imu_residual(
+                &states[from],
+                &states[to],
+                &factor.preintegrated,
+                &gravity_world,
+                imu_t_bc.as_ref(),
+            );
+            squared_sum += residual.iter().map(|value| value * value).sum::<f64>();
+            component_count += residual.len();
+        }
+        (component_count > 0).then(|| (squared_sum / component_count as f64).sqrt())
+    }
+
     /// Applies a metric scale to camera centers and map points.
     pub fn scale_world(&mut self, scale: f64) {
         self.world_epoch = self.world_epoch.wrapping_add(1);

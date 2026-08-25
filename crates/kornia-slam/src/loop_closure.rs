@@ -1,4 +1,4 @@
-//! Geometric loop verification and read-only SE(3) pose-graph diagnostics.
+//! Geometric loop verification and pose-graph diagnostics.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -11,6 +11,7 @@ use kornia_algebra::{Mat3AF32, Mat3F64, SE3F32, SO3F32, Vec2F32, Vec3AF32, Vec3F
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use thiserror::Error;
 
+use crate::gravity_pgo::gravity_pose_graph_optimize;
 use crate::map::Map;
 
 /// Acceptance thresholds for geometric loop verification.
@@ -272,9 +273,24 @@ pub struct PgoApplicationStats {
     pub map_points_merged: usize,
 }
 
+/// Manifold used for a pose-graph solve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgoMode {
+    Se3,
+    Gravity4Dof,
+}
+
+/// Runtime inertial frame needed by gravity-preserving PGO diagnostics.
+#[derive(Debug, Clone, Copy)]
+pub struct InertialPgoContext {
+    pub gravity_world: Vec3F64,
+    pub imu_t_bc: Option<Pose3d>,
+}
+
 /// Output of a PGO run and its optional live-map application statistics.
 #[derive(Debug, Clone)]
 pub struct ShadowPgoDiagnostic {
+    pub mode: PgoMode,
     pub keyframe_indices: Vec<usize>,
     pub original_poses: Vec<Pose3d>,
     pub optimized_poses: Vec<Pose3d>,
@@ -292,6 +308,9 @@ pub struct ShadowPgoDiagnostic {
     pub solve_time_ms: f64,
     pub median_translation_correction: f64,
     pub max_translation_correction: f64,
+    pub max_gravity_alignment_error_rad: Option<f64>,
+    pub imu_residual_rms_before: Option<f64>,
+    pub imu_residual_rms_after: Option<f64>,
     pub application: Option<PgoApplicationStats>,
 }
 
@@ -651,6 +670,7 @@ pub fn run_shadow_pgo(
     map: &Map,
     verified_loops: &[VerifiedLoopEdge],
     config: &ShadowPgoConfig,
+    inertial: Option<InertialPgoContext>,
 ) -> Result<ShadowPgoDiagnostic, ShadowPgoError> {
     let keyframes = map.keyframes();
     if keyframes.len() < 2 {
@@ -701,22 +721,60 @@ pub fn run_shadow_pgo(
     let new_loop_residual_before = weighted_edge_residual_norm(&original_poses, new_loop_edge)
         .ok_or(ShadowPgoError::MissingLoopKeyframe)?;
     let solve_started = Instant::now();
-    let result = pose_graph_optimize(
-        &original_poses,
-        &edges,
-        &[0],
-        &PgoParams {
-            max_iterations: config.max_iterations,
-            cost_tolerance: config.cost_tolerance,
-            gradient_tolerance: config.gradient_tolerance,
-            initial_lambda: config.initial_lambda,
-        },
-    )
-    .map_err(|error| ShadowPgoError::Solver(error.to_string()))?;
+    let params = PgoParams {
+        max_iterations: config.max_iterations,
+        cost_tolerance: config.cost_tolerance,
+        gradient_tolerance: config.gradient_tolerance,
+        initial_lambda: config.initial_lambda,
+    };
+    let (mode, optimized_poses, iterations, converged) = if let Some(context) = inertial {
+        let result = gravity_pose_graph_optimize(
+            &original_poses,
+            &edges,
+            &[0],
+            context.gravity_world,
+            &params,
+        )
+        .map_err(|error| ShadowPgoError::Solver(error.to_string()))?;
+        (
+            PgoMode::Gravity4Dof,
+            result.poses,
+            result.iterations,
+            result.converged,
+        )
+    } else {
+        let result = pose_graph_optimize(&original_poses, &edges, &[0], &params)
+            .map_err(|error| ShadowPgoError::Solver(error.to_string()))?;
+        (
+            PgoMode::Se3,
+            result.poses,
+            result.iterations,
+            result.converged,
+        )
+    };
     let solve_time_ms = solve_started.elapsed().as_secs_f64() * 1000.0;
-    let final_cost = pose_graph_cost(&result.poses, &edges);
-    let new_loop_residual_after = weighted_edge_residual_norm(&result.poses, new_loop_edge)
+    let final_cost = pose_graph_cost(&optimized_poses, &edges);
+    let new_loop_residual_after = weighted_edge_residual_norm(&optimized_poses, new_loop_edge)
         .ok_or(ShadowPgoError::MissingLoopKeyframe)?;
+    let max_gravity_alignment_error_rad = inertial.map(|context| {
+        max_gravity_alignment_error(&original_poses, &optimized_poses, context.gravity_world)
+    });
+    let imu_residual_rms_before = inertial.and_then(|context| {
+        map.inertial_residual_rms(
+            &keyframe_indices,
+            &original_poses,
+            context.gravity_world,
+            context.imu_t_bc,
+        )
+    });
+    let imu_residual_rms_after = inertial.and_then(|context| {
+        map.inertial_residual_rms(
+            &keyframe_indices,
+            &optimized_poses,
+            context.gravity_world,
+            context.imu_t_bc,
+        )
+    });
     let metrics_finite = [
         initial_cost,
         final_cost,
@@ -726,14 +784,22 @@ pub fn run_shadow_pgo(
     ]
     .into_iter()
     .all(f64::is_finite);
-    let usable = result.converged
+    let inertial_metrics_finite = max_gravity_alignment_error_rad
+        .into_iter()
+        .chain(imu_residual_rms_before)
+        .chain(imu_residual_rms_after)
+        .all(f64::is_finite);
+    let gravity_preserved = max_gravity_alignment_error_rad.is_none_or(|error| error <= 1e-4);
+    let usable = converged
         && metrics_finite
+        && inertial_metrics_finite
+        && gravity_preserved
         && final_cost < initial_cost
         && new_loop_residual_after <= new_loop_residual_before;
 
     let mut corrections: Vec<f64> = original_poses
         .iter()
-        .zip(&result.poses)
+        .zip(&optimized_poses)
         .map(|(before, after)| {
             (before.inverse().translation - after.inverse().translation).length()
         })
@@ -747,12 +813,13 @@ pub fn run_shadow_pgo(
         .ok_or(ShadowPgoError::MissingLoopKeyframe)?;
 
     Ok(ShadowPgoDiagnostic {
+        mode,
         keyframe_indices,
         original_poses,
-        optimized_poses: result.poses,
+        optimized_poses,
         verified_loop,
-        iterations: result.iterations,
-        converged: result.converged,
+        iterations,
+        converged,
         usable,
         node_count,
         sequential_edge_count,
@@ -764,8 +831,28 @@ pub fn run_shadow_pgo(
         solve_time_ms,
         median_translation_correction,
         max_translation_correction,
+        max_gravity_alignment_error_rad,
+        imu_residual_rms_before,
+        imu_residual_rms_after,
         application: None,
     })
+}
+
+fn max_gravity_alignment_error(
+    original_poses: &[Pose3d],
+    optimized_poses: &[Pose3d],
+    gravity_world: Vec3F64,
+) -> f64 {
+    let gravity_axis = gravity_world.normalize();
+    original_poses
+        .iter()
+        .zip(optimized_poses)
+        .map(|(before, after)| {
+            let before_camera = (before.rotation * gravity_axis).normalize();
+            let after_camera = (after.rotation * gravity_axis).normalize();
+            before_camera.dot(after_camera).clamp(-1.0, 1.0).acos()
+        })
+        .fold(0.0, f64::max)
 }
 
 fn pose_graph_cost(poses: &[Pose3d], edges: &[PgoEdge]) -> f64 {
@@ -1281,7 +1368,8 @@ mod tests {
             reprojection_rmse_px: 1.0,
             occupied_cells: 8,
         };
-        let diagnostic = run_shadow_pgo(&map, &[verified], &ShadowPgoConfig::default()).unwrap();
+        let diagnostic =
+            run_shadow_pgo(&map, &[verified], &ShadowPgoConfig::default(), None).unwrap();
         assert_eq!(diagnostic.optimized_poses[0], diagnostic.original_poses[0]);
         assert_eq!(diagnostic.node_count, 5);
         assert_eq!(diagnostic.sequential_edge_count, 4);
@@ -1301,5 +1389,49 @@ mod tests {
         let after = diagnostic.optimized_poses[4].inverse().translation.length();
         assert!(after < before, "expected {after} < {before}");
         assert!(diagnostic.max_translation_correction > 0.0);
+    }
+
+    #[test]
+    fn inertial_shadow_pgo_uses_four_dof_and_preserves_gravity() {
+        let gravity = Vec3F64::new(0.3, -9.4, 1.1);
+        let gravity_axis = gravity.normalize();
+        let tilt = kornia_algebra::SO3F64::exp(Vec3F64::new(0.2, -0.1, 0.05)).matrix();
+        let mut map = Map::new();
+        for index in 0..5 {
+            let yaw = index as f64 * 0.03;
+            let yaw_world = kornia_algebra::SO3F64::exp(gravity_axis * -yaw).matrix();
+            let rotation = tilt * yaw_world;
+            let center = Vec3F64::new(index as f64, index as f64 * 0.05, 0.0);
+            let pose = Pose3d::new(rotation, -(rotation * center));
+            map.upsert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())));
+        }
+        let verified = VerifiedLoopEdge {
+            query_kf_idx: 4,
+            candidate_kf_idx: 0,
+            candidate_to_query: Pose3d::IDENTITY,
+            correspondences: 40,
+            inliers: 35,
+            inlier_ratio: 0.875,
+            reprojection_rmse_px: 1.0,
+            occupied_cells: 8,
+        };
+
+        let diagnostic = run_shadow_pgo(
+            &map,
+            &[verified],
+            &ShadowPgoConfig::default(),
+            Some(InertialPgoContext {
+                gravity_world: gravity,
+                imu_t_bc: None,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(diagnostic.mode, PgoMode::Gravity4Dof);
+        assert_eq!(diagnostic.optimized_poses[0], diagnostic.original_poses[0]);
+        assert!(diagnostic.final_cost < diagnostic.initial_cost);
+        assert!(diagnostic.max_gravity_alignment_error_rad.unwrap() <= 1e-4);
+        assert_eq!(diagnostic.imu_residual_rms_before, None);
+        assert_eq!(diagnostic.imu_residual_rms_after, None);
     }
 }

@@ -91,13 +91,13 @@ struct Args {
     #[argh(option)]
     vocab: Option<String>,
 
-    /// geometrically verify loop candidates and run read-only SE(3) pose-graph
+    /// geometrically verify loop candidates and run read-only pose-graph
     /// optimization diagnostics (requires --vocab and stereo or IMU input)
     #[argh(switch)]
     shadow_pgo: bool,
 
-    /// apply usable pose-graph corrections to the live stereo map; currently
-    /// unavailable with IMU input because SE(3) PGO does not preserve gravity
+    /// apply usable pose-graph corrections to the live stereo map; initialized
+    /// IMU input uses gravity-preserving four-degree-of-freedom optimization
     #[argh(switch)]
     apply_pgo: bool,
 }
@@ -365,9 +365,6 @@ fn validate_pgo_mode(
     if shadow_pgo && !has_vocabulary {
         return Err("--shadow-pgo requires --vocab");
     }
-    if apply_pgo && has_imu {
-        return Err("--apply-pgo does not support IMU input until PGO preserves gravity");
-    }
     if apply_pgo && !has_stereo {
         return Err("--apply-pgo requires stereo input");
     }
@@ -541,7 +538,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         local_mapping: args.local_mapping,
         stereo_close_depth_m,
         shadow_pgo: (args.shadow_pgo || args.apply_pgo).then(|| ShadowPgoPipelineConfig {
-            require_imu_initialized: stereo_config.is_none() && imu_enabled,
+            require_imu_initialized: imu_enabled && (args.apply_pgo || stereo_config.is_none()),
             apply: args.apply_pgo,
             ..ShadowPgoPipelineConfig::default()
         }),
@@ -774,7 +771,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         for diagnostic in system.drain_shadow_pgo_diagnostics() {
             eprintln!(
-                "[shadow-pgo] kf={} ~ kf={} nodes={} edges={}/{} iterations={} converged={} usable={} cost={:.6}->{:.6} loop_residual={:.6}->{:.6} solve={:.1}ms median_correction={:.4}m max_correction={:.4}m",
+                "[shadow-pgo] mode={:?} kf={} ~ kf={} nodes={} edges={}/{} iterations={} converged={} usable={} cost={:.6}->{:.6} loop_residual={:.6}->{:.6} solve={:.1}ms median_correction={:.4}m max_correction={:.4}m",
+                diagnostic.mode,
                 diagnostic.verified_loop.query_kf_idx,
                 diagnostic.verified_loop.candidate_kf_idx,
                 diagnostic.node_count,
@@ -791,6 +789,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 diagnostic.median_translation_correction,
                 diagnostic.max_translation_correction,
             );
+            if let Some(gravity_error) = diagnostic.max_gravity_alignment_error_rad {
+                eprintln!(
+                    "[pgo-imu] gravity_error={gravity_error:.3e}rad imu_residual_rms={:?}->{:?}",
+                    diagnostic.imu_residual_rms_before, diagnostic.imu_residual_rms_after,
+                );
+            }
             if let Some(application) = diagnostic.application {
                 eprintln!(
                     "[pgo-apply] kf={} ~ kf={} keyframes={} map_points={} observations_added={} map_points_merged={}",
@@ -920,7 +924,7 @@ mod pgo_mode_tests {
     use super::validate_pgo_mode;
 
     #[test]
-    fn apply_pgo_requires_vocabulary_and_stereo_without_imu() {
+    fn apply_pgo_requires_vocabulary_and_stereo_and_accepts_imu() {
         assert_eq!(
             validate_pgo_mode(false, true, false, true, false).unwrap_err(),
             "--apply-pgo requires --vocab"
@@ -929,10 +933,7 @@ mod pgo_mode_tests {
             validate_pgo_mode(false, true, true, false, false).unwrap_err(),
             "--apply-pgo requires stereo input"
         );
-        assert_eq!(
-            validate_pgo_mode(false, true, true, true, true).unwrap_err(),
-            "--apply-pgo does not support IMU input until PGO preserves gravity"
-        );
+        assert!(validate_pgo_mode(false, true, true, true, true).is_ok());
         assert!(validate_pgo_mode(false, true, true, true, false).is_ok());
     }
 

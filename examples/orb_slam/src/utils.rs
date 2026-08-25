@@ -188,6 +188,13 @@ pub fn log_shadow_pgo_to_rerun(rec: &rerun::RecordingStream, diagnostic: &Shadow
         ("sequential_edges", diagnostic.sequential_edge_count as f64),
         ("loop_edges", diagnostic.loop_edge_count as f64),
         ("iterations", diagnostic.iterations as f64),
+        (
+            "gravity_4dof",
+            f64::from(matches!(
+                diagnostic.mode,
+                kornia_slam::loop_closure::PgoMode::Gravity4Dof
+            )),
+        ),
         ("converged", f64::from(diagnostic.converged)),
         ("usable", f64::from(diagnostic.usable)),
         ("applied", f64::from(diagnostic.application.is_some())),
@@ -216,6 +223,25 @@ pub fn log_shadow_pgo_to_rerun(rec: &rerun::RecordingStream, diagnostic: &Shadow
             &rerun::Scalars::single(value),
         )
         .ok();
+    }
+    for (path, value) in [
+        (
+            "max_gravity_alignment_error_rad",
+            diagnostic.max_gravity_alignment_error_rad,
+        ),
+        (
+            "imu_residual_rms_before",
+            diagnostic.imu_residual_rms_before,
+        ),
+        ("imu_residual_rms_after", diagnostic.imu_residual_rms_after),
+    ] {
+        if let Some(value) = value {
+            rec.log(
+                format!("shadow_pgo/metrics/{path}"),
+                &rerun::Scalars::single(value),
+            )
+            .ok();
+        }
     }
     if let Some(application) = diagnostic.application {
         for (path, value) in [
