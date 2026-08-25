@@ -350,6 +350,14 @@ pub struct PoseGraphCorrectionResult {
     pub map_points_corrected: usize,
 }
 
+/// Result of replacing a duplicate landmark with a surviving landmark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MapPointMergeResult {
+    pub survivor: usize,
+    pub replaced: usize,
+    pub redirected_associations: usize,
+}
+
 /// Refusal to apply a pose-graph result to the live map.
 #[derive(Debug, thiserror::Error)]
 pub enum PoseGraphCorrectionError {
@@ -566,6 +574,108 @@ impl Map {
         Ok(PoseGraphCorrectionResult {
             keyframes_corrected,
             map_points_corrected: changed_points.len(),
+        })
+    }
+
+    /// Replaces a duplicate map point and redirects its keyframe associations.
+    ///
+    /// The point with stronger observation support survives. Associations are
+    /// deduplicated so a keyframe references the survivor from at most one slot.
+    pub fn merge_map_points(&mut self, first: usize, second: usize) -> Option<MapPointMergeResult> {
+        if first == second {
+            return None;
+        }
+        let first_point = self.map_points.get(first)?;
+        let second_point = self.map_points.get(second)?;
+        if first_point.culled || second_point.culled {
+            return None;
+        }
+
+        let support = |point: &MapPoint| {
+            point
+                .observation_kf_indices
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len()
+        };
+        let first_support = support(first_point);
+        let second_support = support(second_point);
+        let second_is_stronger = second_support > first_support
+            || (second_support == first_support && second_point.n_found > first_point.n_found)
+            || (second_support == first_support
+                && second_point.n_found == first_point.n_found
+                && second < first);
+        let (survivor, replaced) = if second_is_stronger {
+            (second, first)
+        } else {
+            (first, second)
+        };
+
+        let mut redirected_associations = 0;
+        for keyframe in &mut self.keyframes {
+            let survivor_slots: Vec<_> = keyframe
+                .map_point_by_desc_idx
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, &point)| (point == Some(survivor)).then_some(slot))
+                .collect();
+            let replaced_slots: Vec<_> = keyframe
+                .map_point_by_desc_idx
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, &point)| (point == Some(replaced)).then_some(slot))
+                .collect();
+
+            let mut keep_survivor = survivor_slots.first().copied();
+            if keep_survivor.is_none()
+                && let Some(&slot) = replaced_slots.first()
+            {
+                keyframe.map_point_by_desc_idx[slot] = Some(survivor);
+                keep_survivor = Some(slot);
+                redirected_associations += 1;
+            }
+            for slot in survivor_slots.into_iter().chain(replaced_slots) {
+                if Some(slot) != keep_survivor {
+                    keyframe.map_point_by_desc_idx[slot] = None;
+                }
+            }
+        }
+
+        let replaced_observations: Vec<_> = self.map_points[replaced]
+            .observation_kf_indices
+            .iter()
+            .copied()
+            .zip(
+                self.map_points[replaced]
+                    .observed_descriptors
+                    .iter()
+                    .copied(),
+            )
+            .collect();
+        let replaced_visible = self.map_points[replaced].n_visible;
+        let replaced_found = self.map_points[replaced].n_found;
+        for (keyframe_idx, descriptor) in replaced_observations {
+            if !self.map_points[survivor]
+                .observation_kf_indices
+                .contains(&keyframe_idx)
+            {
+                self.map_points[survivor].add_observation_descriptor(keyframe_idx, descriptor);
+            }
+        }
+        self.map_points[survivor].n_visible = self.map_points[survivor]
+            .n_visible
+            .saturating_add(replaced_visible);
+        self.map_points[survivor].n_found = self.map_points[survivor]
+            .n_found
+            .saturating_add(replaced_found);
+        self.map_points[replaced].mark_culled();
+        self.update_map_point_geometry(survivor, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+
+        Some(MapPointMergeResult {
+            survivor,
+            replaced,
+            redirected_associations,
         })
     }
 
@@ -2056,6 +2166,106 @@ mod tests {
             map.get_keyframe(0).unwrap().frame.pose_world_to_cam,
             corrected
         );
+    }
+
+    #[test]
+    fn merge_map_points_redirects_associations_and_deduplicates_observers() {
+        let mut map = Map::new();
+        for idx in 0..3 {
+            map.upsert_keyframe(Keyframe::from_frame(test_frame(
+                idx,
+                vec![[idx as u8; 32], [10 + idx as u8; 32]],
+            )));
+        }
+
+        let survivor = map.push_map_point(MapPoint::new(
+            Vec3F64::new(0.0, 0.0, 5.0),
+            [0; 32],
+            0,
+            [0; 3],
+            0,
+        ));
+        map.map_points_mut()[survivor].add_observation_descriptor(1, [1; 32]);
+        map.map_points_mut()[survivor].n_visible = 7;
+        map.map_points_mut()[survivor].n_found = 5;
+        map.get_keyframe_mut(0)
+            .unwrap()
+            .associate_map_point(0, survivor);
+        map.get_keyframe_mut(1)
+            .unwrap()
+            .associate_map_point(0, survivor);
+
+        let replaced = map.push_map_point(MapPoint::new(
+            Vec3F64::new(0.01, 0.0, 5.0),
+            [2; 32],
+            0,
+            [0; 3],
+            2,
+        ));
+        map.map_points_mut()[replaced].add_observation_descriptor(1, [11; 32]);
+        map.map_points_mut()[replaced].n_visible = 4;
+        map.map_points_mut()[replaced].n_found = 3;
+        map.get_keyframe_mut(2)
+            .unwrap()
+            .associate_map_point(0, replaced);
+        map.get_keyframe_mut(1)
+            .unwrap()
+            .associate_map_point(1, replaced);
+
+        let result = map.merge_map_points(survivor, replaced).unwrap();
+
+        assert_eq!(result.survivor, survivor);
+        assert_eq!(result.replaced, replaced);
+        assert_eq!(result.redirected_associations, 1);
+        assert!(map.map_points()[replaced].culled);
+        assert_eq!(map.map_points()[survivor].n_visible, 11);
+        assert_eq!(map.map_points()[survivor].n_found, 8);
+        assert_eq!(
+            map.map_points()[survivor]
+                .observation_kf_indices
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>(),
+            HashSet::from([0, 1, 2])
+        );
+        assert_eq!(map.get_keyframe(2).unwrap().map_point(0), Some(survivor));
+        assert_eq!(map.get_keyframe(1).unwrap().map_point(0), Some(survivor));
+        assert_eq!(map.get_keyframe(1).unwrap().map_point(1), None);
+        for keyframe in map.keyframes() {
+            assert_eq!(
+                keyframe
+                    .map_point_by_desc_idx
+                    .iter()
+                    .filter(|&&point| point == Some(survivor))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn merge_map_points_rejects_invalid_or_culled_inputs() {
+        let mut map = Map::new();
+        map.upsert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0; 32]])));
+        let first = map.push_map_point(MapPoint::new(
+            Vec3F64::new(0.0, 0.0, 5.0),
+            [0; 32],
+            0,
+            [0; 3],
+            0,
+        ));
+        let second = map.push_map_point(MapPoint::new(
+            Vec3F64::new(0.0, 0.0, 5.0),
+            [1; 32],
+            0,
+            [0; 3],
+            0,
+        ));
+
+        assert!(map.merge_map_points(first, first).is_none());
+        assert!(map.merge_map_points(first, usize::MAX).is_none());
+        map.map_points_mut()[second].mark_culled();
+        assert!(map.merge_map_points(first, second).is_none());
     }
 
     // ── Scale-invariance state (T1: deterministic, cross-checked vs ORB-SLAM3
