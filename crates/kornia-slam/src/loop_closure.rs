@@ -1,6 +1,7 @@
 //! Geometric loop verification and read-only SE(3) pose-graph diagnostics.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pgo::{PgoEdge, PgoParams, pose_graph_optimize};
@@ -242,6 +243,15 @@ pub struct ShadowPgoDiagnostic {
     pub verified_loop: VerifiedLoopEdge,
     pub iterations: usize,
     pub converged: bool,
+    pub usable: bool,
+    pub node_count: usize,
+    pub sequential_edge_count: usize,
+    pub loop_edge_count: usize,
+    pub initial_cost: f64,
+    pub final_cost: f64,
+    pub new_loop_residual_before: f64,
+    pub new_loop_residual_after: f64,
+    pub solve_time_ms: f64,
     pub median_translation_correction: f64,
     pub max_translation_correction: f64,
 }
@@ -454,6 +464,14 @@ pub fn run_shadow_pgo(
             weight: config.loop_edge_weight,
         });
     }
+    let node_count = original_poses.len();
+    let sequential_edge_count = node_count - 1;
+    let loop_edge_count = verified_loops.len();
+    let initial_cost = pose_graph_cost(&original_poses, &edges);
+    let new_loop_edge = edges.last().ok_or(ShadowPgoError::MissingLoopKeyframe)?;
+    let new_loop_residual_before = weighted_edge_residual_norm(&original_poses, new_loop_edge)
+        .ok_or(ShadowPgoError::MissingLoopKeyframe)?;
+    let solve_started = Instant::now();
     let result = pose_graph_optimize(
         &original_poses,
         &edges,
@@ -466,6 +484,23 @@ pub fn run_shadow_pgo(
         },
     )
     .map_err(|error| ShadowPgoError::Solver(error.to_string()))?;
+    let solve_time_ms = solve_started.elapsed().as_secs_f64() * 1000.0;
+    let final_cost = pose_graph_cost(&result.poses, &edges);
+    let new_loop_residual_after = weighted_edge_residual_norm(&result.poses, new_loop_edge)
+        .ok_or(ShadowPgoError::MissingLoopKeyframe)?;
+    let metrics_finite = [
+        initial_cost,
+        final_cost,
+        new_loop_residual_before,
+        new_loop_residual_after,
+        solve_time_ms,
+    ]
+    .into_iter()
+    .all(f64::is_finite);
+    let usable = result.converged
+        && metrics_finite
+        && final_cost < initial_cost
+        && new_loop_residual_after <= new_loop_residual_before;
 
     let mut corrections: Vec<f64> = original_poses
         .iter()
@@ -489,9 +524,47 @@ pub fn run_shadow_pgo(
         verified_loop,
         iterations: result.iterations,
         converged: result.converged,
+        usable,
+        node_count,
+        sequential_edge_count,
+        loop_edge_count,
+        initial_cost,
+        final_cost,
+        new_loop_residual_before,
+        new_loop_residual_after,
+        solve_time_ms,
         median_translation_correction,
         max_translation_correction,
     })
+}
+
+fn pose_graph_cost(poses: &[Pose3d], edges: &[PgoEdge]) -> f64 {
+    0.5 * edges
+        .iter()
+        .filter_map(|edge| weighted_edge_residual_squared(poses, edge))
+        .sum::<f64>()
+}
+
+fn weighted_edge_residual_norm(poses: &[Pose3d], edge: &PgoEdge) -> Option<f64> {
+    weighted_edge_residual_squared(poses, edge).map(f64::sqrt)
+}
+
+fn weighted_edge_residual_squared(poses: &[Pose3d], edge: &PgoEdge) -> Option<f64> {
+    let pose_a = pose_to_se3(poses.get(edge.pose_a)?);
+    let pose_b = pose_to_se3(poses.get(edge.pose_b)?);
+    let error = edge.t_ab_meas.inverse() * (pose_b * pose_a.inverse());
+    let (translation, rotation) = error.log();
+    let weight = edge.weight as f64;
+    Some(
+        weight
+            * weight
+            * (translation.x as f64 * translation.x as f64
+                + translation.y as f64 * translation.y as f64
+                + translation.z as f64 * translation.z as f64
+                + rotation.x as f64 * rotation.x as f64
+                + rotation.y as f64 * rotation.y as f64
+                + rotation.z as f64 * rotation.z as f64),
+    )
 }
 
 fn occupied_image_cells(
@@ -784,6 +857,20 @@ mod tests {
         };
         let diagnostic = run_shadow_pgo(&map, &[verified], &ShadowPgoConfig::default()).unwrap();
         assert_eq!(diagnostic.optimized_poses[0], diagnostic.original_poses[0]);
+        assert_eq!(diagnostic.node_count, 5);
+        assert_eq!(diagnostic.sequential_edge_count, 4);
+        assert_eq!(diagnostic.loop_edge_count, 1);
+        assert!(diagnostic.initial_cost.is_finite());
+        assert!(diagnostic.final_cost < diagnostic.initial_cost);
+        assert!(
+            diagnostic.new_loop_residual_after < diagnostic.new_loop_residual_before,
+            "expected loop residual {} < {}",
+            diagnostic.new_loop_residual_after,
+            diagnostic.new_loop_residual_before,
+        );
+        assert!(diagnostic.solve_time_ms.is_finite());
+        assert!(diagnostic.solve_time_ms >= 0.0);
+        assert_eq!(diagnostic.usable, diagnostic.converged);
         let before = diagnostic.original_poses[4].inverse().translation.length();
         let after = diagnostic.optimized_poses[4].inverse().translation.length();
         assert!(after < before, "expected {after} < {before}");
