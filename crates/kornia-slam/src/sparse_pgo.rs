@@ -298,7 +298,6 @@ pub(crate) enum SparsePgoError {
     Factorization(String),
 }
 
-#[allow(dead_code)]
 pub(crate) struct Se3Manifold;
 
 impl PoseManifold<6> for Se3Manifold {
@@ -430,7 +429,6 @@ pub(crate) fn weighted_relative_residual(
     Ok(residual)
 }
 
-#[allow(dead_code)]
 pub(crate) fn sparse_pose_graph_optimize<const DOF: usize>(
     poses: &[Pose3d],
     edges: &[PgoEdge],

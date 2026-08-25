@@ -1098,6 +1098,9 @@ mod tests {
         let sparse =
             sparse_pose_graph_optimize(&poses, &edges, &[0], &params, &Se3Manifold).unwrap();
 
+        assert!(dense.converged);
+        assert!(sparse.converged);
+        assert_eq!(dense.poses.len(), sparse.poses.len());
         assert!(pose_graph_cost(&dense.poses, &edges) < initial_cost);
         assert!(pose_graph_cost(&sparse.poses, &edges) < initial_cost);
         assert_eq!(dense.poses[0], poses[0]);
