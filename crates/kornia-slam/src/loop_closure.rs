@@ -75,6 +75,142 @@ pub struct VerifiedLoopEdge {
     pub occupied_cells: usize,
 }
 
+/// Temporal and map-neighbourhood consistency required before a verified loop
+/// becomes a pose-graph edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopEpisodeConfig {
+    pub min_consistent_edges: usize,
+    pub max_query_gap: usize,
+    pub candidate_neighborhood_radius: usize,
+}
+
+impl Default for LoopEpisodeConfig {
+    fn default() -> Self {
+        Self {
+            min_consistent_edges: 3,
+            max_query_gap: 5,
+            candidate_neighborhood_radius: 10,
+        }
+    }
+}
+
+/// Decision produced for one geometrically verified observation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoopEpisodeDecision {
+    Pending {
+        hits: usize,
+        required: usize,
+    },
+    Ready {
+        representative: VerifiedLoopEdge,
+        hits: usize,
+    },
+    Suppressed {
+        representative_query_kf_idx: usize,
+        representative_candidate_kf_idx: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct LoopEpisode {
+    candidate_anchor_order: usize,
+    last_query_order: usize,
+    hits: usize,
+    representative: VerifiedLoopEdge,
+    ready: bool,
+}
+
+/// Collapses adjacent verified observations into one physical revisit episode.
+#[derive(Debug, Clone)]
+pub struct LoopEpisodeTracker {
+    config: LoopEpisodeConfig,
+    current: Option<LoopEpisode>,
+}
+
+impl LoopEpisodeTracker {
+    pub fn new(mut config: LoopEpisodeConfig) -> Self {
+        config.min_consistent_edges = config.min_consistent_edges.max(1);
+        Self {
+            config,
+            current: None,
+        }
+    }
+
+    pub fn observe(
+        &mut self,
+        query_order: usize,
+        candidate_order: usize,
+        edge: VerifiedLoopEdge,
+    ) -> LoopEpisodeDecision {
+        let compatible = self.current.as_ref().is_some_and(|episode| {
+            query_order >= episode.last_query_order
+                && query_order - episode.last_query_order <= self.config.max_query_gap
+                && candidate_order.abs_diff(episode.candidate_anchor_order)
+                    <= self.config.candidate_neighborhood_radius
+        });
+        if !compatible {
+            self.current = Some(LoopEpisode {
+                candidate_anchor_order: candidate_order,
+                last_query_order: query_order,
+                hits: 1,
+                representative: edge,
+                ready: self.config.min_consistent_edges == 1,
+            });
+            let episode = self.current.as_ref().unwrap();
+            return if episode.ready {
+                LoopEpisodeDecision::Ready {
+                    representative: episode.representative.clone(),
+                    hits: episode.hits,
+                }
+            } else {
+                LoopEpisodeDecision::Pending {
+                    hits: episode.hits,
+                    required: self.config.min_consistent_edges,
+                }
+            };
+        }
+
+        let episode = self.current.as_mut().unwrap();
+        episode.last_query_order = query_order;
+        if episode.ready {
+            return LoopEpisodeDecision::Suppressed {
+                representative_query_kf_idx: episode.representative.query_kf_idx,
+                representative_candidate_kf_idx: episode.representative.candidate_kf_idx,
+            };
+        }
+        episode.hits += 1;
+        if edge_quality_better(&edge, &episode.representative) {
+            episode.representative = edge;
+        }
+        if episode.hits >= self.config.min_consistent_edges {
+            episode.ready = true;
+            LoopEpisodeDecision::Ready {
+                representative: episode.representative.clone(),
+                hits: episode.hits,
+            }
+        } else {
+            LoopEpisodeDecision::Pending {
+                hits: episode.hits,
+                required: self.config.min_consistent_edges,
+            }
+        }
+    }
+}
+
+fn edge_quality_better(candidate: &VerifiedLoopEdge, current: &VerifiedLoopEdge) -> bool {
+    candidate
+        .inliers
+        .cmp(&current.inliers)
+        .then_with(|| candidate.inlier_ratio.total_cmp(&current.inlier_ratio))
+        .then_with(|| candidate.occupied_cells.cmp(&current.occupied_cells))
+        .then_with(|| {
+            current
+                .reprojection_rmse_px
+                .total_cmp(&candidate.reprojection_rmse_px)
+        })
+        .is_gt()
+}
+
 /// Configuration for the read-only PGO solve.
 #[derive(Debug, Clone)]
 pub struct ShadowPgoConfig {
@@ -458,6 +594,26 @@ mod tests {
         descriptor
     }
 
+    fn verified_edge(
+        query_kf_idx: usize,
+        candidate_kf_idx: usize,
+        inliers: usize,
+        inlier_ratio: f32,
+        reprojection_rmse_px: f32,
+        occupied_cells: usize,
+    ) -> VerifiedLoopEdge {
+        VerifiedLoopEdge {
+            query_kf_idx,
+            candidate_kf_idx,
+            candidate_to_query: Pose3d::IDENTITY,
+            correspondences: inliers + 5,
+            inliers,
+            inlier_ratio,
+            reprojection_rmse_px,
+            occupied_cells,
+        }
+    }
+
     fn synthetic_loop_map() -> (Map, Pose3d) {
         let camera = camera();
         let query_pose = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.15, -0.05, 0.1));
@@ -537,6 +693,76 @@ mod tests {
             (verified.candidate_to_query.translation - expected_query_pose.translation).length()
                 < 1e-2
         );
+    }
+
+    #[test]
+    fn loop_episode_requires_consistency_and_selects_strongest_edge() {
+        let mut tracker = LoopEpisodeTracker::new(LoopEpisodeConfig::default());
+        let first = verified_edge(100, 20, 31, 0.70, 1.6, 6);
+        let strongest = verified_edge(108, 24, 42, 0.84, 1.4, 8);
+        let third = verified_edge(116, 16, 36, 0.90, 1.1, 9);
+
+        assert!(matches!(
+            tracker.observe(20, 5, first),
+            LoopEpisodeDecision::Pending {
+                hits: 1,
+                required: 3
+            }
+        ));
+        assert!(matches!(
+            tracker.observe(21, 6, strongest.clone()),
+            LoopEpisodeDecision::Pending {
+                hits: 2,
+                required: 3
+            }
+        ));
+        assert_eq!(
+            tracker.observe(23, 4, third),
+            LoopEpisodeDecision::Ready {
+                representative: strongest,
+                hits: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn loop_episode_suppresses_redundant_edges_after_ready() {
+        let mut tracker = LoopEpisodeTracker::new(LoopEpisodeConfig {
+            min_consistent_edges: 2,
+            ..LoopEpisodeConfig::default()
+        });
+        let representative = verified_edge(100, 20, 35, 0.8, 1.2, 8);
+        tracker.observe(20, 5, representative.clone());
+        assert!(matches!(
+            tracker.observe(21, 6, verified_edge(108, 24, 32, 0.8, 1.3, 7)),
+            LoopEpisodeDecision::Ready { .. }
+        ));
+        assert_eq!(
+            tracker.observe(24, 7, verified_edge(120, 28, 45, 0.9, 1.0, 9)),
+            LoopEpisodeDecision::Suppressed {
+                representative_query_kf_idx: representative.query_kf_idx,
+                representative_candidate_kf_idx: representative.candidate_kf_idx,
+            }
+        );
+    }
+
+    #[test]
+    fn loop_episode_resets_after_query_gap_or_candidate_jump() {
+        let config = LoopEpisodeConfig {
+            min_consistent_edges: 3,
+            max_query_gap: 3,
+            candidate_neighborhood_radius: 4,
+        };
+        let mut tracker = LoopEpisodeTracker::new(config);
+        tracker.observe(10, 5, verified_edge(50, 20, 35, 0.8, 1.2, 8));
+        assert!(matches!(
+            tracker.observe(14, 6, verified_edge(70, 24, 36, 0.8, 1.2, 8)),
+            LoopEpisodeDecision::Pending { hits: 1, .. }
+        ));
+        assert!(matches!(
+            tracker.observe(15, 20, verified_edge(75, 100, 37, 0.8, 1.2, 8)),
+            LoopEpisodeDecision::Pending { hits: 1, .. }
+        ));
     }
 
     #[test]
