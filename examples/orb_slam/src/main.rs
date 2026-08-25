@@ -95,6 +95,11 @@ struct Args {
     /// optimization diagnostics (requires --vocab and stereo or IMU input)
     #[argh(switch)]
     shadow_pgo: bool,
+
+    /// apply usable pose-graph corrections to the live stereo map; currently
+    /// unavailable with IMU input because SE(3) PGO does not preserve gravity
+    #[argh(switch)]
+    apply_pgo: bool,
 }
 
 #[derive(argh::FromArgs)]
@@ -347,6 +352,31 @@ fn build_u8_pyramid(img: &Image<u8, 1>) -> Vec<Image<u8, 1>> {
     pyramid
 }
 
+fn validate_pgo_mode(
+    shadow_pgo: bool,
+    apply_pgo: bool,
+    has_vocabulary: bool,
+    has_stereo: bool,
+    has_imu: bool,
+) -> Result<(), &'static str> {
+    if apply_pgo && !has_vocabulary {
+        return Err("--apply-pgo requires --vocab");
+    }
+    if shadow_pgo && !has_vocabulary {
+        return Err("--shadow-pgo requires --vocab");
+    }
+    if apply_pgo && has_imu {
+        return Err("--apply-pgo does not support IMU input until PGO preserves gravity");
+    }
+    if apply_pgo && !has_stereo {
+        return Err("--apply-pgo requires stereo input");
+    }
+    if shadow_pgo && !has_stereo && !has_imu {
+        return Err("--shadow-pgo requires stereo or IMU input");
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Args = argh::from_env();
 
@@ -489,11 +519,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         StereoMatchConfig::new(baseline as f32, camera.fx as f32, ORB_SCALE, ORB_LEVELS)
     });
 
-    if args.shadow_pgo && args.vocab.is_none() {
-        return Err("--shadow-pgo requires --vocab".into());
-    }
-    if args.shadow_pgo && stereo_config.is_none() && !imu_enabled {
-        return Err("--shadow-pgo requires stereo or IMU input".into());
+    if let Err(error) = validate_pgo_mode(
+        args.shadow_pgo,
+        args.apply_pgo,
+        args.vocab.is_some(),
+        stereo_config.is_some(),
+        imu_enabled,
+    ) {
+        return Err(error.into());
     }
 
     // ── ORB detector ───────────────────────────────────────────────────────
@@ -507,8 +540,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         debug: args.debug,
         local_mapping: args.local_mapping,
         stereo_close_depth_m,
-        shadow_pgo: args.shadow_pgo.then(|| ShadowPgoPipelineConfig {
+        shadow_pgo: (args.shadow_pgo || args.apply_pgo).then(|| ShadowPgoPipelineConfig {
             require_imu_initialized: stereo_config.is_none() && imu_enabled,
+            apply: args.apply_pgo,
             ..ShadowPgoPipelineConfig::default()
         }),
         ..PipelineConfig::default()
@@ -757,6 +791,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 diagnostic.median_translation_correction,
                 diagnostic.max_translation_correction,
             );
+            if let Some(application) = diagnostic.application {
+                eprintln!(
+                    "[pgo-apply] kf={} ~ kf={} keyframes={} map_points={} observations_added={} map_points_merged={}",
+                    diagnostic.verified_loop.query_kf_idx,
+                    diagnostic.verified_loop.candidate_kf_idx,
+                    application.keyframes_corrected,
+                    application.map_points_corrected,
+                    application.observations_added,
+                    application.map_points_merged,
+                );
+            }
             #[cfg(feature = "viz")]
             if let Some(ref rec) = rec {
                 log_shadow_pgo_to_rerun(rec, &diagnostic);
@@ -868,4 +913,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod pgo_mode_tests {
+    use super::validate_pgo_mode;
+
+    #[test]
+    fn apply_pgo_requires_vocabulary_and_stereo_without_imu() {
+        assert_eq!(
+            validate_pgo_mode(false, true, false, true, false).unwrap_err(),
+            "--apply-pgo requires --vocab"
+        );
+        assert_eq!(
+            validate_pgo_mode(false, true, true, false, false).unwrap_err(),
+            "--apply-pgo requires stereo input"
+        );
+        assert_eq!(
+            validate_pgo_mode(false, true, true, true, true).unwrap_err(),
+            "--apply-pgo does not support IMU input until PGO preserves gravity"
+        );
+        assert!(validate_pgo_mode(false, true, true, true, false).is_ok());
+    }
+
+    #[test]
+    fn shadow_pgo_keeps_existing_metric_input_rules() {
+        assert!(validate_pgo_mode(true, false, true, true, false).is_ok());
+        assert!(validate_pgo_mode(true, false, true, false, true).is_ok());
+        assert!(validate_pgo_mode(false, false, false, false, false).is_ok());
+        assert_eq!(
+            validate_pgo_mode(true, false, true, false, false).unwrap_err(),
+            "--shadow-pgo requires stereo or IMU input"
+        );
+    }
 }

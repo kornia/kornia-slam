@@ -114,7 +114,7 @@ pub fn log_map_points_to_rerun(rec: &rerun::RecordingStream, map_points: &[MapPo
     }
 }
 
-/// Log a read-only pose-graph solve alongside the live (unmodified) SLAM state.
+/// Log a pose-graph solve and any explicitly enabled live-map application.
 #[cfg(feature = "viz")]
 pub fn log_shadow_pgo_to_rerun(rec: &rerun::RecordingStream, diagnostic: &ShadowPgoDiagnostic) {
     let original: Vec<_> = diagnostic
@@ -190,6 +190,7 @@ pub fn log_shadow_pgo_to_rerun(rec: &rerun::RecordingStream, diagnostic: &Shadow
         ("iterations", diagnostic.iterations as f64),
         ("converged", f64::from(diagnostic.converged)),
         ("usable", f64::from(diagnostic.usable)),
+        ("applied", f64::from(diagnostic.application.is_some())),
         ("initial_cost", diagnostic.initial_cost),
         ("final_cost", diagnostic.final_cost),
         (
@@ -215,6 +216,20 @@ pub fn log_shadow_pgo_to_rerun(rec: &rerun::RecordingStream, diagnostic: &Shadow
             &rerun::Scalars::single(value),
         )
         .ok();
+    }
+    if let Some(application) = diagnostic.application {
+        for (path, value) in [
+            ("keyframes_corrected", application.keyframes_corrected),
+            ("map_points_corrected", application.map_points_corrected),
+            ("observations_added", application.observations_added),
+            ("map_points_merged", application.map_points_merged),
+        ] {
+            rec.log(
+                format!("shadow_pgo/application/{path}"),
+                &rerun::Scalars::single(value as f64),
+            )
+            .ok();
+        }
     }
 }
 
