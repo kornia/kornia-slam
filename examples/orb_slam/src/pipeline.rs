@@ -21,8 +21,8 @@ use kornia_slam::estimation::optical_flow::{
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use kornia_slam::estimation::{ImuInitConfig, ImuInitializer, MapProjectionEstimator};
 use kornia_slam::loop_closure::{
-    LoopVerificationReject, ShadowPgoDiagnostic, VerifiedLoopEdge, run_shadow_pgo,
-    verify_loop_candidate,
+    LoopEpisodeDecision, LoopEpisodeTracker, LoopVerificationReject, ShadowPgoDiagnostic,
+    VerifiedLoopEdge, run_shadow_pgo, verify_loop_candidate,
 };
 use kornia_slam::map::{Keyframe, KeyframeJob, LocalMapping, Map, MapPoint, ORB_SCALE_FACTOR};
 use kornia_slam::place_recognition::{Candidate, KeyFrameDatabase, Vocabulary, compute_bow};
@@ -95,6 +95,7 @@ pub struct Pipeline {
     // Loop candidates surfaced since the last drain (query KF → matched KF).
     loop_candidates: Vec<LoopClosureCandidate>,
     shadow_pgo_config: Option<ShadowPgoPipelineConfig>,
+    loop_episode_tracker: Option<LoopEpisodeTracker>,
     verified_loops: Vec<VerifiedLoopEdge>,
     verified_loop_pairs: HashSet<(usize, usize)>,
     loop_geometry_events: Vec<LoopGeometryEvent>,
@@ -116,7 +117,17 @@ pub struct LoopClosureCandidate {
 /// Result of attempting to turn an appearance match into a metric loop edge.
 #[derive(Debug, Clone)]
 pub enum LoopGeometryEvent {
+    EpisodePending {
+        edge: VerifiedLoopEdge,
+        hits: usize,
+        required: usize,
+    },
     Accepted(VerifiedLoopEdge),
+    EpisodeSuppressed {
+        edge: VerifiedLoopEdge,
+        representative_query_kf_idx: usize,
+        representative_candidate_kf_idx: usize,
+    },
     Rejected {
         query_kf_idx: usize,
         candidate_kf_idx: usize,
@@ -136,6 +147,10 @@ impl Pipeline {
         let local_mapping =
             LocalMapping::new(config.local_mapping, Arc::clone(&map), camera.clone());
         let map_publication_gate = local_mapping.publication_gate();
+        let shadow_pgo_config = config.shadow_pgo;
+        let loop_episode_tracker = shadow_pgo_config
+            .as_ref()
+            .map(|config| LoopEpisodeTracker::new(config.episode));
         Self {
             camera,
             estimator: MapProjectionEstimator::new(config.map_projection),
@@ -181,7 +196,8 @@ impl Pipeline {
             vocabulary: None,
             kf_database: KeyFrameDatabase::new(),
             loop_candidates: Vec::new(),
-            shadow_pgo_config: config.shadow_pgo,
+            shadow_pgo_config,
+            loop_episode_tracker,
             verified_loops: Vec::new(),
             verified_loop_pairs: HashSet::new(),
             loop_geometry_events: Vec::new(),
@@ -1351,7 +1367,7 @@ impl Pipeline {
             }
         }
 
-        let Some(shadow_config) = self.shadow_pgo_config.as_ref() else {
+        let Some(shadow_config) = self.shadow_pgo_config.clone() else {
             return;
         };
         if shadow_config.require_imu_initialized && !self.state.imu_initialized {
@@ -1375,14 +1391,52 @@ impl Pipeline {
                     &shadow_config.verification,
                 ) {
                     Ok(edge) => {
-                        let mut loops = self.verified_loops.clone();
-                        loops.push(edge.clone());
-                        match run_shadow_pgo(&map, &loops, &shadow_config.pgo) {
-                            Ok(result) => diagnostic = Some(Ok(result)),
-                            Err(error) => diagnostic = Some(Err(error.to_string())),
+                        let query_order = map
+                            .keyframes()
+                            .iter()
+                            .position(|keyframe| keyframe.frame.idx == kf_idx)
+                            .expect("verified query keyframe must be in the map");
+                        let candidate_order = map
+                            .keyframes()
+                            .iter()
+                            .position(|keyframe| keyframe.frame.idx == candidate.kf_idx)
+                            .expect("verified candidate keyframe must be in the map");
+                        let decision = self
+                            .loop_episode_tracker
+                            .as_mut()
+                            .expect("shadow PGO config must create an episode tracker")
+                            .observe(query_order, candidate_order, edge.clone());
+                        match decision {
+                            LoopEpisodeDecision::Pending { hits, required } => {
+                                events.push(LoopGeometryEvent::EpisodePending {
+                                    edge,
+                                    hits,
+                                    required,
+                                });
+                            }
+                            LoopEpisodeDecision::Suppressed {
+                                representative_query_kf_idx,
+                                representative_candidate_kf_idx,
+                            } => events.push(LoopGeometryEvent::EpisodeSuppressed {
+                                edge,
+                                representative_query_kf_idx,
+                                representative_candidate_kf_idx,
+                            }),
+                            LoopEpisodeDecision::Ready { representative, .. } => {
+                                let pair = normalized_loop_pair(
+                                    representative.query_kf_idx,
+                                    representative.candidate_kf_idx,
+                                );
+                                let mut loops = self.verified_loops.clone();
+                                loops.push(representative.clone());
+                                match run_shadow_pgo(&map, &loops, &shadow_config.pgo) {
+                                    Ok(result) => diagnostic = Some(Ok(result)),
+                                    Err(error) => diagnostic = Some(Err(error.to_string())),
+                                }
+                                events.push(LoopGeometryEvent::Accepted(representative.clone()));
+                                accepted = Some((pair, representative));
+                            }
                         }
-                        events.push(LoopGeometryEvent::Accepted(edge.clone()));
-                        accepted = Some((pair, edge));
                         break;
                     }
                     Err(reason) => events.push(LoopGeometryEvent::Rejected {

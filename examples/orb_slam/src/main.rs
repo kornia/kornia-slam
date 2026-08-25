@@ -690,6 +690,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         for event in system.drain_loop_geometry_events() {
             match event {
+                LoopGeometryEvent::EpisodePending {
+                    edge,
+                    hits,
+                    required,
+                } => eprintln!(
+                    "[loop-episode] pending kf={} ~ kf={} consistency={hits}/{required} inliers={} rmse={:.2}px",
+                    edge.query_kf_idx,
+                    edge.candidate_kf_idx,
+                    edge.inliers,
+                    edge.reprojection_rmse_px,
+                ),
                 LoopGeometryEvent::Accepted(edge) => eprintln!(
                     "[loop-geometry] accepted kf={} ~ kf={} correspondences={} inliers={} ratio={:.3} rmse={:.2}px coverage={}",
                     edge.query_kf_idx,
@@ -699,6 +710,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     edge.inlier_ratio,
                     edge.reprojection_rmse_px,
                     edge.occupied_cells,
+                ),
+                LoopGeometryEvent::EpisodeSuppressed {
+                    edge,
+                    representative_query_kf_idx,
+                    representative_candidate_kf_idx,
+                } => eprintln!(
+                    "[loop-episode] suppressed kf={} ~ kf={} representative={} ~ {}",
+                    edge.query_kf_idx,
+                    edge.candidate_kf_idx,
+                    representative_query_kf_idx,
+                    representative_candidate_kf_idx,
                 ),
                 LoopGeometryEvent::Rejected {
                     query_kf_idx,
@@ -718,11 +740,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         for diagnostic in system.drain_shadow_pgo_diagnostics() {
             eprintln!(
-                "[shadow-pgo] kf={} ~ kf={} iterations={} converged={} median_correction={:.4}m max_correction={:.4}m",
+                "[shadow-pgo] kf={} ~ kf={} nodes={} edges={}/{} iterations={} converged={} usable={} cost={:.6}->{:.6} loop_residual={:.6}->{:.6} solve={:.1}ms median_correction={:.4}m max_correction={:.4}m",
                 diagnostic.verified_loop.query_kf_idx,
                 diagnostic.verified_loop.candidate_kf_idx,
+                diagnostic.node_count,
+                diagnostic.sequential_edge_count,
+                diagnostic.loop_edge_count,
                 diagnostic.iterations,
                 diagnostic.converged,
+                diagnostic.usable,
+                diagnostic.initial_cost,
+                diagnostic.final_cost,
+                diagnostic.new_loop_residual_before,
+                diagnostic.new_loop_residual_after,
+                diagnostic.solve_time_ms,
                 diagnostic.median_translation_correction,
                 diagnostic.max_translation_correction,
             );

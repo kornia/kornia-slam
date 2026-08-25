@@ -139,10 +139,15 @@ pub fn log_shadow_pgo_to_rerun(rec: &rerun::RecordingStream, diagnostic: &Shadow
         .ok();
     }
     if optimized.len() >= 2 {
+        let optimized_color = if diagnostic.usable {
+            rerun::Color::from_rgb(60, 220, 100)
+        } else {
+            rerun::Color::from_rgb(255, 145, 45)
+        };
         rec.log(
             "world/shadow_pgo/optimized",
             &rerun::LineStrips3D::new([optimized.as_slice()])
-                .with_colors([rerun::Color::from_rgb(60, 220, 100)])
+                .with_colors([optimized_color])
                 .with_radii([rerun::Radius::new_ui_points(2.5)])
                 .with_labels(["shadow optimized"]),
         )
@@ -179,7 +184,23 @@ pub fn log_shadow_pgo_to_rerun(rec: &rerun::RecordingStream, diagnostic: &Shadow
         ("inliers", edge.inliers as f64),
         ("inlier_ratio", edge.inlier_ratio as f64),
         ("reprojection_rmse_px", edge.reprojection_rmse_px as f64),
+        ("nodes", diagnostic.node_count as f64),
+        ("sequential_edges", diagnostic.sequential_edge_count as f64),
+        ("loop_edges", diagnostic.loop_edge_count as f64),
         ("iterations", diagnostic.iterations as f64),
+        ("converged", f64::from(diagnostic.converged)),
+        ("usable", f64::from(diagnostic.usable)),
+        ("initial_cost", diagnostic.initial_cost),
+        ("final_cost", diagnostic.final_cost),
+        (
+            "new_loop_residual_before",
+            diagnostic.new_loop_residual_before,
+        ),
+        (
+            "new_loop_residual_after",
+            diagnostic.new_loop_residual_after,
+        ),
+        ("solve_time_ms", diagnostic.solve_time_ms),
         (
             "median_translation_correction_m",
             diagnostic.median_translation_correction,

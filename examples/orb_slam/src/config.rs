@@ -1,6 +1,6 @@
 use kornia_slam::estimation::map_projection::MapProjectionConfig;
 use kornia_slam::estimation::two_view::TwoViewInitConfig;
-use kornia_slam::loop_closure::{LoopVerificationConfig, ShadowPgoConfig};
+use kornia_slam::loop_closure::{LoopEpisodeConfig, LoopVerificationConfig, ShadowPgoConfig};
 use kornia_slam::map::LocalMappingMode;
 use kornia_slam::system::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
@@ -28,6 +28,7 @@ pub struct ShadowPgoPipelineConfig {
     /// Mono+IMU maps become metric only after inertial initialization. Stereo
     /// maps are metric from bootstrap and leave this disabled.
     pub require_imu_initialized: bool,
+    pub episode: LoopEpisodeConfig,
     pub verification: LoopVerificationConfig,
     pub pgo: ShadowPgoConfig,
 }
