@@ -307,12 +307,10 @@ impl PoseManifold<6> for Se3Manifold {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) struct GravityManifold {
     gravity_axis: Vec3F64,
 }
 
-#[allow(dead_code)]
 impl GravityManifold {
     pub(crate) fn new(gravity_axis: Vec3F64) -> Result<Self, SparsePgoError> {
         Ok(Self {
@@ -1031,7 +1029,6 @@ fn validate_damping(damping: f32) -> Result<(), SparsePgoError> {
     Ok(())
 }
 
-#[allow(dead_code)]
 fn normalized_gravity(gravity_axis: Vec3F64) -> Result<Vec3F64, SparsePgoError> {
     if !vec3_f64_is_finite(gravity_axis) {
         return Err(SparsePgoError::InvalidInput(
