@@ -1208,28 +1208,28 @@ mod tests {
         (poses, edges)
     }
 
-    fn scaling_edges(expected: &[Pose3d]) -> Vec<PgoEdge> {
-        let mut edges = (0..expected.len() - 1)
+    fn scaling_edges(poses: &[Pose3d], ground_truth: &[Pose3d]) -> Vec<PgoEdge> {
+        let mut edges = (0..poses.len() - 1)
             .map(|pose_a| PgoEdge {
                 pose_a,
                 pose_b: pose_a + 1,
-                t_ab_meas: pose_to_se3(&expected[pose_a + 1]).unwrap()
-                    * pose_to_se3(&expected[pose_a]).unwrap().inverse(),
+                t_ab_meas: pose_to_se3(&poses[pose_a + 1]).unwrap()
+                    * pose_to_se3(&poses[pose_a]).unwrap().inverse(),
                 weight: 1.0,
             })
             .collect::<Vec<_>>();
-        let last = expected.len() - 1;
+        let last = ground_truth.len() - 1;
         for (pose_a, pose_b) in [
             (0, last),
-            (expected.len() / 5, expected.len() * 4 / 5),
-            (expected.len() / 3, expected.len() * 2 / 3),
-            (expected.len() / 7, expected.len() * 6 / 7),
+            (ground_truth.len() / 5, ground_truth.len() * 4 / 5),
+            (ground_truth.len() / 3, ground_truth.len() * 2 / 3),
+            (ground_truth.len() / 7, ground_truth.len() * 6 / 7),
         ] {
             edges.push(PgoEdge {
                 pose_a,
                 pose_b,
-                t_ab_meas: pose_to_se3(&expected[pose_b]).unwrap()
-                    * pose_to_se3(&expected[pose_a]).unwrap().inverse(),
+                t_ab_meas: pose_to_se3(&ground_truth[pose_b]).unwrap()
+                    * pose_to_se3(&ground_truth[pose_a]).unwrap().inverse(),
                 weight: 0.7,
             });
         }
@@ -1237,24 +1237,24 @@ mod tests {
     }
 
     fn se3_scaling_graph(pose_count: usize) -> (Vec<Pose3d>, Vec<PgoEdge>) {
-        let expected = (0..pose_count)
+        let ground_truth = (0..pose_count)
             .map(|index| {
                 let progress = index as f64 / (pose_count - 1) as f64;
                 let center = Vec3F64::new(
-                    index as f64 * 0.08,
-                    (index as f64 * 0.015).sin() * 0.5,
-                    (index as f64 * 0.011).cos() * 0.2,
+                    progress * 8.0,
+                    (progress * 6.0).sin() * 0.5,
+                    (progress * 4.0).cos() * 0.2,
                 );
                 let rotation = SO3F64::exp(Vec3F64::new(
-                    (index as f64 * 0.01).sin() * 0.08,
-                    (index as f64 * 0.013).cos() * -0.04,
+                    (progress * 4.0).sin() * 0.08,
+                    (progress * 5.0).cos() * -0.04,
                     progress * 0.12,
                 ))
                 .matrix();
                 Pose3d::new(rotation, -(rotation * center))
             })
             .collect::<Vec<_>>();
-        let poses = expected
+        let poses = ground_truth
             .iter()
             .enumerate()
             .map(|(index, pose)| {
@@ -1274,7 +1274,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let edges = scaling_edges(&expected);
+        let edges = scaling_edges(&poses, &ground_truth);
         (poses, edges)
     }
 
@@ -1282,20 +1282,20 @@ mod tests {
         let gravity_axis = Vec3F64::new(0.3, -0.8, 0.4).normalize();
         let manifold = GravityManifold::new(gravity_axis).unwrap();
         let base_rotation = SO3F64::exp(Vec3F64::new(0.2, -0.1, 0.15)).matrix();
-        let expected = (0..pose_count)
+        let ground_truth = (0..pose_count)
             .map(|index| {
                 let progress = index as f64 / (pose_count - 1) as f64;
                 let center = Vec3F64::new(
-                    index as f64 * 0.08,
-                    (index as f64 * 0.017).sin() * 0.45,
-                    (index as f64 * 0.009).cos() * 0.25,
+                    progress * 8.0,
+                    (progress * 6.5).sin() * 0.45,
+                    (progress * 4.5).cos() * 0.25,
                 );
-                let yaw = (index as f64 * 0.012).sin() * 0.2 + progress * 0.1;
+                let yaw = (progress * 5.0).sin() * 0.2 + progress * 0.1;
                 let rotation = base_rotation * SO3F64::exp(gravity_axis * yaw).matrix();
                 Pose3d::new(rotation, -(rotation * center))
             })
             .collect::<Vec<_>>();
-        let poses = expected
+        let poses = ground_truth
             .iter()
             .enumerate()
             .map(|(index, pose)| {
@@ -1313,8 +1313,23 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let edges = scaling_edges(&expected);
+        let edges = scaling_edges(&poses, &ground_truth);
         (poses, edges, manifold)
+    }
+
+    fn assert_scaling_topology(poses: &[Pose3d], edges: &[PgoEdge]) {
+        let sequential_edge_count = poses.len() - 1;
+        assert_eq!(edges.len(), sequential_edge_count + 4);
+        let sequential_cost = normal_cost(poses, &edges[..sequential_edge_count]);
+        let loop_cost = normal_cost(poses, &edges[sequential_edge_count..]);
+        assert!(
+            sequential_cost <= 1e-6,
+            "sequential edges must initially match drifted odometry: cost={sequential_cost:e}"
+        );
+        assert!(
+            loop_cost > 1e-6,
+            "ground-truth loop edges must expose drift: cost={loop_cost:e}"
+        );
     }
 
     fn assert_fixed_pose_unchanged(actual: &Pose3d, expected: &Pose3d) {
@@ -1727,14 +1742,13 @@ mod tests {
     #[test]
     #[ignore = "release-only sparse PGO scaling benchmark"]
     fn sparse_pgo_scaling() {
-        // Long sparse chains can need more LM trials than the runtime default,
-        // while retaining the production convergence and damping tolerances.
-        let params = PgoParams {
-            max_iterations: 120,
-            ..PgoParams::default()
-        };
+        // Require at least a 2x cost reduction without binding the benchmark
+        // to the much larger reductions observed for this deterministic fixture.
+        const MIN_COST_REDUCTION_RATIO: f64 = 2.0;
+        let params = PgoParams::default();
         for pose_count in [100, 500, 1_000] {
             let (poses, edges) = se3_scaling_graph(pose_count);
+            assert_scaling_topology(&poses, &edges);
             let initial_cost = normal_cost(&poses, &edges);
             let fixed_pose = poses[0];
             let start = Instant::now();
@@ -1742,15 +1756,22 @@ mod tests {
                 sparse_pose_graph_optimize(&poses, &edges, &[0], &params, &Se3Manifold).unwrap();
             let elapsed = start.elapsed();
             let final_cost = normal_cost(&result.poses, &edges);
+            assert!(result.iterations > 0);
+            let elapsed_per_iteration = elapsed.as_secs_f64() / result.iterations as f64;
+            let elapsed_per_iteration_edge = elapsed_per_iteration / edges.len() as f64;
+            let cost_reduction_ratio = initial_cost / final_cost;
 
             println!(
-                "se3 keyframes={pose_count} edges={} iterations={} elapsed={elapsed:?} cost={initial_cost:.6e}->{final_cost:.6e}",
+                "se3 keyframes={pose_count} edges={} iterations={} elapsed={elapsed:?} elapsed/iteration={:.3}ms elapsed/(iteration*edge)={:.3}us cost={initial_cost:.6e}->{final_cost:.6e} reduction={cost_reduction_ratio:.3e}x",
                 edges.len(),
-                result.iterations
+                result.iterations,
+                elapsed_per_iteration * 1e3,
+                elapsed_per_iteration_edge * 1e6,
             );
             assert!(initial_cost.is_finite());
             assert!(final_cost.is_finite());
             assert!(final_cost < initial_cost);
+            assert!(cost_reduction_ratio >= MIN_COST_REDUCTION_RATIO);
             assert_eq!(result.poses.len(), poses.len());
             assert_fixed_pose_unchanged(&result.poses[0], &fixed_pose);
             assert!(result.converged);
@@ -1758,6 +1779,7 @@ mod tests {
 
         for pose_count in [100, 500, 1_000] {
             let (poses, edges, manifold) = gravity_scaling_graph(pose_count);
+            assert_scaling_topology(&poses, &edges);
             let initial_cost = normal_cost(&poses, &edges);
             let fixed_pose = poses[0];
             let gravity_in_cameras = poses
@@ -1769,15 +1791,22 @@ mod tests {
                 sparse_pose_graph_optimize(&poses, &edges, &[0], &params, &manifold).unwrap();
             let elapsed = start.elapsed();
             let final_cost = normal_cost(&result.poses, &edges);
+            assert!(result.iterations > 0);
+            let elapsed_per_iteration = elapsed.as_secs_f64() / result.iterations as f64;
+            let elapsed_per_iteration_edge = elapsed_per_iteration / edges.len() as f64;
+            let cost_reduction_ratio = initial_cost / final_cost;
 
             println!(
-                "gravity keyframes={pose_count} edges={} iterations={} elapsed={elapsed:?} cost={initial_cost:.6e}->{final_cost:.6e}",
+                "gravity keyframes={pose_count} edges={} iterations={} elapsed={elapsed:?} elapsed/iteration={:.3}ms elapsed/(iteration*edge)={:.3}us cost={initial_cost:.6e}->{final_cost:.6e} reduction={cost_reduction_ratio:.3e}x",
                 edges.len(),
-                result.iterations
+                result.iterations,
+                elapsed_per_iteration * 1e3,
+                elapsed_per_iteration_edge * 1e6,
             );
             assert!(initial_cost.is_finite());
             assert!(final_cost.is_finite());
             assert!(final_cost < initial_cost);
+            assert!(cost_reduction_ratio >= MIN_COST_REDUCTION_RATIO);
             assert_eq!(result.poses.len(), poses.len());
             assert_fixed_pose_unchanged(&result.poses[0], &fixed_pose);
             assert!(result.converged);
