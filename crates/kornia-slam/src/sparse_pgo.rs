@@ -480,10 +480,11 @@ fn sparse_pose_graph_optimize_impl<const DOF: usize>(
     manifold: &impl PoseManifold<DOF>,
     #[cfg(test)] test_hooks: &mut SparsePgoTestHooks,
 ) -> Result<SparsePgoResult, SparsePgoError> {
-    validate_optimizer_inputs(poses, edges, fixed_pose_indices, params)?;
+    let pose_to_block = validate_optimizer_inputs(poses, edges, fixed_pose_indices, params)?;
 
     let mut accepted_poses = poses.to_vec();
-    let mut current_cost = total_squared_residual_cost(&accepted_poses, edges)?;
+    let mut current_cost =
+        active_total_squared_residual_cost(&accepted_poses, edges, &pose_to_block)?;
     let mut damping = params.initial_lambda;
     // One iteration is one evaluated trial. Retrying a failed linear solve
     // changes damping but does not consume the nonlinear iteration budget.
@@ -499,7 +500,8 @@ fn sparse_pose_graph_optimize_impl<const DOF: usize>(
             });
         }
 
-        let normal = build_normal_system(&accepted_poses, edges, fixed_pose_indices, manifold)?;
+        let normal =
+            build_normal_system_with_mapping(&accepted_poses, edges, &pose_to_block, manifold)?;
         #[cfg(test)]
         {
             test_hooks.normal_assemblies += 1;
@@ -549,7 +551,7 @@ fn sparse_pose_graph_optimize_impl<const DOF: usize>(
             match evaluate_trial(
                 &accepted_poses,
                 edges,
-                &normal.pose_to_block,
+                &pose_to_block,
                 manifold,
                 &step,
                 current_cost,
@@ -647,7 +649,7 @@ fn evaluate_trial<const DOF: usize>(
             trial_poses[pose_index] = trial_pose;
         }
     }
-    let trial_cost = match total_squared_residual_cost(&trial_poses, edges) {
+    let trial_cost = match active_total_squared_residual_cost(&trial_poses, edges, pose_to_block) {
         Ok(cost) => cost,
         Err(_) => return Ok(TrialOutcome::NumericalFailure),
     };
@@ -674,12 +676,47 @@ fn validate_optimizer_inputs(
     edges: &[PgoEdge],
     fixed_pose_indices: &[usize],
     params: &PgoParams,
-) -> Result<(), SparsePgoError> {
+) -> Result<Vec<Option<usize>>, SparsePgoError> {
     if poses.is_empty() {
         return Err(SparsePgoError::InvalidInput("empty poses".into()));
     }
     if edges.is_empty() {
         return Err(SparsePgoError::InvalidInput("empty edges".into()));
+    }
+    let pose_to_block = validate_pose_graph(poses, edges, fixed_pose_indices)?;
+    if params.max_iterations == 0 {
+        return Err(SparsePgoError::InvalidInput(
+            "maximum iterations must be greater than zero".into(),
+        ));
+    }
+    if !params.cost_tolerance.is_finite() || params.cost_tolerance < 0.0 {
+        return Err(SparsePgoError::InvalidInput(
+            "cost tolerance must be finite and non-negative".into(),
+        ));
+    }
+    if !params.gradient_tolerance.is_finite() || params.gradient_tolerance < 0.0 {
+        return Err(SparsePgoError::InvalidInput(
+            "gradient tolerance must be finite and non-negative".into(),
+        ));
+    }
+    if !params.initial_lambda.is_finite()
+        || params.initial_lambda <= 0.0
+        || params.initial_lambda > LAMBDA_MAX
+    {
+        return Err(SparsePgoError::InvalidInput(format!(
+            "initial LM damping must be finite and in (0, {LAMBDA_MAX:e}]"
+        )));
+    }
+    Ok(pose_to_block)
+}
+
+fn validate_pose_graph(
+    poses: &[Pose3d],
+    edges: &[PgoEdge],
+    fixed_pose_indices: &[usize],
+) -> Result<Vec<Option<usize>>, SparsePgoError> {
+    if poses.is_empty() {
+        return Err(SparsePgoError::InvalidInput("empty poses".into()));
     }
     for pose in poses {
         validate_pose(pose)?;
@@ -708,102 +745,9 @@ fn validate_optimizer_inputs(
             "fixed pose index is out of range".into(),
         ));
     }
-    if params.max_iterations == 0 {
-        return Err(SparsePgoError::InvalidInput(
-            "maximum iterations must be greater than zero".into(),
-        ));
-    }
-    if !params.cost_tolerance.is_finite() || params.cost_tolerance < 0.0 {
-        return Err(SparsePgoError::InvalidInput(
-            "cost tolerance must be finite and non-negative".into(),
-        ));
-    }
-    if !params.gradient_tolerance.is_finite() || params.gradient_tolerance < 0.0 {
-        return Err(SparsePgoError::InvalidInput(
-            "gradient tolerance must be finite and non-negative".into(),
-        ));
-    }
-    if !params.initial_lambda.is_finite()
-        || params.initial_lambda <= 0.0
-        || params.initial_lambda > LAMBDA_MAX
-    {
-        return Err(SparsePgoError::InvalidInput(format!(
-            "initial LM damping must be finite and in (0, {LAMBDA_MAX:e}]"
-        )));
-    }
-    Ok(())
-}
 
-fn total_squared_residual_cost(poses: &[Pose3d], edges: &[PgoEdge]) -> Result<f32, SparsePgoError> {
-    let mut cost = 0.0f32;
-    for edge in edges {
-        let residual = weighted_relative_residual(
-            &poses[edge.pose_a],
-            &poses[edge.pose_b],
-            &edge.t_ab_meas,
-            edge.weight,
-        )?;
-        for value in residual {
-            cost += value * value;
-            if !cost.is_finite() {
-                return Err(SparsePgoError::InvalidInput(
-                    "pose-graph cost must be finite".into(),
-                ));
-            }
-        }
-    }
-    Ok(cost)
-}
-
-fn finite_l2_norm(values: &[f32], name: &str) -> Result<f64, SparsePgoError> {
-    let squared_norm = values
-        .iter()
-        .map(|&value| f64::from(value) * f64::from(value))
-        .sum::<f64>();
-    let norm = squared_norm.sqrt();
-    if !norm.is_finite() {
-        return Err(SparsePgoError::InvalidInput(format!(
-            "{name} norm must be finite"
-        )));
-    }
-    Ok(norm)
-}
-
-fn build_normal_system<const DOF: usize>(
-    poses: &[Pose3d],
-    edges: &[PgoEdge],
-    fixed_pose_indices: &[usize],
-    manifold: &impl PoseManifold<DOF>,
-) -> Result<NormalSystem<DOF>, SparsePgoError> {
-    if DOF == 0 {
-        return Err(SparsePgoError::InvalidInput(
-            "pose manifold must have at least one degree of freedom".into(),
-        ));
-    }
-    if poses.is_empty() {
-        return Err(SparsePgoError::InvalidInput("empty poses".into()));
-    }
-    for pose in poses {
-        validate_pose(pose)?;
-    }
-    let fixed = fixed_pose_indices.iter().copied().collect::<HashSet<_>>();
-    if fixed.iter().any(|&pose_index| pose_index >= poses.len()) {
-        return Err(SparsePgoError::InvalidInput(
-            "fixed pose index is out of range".into(),
-        ));
-    }
     let mut is_free = vec![false; poses.len()];
     for edge in edges {
-        if edge.pose_a >= poses.len() || edge.pose_b >= poses.len() {
-            return Err(SparsePgoError::InvalidInput(
-                "pose-graph edge index is out of range".into(),
-            ));
-        }
-        if edge.pose_a == edge.pose_b {
-            return Err(SparsePgoError::InvalidInput(
-                "pose-graph edge endpoints must be distinct".into(),
-            ));
-        }
         if !fixed.contains(&edge.pose_a) {
             is_free[edge.pose_a] = true;
         }
@@ -824,16 +768,115 @@ fn build_normal_system<const DOF: usize>(
             "pose graph has no free poses".into(),
         ));
     }
+    Ok(pose_to_block)
+}
+
+fn active_total_squared_residual_cost(
+    poses: &[Pose3d],
+    edges: &[PgoEdge],
+    pose_to_block: &[Option<usize>],
+) -> Result<f32, SparsePgoError> {
+    if pose_to_block.len() != poses.len() {
+        return Err(SparsePgoError::InvalidInput(
+            "pose-to-block map has an invalid dimension".into(),
+        ));
+    }
+    let mut cost = 0.0f32;
+    for edge in edges {
+        if pose_to_block[edge.pose_a].is_some() || pose_to_block[edge.pose_b].is_some() {
+            accumulate_edge_squared_cost(poses, edge, &mut cost)?;
+        }
+    }
+    Ok(cost)
+}
+
+fn accumulate_edge_squared_cost(
+    poses: &[Pose3d],
+    edge: &PgoEdge,
+    cost: &mut f32,
+) -> Result<(), SparsePgoError> {
+    let residual = weighted_relative_residual(
+        &poses[edge.pose_a],
+        &poses[edge.pose_b],
+        &edge.t_ab_meas,
+        edge.weight,
+    )?;
+    for value in residual {
+        *cost += value * value;
+        if !cost.is_finite() {
+            return Err(SparsePgoError::InvalidInput(
+                "pose-graph cost must be finite".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn finite_l2_norm(values: &[f32], name: &str) -> Result<f64, SparsePgoError> {
+    let squared_norm = values
+        .iter()
+        .map(|&value| f64::from(value) * f64::from(value))
+        .sum::<f64>();
+    let norm = squared_norm.sqrt();
+    if !norm.is_finite() {
+        return Err(SparsePgoError::InvalidInput(format!(
+            "{name} norm must be finite"
+        )));
+    }
+    Ok(norm)
+}
+
+#[cfg(test)]
+fn build_normal_system<const DOF: usize>(
+    poses: &[Pose3d],
+    edges: &[PgoEdge],
+    fixed_pose_indices: &[usize],
+    manifold: &impl PoseManifold<DOF>,
+) -> Result<NormalSystem<DOF>, SparsePgoError> {
+    if DOF == 0 {
+        return Err(SparsePgoError::InvalidInput(
+            "pose manifold must have at least one degree of freedom".into(),
+        ));
+    }
+    let pose_to_block = validate_pose_graph(poses, edges, fixed_pose_indices)?;
+    build_normal_system_with_mapping(poses, edges, &pose_to_block, manifold)
+}
+
+fn build_normal_system_with_mapping<const DOF: usize>(
+    poses: &[Pose3d],
+    edges: &[PgoEdge],
+    pose_to_block: &[Option<usize>],
+    manifold: &impl PoseManifold<DOF>,
+) -> Result<NormalSystem<DOF>, SparsePgoError> {
+    if DOF == 0 {
+        return Err(SparsePgoError::InvalidInput(
+            "pose manifold must have at least one degree of freedom".into(),
+        ));
+    }
+    if pose_to_block.len() != poses.len() {
+        return Err(SparsePgoError::InvalidInput(
+            "pose-to-block map has an invalid dimension".into(),
+        ));
+    }
+    let block_count = pose_to_block.iter().flatten().count();
+    if block_count == 0 {
+        return Err(SparsePgoError::InvalidInput(
+            "pose graph has no free poses".into(),
+        ));
+    }
     let scalar_dim = block_count
         .checked_mul(DOF)
         .ok_or_else(|| SparsePgoError::InvalidInput("normal-system dimension overflow".into()))?;
     let mut normal = NormalSystem {
-        pose_to_block,
+        pose_to_block: pose_to_block.to_vec(),
         blocks: BTreeMap::new(),
         gradient: vec![0.0; scalar_dim],
     };
 
     for edge in edges {
+        if pose_to_block[edge.pose_a].is_none() && pose_to_block[edge.pose_b].is_none() {
+            continue;
+        }
         let residual = weighted_relative_residual(
             &poses[edge.pose_a],
             &poses[edge.pose_b],
@@ -1520,6 +1563,85 @@ mod tests {
         assert!(normal_cost(&result.poses, &edges) < initial_cost * 0.01);
         assert!(result.iterations > 0);
         assert!(result.converged);
+    }
+
+    #[test]
+    fn fixed_fixed_edge_does_not_change_optimizer_convergence() {
+        let (mut poses, active_edges) = drifting_loop_graph();
+        poses.push(Pose3d::new(
+            Mat3F64::IDENTITY,
+            Vec3F64::new(100.0, -50.0, 25.0),
+        ));
+        let (_, mut edges_with_constant) = drifting_loop_graph();
+        edges_with_constant.push(PgoEdge {
+            pose_a: 0,
+            pose_b: 4,
+            t_ab_meas: pose_to_se3(&Pose3d::IDENTITY).unwrap(),
+            weight: 1e3,
+        });
+        let fixed = [0, 4];
+
+        let active_result = sparse_pose_graph_optimize(
+            &poses,
+            &active_edges,
+            &fixed,
+            &PgoParams::default(),
+            &Se3Manifold,
+        )
+        .unwrap();
+        let constant_result = sparse_pose_graph_optimize(
+            &poses,
+            &edges_with_constant,
+            &fixed,
+            &PgoParams::default(),
+            &Se3Manifold,
+        )
+        .unwrap();
+
+        assert!(active_result.converged);
+        assert!(constant_result.converged);
+        assert_eq!(constant_result.iterations, active_result.iterations);
+        assert_eq!(
+            normal_cost(&constant_result.poses, &active_edges),
+            normal_cost(&active_result.poses, &active_edges)
+        );
+        for (with_constant, active_only) in constant_result.poses.iter().zip(&active_result.poses) {
+            assert_eq!(with_constant.rotation, active_only.rotation);
+            assert_eq!(with_constant.translation, active_only.translation);
+        }
+    }
+
+    #[test]
+    fn inactive_fixed_fixed_edge_is_still_validated() {
+        let poses = vec![Pose3d::IDENTITY; 3];
+        let edges = [
+            PgoEdge {
+                pose_a: 0,
+                pose_b: 1,
+                t_ab_meas: pose_to_se3(&Pose3d::IDENTITY).unwrap(),
+                weight: f32::NAN,
+            },
+            PgoEdge {
+                pose_a: 1,
+                pose_b: 2,
+                t_ab_meas: pose_to_se3(&Pose3d::IDENTITY).unwrap(),
+                weight: 1.0,
+            },
+        ];
+
+        let result = sparse_pose_graph_optimize(
+            &poses,
+            &edges,
+            &[0, 1],
+            &PgoParams::default(),
+            &Se3Manifold,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SparsePgoError::InvalidInput(message))
+                if message == "pose-graph edge weight must be finite"
+        ));
     }
 
     #[test]
