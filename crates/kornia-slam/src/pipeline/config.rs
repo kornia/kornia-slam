@@ -1,12 +1,12 @@
-use kornia_slam::estimation::map_projection::MapProjectionConfig;
-use kornia_slam::estimation::two_view::TwoViewInitConfig;
-use kornia_slam::loop_closure::{
+use crate::estimation::map_projection::MapProjectionConfig;
+use crate::estimation::two_view::TwoViewInitConfig;
+use crate::loop_closure::{
     LoopEpisodeConfig, LoopFusionConfig, LoopVerificationConfig, PgoConfig,
 };
-use kornia_slam::map::LocalMappingMode;
-use kornia_slam::system::{KeyframePolicy, TrackingLossRecoveryPolicy};
+use crate::map::LocalMappingMode;
+use crate::system::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
-/// Example-local pipeline preset used by the standalone ORB-SLAM binary.
+/// Runtime preset for [`SlamPipeline`](super::SlamPipeline).
 pub struct PipelineConfig {
     pub two_view_init: TwoViewInitConfig,
     pub map_projection: MapProjectionConfig,
