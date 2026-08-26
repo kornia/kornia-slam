@@ -10,14 +10,6 @@ pub use config::{PgoPipelineConfig, PipelineConfig};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-
-use kornia_3d::camera::PinholeCamera;
-use kornia_3d::pose::Pose3d;
-use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
-use kornia_algebra::{Mat3F64, Vec2F64, Vec3F64};
-use kornia_image::Image;
-use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
-use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use crate::Frame;
 use crate::estimation::optical_flow::{
     FlowSurvivor, KltTracker, MapKeypointMatch, TrackSet, snap_unique,
@@ -35,6 +27,13 @@ use crate::system::{
     KeyframePolicy, SystemMode, SystemState, TrackingLossRecoveryPolicy, TrackingResult,
     TrackingStatus,
 };
+use kornia_3d::camera::PinholeCamera;
+use kornia_3d::pose::Pose3d;
+use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
+use kornia_algebra::{Mat3F64, Vec2F64, Vec3F64};
+use kornia_image::Image;
+use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
+use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 
 /// Top-level ORB-SLAM pipeline: orchestrates tracking, mapping, and state transitions.
 pub struct SlamPipeline {
@@ -1944,9 +1943,9 @@ mod tests {
         apply_reference_pose_correction, carry_klt_survivors, format_imu_init_gate,
         pose_graph_reference_correction, pose_graph_tracking_correction,
     };
+    use crate::estimation::optical_flow::{FlowSurvivor, MapKeypointMatch, TrackSet};
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::{SO3F64, Vec3F64};
-    use crate::estimation::optical_flow::{FlowSurvivor, MapKeypointMatch, TrackSet};
 
     fn assert_pose_close(actual: Pose3d, expected: Pose3d) {
         assert!((actual.translation - expected.translation).length() < 1e-10);
