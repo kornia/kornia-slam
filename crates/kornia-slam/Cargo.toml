@@ -3,6 +3,7 @@ name = "kornia-slam"
 version = "0.1.0"
 edition = "2024"
 description = "Spatial runtime for real-time pose estimation, mapping, and agent interaction."
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
 

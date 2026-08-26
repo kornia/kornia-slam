@@ -3,6 +3,7 @@ name = "kornia-sensors"
 version = "0.1.0"
 edition = "2024"
 description = "Physical sensor processing for kornia: IMU preintegration, noise models, and calibration."
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
 

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 description = "Runnable visual and visual-inertial SLAM application"
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
