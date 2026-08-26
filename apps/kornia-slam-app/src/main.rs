@@ -23,11 +23,9 @@
 //! ```
 
 mod config;
-#[path = "../../common/datasets/mod.rs"]
 mod datasets;
 mod evaluation;
 mod pipeline;
-#[path = "../../common/source/mod.rs"]
 mod source;
 mod tui;
 mod utils;

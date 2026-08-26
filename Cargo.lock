@@ -6101,6 +6101,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "kornia-slam-app"
+version = "0.1.0"
+dependencies = [
+ "argh",
+ "ciborium",
+ "crossterm 0.28.1",
+ "depthai",
+ "kornia-3d",
+ "kornia-algebra",
+ "kornia-image",
+ "kornia-imgproc",
+ "kornia-io",
+ "kornia-sensors",
+ "kornia-slam",
+ "kornia-tensor",
+ "libc",
+ "mcap 0.21.0",
+ "nokhwa",
+ "ratatui",
+ "rerun",
+ "serde",
+ "serde_yaml",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "kornia-tensor"
 version = "0.1.15-rc.5"
 source = "git+https://github.com/kornia/kornia-rs?branch=main#ca461e2b69651ffab5d258a85406500d0b11966e"
@@ -7939,32 +7965,6 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
-
-[[package]]
-name = "orb_slam"
-version = "0.1.0"
-dependencies = [
- "argh",
- "ciborium",
- "crossterm 0.28.1",
- "depthai",
- "kornia-3d",
- "kornia-algebra",
- "kornia-image",
- "kornia-imgproc",
- "kornia-io",
- "kornia-sensors",
- "kornia-slam",
- "kornia-tensor",
- "libc",
- "mcap 0.21.0",
- "nokhwa",
- "ratatui",
- "rerun",
- "serde",
- "serde_yaml",
- "thiserror 2.0.19",
-]
 
 [[package]]
 name = "orbclient"
