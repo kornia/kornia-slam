@@ -1,16 +1,17 @@
-# ORB-SLAM Example
+# kornia-slam-app
 
-This package is the current runnable slice of `kornia-slam`: an ORB-based SLAM pipeline with four interchangeable frame sources — offline EuRoC MAV image sequences, offline MCAP recordings (e.g. bubbaloop captures), a live OAK-D camera, and any UVC-class camera (laptop webcams, USB cams, CSI-to-UVC adapters on a Pi…). All feed the same `process_frame` orchestrator, and the TUI / Rerun visualizers work for any of them. EuRoC, MCAP, and OAK-D additionally support a **stereo mode** (see below) that yields metric depth; UVC is monocular only.
+This package is the composition root for the `kornia-slam` executable. It wires the
+`kornia_slam::SlamPipeline` runtime to four interchangeable frame sources — offline EuRoC MAV image sequences, offline MCAP recordings (e.g. bubbaloop captures), a live OAK-D camera, and any UVC-class camera (laptop webcams, USB cams, CSI-to-UVC adapters on a Pi…). All feed the same `process_frame` orchestrator, and the TUI / Rerun visualizers work for any of them. EuRoC, MCAP, and OAK-D additionally support a **stereo mode** (see below) that yields metric depth; UVC is monocular only.
 
 ## Frame sources
 
 Selectable via subcommand:
 
 ```text
-orb_slam euroc --data /path/to/V1_01_easy [--start-frame N] [--max-frames N] [--stereo] [--evaluate] [--eval-out DIR]
-orb_slam mcap  --path FILE.mcap [--channel mono_left] [--max-frames N] [--stereo --calib calib.yaml --right-channel mono_right]
-orb_slam oakd  [--width 640 --height 400 --fps 30] [--max-frames N] [--stereo --calib calib.yaml]
-orb_slam uvc   --fx F --fy F --cx C --cy C [--index 0] [--width 640 --height 480] [--max-frames N]
+kornia-slam euroc --data /path/to/V1_01_easy [--start-frame N] [--max-frames N] [--stereo] [--evaluate] [--eval-out DIR]
+kornia-slam mcap  --path FILE.mcap [--channel mono_left] [--max-frames N] [--stereo --calib calib.yaml --right-channel mono_right]
+kornia-slam oakd  [--width 640 --height 400 --fps 30] [--max-frames N] [--stereo --calib calib.yaml]
+kornia-slam uvc   --fx F --fy F --cx C --cy C [--index 0] [--width 640 --height 480] [--max-frames N]
 ```
 
 `oakd` requires `--features oakd`; `uvc` requires `--features uvc`. The default build needs no extra system dependencies.
@@ -40,7 +41,7 @@ V1_01_easy/
 [Machine Hall sequences](https://www.research-collection.ethz.ch/entities/researchdata/bcaf173e-5dac-484b-bc37-faf97a594f1f) (MH_01–MH_05) are recommended for initial testing.
 
 ```bash
-cargo run --release -p orb_slam -- euroc --data /path/to/MH_01_easy
+cargo run --release -p kornia-slam-app -- euroc --data /path/to/MH_01_easy
 ```
 
 ## OAK-D camera
@@ -70,10 +71,10 @@ at cargo invocation time when building with both `viz` and `oakd`.
 ```bash
 # Live, with Rerun visualization:
 RUSTFLAGS="-C link-arg=-Wl,--allow-multiple-definition" \
-  cargo run --release -p orb_slam --features oakd -- --rerun-stream oakd
+  cargo run --release -p kornia-slam-app --features oakd -- --rerun-stream oakd
 
 # Live, TUI only (no Rerun, no lz4 clash):
-cargo run --release -p orb_slam --no-default-features --features oakd -- oakd
+cargo run --release -p kornia-slam-app --no-default-features --features oakd -- oakd
 ```
 
 In **mono** mode intrinsics are placeholder (rough scale of the OAK-D Pro factory fx/fy at 1280×800); reading the on-device factory calibration is a TODO. In **stereo** mode (`--stereo --calib …`) the intrinsics come from the calibration YAML and online rectification produces metric pairs — see [Stereo mode](#stereo-mode).
@@ -119,17 +120,17 @@ For an OAK-D this is the device's factory calibration (readable once via the dep
 
 ```bash
 # EuRoC stereo (metric), first 500 frames, with evaluation CSVs:
-cargo run --release -p orb_slam -- \
+cargo run --release -p kornia-slam-app -- \
     euroc --data /path/to/MH_01_easy --stereo --max-frames 500 --evaluate
 
 # Offline MCAP stereo (raw OAK-D recording + calibration):
-cargo run --release -p orb_slam -- \
+cargo run --release -p kornia-slam-app -- \
     mcap --path recording.mcap --stereo --calib calib.yaml \
     --channel mono_left --right-channel mono_right
 
 # Live OAK-D stereo (free the device first if a daemon holds it, e.g.
 # `bubbaloop node stop oak-camera`):
-cargo run --release -p orb_slam --no-default-features --features oakd -- \
+cargo run --release -p kornia-slam-app --no-default-features --features oakd -- \
     oakd --stereo --calib calib.yaml --fps 30
 ```
 
@@ -141,13 +142,13 @@ Any UVC-class device works (built-in laptop webcam, USB camera, CSI-to-UVC adapt
 
 ```bash
 # /dev/video0 at 640x480, rough pinhole calibration:
-cargo run --release -p orb_slam --features uvc -- \
+cargo run --release -p kornia-slam-app --features uvc -- \
     uvc --index 0 --fx 600 --fy 600 --cx 320 --cy 240
 ```
 
 ## Visualizers
 
-The TUI is the default — just run the example. Override with one of:
+The TUI is the default — just run the app. Override with one of:
 
 - `--rerun-stream` — spawn a Rerun viewer and stream image / keypoints / trajectory / camera / map points (requires `--features viz`, default on). Disables the TUI.
 - `--no-tui` — fall back to plain stderr status lines (no TUI, no Rerun).
@@ -156,7 +157,7 @@ The TUI is the default — just run the example. Override with one of:
 ## Local checks
 
 ```bash
-cargo fmt -p orb_slam -- --check
-cargo clippy -p orb_slam --all-targets -- -D warnings
-cargo run -p orb_slam -- --help
+cargo fmt -p kornia-slam-app -- --check
+cargo clippy -p kornia-slam-app --all-targets -- -D warnings
+cargo run -p kornia-slam-app -- --help
 ```

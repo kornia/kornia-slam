@@ -1,24 +1,24 @@
-//! Monocular ORB-SLAM example with a selectable frame source.
+//! `kornia-slam` command-line application: runs the SLAM runtime over a selectable frame source.
 //!
 //! Run on an offline EuRoC dataset:
 //! ```text
-//! cargo run --release -p orb_slam -- euroc --data /path/to/V1_01_easy
+//! cargo run --release -p kornia-slam-app -- euroc --data /path/to/V1_01_easy
 //! ```
 //!
 //! Run on a bubbaloop MCAP recording (defaults to the mono_left channel):
 //! ```text
-//! cargo run --release -p orb_slam -- mcap --path /path/to/recording.mcap
+//! cargo run --release -p kornia-slam-app -- mcap --path /path/to/recording.mcap
 //! ```
 //!
 //! Run live on an OAK-D camera (requires `--features oakd`):
 //! ```text
-//! cargo run --release -p orb_slam --features oakd -- oakd
+//! cargo run --release -p kornia-slam-app --features oakd -- oakd
 //! ```
 //!
 //! Run live on a UVC camera (built-in webcam, USB cam, etc.; requires
 //! `--features uvc`):
 //! ```text
-//! cargo run --release -p orb_slam --features uvc -- uvc \
+//! cargo run --release -p kornia-slam-app --features uvc -- uvc \
 //!     --fx 600 --fy 600 --cx 320 --cy 240
 //! ```
 
@@ -551,7 +551,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Rerun ──────────────────────────────────────────────────────────────
     #[cfg(feature = "viz")]
     let rec = if args.rerun_stream {
-        let r = rerun::RecordingStreamBuilder::new("orb_slam").spawn()?;
+        let r = rerun::RecordingStreamBuilder::new("kornia-slam").spawn()?;
         r.log("/", &rerun::ViewCoordinates::RIGHT_HAND_Y_DOWN())?;
         r.log("world/camera", &rerun::ViewCoordinates::RDF())?;
         Some(r)

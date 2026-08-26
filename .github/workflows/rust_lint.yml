@@ -6,7 +6,7 @@ on:
     branches: [main, develop]
     paths:
       - "crates/**"
-      - "examples/**"
+      - "apps/**"
       - "tests/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -16,7 +16,7 @@ on:
     branches: [main, develop]
     paths:
       - "crates/**"
-      - "examples/**"
+      - "apps/**"
       - "tests/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -42,31 +42,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Default workspace lint: covers the library and the example with
+          # Default workspace lint: covers the library and the app with
           # its default feature set (viz).
           - name: workspace-default
             apt: ""
             command: cargo clippy --all-targets -- -D warnings
 
-          # Example with no default features — exercises the non-viz, non-rerun
+          # App with no default features — exercises the non-viz, non-rerun
           # build path. TUI deps are now unconditional, so this also verifies
-          # the example still compiles without the rerun integration.
-          - name: example-no-default
+          # the app still compiles without the rerun integration.
+          - name: app-no-default
             apt: ""
             command: >-
               cargo clippy
-              --manifest-path examples/orb_slam/Cargo.toml
+              --manifest-path apps/kornia-slam-app/Cargo.toml
               --no-default-features
               --all-targets
               -- -D warnings
 
-          # Example with the UVC source enabled. nokhwa's native Linux backend
+          # App with the UVC source enabled. nokhwa's native Linux backend
           # needs the V4L2 headers from libv4l-dev.
-          - name: example-uvc
+          - name: app-uvc
             apt: "libv4l-dev"
             command: >-
               cargo clippy
-              --manifest-path examples/orb_slam/Cargo.toml
+              --manifest-path apps/kornia-slam-app/Cargo.toml
               --features uvc
               --all-targets
               -- -D warnings

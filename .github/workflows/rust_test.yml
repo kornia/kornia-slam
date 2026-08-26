@@ -6,7 +6,7 @@ on:
     branches: [main, develop]
     paths:
       - "crates/**"
-      - "examples/**"
+      - "apps/**"
       - "tests/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -16,7 +16,7 @@ on:
     branches: [main, develop]
     paths:
       - "crates/**"
-      - "examples/**"
+      - "apps/**"
       - "tests/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -33,31 +33,31 @@ jobs:
       matrix:
         include:
           # Default workspace: runs the actual test suite and a CLI smoke run
-          # on the example with default features (viz + tui).
+          # on the app with default features (viz + tui).
           - name: workspace-default
             apt: ""
             test_cmd: cargo test --workspace
-            build_cmd: cargo run -p orb_slam -- --help
+            build_cmd: cargo run -p kornia-slam-app -- --help
 
-          # Example with no default features — just confirms the non-viz build
+          # App with no default features — just confirms the non-viz build
           # links and the CLI parses.
-          - name: example-no-default
+          - name: app-no-default
             apt: ""
             test_cmd: ""
             build_cmd: >-
               cargo run
-              --manifest-path examples/orb_slam/Cargo.toml
+              --manifest-path apps/kornia-slam-app/Cargo.toml
               --no-default-features
               -- --help
 
-          # Example with the UVC source — build only (the runner has no camera,
+          # App with the UVC source — build only (the runner has no camera,
           # so we can't actually open the device).
-          - name: example-uvc
+          - name: app-uvc
             apt: "libv4l-dev"
             test_cmd: ""
             build_cmd: >-
               cargo build
-              --manifest-path examples/orb_slam/Cargo.toml
+              --manifest-path apps/kornia-slam-app/Cargo.toml
               --features uvc
 
     steps:

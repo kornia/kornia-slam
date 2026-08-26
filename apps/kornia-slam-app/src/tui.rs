@@ -429,7 +429,7 @@ impl TuiApp {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(C_BORDER))
                 .title(Span::styled(
-                    " orb_slam ",
+                    " kornia-slam ",
                     Style::default().fg(C_TITLE).add_modifier(Modifier::BOLD),
                 )),
         )
