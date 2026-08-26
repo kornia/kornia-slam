@@ -1076,6 +1076,8 @@ fn vec3_f64_is_finite(value: Vec3F64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use kornia_3d::pgo::{PgoEdge, PgoParams};
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
@@ -1204,6 +1206,120 @@ mod tests {
             weight: 1.0,
         });
         (poses, edges)
+    }
+
+    fn scaling_edges(expected: &[Pose3d]) -> Vec<PgoEdge> {
+        let mut edges = (0..expected.len() - 1)
+            .map(|pose_a| PgoEdge {
+                pose_a,
+                pose_b: pose_a + 1,
+                t_ab_meas: pose_to_se3(&expected[pose_a + 1]).unwrap()
+                    * pose_to_se3(&expected[pose_a]).unwrap().inverse(),
+                weight: 1.0,
+            })
+            .collect::<Vec<_>>();
+        let last = expected.len() - 1;
+        for (pose_a, pose_b) in [
+            (0, last),
+            (expected.len() / 5, expected.len() * 4 / 5),
+            (expected.len() / 3, expected.len() * 2 / 3),
+            (expected.len() / 7, expected.len() * 6 / 7),
+        ] {
+            edges.push(PgoEdge {
+                pose_a,
+                pose_b,
+                t_ab_meas: pose_to_se3(&expected[pose_b]).unwrap()
+                    * pose_to_se3(&expected[pose_a]).unwrap().inverse(),
+                weight: 0.7,
+            });
+        }
+        edges
+    }
+
+    fn se3_scaling_graph(pose_count: usize) -> (Vec<Pose3d>, Vec<PgoEdge>) {
+        let expected = (0..pose_count)
+            .map(|index| {
+                let progress = index as f64 / (pose_count - 1) as f64;
+                let center = Vec3F64::new(
+                    index as f64 * 0.08,
+                    (index as f64 * 0.015).sin() * 0.5,
+                    (index as f64 * 0.011).cos() * 0.2,
+                );
+                let rotation = SO3F64::exp(Vec3F64::new(
+                    (index as f64 * 0.01).sin() * 0.08,
+                    (index as f64 * 0.013).cos() * -0.04,
+                    progress * 0.12,
+                ))
+                .matrix();
+                Pose3d::new(rotation, -(rotation * center))
+            })
+            .collect::<Vec<_>>();
+        let poses = expected
+            .iter()
+            .enumerate()
+            .map(|(index, pose)| {
+                let progress = index as f32 / (pose_count - 1) as f32;
+                Se3Manifold
+                    .retract(
+                        pose,
+                        &[
+                            0.15 * progress,
+                            -0.08 * progress,
+                            0.05 * progress,
+                            0.025 * progress,
+                            -0.018 * progress,
+                            0.035 * progress,
+                        ],
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let edges = scaling_edges(&expected);
+        (poses, edges)
+    }
+
+    fn gravity_scaling_graph(pose_count: usize) -> (Vec<Pose3d>, Vec<PgoEdge>, GravityManifold) {
+        let gravity_axis = Vec3F64::new(0.3, -0.8, 0.4).normalize();
+        let manifold = GravityManifold::new(gravity_axis).unwrap();
+        let base_rotation = SO3F64::exp(Vec3F64::new(0.2, -0.1, 0.15)).matrix();
+        let expected = (0..pose_count)
+            .map(|index| {
+                let progress = index as f64 / (pose_count - 1) as f64;
+                let center = Vec3F64::new(
+                    index as f64 * 0.08,
+                    (index as f64 * 0.017).sin() * 0.45,
+                    (index as f64 * 0.009).cos() * 0.25,
+                );
+                let yaw = (index as f64 * 0.012).sin() * 0.2 + progress * 0.1;
+                let rotation = base_rotation * SO3F64::exp(gravity_axis * yaw).matrix();
+                Pose3d::new(rotation, -(rotation * center))
+            })
+            .collect::<Vec<_>>();
+        let poses = expected
+            .iter()
+            .enumerate()
+            .map(|(index, pose)| {
+                let progress = index as f32 / (pose_count - 1) as f32;
+                manifold
+                    .retract(
+                        pose,
+                        &[
+                            0.12 * progress,
+                            -0.07 * progress,
+                            0.04 * progress,
+                            0.04 * progress,
+                        ],
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let edges = scaling_edges(&expected);
+        (poses, edges, manifold)
+    }
+
+    fn assert_fixed_pose_unchanged(actual: &Pose3d, expected: &Pose3d) {
+        assert_eq!(actual.rotation, expected.rotation);
+        assert_eq!(actual.translation, expected.translation);
     }
 
     #[test]
@@ -1605,6 +1721,73 @@ mod tests {
                 expected_gravity,
                 1e-8,
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "release-only sparse PGO scaling benchmark"]
+    fn sparse_pgo_scaling() {
+        // Long sparse chains can need more LM trials than the runtime default,
+        // while retaining the production convergence and damping tolerances.
+        let params = PgoParams {
+            max_iterations: 120,
+            ..PgoParams::default()
+        };
+        for pose_count in [100, 500, 1_000] {
+            let (poses, edges) = se3_scaling_graph(pose_count);
+            let initial_cost = normal_cost(&poses, &edges);
+            let fixed_pose = poses[0];
+            let start = Instant::now();
+            let result =
+                sparse_pose_graph_optimize(&poses, &edges, &[0], &params, &Se3Manifold).unwrap();
+            let elapsed = start.elapsed();
+            let final_cost = normal_cost(&result.poses, &edges);
+
+            println!(
+                "se3 keyframes={pose_count} edges={} iterations={} elapsed={elapsed:?} cost={initial_cost:.6e}->{final_cost:.6e}",
+                edges.len(),
+                result.iterations
+            );
+            assert!(initial_cost.is_finite());
+            assert!(final_cost.is_finite());
+            assert!(final_cost < initial_cost);
+            assert_eq!(result.poses.len(), poses.len());
+            assert_fixed_pose_unchanged(&result.poses[0], &fixed_pose);
+            assert!(result.converged);
+        }
+
+        for pose_count in [100, 500, 1_000] {
+            let (poses, edges, manifold) = gravity_scaling_graph(pose_count);
+            let initial_cost = normal_cost(&poses, &edges);
+            let fixed_pose = poses[0];
+            let gravity_in_cameras = poses
+                .iter()
+                .map(|pose| pose.rotation * manifold.gravity_axis)
+                .collect::<Vec<_>>();
+            let start = Instant::now();
+            let result =
+                sparse_pose_graph_optimize(&poses, &edges, &[0], &params, &manifold).unwrap();
+            let elapsed = start.elapsed();
+            let final_cost = normal_cost(&result.poses, &edges);
+
+            println!(
+                "gravity keyframes={pose_count} edges={} iterations={} elapsed={elapsed:?} cost={initial_cost:.6e}->{final_cost:.6e}",
+                edges.len(),
+                result.iterations
+            );
+            assert!(initial_cost.is_finite());
+            assert!(final_cost.is_finite());
+            assert!(final_cost < initial_cost);
+            assert_eq!(result.poses.len(), poses.len());
+            assert_fixed_pose_unchanged(&result.poses[0], &fixed_pose);
+            assert!(result.converged);
+            for (pose, expected_gravity) in result.poses.iter().zip(gravity_in_cameras) {
+                assert_vec3_near(
+                    pose.rotation * manifold.gravity_axis,
+                    expected_gravity,
+                    1e-8,
+                );
+            }
         }
     }
 }
