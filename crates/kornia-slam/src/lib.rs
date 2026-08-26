@@ -2,10 +2,10 @@
 
 pub mod estimation;
 pub mod frame;
-mod gravity_pgo;
 pub mod loop_closure;
 pub mod map;
 pub mod place_recognition;
+mod pose_conversion;
 mod sparse_pgo;
 pub mod stereo;
 pub mod system;

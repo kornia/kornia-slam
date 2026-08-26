@@ -8,13 +8,15 @@ use kornia_3d::pgo::pose_graph_optimize;
 use kornia_3d::pgo::{PgoEdge, PgoParams};
 use kornia_3d::pnp::{PnPMethod, RansacParams, solve_pnp_ransac};
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat3AF32, Mat3F64, SE3F32, SO3F32, Vec2F32, Vec3AF32, Vec3F64};
+use kornia_algebra::{Mat3AF32, Mat3F64, Vec2F32, Vec3AF32, Vec3F64};
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use thiserror::Error;
 
-use crate::gravity_pgo::gravity_pose_graph_optimize;
 use crate::map::Map;
-use crate::sparse_pgo::{Se3Manifold, sparse_pose_graph_optimize};
+use crate::pose_conversion::pose_to_se3;
+use crate::sparse_pgo::{
+    GravityManifold, Se3Manifold, sparse_pose_graph_optimize, weighted_relative_residual,
+};
 
 /// Acceptance thresholds for geometric loop verification.
 #[derive(Debug, Clone)]
@@ -278,6 +280,7 @@ pub struct PgoResult {
     pub keyframe_indices: Vec<usize>,
     pub original_poses: Vec<Pose3d>,
     pub optimized_poses: Vec<Pose3d>,
+    pub iterations: usize,
     pub usable: bool,
 }
 
@@ -690,22 +693,16 @@ pub fn optimize_pose_graph(
         gradient_tolerance: config.gradient_tolerance,
         initial_lambda: config.initial_lambda,
     };
-    let (optimized_poses, converged) = if let Some(context) = inertial {
-        let result = gravity_pose_graph_optimize(
-            &original_poses,
-            &edges,
-            &[0],
-            context.gravity_world,
-            &params,
-        )
-        .map_err(|error| PgoError::Solver(error.to_string()))?;
-        (result.poses, result.converged)
+    let result = if let Some(context) = inertial {
+        let manifold = GravityManifold::new(context.gravity_world)
+            .map_err(|error| PgoError::Solver(error.to_string()))?;
+        sparse_pose_graph_optimize(&original_poses, &edges, &[0], &params, &manifold)
+            .map_err(|error| PgoError::Solver(error.to_string()))?
     } else {
-        let result =
-            sparse_pose_graph_optimize(&original_poses, &edges, &[0], &params, &Se3Manifold)
-                .map_err(|error| PgoError::Solver(error.to_string()))?;
-        (result.poses, result.converged)
+        sparse_pose_graph_optimize(&original_poses, &edges, &[0], &params, &Se3Manifold)
+            .map_err(|error| PgoError::Solver(error.to_string()))?
     };
+    let optimized_poses = result.poses;
     let final_cost = pose_graph_cost(&optimized_poses, &edges);
     let new_loop_residual_after = weighted_edge_residual_norm(&optimized_poses, new_loop_edge)
         .ok_or(PgoError::MissingLoopKeyframe)?;
@@ -722,7 +719,7 @@ pub fn optimize_pose_graph(
     .all(f64::is_finite);
     let inertial_metrics_finite = max_gravity_alignment_error_rad.is_none_or(f64::is_finite);
     let gravity_preserved = max_gravity_alignment_error_rad.is_none_or(|error| error <= 1e-4);
-    let usable = converged
+    let usable = result.converged
         && metrics_finite
         && inertial_metrics_finite
         && gravity_preserved
@@ -733,6 +730,7 @@ pub fn optimize_pose_graph(
         keyframe_indices,
         original_poses,
         optimized_poses,
+        iterations: result.iterations,
         usable,
     })
 }
@@ -766,20 +764,18 @@ fn weighted_edge_residual_norm(poses: &[Pose3d], edge: &PgoEdge) -> Option<f64> 
 }
 
 fn weighted_edge_residual_squared(poses: &[Pose3d], edge: &PgoEdge) -> Option<f64> {
-    let pose_a = pose_to_se3(poses.get(edge.pose_a)?);
-    let pose_b = pose_to_se3(poses.get(edge.pose_b)?);
-    let error = edge.t_ab_meas.inverse() * (pose_b * pose_a.inverse());
-    let (translation, rotation) = error.log();
-    let weight = edge.weight as f64;
+    let residual = weighted_relative_residual(
+        poses.get(edge.pose_a)?,
+        poses.get(edge.pose_b)?,
+        &edge.t_ab_meas,
+        edge.weight,
+    )
+    .ok()?;
     Some(
-        weight
-            * weight
-            * (translation.x as f64 * translation.x as f64
-                + translation.y as f64 * translation.y as f64
-                + translation.z as f64 * translation.z as f64
-                + rotation.x as f64 * rotation.x as f64
-                + rotation.y as f64 * rotation.y as f64
-                + rotation.z as f64 * rotation.z as f64),
+        residual
+            .into_iter()
+            .map(|value| f64::from(value) * f64::from(value))
+            .sum(),
     )
 }
 
@@ -814,15 +810,6 @@ fn pnp_pose(pose: &kornia_3d::pnp::PnPResult) -> Pose3d {
         ),
         vec3_f64(pose.translation),
     )
-}
-
-fn pose_to_se3(pose: &Pose3d) -> SE3F32 {
-    let rotation = Mat3AF32::from_cols(
-        vec3_f32(pose.rotation.col(0).into()),
-        vec3_f32(pose.rotation.col(1).into()),
-        vec3_f32(pose.rotation.col(2).into()),
-    );
-    SE3F32::new(SO3F32::from_matrix(&rotation), vec3_f32(pose.translation))
 }
 
 fn vec3_f32(value: Vec3F64) -> Vec3AF32 {
@@ -1333,6 +1320,7 @@ mod tests {
         };
         let result = optimize_pose_graph(&map, &[verified], &PgoConfig::default(), None).unwrap();
         assert_eq!(result.optimized_poses[0], result.original_poses[0]);
+        assert!(result.iterations > 0);
         assert!(result.usable);
         let before = result.original_poses[4].inverse().translation.length();
         let after = result.optimized_poses[4].inverse().translation.length();
@@ -1375,6 +1363,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.optimized_poses[0], result.original_poses[0]);
+        assert!(result.iterations > 0);
         assert!(result.usable);
         assert!(
             max_gravity_alignment_error(&result.original_poses, &result.optimized_poses, gravity,)

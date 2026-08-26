@@ -39,8 +39,10 @@
 
 use faer::Mat;
 use faer::prelude::Solve;
-use kornia_algebra::{Mat3AF32, Mat3F64, SE3F32, SO3F32, SO3F64, Vec3AF32, Vec3F64};
+use kornia_algebra::{Mat3F64, SE3F32, SO3F64, Vec3AF32, Vec3F64};
 use thiserror::Error;
+
+use crate::pose_conversion::{pose_to_se3, se3_to_pose};
 
 use kornia_3d::ba::{BaError, BaObservation};
 use kornia_3d::camera::PinholeCamera;
@@ -194,51 +196,9 @@ pub struct ViBaResult {
     pub final_cost: f64,
 }
 
-// ── f32 ↔ f64 pose conversion + reprojection residual/Jacobian ────────────
+// ── Reprojection residual/Jacobian ────────────────────────────────────────
 // Reprojection factor algebra shared with kornia_3d's visual-only BA; kept
 // here in f32 for the Schur assembly below.
-
-fn pose_to_se3(pose: &Pose3d) -> SE3F32 {
-    let r = Mat3AF32::from_cols(
-        Vec3AF32::new(
-            pose.rotation.col(0).x as f32,
-            pose.rotation.col(0).y as f32,
-            pose.rotation.col(0).z as f32,
-        ),
-        Vec3AF32::new(
-            pose.rotation.col(1).x as f32,
-            pose.rotation.col(1).y as f32,
-            pose.rotation.col(1).z as f32,
-        ),
-        Vec3AF32::new(
-            pose.rotation.col(2).x as f32,
-            pose.rotation.col(2).y as f32,
-            pose.rotation.col(2).z as f32,
-        ),
-    );
-    let so3 = SO3F32::from_matrix(&r);
-    SE3F32::new(
-        so3,
-        Vec3AF32::new(
-            pose.translation.x as f32,
-            pose.translation.y as f32,
-            pose.translation.z as f32,
-        ),
-    )
-}
-
-fn se3_to_pose(se3: &SE3F32) -> Pose3d {
-    let r = se3.r.matrix();
-    let t = se3.t;
-    Pose3d::new(
-        Mat3F64::from_cols(
-            Vec3F64::new(r.col(0).x as f64, r.col(0).y as f64, r.col(0).z as f64),
-            Vec3F64::new(r.col(1).x as f64, r.col(1).y as f64, r.col(1).z as f64),
-            Vec3F64::new(r.col(2).x as f64, r.col(2).y as f64, r.col(2).z as f64),
-        ),
-        Vec3F64::new(t.x as f64, t.y as f64, t.z as f64),
-    )
-}
 
 /// Computes (residual, J_pose 2×6, J_point 2×3) at the current state, matching
 /// `kornia_3d::ba::ReprojFactor`. Jacobian layout (row-major flat):

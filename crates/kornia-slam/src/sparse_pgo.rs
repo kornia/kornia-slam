@@ -6,8 +6,12 @@ use faer::sparse::{SparseColMat, Triplet};
 use faer::{Mat, Side};
 use kornia_3d::pgo::{PgoEdge, PgoParams};
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat3AF32, Mat3F64, SE3F32, SO3F32, SO3F64, Vec3AF32, Vec3F64};
+use kornia_algebra::{SE3F32, SO3F64, Vec3F64};
 use thiserror::Error;
+
+use crate::pose_conversion::{
+    pose_to_se3 as convert_pose_to_se3, se3_to_pose as convert_se3_to_pose,
+};
 
 const RESIDUAL_DIM: usize = 6;
 
@@ -24,13 +28,12 @@ pub(crate) trait PoseManifold<const DOF: usize> {
 
 pub(crate) struct SparsePgoResult {
     pub poses: Vec<Pose3d>,
-    #[allow(dead_code)]
     pub iterations: usize,
     pub converged: bool,
 }
 
 struct NormalSystem<const DOF: usize> {
-    pose_to_block: Vec<Option<usize>>,
+    block_count: usize,
     blocks: BTreeMap<(usize, usize), Vec<f32>>,
     gradient: Vec<f32>,
 }
@@ -42,23 +45,13 @@ struct SparseSolveCache {
 }
 
 impl<const DOF: usize> NormalSystem<DOF> {
-    fn scalar_dim(&self) -> Result<usize, SparsePgoError> {
+    fn validate(&self) -> Result<(), SparsePgoError> {
         if DOF == 0 {
             return Err(SparsePgoError::InvalidInput(
                 "pose manifold must have at least one degree of freedom".into(),
             ));
         }
-        let block_count = self.pose_to_block.iter().flatten().count();
-        let mut seen_blocks = vec![false; block_count];
-        for &block in self.pose_to_block.iter().flatten() {
-            if block >= block_count || seen_blocks[block] {
-                return Err(SparsePgoError::InvalidInput(
-                    "pose-to-block map must contain contiguous unique indices".into(),
-                ));
-            }
-            seen_blocks[block] = true;
-        }
-        let scalar_dim = block_count.checked_mul(DOF).ok_or_else(|| {
+        let scalar_dim = self.block_count.checked_mul(DOF).ok_or_else(|| {
             SparsePgoError::InvalidInput("normal-system dimension overflow".into())
         })?;
         let block_len = DOF.checked_mul(DOF).ok_or_else(|| {
@@ -75,9 +68,14 @@ impl<const DOF: usize> NormalSystem<DOF> {
             ));
         }
         for (&(block_row, block_col), block) in &self.blocks {
-            if block_row >= block_count || block_col >= block_count {
+            if block_row >= self.block_count || block_col >= self.block_count {
                 return Err(SparsePgoError::InvalidInput(
                     "normal-system block index is out of range".into(),
+                ));
+            }
+            if block_row < block_col {
+                return Err(SparsePgoError::InvalidInput(
+                    "normal-system blocks must use lower-triangular coordinates".into(),
                 ));
             }
             if block.len() != block_len {
@@ -91,7 +89,7 @@ impl<const DOF: usize> NormalSystem<DOF> {
                 ));
             }
         }
-        Ok(scalar_dim)
+        Ok(())
     }
 
     #[cfg(test)]
@@ -105,7 +103,7 @@ impl<const DOF: usize> NormalSystem<DOF> {
         cache: &mut Option<SparseSolveCache>,
         #[cfg(test)] test_hooks: &mut SparsePgoTestHooks,
     ) -> Result<Vec<f32>, SparsePgoError> {
-        let scalar_dim = self.scalar_dim()?;
+        let scalar_dim = self.gradient.len();
         validate_damping(damping)?;
         if scalar_dim == 0 {
             return Err(SparsePgoError::InvalidInput(
@@ -172,41 +170,34 @@ impl<const DOF: usize> NormalSystem<DOF> {
         &self,
         damping: f32,
     ) -> Result<Vec<Triplet<usize, usize, f32>>, SparsePgoError> {
-        let scalar_dim = self.scalar_dim()?;
         validate_damping(damping)?;
-        let mut entries = BTreeMap::new();
+        let mut entries = Vec::with_capacity(self.blocks.len() * DOF * DOF);
         for (&(block_row, block_col), block) in &self.blocks {
-            if block_row < block_col {
-                continue;
-            }
             for local_row in 0..DOF {
                 for local_col in 0..DOF {
                     let row = block_row * DOF + local_row;
                     let col = block_col * DOF + local_col;
                     if row >= col {
-                        entries.insert((row, col), block[local_row * DOF + local_col]);
+                        let mut value = block[local_row * DOF + local_col];
+                        if row == col {
+                            value += damping;
+                        }
+                        if !value.is_finite() {
+                            return Err(SparsePgoError::InvalidInput(
+                                "damped Hessian must be finite".into(),
+                            ));
+                        }
+                        entries.push(Triplet::new(row, col, value));
                     }
                 }
             }
         }
-        for diagonal in 0..scalar_dim {
-            let value = entries.entry((diagonal, diagonal)).or_insert(0.0);
-            *value += damping;
-            if !value.is_finite() {
-                return Err(SparsePgoError::InvalidInput(
-                    "damped Hessian must be finite".into(),
-                ));
-            }
-        }
-        Ok(entries
-            .into_iter()
-            .map(|((row, col), val)| Triplet::new(row, col, val))
-            .collect())
+        Ok(entries)
     }
 
     #[cfg(test)]
     fn solve_damped_dense(&self, damping: f32) -> Result<Vec<f32>, SparsePgoError> {
-        let scalar_dim = self.scalar_dim()?;
+        let scalar_dim = self.gradient.len();
         validate_damping(damping)?;
         if scalar_dim == 0 {
             return Err(SparsePgoError::InvalidInput(
@@ -217,8 +208,13 @@ impl<const DOF: usize> NormalSystem<DOF> {
         for (&(block_row, block_col), block) in &self.blocks {
             for local_row in 0..DOF {
                 for local_col in 0..DOF {
-                    matrix[block_row * DOF + local_row][block_col * DOF + local_col] =
-                        block[local_row * DOF + local_col] as f64;
+                    let row = block_row * DOF + local_row;
+                    let col = block_col * DOF + local_col;
+                    if row >= col {
+                        let value = block[local_row * DOF + local_col] as f64;
+                        matrix[row][col] = value;
+                        matrix[col][row] = value;
+                    }
                 }
             }
         }
@@ -323,58 +319,14 @@ impl PoseManifold<4> for GravityManifold {
 
 pub(crate) fn pose_to_se3(pose: &Pose3d) -> Result<SE3F32, SparsePgoError> {
     validate_pose(pose)?;
-    let rotation = Mat3AF32::from_cols(
-        Vec3AF32::new(
-            pose.rotation.col(0).x as f32,
-            pose.rotation.col(0).y as f32,
-            pose.rotation.col(0).z as f32,
-        ),
-        Vec3AF32::new(
-            pose.rotation.col(1).x as f32,
-            pose.rotation.col(1).y as f32,
-            pose.rotation.col(1).z as f32,
-        ),
-        Vec3AF32::new(
-            pose.rotation.col(2).x as f32,
-            pose.rotation.col(2).y as f32,
-            pose.rotation.col(2).z as f32,
-        ),
-    );
-    let se3 = SE3F32::new(
-        SO3F32::from_matrix(&rotation),
-        Vec3AF32::new(
-            pose.translation.x as f32,
-            pose.translation.y as f32,
-            pose.translation.z as f32,
-        ),
-    );
+    let se3 = convert_pose_to_se3(pose);
     validate_se3(&se3)?;
     Ok(se3)
 }
 
 pub(crate) fn se3_to_pose(se3: &SE3F32) -> Result<Pose3d, SparsePgoError> {
     validate_se3(se3)?;
-    let rotation = se3.r.matrix();
-    let pose = Pose3d::new(
-        Mat3F64::from_cols(
-            Vec3F64::new(
-                rotation.col(0).x as f64,
-                rotation.col(0).y as f64,
-                rotation.col(0).z as f64,
-            ),
-            Vec3F64::new(
-                rotation.col(1).x as f64,
-                rotation.col(1).y as f64,
-                rotation.col(1).z as f64,
-            ),
-            Vec3F64::new(
-                rotation.col(2).x as f64,
-                rotation.col(2).y as f64,
-                rotation.col(2).z as f64,
-            ),
-        ),
-        Vec3F64::new(se3.t.x as f64, se3.t.y as f64, se3.t.z as f64),
-    );
+    let pose = convert_se3_to_pose(se3);
     validate_pose(&pose)?;
     Ok(pose)
 }
@@ -868,7 +820,7 @@ fn build_normal_system_with_mapping<const DOF: usize>(
         .checked_mul(DOF)
         .ok_or_else(|| SparsePgoError::InvalidInput("normal-system dimension overflow".into()))?;
     let mut normal = NormalSystem {
-        pose_to_block: pose_to_block.to_vec(),
+        block_count,
         blocks: BTreeMap::new(),
         gradient: vec![0.0; scalar_dim],
     };
@@ -883,28 +835,24 @@ fn build_normal_system_with_mapping<const DOF: usize>(
             &edge.t_ab_meas,
             edge.weight,
         )?;
-        let jacobian_a = normal.pose_to_block[edge.pose_a]
+        let jacobian_a = pose_to_block[edge.pose_a]
             .map(|_| edge_endpoint_jacobian(poses, edge, EdgeEndpoint::A, manifold))
             .transpose()?;
-        let jacobian_b = normal.pose_to_block[edge.pose_b]
+        let jacobian_b = pose_to_block[edge.pose_b]
             .map(|_| edge_endpoint_jacobian(poses, edge, EdgeEndpoint::B, manifold))
             .transpose()?;
 
-        if let (Some(block), Some(jacobian)) =
-            (normal.pose_to_block[edge.pose_a], jacobian_a.as_ref())
-        {
+        if let (Some(block), Some(jacobian)) = (pose_to_block[edge.pose_a], jacobian_a.as_ref()) {
             accumulate_gradient::<DOF>(&mut normal.gradient, block, jacobian, &residual)?;
             accumulate_hessian::<DOF>(&mut normal.blocks, block, block, jacobian, jacobian)?;
         }
-        if let (Some(block), Some(jacobian)) =
-            (normal.pose_to_block[edge.pose_b], jacobian_b.as_ref())
-        {
+        if let (Some(block), Some(jacobian)) = (pose_to_block[edge.pose_b], jacobian_b.as_ref()) {
             accumulate_gradient::<DOF>(&mut normal.gradient, block, jacobian, &residual)?;
             accumulate_hessian::<DOF>(&mut normal.blocks, block, block, jacobian, jacobian)?;
         }
         if let (Some(block_a), Some(block_b), Some(jacobian_a), Some(jacobian_b)) = (
-            normal.pose_to_block[edge.pose_a],
-            normal.pose_to_block[edge.pose_b],
+            pose_to_block[edge.pose_a],
+            pose_to_block[edge.pose_b],
             jacobian_a.as_ref(),
             jacobian_b.as_ref(),
         ) {
@@ -915,16 +863,9 @@ fn build_normal_system_with_mapping<const DOF: usize>(
                 jacobian_a,
                 jacobian_b,
             )?;
-            accumulate_hessian::<DOF>(
-                &mut normal.blocks,
-                block_b,
-                block_a,
-                jacobian_b,
-                jacobian_a,
-            )?;
         }
     }
-    normal.scalar_dim()?;
+    normal.validate()?;
     Ok(normal)
 }
 
@@ -1009,17 +950,21 @@ fn accumulate_gradient<const DOF: usize>(
     Ok(())
 }
 
-fn accumulate_hessian<const DOF: usize>(
+fn accumulate_hessian<'a, const DOF: usize>(
     blocks: &mut BTreeMap<(usize, usize), Vec<f32>>,
-    block_row: usize,
-    block_col: usize,
-    jacobian_row: &[f32],
-    jacobian_col: &[f32],
+    mut block_row: usize,
+    mut block_col: usize,
+    mut jacobian_row: &'a [f32],
+    mut jacobian_col: &'a [f32],
 ) -> Result<(), SparsePgoError> {
     if jacobian_row.len() != RESIDUAL_DIM * DOF || jacobian_col.len() != RESIDUAL_DIM * DOF {
         return Err(SparsePgoError::InvalidInput(
             "Jacobian has an invalid dimension".into(),
         ));
+    }
+    if block_row < block_col {
+        std::mem::swap(&mut block_row, &mut block_col);
+        std::mem::swap(&mut jacobian_row, &mut jacobian_col);
     }
     let block = blocks
         .entry((block_row, block_col))
@@ -1424,7 +1369,10 @@ mod tests {
     }
 
     #[test]
-    fn gravity_retraction_preserves_gravity_in_camera_coordinates() {
+    fn gravity_manifold_validates_axis_and_preserves_gravity_in_camera_coordinates() {
+        assert!(GravityManifold::new(Vec3F64::ZERO).is_err());
+        assert!(GravityManifold::new(Vec3F64::new(f64::NAN, 0.0, 0.0)).is_err());
+
         let gravity_axis = Vec3F64::new(0.3, -0.8, 0.4).normalize();
         let rotation = SO3F64::exp(Vec3F64::new(0.2, -0.1, 0.3)).matrix();
         let center = Vec3F64::new(1.0, -2.0, 0.5);
@@ -1465,11 +1413,11 @@ mod tests {
 
         let normal = build_normal_system(&poses, &edges, &[0], &Se3Manifold).unwrap();
 
-        assert_eq!(normal.pose_to_block, vec![None, Some(0), Some(1), None]);
+        assert_eq!(normal.block_count, 2);
         assert_eq!(normal.gradient.len(), 12);
         assert_eq!(
             normal.blocks.keys().copied().collect::<Vec<_>>(),
-            vec![(0, 0), (0, 1), (1, 0), (1, 1)]
+            vec![(0, 0), (1, 0), (1, 1)]
         );
         assert!(normal.blocks.values().all(|block| block.len() == 36));
     }
@@ -1523,17 +1471,12 @@ mod tests {
     }
 
     #[test]
-    fn gravity_normal_blocks_are_symmetric_and_gradient_matches_cost_change() {
+    fn gravity_normal_blocks_are_lower_triangular_and_gradient_matches_cost_change() {
         let (poses, edges, manifold) = rotated_gravity_chain();
         let normal = build_normal_system(&poses, &edges, &[0], &manifold).unwrap();
-        let h_ab = &normal.blocks[&(0, 1)];
-        let h_ba = &normal.blocks[&(1, 0)];
-
-        for row in 0..4 {
-            for col in 0..4 {
-                assert_near(h_ab[row * 4 + col] as f64, h_ba[col * 4 + row] as f64, 1e-6);
-            }
-        }
+        assert!(normal.blocks.keys().all(|&(row, col)| row >= col));
+        assert!(normal.blocks.contains_key(&(1, 0)));
+        assert!(!normal.blocks.contains_key(&(0, 1)));
 
         let epsilon = 1e-3;
         let mut delta_plus = [0.0; 4];

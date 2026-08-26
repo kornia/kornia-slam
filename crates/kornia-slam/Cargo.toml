@@ -14,6 +14,6 @@ kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", branch = "main" 
 kornia-bow = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
 kornia-sensors = { path = "../kornia-sensors" }
 # Sparse LLT for pose-graph optimization and dense Cholesky for the reduced
-# camera system in Schur-complement BA (see sparse_pgo.rs / vi_ba_schur.rs / ba_schur.rs).
+# camera system in visual-inertial Schur-complement BA.
 faer = "0.22"
 thiserror = "1"
