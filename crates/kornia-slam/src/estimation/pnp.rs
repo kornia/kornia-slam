@@ -218,6 +218,7 @@ pub fn solve_pnp_with_diagnostics(
 
         if round + 1 < rounds {
             let pose = unnormalize(&lm.rotation, lm.translation);
+            let before = active.len();
             active.retain(|&i| {
                 let original_index = prior_inlier_indices[i];
                 camera
@@ -229,6 +230,15 @@ pub fn solve_pnp_with_diagnostics(
                     )
                     .is_some_and(|error_sq| error_sq <= final_threshold_sq)
             });
+            // Rounds are stateless — every one starts from the same prior with the filtered
+            // set — so an unchanged active set makes every remaining round an identical
+            // re-solve of the identical input. Measured on a live Orin loop: the filter
+            // removes nothing on the vast majority of frames, so this early-exit is a
+            // straight multi-x cut of tracking-path PnP with a bitwise-identical result.
+            if active.len() == before {
+                last_lm = Some(lm);
+                break;
+            }
         }
         last_lm = Some(lm);
     }
