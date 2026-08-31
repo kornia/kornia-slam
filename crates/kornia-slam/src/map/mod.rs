@@ -371,6 +371,35 @@ pub enum PoseGraphCorrectionError {
     MissingReferenceKeyframe,
 }
 
+/// Policy for [`Map::cull_redundant_keyframes`].
+///
+/// Keyframes are otherwise APPEND-ONLY, so a long session grows the map without bound: every
+/// local-map build, covisibility walk and BA gather scales with it, and each keyframe carries
+/// its descriptors + per-keypoint vectors (tens of KB). A live rig tracking successfully for
+/// hours therefore slows down and grows until it is unusable — dropping the whole map on
+/// tracking loss is not a bound, because a session that never loses tracking never drops it.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyframeCullConfig {
+    /// A point is "well observed" when at least this many OTHER keyframes see it
+    /// (ORB-SLAM3 uses 3).
+    pub min_observations: usize,
+    /// Cull the keyframe when at least this fraction of its points are well observed.
+    pub redundant_fraction: f64,
+    /// Never cull the newest N keyframes: they are the active local window, and their
+    /// points have not had time to accumulate observations yet.
+    pub protect_recent: usize,
+}
+
+impl Default for KeyframeCullConfig {
+    fn default() -> Self {
+        Self {
+            min_observations: 3,
+            redundant_fraction: 0.9,
+            protect_recent: 20,
+        }
+    }
+}
+
 /// In-memory map storage for keyframes and persistent map points.
 #[derive(Debug, Clone, Default)]
 pub struct Map {
@@ -830,6 +859,125 @@ impl Map {
     }
 
     /// Returns the keyframe with frame index `idx`, if present.
+    /// Drops keyframes whose observations are redundant, returning how many were removed.
+    ///
+    /// ORB-SLAM3's `LocalMapping::KeyFrameCulling`: a keyframe is redundant when
+    /// [`KeyframeCullConfig::redundant_fraction`] of the map points it sees are already seen
+    /// by [`min_observations`](KeyframeCullConfig::min_observations) OTHER keyframes — the
+    /// map keeps the structure and loses only the duplicate viewpoint.
+    ///
+    /// Removal is PHYSICAL, not a `culled` flag like [`MapPoint`], for two reasons: the
+    /// memory is the point (a keyframe owns its descriptors and per-keypoint vectors), and
+    /// keyframes are addressed by `frame.idx` rather than by position, so nothing downstream
+    /// holds an index that shifts. What must be repaired is the map points' bookkeeping:
+    /// every removed keyframe is dropped from `observation_kf_indices` (and its parallel
+    /// descriptor), and a point ANCHORED to a removed keyframe is re-anchored to a surviving
+    /// observer — or culled if it has none left, since `keyframe_idx` must always resolve
+    /// (the covisibility builder asserts exactly that).
+    ///
+    /// Two keyframes are never removed regardless of redundancy: the FIRST (it anchors the
+    /// map's gauge) and any keyframe referenced by an IMU factor (removing one would break
+    /// the preintegration chain, whose factors are keyed on consecutive keyframe indices).
+    pub fn cull_redundant_keyframes(&mut self, config: &KeyframeCullConfig) -> usize {
+        if self.keyframes.len() <= config.protect_recent + 1 {
+            return 0;
+        }
+        // Keyframes pinned by the IMU chain: an ImuFactor is defined between a specific pair,
+        // and there is no way to re-integrate across a hole here.
+        let mut pinned: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for f in &self.imu_factors {
+            pinned.insert(f.prev_kf_idx);
+            pinned.insert(f.curr_kf_idx);
+        }
+
+        let last_protected = self.keyframes.len() - config.protect_recent;
+        let mut doomed: Vec<usize> = Vec::new();
+        for (pos, kf) in self.keyframes.iter().enumerate() {
+            // Skip the gauge anchor and the active window.
+            if pos == 0 || pos >= last_protected || pinned.contains(&kf.frame.idx) {
+                continue;
+            }
+            let (mut seen, mut redundant) = (0usize, 0usize);
+            for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
+                let Some(mp) = self.map_points.get(*mp_idx) else {
+                    continue;
+                };
+                if mp.culled {
+                    continue;
+                }
+                seen += 1;
+                // "Other" observers: this keyframe's own observation does not count toward
+                // the point surviving without it.
+                let others = mp
+                    .observation_kf_indices
+                    .iter()
+                    .filter(|i| **i != kf.frame.idx)
+                    .count();
+                if others >= config.min_observations {
+                    redundant += 1;
+                }
+            }
+            // A keyframe observing nothing live is pure overhead — its structure is already
+            // gone, so it is redundant by definition rather than by ratio.
+            let is_redundant = if seen == 0 {
+                true
+            } else {
+                redundant as f64 >= config.redundant_fraction * seen as f64
+            };
+            if is_redundant {
+                doomed.push(kf.frame.idx);
+            }
+        }
+        if doomed.is_empty() {
+            return 0;
+        }
+        let doomed_set: std::collections::HashSet<usize> = doomed.iter().copied().collect();
+
+        // Repair the points BEFORE dropping the keyframes, so an anchor is only ever moved to
+        // a keyframe that is still there.
+        for mp in &mut self.map_points {
+            if mp.culled {
+                continue;
+            }
+            if mp
+                .observation_kf_indices
+                .iter()
+                .any(|i| doomed_set.contains(i))
+            {
+                let mut kept_desc = Vec::with_capacity(mp.observation_kf_indices.len());
+                let mut kept_kf = Vec::with_capacity(mp.observation_kf_indices.len());
+                for (i, kf_idx) in mp.observation_kf_indices.iter().enumerate() {
+                    if doomed_set.contains(kf_idx) {
+                        continue;
+                    }
+                    kept_kf.push(*kf_idx);
+                    if let Some(d) = mp.observed_descriptors.get(i) {
+                        kept_desc.push(*d);
+                    }
+                }
+                mp.observation_kf_indices = kept_kf;
+                mp.observed_descriptors = kept_desc;
+            }
+            if doomed_set.contains(&mp.keyframe_idx) {
+                match mp.observation_kf_indices.first() {
+                    // Re-anchor: the octave belonged to the old reference keyframe, but the
+                    // scale bounds it drives are recomputed from observations anyway.
+                    Some(first) => mp.keyframe_idx = *first,
+                    // No observer left: the point cannot be projected or re-matched, and its
+                    // anchor would dangle. Cull it logically, like any other dead point.
+                    None => mp.mark_culled(),
+                }
+            }
+        }
+        let before = self.keyframes.len();
+        self.keyframes
+            .retain(|kf| !doomed_set.contains(&kf.frame.idx));
+        // Reclaim the descriptor/keypoint storage rather than leaving it in the Vec's spare
+        // capacity — recovering the memory is half the reason this exists.
+        self.keyframes.shrink_to_fit();
+        before - self.keyframes.len()
+    }
+
     pub fn get_keyframe(&self, idx: usize) -> Option<&Keyframe> {
         self.keyframes.iter().find(|kf| kf.frame.idx == idx)
     }
@@ -1788,6 +1936,112 @@ mod tests {
             depth: Vec::new(),
             keypoints_undist: Vec::new(),
         }
+    }
+
+    /// Builds a map of `n_kf` keyframes that all observe one shared point, so every
+    /// middle keyframe is redundant by ORB-SLAM3's rule.
+    fn map_with_shared_point(n_kf: usize) -> Map {
+        let mut map = Map::new();
+        let mut mp = MapPoint::new(
+            Vec3F64::new(0.0, 0.0, 5.0),
+            [7u8; 32],
+            0,
+            [0; 3],
+            0, // anchored to keyframe 0
+        );
+        for idx in 1..n_kf {
+            mp.observation_kf_indices.push(idx);
+            mp.observed_descriptors.push([7u8; 32]);
+        }
+        let mp_idx = map.push_map_point(mp);
+        for idx in 0..n_kf {
+            let mut kf = Keyframe::from_frame(test_frame(idx, vec![[7u8; 32]]));
+            kf.associate_map_point(0, mp_idx);
+            map.upsert_keyframe(kf);
+        }
+        map
+    }
+
+    #[test]
+    fn culling_keeps_the_gauge_anchor_and_the_recent_window() {
+        let mut map = map_with_shared_point(30);
+        let cfg = KeyframeCullConfig {
+            protect_recent: 20,
+            ..Default::default()
+        };
+        let removed = map.cull_redundant_keyframes(&cfg);
+
+        // 30 keyframes: #0 is the gauge anchor and the last 20 are the active window, so only
+        // the 9 in between may go.
+        assert_eq!(removed, 9, "expected the unprotected middle to be culled");
+        assert_eq!(map.keyframes().len(), 21);
+        assert_eq!(map.keyframes()[0].frame.idx, 0, "gauge anchor survives");
+        assert_eq!(map.keyframes().last().unwrap().frame.idx, 29);
+    }
+
+    /// The invariant the covisibility builder asserts: every live point's `keyframe_idx`
+    /// resolves. A point anchored to a CULLED keyframe must be re-anchored, never left
+    /// dangling.
+    #[test]
+    fn culling_re_anchors_points_off_removed_keyframes() {
+        let mut map = map_with_shared_point(30);
+        // Anchor the point to a keyframe that is about to be culled (one of the middle ones).
+        map.map_points_mut()[0].keyframe_idx = 5;
+
+        let cfg = KeyframeCullConfig {
+            protect_recent: 20,
+            ..Default::default()
+        };
+        assert!(map.cull_redundant_keyframes(&cfg) > 0);
+
+        let mp = &map.map_points()[0];
+        assert!(!mp.culled, "the point still has observers, so it must survive");
+        assert!(
+            map.get_keyframe(mp.keyframe_idx).is_some(),
+            "anchor {} dangles after culling",
+            mp.keyframe_idx
+        );
+        for kf_idx in &mp.observation_kf_indices {
+            assert!(
+                map.get_keyframe(*kf_idx).is_some(),
+                "observation {kf_idx} refers to a removed keyframe"
+            );
+        }
+        assert_eq!(
+            mp.observation_kf_indices.len(),
+            mp.observed_descriptors.len(),
+            "descriptors must stay parallel to observations"
+        );
+    }
+
+    #[test]
+    fn culling_spares_keyframes_pinned_by_imu_factors() {
+        let mut map = map_with_shared_point(30);
+        let pim = kornia_sensors::imu::PreintegratedImu::new(
+            ImuBias::default(),
+            kornia_sensors::imu::ImuCalib {
+                gyro_noise: 1e-3,
+                accel_noise: 1e-2,
+                gyro_bias_noise: 1e-5,
+                accel_bias_noise: 1e-4,
+            },
+        );
+        map.add_imu_factor(5, 6, pim, Vec::new(), 0.0, 0.1);
+        let cfg = KeyframeCullConfig {
+            protect_recent: 20,
+            ..Default::default()
+        };
+        map.cull_redundant_keyframes(&cfg);
+        // Removing either end of a preintegration interval would break the chain.
+        assert!(map.get_keyframe(5).is_some(), "IMU-pinned keyframe removed");
+        assert!(map.get_keyframe(6).is_some(), "IMU-pinned keyframe removed");
+    }
+
+    #[test]
+    fn culling_is_a_no_op_on_a_short_map() {
+        let mut map = map_with_shared_point(5);
+        assert_eq!(map.cull_redundant_keyframes(&KeyframeCullConfig::default()), 0);
+        assert_eq!(map.keyframes().len(), 5);
     }
 
     #[test]
