@@ -12,6 +12,9 @@ pub mod stereo;
 pub mod system;
 pub mod vi_ba_schur;
 
+#[cfg(feature = "apriltag")]
+pub mod apriltag_anchor;
+
 pub use estimation::MapProjectionEstimator;
 pub use frame::Frame;
 pub use kornia_imgproc::features::OrbFeatures;

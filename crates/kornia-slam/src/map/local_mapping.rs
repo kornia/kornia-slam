@@ -131,6 +131,29 @@ impl LocalMapping {
             LocalMappingBackend::Asynchronous { handle, .. } => handle.drain_results(),
         }
     }
+
+    /// Waits for the local-mapping worker to finish any in-flight merge and
+    /// returns the drained result notifications.
+    ///
+    /// The worker holds the publication gate for the whole duration of a merge,
+    /// so acquiring it here guarantees that no keyframe/map-point mutation is
+    /// in progress when this returns. Consumers that read the map for a global
+    /// post-hoc transform (e.g. the AprilTag anchor) must call this first so
+    /// they observe a self-consistent map. It is a no-op in synchronous mode.
+    pub fn flush(&self) -> Vec<LocalBaMergeResult> {
+        let LocalMappingBackend::Asynchronous {
+            publication_gate, ..
+        } = &self.backend
+        else {
+            return Vec::new();
+        };
+        // Blocks until any in-flight merge releases the gate; the merge is the
+        // only place results are published, so the channel is quiescent after.
+        let _publication = publication_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.drain_results()
+    }
 }
 
 #[derive(Default)]

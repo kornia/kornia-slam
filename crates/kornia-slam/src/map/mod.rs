@@ -37,8 +37,8 @@ use kornia_3d::ba_schur::bundle_adjust_schur;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::ransac::RobustKernelKind;
-use kornia_algebra::SO3F64;
 use kornia_algebra::Vec3F64;
+use kornia_algebra::{Mat3F64, SO3F64};
 use kornia_image::ImageSize;
 use kornia_imgproc::features::hamming_distance;
 use kornia_sensors::imu::{ImuBias, ImuMeasurement, PreintegratedImu};
@@ -744,6 +744,27 @@ impl Map {
         for mp in self.map_points_mut() {
             if !mp.culled {
                 mp.position = *r * mp.position;
+            }
+        }
+    }
+
+    /// Applies a full similarity transform X' = s·R·X + t to all keyframe
+    /// camera centers/orientations and map points. Single world_epoch bump.
+    pub fn apply_world_sim3(&mut self, scale: f64, rotation: &Mat3F64, translation: Vec3F64) {
+        self.world_epoch = self.world_epoch.wrapping_add(1);
+
+        for kf in self.keyframes_mut() {
+            let cam_to_world = kf.frame.pose_world_to_cam.inverse();
+            let new_translation = scale * (*rotation * cam_to_world.translation) + translation;
+            let rot_so3 = SO3F64::from_matrix(&cam_to_world.rotation);
+            let new_rot_so3 = SO3F64::from_matrix(rotation) * rot_so3;
+            kf.frame.pose_world_to_cam =
+                Pose3d::from_rt(new_rot_so3.matrix(), new_translation).inverse();
+        }
+
+        for mp in self.map_points_mut() {
+            if !mp.culled {
+                mp.position = scale * (*rotation * mp.position) + translation;
             }
         }
     }
@@ -2381,5 +2402,129 @@ mod tests {
         assert!((n.y - expected.y).abs() < 1e-9);
         assert!((n.z - expected.z).abs() < 1e-9);
         assert!(n.length() <= 1.0 + 1e-12);
+    }
+
+    fn rotation_from_axis_angle(axis: Vec3F64, angle: f64) -> Mat3F64 {
+        let len = axis.length();
+        let (nx, ny, nz) = (axis.x / len, axis.y / len, axis.z / len);
+        let (c, s, ti) = (angle.cos(), angle.sin(), 1.0 - angle.cos());
+
+        let col0 = Vec3F64::new(
+            ti * nx * nx + c,
+            ti * nx * ny + s * nz,
+            ti * nx * nz - s * ny,
+        );
+        let col1 = Vec3F64::new(
+            ti * nx * ny - s * nz,
+            ti * ny * ny + c,
+            ti * ny * nz + s * nx,
+        );
+        let col2 = Vec3F64::new(
+            ti * nx * nz + s * ny,
+            ti * ny * nz - s * nx,
+            ti * nz * nz + c,
+        );
+        Mat3F64::from_cols(col0, col1, col2)
+    }
+
+    fn mat3_frobenius_diff(a: &Mat3F64, b: &Mat3F64) -> f64 {
+        let d = *a - *b;
+        let cols = [d.x_axis, d.y_axis, d.z_axis];
+        cols.iter()
+            .map(|c| c.x * c.x + c.y * c.y + c.z * c.z)
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    #[test]
+    fn apply_world_sim3_transforms_map_and_is_identity_idempotent() {
+        let scale = 1.7;
+        let r = rotation_from_axis_angle(Vec3F64::new(0.3, 1.0, 0.5), 0.9);
+        let t = Vec3F64::new(2.0, -1.5, 0.25);
+
+        // Cam-to-world pose data for three keyframes.
+        let centers = [
+            Vec3F64::new(0.0, 0.0, 0.0),
+            Vec3F64::new(1.0, 2.0, 3.0),
+            Vec3F64::new(-4.0, 0.5, 2.0),
+        ];
+        let rots = [
+            Mat3F64::IDENTITY,
+            rotation_from_axis_angle(Vec3F64::new(1.0, 0.0, 0.0), 0.3),
+            rotation_from_axis_angle(Vec3F64::new(0.0, 1.0, 0.0), -2.1),
+        ];
+
+        let mut map = Map::new();
+        for (i, (c, rk)) in centers.iter().zip(rots.iter()).enumerate() {
+            let cam_to_world = Pose3d::from_rt(*rk, *c);
+            map.upsert_keyframe(Keyframe::from_frame(test_frame_with_pose(
+                i,
+                Vec::new(),
+                cam_to_world.inverse(),
+            )));
+        }
+
+        let pts = [
+            Vec3F64::new(0.5, 0.0, 4.0),
+            Vec3F64::new(-3.0, 2.0, 1.0),
+            Vec3F64::new(8.0, -5.0, 0.5),
+        ];
+        let mut mp_indices = Vec::new();
+        for p in pts {
+            mp_indices.push(map.push_map_point(MapPoint::new(p, [0u8; 32], 0, [0; 3], 0)));
+        }
+        let culled_idx = map.push_map_point(MapPoint::new(
+            Vec3F64::new(9.0, 9.0, 9.0),
+            [0u8; 32],
+            0,
+            [0; 3],
+            0,
+        ));
+        map.map_points_mut()[culled_idx].mark_culled();
+        let culled_pos_before = map.map_points()[culled_idx].position;
+
+        let epoch_before = map.world_epoch;
+        map.apply_world_sim3(scale, &r, t);
+        assert_eq!(map.world_epoch, epoch_before.wrapping_add(1));
+
+        // Keyframes: camera centers and rotations follow X' = sRX + t.
+        for (i, (c, rk)) in centers.iter().zip(rots.iter()).enumerate() {
+            let new_c2w = map.keyframes()[i].frame.pose_world_to_cam.inverse();
+            let expected_t = scale * (r * *c) + t;
+            assert!(
+                (new_c2w.translation - expected_t).length() < 1e-9,
+                "kf {i} center error too large"
+            );
+            let expected_r = r * *rk;
+            assert!(
+                mat3_frobenius_diff(&new_c2w.rotation, &expected_r) < 1e-9,
+                "kf {i} rotation error too large"
+            );
+        }
+
+        // Map points transform exactly; culled points are untouched.
+        for (mp_idx, p) in mp_indices.iter().zip(pts.iter()) {
+            let pos = map.map_points()[*mp_idx].position;
+            let expected = scale * (r * *p) + t;
+            assert!(
+                (pos - expected).length() < 1e-12,
+                "map point {mp_idx} error too large"
+            );
+        }
+        assert_eq!(map.map_points()[culled_idx].position, culled_pos_before);
+
+        // Composing the identity similarity must be a no-op.
+        map.apply_world_sim3(1.0, &Mat3F64::IDENTITY, Vec3F64::ZERO);
+        assert_eq!(map.world_epoch, epoch_before.wrapping_add(2));
+        for (i, (c, rk)) in centers.iter().zip(rots.iter()).enumerate() {
+            let new_c2w = map.keyframes()[i].frame.pose_world_to_cam.inverse();
+            assert!((new_c2w.translation - (scale * (r * *c) + t)).length() < 1e-9);
+            assert!(mat3_frobenius_diff(&new_c2w.rotation, &(r * *rk)) < 1e-9);
+        }
+        for (mp_idx, p) in mp_indices.iter().zip(pts.iter()) {
+            let pos = map.map_points()[*mp_idx].position;
+            let expected = scale * (r * *p) + t;
+            assert!((pos - expected).length() < 1e-12);
+        }
     }
 }

@@ -21,6 +21,11 @@ pub struct PipelineConfig {
     pub debug: bool,
     /// Optional verified loop closure and live pose-graph correction.
     pub pgo: Option<PgoPipelineConfig>,
+    /// Optional AprilTag metric anchor: observes a known physical tag in
+    /// keyframes and applies one post-hoc Sim3 correction (see
+    /// [`SlamPipeline::apply_apriltag_anchor`](super::SlamPipeline)).
+    #[cfg(feature = "apriltag")]
+    pub apriltag: Option<crate::apriltag_anchor::AprilTagAnchorConfig>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -49,6 +54,8 @@ impl Default for PipelineConfig {
             stereo_close_depth_m: None,
             debug: false,
             pgo: None,
+            #[cfg(feature = "apriltag")]
+            apriltag: None,
         }
     }
 }

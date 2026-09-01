@@ -11,9 +11,13 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::Frame;
+#[cfg(feature = "apriltag")]
+use crate::apriltag_anchor::{AprilTagAnchor, AprilTagAnchorError};
 use crate::estimation::optical_flow::{
     FlowSurvivor, KltTracker, MapKeypointMatch, TrackSet, snap_unique,
 };
+#[cfg(feature = "apriltag")]
+use crate::estimation::sim3::Sim3Alignment;
 use crate::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use crate::estimation::{ImuInitConfig, ImuInitializer, MapProjectionEstimator};
 use crate::loop_closure::{
@@ -100,6 +104,10 @@ pub struct SlamPipeline {
     verified_loops: Vec<VerifiedLoopEdge>,
     verified_loop_pairs: HashSet<(usize, usize)>,
     loop_closure_events: Vec<LoopClosureEvent>,
+    // Optional AprilTag metric anchor: observes the tag in keyframes and can
+    // apply one post-hoc Sim3 world correction.
+    #[cfg(feature = "apriltag")]
+    apriltag_anchor: Option<AprilTagAnchor>,
     // System state
     state: SystemState,
 }
@@ -178,6 +186,8 @@ impl SlamPipeline {
             verified_loops: Vec::new(),
             verified_loop_pairs: HashSet::new(),
             loop_closure_events: Vec::new(),
+            #[cfg(feature = "apriltag")]
+            apriltag_anchor: config.apriltag.map(AprilTagAnchor::new),
         }
     }
 
@@ -219,7 +229,7 @@ impl SlamPipeline {
         self.pending_imu.extend(imu_samples);
 
         match self.state.mode {
-            SystemMode::Bootstrap => self.bootstrap_step(frame, timestamp_sec),
+            SystemMode::Bootstrap => self.bootstrap_step(frame, current_image, timestamp_sec),
             SystemMode::ImuInit => {
                 self.inertial_init_step(frame, previous_image, current_image, timestamp_sec)
             }
@@ -229,11 +239,68 @@ impl SlamPipeline {
         }
     }
 
+    /// Feeds one keyframe image to the AprilTag anchor (no-op unless configured).
+    #[cfg(feature = "apriltag")]
+    fn observe_tag_on_keyframe(&mut self, kf_idx: usize, image: &Image<u8, 1>) {
+        if self.apriltag_anchor.is_none() {
+            return;
+        }
+        if let Some(anchor) = self.apriltag_anchor.as_mut() {
+            anchor.on_keyframe(kf_idx, image, &self.camera);
+        }
+    }
+
+    /// Solves the AprilTag anchor Sim3 from the keyframe observations gathered
+    /// during the run and applies it once to the whole map: keyframe camera
+    /// centers/orientations and map points are transformed into the metric tag
+    /// frame (`X' = s·R·X + t`).
+    ///
+    /// Purely post-hoc: no tracking, mapping, or loop-closure behavior is
+    /// affected before this call. On success the observation set is cleared,
+    /// so a second call fails with
+    /// [`AprilTagAnchorError::InsufficientObservations`] instead of re-applying
+    /// a second correction.
+    #[cfg(feature = "apriltag")]
+    pub fn apply_apriltag_anchor(&mut self) -> Result<Sim3Alignment, AprilTagAnchorError> {
+        let Some(anchor) = self.apriltag_anchor.as_ref() else {
+            return Err(AprilTagAnchorError::AnchorNotConfigured);
+        };
+        // Ensure no async local-BA merge is in flight before reading the map;
+        // then resolve the stored tag observations against each keyframe's
+        // *final* pose so the Sim3 solve sees a self-consistent map regardless
+        // of when each keyframe was observed.
+        self.local_mapping.flush();
+        let alignment = {
+            let map = self.map.lock().unwrap();
+            anchor.solve(|kf_idx| {
+                map.get_keyframe(kf_idx)
+                    .map(|kf| kf.frame.pose_world_to_cam)
+            })?
+        };
+        let config = anchor.config().clone();
+        self.map.lock().unwrap().apply_world_sim3(
+            alignment.scale,
+            &alignment.rotation,
+            alignment.translation,
+        );
+        self.apriltag_anchor = Some(AprilTagAnchor::new(config));
+        Ok(alignment)
+    }
+
     /// Runs `f` against the live map points, holding the map lock only for the
     /// duration of the call. Avoids cloning the whole point list (descriptors
     /// included) for read-only consumers such as viz logging and summaries.
     pub fn with_map_points<R>(&self, f: impl FnOnce(&[MapPoint]) -> R) -> R {
         f(self.map.lock().unwrap().map_points())
+    }
+
+    /// Counts the tag detections accumulated for the AprilTag anchor
+    /// (total observations and distinct keyframes observed).
+    #[cfg(feature = "apriltag")]
+    pub fn apriltag_anchor_stats(&self) -> Option<(usize, usize)> {
+        self.apriltag_anchor
+            .as_ref()
+            .map(|a| (a.num_observations(), a.num_distinct_keyframes()))
     }
 
     /// Returns the index of the current reference keyframe, if tracking has one.
@@ -297,18 +364,30 @@ impl SlamPipeline {
         }
     }
 
-    fn bootstrap_step(&mut self, curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
+    #[cfg_attr(not(feature = "apriltag"), allow(unused_variables))]
+    fn bootstrap_step(
+        &mut self,
+        curr_frame: Frame,
+        current_image: &Image<u8, 1>,
+        timestamp_sec: f64,
+    ) -> TrackingResult {
         // Stereo frames carry metric per-keypoint depth, so we can build a
         // metric map from a single keyframe (ORB-SLAM3's StereoInitialization)
         // instead of waiting for two-view parallax.
         if curr_frame.is_stereo() {
-            return self.bootstrap_stereo(curr_frame, timestamp_sec);
+            return self.bootstrap_stereo(curr_frame, current_image, timestamp_sec);
         }
-        self.bootstrap_mono(curr_frame, timestamp_sec)
+        self.bootstrap_mono(curr_frame, current_image, timestamp_sec)
     }
 
     /// Single-frame metric initialization from stereo depth.
-    fn bootstrap_stereo(&mut self, mut curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
+    #[cfg_attr(not(feature = "apriltag"), allow(unused_variables))]
+    fn bootstrap_stereo(
+        &mut self,
+        mut curr_frame: Frame,
+        current_image: &Image<u8, 1>,
+        timestamp_sec: f64,
+    ) -> TrackingResult {
         // Build the new map in the current odometry frame (identity at start,
         // or the recovery pose after a tracking loss).
         curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
@@ -351,6 +430,8 @@ impl SlamPipeline {
             .unwrap()
             .add_triangulated_points(None, &mut keyframe, &points);
         self.map.lock().unwrap().upsert_keyframe(keyframe);
+        #[cfg(feature = "apriltag")]
+        self.observe_tag_on_keyframe(curr_idx, current_image);
 
         self.dbg(format!(
             "[bootstrap_stereo] frame={curr_idx} metric map created with {added} points",
@@ -417,7 +498,13 @@ impl SlamPipeline {
             .add_triangulated_points(None, curr_kf, &points)
     }
 
-    fn bootstrap_mono(&mut self, mut curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
+    #[cfg_attr(not(feature = "apriltag"), allow(unused_variables))]
+    fn bootstrap_mono(
+        &mut self,
+        mut curr_frame: Frame,
+        current_image: &Image<u8, 1>,
+        timestamp_sec: f64,
+    ) -> TrackingResult {
         // Stamp frames with current odometry pose so bootstrap builds
         // the new map in the existing coordinate frame.
         curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
@@ -530,6 +617,10 @@ impl SlamPipeline {
         if let Some(kf) = self.map.lock().unwrap().get_keyframe(curr_idx) {
             self.state.pose_world_to_cam = kf.frame.pose_world_to_cam;
         }
+        // Read the post-BA keyframe pose so the tag observation lands in the
+        // refined frame.
+        #[cfg(feature = "apriltag")]
+        self.observe_tag_on_keyframe(curr_idx, current_image);
 
         if let Some(prev_ts) = self.bootstrap_timestamp_sec {
             let (preint, raw_samples) = self.preintegrate_window(prev_ts, timestamp_sec);
@@ -1007,7 +1098,13 @@ impl SlamPipeline {
                 map_guard.update_observation_counts(&visible, &matches);
             }
 
-            if self.try_insert_keyframe(&frame, timestamp_sec, tracked_inliers, &matches) {
+            if self.try_insert_keyframe(
+                &frame,
+                current_image,
+                timestamp_sec,
+                tracked_inliers,
+                &matches,
+            ) {
                 status = TrackingStatus::KeyframeAccepted;
             }
         }
@@ -1034,7 +1131,7 @@ impl SlamPipeline {
                 ));
                 self.track_set = TrackSet::new();
                 self.state.reset();
-                return self.bootstrap_step(frame, timestamp_sec);
+                return self.bootstrap_step(frame, current_image, timestamp_sec);
             }
         } else {
             self.state.lost_since_sec = None;
@@ -1051,9 +1148,11 @@ impl SlamPipeline {
         }
     }
 
+    #[cfg_attr(not(feature = "apriltag"), allow(unused_variables))]
     fn try_insert_keyframe(
         &mut self,
         frame: &Frame,
+        current_image: &Image<u8, 1>,
         timestamp_sec: f64,
         tracked_inliers: usize,
         matches: &[(usize, usize)],
@@ -1164,6 +1263,8 @@ impl SlamPipeline {
         ));
 
         self.map.lock().unwrap().upsert_keyframe(curr_kf);
+        #[cfg(feature = "apriltag")]
+        self.observe_tag_on_keyframe(frame.idx, current_image);
         if let (Some(prev_kf_idx), Some(prev_ts)) = (
             self.state.last_keyframe_idx,
             self.last_keyframe_timestamp_sec,

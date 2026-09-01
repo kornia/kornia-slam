@@ -13,8 +13,12 @@ kornia-algebra = { git = "https://github.com/kornia/kornia-rs", branch = "main" 
 kornia-image = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
 kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
 kornia-bow = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
+kornia-apriltag = { git = "https://github.com/kornia/kornia-rs", branch = "main", optional = true }
 kornia-sensors = { path = "../kornia-sensors" }
 # Sparse LLT for pose-graph optimization and dense Cholesky for the reduced
 # camera system in visual-inertial Schur-complement BA.
 faer = "0.22"
 thiserror = "1"
+
+[features]
+apriltag = ["dep:kornia-apriltag"]

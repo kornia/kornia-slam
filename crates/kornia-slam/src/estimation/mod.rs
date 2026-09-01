@@ -5,6 +5,7 @@ pub mod inertial_init_factor;
 pub mod map_projection;
 pub mod optical_flow;
 pub mod pnp;
+pub mod sim3;
 pub mod two_view;
 
 use kornia_3d::pose::Pose3d;
