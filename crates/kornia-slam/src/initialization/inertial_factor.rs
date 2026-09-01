@@ -1,7 +1,6 @@
 //! `Factor` adapter wiring `PreintegratedImu` into `kornia_algebra::optim`'s
 //! generic Levenberg-Marquardt solver, for the ORB-SLAM3-style joint
-//! inertial-initialization optimization (`Optimizer::InertialOptimization`,
-//! `docs/imu_init_guide.md`).
+//! inertial-initialization optimization (`Optimizer::InertialOptimization`).
 //!
 //! Variable order for every edge added via `Problem::add_factor` MUST be
 //! `[v_i, v_j, bg, ba, gdir, scale]` — this matches `variable_local_dim`
@@ -94,6 +93,7 @@ impl InertialInitFactor {
     }
 
     /// See `ScaleRefinement` doc on `fixed_bias_vel`.
+    #[allow(dead_code)]
     pub fn with_fixed_bias_vel(mut self, fixed: bool) -> Self {
         self.fixed_bias_vel = fixed;
         self
@@ -148,7 +148,7 @@ impl Factor for InertialInitFactor {
 
         // Gravity: g = Rwg · gI, ORB-SLAM3's own internal convention gI=(0,0,-G).
         // Converted to kornia's +Y convention only once, at the very end in
-        // `apply_initialization` — never mix conventions mid-solve.
+        // the system's initialization application — never mix conventions mid-solve.
         let rwg = SO3F64::from_array(gdir_arr).matrix();
         let g_i = Vec3F64::new(0.0, 0.0, -GRAVITY_MAGNITUDE);
         let g = rwg * g_i;

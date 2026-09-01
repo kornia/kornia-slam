@@ -11,8 +11,9 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::Frame;
-use crate::initialization::two_view::{TwoViewInitConfig, try_initialize_two_view};
-use crate::initialization::{ImuInitConfig, ImuInitializer};
+use crate::initialization::{
+    ImuInitConfig, ImuInitResult, ImuInitializer, TwoViewInitConfig, try_initialize_two_view,
+};
 use crate::loop_closure::{
     InertialPgoContext, LoopEpisodeDecision, LoopEpisodeTracker, VerifiedLoopEdge,
     fuse_verified_loop, optimize_pose_graph, verify_loop_candidate,
@@ -31,7 +32,7 @@ use crate::tracking::{
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
-use kornia_algebra::{Mat3F64, Vec2F64, Vec3F64};
+use kornia_algebra::{Mat3F64, QuatF64, SO3F64, Vec2F64, Vec3F64};
 use kornia_image::Image;
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
@@ -119,8 +120,126 @@ pub enum LoopClosureEvent {
     },
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ImuInitApplyError {
+    #[error("invalid initialization scale {0}")]
+    InvalidScale(f64),
+    #[error("initialization gravity vector is zero or non-finite")]
+    InvalidGravity,
+    #[error("initialization contains no keyframe velocities")]
+    MissingVelocities,
+    #[error("initialization contains duplicate velocity for keyframe {0}")]
+    DuplicateKeyframe(usize),
+    #[error("initialization references missing keyframe {0}")]
+    MissingKeyframe(usize),
+    #[error("initialization velocity for keyframe {0} is non-finite")]
+    InvalidVelocity(usize),
+    #[error("initialization bias is non-finite")]
+    InvalidBias,
+}
+
+/// Rotation that takes unit vector `from` to unit vector `to`.
+fn rotation_from_to(from: Vec3F64, to: Vec3F64) -> SO3F64 {
+    let from = from.normalize();
+    let to = to.normalize();
+    let dot = from.dot(to).clamp(-1.0, 1.0);
+    let cross = from.cross(to);
+
+    if dot < -1.0 + 1e-9 {
+        let perpendicular = if from.x.abs() < 0.9 {
+            Vec3F64::new(1.0, 0.0, 0.0)
+        } else {
+            Vec3F64::new(0.0, 1.0, 0.0)
+        };
+        let axis = from.cross(perpendicular).normalize();
+        return SO3F64::from_quaternion(QuatF64::from_array([axis.x, axis.y, axis.z, 0.0]));
+    }
+
+    let w = ((1.0 + dot) / 2.0).sqrt();
+    let s = 1.0 / (2.0 * w);
+    SO3F64::from_quaternion(QuatF64::from_array([
+        cross.x * s,
+        cross.y * s,
+        cross.z * s,
+        w,
+    ]))
+}
+
+/// Atomically validates and applies an inertial initialization result.
+///
+/// Velocity assignments carry keyframe identities, so map insertion order cannot
+/// silently attach an optimizer result to the wrong keyframe.
+pub(crate) fn apply_inertial_initialization(
+    map: &mut Map,
+    state: &mut SystemState,
+    imu_bias: &mut ImuBias,
+    gravity_world: &mut Vec3F64,
+    init: ImuInitResult,
+) -> Result<(), ImuInitApplyError> {
+    if !init.scale.is_finite() || init.scale <= 0.0 {
+        return Err(ImuInitApplyError::InvalidScale(init.scale));
+    }
+    let gravity_norm = init.gravity_world.length();
+    if !gravity_norm.is_finite() || gravity_norm <= 1e-9 {
+        return Err(ImuInitApplyError::InvalidGravity);
+    }
+    if init.keyframe_velocities.is_empty() {
+        return Err(ImuInitApplyError::MissingVelocities);
+    }
+    if !init.bias.gyro.length().is_finite() || !init.bias.accel.length().is_finite() {
+        return Err(ImuInitApplyError::InvalidBias);
+    }
+
+    let mut seen = HashSet::with_capacity(init.keyframe_velocities.len());
+    for assignment in &init.keyframe_velocities {
+        if !seen.insert(assignment.keyframe_idx) {
+            return Err(ImuInitApplyError::DuplicateKeyframe(
+                assignment.keyframe_idx,
+            ));
+        }
+        if map.get_keyframe(assignment.keyframe_idx).is_none() {
+            return Err(ImuInitApplyError::MissingKeyframe(assignment.keyframe_idx));
+        }
+        if !assignment.velocity_world.length().is_finite() {
+            return Err(ImuInitApplyError::InvalidVelocity(assignment.keyframe_idx));
+        }
+    }
+
+    let last_keyframe_idx = init
+        .keyframe_velocities
+        .iter()
+        .map(|assignment| assignment.keyframe_idx)
+        .max()
+        .expect("velocity list was checked above");
+    let alignment = rotation_from_to(
+        init.gravity_world / gravity_norm,
+        Vec3F64::new(0.0, 1.0, 0.0),
+    );
+
+    map.scale_world(init.scale);
+    map.rotate_world(&alignment);
+    for assignment in init.keyframe_velocities {
+        let keyframe = map
+            .get_keyframe_mut(assignment.keyframe_idx)
+            .expect("keyframe existence was checked before mutating the map");
+        keyframe.velocity_world = alignment * assignment.velocity_world;
+        keyframe.imu_bias = init.bias;
+    }
+
+    let last_keyframe = map
+        .get_keyframe(last_keyframe_idx)
+        .expect("last keyframe existence was checked before mutating the map");
+    state.velocity_world = last_keyframe.velocity_world;
+    state.pose_world_to_cam = last_keyframe.frame.pose_world_to_cam;
+    state.velocity = None;
+    state.imu_initialized = true;
+    *gravity_world = Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0);
+    *imu_bias = init.bias;
+    Ok(())
+}
+
 impl SlamSystem {
-    /// Creates a new pipeline with identity pose.
+    /// Creates a new SLAM system with identity pose.
     pub fn new(camera: PinholeCamera, config: SlamConfig) -> Self {
         let map = Arc::new(Mutex::new(Map::new()));
         let local_mapping =
@@ -180,6 +299,20 @@ impl SlamSystem {
             verified_loop_pairs: HashSet::new(),
             loop_closure_events: Vec::new(),
         }
+    }
+
+    fn apply_inertial_initialization(
+        &mut self,
+        init: ImuInitResult,
+    ) -> Result<(), ImuInitApplyError> {
+        let map = Arc::clone(&self.map);
+        apply_inertial_initialization(
+            &mut map.lock().unwrap(),
+            &mut self.state,
+            &mut self.imu_bias,
+            &mut self.gravity_world,
+            init,
+        )
     }
 
     /// Enables appearance-based loop detection with a bag-of-words vocabulary.
@@ -258,7 +391,7 @@ impl SlamSystem {
         std::mem::take(&mut self.debug_messages)
     }
 
-    /// Toggle whether the pipeline buffers per-frame debug messages.
+    /// Toggle whether the system buffers per-frame debug messages.
     pub fn set_debug(&mut self, on: bool) {
         self.debug = on;
         if !on {
@@ -468,7 +601,7 @@ impl SlamSystem {
         let two_view_estimate = match result {
             Err(reason) => {
                 self.dbg(format!(
-                    "[bootstrap] frame={} (ref={}) reject: {:?}",
+                    "[bootstrap] frame={} (ref={}) reject: {}",
                     curr_frame.idx, prev_bootstrap_frame.idx, reason,
                 ));
                 self.state.bootstrap_frame = Some(prev_bootstrap_frame);
@@ -485,10 +618,10 @@ impl SlamSystem {
             curr_frame.idx,
             two_view_estimate.model_kind,
             two_view_estimate.points3d.len(),
-            two_view_estimate.estimate.inliers,
+            two_view_estimate.inliers,
         ));
 
-        let estimated_pose = two_view_estimate.estimate.pose;
+        let estimated_pose = two_view_estimate.pose;
         let prev_pose_world_to_cam = curr_frame.pose_world_to_cam;
         self.state.pose_world_to_cam = estimated_pose;
         curr_frame.pose_world_to_cam = estimated_pose;
@@ -502,7 +635,7 @@ impl SlamSystem {
         self.build_initial_map(
             reference_kf,
             current_kf,
-            &two_view_estimate.estimate.matches,
+            &two_view_estimate.matches,
             &two_view_estimate.points3d,
             &two_view_estimate.inlier_indices,
             two_view_estimate.median_depth,
@@ -792,18 +925,14 @@ impl SlamSystem {
                 false,
             );
             match init_result {
-                Some(init) => {
+                Ok(init) => {
                     let scale = init.scale;
                     let gravity = init.gravity_world;
                     let bg = init.bias.gyro;
-                    self.inertial_init.apply_initialization(
-                        &mut self.map.lock().unwrap(),
-                        &mut self.state,
-                        &mut self.imu_bias,
-                        &mut self.gravity_world,
-                        init,
-                        start_idx,
-                    );
+                    if let Err(error) = self.apply_inertial_initialization(init) {
+                        self.dbg(format!("[imu_init] VIBA0 apply rejected: {error}"));
+                        return result;
+                    }
                     // Mirrors ORB-SLAM3: IMU is marked initialized (and
                     // tracking resumes) immediately after VIBA0 succeeds —
                     // VIBA1/VIBA2 refine bg/ba/scale/gravity further in the
@@ -825,8 +954,8 @@ impl SlamSystem {
                         gravity.x, gravity.y, gravity.z, bg.x, bg.y, bg.z
                     ));
                 }
-                None => {
-                    self.dbg("[imu_init] VIBA0 rejected: solve failed or invalid scale".into());
+                Err(error) => {
+                    self.dbg(format!("[imu_init] VIBA0 rejected: {error}"));
                 }
             }
         }
@@ -1217,7 +1346,7 @@ impl SlamSystem {
         true
     }
 
-    /// Kept at VIBA2 because this pipeline lacks the intervening pose-adjusting
+    /// Kept at VIBA2 because this system lacks the intervening pose-adjusting
     /// inertial BA that lets ORB-SLAM3 safely remove the prior (kornia-slam#51).
     const VIBA_PRIOR_A: f64 = 1e5;
 
@@ -1258,26 +1387,21 @@ impl SlamSystem {
             true,
         );
         match init_result {
-            Some(init) => {
+            Ok(init) => {
                 let scale = init.scale;
                 let bg = init.bias.gyro;
-                self.inertial_init.apply_initialization(
-                    &mut self.map.lock().unwrap(),
-                    &mut self.state,
-                    &mut self.imu_bias,
-                    &mut self.gravity_world,
-                    init,
-                    start_idx,
-                );
-                self.dbg(format!(
-                    "[imu_init] {stage} accepted: scale_correction={scale:.4} gyro_bias=({:.4},{:.4},{:.4})",
-                    bg.x, bg.y, bg.z
-                ));
+                match self.apply_inertial_initialization(init) {
+                    Ok(()) => self.dbg(format!(
+                        "[imu_init] {stage} accepted: scale_correction={scale:.4} gyro_bias=({:.4},{:.4},{:.4})",
+                        bg.x, bg.y, bg.z
+                    )),
+                    Err(error) => {
+                        self.dbg(format!("[imu_init] {stage} apply rejected: {error}"));
+                    }
+                }
             }
-            None => {
-                self.dbg(format!(
-                    "[imu_init] {stage} rejected: solve failed or invalid scale"
-                ));
+            Err(error) => {
+                self.dbg(format!("[imu_init] {stage} rejected: {error}"));
             }
         }
 
@@ -1941,12 +2065,19 @@ fn pose_graph_reference_correction(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_reference_pose_correction, carry_klt_survivors, format_imu_init_gate,
-        pose_graph_reference_correction, pose_graph_tracking_correction,
+        apply_inertial_initialization, apply_reference_pose_correction, carry_klt_survivors,
+        format_imu_init_gate, pose_graph_reference_correction, pose_graph_tracking_correction,
     };
+    use crate::Frame;
+    use crate::initialization::{ImuInitResult, KeyframeVelocity};
+    use crate::map::{Keyframe, Map};
+    use crate::tracking::SystemState;
     use crate::tracking::optical_flow::{FlowSurvivor, MapKeypointMatch, TrackSet};
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::{SO3F64, Vec3F64};
+    use kornia_image::ImageSize;
+    use kornia_imgproc::features::OrbFeatures;
+    use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias};
 
     fn assert_pose_close(actual: Pose3d, expected: Pose3d) {
         assert!((actual.translation - expected.translation).length() < 1e-10);
@@ -1958,6 +2089,61 @@ mod tests {
         {
             assert!((actual - expected).abs() < 1e-10);
         }
+    }
+
+    fn empty_keyframe(idx: usize) -> Keyframe {
+        Keyframe::from_frame(Frame {
+            idx,
+            features: OrbFeatures {
+                keypoints_xy: Vec::new(),
+                orientations: Vec::new(),
+                descriptors: Vec::new(),
+                octaves: Vec::new(),
+            },
+            pose_world_to_cam: Pose3d::IDENTITY,
+            image_size: ImageSize {
+                width: 640,
+                height: 480,
+            },
+            keypoint_colors: Vec::new(),
+            u_right: Vec::new(),
+            depth: Vec::new(),
+            keypoints_undist: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn inertial_initialization_assigns_velocities_by_keyframe_id() {
+        let mut map = Map::new();
+        map.upsert_keyframe(empty_keyframe(20));
+        map.upsert_keyframe(empty_keyframe(10));
+        let velocity_10 = Vec3F64::new(1.0, 2.0, 3.0);
+        let velocity_20 = Vec3F64::new(4.0, 5.0, 6.0);
+        let result = ImuInitResult {
+            scale: 1.0,
+            gravity_world: Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0),
+            keyframe_velocities: vec![
+                KeyframeVelocity {
+                    keyframe_idx: 10,
+                    velocity_world: velocity_10,
+                },
+                KeyframeVelocity {
+                    keyframe_idx: 20,
+                    velocity_world: velocity_20,
+                },
+            ],
+            bias: ImuBias::default(),
+        };
+        let mut state = SystemState::new();
+        let mut bias = ImuBias::default();
+        let mut gravity = Vec3F64::ZERO;
+
+        apply_inertial_initialization(&mut map, &mut state, &mut bias, &mut gravity, result)
+            .expect("valid initialization should apply");
+
+        assert!((map.get_keyframe(10).unwrap().velocity_world - velocity_10).length() < 1e-12);
+        assert!((map.get_keyframe(20).unwrap().velocity_world - velocity_20).length() < 1e-12);
+        assert!((state.velocity_world - velocity_20).length() < 1e-12);
     }
 
     #[test]

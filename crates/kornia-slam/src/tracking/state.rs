@@ -25,7 +25,7 @@ pub struct TrackingResult {
     pub status: TrackingStatus,
 }
 
-/// Mutable pipeline state carried across frames.
+/// Mutable system state carried across frames.
 #[derive(Debug, Clone)]
 pub struct SystemState {
     pub pose_world_to_cam: Pose3d,

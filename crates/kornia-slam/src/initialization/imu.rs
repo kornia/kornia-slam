@@ -6,7 +6,6 @@ use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias};
 
 use crate::initialization::inertial_factor::{InertialInitFactor, KfConst, WeightedZeroPrior};
 use crate::map::{Keyframe, Map};
-use crate::tracking::SystemState;
 use kornia_algebra::optim::{LevenbergMarquardt, Problem, Variable, VariableType};
 // ─────────────────────────────────────────────────────────────────────────────
 // Small numeric helpers
@@ -67,12 +66,67 @@ pub struct ImuInitConfig {
     pub min_motion: f64,
 }
 
+impl ImuInitConfig {
+    fn validate(&self) -> Result<(), ImuInitReject> {
+        if self.min_keyframes < 2 {
+            return Err(ImuInitReject::InvalidConfig(
+                "min_keyframes must be at least 2".into(),
+            ));
+        }
+        for (name, value) in [
+            ("min_time_sec", self.min_time_sec),
+            ("min_motion", self.min_motion),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(ImuInitReject::InvalidConfig(format!(
+                    "{name} must be finite and non-negative"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeyframeVelocity {
+    pub keyframe_idx: usize,
+    pub velocity_world: Vec3F64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ImuInitResult {
     pub scale: f64,
     pub gravity_world: Vec3F64,
-    pub velocities_world: Vec<Vec3F64>,
+    pub keyframe_velocities: Vec<KeyframeVelocity>,
     pub bias: ImuBias,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ImuInitReject {
+    #[error("invalid IMU initialization configuration: {0}")]
+    InvalidConfig(String),
+    #[error("camera-to-body IMU extrinsics are missing")]
+    MissingExtrinsics,
+    #[error("not enough keyframes: found {found}, need at least {required}")]
+    InsufficientKeyframes { found: usize, required: usize },
+    #[error("no usable IMU factors connect the initialization window")]
+    NoUsableFactors,
+    #[error("inertial optimizer failed: {0}")]
+    OptimizerFailed(String),
+    #[error("invalid estimated scale {0}")]
+    InvalidScale(f64),
+    #[error("estimated IMU bias is non-finite")]
+    NonFiniteBias,
+    #[error("estimated accelerometer bias norm {actual:.3} exceeds {maximum:.3} m/s^2")]
+    ImplausibleAccelBias { actual: f64, maximum: f64 },
+}
+
+struct InertialSolution {
+    rwg: Mat3F64,
+    scale: f64,
+    gyro_bias: Vec3F64,
+    accel_bias: Vec3F64,
+    velocities: Vec<Vec3F64>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -91,6 +145,9 @@ impl ImuInitializer {
     // ── readiness gate ────────────────────────────────────────────────────────
 
     pub fn ready(&self, map: &Map, start_idx: Option<usize>) -> bool {
+        if self.config.validate().is_err() {
+            return false;
+        }
         let Some(start_idx) = start_idx else {
             return false;
         };
@@ -141,11 +198,11 @@ impl ImuInitializer {
 
     // ── main entry point ──────────────────────────────────────────────────────
     #[allow(clippy::too_many_arguments)]
-    pub fn inertial_optimizer(
+    fn inertial_optimizer(
         &self,
         map: &Map,
         frame_to_local: &HashMap<usize, usize>,
-        keyframes: Vec<&Keyframe>,
+        keyframes: &[&Keyframe],
         rwg: Mat3F64,
         seed_velocities: &[Vec3F64],
         scale_init: f64,
@@ -155,7 +212,7 @@ impl ImuInitializer {
         prior_g: f64,
         prior_a: f64,
         imu_t_bc: Pose3d,
-    ) -> Option<(Mat3F64, f64, Vec3F64, Vec3F64, Vec<Vec3F64>)> {
+    ) -> Result<InertialSolution, ImuInitReject> {
         let n = keyframes.len();
         let mut problem = Problem::new();
 
@@ -163,14 +220,14 @@ impl ImuInitializer {
             let name = format!("v{}", local_idx);
             problem
                 .add_variable(Variable::euclidean(&name, 3), vec3_to_f32(*vel))
-                .ok()?;
+                .map_err(|error| ImuInitReject::OptimizerFailed(error.to_string()))?;
         }
         problem
             .add_variable(Variable::euclidean("bg", 3), vec3_to_f32(bg))
-            .ok()?;
+            .map_err(|error| ImuInitReject::OptimizerFailed(error.to_string()))?;
         problem
             .add_variable(Variable::euclidean("ba", 3), vec3_to_f32(ba))
-            .ok()?;
+            .map_err(|error| ImuInitReject::OptimizerFailed(error.to_string()))?;
         let q = SO3F64::from_matrix(&rwg).to_array();
         let g_f32: Vec<f32> = q.iter().map(|&v| v as f32).collect();
         problem
@@ -178,10 +235,10 @@ impl ImuInitializer {
                 Variable::new("gdir", VariableType::SO3, g_f32.clone()),
                 g_f32,
             )
-            .ok()?;
+            .map_err(|error| ImuInitReject::OptimizerFailed(error.to_string()))?;
         problem
             .add_variable(Variable::euclidean("scale", 1), vec![scale_init as f32])
-            .ok()?;
+            .map_err(|error| ImuInitReject::OptimizerFailed(error.to_string()))?;
         let kf_const: Vec<KfConst> = keyframes
             .iter()
             .map(|kf| KfConst::new(&kf.frame.pose_world_to_cam, &imu_t_bc))
@@ -224,12 +281,12 @@ impl ImuInitializer {
                         "scale".to_string(),
                     ],
                 )
-                .ok()?;
+                .map_err(|error| ImuInitReject::OptimizerFailed(error.to_string()))?;
             edge_count += 1;
         }
 
         if edge_count == 0 {
-            return None;
+            return Err(ImuInitReject::NoUsableFactors);
         }
 
         problem
@@ -239,7 +296,7 @@ impl ImuInitializer {
                 }),
                 vec!["bg".to_string()],
             )
-            .ok()?;
+            .map_err(|error| ImuInitReject::OptimizerFailed(error.to_string()))?;
         problem
             .add_factor(
                 Box::new(WeightedZeroPrior {
@@ -247,7 +304,7 @@ impl ImuInitializer {
                 }),
                 vec!["ba".to_string()],
             )
-            .ok()?;
+            .map_err(|error| ImuInitReject::OptimizerFailed(error.to_string()))?;
 
         let lm = LevenbergMarquardt {
             max_iterations: 200,
@@ -255,11 +312,8 @@ impl ImuInitializer {
             ..Default::default()
         };
 
-        let result = lm.optimize(&mut problem).ok()?;
-        eprintln!(
-            "[inertial_optimizer] {:?} after {} iters, final_cost={:.6}",
-            result.termination_reason, result.iterations, result.final_cost
-        );
+        lm.optimize(&mut problem)
+            .map_err(|error| ImuInitReject::OptimizerFailed(error.to_string()))?;
         let vars = problem.get_variables(); // &HashMap<String, Variable>
 
         let bg_out = vec3_from_var(&vars["bg"].values);
@@ -282,11 +336,17 @@ impl ImuInitializer {
             .map(|i| vec3_from_var(&vars[&format!("v{i}")].values))
             .collect();
 
-        Some((rwg_out, scale_out, bg_out, ba_out, velocities_out))
+        Ok(InertialSolution {
+            rwg: rwg_out,
+            scale: scale_out,
+            gyro_bias: bg_out,
+            accel_bias: ba_out,
+            velocities: velocities_out,
+        })
     }
 
     /// Mirrors ORB-SLAM3's `LocalMapping::InitializeIMU(priorG, priorA, bFIBA)`:
-    /// a *single* joint LM solve per call. The pipeline is responsible for the
+    /// a *single* joint LM solve per call. The system is responsible for the
     /// progressive VIBA0 (immediate) / VIBA1 (mTinit>5s) / VIBA2 (mTinit>15s)
     /// re-triggering schedule with progressively relaxed priors — this
     /// function does not chain multiple passes internally.
@@ -309,8 +369,14 @@ impl ImuInitializer {
         prior_g: f64,
         prior_a: f64,
         already_initialized: bool,
-    ) -> Option<ImuInitResult> {
-        let imu_t_bc = imu_t_bc?;
+    ) -> Result<ImuInitResult, ImuInitReject> {
+        self.config.validate()?;
+        if !prior_g.is_finite() || prior_g < 0.0 || !prior_a.is_finite() || prior_a < 0.0 {
+            return Err(ImuInitReject::InvalidConfig(
+                "bias prior weights must be finite and non-negative".into(),
+            ));
+        }
+        let imu_t_bc = imu_t_bc.ok_or(ImuInitReject::MissingExtrinsics)?;
 
         let mut keyframes: Vec<&Keyframe> = map
             .keyframes()
@@ -320,7 +386,10 @@ impl ImuInitializer {
         keyframes.sort_by_key(|kf| kf.frame.idx);
         let n = keyframes.len();
         if n < self.config.min_keyframes {
-            return None;
+            return Err(ImuInitReject::InsufficientKeyframes {
+                found: n,
+                required: self.config.min_keyframes,
+            });
         }
 
         let frame_to_local: HashMap<usize, usize> = keyframes
@@ -336,7 +405,7 @@ impl ImuInitializer {
             // NOT Identity: ORB-SLAM3 can seed Identity here because its
             // ApplyScaledRotation rotates the map so gravity lands back on
             // its own internal reference gI=(0,0,-1) — so "already aligned"
-            // means "already at gI". `apply_initialization` here instead
+            // means "already at gI". The system application here instead
             // rotates the map to kornia-slam's own canonical (0,+G,0), a
             // fixed ~125° offset from gI. Seeding Identity would tell this
             // solve gravity is still at gI when it is actually at (0,+G,0),
@@ -386,10 +455,10 @@ impl ImuInitializer {
             (velocities, rwg)
         };
 
-        let (rwg_out, scale_out, bg_out, ba_out, velocities_out) = self.inertial_optimizer(
+        let solution = self.inertial_optimizer(
             map,
             &frame_to_local,
-            keyframes,
+            &keyframes,
             rwg,
             &velocities,
             1.0, // scale_init — ORB-SLAM3 always seeds mScale=1.0 before InertialOptimization
@@ -408,29 +477,23 @@ impl ImuInitializer {
         // pass. A hard |bg|>0.05 reject was added here previously and is what
         // broke real-data initialization — it rejected results ORB-SLAM3
         // would have accepted and simply refined at VIBA1/VIBA2.
-        if !scale_out.is_finite() || scale_out < 0.1 {
-            eprintln!("[imu_init] rejected: bad scale {:.4}", scale_out);
-            return None;
+        if !solution.scale.is_finite() || solution.scale < 0.1 {
+            return Err(ImuInitReject::InvalidScale(solution.scale));
         }
-        if !bg_out.length().is_finite() || !ba_out.length().is_finite() {
-            eprintln!("[imu_init] rejected: non-finite bias");
-            return None;
+        if !solution.gyro_bias.length().is_finite() || !solution.accel_bias.length().is_finite() {
+            return Err(ImuInitReject::NonFiniteBias);
         }
         // Reject a diverged refinement instead of replacing the last valid bias.
         const MAX_PLAUSIBLE_ACCEL_BIAS: f64 = 1.0; // m/s^2
-        if ba_out.length() > MAX_PLAUSIBLE_ACCEL_BIAS {
-            eprintln!(
-                "[imu_init] rejected: implausible accel bias |ba|={:.3} > {MAX_PLAUSIBLE_ACCEL_BIAS} m/s^2 ({:.3},{:.3},{:.3})",
-                ba_out.length(),
-                ba_out.x,
-                ba_out.y,
-                ba_out.z,
-            );
-            return None;
+        if solution.accel_bias.length() > MAX_PLAUSIBLE_ACCEL_BIAS {
+            return Err(ImuInitReject::ImplausibleAccelBias {
+                actual: solution.accel_bias.length(),
+                maximum: MAX_PLAUSIBLE_ACCEL_BIAS,
+            });
         }
         // Reconstruct the PHYSICAL gravity vector using the *same* gI the factor
         // used internally — do not reuse rwg_out assuming any other convention.
-        let gravity_world = rwg_out * Vec3F64::new(0.0, 0.0, -GRAVITY_MAGNITUDE);
+        let gravity_world = solution.rwg * Vec3F64::new(0.0, 0.0, -GRAVITY_MAGNITUDE);
 
         // NOTE: a hard gravity-misalignment gate was tried here and reverted.
         // VIBA0's own bootstrap (the `!already_initialized` branch above) is a
@@ -443,78 +506,24 @@ impl ImuInitializer {
         // VIBA0's roughness — confirmed on the same V101 sequence pre-gate:
         // VIBA0 23.0° → VIBA1 1.13° → VIBA2 0.78°, all within the first 15s of
         // IMU time. Trust that chain; don't gate its entry point.
-        eprintln!(
-            "[imu_init] accepted  scale={:.4}  gravity=({:.3},{:.3},{:.3})  bg=({:.5},{:.5},{:.5})  ba=({:.6},{:.6},{:.6})",
-            scale_out,
-            gravity_world.x,
-            gravity_world.y,
-            gravity_world.z,
-            bg_out.x,
-            bg_out.y,
-            bg_out.z,
-            ba_out.x,
-            ba_out.y,
-            ba_out.z,
-        );
+        let keyframe_velocities = keyframes
+            .iter()
+            .zip(solution.velocities)
+            .map(|(keyframe, velocity_world)| KeyframeVelocity {
+                keyframe_idx: keyframe.frame.idx,
+                velocity_world,
+            })
+            .collect();
 
-        Some(ImuInitResult {
-            scale: scale_out,
+        Ok(ImuInitResult {
+            scale: solution.scale,
             gravity_world,
-            velocities_world: velocities_out,
+            keyframe_velocities,
             bias: ImuBias {
-                gyro: bg_out,
-                accel: ba_out,
+                gyro: solution.gyro_bias,
+                accel: solution.accel_bias,
             },
         })
-    }
-
-    // ── apply to map & state ──────────────────────────────────────────────────
-
-    pub fn apply_initialization(
-        &self,
-        map: &mut Map,
-        state: &mut SystemState,
-        imu_bias: &mut ImuBias,
-        gravity_world: &mut Vec3F64,
-        init: ImuInitResult,
-        start_idx: usize,
-    ) {
-        eprintln!(
-            "[imu_init] applying: scale={:.4}  g=({:.3},{:.3},{:.3})",
-            init.scale, init.gravity_world.x, init.gravity_world.y, init.gravity_world.z
-        );
-
-        // 1. Bring the monocular map to metric scale.
-        map.scale_world(init.scale);
-
-        // 2. Rotate world so that gravity aligns with +Y (OpenCV convention).
-        let g_norm = init.gravity_world / init.gravity_world.length();
-        let rwg = rotation_from_to(g_norm, Vec3F64::new(0.0, 1.0, 0.0));
-        map.rotate_world(&rwg);
-
-        // 3. Assign velocities and biases to every keyframe in the window.
-        let mut vel_iter = init.velocities_world.into_iter();
-        for kf in map
-            .keyframes_mut()
-            .iter_mut()
-            .filter(|kf| kf.frame.idx >= start_idx)
-        {
-            if let Some(v) = vel_iter.next() {
-                kf.velocity_world = rwg * v;
-                kf.imu_bias = init.bias;
-            }
-        }
-
-        // 4. Update the tracker state from the last initialized keyframe.
-        if let Some(last_kf) = map.keyframes().iter().rfind(|kf| kf.frame.idx >= start_idx) {
-            state.velocity_world = last_kf.velocity_world;
-            state.pose_world_to_cam = last_kf.frame.pose_world_to_cam;
-        }
-
-        state.velocity = None;
-        state.imu_initialized = true;
-        *gravity_world = Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0);
-        *imu_bias = init.bias;
     }
 }
 
@@ -522,6 +531,8 @@ impl ImuInitializer {
 mod tests {
     use super::*;
     use crate::frame::Frame;
+    use crate::system::apply_inertial_initialization;
+    use crate::tracking::SystemState;
     use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbFeatures;
     use kornia_sensors::imu::{ImuCalib, ImuMeasurement};
@@ -673,6 +684,70 @@ mod tests {
         map
     }
 
+    #[test]
+    fn missing_extrinsics_has_a_typed_rejection() {
+        let initializer = ImuInitializer::new(ImuInitConfig {
+            min_keyframes: 2,
+            min_time_sec: 0.0,
+            min_motion: 0.0,
+        });
+
+        let result =
+            initializer.try_initialize(&Map::new(), None, ImuBias::default(), 0, 0.0, 0.0, false);
+
+        assert!(matches!(result, Err(ImuInitReject::MissingExtrinsics)));
+    }
+
+    #[test]
+    fn invalid_configuration_has_a_typed_rejection() {
+        let initializer = ImuInitializer::new(ImuInitConfig {
+            min_keyframes: 1,
+            min_time_sec: 0.0,
+            min_motion: 0.0,
+        });
+
+        let result = initializer.try_initialize(
+            &Map::new(),
+            Some(Pose3d::IDENTITY),
+            ImuBias::default(),
+            0,
+            0.0,
+            0.0,
+            false,
+        );
+
+        assert!(matches!(result, Err(ImuInitReject::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn insufficient_keyframes_reports_found_and_required_counts() {
+        let initializer = ImuInitializer::new(ImuInitConfig {
+            min_keyframes: 3,
+            min_time_sec: 0.0,
+            min_motion: 0.0,
+        });
+        let mut map = Map::new();
+        map.upsert_keyframe(Keyframe::from_frame(synth_frame(7, Pose3d::IDENTITY)));
+
+        let result = initializer.try_initialize(
+            &map,
+            Some(Pose3d::IDENTITY),
+            ImuBias::default(),
+            0,
+            0.0,
+            0.0,
+            false,
+        );
+
+        assert!(matches!(
+            result,
+            Err(ImuInitReject::InsufficientKeyframes {
+                found: 1,
+                required: 3
+            })
+        ));
+    }
+
     /// Checks that recovered scale remains inversely proportional to vision-map scale.
     #[test]
     fn viba0_scale_is_invariant_to_vision_map_scale() {
@@ -765,14 +840,8 @@ mod tests {
         let mut state = SystemState::new();
         let mut bias = ImuBias::default();
         let mut gravity_world = Vec3F64::ZERO;
-        initializer.apply_initialization(
-            &mut map,
-            &mut state,
-            &mut bias,
-            &mut gravity_world,
-            viba0,
-            0,
-        );
+        apply_inertial_initialization(&mut map, &mut state, &mut bias, &mut gravity_world, viba0)
+            .expect("VIBA0 result should apply");
 
         let solve_viba2 = |prior_a: f64| -> Vec3F64 {
             initializer
@@ -886,7 +955,7 @@ mod tests {
             )
             .expect("VIBA0 pass should recover a rough solution from clean synthetic data");
 
-        // Capture VIBA0's scale/gravity before it's consumed by apply_initialization
+        // Capture VIBA0's scale/gravity before it's consumed by application
         // (needed below to reconstruct what frame the second call's raw output —
         // scale correction, velocities — is expressed relative to).
         let viba0_scale = viba0.scale;
@@ -896,21 +965,15 @@ mod tests {
         let mut state = SystemState::new();
         let mut bias = ImuBias::default();
         let mut gravity_world = Vec3F64::ZERO;
-        initializer.apply_initialization(
-            &mut map,
-            &mut state,
-            &mut bias,
-            &mut gravity_world,
-            viba0,
-            0,
-        );
+        apply_inertial_initialization(&mut map, &mut state, &mut bias, &mut gravity_world, viba0)
+            .expect("VIBA0 result should apply");
 
         let result = initializer
             .try_initialize(&map, Some(Pose3d::IDENTITY), bias, 0, 0.0, 0.0, true)
             .expect("VIBA1 (loosened-prior) pass should refine to the true solution");
 
         // `result.scale` is only the *residual* correction on top of what
-        // VIBA0 already applied to the map (apply_initialization composes
+        // VIBA0 already applied to the map (system application composes
         // scale/rotation multiplicatively, mirroring ORB-SLAM3's
         // ApplyScaledRotation) — compare the cumulative effect, not the raw
         // second-call output in isolation.
@@ -936,7 +999,7 @@ mod tests {
             bias_accel_true,
         );
 
-        // apply_initialization already rotated the map so gravity sits at
+        // System application already rotated the map so gravity sits at
         // kornia-slam's own canonical (0,+G,0) — the second call's residual
         // gravity-direction correction should converge there too, not to the
         // original (pre-rotation) r_arb-relative direction.
@@ -954,17 +1017,22 @@ mod tests {
         // solve: after VIBA0's position scale/rotation was applied to the
         // map, but before this call's own residual scale correction (that
         // correction is only reflected in `result.scale`, applied to the map
-        // by a subsequent apply_initialization — not folded back into
-        // `result.velocities_world` here).
+        // by subsequent system application — not folded back into the
+        // returned keyframe velocities here).
         for k in 0..n_keyframes {
             let t = k as f64 * kf_dt;
             let (_, v_true, _, _) = circular_trajectory(t, OMEGA);
             let expected_v = rwg_viba0 * ((r_arb * v_true) * s_true * viba0_scale);
-            let err = (result.velocities_world[k] - expected_v).length();
+            let assignment = result
+                .keyframe_velocities
+                .iter()
+                .find(|assignment| assignment.keyframe_idx == k)
+                .expect("every initialized keyframe should have a velocity");
+            let err = (assignment.velocity_world - expected_v).length();
             assert!(
                 err < 0.15,
                 "velocity[{k}]: got {:?}, want {:?}",
-                result.velocities_world[k],
+                assignment.velocity_world,
                 expected_v
             );
         }

@@ -1,4 +1,4 @@
-use crate::initialization::two_view::TwoViewInitConfig;
+use crate::initialization::TwoViewInitConfig;
 use crate::loop_closure::{LoopEpisodeConfig, LoopFusionConfig, LoopVerificationConfig, PgoConfig};
 use crate::map::LocalMappingMode;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;

@@ -1,7 +1,11 @@
 //! Visual and inertial initialization for the SLAM system.
 
-pub mod imu;
-pub mod inertial_factor;
-pub mod two_view;
+mod imu;
+mod inertial_factor;
+mod two_view;
 
-pub use imu::{ImuInitConfig, ImuInitResult, ImuInitializer};
+pub use imu::{ImuInitConfig, ImuInitReject, ImuInitResult, ImuInitializer, KeyframeVelocity};
+pub use two_view::{
+    TwoViewAcceptanceConfig, TwoViewEstimate, TwoViewInitConfig, TwoViewRejectReason,
+    try_initialize_two_view,
+};
