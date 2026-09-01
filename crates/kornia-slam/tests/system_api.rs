@@ -1,4 +1,8 @@
 use kornia_3d::camera::PinholeCamera;
+use kornia_slam::initialization::{
+    ImuInitConfig, ImuInitReject, ImuInitResult, ImuInitializer, KeyframeVelocity, TwoViewEstimate,
+    TwoViewInitConfig,
+};
 use kornia_slam::{LoopClosingConfig, SlamConfig, SlamSystem};
 
 fn test_camera() -> PinholeCamera {
@@ -22,6 +26,23 @@ fn slam_system_is_constructible_from_the_public_api() {
     };
 
     let _system = SlamSystem::new(test_camera(), config);
+}
+
+#[test]
+fn initialization_api_is_exposed_through_the_facade() {
+    fn assert_public_type<T>() {}
+
+    assert_public_type::<ImuInitReject>();
+    assert_public_type::<ImuInitResult>();
+    assert_public_type::<KeyframeVelocity>();
+    assert_public_type::<TwoViewEstimate>();
+
+    let _initializer = ImuInitializer::new(ImuInitConfig {
+        min_keyframes: 10,
+        min_time_sec: 1.0,
+        min_motion: 0.05,
+    });
+    let _two_view_config = TwoViewInitConfig::default();
 }
 
 #[test]

@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 
+mod factor;
+
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, QuatF64, SO3F64, Vec3F64};
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias};
 
-use crate::initialization::inertial_factor::{InertialInitFactor, KfConst, WeightedZeroPrior};
+use self::factor::{InertialInitFactor, KfConst, WeightedZeroPrior};
 use crate::map::{Keyframe, Map};
 use kornia_algebra::optim::{LevenbergMarquardt, Problem, Variable, VariableType};
 // ─────────────────────────────────────────────────────────────────────────────
@@ -607,7 +609,7 @@ mod tests {
     /// measurement — `PreintegratedImu` is seeded with zero reference bias,
     /// so it integrates the biased signal uncorrected, exactly like a real
     /// biased sensor (`PreintegratedImu::integrate` subtracts `self.bias`,
-    /// which is zero here — see `imu.rs:140-143`).
+    /// which is zero here — see `kornia-sensors/src/imu.rs`).
     #[allow(clippy::too_many_arguments)]
     fn integrate_true_imu(
         t0: f64,
