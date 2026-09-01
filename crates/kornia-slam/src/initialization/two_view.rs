@@ -19,7 +19,7 @@ use kornia_3d::pose::{TriangulationConfig, TwoViewEstimator, TwoViewModel};
 use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::{OrbFeatures, OrbMatchConfig, match_orb_descriptors};
 
-use super::Estimate;
+use crate::tracking::pose_estimation::Estimate;
 
 /// Configuration for two-view initialization.
 #[derive(Debug, Clone)]

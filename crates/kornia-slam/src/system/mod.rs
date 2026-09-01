@@ -3,19 +3,16 @@
 //! The runtime flow is kept in one file so it can be read from top to bottom
 //! in the same order frames move through the system.
 
-mod config;
+pub mod config;
 
-pub use config::{PgoPipelineConfig, PipelineConfig};
+pub use config::{LoopClosingConfig, SlamConfig};
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::Frame;
-use crate::estimation::optical_flow::{
-    FlowSurvivor, KltTracker, MapKeypointMatch, TrackSet, snap_unique,
-};
-use crate::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
-use crate::estimation::{ImuInitConfig, ImuInitializer, MapProjectionEstimator};
+use crate::initialization::two_view::{TwoViewInitConfig, try_initialize_two_view};
+use crate::initialization::{ImuInitConfig, ImuInitializer};
 use crate::loop_closure::{
     InertialPgoContext, LoopEpisodeDecision, LoopEpisodeTracker, VerifiedLoopEdge,
     fuse_verified_loop, optimize_pose_graph, verify_loop_candidate,
@@ -23,7 +20,11 @@ use crate::loop_closure::{
 use crate::map::{Keyframe, KeyframeJob, LocalMapping, Map, MapPoint, ORB_SCALE_FACTOR};
 use crate::place_recognition::{KeyFrameDatabase, Vocabulary, compute_bow};
 use crate::stereo::unproject_stereo;
-use crate::system::{
+use crate::tracking::optical_flow::{
+    FlowSurvivor, KltTracker, MapKeypointMatch, TrackSet, snap_unique,
+};
+use crate::tracking::pose_estimation::MapProjectionEstimator;
+use crate::tracking::{
     KeyframePolicy, SystemMode, SystemState, TrackingLossRecoveryPolicy, TrackingResult,
     TrackingStatus,
 };
@@ -35,8 +36,8 @@ use kornia_image::Image;
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 
-/// Top-level ORB-SLAM pipeline: orchestrates tracking, mapping, and state transitions.
-pub struct SlamPipeline {
+/// Top-level SLAM system: orchestrates tracking, mapping, and state transitions.
+pub struct SlamSystem {
     // Camera model
     camera: PinholeCamera,
     // Primary pose estimator
@@ -95,7 +96,7 @@ pub struct SlamPipeline {
     // and the inverted-index keyframe database queried at each keyframe insert.
     vocabulary: Option<Vocabulary>,
     kf_database: KeyFrameDatabase,
-    pgo_config: Option<PgoPipelineConfig>,
+    pgo_config: Option<LoopClosingConfig>,
     loop_episode_tracker: Option<LoopEpisodeTracker>,
     verified_loops: Vec<VerifiedLoopEdge>,
     verified_loop_pairs: HashSet<(usize, usize)>,
@@ -118,9 +119,9 @@ pub enum LoopClosureEvent {
     },
 }
 
-impl SlamPipeline {
+impl SlamSystem {
     /// Creates a new pipeline with identity pose.
-    pub fn new(camera: PinholeCamera, config: PipelineConfig) -> Self {
+    pub fn new(camera: PinholeCamera, config: SlamConfig) -> Self {
         let map = Arc::new(Mutex::new(Map::new()));
         let local_mapping =
             LocalMapping::new(config.local_mapping, Arc::clone(&map), camera.clone());
@@ -1943,7 +1944,7 @@ mod tests {
         apply_reference_pose_correction, carry_klt_survivors, format_imu_init_gate,
         pose_graph_reference_correction, pose_graph_tracking_correction,
     };
-    use crate::estimation::optical_flow::{FlowSurvivor, MapKeypointMatch, TrackSet};
+    use crate::tracking::optical_flow::{FlowSurvivor, MapKeypointMatch, TrackSet};
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::{SO3F64, Vec3F64};
 

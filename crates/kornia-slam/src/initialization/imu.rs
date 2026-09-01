@@ -4,9 +4,9 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, QuatF64, SO3F64, Vec3F64};
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias};
 
-use crate::estimation::inertial_init_factor::{InertialInitFactor, KfConst, WeightedZeroPrior};
+use crate::initialization::inertial_factor::{InertialInitFactor, KfConst, WeightedZeroPrior};
 use crate::map::{Keyframe, Map};
-use crate::system::SystemState;
+use crate::tracking::SystemState;
 use kornia_algebra::optim::{LevenbergMarquardt, Problem, Variable, VariableType};
 // ─────────────────────────────────────────────────────────────────────────────
 // Small numeric helpers
