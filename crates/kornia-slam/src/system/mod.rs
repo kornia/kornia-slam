@@ -12,14 +12,19 @@ use std::sync::{Arc, Mutex};
 
 use crate::Frame;
 use crate::initialization::{
-    ImuInitConfig, ImuInitResult, ImuInitializer, TwoViewInitConfig, try_initialize_two_view,
+    ImuInitConfig, ImuInitNotReadyReason, ImuInitResult, ImuInitializer, InertialInitOutcome,
+    TwoViewInitConfig, try_initialize_two_view,
 };
 use crate::loop_closure::{
     InertialPgoContext, LoopEpisodeDecision, LoopEpisodeTracker, VerifiedLoopEdge,
     fuse_verified_loop, optimize_pose_graph, verify_loop_candidate,
 };
-use crate::map::{Keyframe, KeyframeJob, LocalMapping, Map, MapPoint, ORB_SCALE_FACTOR};
+use crate::map::{
+    InertialAlignment, InertialAlignmentError, Keyframe, KeyframeJob, LocalMapping, Map, MapPoint,
+    ORB_SCALE_FACTOR,
+};
 use crate::place_recognition::{KeyFrameDatabase, Vocabulary, compute_bow};
+use crate::pose_conversion::rotation_from_to;
 use crate::stereo::unproject_stereo;
 use crate::tracking::optical_flow::{
     FlowSurvivor, KltTracker, MapKeypointMatch, TrackSet, snap_unique,
@@ -32,7 +37,7 @@ use crate::tracking::{
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
-use kornia_algebra::{Mat3F64, QuatF64, SO3F64, Vec2F64, Vec3F64};
+use kornia_algebra::{Mat3F64, Vec2F64, Vec3F64};
 use kornia_image::Image;
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
@@ -71,25 +76,9 @@ pub struct SlamSystem {
     gravity_world: Vec3F64,
     bootstrap_timestamp_sec: Option<f64>,
     last_keyframe_timestamp_sec: Option<f64>,
-    inertial_init_start_kf_idx: Option<usize>,
+    // Owns the inertial-initialization window, readiness gate and the
+    // VIBA0/VIBA1/VIBA2 schedule; the system only applies its results.
     inertial_init: ImuInitializer,
-    // Timestamp of the last try_initialize attempt (successful or not), so
-    // retries are throttled to a fixed cadence instead of firing on every
-    // single keyframe forever once `ready()` is true — with an ever-growing
-    // window (start_idx never resets) and a solve that scales with window
-    // size, unthrottled per-keyframe retries turn into an ever-more-expensive
-    // no-op once a call starts getting rejected.
-    inertial_init_last_attempt_sec: Option<f64>,
-    // Timestamp the current inertial-init window started (first keyframe at
-    // or after `inertial_init_start_kf_idx`). Mirrors ORB-SLAM3's `mFirstTs`
-    // / `mTinit` — used to gate the VIBA1/VIBA2 progressive visual-inertial
-    // BA refinement passes (mTinit>5s / mTinit>15s respectively, after the
-    // initial VIBA0 solve) at LocalMapping.cc:200-228.
-    imu_init_window_start_sec: Option<f64>,
-    // VIBA1/VIBA2 fire at most once each, mirroring
-    // Map::GetIniertialBA1()/GetIniertialBA2() latching in ORB-SLAM3.
-    imu_viba1_done: bool,
-    imu_viba2_done: bool,
     local_mapping: LocalMapping,
     klt_tracker: KltTracker,
     track_set: TrackSet,
@@ -122,120 +111,10 @@ pub enum LoopClosureEvent {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ImuInitApplyError {
-    #[error("invalid initialization scale {0}")]
-    InvalidScale(f64),
     #[error("initialization gravity vector is zero or non-finite")]
     InvalidGravity,
-    #[error("initialization contains no keyframe velocities")]
-    MissingVelocities,
-    #[error("initialization contains duplicate velocity for keyframe {0}")]
-    DuplicateKeyframe(usize),
-    #[error("initialization references missing keyframe {0}")]
-    MissingKeyframe(usize),
-    #[error("initialization velocity for keyframe {0} is non-finite")]
-    InvalidVelocity(usize),
-    #[error("initialization bias is non-finite")]
-    InvalidBias,
-}
-
-/// Rotation that takes unit vector `from` to unit vector `to`.
-fn rotation_from_to(from: Vec3F64, to: Vec3F64) -> SO3F64 {
-    let from = from.normalize();
-    let to = to.normalize();
-    let dot = from.dot(to).clamp(-1.0, 1.0);
-    let cross = from.cross(to);
-
-    if dot < -1.0 + 1e-9 {
-        let perpendicular = if from.x.abs() < 0.9 {
-            Vec3F64::new(1.0, 0.0, 0.0)
-        } else {
-            Vec3F64::new(0.0, 1.0, 0.0)
-        };
-        let axis = from.cross(perpendicular).normalize();
-        return SO3F64::from_quaternion(QuatF64::from_array([axis.x, axis.y, axis.z, 0.0]));
-    }
-
-    let w = ((1.0 + dot) / 2.0).sqrt();
-    let s = 1.0 / (2.0 * w);
-    SO3F64::from_quaternion(QuatF64::from_array([
-        cross.x * s,
-        cross.y * s,
-        cross.z * s,
-        w,
-    ]))
-}
-
-/// Atomically validates and applies an inertial initialization result.
-///
-/// Velocity assignments carry keyframe identities, so map insertion order cannot
-/// silently attach an optimizer result to the wrong keyframe.
-pub(crate) fn apply_inertial_initialization(
-    map: &mut Map,
-    state: &mut SystemState,
-    imu_bias: &mut ImuBias,
-    gravity_world: &mut Vec3F64,
-    init: ImuInitResult,
-) -> Result<(), ImuInitApplyError> {
-    if !init.scale.is_finite() || init.scale <= 0.0 {
-        return Err(ImuInitApplyError::InvalidScale(init.scale));
-    }
-    let gravity_norm = init.gravity_world.length();
-    if !gravity_norm.is_finite() || gravity_norm <= 1e-9 {
-        return Err(ImuInitApplyError::InvalidGravity);
-    }
-    if init.keyframe_velocities.is_empty() {
-        return Err(ImuInitApplyError::MissingVelocities);
-    }
-    if !init.bias.gyro.length().is_finite() || !init.bias.accel.length().is_finite() {
-        return Err(ImuInitApplyError::InvalidBias);
-    }
-
-    let mut seen = HashSet::with_capacity(init.keyframe_velocities.len());
-    for assignment in &init.keyframe_velocities {
-        if !seen.insert(assignment.keyframe_idx) {
-            return Err(ImuInitApplyError::DuplicateKeyframe(
-                assignment.keyframe_idx,
-            ));
-        }
-        if map.get_keyframe(assignment.keyframe_idx).is_none() {
-            return Err(ImuInitApplyError::MissingKeyframe(assignment.keyframe_idx));
-        }
-        if !assignment.velocity_world.length().is_finite() {
-            return Err(ImuInitApplyError::InvalidVelocity(assignment.keyframe_idx));
-        }
-    }
-
-    let last_keyframe_idx = init
-        .keyframe_velocities
-        .iter()
-        .map(|assignment| assignment.keyframe_idx)
-        .max()
-        .expect("velocity list was checked above");
-    let alignment = rotation_from_to(
-        init.gravity_world / gravity_norm,
-        Vec3F64::new(0.0, 1.0, 0.0),
-    );
-
-    map.scale_world(init.scale);
-    map.rotate_world(&alignment);
-    for assignment in init.keyframe_velocities {
-        let keyframe = map
-            .get_keyframe_mut(assignment.keyframe_idx)
-            .expect("keyframe existence was checked before mutating the map");
-        keyframe.velocity_world = alignment * assignment.velocity_world;
-        keyframe.imu_bias = init.bias;
-    }
-
-    let last_keyframe = map
-        .get_keyframe(last_keyframe_idx)
-        .expect("last keyframe existence was checked before mutating the map");
-    state.velocity_world = last_keyframe.velocity_world;
-    state.pose_world_to_cam = last_keyframe.frame.pose_world_to_cam;
-    state.velocity = None;
-    state.imu_initialized = true;
-    *gravity_world = Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0);
-    *imu_bias = init.bias;
-    Ok(())
+    #[error(transparent)]
+    Alignment(#[from] InertialAlignmentError),
 }
 
 impl SlamSystem {
@@ -274,21 +153,7 @@ impl SlamSystem {
             gravity_world: Vec3F64::new(0.0, 0.0, -GRAVITY_MAGNITUDE),
             bootstrap_timestamp_sec: None,
             last_keyframe_timestamp_sec: None,
-            inertial_init_start_kf_idx: None,
-            // Matches ORB-SLAM3's LocalMapping::InitializeIMU VIBA0 gate
-            // (nMinKF=10; minTime=1.0s stereo/2.0s mono — `ready()` doubles
-            // this for mono). The previous min_keyframes=30/min_time_sec=15.0
-            // was effectively skipping VIBA0/VIBA1 and attempting a
-            // VIBA2-strength window on the very first try.
-            inertial_init: ImuInitializer::new(ImuInitConfig {
-                min_keyframes: 10,
-                min_time_sec: 1.0,
-                min_motion: 0.05,
-            }),
-            inertial_init_last_attempt_sec: None,
-            imu_init_window_start_sec: None,
-            imu_viba1_done: false,
-            imu_viba2_done: false,
+            inertial_init: ImuInitializer::new(ImuInitConfig::default()),
             klt_tracker: KltTracker::default(),
             track_set: TrackSet::new(),
             vocabulary: None,
@@ -301,18 +166,50 @@ impl SlamSystem {
         }
     }
 
+    /// The local-mapping job description for the current system state.
+    fn keyframe_job(&self) -> KeyframeJob {
+        KeyframeJob {
+            imu_initialized: self.state.imu_initialized,
+            imu_t_bc: self.imu_t_bc,
+            gravity_world: self.gravity_world,
+        }
+    }
+
+    /// Atomically validates and applies an inertial initialization result: the
+    /// map takes the scale, gravity-aligning rotation, velocities and bias;
+    /// the system then adopts the last aligned keyframe's state.
     fn apply_inertial_initialization(
         &mut self,
         init: ImuInitResult,
     ) -> Result<(), ImuInitApplyError> {
+        let gravity_norm = init.gravity_world.length();
+        if !gravity_norm.is_finite() || gravity_norm <= 1e-9 {
+            return Err(ImuInitApplyError::InvalidGravity);
+        }
+        let rotation = rotation_from_to(
+            init.gravity_world / gravity_norm,
+            Vec3F64::new(0.0, 1.0, 0.0),
+        );
+
         let map = Arc::clone(&self.map);
-        apply_inertial_initialization(
-            &mut map.lock().unwrap(),
-            &mut self.state,
-            &mut self.imu_bias,
-            &mut self.gravity_world,
-            init,
-        )
+        let mut map = map.lock().unwrap();
+        let last_keyframe_idx = map.apply_inertial_alignment(InertialAlignment {
+            scale: init.scale,
+            rotation,
+            keyframe_velocities: init.keyframe_velocities,
+            bias: init.bias,
+        })?;
+
+        let last_keyframe = map
+            .get_keyframe(last_keyframe_idx)
+            .expect("last keyframe existence was checked before mutating the map");
+        self.state.velocity_world = last_keyframe.velocity_world;
+        self.state.pose_world_to_cam = last_keyframe.frame.pose_world_to_cam;
+        self.state.velocity = None;
+        self.state.imu_initialized = true;
+        self.gravity_world = Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0);
+        self.imu_bias = init.bias;
+        Ok(())
     }
 
     /// Enables appearance-based loop detection with a bag-of-words vocabulary.
@@ -497,10 +394,7 @@ impl SlamSystem {
         // and the gyro bias still need the inertial init before IMU prediction
         // can run; the solve there keeps scale fixed at 1.
         self.state.mode = if self.imu_t_bc.is_some() {
-            self.inertial_init_start_kf_idx = Some(curr_idx);
-            self.imu_init_window_start_sec = Some(timestamp_sec);
-            self.imu_viba1_done = false;
-            self.imu_viba2_done = false;
+            self.inertial_init.begin_window(curr_idx, timestamp_sec);
             SystemMode::ImuInit
         } else {
             SystemMode::Tracking
@@ -690,10 +584,7 @@ impl SlamSystem {
         // Inertial init needs the camera-to-body extrinsic to relate IMU deltas
         // to camera poses; without it, run visual-only as before.
         self.state.mode = if self.imu_t_bc.is_some() {
-            self.inertial_init_start_kf_idx = Some(curr_idx);
-            self.imu_init_window_start_sec = Some(timestamp_sec);
-            self.imu_viba1_done = false;
-            self.imu_viba2_done = false;
+            self.inertial_init.begin_window(curr_idx, timestamp_sec);
             SystemMode::ImuInit
         } else {
             SystemMode::Tracking
@@ -846,91 +737,39 @@ impl SlamSystem {
         timestamp_sec: f64,
     ) -> TrackingResult {
         let result = self.tracking_step(frame, previous_image, current_image, timestamp_sec);
-
-        if result.status == TrackingStatus::KeyframeAccepted
-            && let Some(start_idx) = self.inertial_init_start_kf_idx
-        {
-            // Snapshot the fields needed after releasing the map lock.
-            let kfs: Vec<usize> = self
-                .map
-                .lock()
-                .unwrap()
-                .keyframes()
-                .iter()
-                .filter(|kf| kf.frame.idx >= start_idx)
-                .map(|kf| kf.frame.idx)
-                .collect();
-            let imu_time: f64 = self
-                .map
-                .lock()
-                .unwrap()
-                .imu_factors()
-                .iter()
-                .filter(|f| f.curr_kf_idx >= start_idx)
-                .map(|f| f.preintegrated.dt)
-                .sum();
-            let gate_msg = format_imu_init_gate(
-                start_idx,
-                kfs.first().copied(),
-                kfs.last().copied(),
-                kfs.len(),
-                self.inertial_init.config.min_keyframes,
-                imu_time,
-                self.inertial_init.config.min_time_sec,
-            );
-            self.dbg(gate_msg);
+        if result.status != TrackingStatus::KeyframeAccepted {
+            return result;
         }
 
-        // Throttle retries: without this, once `ready()` is true, a rejected
-        // attempt keeps mode at ImuInit and never resets start_idx, so the
-        // exact same (growing) window gets re-solved from scratch on every
-        // single subsequent keyframe forever — an ever-more-expensive no-op
-        // once a call starts failing. Re-attempt at most once every 5s of
-        // new data (mirrors the VIBA1 5s cadence), not every keyframe.
-        const RETRY_INTERVAL_SEC: f64 = 5.0;
-        let due_for_retry = self
-            .inertial_init_last_attempt_sec
-            .is_none_or(|last| timestamp_sec - last >= RETRY_INTERVAL_SEC);
-        let imu_init_ready = self
-            .inertial_init
-            .ready(&self.map.lock().unwrap(), self.inertial_init_start_kf_idx);
-
-        if result.status == TrackingStatus::KeyframeAccepted && due_for_retry && imu_init_ready {
-            let Some(start_idx) = self.inertial_init_start_kf_idx else {
-                return result;
-            };
-            self.inertial_init_last_attempt_sec = Some(timestamp_sec);
-            // VIBA0: ORB-SLAM3's first InitializeIMU call
-            // (LocalMapping.cc:183-186) — heavily-regularized, mono suppresses
-            // accel bias almost entirely (priorA=1e10) since a short/early
-            // window can't yet observe it; stereo uses priorA=1e5.
-            let is_mono = !self
-                .map
-                .lock()
-                .unwrap()
-                .keyframes()
-                .iter()
-                .find(|kf| kf.frame.idx >= start_idx)
-                .map(|kf| kf.frame.is_stereo())
-                .unwrap_or(false);
-            let prior_a0 = if is_mono { 1e10 } else { 1e5 };
-            // Drop the solve's map lock before applying its result with a new lock.
-            let init_result = self.inertial_init.try_initialize(
-                &self.map.lock().unwrap(),
+        // Drop the solve's map lock before applying its result with a new lock.
+        let outcome = {
+            let map = self.map.lock().unwrap();
+            self.inertial_init.on_keyframe_uninitialized(
+                &map,
+                timestamp_sec,
                 self.imu_t_bc,
                 self.imu_bias,
-                start_idx,
-                1e2,
-                prior_a0,
-                false,
-            );
-            match init_result {
+            )
+        };
+
+        match outcome {
+            InertialInitOutcome::NotDue => {}
+            InertialInitOutcome::NotReady(not_ready) => {
+                if not_ready.reason != ImuInitNotReadyReason::NoWindow {
+                    self.dbg(not_ready.to_string());
+                }
+            }
+            InertialInitOutcome::Attempted {
+                stage,
+                result: init,
+            } => match init {
                 Ok(init) => {
+                    let label = stage.label();
                     let scale = init.scale;
                     let gravity = init.gravity_world;
                     let bg = init.bias.gyro;
                     if let Err(error) = self.apply_inertial_initialization(init) {
-                        self.dbg(format!("[imu_init] VIBA0 apply rejected: {error}"));
+                        self.dbg(format!("[imu_init] {label} apply rejected: {error}"));
                         return result;
                     }
                     // Mirrors ORB-SLAM3: IMU is marked initialized (and
@@ -940,24 +779,21 @@ impl SlamSystem {
                     // resuming tracking.
                     self.state.mode = SystemMode::Tracking;
                     self.state.imu_init_timestamp_sec = Some(timestamp_sec);
-                    if !self.local_mapping.submit(KeyframeJob {
-                        imu_initialized: true,
-                        imu_t_bc: self.imu_t_bc,
-                        gravity_world: self.gravity_world,
-                    }) {
+                    let job = self.keyframe_job();
+                    if !self.local_mapping.submit(job) {
                         self.dbg("[local_mapping] worker is unavailable".into());
                     }
                     self.apply_local_mapping_results();
                     self.dbg(format!(
-                        "[imu_init] VIBA0 accepted: scale={scale:.4} gravity=({:.3},{:.3},{:.3}) \
+                        "[imu_init] {label} accepted: scale={scale:.4} gravity=({:.3},{:.3},{:.3}) \
                          gyro_bias=({:.4},{:.4},{:.4})",
                         gravity.x, gravity.y, gravity.z, bg.x, bg.y, bg.z
                     ));
                 }
                 Err(error) => {
-                    self.dbg(format!("[imu_init] VIBA0 rejected: {error}"));
+                    self.dbg(format!("[imu_init] {} rejected: {error}", stage.label()));
                 }
-            }
+            },
         }
 
         result
@@ -1325,14 +1161,22 @@ impl SlamSystem {
         // Refinement can rotate/scale the world and update gravity. Do it before
         // constructing the BA request so the job and its future snapshot agree.
         if imu_initialized {
-            self.refine_inertial_init(timestamp_sec);
+            // Drop the solve's map lock before applying its result with a new lock.
+            let outcome = {
+                let map = self.map.lock().unwrap();
+                self.inertial_init.on_keyframe_initialized(
+                    &map,
+                    timestamp_sec,
+                    self.imu_t_bc,
+                    self.imu_bias,
+                    self.gravity_world,
+                )
+            };
+            self.apply_inertial_refinement(outcome);
         }
 
-        if !self.local_mapping.submit(KeyframeJob {
-            imu_initialized,
-            imu_t_bc: self.imu_t_bc,
-            gravity_world: self.gravity_world,
-        }) {
+        let job = self.keyframe_job();
+        if !self.local_mapping.submit(job) {
             self.dbg("[local_mapping] worker is unavailable".into());
         }
         // Synchronous mode has a completed correction available immediately;
@@ -1346,69 +1190,29 @@ impl SlamSystem {
         true
     }
 
-    /// Kept at VIBA2 because this system lacks the intervening pose-adjusting
-    /// inertial BA that lets ORB-SLAM3 safely remove the prior (kornia-slam#51).
-    const VIBA_PRIOR_A: f64 = 1e5;
-
-    /// VIBA1 (mTinit>5s) / VIBA2 (mTinit>15s): progressive re-solves with
-    /// relaxed priors over the same (now-growing) window that VIBA0 used,
-    /// mirroring LocalMapping.cc:200-228. Each fires at most once and refines
-    /// bg/ba/scale/gravity further — tracking is already running on VIBA0's
-    /// result by the time these get a chance to fire, so a rejection here
-    /// just means "try again never" for that stage, not a tracking failure.
-    fn refine_inertial_init(&mut self, timestamp_sec: f64) {
-        let (Some(start_idx), Some(window_start_sec)) = (
-            self.inertial_init_start_kf_idx,
-            self.imu_init_window_start_sec,
-        ) else {
+    /// Applies a VIBA1/VIBA2 refinement outcome produced by the initializer.
+    fn apply_inertial_refinement(&mut self, outcome: InertialInitOutcome) {
+        let InertialInitOutcome::Attempted { stage, result } = outcome else {
             return;
         };
-        let mtinit = timestamp_sec - window_start_sec;
-        if mtinit >= 50.0 {
-            return;
-        }
-
-        let (prior_g, prior_a, stage) = if !self.imu_viba1_done && mtinit > 5.0 {
-            (1.0, Self::VIBA_PRIOR_A, "VIBA1")
-        } else if self.imu_viba1_done && !self.imu_viba2_done && mtinit > 15.0 {
-            (0.0, Self::VIBA_PRIOR_A, "VIBA2")
-        } else {
-            return;
-        };
-
-        // Drop the solve's map lock before applying its result with a new lock.
-        let init_result = self.inertial_init.try_initialize(
-            &self.map.lock().unwrap(),
-            self.imu_t_bc,
-            self.imu_bias,
-            start_idx,
-            prior_g,
-            prior_a,
-            true,
-        );
-        match init_result {
+        let stage_label = stage.label();
+        match result {
             Ok(init) => {
                 let scale = init.scale;
                 let bg = init.bias.gyro;
                 match self.apply_inertial_initialization(init) {
                     Ok(()) => self.dbg(format!(
-                        "[imu_init] {stage} accepted: scale_correction={scale:.4} gyro_bias=({:.4},{:.4},{:.4})",
+                        "[imu_init] {stage_label} accepted: scale_correction={scale:.4} gyro_bias=({:.4},{:.4},{:.4})",
                         bg.x, bg.y, bg.z
                     )),
                     Err(error) => {
-                        self.dbg(format!("[imu_init] {stage} apply rejected: {error}"));
+                        self.dbg(format!("[imu_init] {stage_label} apply rejected: {error}"));
                     }
                 }
             }
             Err(error) => {
-                self.dbg(format!("[imu_init] {stage} rejected: {error}"));
+                self.dbg(format!("[imu_init] {stage_label} rejected: {error}"));
             }
-        }
-
-        if stage == "VIBA1" {
-            self.imu_viba1_done = true;
-        } else {
-            self.imu_viba2_done = true;
         }
     }
 
@@ -1598,11 +1402,8 @@ impl SlamSystem {
         if pgo_applied {
             self.track_set = TrackSet::new();
             if self.state.imu_initialized {
-                if !self.local_mapping.submit(KeyframeJob {
-                    imu_initialized: true,
-                    imu_t_bc: self.imu_t_bc,
-                    gravity_world: self.gravity_world,
-                }) {
+                let job = self.keyframe_job();
+                if !self.local_mapping.submit(job) {
                     self.dbg("[local_mapping] worker is unavailable after PGO".into());
                 }
                 self.apply_local_mapping_results();
@@ -2001,20 +1802,6 @@ fn carry_klt_survivors(track_set: &mut TrackSet, survivors: Option<Vec<FlowSurvi
     }
 }
 
-fn format_imu_init_gate(
-    start_idx: usize,
-    first_idx: Option<usize>,
-    last_idx: Option<usize>,
-    keyframes: usize,
-    min_keyframes: usize,
-    imu_time: f64,
-    min_time_sec: f64,
-) -> String {
-    format!(
-        "[imu_init_gate] start_idx={start_idx} first_idx={first_idx:?} last_idx={last_idx:?} kfs={keyframes}/{min_keyframes} imu_time={imu_time:.2}/{min_time_sec:.1}s"
-    )
-}
-
 /// Carries a reference-keyframe BA correction into the current tracking pose
 /// while preserving the current camera's pose relative to that reference.
 fn apply_reference_pose_correction(
@@ -2065,14 +1852,14 @@ fn pose_graph_reference_correction(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_inertial_initialization, apply_reference_pose_correction, carry_klt_survivors,
-        format_imu_init_gate, pose_graph_reference_correction, pose_graph_tracking_correction,
+        ImuInitApplyError, SlamConfig, SlamSystem, apply_reference_pose_correction,
+        carry_klt_survivors, pose_graph_reference_correction, pose_graph_tracking_correction,
     };
     use crate::Frame;
     use crate::initialization::{ImuInitResult, KeyframeVelocity};
-    use crate::map::{Keyframe, Map};
-    use crate::tracking::SystemState;
+    use crate::map::Keyframe;
     use crate::tracking::optical_flow::{FlowSurvivor, MapKeypointMatch, TrackSet};
+    use kornia_3d::camera::PinholeCamera;
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::{SO3F64, Vec3F64};
     use kornia_image::ImageSize;
@@ -2112,15 +1899,32 @@ mod tests {
         })
     }
 
+    /// The map-side alignment is covered in `map`; this checks the system
+    /// state the application adopts from the last aligned keyframe.
     #[test]
-    fn inertial_initialization_assigns_velocities_by_keyframe_id() {
-        let mut map = Map::new();
-        map.upsert_keyframe(empty_keyframe(20));
-        map.upsert_keyframe(empty_keyframe(10));
+    fn inertial_initialization_adopts_the_last_keyframe_state() {
+        let camera = PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let mut system = SlamSystem::new(camera, SlamConfig::default());
+        {
+            let mut map = system.map.lock().unwrap();
+            map.upsert_keyframe(empty_keyframe(20));
+            map.upsert_keyframe(empty_keyframe(10));
+        }
         let velocity_10 = Vec3F64::new(1.0, 2.0, 3.0);
         let velocity_20 = Vec3F64::new(4.0, 5.0, 6.0);
         let result = ImuInitResult {
             scale: 1.0,
+            // Already at the canonical gravity direction, so the alignment
+            // rotation is identity and the velocities pass through unchanged.
             gravity_world: Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0),
             keyframe_velocities: vec![
                 KeyframeVelocity {
@@ -2134,16 +1938,43 @@ mod tests {
             ],
             bias: ImuBias::default(),
         };
-        let mut state = SystemState::new();
-        let mut bias = ImuBias::default();
-        let mut gravity = Vec3F64::ZERO;
 
-        apply_inertial_initialization(&mut map, &mut state, &mut bias, &mut gravity, result)
+        system
+            .apply_inertial_initialization(result)
             .expect("valid initialization should apply");
 
-        assert!((map.get_keyframe(10).unwrap().velocity_world - velocity_10).length() < 1e-12);
-        assert!((map.get_keyframe(20).unwrap().velocity_world - velocity_20).length() < 1e-12);
-        assert!((state.velocity_world - velocity_20).length() < 1e-12);
+        assert!((system.state.velocity_world - velocity_20).length() < 1e-12);
+        assert!(system.state.imu_initialized);
+        assert!(system.state.velocity.is_none());
+        assert!(
+            (system.gravity_world - Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0)).length() < 1e-12
+        );
+    }
+
+    #[test]
+    fn inertial_initialization_rejects_zero_gravity() {
+        let camera = PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let mut system = SlamSystem::new(camera, SlamConfig::default());
+        let result = ImuInitResult {
+            scale: 1.0,
+            gravity_world: Vec3F64::ZERO,
+            keyframe_velocities: Vec::new(),
+            bias: ImuBias::default(),
+        };
+
+        assert!(matches!(
+            system.apply_inertial_initialization(result),
+            Err(ImuInitApplyError::InvalidGravity)
+        ));
     }
 
     #[test]
@@ -2223,14 +2054,6 @@ mod tests {
         let corrected = correction.rotation * velocity;
 
         assert!((corrected - yaw * velocity).length() < 1e-10);
-    }
-
-    #[test]
-    fn formats_compact_imu_init_gate() {
-        assert_eq!(
-            format_imu_init_gate(12, Some(12), Some(32), 7, 10, 1.05, 1.0),
-            "[imu_init_gate] start_idx=12 first_idx=Some(12) last_idx=Some(32) kfs=7/10 imu_time=1.05/1.0s"
-        );
     }
 
     #[test]

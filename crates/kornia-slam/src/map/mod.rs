@@ -32,6 +32,7 @@ pub use local_mapping::{KeyframeJob, LocalMapping, LocalMappingMode};
 use std::collections::{HashMap, HashSet};
 
 use crate::frame::Frame;
+use crate::initialization::KeyframeVelocity;
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::bundle_adjust_schur;
 use kornia_3d::camera::PinholeCamera;
@@ -369,6 +370,33 @@ pub enum PoseGraphCorrectionError {
     NonFinitePose,
     #[error("map point references a keyframe outside the pose graph")]
     MissingReferenceKeyframe,
+}
+
+/// A validated inertial alignment to apply to the whole map: a metric scale, a
+/// gravity-aligning world rotation, and the per-keyframe velocity/bias writes
+/// that go with them.
+#[derive(Debug, Clone)]
+pub struct InertialAlignment {
+    pub scale: f64,
+    pub rotation: SO3F64,
+    pub keyframe_velocities: Vec<KeyframeVelocity>,
+    pub bias: ImuBias,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum InertialAlignmentError {
+    #[error("invalid initialization scale {0}")]
+    InvalidScale(f64),
+    #[error("initialization contains no keyframe velocities")]
+    MissingVelocities,
+    #[error("initialization contains duplicate velocity for keyframe {0}")]
+    DuplicateKeyframe(usize),
+    #[error("initialization references missing keyframe {0}")]
+    MissingKeyframe(usize),
+    #[error("initialization velocity for keyframe {0} is non-finite")]
+    InvalidVelocity(usize),
+    #[error("initialization bias is non-finite")]
+    InvalidBias,
 }
 
 /// In-memory map storage for keyframes and persistent map points.
@@ -714,6 +742,84 @@ impl Map {
     /// Returns all keyframe-to-keyframe IMU factors in insertion order.
     pub fn imu_factors(&self) -> &[ImuFactor] {
         &self.imu_factors
+    }
+
+    /// Keyframes belonging to the window that starts at `start_idx`, in map
+    /// insertion order — callers that need index order sort themselves.
+    pub fn keyframes_from(&self, start_idx: usize) -> impl Iterator<Item = &Keyframe> {
+        self.keyframes
+            .iter()
+            .filter(move |kf| kf.frame.idx >= start_idx)
+    }
+
+    /// Total preintegrated IMU time carried by the factors whose target
+    /// keyframe lies in the window that starts at `start_idx`.
+    pub fn imu_time_from(&self, start_idx: usize) -> f64 {
+        self.imu_factors
+            .iter()
+            .filter(|factor| factor.curr_kf_idx >= start_idx)
+            .map(|factor| factor.preintegrated.dt)
+            .sum()
+    }
+
+    /// Applies a validated inertial alignment: scales and rotates the world,
+    /// then writes each keyframe's velocity and bias.
+    ///
+    /// Velocity assignments carry keyframe identities, so map insertion order
+    /// cannot silently attach an optimizer result to the wrong keyframe.
+    /// Everything is validated before the first mutation, so a rejected
+    /// alignment leaves the map untouched. Returns the index of the last
+    /// (max idx) keyframe in the assignment.
+    pub fn apply_inertial_alignment(
+        &mut self,
+        alignment: InertialAlignment,
+    ) -> Result<usize, InertialAlignmentError> {
+        if !alignment.scale.is_finite() || alignment.scale <= 0.0 {
+            return Err(InertialAlignmentError::InvalidScale(alignment.scale));
+        }
+        if alignment.keyframe_velocities.is_empty() {
+            return Err(InertialAlignmentError::MissingVelocities);
+        }
+        if !alignment.bias.gyro.length().is_finite() || !alignment.bias.accel.length().is_finite() {
+            return Err(InertialAlignmentError::InvalidBias);
+        }
+
+        let mut seen = HashSet::with_capacity(alignment.keyframe_velocities.len());
+        for assignment in &alignment.keyframe_velocities {
+            if !seen.insert(assignment.keyframe_idx) {
+                return Err(InertialAlignmentError::DuplicateKeyframe(
+                    assignment.keyframe_idx,
+                ));
+            }
+            if self.get_keyframe(assignment.keyframe_idx).is_none() {
+                return Err(InertialAlignmentError::MissingKeyframe(
+                    assignment.keyframe_idx,
+                ));
+            }
+            if !assignment.velocity_world.length().is_finite() {
+                return Err(InertialAlignmentError::InvalidVelocity(
+                    assignment.keyframe_idx,
+                ));
+            }
+        }
+
+        let last_keyframe_idx = alignment
+            .keyframe_velocities
+            .iter()
+            .map(|assignment| assignment.keyframe_idx)
+            .max()
+            .expect("velocity list was checked above");
+
+        self.scale_world(alignment.scale);
+        self.rotate_world(&alignment.rotation);
+        for assignment in alignment.keyframe_velocities {
+            let keyframe = self
+                .get_keyframe_mut(assignment.keyframe_idx)
+                .expect("keyframe existence was checked before mutating the map");
+            keyframe.velocity_world = alignment.rotation * assignment.velocity_world;
+            keyframe.imu_bias = alignment.bias;
+        }
+        Ok(last_keyframe_idx)
     }
 
     /// Applies a metric scale to camera centers and map points.
@@ -1788,6 +1894,80 @@ mod tests {
             depth: Vec::new(),
             keypoints_undist: Vec::new(),
         }
+    }
+
+    #[test]
+    fn inertial_alignment_assigns_velocities_by_keyframe_id() {
+        let mut map = Map::new();
+        map.upsert_keyframe(Keyframe::from_frame(test_frame(20, Vec::new())));
+        map.upsert_keyframe(Keyframe::from_frame(test_frame(10, Vec::new())));
+        let velocity_10 = Vec3F64::new(1.0, 2.0, 3.0);
+        let velocity_20 = Vec3F64::new(4.0, 5.0, 6.0);
+
+        let last = map
+            .apply_inertial_alignment(InertialAlignment {
+                scale: 1.0,
+                rotation: SO3F64::IDENTITY,
+                keyframe_velocities: vec![
+                    KeyframeVelocity {
+                        keyframe_idx: 10,
+                        velocity_world: velocity_10,
+                    },
+                    KeyframeVelocity {
+                        keyframe_idx: 20,
+                        velocity_world: velocity_20,
+                    },
+                ],
+                bias: ImuBias::default(),
+            })
+            .expect("valid alignment should apply");
+
+        assert_eq!(last, 20);
+        assert!((map.get_keyframe(10).unwrap().velocity_world - velocity_10).length() < 1e-12);
+        assert!((map.get_keyframe(20).unwrap().velocity_world - velocity_20).length() < 1e-12);
+    }
+
+    #[test]
+    fn inertial_alignment_rejects_an_unknown_keyframe_without_mutating() {
+        let mut map = Map::new();
+        map.upsert_keyframe(Keyframe::from_frame(test_frame(10, Vec::new())));
+
+        let error = map
+            .apply_inertial_alignment(InertialAlignment {
+                scale: 2.0,
+                rotation: SO3F64::IDENTITY,
+                keyframe_velocities: vec![KeyframeVelocity {
+                    keyframe_idx: 11,
+                    velocity_world: Vec3F64::ZERO,
+                }],
+                bias: ImuBias::default(),
+            })
+            .unwrap_err();
+
+        assert_eq!(error, InertialAlignmentError::MissingKeyframe(11));
+        // Validation runs before the first mutation, so nothing was scaled.
+        assert!((map.get_keyframe(10).unwrap().velocity_world).length() < 1e-12);
+    }
+
+    #[test]
+    fn inertial_alignment_rotates_stored_velocities() {
+        let mut map = Map::new();
+        map.upsert_keyframe(Keyframe::from_frame(test_frame(0, Vec::new())));
+        let yaw = SO3F64::exp(Vec3F64::new(0.0, 0.4, 0.0));
+        let velocity = Vec3F64::new(1.0, 0.2, -0.5);
+
+        map.apply_inertial_alignment(InertialAlignment {
+            scale: 1.0,
+            rotation: yaw,
+            keyframe_velocities: vec![KeyframeVelocity {
+                keyframe_idx: 0,
+                velocity_world: velocity,
+            }],
+            bias: ImuBias::default(),
+        })
+        .expect("valid alignment should apply");
+
+        assert!((map.get_keyframe(0).unwrap().velocity_world - yaw * velocity).length() < 1e-12);
     }
 
     #[test]
