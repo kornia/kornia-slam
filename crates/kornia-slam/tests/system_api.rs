@@ -59,3 +59,19 @@ fn legacy_pipeline_names_remain_source_compatible() {
 
     let _pipeline = SlamPipeline::new(test_camera(), config);
 }
+
+#[test]
+fn loop_closing_types_keep_existing_public_paths() {
+    let config = kornia_slam::loop_closure::LoopClosingConfig::default();
+    let config: kornia_slam::system::config::LoopClosingConfig = config;
+    let config: kornia_slam::system::LoopClosingConfig = config;
+    let _: LoopClosingConfig = config;
+
+    let event = kornia_slam::loop_closure::LoopClosureEvent::PgoFailed {
+        query_kf_idx: 10,
+        candidate_kf_idx: 0,
+        reason: "test".into(),
+    };
+    let event: kornia_slam::system::LoopClosureEvent = event;
+    let _: kornia_slam::LoopClosureEvent = event;
+}

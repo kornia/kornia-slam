@@ -1,5 +1,5 @@
 use crate::initialization::TwoViewInitConfig;
-use crate::loop_closure::{LoopEpisodeConfig, LoopFusionConfig, LoopVerificationConfig, PgoConfig};
+pub use crate::loop_closure::LoopClosingConfig;
 use crate::map::LocalMappingMode;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
@@ -21,17 +21,6 @@ pub struct SlamConfig {
     pub debug: bool,
     /// Optional verified loop closure and live pose-graph correction.
     pub pgo: Option<LoopClosingConfig>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct LoopClosingConfig {
-    /// Mono+IMU maps become metric only after inertial initialization. Stereo
-    /// maps are metric from bootstrap and leave this disabled.
-    pub require_imu_initialized: bool,
-    pub episode: LoopEpisodeConfig,
-    pub fusion: LoopFusionConfig,
-    pub verification: LoopVerificationConfig,
-    pub optimizer: PgoConfig,
 }
 
 impl Default for SlamConfig {

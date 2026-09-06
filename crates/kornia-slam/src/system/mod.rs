@@ -5,9 +5,11 @@
 
 pub mod config;
 
+pub use crate::loop_closure::LoopClosureEvent;
+#[cfg(test)]
+use crate::loop_closure::pose_graph_reference_correction;
 pub use config::{LoopClosingConfig, SlamConfig};
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::Frame;
@@ -15,14 +17,11 @@ use crate::initialization::{
     ImuInitConfig, ImuInitNotReadyReason, ImuInitResult, ImuInitializer, InertialInitOutcome,
     TwoViewInitConfig, try_initialize_two_view,
 };
-use crate::loop_closure::{
-    InertialPgoContext, LoopEpisodeDecision, LoopEpisodeTracker, VerifiedLoopEdge,
-    fuse_verified_loop, optimize_pose_graph, verify_loop_candidate,
-};
+use crate::loop_closure::{InertialPgoContext, LoopCloser, LoopClosingContext, LoopClosingOutcome};
 use crate::map::{
     InertialAlignment, InertialAlignmentError, Keyframe, KeyframeJob, LocalMapping, Map, MapPoint,
 };
-use crate::place_recognition::{KeyFrameDatabase, Vocabulary, compute_bow};
+use crate::place_recognition::Vocabulary;
 use crate::pose_conversion::rotation_from_to;
 use crate::stereo::unproject_stereo;
 use crate::tracking::optical_flow::{
@@ -79,31 +78,10 @@ pub struct SlamSystem {
     local_mapping: LocalMapping,
     klt_tracker: KltTracker,
     track_set: TrackSet,
-    // Place recognition: bag-of-words vocabulary (None disables loop detection)
-    // and the inverted-index keyframe database queried at each keyframe insert.
-    vocabulary: Option<Vocabulary>,
-    kf_database: KeyFrameDatabase,
-    pgo_config: Option<LoopClosingConfig>,
-    loop_episode_tracker: Option<LoopEpisodeTracker>,
-    verified_loops: Vec<VerifiedLoopEdge>,
-    verified_loop_pairs: HashSet<(usize, usize)>,
+    loop_closer: LoopCloser,
     loop_closure_events: Vec<LoopClosureEvent>,
     // System state
     state: SystemState,
-}
-
-/// Concise externally visible result of a loop-closure attempt.
-#[derive(Debug, Clone)]
-pub enum LoopClosureEvent {
-    Accepted {
-        edge: VerifiedLoopEdge,
-        applied: bool,
-    },
-    PgoFailed {
-        query_kf_idx: usize,
-        candidate_kf_idx: usize,
-        reason: String,
-    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -121,10 +99,6 @@ impl SlamSystem {
         let local_mapping =
             LocalMapping::new(config.local_mapping, Arc::clone(&map), camera.clone());
         let map_publication_gate = local_mapping.publication_gate();
-        let pgo_config = config.pgo;
-        let loop_episode_tracker = pgo_config
-            .as_ref()
-            .map(|config| LoopEpisodeTracker::new(config.episode));
         Self {
             camera,
             estimator: MapProjectionEstimator::new(config.map_projection),
@@ -153,12 +127,7 @@ impl SlamSystem {
             inertial_init: ImuInitializer::new(ImuInitConfig::default()),
             klt_tracker: KltTracker::default(),
             track_set: TrackSet::new(),
-            vocabulary: None,
-            kf_database: KeyFrameDatabase::new(),
-            pgo_config,
-            loop_episode_tracker,
-            verified_loops: Vec::new(),
-            verified_loop_pairs: HashSet::new(),
+            loop_closer: LoopCloser::new(config.pgo),
             loop_closure_events: Vec::new(),
         }
     }
@@ -212,7 +181,7 @@ impl SlamSystem {
     /// Enables appearance-based loop detection with a bag-of-words vocabulary.
     /// Without it, keyframes are not indexed and no loop candidates are emitted.
     pub fn set_vocabulary(&mut self, vocabulary: Vocabulary) {
-        self.vocabulary = Some(vocabulary);
+        self.loop_closer.set_vocabulary(vocabulary);
     }
 
     pub fn drain_loop_closure_events(&mut self) -> Vec<LoopClosureEvent> {
@@ -1185,190 +1154,33 @@ impl SlamSystem {
         }
     }
 
-    /// Indexes a freshly inserted keyframe for place recognition and queries the
-    /// database for appearance-based loop candidates.
-    ///
-    /// Mirrors ORB-SLAM3's `LoopClosing::DetectLoop`: the acceptance threshold is
-    /// the lowest BoW similarity to a covisible neighbour, and the covisibility
-    /// set is excluded so only a revisited place can match. The query runs before
-    /// this keyframe is added, so it never matches itself.
+    /// Runs map-side loop closing, then applies its live tracking consequences.
     fn register_place_recognition(&mut self, kf_idx: usize) {
-        let Some(vocabulary) = self.vocabulary.as_ref() else {
-            return;
+        let context = LoopClosingContext {
+            reference_keyframe_idx: self.state.current_keyframe_idx,
+            inertial: self.state.imu_initialized.then_some(InertialPgoContext {
+                gravity_world: self.gravity_world,
+            }),
         };
-        const MIN_COVIS_WEIGHT: usize = 15;
-        let (bow, neighbors) = {
-            let map = self.map.lock().unwrap();
-            let Some(kf) = map.get_keyframe(kf_idx) else {
-                return;
-            };
-            let bow = compute_bow(vocabulary, &kf.frame.features.descriptors);
-            if bow.0.is_empty() {
-                return;
-            }
-            let neighbors = map.covisible_keyframes(kf_idx, MIN_COVIS_WEIGHT);
-            (bow, neighbors)
-        };
-        let candidates = self.kf_database.detect_loop_candidates(
-            kf_idx,
-            &bow,
-            neighbors.iter().map(|&(nb_idx, _w)| nb_idx),
-        );
-        self.kf_database.add(kf_idx, bow);
-
-        if let Some(best) = candidates.first().copied() {
-            self.dbg(format!(
-                "[loop] kf={kf_idx} matched kf={} score={:.3} shared_words={} ({} candidates)",
-                best.kf_idx,
-                best.score,
-                best.shared_words,
-                candidates.len()
-            ));
-        }
-
-        let Some(pgo_config) = self.pgo_config.clone() else {
-            return;
-        };
-        if pgo_config.require_imu_initialized && !self.state.imu_initialized {
-            return;
-        }
-        let inertial_pgo = self.state.imu_initialized.then_some(InertialPgoContext {
-            gravity_world: self.gravity_world,
-        });
-        let (events, accepted, corrected_tracking_state, pgo_applied) = {
+        let outcome = {
             let mut map = self.map.lock().unwrap();
-            let mut events = Vec::new();
-            let mut accepted = None;
-            let mut corrected_tracking_state = None;
-            let mut pgo_applied = false;
-            for candidate in &candidates {
-                let pair = normalized_loop_pair(kf_idx, candidate.kf_idx);
-                if self.verified_loop_pairs.contains(&pair) {
-                    continue;
-                }
-                if let Ok(edge) = verify_loop_candidate(
-                    &map,
-                    &self.camera,
-                    kf_idx,
-                    candidate.kf_idx,
-                    &pgo_config.verification,
-                ) {
-                    let query_order = map
-                        .keyframes()
-                        .iter()
-                        .position(|keyframe| keyframe.frame.idx == kf_idx)
-                        .expect("verified query keyframe must be in the map");
-                    let candidate_order = map
-                        .keyframes()
-                        .iter()
-                        .position(|keyframe| keyframe.frame.idx == candidate.kf_idx)
-                        .expect("verified candidate keyframe must be in the map");
-                    let decision = self
-                        .loop_episode_tracker
-                        .as_mut()
-                        .expect("PGO config must create an episode tracker")
-                        .observe(query_order, candidate_order, edge.clone());
-                    match decision {
-                        LoopEpisodeDecision::Pending { .. }
-                        | LoopEpisodeDecision::Suppressed { .. } => {}
-                        LoopEpisodeDecision::Ready { representative, .. } => {
-                            let pair = normalized_loop_pair(
-                                representative.query_kf_idx,
-                                representative.candidate_kf_idx,
-                            );
-                            let mut loops = self.verified_loops.clone();
-                            loops.push(representative.clone());
-                            match optimize_pose_graph(
-                                &map,
-                                &loops,
-                                &pgo_config.optimizer,
-                                inertial_pgo,
-                            ) {
-                                Ok(result) => {
-                                    if result.usable {
-                                        let tracking_correction = self
-                                            .state
-                                            .current_keyframe_idx
-                                            .and_then(|reference_kf_idx| {
-                                                pose_graph_reference_correction(
-                                                    reference_kf_idx,
-                                                    &result.keyframe_indices,
-                                                    &result.original_poses,
-                                                    &result.optimized_poses,
-                                                )
-                                            })
-                                            .map(|(reference_before, reference_after, world)| {
-                                                (
-                                                    apply_reference_pose_correction(
-                                                        self.state.pose_world_to_cam,
-                                                        reference_before,
-                                                        reference_after,
-                                                    ),
-                                                    world.rotation * self.state.velocity_world,
-                                                )
-                                            });
-                                        if let Some(tracking_correction) = tracking_correction {
-                                            match map.apply_pose_graph_correction(
-                                                &result.keyframe_indices,
-                                                &result.original_poses,
-                                                &result.optimized_poses,
-                                            ) {
-                                                Ok(_) => {
-                                                    fuse_verified_loop(
-                                                        &mut map,
-                                                        &self.camera,
-                                                        &representative,
-                                                        &pgo_config.fusion,
-                                                    );
-                                                    corrected_tracking_state =
-                                                        Some(tracking_correction);
-                                                    pgo_applied = true;
-                                                }
-                                                Err(error) => {
-                                                    events.push(LoopClosureEvent::PgoFailed {
-                                                        query_kf_idx: representative.query_kf_idx,
-                                                        candidate_kf_idx: representative
-                                                            .candidate_kf_idx,
-                                                        reason: format!(
-                                                            "live map correction rejected: {error}"
-                                                        ),
-                                                    })
-                                                }
-                                            }
-                                        } else {
-                                            events.push(LoopClosureEvent::PgoFailed {
-                                                    query_kf_idx: representative.query_kf_idx,
-                                                    candidate_kf_idx: representative
-                                                        .candidate_kf_idx,
-                                                    reason: "current reference keyframe is outside the PGO snapshot"
-                                                        .into(),
-                                                });
-                                        }
-                                    }
-                                }
-                                Err(error) => events.push(LoopClosureEvent::PgoFailed {
-                                    query_kf_idx: representative.query_kf_idx,
-                                    candidate_kf_idx: representative.candidate_kf_idx,
-                                    reason: error.to_string(),
-                                }),
-                            }
-                            events.push(LoopClosureEvent::Accepted {
-                                edge: representative.clone(),
-                                applied: pgo_applied,
-                            });
-                            accepted = Some((pair, representative));
-                        }
-                    }
-                    break;
-                }
-            }
-            (events, accepted, corrected_tracking_state, pgo_applied)
+            self.loop_closer
+                .on_keyframe(&mut map, &self.camera, kf_idx, context)
         };
-        if let Some((corrected_tracking_pose, corrected_velocity)) = corrected_tracking_state {
-            self.state.pose_world_to_cam = corrected_tracking_pose;
-            self.state.velocity_world = corrected_velocity;
+        self.apply_loop_closure_outcome(outcome);
+    }
+
+    fn apply_loop_closure_outcome(&mut self, outcome: LoopClosingOutcome) {
+        if let Some(message) = outcome.debug_message {
+            self.dbg(message);
         }
-        if pgo_applied {
+        if let Some(correction) = outcome.reference_correction {
+            self.state.pose_world_to_cam = apply_reference_pose_correction(
+                self.state.pose_world_to_cam,
+                correction.before,
+                correction.after,
+            );
+            self.state.velocity_world = correction.world.rotation * self.state.velocity_world;
             self.track_set = TrackSet::new();
             if self.state.imu_initialized {
                 let job = self.keyframe_job();
@@ -1378,16 +1190,8 @@ impl SlamSystem {
                 self.apply_local_mapping_results();
             }
         }
-        self.loop_closure_events.extend(events);
-        if let Some((pair, edge)) = accepted {
-            self.verified_loop_pairs.insert(pair);
-            self.verified_loops.push(edge);
-        }
+        self.loop_closure_events.extend(outcome.events);
     }
-}
-
-fn normalized_loop_pair(a: usize, b: usize) -> (usize, usize) {
-    if a <= b { (a, b) } else { (b, a) }
 }
 
 fn carry_klt_survivors(track_set: &mut TrackSet, survivors: Option<Vec<FlowSurvivor>>) {
@@ -1426,21 +1230,6 @@ fn pose_graph_tracking_correction(
         reference_before,
         reference_after,
     ))
-}
-
-fn pose_graph_reference_correction(
-    reference_kf_idx: usize,
-    keyframe_indices: &[usize],
-    poses_before: &[Pose3d],
-    poses_after: &[Pose3d],
-) -> Option<(Pose3d, Pose3d, Pose3d)> {
-    let node = keyframe_indices
-        .iter()
-        .position(|&keyframe_idx| keyframe_idx == reference_kf_idx)?;
-    let reference_before = *poses_before.get(node)?;
-    let reference_after = *poses_after.get(node)?;
-    let world_correction = reference_after.inverse().compose(&reference_before);
-    Some((reference_before, reference_after, world_correction))
 }
 
 #[cfg(test)]
@@ -1681,5 +1470,73 @@ mod tests {
 
         carry_klt_survivors(&mut tracks, None);
         assert!(tracks.is_empty());
+    }
+    #[test]
+    fn loop_closure_outcome_only_changes_tracking_after_map_correction() {
+        use crate::loop_closure::{LoopClosingOutcome, LoopClosureEvent, ReferencePoseCorrection};
+        use crate::map::LocalMappingMode;
+        let camera = PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let mut system = SlamSystem::new(
+            camera,
+            SlamConfig {
+                local_mapping: LocalMappingMode::Synchronous,
+                ..SlamConfig::default()
+            },
+        );
+        let before = Pose3d::new(SO3F64::IDENTITY.matrix(), Vec3F64::new(-1.0, 0.0, 0.0));
+        let relative = Pose3d::new(SO3F64::IDENTITY.matrix(), Vec3F64::new(0.0, 0.0, 0.2));
+        let live_pose = relative.compose(&before);
+        let velocity = Vec3F64::new(1.0, 0.2, -0.5);
+        system.state.pose_world_to_cam = live_pose;
+        system.state.velocity_world = velocity;
+        system
+            .track_set
+            .reconcile_from_matches(
+                &[MapKeypointMatch {
+                    map_point_idx: 42,
+                    keypoint_idx: 0,
+                }],
+                &[[10.0, 20.0]],
+            )
+            .unwrap();
+        system.apply_loop_closure_outcome(LoopClosingOutcome {
+            events: vec![LoopClosureEvent::PgoFailed {
+                query_kf_idx: 10,
+                candidate_kf_idx: 0,
+                reason: "rejected".into(),
+            }],
+            ..LoopClosingOutcome::default()
+        });
+        assert_eq!(system.state.pose_world_to_cam, live_pose);
+        assert_eq!(system.state.velocity_world, velocity);
+        assert_eq!(system.track_set.len(), 1);
+        assert_eq!(system.drain_loop_closure_events().len(), 1);
+        assert!(system.drain_loop_closure_events().is_empty());
+
+        let yaw = SO3F64::exp(Vec3F64::new(0.0, 0.4, 0.0)).matrix();
+        let after = Pose3d::new(yaw.transpose(), Vec3F64::new(-2.0, 0.0, 0.0));
+        system.apply_loop_closure_outcome(LoopClosingOutcome {
+            reference_correction: Some(ReferencePoseCorrection {
+                before,
+                after,
+                world: after.inverse().compose(&before),
+            }),
+            ..LoopClosingOutcome::default()
+        });
+        assert_pose_close(
+            Pose3d::between(&after, &system.state.pose_world_to_cam),
+            relative,
+        );
+        assert!((system.state.velocity_world - yaw * velocity).length() < 1e-10);
+        assert!(system.track_set.is_empty());
     }
 }
