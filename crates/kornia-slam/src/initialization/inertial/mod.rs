@@ -24,6 +24,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::ImuBias;
 
+pub use crate::map::KeyframeVelocity;
 use crate::map::{Keyframe, Map};
 
 /// A keyframe window is monocular unless its first keyframe carries stereo data.
@@ -117,12 +118,6 @@ impl ImuInitConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 // Requests, results, rejections
 // ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct KeyframeVelocity {
-    pub keyframe_idx: usize,
-    pub velocity_world: Vec3F64,
-}
 
 #[derive(Debug, Clone)]
 pub struct ImuInitResult {
