@@ -36,7 +36,7 @@ use kornia_imgproc::resize::resize_fast_mono;
 use kornia_sensors::imu::ImuMeasurement;
 use kornia_slam::map::LocalMappingMode;
 use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches};
-use kornia_slam::{Frame, LoopClosureEvent, PgoPipelineConfig, PipelineConfig, SlamPipeline};
+use kornia_slam::{Frame, LoopClosingConfig, LoopClosureEvent, SlamConfig, SlamSystem};
 #[cfg(feature = "oakd")]
 use source::OakdSource;
 #[cfg(feature = "uvc")]
@@ -513,17 +513,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // ── SLAM system ────────────────────────────────────────────────────────
-    let pipeline_config = PipelineConfig {
+    let slam_config = SlamConfig {
         debug: args.debug,
         local_mapping: args.local_mapping,
         stereo_close_depth_m,
-        pgo: args.apply_pgo.then(|| PgoPipelineConfig {
+        pgo: args.apply_pgo.then(|| LoopClosingConfig {
             require_imu_initialized: imu_enabled,
-            ..PgoPipelineConfig::default()
+            ..LoopClosingConfig::default()
         }),
-        ..PipelineConfig::default()
+        ..SlamConfig::default()
     };
-    let mut system = SlamPipeline::new(camera.clone(), pipeline_config);
+    let mut system = SlamSystem::new(camera.clone(), slam_config);
     if let Some(vocab_path) = args.vocab.as_deref() {
         use kornia_slam::place_recognition::{Vocabulary, load_orb_slam3_vocabulary};
         let vocab = if vocab_path.ends_with(".txt") {
