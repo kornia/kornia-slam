@@ -3,7 +3,7 @@
 pub mod frame;
 pub mod initialization;
 pub mod loop_closure;
-pub mod map;
+pub mod mapping;
 pub mod place_recognition;
 mod pose_conversion;
 mod sparse_pgo;
@@ -14,6 +14,8 @@ pub mod vi_ba_schur;
 
 pub use frame::Frame;
 pub use kornia_imgproc::features::OrbFeatures;
+/// Compatibility alias: the map now lives under [`mapping`].
+pub use mapping::map;
 pub use system::{LoopClosingConfig, LoopClosureEvent, SlamConfig, SlamSystem};
 pub use tracking::pose_estimation::MapProjectionEstimator;
 pub use tracking::{KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus};
