@@ -166,7 +166,6 @@ impl Map {
                 live.preintegrated = optimized.preintegrated.clone();
             }
         }
-        self.cull();
         Some(result)
     }
 

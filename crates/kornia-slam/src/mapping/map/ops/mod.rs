@@ -2,7 +2,6 @@
 
 mod bundle_adjustment;
 mod correction;
-mod culling;
 mod growth;
 mod mutation;
 mod queries;

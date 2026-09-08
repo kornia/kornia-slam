@@ -11,11 +11,10 @@
 //! | `correction` | `apply_pose_graph_correction`, `apply_inertial_alignment`, `scale_world` |
 //! | `queries` | `covisible_keyframes` — the remaining structural query |
 //! | `growth` | `add_close_stereo_points`, `grow_map_points_from_keyframe_pair`, `fuse_into_neighbors` |
-//! | `culling` | `cull` |
 //! | `bundle_adjustment` | `local_ba_snapshot`, `merge_local_ba_snapshot`, `run_local_ba` |
 //!
 //! Callers are unaffected by the grouping: the methods stay inherent on `Map`,
-//! so `map.cull()` and `map::MapPoint` resolve exactly as before. Scheduling the
+//! so `map.keyframes()` and `map::MapPoint` resolve exactly as before. Scheduling the
 //! BA worker is separate again, and stays in [`local_mapping`].
 
 mod keyframe;

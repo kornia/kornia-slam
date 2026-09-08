@@ -105,11 +105,18 @@ impl LocalMapping {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .local_ba_snapshot();
                 let snapshot = solve_snapshot(snapshot, camera, &job);
-                if let Some(result) = map
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .merge_local_ba_snapshot(snapshot)
-                {
+                // Cull under the same lock as the merge, so a completed result
+                // is never observable before cleanup. A rejected snapshot culls
+                // nothing.
+                let merged = {
+                    let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let merged = map.merge_local_ba_snapshot(snapshot);
+                    if merged.is_some() {
+                        crate::mapping::culling::cull_landmarks(&mut map);
+                    }
+                    merged
+                };
+                if let Some(result) = merged {
                     results
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -221,10 +228,15 @@ impl LocalMappingHandle {
                         let _publication = publication_gate
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let merged = map
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .merge_local_ba_snapshot(snapshot);
+                        let merged = {
+                            let mut map =
+                                map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let merged = map.merge_local_ba_snapshot(snapshot);
+                            if merged.is_some() {
+                                crate::mapping::culling::cull_landmarks(&mut map);
+                            }
+                            merged
+                        };
                         merged.is_some_and(|result| result_sender.send(result).is_err())
                     };
                     if should_stop {

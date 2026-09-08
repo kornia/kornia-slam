@@ -5,6 +5,7 @@
 //! scheduling are mapping algorithms layered on top; they read the map
 //! immutably and write only through its operations.
 
+pub mod culling;
 pub mod map;
 
 pub use map::{Keyframe, KeyframeJob, LocalMapping, LocalMappingMode, Map, MapPoint};
