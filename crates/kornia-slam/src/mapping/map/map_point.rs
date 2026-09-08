@@ -117,6 +117,10 @@ impl MapPoint {
         Some(removed)
     }
 
+    pub(crate) fn clear_observations(&mut self) {
+        self.observations.clear();
+    }
+
     pub fn observations(&self) -> &[LandmarkObservation] {
         &self.observations
     }

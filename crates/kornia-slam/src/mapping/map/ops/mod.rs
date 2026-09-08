@@ -15,5 +15,8 @@ pub use correction::{
     InertialAlignment, InertialAlignmentError, KeyframeVelocity, PoseGraphCorrectionError,
     PoseGraphCorrectionResult,
 };
-pub use mutation::{MapPointMergeResult, TriangulatedPoint};
+pub use mutation::{
+    InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError,
+    MapPointMergeResult, ObservationLink, TriangulatedPoint,
+};
 pub use queries::covisible_above_weight;

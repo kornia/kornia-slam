@@ -32,6 +32,9 @@ pub use ops::{
     LocalBaMergeResult, LocalBaSnapshot, MapPointMergeResult, PoseGraphCorrectionError,
     PoseGraphCorrectionResult, STEREO_DEPTH_MIN_SIGMA, STEREO_DEPTH_REL_SIGMA, TriangulatedPoint,
 };
+pub use ops::{
+    InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError, ObservationLink,
+};
 
 use kornia_sensors::imu::{ImuMeasurement, PreintegratedImu};
 
