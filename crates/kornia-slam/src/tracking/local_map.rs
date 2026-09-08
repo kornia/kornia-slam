@@ -52,7 +52,7 @@ pub fn select_local_landmarks(
     let mut keyframe_votes: HashMap<usize, usize> = HashMap::new();
     for &mp_idx in matched_landmark_ids {
         if let Some(mp) = map.map_points().get(mp_idx) {
-            for &obs_kf in &mp.observation_kf_indices {
+            for obs_kf in mp.observer_keyframes() {
                 *keyframe_votes.entry(obs_kf).or_insert(0) += 1;
             }
         }

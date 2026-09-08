@@ -3,7 +3,9 @@
 //! Behaviour-preserving relocation: the existing split between keyframe
 //! association and point-side registration is unchanged here.
 
-use crate::map::{ImuFactor, Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
+use crate::map::{
+    ImuFactor, Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR, ObservationKey,
+};
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::{ImuMeasurement, PreintegratedImu};
 use std::collections::HashSet;
@@ -86,7 +88,7 @@ impl Map {
     ) -> usize {
         let first_mp_idx = self.map_points.len();
         let curr_kf_idx = curr_kf.frame.idx;
-        for (i, &(position, descriptor, color, _, curr_desc_idx)) in points.iter().enumerate() {
+        for &(position, descriptor, color, _, curr_desc_idx) in points.iter() {
             let octave = curr_kf
                 .frame
                 .features
@@ -101,8 +103,16 @@ impl Map {
                 .get(curr_desc_idx)
                 .copied()
                 .unwrap_or(descriptor);
-            self.push_map_point(MapPoint::new(position, desc, octave, color, curr_kf_idx));
-            curr_kf.associate_map_point(curr_desc_idx, first_mp_idx + i);
+            let mp_idx =
+                self.push_map_point(MapPoint::new(position, desc, octave, color, curr_kf_idx));
+            self.map_points[mp_idx].add_observation(
+                ObservationKey {
+                    keyframe_idx: curr_kf_idx,
+                    feature_idx: curr_desc_idx,
+                },
+                desc,
+            );
+            curr_kf.associate_map_point(curr_desc_idx, mp_idx);
         }
         if let Some(prev) = prev_kf {
             let prev_kf_idx = prev.frame.idx;
@@ -113,7 +123,13 @@ impl Map {
                 if let Some(&prev_desc) = prev.frame.features.descriptors.get(prev_desc_idx)
                     && let Some(mp) = self.map_points.get_mut(first_mp_idx + i)
                 {
-                    mp.add_observation_descriptor(prev_kf_idx, prev_desc);
+                    mp.add_observation(
+                        ObservationKey {
+                            keyframe_idx: prev_kf_idx,
+                            feature_idx: prev_desc_idx,
+                        },
+                        prev_desc,
+                    );
                 }
             }
         }
@@ -133,7 +149,13 @@ impl Map {
         };
         let kf_idx = keyframe.frame.idx;
         if let Some(mp) = self.map_points.get_mut(mp_idx) {
-            mp.add_observation_descriptor(kf_idx, descriptor);
+            mp.add_observation(
+                ObservationKey {
+                    keyframe_idx: kf_idx,
+                    feature_idx: desc_idx,
+                },
+                descriptor,
+            );
         }
         self.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
     }
@@ -150,7 +172,13 @@ impl Map {
             return;
         };
         if let Some(mp) = self.map_points.get_mut(mp_idx) {
-            mp.add_observation_descriptor(kf_idx, descriptor);
+            mp.add_observation(
+                ObservationKey {
+                    keyframe_idx: kf_idx,
+                    feature_idx: desc_idx,
+                },
+                descriptor,
+            );
         }
         self.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
     }
@@ -169,7 +197,7 @@ impl Map {
             }
             (
                 mp.position,
-                mp.observation_kf_indices.clone(),
+                mp.observer_keyframes().collect::<Vec<_>>(),
                 mp.keyframe_idx,
                 mp.reference_octave,
             )
@@ -243,14 +271,9 @@ impl Map {
             return None;
         }
 
-        let support = |point: &MapPoint| {
-            point
-                .observation_kf_indices
-                .iter()
-                .copied()
-                .collect::<HashSet<_>>()
-                .len()
-        };
+        // Records already carry at most one entry per keyframe, so support is
+        // simply the number of links.
+        let support = |point: &MapPoint| point.observations().len();
         let first_support = support(first_point);
         let second_support = support(second_point);
         let second_is_stronger = second_support > first_support
@@ -294,26 +317,13 @@ impl Map {
             }
         }
 
-        let replaced_observations: Vec<_> = self.map_points[replaced]
-            .observation_kf_indices
-            .iter()
-            .copied()
-            .zip(
-                self.map_points[replaced]
-                    .observed_descriptors
-                    .iter()
-                    .copied(),
-            )
-            .collect();
+        let replaced_observations: Vec<_> = self.map_points[replaced].observations().to_vec();
         let replaced_visible = self.map_points[replaced].n_visible;
         let replaced_found = self.map_points[replaced].n_found;
-        for (keyframe_idx, descriptor) in replaced_observations {
-            if !self.map_points[survivor]
-                .observation_kf_indices
-                .contains(&keyframe_idx)
-            {
-                self.map_points[survivor].add_observation_descriptor(keyframe_idx, descriptor);
-            }
+        // `add_observation` is a no-op where the survivor already observes that
+        // keyframe, so its own feature and descriptor contribution are kept.
+        for observation in replaced_observations {
+            self.map_points[survivor].add_observation(observation.key, observation.descriptor);
         }
         self.map_points[survivor].n_visible = self.map_points[survivor]
             .n_visible
@@ -335,7 +345,7 @@ impl Map {
 #[cfg(test)]
 mod tests {
     use crate::map::{
-        Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR,
+        Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR, ObservationKey,
         tests::{test_frame, test_frame_with_pose},
     };
     use kornia_3d::pose::Pose3d;
@@ -407,7 +417,20 @@ mod tests {
             [0; 3],
             0,
         ));
-        map.map_points_mut()[survivor].add_observation_descriptor(1, [1; 32]);
+        map.map_points_mut()[survivor].add_observation(
+            ObservationKey {
+                keyframe_idx: 0,
+                feature_idx: 0,
+            },
+            [0; 32],
+        );
+        map.map_points_mut()[survivor].add_observation(
+            ObservationKey {
+                keyframe_idx: 1,
+                feature_idx: 0,
+            },
+            [1; 32],
+        );
         map.map_points_mut()[survivor].n_visible = 7;
         map.map_points_mut()[survivor].n_found = 5;
         map.get_keyframe_mut(0)
@@ -424,7 +447,20 @@ mod tests {
             [0; 3],
             2,
         ));
-        map.map_points_mut()[replaced].add_observation_descriptor(1, [11; 32]);
+        map.map_points_mut()[replaced].add_observation(
+            ObservationKey {
+                keyframe_idx: 2,
+                feature_idx: 0,
+            },
+            [2; 32],
+        );
+        map.map_points_mut()[replaced].add_observation(
+            ObservationKey {
+                keyframe_idx: 1,
+                feature_idx: 1,
+            },
+            [11; 32],
+        );
         map.map_points_mut()[replaced].n_visible = 4;
         map.map_points_mut()[replaced].n_found = 3;
         map.get_keyframe_mut(2)
@@ -444,9 +480,7 @@ mod tests {
         assert_eq!(map.map_points()[survivor].n_found, 8);
         assert_eq!(
             map.map_points()[survivor]
-                .observation_kf_indices
-                .iter()
-                .copied()
+                .observer_keyframes()
                 .collect::<HashSet<_>>(),
             HashSet::from([0, 1, 2])
         );
@@ -541,6 +575,15 @@ mod tests {
             [0; 3],
             0,
         ));
+        // The reference observation is explicit now: `MapPoint::new` no longer
+        // fabricates an observer from its reference keyframe id alone.
+        map.map_points_mut()[mp_idx].add_observation(
+            ObservationKey {
+                keyframe_idx: 0,
+                feature_idx: 0,
+            },
+            [0u8; 32],
+        );
         map.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
 
         // Single observation from the origin looking at (0,0,5): normal = +z.

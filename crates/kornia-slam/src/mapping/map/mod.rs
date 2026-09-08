@@ -25,7 +25,7 @@ mod ops;
 
 pub use keyframe::Keyframe;
 pub use local_mapping::{KeyframeJob, LocalMapping, LocalMappingMode};
-pub use map_point::MapPoint;
+pub use map_point::{LandmarkObservation, MapPoint, ObservationKey};
 pub use ops::covisible_above_weight;
 pub use ops::{
     InertialAlignment, InertialAlignmentError, KeyframeBaCorrection, KeyframeVelocity,

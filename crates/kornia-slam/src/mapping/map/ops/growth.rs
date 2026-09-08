@@ -339,7 +339,7 @@ impl Map {
                         _ => continue,
                     };
                     // Skip if neighbor already observes this map point.
-                    if mp.observation_kf_indices.contains(&nb_kf_idx) {
+                    if mp.is_observed_by(nb_kf_idx) {
                         continue;
                     }
 
@@ -462,7 +462,12 @@ mod tests {
             map.map_points()[added].position,
             Vec3F64::new(1.0, 0.0, 3.0)
         );
-        assert_eq!(map.map_points()[added].observation_kf_indices, vec![10]);
+        assert_eq!(
+            map.map_points()[added]
+                .observer_keyframes()
+                .collect::<Vec<_>>(),
+            vec![10]
+        );
         assert_eq!(kf.map_point(2), None);
         assert_eq!(kf.map_point(3), None);
         assert_eq!(map.add_close_stereo_points(&mut kf, 5.0, &camera()), 0);
@@ -508,9 +513,9 @@ mod tests {
             assert_eq!(map.get_keyframe(10).unwrap().map_point(i), Some(mp));
             let point = &map.map_points()[mp];
             assert!((point.position - *expected).length() < 1e-4);
-            assert_eq!(point.observation_kf_indices.len(), 2);
-            assert!(point.observation_kf_indices.contains(&10));
-            assert!(point.observation_kf_indices.contains(&20));
+            assert_eq!(point.observations().len(), 2);
+            assert!(point.is_observed_by(10));
+            assert!(point.is_observed_by(20));
         }
         assert_eq!(
             map.grow_map_points_from_keyframe_pair(
@@ -551,8 +556,8 @@ mod tests {
 
         assert_eq!(map.fuse_into_neighbors(10, &[10, 20, 999], &camera()), 1);
         assert_eq!(map.get_keyframe(20).unwrap().map_point(0), Some(best));
-        assert!(map.map_points()[best].observation_kf_indices.contains(&20));
-        assert!(!map.map_points()[worse].observation_kf_indices.contains(&20));
+        assert!(map.map_points()[best].is_observed_by(20));
+        assert!(!map.map_points()[worse].is_observed_by(20));
         assert_eq!(map.fuse_into_neighbors(10, &[20], &camera()), 0);
     }
 }

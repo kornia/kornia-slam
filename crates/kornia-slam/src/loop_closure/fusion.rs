@@ -117,9 +117,7 @@ fn fuse_loop_direction(
                 let Some(source_point) = map.map_points().get(source_point_idx) else {
                     continue;
                 };
-                if source_point.culled
-                    || source_point.observation_kf_indices.contains(&target_kf_idx)
-                {
+                if source_point.culled || source_point.is_observed_by(target_kf_idx) {
                     continue;
                 }
                 let Some(target) = map.get_keyframe(target_kf_idx) else {

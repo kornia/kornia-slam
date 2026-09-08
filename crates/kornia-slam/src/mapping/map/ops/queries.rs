@@ -16,7 +16,7 @@ impl Map {
     /// weight and then descending frame index for determinism. An unknown
     /// keyframe yields an empty result.
     ///
-    /// Derived on demand by inverting `MapPoint::observation_kf_indices` — no
+    /// Derived on demand by inverting each landmark's observation records — no
     /// cached graph state, so it stays correct across culls and fuses.
     pub fn covisible_keyframes(&self, kf_idx: usize) -> Vec<(usize, usize)> {
         let Some(kf) = self.get_keyframe(kf_idx) else {
@@ -31,7 +31,7 @@ impl Map {
             if mp.culled {
                 continue;
             }
-            for &obs_kf in &mp.observation_kf_indices {
+            for obs_kf in mp.observer_keyframes() {
                 if obs_kf != kf_idx {
                     *weights.entry(obs_kf).or_insert(0) += 1;
                 }

@@ -327,7 +327,7 @@ fn loop_fusion_attaches_a_point_to_an_unassociated_loop_keypoint() {
     assert_eq!(stats.observations_added, 1);
     assert_eq!(stats.map_points_merged, 0);
     assert_eq!(map.get_keyframe(10).unwrap().map_point(0), Some(point));
-    assert!(map.map_points()[point].observation_kf_indices.contains(&10));
+    assert!(map.map_points()[point].is_observed_by(10));
 }
 
 #[test]
