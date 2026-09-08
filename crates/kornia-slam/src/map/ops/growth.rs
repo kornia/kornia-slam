@@ -3,7 +3,7 @@
 //! Operations borrow the map directly. The runtime owns synchronization and
 //! invokes them in keyframe insertion order under its publication gate.
 
-use super::{Keyframe, Map, ORB_SCALE_FACTOR};
+use crate::map::{Keyframe, Map, ORB_SCALE_FACTOR};
 use crate::stereo::unproject_stereo;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::{Pose3d, TriangulationConfig, triangulate_matched_points};
@@ -421,8 +421,8 @@ impl Map {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{MapPoint, tests::test_frame};
     use super::*;
+    use crate::map::{MapPoint, tests::test_frame};
 
     fn camera() -> PinholeCamera {
         PinholeCamera {

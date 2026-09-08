@@ -1,8 +1,6 @@
 //! Bundle adjustment and publication of optimized map snapshots.
 
-use super::{
-    Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR, STEREO_DEPTH_MIN_SIGMA, STEREO_DEPTH_REL_SIGMA,
-};
+use crate::map::{Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR};
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::bundle_adjust_schur;
 use kornia_3d::camera::PinholeCamera;
@@ -11,6 +9,14 @@ use kornia_3d::ransac::RobustKernelKind;
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::{ImuBias, PreintegratedImu};
 use std::collections::{HashMap, HashSet};
+
+/// Relative standard deviation of a stereo depth measurement, as a fraction of
+/// the measured depth (used to weight the BA depth residual). Depth-proportional
+/// so far points—where disparity is least reliable—are downweighted.
+pub const STEREO_DEPTH_REL_SIGMA: f32 = 0.05;
+/// Floor on the stereo depth sigma (metres) to avoid over-trusting very near
+/// points.
+pub const STEREO_DEPTH_MIN_SIGMA: f32 = 0.02;
 
 #[derive(Debug, Clone, Copy)]
 struct KeyframeBaState {
@@ -687,8 +693,8 @@ fn initial_ba_diagnostics(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{MapPoint, tests::test_frame};
     use super::*;
+    use crate::map::{MapPoint, tests::test_frame};
     #[test]
     fn stereo_depth_obs_uses_proportional_sigma_with_floor() {
         let mut frame = test_frame(0, vec![[0u8; 32], [1u8; 32]]);
