@@ -75,3 +75,36 @@ fn loop_closing_types_keep_existing_public_paths() {
     let event: kornia_slam::system::LoopClosureEvent = event;
     let _: kornia_slam::LoopClosureEvent = event;
 }
+
+#[test]
+fn tracking_state_and_policy_exports_remain_compatible() {
+    let mut state: kornia_slam::tracking::SystemState = kornia_slam::SystemState::new();
+    state.mode = kornia_slam::SystemMode::Tracking;
+    state.reset();
+    assert_eq!(state.mode, kornia_slam::tracking::SystemMode::Bootstrap);
+    let _: kornia_slam::tracking::KeyframePolicy = kornia_slam::KeyframePolicy::default();
+    let result = kornia_slam::TrackingResult {
+        pose_world_to_cam: state.pose_world_to_cam,
+        status: kornia_slam::tracking::TrackingStatus::Skipped,
+    };
+    let _: kornia_slam::tracking::TrackingResult = result;
+}
+
+#[test]
+fn sensor_rig_is_constructible_from_the_public_api() {
+    use kornia_3d::pose::Pose3d;
+    use kornia_slam::{ImuCalibration, SensorRig};
+
+    let rig = SensorRig {
+        camera: test_camera(),
+        imu: Some(ImuCalibration::new(Pose3d::IDENTITY)),
+    };
+    let _system = SlamSystem::with_rig(rig, SlamConfig::default());
+    let _visual = SlamSystem::with_rig(
+        SensorRig {
+            camera: test_camera(),
+            imu: None,
+        },
+        SlamConfig::default(),
+    );
+}

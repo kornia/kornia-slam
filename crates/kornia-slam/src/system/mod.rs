@@ -4,18 +4,19 @@
 //! in the same order frames move through the system.
 
 pub mod config;
+mod inertial;
+
+use inertial::InertialState;
 
 pub use crate::loop_closure::LoopClosureEvent;
-#[cfg(test)]
-use crate::loop_closure::pose_graph_reference_correction;
 pub use config::{LoopClosingConfig, SlamConfig};
 
 use std::sync::{Arc, Mutex};
 
 use crate::Frame;
 use crate::initialization::{
-    ImuInitConfig, ImuInitNotReadyReason, ImuInitResult, ImuInitializer, InertialInitOutcome,
-    TwoViewInitConfig, try_initialize_two_view,
+    ImuInitNotReadyReason, ImuInitResult, InertialInitOutcome, TwoViewInitConfig,
+    try_initialize_two_view,
 };
 use crate::loop_closure::{InertialPgoContext, LoopCloser, LoopClosingContext, LoopClosingOutcome};
 use crate::map::{
@@ -23,33 +24,27 @@ use crate::map::{
 };
 use crate::place_recognition::Vocabulary;
 use crate::pose_conversion::rotation_from_to;
+use crate::sensor_rig::{ImuCalibration, SensorRig};
 use crate::stereo::unproject_stereo;
-use crate::tracking::optical_flow::{
-    FlowSurvivor, KltTracker, MapKeypointMatch, TrackSet, snap_unique,
-};
-use crate::tracking::pose_estimation::MapProjectionEstimator;
 use crate::tracking::{
-    KeyframePolicy, SystemMode, SystemState, TrackingLossRecoveryPolicy, TrackingResult,
-    TrackingStatus,
+    InertialPrediction, KeyframePolicy, RecoveryDecision, SystemMode, Tracker, TrackingInput,
+    TrackingResult, TrackingStatus,
 };
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use kornia_image::Image;
-use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
+use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuMeasurement};
 
 /// Top-level SLAM system: orchestrates tracking, mapping, and state transitions.
 pub struct SlamSystem {
-    // Camera model
-    camera: PinholeCamera,
-    // Primary pose estimator
-    estimator: MapProjectionEstimator,
+    // Fixed camera and IMU calibration
+    rig: SensorRig,
+    tracker: Tracker,
     // Boostrap pose estimator
     two_view_init_config: TwoViewInitConfig,
     // Keyframe insertion policy
     keyframe_policy: KeyframePolicy,
-    // Recently-lost grace period policy
-    tracking_loss_recovery: TrackingLossRecoveryPolicy,
     // mThDepth (metres): back-project close stereo points at each keyframe when set
     stereo_close_depth: Option<f64>,
     // Emit per-frame diagnostic logs (skip/reject reasons, growth counters)
@@ -61,27 +56,10 @@ pub struct SlamSystem {
     map: Arc<Mutex<Map>>,
     // Serializes compound map publication and short local-BA snapshot/merge phases.
     map_publication_gate: Option<Arc<Mutex<()>>>,
-    // IMU states
-    imu_calib: ImuCalib,
-    imu_bias: ImuBias,
-    // Camera-to-body extrinsic T_BC (X_body = T_BC * X_cam). IMU deltas live in
-    // the body frame, so every place that mixes them with camera poses must go
-    // through this; None disables the inertial path entirely.
-    imu_t_bc: Option<Pose3d>,
-    pending_imu: Vec<ImuMeasurement>,
-    gravity_world: Vec3F64,
-    bootstrap_timestamp_sec: Option<f64>,
-    last_keyframe_timestamp_sec: Option<f64>,
-    // Owns the inertial-initialization window, readiness gate and the
-    // VIBA0/VIBA1/VIBA2 schedule; the system only applies its results.
-    inertial_init: ImuInitializer,
+    inertial: InertialState,
     local_mapping: LocalMapping,
-    klt_tracker: KltTracker,
-    track_set: TrackSet,
     loop_closer: LoopCloser,
     loop_closure_events: Vec<LoopClosureEvent>,
-    // System state
-    state: SystemState,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -95,38 +73,27 @@ pub(crate) enum ImuInitApplyError {
 impl SlamSystem {
     /// Creates a new SLAM system with identity pose.
     pub fn new(camera: PinholeCamera, config: SlamConfig) -> Self {
+        Self::with_rig(SensorRig { camera, imu: None }, config)
+    }
+
+    /// Creates a SLAM system with fixed camera and optional IMU calibration.
+    pub fn with_rig(rig: SensorRig, config: SlamConfig) -> Self {
         let map = Arc::new(Mutex::new(Map::new()));
         let local_mapping =
-            LocalMapping::new(config.local_mapping, Arc::clone(&map), camera.clone());
+            LocalMapping::new(config.local_mapping, Arc::clone(&map), rig.camera.clone());
         let map_publication_gate = local_mapping.publication_gate();
         Self {
-            camera,
-            estimator: MapProjectionEstimator::new(config.map_projection),
+            rig,
+            tracker: Tracker::new(config.map_projection, config.tracking_loss_recovery),
             two_view_init_config: config.two_view_init,
             keyframe_policy: config.keyframe_policy,
-            tracking_loss_recovery: config.tracking_loss_recovery,
             stereo_close_depth: config.stereo_close_depth_m,
             debug: config.debug,
             debug_messages: Vec::new(),
             map,
             map_publication_gate,
             local_mapping,
-            state: SystemState::new(),
-            imu_calib: ImuCalib {
-                gyro_noise: 1.6968e-4,
-                accel_noise: 2.0e-3,
-                gyro_bias_noise: 1.9393e-5,
-                accel_bias_noise: 3.0e-3,
-            },
-            imu_bias: ImuBias::default(),
-            imu_t_bc: None,
-            pending_imu: Vec::new(),
-            gravity_world: Vec3F64::new(0.0, 0.0, -GRAVITY_MAGNITUDE),
-            bootstrap_timestamp_sec: None,
-            last_keyframe_timestamp_sec: None,
-            inertial_init: ImuInitializer::new(ImuInitConfig::default()),
-            klt_tracker: KltTracker::default(),
-            track_set: TrackSet::new(),
+            inertial: InertialState::new(),
             loop_closer: LoopCloser::new(config.pgo),
             loop_closure_events: Vec::new(),
         }
@@ -135,9 +102,9 @@ impl SlamSystem {
     /// The local-mapping job description for the current system state.
     fn keyframe_job(&self) -> KeyframeJob {
         KeyframeJob {
-            imu_initialized: self.state.imu_initialized,
-            imu_t_bc: self.imu_t_bc,
-            gravity_world: self.gravity_world,
+            imu_initialized: self.tracker.state.imu_initialized,
+            imu_t_bc: self.rig.imu.as_ref().map(|imu| imu.camera_to_body),
+            gravity_world: self.inertial.gravity_world,
         }
     }
 
@@ -169,12 +136,12 @@ impl SlamSystem {
         let last_keyframe = map
             .get_keyframe(last_keyframe_idx)
             .expect("last keyframe existence was checked before mutating the map");
-        self.state.velocity_world = last_keyframe.velocity_world;
-        self.state.pose_world_to_cam = last_keyframe.frame.pose_world_to_cam;
-        self.state.velocity = None;
-        self.state.imu_initialized = true;
-        self.gravity_world = Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0);
-        self.imu_bias = init.bias;
+        self.tracker.adopt_inertial_alignment(
+            last_keyframe.frame.pose_world_to_cam,
+            last_keyframe.velocity_world,
+        );
+        self.inertial.gravity_world = Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0);
+        self.inertial.bias = init.bias;
         Ok(())
     }
 
@@ -191,7 +158,10 @@ impl SlamSystem {
     /// Enables the inertial path by providing the camera-to-body extrinsic
     /// `T_BC` (`X_body = T_BC * X_cam`). Without it, IMU samples are ignored.
     pub fn set_imu_extrinsics(&mut self, t_bc: Pose3d) {
-        self.imu_t_bc = Some(t_bc);
+        match &mut self.rig.imu {
+            Some(imu) => imu.camera_to_body = t_bc,
+            None => self.rig.imu = Some(ImuCalibration::new(t_bc)),
+        }
     }
 
     /// Processes one frame (pre-extracted features) and returns the tracking result.
@@ -212,10 +182,10 @@ impl SlamSystem {
         self.apply_local_mapping_results();
         // Fill the per-frame undistortion cache once; tracking, BA gathering,
         // growth, and fuse all read from it.
-        frame.ensure_undistorted(&self.camera);
-        self.pending_imu.extend(imu_samples);
+        frame.ensure_undistorted(&self.rig.camera);
+        self.inertial.buffer_samples(imu_samples);
 
-        match self.state.mode {
+        match self.tracker.state.mode {
             SystemMode::Bootstrap => self.bootstrap_step(frame, timestamp_sec),
             SystemMode::ImuInit => {
                 self.inertial_init_step(frame, previous_image, current_image, timestamp_sec)
@@ -235,7 +205,7 @@ impl SlamSystem {
 
     /// Returns the index of the current reference keyframe, if tracking has one.
     pub fn current_keyframe_idx(&self) -> Option<usize> {
-        self.state.current_keyframe_idx.and_then(|ki| {
+        self.tracker.state.current_keyframe_idx.and_then(|ki| {
             self.map
                 .lock()
                 .unwrap()
@@ -263,7 +233,7 @@ impl SlamSystem {
     }
 
     fn apply_local_mapping_results(&mut self) {
-        let Some(reference_idx) = self.state.current_keyframe_idx else {
+        let Some(reference_idx) = self.tracker.state.current_keyframe_idx else {
             // Still drain results so a completed worker cannot build a result backlog.
             let _ = self.local_mapping.drain_results();
             return;
@@ -278,13 +248,12 @@ impl SlamSystem {
                 continue;
             };
 
-            self.state.pose_world_to_cam = apply_reference_pose_correction(
-                self.state.pose_world_to_cam,
+            self.tracker.apply_local_ba_correction(
                 correction.pose_before,
                 correction.pose_after,
+                correction.velocity_world,
             );
-            self.state.velocity_world = correction.velocity_world;
-            self.imu_bias = correction.imu_bias;
+            self.inertial.bias = correction.imu_bias;
         }
     }
 
@@ -308,10 +277,10 @@ impl SlamSystem {
     fn bootstrap_stereo(&mut self, mut curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
         // Build the new map in the current odometry frame (identity at start,
         // or the recovery pose after a tracking loss).
-        curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
+        curr_frame.pose_world_to_cam = self.tracker.state.pose_world_to_cam;
 
         const MIN_STEREO_POINTS: usize = 50;
-        let cam_points = unproject_stereo(&curr_frame, &self.camera);
+        let cam_points = unproject_stereo(&curr_frame, &self.rig.camera);
         if cam_points.len() < MIN_STEREO_POINTS {
             self.dbg(format!(
                 "[bootstrap_stereo] frame={} skip: only {} stereo points (need >= {})",
@@ -320,7 +289,7 @@ impl SlamSystem {
                 MIN_STEREO_POINTS,
             ));
             return TrackingResult {
-                pose_world_to_cam: self.state.pose_world_to_cam,
+                pose_world_to_cam: self.tracker.state.pose_world_to_cam,
                 status: TrackingStatus::Skipped,
             };
         }
@@ -353,23 +322,31 @@ impl SlamSystem {
             "[bootstrap_stereo] frame={curr_idx} metric map created with {added} points",
         ));
 
-        self.state.current_keyframe_idx = Some(curr_idx);
-        self.state.last_keyframe_idx = Some(curr_idx);
-        self.state.velocity = None;
+        self.tracker.state.current_keyframe_idx = Some(curr_idx);
+        self.tracker.state.last_keyframe_idx = Some(curr_idx);
+        self.tracker.state.velocity = None;
         // The map is already metric (stereo baseline), but gravity, velocities,
         // and the gyro bias still need the inertial init before IMU prediction
         // can run; the solve there keeps scale fixed at 1.
-        self.state.mode = if self.imu_t_bc.is_some() {
-            self.inertial_init.begin_window(curr_idx, timestamp_sec);
+        self.tracker.state.mode = if self
+            .rig
+            .imu
+            .as_ref()
+            .map(|imu| imu.camera_to_body)
+            .is_some()
+        {
+            self.inertial
+                .initializer
+                .begin_window(curr_idx, timestamp_sec);
             SystemMode::ImuInit
         } else {
             SystemMode::Tracking
         };
-        self.last_keyframe_timestamp_sec = Some(timestamp_sec);
-        self.prune_imu_before(timestamp_sec);
+        self.inertial.last_keyframe_timestamp_sec = Some(timestamp_sec);
+        self.inertial.prune_before(timestamp_sec);
 
         TrackingResult {
-            pose_world_to_cam: self.state.pose_world_to_cam,
+            pose_world_to_cam: self.tracker.state.pose_world_to_cam,
             status: TrackingStatus::KeyframeAccepted,
         }
     }
@@ -377,7 +354,7 @@ impl SlamSystem {
     fn bootstrap_mono(&mut self, mut curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
         // Stamp frames with current odometry pose so bootstrap builds
         // the new map in the existing coordinate frame.
-        curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
+        curr_frame.pose_world_to_cam = self.tracker.state.pose_world_to_cam;
 
         // Staleness guard (mirrors ORB-SLAM3's MonocularInitialization):
         // a frame with too few keypoints is neither a viable reference nor
@@ -391,24 +368,24 @@ impl SlamSystem {
                 curr_frame.features.keypoints_xy.len(),
                 MIN_KEYPOINTS_FOR_BOOTSTRAP,
             ));
-            self.state.bootstrap_frame = None;
+            self.tracker.state.bootstrap_frame = None;
             return TrackingResult {
-                pose_world_to_cam: self.state.pose_world_to_cam,
+                pose_world_to_cam: self.tracker.state.pose_world_to_cam,
                 status: TrackingStatus::Skipped,
             };
         }
 
-        let Some(prev_bootstrap_frame) = self.state.bootstrap_frame.take() else {
+        let Some(prev_bootstrap_frame) = self.tracker.state.bootstrap_frame.take() else {
             self.dbg(format!(
                 "[bootstrap] frame={} stored as reference (awaiting second frame)",
                 curr_frame.idx,
             ));
-            self.state.bootstrap_frame = Some(curr_frame);
-            self.bootstrap_timestamp_sec = Some(timestamp_sec);
+            self.tracker.state.bootstrap_frame = Some(curr_frame);
+            self.inertial.bootstrap_timestamp_sec = Some(timestamp_sec);
             // Samples before the reference frame can never enter an edge.
-            self.prune_imu_before(timestamp_sec);
+            self.inertial.prune_before(timestamp_sec);
             return TrackingResult {
-                pose_world_to_cam: self.state.pose_world_to_cam,
+                pose_world_to_cam: self.tracker.state.pose_world_to_cam,
                 status: TrackingStatus::Skipped,
             };
         };
@@ -417,7 +394,7 @@ impl SlamSystem {
             &prev_bootstrap_frame.features,
             &prev_bootstrap_frame.pose_world_to_cam,
             &curr_frame.features,
-            &self.camera,
+            &self.rig.camera,
             &self.two_view_init_config,
         );
 
@@ -427,9 +404,9 @@ impl SlamSystem {
                     "[bootstrap] frame={} (ref={}) reject: {}",
                     curr_frame.idx, prev_bootstrap_frame.idx, reason,
                 ));
-                self.state.bootstrap_frame = Some(prev_bootstrap_frame);
+                self.tracker.state.bootstrap_frame = Some(prev_bootstrap_frame);
                 return TrackingResult {
-                    pose_world_to_cam: self.state.pose_world_to_cam,
+                    pose_world_to_cam: self.tracker.state.pose_world_to_cam,
                     status: TrackingStatus::Skipped,
                 };
             }
@@ -446,7 +423,7 @@ impl SlamSystem {
 
         let estimated_pose = two_view_estimate.pose;
         let prev_pose_world_to_cam = curr_frame.pose_world_to_cam;
-        self.state.pose_world_to_cam = estimated_pose;
+        self.tracker.state.pose_world_to_cam = estimated_pose;
         curr_frame.pose_world_to_cam = estimated_pose;
 
         // Promote to Keyframes
@@ -475,9 +452,9 @@ impl SlamSystem {
                 health.valid_in_both, health.median_depth_older_kf, MIN_VALID_POINTS,
             ));
             self.map.lock().unwrap().clear_active();
-            self.state.reset();
+            self.tracker.state.reset();
             return TrackingResult {
-                pose_world_to_cam: self.state.pose_world_to_cam,
+                pose_world_to_cam: self.tracker.state.pose_world_to_cam,
                 status: TrackingStatus::Skipped,
             };
         }
@@ -485,11 +462,13 @@ impl SlamSystem {
         // BA inside build_initial_map may have refined KF1's pose; sync state
         // and recompute velocity from the post-BA pose.
         if let Some(kf) = self.map.lock().unwrap().get_keyframe(curr_idx) {
-            self.state.pose_world_to_cam = kf.frame.pose_world_to_cam;
+            self.tracker.state.pose_world_to_cam = kf.frame.pose_world_to_cam;
         }
 
-        if let Some(prev_ts) = self.bootstrap_timestamp_sec {
-            let (preint, raw_samples) = self.preintegrate_window(prev_ts, timestamp_sec);
+        if let Some(prev_ts) = self.inertial.bootstrap_timestamp_sec {
+            let (preint, raw_samples) =
+                self.inertial
+                    .preintegrate_window(self.rig.imu.as_ref(), prev_ts, timestamp_sec);
             if preint.dt > 0.0 {
                 self.map.lock().unwrap().add_imu_factor(
                     prev_idx,
@@ -500,28 +479,35 @@ impl SlamSystem {
                     timestamp_sec,
                 );
             }
-            self.prune_imu_before(timestamp_sec);
+            self.inertial.prune_before(timestamp_sec);
         }
 
-        self.state.velocity = Some(Pose3d::between(
+        self.tracker.state.current_keyframe_idx = Some(curr_idx);
+        self.tracker.state.last_keyframe_idx = Some(curr_idx);
+        self.tracker.state.velocity = Some(Pose3d::between(
             &prev_pose_world_to_cam,
-            &self.state.pose_world_to_cam,
+            &self.tracker.state.pose_world_to_cam,
         ));
-
-        self.state.current_keyframe_idx = Some(curr_idx);
-        self.state.last_keyframe_idx = Some(curr_idx);
         // Inertial init needs the camera-to-body extrinsic to relate IMU deltas
         // to camera poses; without it, run visual-only as before.
-        self.state.mode = if self.imu_t_bc.is_some() {
-            self.inertial_init.begin_window(curr_idx, timestamp_sec);
+        self.tracker.state.mode = if self
+            .rig
+            .imu
+            .as_ref()
+            .map(|imu| imu.camera_to_body)
+            .is_some()
+        {
+            self.inertial
+                .initializer
+                .begin_window(curr_idx, timestamp_sec);
             SystemMode::ImuInit
         } else {
             SystemMode::Tracking
         };
-        self.last_keyframe_timestamp_sec = Some(timestamp_sec);
+        self.inertial.last_keyframe_timestamp_sec = Some(timestamp_sec);
 
         TrackingResult {
-            pose_world_to_cam: self.state.pose_world_to_cam,
+            pose_world_to_cam: self.tracker.state.pose_world_to_cam,
             status: TrackingStatus::KeyframeAccepted,
         }
     }
@@ -586,7 +572,7 @@ impl SlamSystem {
         self.map.lock().unwrap().upsert_keyframe(reference_kf);
         self.map.lock().unwrap().upsert_keyframe(current_kf);
 
-        self.map.lock().unwrap().run_initial_ba(&self.camera);
+        self.map.lock().unwrap().run_initial_ba(&self.rig.camera);
 
         // Seed the place-recognition database with the two bootstrap keyframes so
         // a later revisit of the start can match them.
@@ -594,68 +580,6 @@ impl SlamSystem {
         self.register_place_recognition(current_kf_idx);
 
         added
-    }
-
-    /// Preintegrates buffered IMU samples over `[t0, t1]` without consuming
-    /// them: the same samples serve both per-frame pose prediction and the
-    /// keyframe-to-keyframe edges. [`Self::prune_imu_before`] discards samples
-    /// once no future window can need them.
-    /// Preintegrates over `[t0, t1]` and also returns the raw samples used,
-    /// so the caller can hand them to `Map::add_imu_factor` for later
-    /// repropagation (see `PreintegratedImu::from_measurements` doc) — once
-    /// this returns, `prune_imu_before` is free to drop them from
-    /// `self.pending_imu`, since the edge now carries its own copy.
-    fn preintegrate_window(&self, t0: f64, t1: f64) -> (PreintegratedImu, Vec<ImuMeasurement>) {
-        let samples: Vec<ImuMeasurement> = self
-            .pending_imu
-            .iter()
-            .filter(|m| m.timestamp >= t0 && m.timestamp <= t1)
-            .copied()
-            .collect();
-        let pre =
-            PreintegratedImu::from_measurements(self.imu_bias, self.imu_calib, &samples, t0, t1);
-        (pre, samples)
-    }
-
-    /// Drops buffered IMU samples strictly older than `t` (typically the last
-    /// keyframe timestamp: the next edge and all per-frame windows start there).
-    fn prune_imu_before(&mut self, t: f64) {
-        self.pending_imu.retain(|m| m.timestamp >= t);
-    }
-
-    /// Body-to-world pose `T_WB` for a world-to-camera pose, via
-    /// `T_WB = T_WC ∘ T_CB`. Treats camera == body when no extrinsic is set.
-    fn body_to_world(&self, pose_w2c: &Pose3d) -> Pose3d {
-        let cam_to_world = pose_w2c.inverse();
-        match &self.imu_t_bc {
-            Some(t_bc) => cam_to_world.compose(&t_bc.inverse()),
-            None => cam_to_world,
-        }
-    }
-
-    /// Propagates the camera pose and body velocity through one preintegrated
-    /// IMU window.
-    fn predict_pose_imu(
-        &self,
-        pose_w2c: Pose3d,
-        vel_world: Vec3F64,
-        gravity_world: Vec3F64,
-        preint: &PreintegratedImu,
-    ) -> (Pose3d, Vec3F64) {
-        let body_to_world = self.body_to_world(&pose_w2c);
-        let (r_j, v_j, p_j) = preint.predict(
-            &body_to_world.rotation,
-            &vel_world,
-            &body_to_world.translation,
-            &gravity_world,
-        );
-
-        let pred_body_to_world = Pose3d::from_rt(r_j, p_j);
-        let pred_cam_to_world = match &self.imu_t_bc {
-            Some(t_bc) => pred_body_to_world.compose(t_bc),
-            None => pred_body_to_world,
-        };
-        (pred_cam_to_world.inverse(), v_j)
     }
 
     fn inertial_init_step(
@@ -673,11 +597,11 @@ impl SlamSystem {
         // Drop the solve's map lock before applying its result with a new lock.
         let outcome = {
             let map = self.map.lock().unwrap();
-            self.inertial_init.on_keyframe_uninitialized(
+            self.inertial.initializer.on_keyframe_uninitialized(
                 &map,
                 timestamp_sec,
-                self.imu_t_bc,
-                self.imu_bias,
+                self.rig.imu.as_ref().map(|imu| imu.camera_to_body),
+                self.inertial.bias,
             )
         };
 
@@ -706,8 +630,8 @@ impl SlamSystem {
                     // VIBA1/VIBA2 refine bg/ba/scale/gravity further in the
                     // background (see try_insert_keyframe), they don't gate
                     // resuming tracking.
-                    self.state.mode = SystemMode::Tracking;
-                    self.state.imu_init_timestamp_sec = Some(timestamp_sec);
+                    self.tracker.state.mode = SystemMode::Tracking;
+                    self.tracker.state.imu_init_timestamp_sec = Some(timestamp_sec);
                     let job = self.keyframe_job();
                     if !self.local_mapping.submit(job) {
                         self.dbg("[local_mapping] worker is unavailable".into());
@@ -735,213 +659,101 @@ impl SlamSystem {
         current_image: &Image<u8, 1>,
         timestamp_sec: f64,
     ) -> TrackingResult {
-        let image_size = frame.image_size;
-        let pose_before = self.state.pose_world_to_cam;
-        let prev_timestamp = self.state.last_frame_timestamp_sec;
-
-        // Local BA updates keyframe state asynchronously, so refresh cached IMU state.
-        if let Some(kf_idx) = self.state.current_keyframe_idx
+        // Preserve reference-state refresh before building the IMU window.
+        if let Some(kf_idx) = self.tracker.state.current_keyframe_idx
             && let Some(kf) = self.map.lock().unwrap().get_keyframe(kf_idx)
         {
-            self.state.velocity_world = kf.velocity_world;
-            self.imu_bias = kf.imu_bias;
+            self.tracker.state.velocity_world = kf.velocity_world;
+            self.inertial.bias = kf.imu_bias;
         }
-
-        let candidate_pose = if self.state.imu_initialized && prev_timestamp > 0.0 {
-            let (preint, _) = self.preintegrate_window(prev_timestamp, timestamp_sec);
-            if preint.dt > 0.0 {
-                let (pred_pose, pred_vel) = self.predict_pose_imu(
-                    pose_before,
-                    self.state.velocity_world,
-                    self.gravity_world,
-                    &preint,
-                );
-                self.state.velocity_world = pred_vel; // propagate for next frame
-                pred_pose
-            } else {
-                // IMU stalled, fall back to visual constant velocity
-                self.state
-                    .velocity
-                    .map(|v| v.compose(&pose_before))
-                    .unwrap_or(pose_before)
-            }
-        } else {
-            self.state
-                .velocity
-                .map(|v| v.compose(&pose_before))
-                .unwrap_or(pose_before)
+        let prev_timestamp = self.tracker.state.last_frame_timestamp_sec;
+        let preint = (self.tracker.state.imu_initialized && prev_timestamp > 0.0).then(|| {
+            self.inertial
+                .preintegrate_window(self.rig.imu.as_ref(), prev_timestamp, timestamp_sec)
+                .0
+        });
+        let outcome = {
+            let map = self.map.lock().unwrap();
+            self.tracker.track(
+                TrackingInput {
+                    frame: &frame,
+                    previous_image,
+                    current_image,
+                    timestamp_sec,
+                    inertial: preint.as_ref().map(|preintegrated| InertialPrediction {
+                        preintegrated,
+                        t_bc: self.rig.imu.as_ref().map(|imu| imu.camera_to_body),
+                        gravity_world: self.inertial.gravity_world,
+                    }),
+                },
+                &map,
+                &self.rig.camera,
+            )
         };
-
-        let currently_lost_for = self
-            .state
-            .lost_since_sec
-            .map_or(0.0, |t0| timestamp_sec - t0);
-        let search_scale = self.estimator.config().search_scale_for(currently_lost_for);
-
-        let klt_survivors = if self.track_set.is_empty() {
-            None
+        let mut status = if outcome.rejection.is_some() {
+            TrackingStatus::Skipped
         } else {
-            previous_image.and_then(|previous_image| {
-                self.klt_tracker
-                    .track(self.track_set.tracks(), previous_image, current_image)
-                    .ok()
-            })
-        };
-        let pre_seeded = klt_survivors
-            .as_ref()
-            .and_then(|survivors| {
-                snap_unique(
-                    &self.track_set,
-                    survivors,
-                    &frame.features.keypoints_xy,
-                    3.0,
-                )
-                .ok()
-            })
-            .map(|matches| {
-                matches
-                    .into_iter()
-                    .map(|matched| (matched.map_point_idx, matched.keypoint_idx))
-                    .collect()
-            });
-
-        let result = self.estimator.estimate_pose(
-            &frame,
-            &candidate_pose,
-            &pose_before,
-            &self.map.lock().unwrap(),
-            &self.camera,
-            self.state.current_keyframe_idx,
-            search_scale,
-            pre_seeded,
-        );
-
-        let (mut status, matches, tracked_inliers, reject_reason) = match result {
-            Ok(estimate) => {
-                self.state.pose_world_to_cam = estimate.pose;
-
-                // When IMU-initialized, velocity_world was already updated by IMU
-                // preintegration (predict_pose_imu → pred_vel) before PnP ran; don't
-                // overwrite it with a visual finite-difference, since at 30 fps the
-                // inter-frame displacement is noise-dominated during low-translation
-                // segments, which would collapse velocity to zero and permanently
-                // freeze the IMU pose prediction.
-                if !self.state.imu_initialized {
-                    self.state.velocity = Some(Pose3d::between(&pose_before, &estimate.pose));
-                }
-
-                let track_matches: Vec<MapKeypointMatch> = estimate
-                    .matches
-                    .iter()
-                    .map(|&(map_point_idx, keypoint_idx)| MapKeypointMatch {
-                        map_point_idx,
-                        keypoint_idx,
-                    })
-                    .collect();
-                if self
-                    .track_set
-                    .reconcile_from_matches(&track_matches, &frame.features.keypoints_xy)
-                    .is_err()
-                {
-                    self.track_set = TrackSet::new();
-                }
-
-                (
-                    TrackingStatus::Tracked,
-                    estimate.matches,
-                    estimate.inliers,
-                    None,
-                )
-            }
-            Err(reason) => {
-                carry_klt_survivors(&mut self.track_set, klt_survivors);
-
-                // Carry the predicted pose forward instead of freezing at
-                // pose_before. state.velocity_world was already advanced by
-                // predict_pose_imu above regardless of visual outcome, so
-                // anchoring the next frame's prediction on a stale position
-                // would desync position/rotation from velocity: every
-                // subsequent frame's candidate pose would drift further from
-                // reality, making the projection search miss again and
-                // compounding a single bad frame into a full tracking loss.
-                self.state.pose_world_to_cam = candidate_pose;
-                (TrackingStatus::Skipped, Vec::new(), 0, Some(reason))
-            }
+            TrackingStatus::Tracked
         };
         if self.debug {
-            let msg = match reject_reason {
+            let msg = match outcome.rejection {
                 Some(reason) => format!("[track] frame={} reject: {:?}", frame.idx, reason),
                 None => format!(
                     "[track] frame={} ok: matches={} inliers={}",
                     frame.idx,
-                    matches.len(),
-                    tracked_inliers,
+                    outcome.matches.len(),
+                    outcome.inliers,
                 ),
             };
             self.debug_messages.push(msg);
         }
-
         if status == TrackingStatus::Tracked {
-            // Visibility bookkeeping over the local map only (mirrors
-            // ORB-SLAM3, which counts mnVisible on local-map points): full-map
-            // scans here would grow with trajectory length.
-            // Release this non-reentrant lock before keyframe insertion locks the map.
+            // Keep visibility accounting on the predicted pose and local map.
+            // Release the map borrow before publication can lock it again.
             {
-                let mut map_guard = self.map.lock().unwrap();
+                let mut map = self.map.lock().unwrap();
                 let current_kf = self
+                    .tracker
                     .state
                     .current_keyframe_idx
-                    .and_then(|ki| map_guard.get_keyframe(ki));
-                let local_indices = map_guard.build_local_map_point_indices(&matches, current_kf);
-                let visible = map_guard.map_points_in_frustum(
+                    .and_then(|ki| map.get_keyframe(ki));
+                let local_indices = map.build_local_map_point_indices(&outcome.matches, current_kf);
+                let visible = map.map_points_in_frustum(
                     &local_indices,
-                    &self.camera,
-                    &candidate_pose,
-                    image_size,
+                    &self.rig.camera,
+                    &outcome.candidate_pose,
+                    frame.image_size,
                 );
-                map_guard.update_observation_counts(&visible, &matches);
+                map.update_observation_counts(&visible, &outcome.matches);
             }
-
-            if self.try_insert_keyframe(&frame, timestamp_sec, tracked_inliers, &matches) {
+            if self.try_insert_keyframe(&frame, timestamp_sec, outcome.inliers, &outcome.matches) {
                 status = TrackingStatus::KeyframeAccepted;
             }
         }
-
-        if status == TrackingStatus::Skipped {
-            let policy = &self.tracking_loss_recovery;
-
-            let lost_since = *self.state.lost_since_sec.get_or_insert(timestamp_sec);
-            let recently_lost_for = timestamp_sec - lost_since;
-
-            let imu_confident = self.state.imu_initialized
-                && self
-                    .state
-                    .imu_init_timestamp_sec
-                    .is_some_and(|t0| timestamp_sec - t0 >= policy.min_imu_confidence_sec);
-            let grace_period_sec = policy.grace_period_sec(imu_confident);
-            let map_established =
-                self.map.lock().unwrap().keyframes().len() > policy.min_keyframes_for_grace;
-
-            if !map_established || recently_lost_for >= grace_period_sec {
-                self.dbg(format!(
-                    "[lost] frame={} giving up after {:.2}s (map_established={}): resetting",
-                    frame.idx, recently_lost_for, map_established,
-                ));
-                self.track_set = TrackSet::new();
-                self.state.reset();
-                return self.bootstrap_step(frame, timestamp_sec);
-            }
-        } else {
-            self.state.lost_since_sec = None;
+        if outcome.recovery == RecoveryDecision::RestartBootstrap {
+            let lost_for_sec = self
+                .tracker
+                .state
+                .lost_since_sec
+                .map_or(0.0, |since| timestamp_sec - since);
+            self.dbg(format!(
+                "[lost] frame={} giving up after {:.2}s: resetting",
+                frame.idx, lost_for_sec,
+            ));
+            self.tracker.restart_bootstrap();
+            return self.bootstrap_step(frame, timestamp_sec);
         }
-        self.state.last_frame_timestamp_sec = timestamp_sec;
-        // Samples older than the last keyframe can't enter any future window
-        // (the next edge and all per-frame predictions start at or after it).
-        if let Some(kf_ts) = self.last_keyframe_timestamp_sec {
-            self.prune_imu_before(kf_ts.min(timestamp_sec));
+        // Keyframe insertion may have corrected the live pose. Finalize and
+        // return that state, not a pose captured before BA or loop closing.
+        if status != TrackingStatus::Skipped {
+            self.tracker.state.lost_since_sec = None;
+        }
+        self.tracker.state.last_frame_timestamp_sec = timestamp_sec;
+        if let Some(kf_ts) = self.inertial.last_keyframe_timestamp_sec {
+            self.inertial.prune_before(kf_ts.min(timestamp_sec));
         }
         TrackingResult {
-            pose_world_to_cam: self.state.pose_world_to_cam,
+            pose_world_to_cam: self.tracker.state.pose_world_to_cam,
             status,
         }
     }
@@ -953,7 +765,7 @@ impl SlamSystem {
         tracked_inliers: usize,
         matches: &[(usize, usize)],
     ) -> bool {
-        let n_ref_map_points = if let Some(ki) = self.state.current_keyframe_idx {
+        let n_ref_map_points = if let Some(ki) = self.tracker.state.current_keyframe_idx {
             let map = self.map.lock().unwrap();
             map.get_keyframe(ki)
                 .map(|kf| kf.num_associated_points())
@@ -964,7 +776,7 @@ impl SlamSystem {
 
         if !self.keyframe_policy.should_insert(
             frame.idx,
-            self.state.last_keyframe_idx,
+            self.tracker.state.last_keyframe_idx,
             tracked_inliers,
             n_ref_map_points,
         ) {
@@ -972,7 +784,7 @@ impl SlamSystem {
         }
 
         // Guard: reference KF must exist before we can triangulate.
-        if let Some(ki) = self.state.current_keyframe_idx {
+        if let Some(ki) = self.tracker.state.current_keyframe_idx {
             let map = self.map.lock().unwrap();
             if map.get_keyframe(ki).is_none() {
                 return false;
@@ -984,7 +796,7 @@ impl SlamSystem {
         let mut curr_kf = Keyframe::from_frame(Frame {
             idx: frame.idx,
             features: frame.features.clone(),
-            pose_world_to_cam: self.state.pose_world_to_cam,
+            pose_world_to_cam: self.tracker.state.pose_world_to_cam,
             image_size: frame.image_size,
             keypoint_colors: frame.keypoint_colors.clone(),
             u_right: frame.u_right.clone(),
@@ -994,9 +806,9 @@ impl SlamSystem {
         // Seed the new keyframe with the IMU-propagated velocity and current bias
         // estimate so that VI-BA starts from a reasonable linearisation point rather
         // than zero, which would produce huge residuals on the newest IMU edge.
-        if self.state.imu_initialized {
-            curr_kf.velocity_world = self.state.velocity_world;
-            curr_kf.imu_bias = self.imu_bias;
+        if self.tracker.state.imu_initialized {
+            curr_kf.velocity_world = self.tracker.state.velocity_world;
+            curr_kf.imu_bias = self.inertial.bias;
         }
         for &(mp_idx, curr_idx) in matches {
             curr_kf.associate_map_point(curr_idx, mp_idx);
@@ -1016,7 +828,7 @@ impl SlamSystem {
             let n_close = self.map.lock().unwrap().add_close_stereo_points(
                 &mut curr_kf,
                 mthdepth,
-                &self.camera,
+                &self.rig.camera,
             );
             self.dbg(format!(
                 "[kf_stereo] frame={} close_points={}",
@@ -1042,7 +854,7 @@ impl SlamSystem {
             .map(|kf| kf.frame.idx)
             .collect();
 
-        let imu_initialized = self.state.imu_initialized;
+        let imu_initialized = self.tracker.state.imu_initialized;
         let match_config = self.two_view_init_config.match_config;
         let triangulation_config = self.two_view_init_config.triangulation_config.clone();
 
@@ -1053,7 +865,7 @@ impl SlamSystem {
                 &mut curr_kf,
                 match_config,
                 &triangulation_config,
-                &self.camera,
+                &self.rig.camera,
             );
         }
         self.dbg(format!(
@@ -1065,10 +877,12 @@ impl SlamSystem {
 
         self.map.lock().unwrap().upsert_keyframe(curr_kf);
         if let (Some(prev_kf_idx), Some(prev_ts)) = (
-            self.state.last_keyframe_idx,
-            self.last_keyframe_timestamp_sec,
+            self.tracker.state.last_keyframe_idx,
+            self.inertial.last_keyframe_timestamp_sec,
         ) {
-            let (preint, raw_samples) = self.preintegrate_window(prev_ts, timestamp_sec);
+            let (preint, raw_samples) =
+                self.inertial
+                    .preintegrate_window(self.rig.imu.as_ref(), prev_ts, timestamp_sec);
             if preint.dt > 0.0 {
                 self.map.lock().unwrap().add_imu_factor(
                     prev_kf_idx,
@@ -1081,10 +895,10 @@ impl SlamSystem {
             }
         }
 
-        self.last_keyframe_timestamp_sec = Some(timestamp_sec);
+        self.inertial.last_keyframe_timestamp_sec = Some(timestamp_sec);
 
-        self.state.current_keyframe_idx = Some(frame.idx);
-        self.state.last_keyframe_idx = Some(frame.idx);
+        self.tracker.state.current_keyframe_idx = Some(frame.idx);
+        self.tracker.state.last_keyframe_idx = Some(frame.idx);
 
         // Forward SearchInNeighbors / Fuse: extend each curr_kf-observed map
         // point's observation list to neighbor KFs that don't yet observe it.
@@ -1092,7 +906,7 @@ impl SlamSystem {
         let n_fused = self.map.lock().unwrap().fuse_into_neighbors(
             frame.idx,
             &neighbor_kf_indices,
-            &self.camera,
+            &self.rig.camera,
         );
         self.dbg(format!("[fuse] frame={} fused={}", frame.idx, n_fused));
 
@@ -1102,12 +916,12 @@ impl SlamSystem {
             // Drop the solve's map lock before applying its result with a new lock.
             let outcome = {
                 let map = self.map.lock().unwrap();
-                self.inertial_init.on_keyframe_initialized(
+                self.inertial.initializer.on_keyframe_initialized(
                     &map,
                     timestamp_sec,
-                    self.imu_t_bc,
-                    self.imu_bias,
-                    self.gravity_world,
+                    self.rig.imu.as_ref().map(|imu| imu.camera_to_body),
+                    self.inertial.bias,
+                    self.inertial.gravity_world,
                 )
             };
             self.apply_inertial_refinement(outcome);
@@ -1157,15 +971,19 @@ impl SlamSystem {
     /// Runs map-side loop closing, then applies its live tracking consequences.
     fn register_place_recognition(&mut self, kf_idx: usize) {
         let context = LoopClosingContext {
-            reference_keyframe_idx: self.state.current_keyframe_idx,
-            inertial: self.state.imu_initialized.then_some(InertialPgoContext {
-                gravity_world: self.gravity_world,
-            }),
+            reference_keyframe_idx: self.tracker.state.current_keyframe_idx,
+            inertial: self
+                .tracker
+                .state
+                .imu_initialized
+                .then_some(InertialPgoContext {
+                    gravity_world: self.inertial.gravity_world,
+                }),
         };
         let outcome = {
             let mut map = self.map.lock().unwrap();
             self.loop_closer
-                .on_keyframe(&mut map, &self.camera, kf_idx, context)
+                .on_keyframe(&mut map, &self.rig.camera, kf_idx, context)
         };
         self.apply_loop_closure_outcome(outcome);
     }
@@ -1175,14 +993,12 @@ impl SlamSystem {
             self.dbg(message);
         }
         if let Some(correction) = outcome.reference_correction {
-            self.state.pose_world_to_cam = apply_reference_pose_correction(
-                self.state.pose_world_to_cam,
+            self.tracker.apply_loop_correction(
                 correction.before,
                 correction.after,
+                correction.world,
             );
-            self.state.velocity_world = correction.world.rotation * self.state.velocity_world;
-            self.track_set = TrackSet::new();
-            if self.state.imu_initialized {
+            if self.tracker.state.imu_initialized {
                 let job = self.keyframe_job();
                 if !self.local_mapping.submit(job) {
                     self.dbg("[local_mapping] worker is unavailable after PGO".into());
@@ -1194,54 +1010,12 @@ impl SlamSystem {
     }
 }
 
-fn carry_klt_survivors(track_set: &mut TrackSet, survivors: Option<Vec<FlowSurvivor>>) {
-    if survivors.is_none_or(|survivors| track_set.advance(survivors).is_err()) {
-        *track_set = TrackSet::new();
-    }
-}
-
-/// Carries a reference-keyframe BA correction into the current tracking pose
-/// while preserving the current camera's pose relative to that reference.
-fn apply_reference_pose_correction(
-    current_pose: Pose3d,
-    reference_before: Pose3d,
-    reference_after: Pose3d,
-) -> Pose3d {
-    let current_from_reference = Pose3d::between(&reference_before, &current_pose);
-    current_from_reference.compose(&reference_after)
-}
-
-#[cfg(test)]
-fn pose_graph_tracking_correction(
-    current_pose: Pose3d,
-    reference_kf_idx: usize,
-    keyframe_indices: &[usize],
-    poses_before: &[Pose3d],
-    poses_after: &[Pose3d],
-) -> Option<Pose3d> {
-    let (reference_before, reference_after, _) = pose_graph_reference_correction(
-        reference_kf_idx,
-        keyframe_indices,
-        poses_before,
-        poses_after,
-    )?;
-    Some(apply_reference_pose_correction(
-        current_pose,
-        reference_before,
-        reference_after,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        ImuInitApplyError, SlamConfig, SlamSystem, apply_reference_pose_correction,
-        carry_klt_survivors, pose_graph_reference_correction, pose_graph_tracking_correction,
-    };
+    use super::{ImuInitApplyError, SlamConfig, SlamSystem};
     use crate::Frame;
     use crate::initialization::{ImuInitResult, KeyframeVelocity};
     use crate::map::Keyframe;
-    use crate::tracking::optical_flow::{FlowSurvivor, MapKeypointMatch, TrackSet};
     use kornia_3d::camera::PinholeCamera;
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::{SO3F64, Vec3F64};
@@ -1259,6 +1033,41 @@ mod tests {
         {
             assert!((actual - expected).abs() < 1e-10);
         }
+    }
+
+    #[test]
+    fn legacy_extrinsics_setter_preserves_configured_imu_noise() {
+        let (_, _, camera) = crate::tracking::tests::synthetic_scene();
+        let mut calibration = crate::ImuCalibration::new(Pose3d::IDENTITY);
+        calibration.noise.gyro_noise = 0.123;
+        calibration.noise.accel_noise = 0.456;
+        let mut system = SlamSystem::with_rig(
+            crate::SensorRig {
+                camera,
+                imu: Some(calibration),
+            },
+            SlamConfig::default(),
+        );
+        let extrinsic = Pose3d::new(SO3F64::IDENTITY.matrix(), Vec3F64::new(0.1, 0.2, 0.3));
+        system.set_imu_extrinsics(extrinsic);
+        let imu = system.rig.imu.as_ref().unwrap();
+        assert_eq!(imu.noise.gyro_noise, 0.123);
+        assert_eq!(imu.noise.accel_noise, 0.456);
+        assert_pose_close(imu.camera_to_body, extrinsic);
+        assert_pose_close(system.keyframe_job().imu_t_bc.unwrap(), extrinsic);
+    }
+
+    #[test]
+    fn legacy_constructor_enables_imu_with_historical_noise() {
+        let (_, _, camera) = crate::tracking::tests::synthetic_scene();
+        let mut system = SlamSystem::new(camera, SlamConfig::default());
+        assert!(system.rig.imu.is_none());
+        system.set_imu_extrinsics(Pose3d::IDENTITY);
+        let imu = system.rig.imu.as_ref().unwrap();
+        assert_eq!(imu.noise.gyro_noise, 1.6968e-4);
+        assert_eq!(imu.noise.accel_noise, 2.0e-3);
+        assert_eq!(imu.noise.gyro_bias_noise, 1.9393e-5);
+        assert_eq!(imu.noise.accel_bias_noise, 3.0e-3);
     }
 
     fn empty_keyframe(idx: usize) -> Keyframe {
@@ -1326,11 +1135,12 @@ mod tests {
             .apply_inertial_initialization(result)
             .expect("valid initialization should apply");
 
-        assert!((system.state.velocity_world - velocity_20).length() < 1e-12);
-        assert!(system.state.imu_initialized);
-        assert!(system.state.velocity.is_none());
+        assert!((system.tracker.state.velocity_world - velocity_20).length() < 1e-12);
+        assert!(system.tracker.state.imu_initialized);
+        assert!(system.tracker.state.velocity.is_none());
         assert!(
-            (system.gravity_world - Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0)).length() < 1e-12
+            (system.inertial.gravity_world - Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0)).length()
+                < 1e-12
         );
     }
 
@@ -1361,117 +1171,6 @@ mod tests {
     }
 
     #[test]
-    fn reference_pose_correction_preserves_relative_camera_pose() {
-        let reference_before = Pose3d::new(
-            SO3F64::exp(Vec3F64::new(0.1, -0.2, 0.3)).matrix(),
-            Vec3F64::new(-1.0, 0.5, 0.2),
-        );
-        let relative_pose = Pose3d::new(
-            SO3F64::exp(Vec3F64::new(-0.15, 0.05, 0.2)).matrix(),
-            Vec3F64::new(-0.5, 0.1, 0.3),
-        );
-        let current_before = relative_pose.compose(&reference_before);
-        let reference_after = Pose3d::new(
-            SO3F64::exp(Vec3F64::new(0.25, 0.1, -0.1)).matrix(),
-            Vec3F64::new(-2.0, -0.3, 0.8),
-        );
-
-        let corrected =
-            apply_reference_pose_correction(current_before, reference_before, reference_after);
-
-        assert_pose_close(Pose3d::between(&reference_after, &corrected), relative_pose);
-    }
-
-    #[test]
-    fn pose_graph_tracking_correction_uses_current_reference_keyframe() {
-        let reference_before = Pose3d::new(
-            SO3F64::exp(Vec3F64::new(0.1, -0.2, 0.3)).matrix(),
-            Vec3F64::new(-1.0, 0.5, 0.2),
-        );
-        let reference_after = Pose3d::new(
-            SO3F64::exp(Vec3F64::new(0.25, 0.1, -0.1)).matrix(),
-            Vec3F64::new(-2.0, -0.3, 0.8),
-        );
-        let relative_pose = Pose3d::new(
-            SO3F64::exp(Vec3F64::new(-0.15, 0.05, 0.2)).matrix(),
-            Vec3F64::new(-0.5, 0.1, 0.3),
-        );
-        let current_before = relative_pose.compose(&reference_before);
-
-        let corrected = pose_graph_tracking_correction(
-            current_before,
-            20,
-            &[10, 20],
-            &[Pose3d::IDENTITY, reference_before],
-            &[Pose3d::IDENTITY, reference_after],
-        )
-        .unwrap();
-
-        assert_pose_close(Pose3d::between(&reference_after, &corrected), relative_pose);
-        assert!(
-            pose_graph_tracking_correction(
-                current_before,
-                99,
-                &[10, 20],
-                &[Pose3d::IDENTITY, reference_before],
-                &[Pose3d::IDENTITY, reference_after],
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn pose_graph_reference_correction_rotates_live_world_velocity() {
-        let yaw = SO3F64::exp(Vec3F64::new(0.0, 0.4, 0.0)).matrix();
-        let reference_before = Pose3d::IDENTITY;
-        let reference_after = Pose3d::new(yaw.transpose(), Vec3F64::ZERO);
-        let (_, _, correction) = pose_graph_reference_correction(
-            20,
-            &[10, 20],
-            &[Pose3d::IDENTITY, reference_before],
-            &[Pose3d::IDENTITY, reference_after],
-        )
-        .unwrap();
-        let velocity = Vec3F64::new(1.0, 0.2, -0.5);
-
-        let corrected = correction.rotation * velocity;
-
-        assert!((corrected - yaw * velocity).length() < 1e-10);
-    }
-
-    #[test]
-    fn klt_tracks_survive_skipped_frame_and_clear_without_survivors() {
-        let mut tracks = TrackSet::new();
-        tracks
-            .reconcile_from_matches(
-                &[MapKeypointMatch {
-                    map_point_idx: 42,
-                    keypoint_idx: 0,
-                }],
-                &[[10.0, 20.0]],
-            )
-            .unwrap();
-        let track_id = tracks.tracks()[0].id();
-
-        carry_klt_survivors(
-            &mut tracks,
-            Some(vec![FlowSurvivor {
-                track_id,
-                pixel: [12.0, 21.0],
-                error: 0.5,
-            }]),
-        );
-
-        assert_eq!(tracks.len(), 1);
-        assert_eq!(tracks.tracks()[0].id(), track_id);
-        assert_eq!(tracks.tracks()[0].map_point_idx(), Some(42));
-        assert_eq!(tracks.tracks()[0].pixel(), [12.0, 21.0]);
-        assert_eq!(tracks.tracks()[0].age(), 2);
-
-        carry_klt_survivors(&mut tracks, None);
-        assert!(tracks.is_empty());
-    }
-    #[test]
     fn loop_closure_outcome_only_changes_tracking_after_map_correction() {
         use crate::loop_closure::{LoopClosingOutcome, LoopClosureEvent, ReferencePoseCorrection};
         use crate::map::LocalMappingMode;
@@ -1496,18 +1195,8 @@ mod tests {
         let relative = Pose3d::new(SO3F64::IDENTITY.matrix(), Vec3F64::new(0.0, 0.0, 0.2));
         let live_pose = relative.compose(&before);
         let velocity = Vec3F64::new(1.0, 0.2, -0.5);
-        system.state.pose_world_to_cam = live_pose;
-        system.state.velocity_world = velocity;
-        system
-            .track_set
-            .reconcile_from_matches(
-                &[MapKeypointMatch {
-                    map_point_idx: 42,
-                    keypoint_idx: 0,
-                }],
-                &[[10.0, 20.0]],
-            )
-            .unwrap();
+        system.tracker.state.pose_world_to_cam = live_pose;
+        system.tracker.state.velocity_world = velocity;
         system.apply_loop_closure_outcome(LoopClosingOutcome {
             events: vec![LoopClosureEvent::PgoFailed {
                 query_kf_idx: 10,
@@ -1516,9 +1205,8 @@ mod tests {
             }],
             ..LoopClosingOutcome::default()
         });
-        assert_eq!(system.state.pose_world_to_cam, live_pose);
-        assert_eq!(system.state.velocity_world, velocity);
-        assert_eq!(system.track_set.len(), 1);
+        assert_eq!(system.tracker.state.pose_world_to_cam, live_pose);
+        assert_eq!(system.tracker.state.velocity_world, velocity);
         assert_eq!(system.drain_loop_closure_events().len(), 1);
         assert!(system.drain_loop_closure_events().is_empty());
 
@@ -1533,10 +1221,171 @@ mod tests {
             ..LoopClosingOutcome::default()
         });
         assert_pose_close(
-            Pose3d::between(&after, &system.state.pose_world_to_cam),
+            Pose3d::between(&after, &system.tracker.state.pose_world_to_cam),
             relative,
         );
-        assert!((system.state.velocity_world - yaw * velocity).length() < 1e-10);
-        assert!(system.track_set.is_empty());
+        assert!((system.tracker.state.velocity_world - yaw * velocity).length() < 1e-10);
+    }
+    fn tracking_test_system(map_size: usize) -> SlamSystem {
+        let camera = PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let mut system = SlamSystem::new(
+            camera,
+            SlamConfig {
+                local_mapping: crate::map::LocalMappingMode::Synchronous,
+                ..SlamConfig::default()
+            },
+        );
+        for idx in 0..map_size {
+            system
+                .map
+                .lock()
+                .unwrap()
+                .upsert_keyframe(empty_keyframe(idx));
+        }
+        system.tracker.state.mode = crate::tracking::SystemMode::Tracking;
+        system.tracker.state.last_frame_timestamp_sec = 1.0;
+        system.tracker.state.velocity = Some(Pose3d::new(
+            SO3F64::IDENTITY.matrix(),
+            Vec3F64::new(0.1, 0.0, 0.0),
+        ));
+        system
+    }
+
+    #[test]
+    fn tracking_rejection_carries_visual_prediction_during_grace() {
+        let mut system = tracking_test_system(11);
+        let image = kornia_image::Image::from_size_val(
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            0u8,
+        )
+        .unwrap();
+        for (idx, timestamp) in [(20, 2.0), (21, 2.25)] {
+            let result = system.tracking_step(empty_keyframe(idx).frame, None, &image, timestamp);
+            assert_eq!(result.status, crate::tracking::TrackingStatus::Skipped);
+            assert_eq!(
+                system.tracker.state.mode,
+                crate::tracking::SystemMode::Tracking
+            );
+            assert_eq!(system.tracker.state.last_frame_timestamp_sec, timestamp);
+            assert_eq!(system.tracker.state.lost_since_sec, Some(2.0));
+        }
+        assert!((system.tracker.state.pose_world_to_cam.translation.x - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn tracking_loss_boundaries_preserve_same_frame_bootstrap_and_map() {
+        let image = kornia_image::Image::from_size_val(
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            0u8,
+        )
+        .unwrap();
+        // Exactly the minimum map size is not established; timeout is inclusive.
+        for (map_size, lost_since, timestamp, expect_reset) in [
+            (10, None, 2.0, true),
+            (11, None, 2.0, false),
+            (11, Some(2.0), 2.499, false),
+            (11, Some(2.0), 2.5, true),
+        ] {
+            let mut system = tracking_test_system(map_size);
+            system.tracker.state.lost_since_sec = lost_since;
+            let mut frame = empty_keyframe(30).frame;
+            frame.features.keypoints_xy = vec![[320.0, 240.0]; 101];
+            frame.features.descriptors = vec![[0; 32]; 101];
+            frame.features.orientations = vec![0.0; 101];
+            frame.features.octaves = vec![0; 101];
+            system.tracking_step(frame, None, &image, timestamp);
+            assert_eq!(system.map.lock().unwrap().keyframes().len(), map_size);
+            assert!((system.tracker.state.pose_world_to_cam.translation.x - 0.1).abs() < 1e-12);
+            if expect_reset {
+                assert_eq!(
+                    system.tracker.state.mode,
+                    crate::tracking::SystemMode::Bootstrap
+                );
+                assert_eq!(
+                    system.tracker.state.bootstrap_frame.as_ref().unwrap().idx,
+                    30
+                );
+                assert_eq!(system.inertial.bootstrap_timestamp_sec, Some(timestamp));
+                assert_eq!(system.tracker.state.last_frame_timestamp_sec, 1.0);
+                assert!(system.tracker.state.velocity.is_none());
+            } else {
+                assert_eq!(
+                    system.tracker.state.mode,
+                    crate::tracking::SystemMode::Tracking
+                );
+                assert_eq!(system.tracker.state.last_frame_timestamp_sec, timestamp);
+            }
+        }
+    }
+
+    #[test]
+    fn tracking_imu_confidence_boundary_selects_longer_grace() {
+        let image = kornia_image::Image::from_size_val(
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            0u8,
+        )
+        .unwrap();
+        for (initialized_at, timestamp, reset) in
+            [(0.5, 2.5, false), (0.501, 2.5, true), (0.5, 3.0, true)]
+        {
+            let mut system = tracking_test_system(11);
+            system.tracker.state.imu_initialized = true;
+            system.tracker.state.imu_init_timestamp_sec = Some(initialized_at);
+            system.tracker.state.lost_since_sec = Some(2.0);
+            system.tracking_step(empty_keyframe(20).frame, None, &image, timestamp);
+            assert_eq!(
+                system.tracker.state.mode == crate::tracking::SystemMode::Bootstrap,
+                reset
+            );
+        }
+    }
+
+    #[test]
+    fn tracked_keyframe_result_uses_live_state_after_synchronous_mapping() {
+        let (map, frame, camera) = crate::tracking::tests::synthetic_scene();
+        let image = kornia_image::Image::from_size_val(frame.image_size, 0u8).unwrap();
+        let mut system = SlamSystem::new(
+            camera,
+            SlamConfig {
+                local_mapping: crate::map::LocalMappingMode::Synchronous,
+                ..SlamConfig::default()
+            },
+        );
+        *system.map.lock().unwrap() = map;
+        system.tracker.state.mode = crate::tracking::SystemMode::Tracking;
+        system.tracker.state.current_keyframe_idx = Some(0);
+        system.tracker.state.last_keyframe_idx = Some(0);
+        system.tracker.state.lost_since_sec = Some(0.9);
+        let result = system.tracking_step(frame, None, &image, 1.0);
+        assert_eq!(
+            result.status,
+            crate::tracking::TrackingStatus::KeyframeAccepted
+        );
+        assert_eq!(system.current_keyframe_idx(), Some(8));
+        assert_eq!(
+            result.pose_world_to_cam,
+            system.tracker.state.pose_world_to_cam
+        );
+        assert_eq!(system.tracker.state.last_frame_timestamp_sec, 1.0);
+        assert!(system.tracker.state.lost_since_sec.is_none());
+        assert_eq!(system.map.lock().unwrap().keyframes().len(), 2);
     }
 }
