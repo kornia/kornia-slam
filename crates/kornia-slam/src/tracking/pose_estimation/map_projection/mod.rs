@@ -179,7 +179,12 @@ impl MapProjectionEstimator {
         // per-frame tracking cost is independent of total map size. With no
         // reference KF yet the builder falls back to all non-culled points.
         let current_kf = current_keyframe_idx.and_then(|ki| map.get_keyframe(ki));
-        let local_indices = map.build_local_map_point_indices(&[], current_kf);
+        let local_indices = crate::tracking::local_map::select_local_landmarks(
+            map,
+            &[],
+            current_kf.map(|kf| kf.frame.idx),
+            &Default::default(),
+        );
 
         let (projection_matches, curr_keypoints_undist, grid) = self.match_map_to_frame(
             map,
@@ -376,7 +381,13 @@ impl MapProjectionEstimator {
         search_scale: f32,
     ) -> Option<Estimate> {
         let current_kf = current_kf_idx.and_then(|ki| map.get_keyframe(ki));
-        let local_indices = map.build_local_map_point_indices(tracked_matches, current_kf);
+        let matched_ids: Vec<usize> = tracked_matches.iter().map(|&(mp_idx, _)| mp_idx).collect();
+        let local_indices = crate::tracking::local_map::select_local_landmarks(
+            map,
+            &matched_ids,
+            current_kf.map(|kf| kf.frame.idx),
+            &Default::default(),
+        );
         let min_corr = self.config.pnp.min_correspondences;
         if local_indices.len() < min_corr {
             return None;

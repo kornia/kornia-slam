@@ -1,5 +1,6 @@
 //! Visual and inertial initialization for the SLAM system.
 
+pub(crate) mod bootstrap;
 mod inertial;
 mod two_view;
 

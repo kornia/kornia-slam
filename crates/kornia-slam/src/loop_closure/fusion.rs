@@ -71,10 +71,13 @@ fn loop_side_keyframes(map: &Map, anchor: usize, config: &LoopFusionConfig) -> V
     }
     let mut side = vec![anchor];
     side.extend(
-        map.covisible_keyframes(anchor, config.min_covisibility_weight)
-            .into_iter()
-            .take(config.max_neighbors_per_side)
-            .map(|(keyframe_idx, _)| keyframe_idx),
+        crate::map::covisible_above_weight(
+            map.covisible_keyframes(anchor),
+            config.min_covisibility_weight,
+        )
+        .into_iter()
+        .take(config.max_neighbors_per_side)
+        .map(|(keyframe_idx, _)| keyframe_idx),
     );
     side
 }

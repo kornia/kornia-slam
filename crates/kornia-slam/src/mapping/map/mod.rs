@@ -9,7 +9,7 @@
 //! |---|---|
 //! | `mutation` | `upsert_keyframe`, `push_map_point`, `register_observation`, `merge_map_points` |
 //! | `correction` | `apply_pose_graph_correction`, `apply_inertial_alignment`, `scale_world` |
-//! | `selection` | `covisible_keyframes`, `build_local_map_point_indices`, `map_points_in_frustum` |
+//! | `queries` | `covisible_keyframes` — the remaining structural query |
 //! | `growth` | `add_close_stereo_points`, `grow_map_points_from_keyframe_pair`, `fuse_into_neighbors` |
 //! | `culling` | `cull` |
 //! | `bundle_adjustment` | `local_ba_snapshot`, `merge_local_ba_snapshot`, `run_local_ba` |
@@ -26,11 +26,11 @@ mod ops;
 pub use keyframe::Keyframe;
 pub use local_mapping::{KeyframeJob, LocalMapping, LocalMappingMode};
 pub use map_point::MapPoint;
+pub use ops::covisible_above_weight;
 pub use ops::{
-    InertialAlignment, InertialAlignmentError, InitialMapHealth, KeyframeBaCorrection,
-    KeyframeVelocity, LocalBaMergeResult, LocalBaSnapshot, MapPointMergeResult,
-    PoseGraphCorrectionError, PoseGraphCorrectionResult, STEREO_DEPTH_MIN_SIGMA,
-    STEREO_DEPTH_REL_SIGMA, TriangulatedPoint,
+    InertialAlignment, InertialAlignmentError, KeyframeBaCorrection, KeyframeVelocity,
+    LocalBaMergeResult, LocalBaSnapshot, MapPointMergeResult, PoseGraphCorrectionError,
+    PoseGraphCorrectionResult, STEREO_DEPTH_MIN_SIGMA, STEREO_DEPTH_REL_SIGMA, TriangulatedPoint,
 };
 
 use kornia_sensors::imu::{ImuMeasurement, PreintegratedImu};

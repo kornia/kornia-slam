@@ -5,7 +5,7 @@ mod correction;
 mod culling;
 mod growth;
 mod mutation;
-mod selection;
+mod queries;
 
 pub use bundle_adjustment::{
     KeyframeBaCorrection, LocalBaMergeResult, LocalBaSnapshot, STEREO_DEPTH_MIN_SIGMA,
@@ -16,4 +16,4 @@ pub use correction::{
     PoseGraphCorrectionResult,
 };
 pub use mutation::{MapPointMergeResult, TriangulatedPoint};
-pub use selection::InitialMapHealth;
+pub use queries::covisible_above_weight;

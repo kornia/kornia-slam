@@ -441,15 +441,17 @@ impl SlamSystem {
             two_view_estimate.median_depth,
         );
 
-        // Post-BA sanity gate (mirrors ORB-SLAM3's reset criteria in
-        // CreateInitialMapMonocular). Discard the bootstrap if the resulting
-        // map has too few valid points or a degenerate scale.
-        const MIN_VALID_POINTS: usize = 50;
-        let health = self.map.lock().unwrap().initial_map_health();
-        if health.valid_in_both < MIN_VALID_POINTS || health.median_depth_older_kf <= 0.0 {
+        // Post-BA acceptance gate. Initialization owns the metric and its
+        // thresholds; the system only acts on the verdict.
+        let outcome = {
+            let map = self.map.lock().unwrap();
+            crate::initialization::bootstrap::evaluate_bootstrap(&map, prev_idx, curr_idx)
+        };
+        if let crate::initialization::bootstrap::BootstrapOutcome::Rejected { reason, quality } =
+            outcome
+        {
             self.dbg(format!(
-                "[init_gate] reject: valid_in_both={} median_depth={:.3} (need >= {} and > 0)",
-                health.valid_in_both, health.median_depth_older_kf, MIN_VALID_POINTS,
+                "[init_gate] reject: {reason:?} quality={quality:?}"
             ));
             self.map.lock().unwrap().clear_active();
             self.tracker.state.reset();
@@ -712,13 +714,16 @@ impl SlamSystem {
             // Release the map borrow before publication can lock it again.
             {
                 let mut map = self.map.lock().unwrap();
-                let current_kf = self
-                    .tracker
-                    .state
-                    .current_keyframe_idx
-                    .and_then(|ki| map.get_keyframe(ki));
-                let local_indices = map.build_local_map_point_indices(&outcome.matches, current_kf);
-                let visible = map.map_points_in_frustum(
+                let matched_ids: Vec<usize> =
+                    outcome.matches.iter().map(|&(mp_idx, _)| mp_idx).collect();
+                let local_indices = crate::tracking::local_map::select_local_landmarks(
+                    &map,
+                    &matched_ids,
+                    self.tracker.state.current_keyframe_idx,
+                    &Default::default(),
+                );
+                let visible = crate::tracking::local_map::landmarks_in_frustum(
+                    &map,
                     &local_indices,
                     &self.rig.camera,
                     &outcome.candidate_pose,

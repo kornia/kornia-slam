@@ -1,5 +1,6 @@
 //! Frame-to-map tracking, motion propagation, and tracking policies.
 
+pub mod local_map;
 pub mod optical_flow;
 mod policy;
 pub mod pose_estimation;

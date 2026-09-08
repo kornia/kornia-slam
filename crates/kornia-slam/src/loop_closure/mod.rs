@@ -119,7 +119,10 @@ impl LoopCloser {
             if bow.0.is_empty() {
                 return outcome;
             }
-            let neighbors = map.covisible_keyframes(kf_idx, MIN_COVIS_WEIGHT);
+            let neighbors = crate::map::covisible_above_weight(
+                map.covisible_keyframes(kf_idx),
+                MIN_COVIS_WEIGHT,
+            );
             (bow, neighbors)
         };
         let candidates = self.kf_database.detect_loop_candidates(
