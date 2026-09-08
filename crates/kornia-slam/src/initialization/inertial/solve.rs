@@ -350,8 +350,8 @@ impl ImuInitializer {
         let imu_bias = request.bias;
         let start_idx = request.start_kf_idx;
 
-        let mut keyframes: Vec<&Keyframe> = map.keyframes_from(start_idx).collect();
-        keyframes.sort_by_key(|kf| kf.frame.idx);
+        let keyframes: Vec<&Keyframe> =
+            super::window::InitWindow::select(map, start_idx).sorted_by_frame_idx();
         let n = keyframes.len();
         if n < self.config.min_keyframes {
             return Err(ImuInitRejectReason::InsufficientKeyframes {

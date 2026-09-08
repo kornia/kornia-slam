@@ -16,6 +16,7 @@
 
 mod factor;
 mod solve;
+mod window;
 
 #[cfg(test)]
 mod tests;
@@ -509,7 +510,8 @@ impl ImuInitializer {
             return Err(report);
         };
 
-        let kfs: Vec<&Keyframe> = map.keyframes_from(start_idx).collect();
+        let window = window::InitWindow::select(map, start_idx);
+        let kfs: Vec<&Keyframe> = window.in_insertion_order().to_vec();
         report.first_kf_idx = kfs.first().map(|kf| kf.frame.idx);
         report.last_kf_idx = kfs.last().map(|kf| kf.frame.idx);
         report.keyframes = kfs.len();
@@ -520,7 +522,7 @@ impl ImuInitializer {
         } else {
             self.config.min_time_sec
         };
-        report.imu_time_sec = map.imu_time_from(start_idx);
+        report.imu_time_sec = window.integrated_imu_time_sec(map);
 
         if kfs.len() < self.config.min_keyframes {
             report.reason = ImuInitNotReadyReason::Keyframes;

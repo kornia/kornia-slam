@@ -20,24 +20,6 @@ pub struct InitialMapHealth {
 }
 
 impl Map {
-    /// Keyframes belonging to the window that starts at `start_idx`, in map
-    /// insertion order — callers that need index order sort themselves.
-    pub fn keyframes_from(&self, start_idx: usize) -> impl Iterator<Item = &Keyframe> {
-        self.keyframes
-            .iter()
-            .filter(move |kf| kf.frame.idx >= start_idx)
-    }
-
-    /// Total preintegrated IMU time carried by the factors whose target
-    /// keyframe lies in the window that starts at `start_idx`.
-    pub fn imu_time_from(&self, start_idx: usize) -> f64 {
-        self.imu_factors
-            .iter()
-            .filter(|factor| factor.curr_kf_idx >= start_idx)
-            .map(|factor| factor.preintegrated.dt)
-            .sum()
-    }
-
     /// Health metrics for the just-bootstrapped pair of keyframes.
     ///
     /// Inspects the last two keyframes in insertion order and reports how
