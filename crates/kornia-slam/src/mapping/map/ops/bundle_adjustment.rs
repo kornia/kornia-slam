@@ -693,7 +693,7 @@ fn initial_ba_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::{MapPoint, tests::test_frame};
+    use crate::map::{LandmarkSeed, MapInsertion, MapPoint, ObservationKey, tests::test_frame};
     #[test]
     fn stereo_depth_obs_uses_proportional_sigma_with_floor() {
         let mut frame = test_frame(0, vec![[0u8; 32], [1u8; 32]]);
@@ -814,5 +814,101 @@ mod tests {
             map.get_keyframe(0).unwrap().frame.pose_world_to_cam,
             corrected
         );
+    }
+
+    // ── canonical mutation vs. an in-flight BA snapshot ──────────────────
+
+    fn seeded(kf: usize, feature: usize, z: f64) -> LandmarkSeed {
+        LandmarkSeed {
+            position: Vec3F64::new(0.0, 0.0, z),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: kf,
+                feature_idx: feature,
+            },
+        }
+    }
+
+    fn snapshot_fixture() -> (Map, usize) {
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]; 2])))
+            .unwrap();
+        let point = map.insert_landmark(seeded(0, 0, 5.0)).unwrap();
+        (map, point)
+    }
+
+    /// A snapshot taken before a landmark was retired must not resurrect it.
+    #[test]
+    fn merging_an_older_snapshot_does_not_resurrect_a_retired_landmark() {
+        let (mut map, point) = snapshot_fixture();
+        let snapshot = map.local_ba_snapshot();
+
+        assert!(map.remove_landmark(point).unwrap());
+        map.merge_local_ba_snapshot(snapshot);
+
+        assert!(map.map_points()[point].culled, "still retired");
+        assert!(map.map_points()[point].observations().is_empty());
+        assert_eq!(map.get_keyframe(0).unwrap().map_point(0), None);
+    }
+
+    /// Entities added while BA was running must survive the writeback.
+    #[test]
+    fn entities_added_after_a_snapshot_survive_its_merge() {
+        let (mut map, _) = snapshot_fixture();
+        let snapshot = map.local_ba_snapshot();
+
+        let result = map
+            .apply_insertion(MapInsertion {
+                keyframes: vec![Keyframe::from_frame(test_frame(1, vec![[1u8; 32]; 2]))],
+                landmarks: vec![seeded(1, 0, 7.0)],
+                ..Default::default()
+            })
+            .expect("valid batch");
+        let newer = result.landmark_ids[0];
+
+        map.merge_local_ba_snapshot(snapshot);
+
+        assert!(map.get_keyframe(1).is_some(), "newer keyframe survived");
+        assert!(!map.map_points()[newer].culled, "newer landmark survived");
+        assert_eq!(
+            map.get_keyframe(1).unwrap().map_point(0),
+            Some(newer),
+            "its link survived"
+        );
+    }
+
+    /// A merge must not reapply the pre-merge observation lists over a merge
+    /// that happened in the meantime.
+    #[test]
+    fn merging_after_a_landmark_merge_keeps_structure_consistent() {
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]; 2])))
+            .unwrap();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(1, vec![[1u8; 32]; 2])))
+            .unwrap();
+        let survivor = map.insert_landmark(seeded(0, 0, 5.0)).unwrap();
+        let duplicate = map.insert_landmark(seeded(0, 1, 5.01)).unwrap();
+        map.link_observation(1, 0, survivor).unwrap();
+
+        let snapshot = map.local_ba_snapshot();
+        map.merge_map_points(survivor, duplicate);
+        map.merge_local_ba_snapshot(snapshot);
+
+        // Whatever survived, the two sides still agree everywhere.
+        for kf in map.keyframes() {
+            for (feature, slot) in kf.map_point_by_desc_idx.iter().enumerate() {
+                let Some(mp_idx) = *slot else { continue };
+                let mp = &map.map_points()[mp_idx];
+                assert!(!mp.culled, "kf {} links a retired landmark", kf.frame.idx);
+                assert!(
+                    mp.observations()
+                        .iter()
+                        .any(|o| o.key.keyframe_idx == kf.frame.idx
+                            && o.key.feature_idx == feature),
+                    "link from kf {} has no record",
+                    kf.frame.idx
+                );
+            }
+        }
     }
 }
