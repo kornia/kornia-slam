@@ -91,13 +91,16 @@ impl MapPoint {
 
     /// Records a link. Returns false if this keyframe already observes the
     /// landmark, leaving the records untouched.
+    ///
+    /// Does not finalize: the representative descriptor is stale until
+    /// [`MapPoint::finalize_descriptor`] runs. A batch or a merge changing
+    /// several links pays for one O(n^2) selection rather than one per link.
     pub(crate) fn add_observation(&mut self, key: ObservationKey, descriptor: [u8; 32]) -> bool {
         if self.is_observed_by(key.keyframe_idx) {
             return false;
         }
         self.observations
             .push(LandmarkObservation { key, descriptor });
-        self.recompute_representative_descriptor();
         true
     }
 

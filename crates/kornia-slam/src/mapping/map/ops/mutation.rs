@@ -1878,4 +1878,87 @@ mod tests {
         assert_eq!(map.map_points()[point].reference_octave, 0);
         assert_map_consistent(&map);
     }
+
+    /// The representative descriptor must be right after a batch, which is the
+    /// only place finalization now happens: `add_observation` records without
+    /// selecting. Removing the finalize call breaks this and nothing else.
+    #[test]
+    fn a_batch_finalizes_the_representative_descriptor() {
+        // Four descriptors spaced four bits apart along a line: medians of the
+        // pairwise distances are 8, 4, 4, 8, so the second wins on the
+        // first-of-equals tie-break.
+        let d0 = [0u8; 32];
+        let mut d4 = [0u8; 32];
+        d4[0] = 0b0000_1111;
+        let mut d8 = [0u8; 32];
+        d8[0] = 0b1111_1111;
+        let mut d12 = [0u8; 32];
+        d12[0] = 0b1111_1111;
+        d12[1] = 0b0000_1111;
+
+        let mut map = Map::new();
+        let mut request = MapInsertion::default();
+        for (idx, descriptor) in [d0, d4, d8, d12].into_iter().enumerate() {
+            let mut kf = detached(idx, 1);
+            kf.frame.features.descriptors = vec![descriptor];
+            request.keyframes.push(kf);
+            if idx == 0 {
+                request.landmarks.push(seed(0, 0, 5.0));
+            } else {
+                request.observations.push(ObservationLink {
+                    observation: ObservationKey {
+                        keyframe_idx: idx,
+                        feature_idx: 0,
+                    },
+                    landmark: LandmarkTarget::New(0),
+                });
+            }
+        }
+        let landmark = map
+            .apply_insertion(request)
+            .expect("valid batch")
+            .landmark_ids[0];
+
+        assert_eq!(map.map_points()[landmark].observations().len(), 4);
+        assert_eq!(
+            map.map_points()[landmark].descriptor,
+            d4,
+            "the batch selected a representative over all four records"
+        );
+        assert_map_consistent(&map);
+    }
+
+    /// The single-operation path finalizes too: two records fall back to the
+    /// first, and a third can move the winner.
+    #[test]
+    fn a_single_link_finalizes_the_representative_descriptor() {
+        let d0 = [0u8; 32];
+        let mut d8 = [0u8; 32];
+        d8[0] = 0b1111_1111;
+        let mut d12 = [0u8; 32];
+        d12[0] = 0b1111_1111;
+        d12[1] = 0b0000_1111;
+
+        let mut map = Map::new();
+        for (idx, descriptor) in [d0, d12, d8].into_iter().enumerate() {
+            let mut kf = detached(idx, 1);
+            kf.frame.features.descriptors = vec![descriptor];
+            map.insert_keyframe(kf).unwrap();
+        }
+        let landmark = map.insert_landmark(seed(0, 0, 5.0)).unwrap();
+        map.link_observation(1, 0, landmark).unwrap();
+        assert_eq!(
+            map.map_points()[landmark].descriptor,
+            d0,
+            "two records take the first"
+        );
+
+        map.link_observation(2, 0, landmark).unwrap();
+        assert_eq!(
+            map.map_points()[landmark].descriptor,
+            d12,
+            "a third record moves the median winner off the first"
+        );
+        assert_map_consistent(&map);
+    }
 }

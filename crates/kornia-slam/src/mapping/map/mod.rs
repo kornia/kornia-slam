@@ -194,12 +194,19 @@ impl Map {
         }
     }
 
-    /// A comparable rendering of every stored value a mutation could touch.
+    /// A comparable rendering of the complete stored state.
     ///
     /// For unchanged-on-error assertions: comparing two of these catches a
     /// partial write that entity counts alone would miss — a redirected
     /// association, a lost descriptor contribution, a bumped counter, a moved
-    /// reference, a stale epoch.
+    /// reference, a stale epoch, a mutated measurement.
+    ///
+    /// Everything `Map` owns is covered: the epoch, each keyframe's pose,
+    /// velocity, bias, association slots and frame data, each landmark's
+    /// position, descriptor, colour, reference, geometry, counters and
+    /// records, and each IMU factor whole, preintegration and raw samples
+    /// included. `Frame` and `PreintegratedImu` are rendered through `Debug`,
+    /// so a new field on either joins this automatically.
     pub(crate) fn state_fingerprint_for_test(&self) -> String {
         use std::fmt::Write as _;
         let mut out = String::new();
@@ -207,21 +214,18 @@ impl Map {
         for kf in &self.keyframes {
             let _ = writeln!(
                 out,
-                "kf {} pose {:?} vel {:?} bias {:?} slots {:?}",
-                kf.frame.idx,
-                kf.frame.pose_world_to_cam,
-                kf.velocity_world,
-                kf.imu_bias,
-                kf.map_point_by_desc_idx,
+                "kf {} vel {:?} bias {:?} slots {:?} frame {:?}",
+                kf.frame.idx, kf.velocity_world, kf.imu_bias, kf.map_point_by_desc_idx, kf.frame,
             );
         }
         for (idx, mp) in self.map_points.iter().enumerate() {
             let _ = writeln!(
                 out,
-                "mp {idx} pos {:?} desc {:?} ref {} oct {} normal {:?} dist {:?}..{:?} \
-                 seen {}/{} culled {} obs {:?}",
+                "mp {idx} pos {:?} desc {:?} color {:?} ref {} oct {} normal {:?} \
+                 dist {:?}..{:?} seen {}/{} culled {} obs {:?}",
                 mp.position,
                 mp.descriptor,
+                mp.color,
                 mp.keyframe_idx,
                 mp.reference_octave,
                 mp.mean_viewing_direction,
@@ -236,12 +240,13 @@ impl Map {
         for factor in &self.imu_factors {
             let _ = writeln!(
                 out,
-                "imu {} -> {} [{}, {}] dt {}",
+                "imu {} -> {} [{}, {}] pre {:?} raw {:?}",
                 factor.prev_kf_idx,
                 factor.curr_kf_idx,
                 factor.t0,
                 factor.t1,
-                factor.preintegrated.dt,
+                factor.preintegrated,
+                factor.raw_samples,
             );
         }
         out

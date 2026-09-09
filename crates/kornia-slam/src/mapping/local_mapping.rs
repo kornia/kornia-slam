@@ -64,6 +64,20 @@ enum LocalMappingBackend {
     },
 }
 
+/// The coordinator's writeback decision, shared by both backends.
+///
+/// Culling runs under the caller's map lock, immediately after an accepted
+/// merge and before the result is published, so a completed result is never
+/// observable ahead of its cleanup. A refused snapshot — one whose world epoch
+/// no longer matches — publishes nothing and must therefore cull nothing.
+fn merge_and_cull(map: &mut Map, snapshot: LocalBaSnapshot) -> Option<LocalBaMergeResult> {
+    let merged = map.merge_local_ba_snapshot(snapshot);
+    if merged.is_some() {
+        crate::mapping::culling::cull_landmarks(map);
+    }
+    merged
+}
+
 impl LocalMapping {
     pub fn new(mode: LocalMappingMode, map: Arc<Mutex<Map>>, camera: PinholeCamera) -> Self {
         let backend = match mode {
@@ -108,14 +122,10 @@ impl LocalMapping {
                 // Cull under the same lock as the merge, so a completed result
                 // is never observable before cleanup. A rejected snapshot culls
                 // nothing.
-                let merged = {
-                    let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let merged = map.merge_local_ba_snapshot(snapshot);
-                    if merged.is_some() {
-                        crate::mapping::culling::cull_landmarks(&mut map);
-                    }
-                    merged
-                };
+                let merged = merge_and_cull(
+                    &mut map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    snapshot,
+                );
                 if let Some(result) = merged {
                     results
                         .lock()
@@ -228,15 +238,10 @@ impl LocalMappingHandle {
                         let _publication = publication_gate
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let merged = {
-                            let mut map =
-                                map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                            let merged = map.merge_local_ba_snapshot(snapshot);
-                            if merged.is_some() {
-                                crate::mapping::culling::cull_landmarks(&mut map);
-                            }
-                            merged
-                        };
+                        let merged = merge_and_cull(
+                            &mut map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            snapshot,
+                        );
                         merged.is_some_and(|result| result_sender.send(result).is_err())
                     };
                     if should_stop {
@@ -479,23 +484,44 @@ mod tests {
 
     /// An epoch-rejected snapshot publishes nothing, so it must not cull
     /// either — the live map is left exactly as it was.
+    /// Through the coordinator's own decision, not `merge_local_ba_snapshot`
+    /// directly: a test that bypassed `merge_and_cull` would pass even if the
+    /// worker culled after every refused merge.
     #[test]
-    fn a_rejected_snapshot_leaves_a_cullable_landmark_untouched() {
+    fn the_coordinator_does_not_cull_after_a_refused_merge() {
         let (map, doomed) = map_with_a_cullable_landmark();
         let snapshot = map.lock().unwrap().local_ba_snapshot();
         // Advance the world frame, so the snapshot belongs to an older epoch.
         map.lock().unwrap().scale_world(2.0);
 
-        assert!(
-            map.lock()
-                .unwrap()
-                .merge_local_ba_snapshot(snapshot)
-                .is_none(),
-            "an older-epoch snapshot is refused"
-        );
+        let merged = super::merge_and_cull(&mut map.lock().unwrap(), snapshot);
 
+        assert!(merged.is_none(), "an older-epoch snapshot is refused");
         let map = map.lock().unwrap();
         assert!(!map.map_points()[doomed].culled, "no cull after a refusal");
         assert_eq!(map.get_keyframe(0).unwrap().map_point(0), Some(doomed));
+    }
+
+    /// The same seam on the accepting side: an accepted merge culls, even when
+    /// it published no numerical change.
+    #[test]
+    fn the_coordinator_culls_after_an_accepted_merge() {
+        let (map, doomed) = map_with_a_cullable_landmark();
+        let snapshot = map.lock().unwrap().local_ba_snapshot();
+
+        let merged = super::merge_and_cull(&mut map.lock().unwrap(), snapshot);
+
+        assert!(merged.is_some(), "a current-epoch snapshot is accepted");
+        assert_eq!(
+            merged.expect("accepted").map_points_updated,
+            0,
+            "nothing moved, so the merge published no change"
+        );
+        let map = map.lock().unwrap();
+        assert!(
+            map.map_points()[doomed].culled,
+            "culling still runs after an accepted no-op merge"
+        );
+        assert_eq!(map.get_keyframe(0).unwrap().map_point(0), None);
     }
 }
