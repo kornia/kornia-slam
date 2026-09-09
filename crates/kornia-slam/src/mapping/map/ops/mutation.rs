@@ -820,12 +820,7 @@ mod tests {
         let replaced = map.insert_landmark(seed(2, 0, 5.01)).unwrap();
         map.link_observation(1, 1, replaced).unwrap();
         map.set_tracking_stats_for_test(replaced, 4, 3);
-        map.get_keyframe_mut(2)
-            .unwrap()
-            .associate_map_point(0, replaced);
-        map.get_keyframe_mut(1)
-            .unwrap()
-            .associate_map_point(1, replaced);
+        assert_map_consistent(&map);
 
         let result = map.merge_map_points(survivor, replaced).unwrap();
 
@@ -866,8 +861,12 @@ mod tests {
 
         assert!(map.merge_map_points(first, first).is_none());
         assert!(map.merge_map_points(first, usize::MAX).is_none());
-        map.map_points_mut()[second].mark_culled();
+        // Retired canonically, so its association goes with it — marking the
+        // flag alone would leave a link to a retired landmark, a state the
+        // invariant forbids.
+        map.remove_landmark(second).unwrap();
         assert!(map.merge_map_points(first, second).is_none());
+        assert_map_consistent(&map);
     }
 
     // ── Scale-invariance state (T1: deterministic, cross-checked vs ORB-SLAM3
@@ -1419,10 +1418,8 @@ mod tests {
         }
         let survivor = map.insert_landmark(seed(0, 0, 5.0)).unwrap();
         let duplicate = map.insert_landmark(seed(1, 0, 5.01)).unwrap();
-        map.map_points_mut()[survivor].n_visible = 7;
-        map.map_points_mut()[survivor].n_found = 5;
-        map.map_points_mut()[duplicate].n_visible = 4;
-        map.map_points_mut()[duplicate].n_found = 3;
+        map.set_tracking_stats_for_test(survivor, 7, 5);
+        map.set_tracking_stats_for_test(duplicate, 4, 3);
 
         let result = map.merge_map_points(survivor, duplicate).unwrap();
 

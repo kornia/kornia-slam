@@ -442,7 +442,11 @@ impl SlamSystem {
 
         let estimated_pose = two_view_estimate.pose;
         let prev_pose_world_to_cam = curr_frame.pose_world_to_cam;
-        self.tracker.state.pose_world_to_cam = estimated_pose;
+        // The frame carries the estimate into the keyframe it becomes, but the
+        // tracker does not adopt it yet: a map that fails publication or the
+        // health gate below must not leave its pose behind. Adoption happens
+        // once, from the stored keyframe, after both gates pass — which also
+        // picks up whatever initial BA refined.
         curr_frame.pose_world_to_cam = estimated_pose;
 
         // Promote to Keyframes
@@ -492,8 +496,9 @@ impl SlamSystem {
             };
         }
 
-        // BA inside build_initial_map may have refined KF1's pose; sync state
-        // and recompute velocity from the post-BA pose.
+        // Both gates passed, so the map is committed: adopt its pose. This is
+        // the only place bootstrap moves the tracker, and it reads the stored
+        // keyframe, so it picks up whatever initial BA refined.
         if let Some(kf) = self.map.lock().unwrap().get_keyframe(curr_idx) {
             self.tracker.state.pose_world_to_cam = kf.frame.pose_world_to_cam;
         }
