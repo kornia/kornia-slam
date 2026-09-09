@@ -1172,7 +1172,12 @@ mod tests {
 
     /// Every link is mirrored on both sides, and no feature or landmark is
     /// claimed twice within a keyframe.
+    /// The full documented invariant, not a subset. Every rule here is one the
+    /// module doc promises, so a fixture that violates one is a broken fixture
+    /// rather than a tolerated shape.
     fn assert_map_consistent(map: &Map) {
+        // Keyframe side: each association is mirrored by a record, targets an
+        // active landmark, and no landmark is claimed twice in one keyframe.
         for kf in map.keyframes() {
             let mut seen: HashSet<usize> = HashSet::new();
             for (feature, slot) in kf.map_point_by_desc_idx.iter().enumerate() {
@@ -1180,8 +1185,10 @@ mod tests {
                 let mp = &map.map_points()[mp_idx];
                 assert!(!mp.culled, "kf {} links retired {mp_idx}", kf.frame.idx);
                 assert!(
-                    mp.observations().iter().any(|o| o.key.keyframe_idx == kf.frame.idx
-                        && o.key.feature_idx == feature),
+                    mp.observations()
+                        .iter()
+                        .any(|o| o.key.keyframe_idx == kf.frame.idx
+                            && o.key.feature_idx == feature),
                     "kf {} feature {feature} -> {mp_idx} has no matching record",
                     kf.frame.idx
                 );
@@ -1191,14 +1198,33 @@ mod tests {
                 );
             }
         }
+
         for (mp_idx, mp) in map.map_points().iter().enumerate() {
             if mp.culled {
                 assert!(
                     mp.observations().is_empty(),
                     "retired {mp_idx} kept records"
                 );
+                assert_eq!(
+                    (mp.mean_viewing_direction, mp.min_distance, mp.max_distance),
+                    (Vec3F64::ZERO, 0.0, 0.0),
+                    "retired {mp_idx} kept derived geometry"
+                );
                 continue;
             }
+
+            // An active landmark is observed, and its reference is one of those
+            // observations rather than a dangling id.
+            assert!(
+                !mp.observations().is_empty(),
+                "active {mp_idx} has no observations"
+            );
+            assert!(
+                mp.is_observed_by(mp.keyframe_idx),
+                "active {mp_idx} references kf {} without observing it",
+                mp.keyframe_idx
+            );
+
             let mut kfs: HashSet<usize> = HashSet::new();
             for obs in mp.observations() {
                 assert!(kfs.insert(obs.key.keyframe_idx), "duplicate observer");
@@ -1206,7 +1232,56 @@ mod tests {
                     .get_keyframe(obs.key.keyframe_idx)
                     .expect("observer exists");
                 assert_eq!(kf.map_point(obs.key.feature_idx), Some(mp_idx));
+
+                // The referenced feature exists in both arrays, and the record
+                // carries that feature's own descriptor.
+                assert!(
+                    obs.key.feature_idx < kf.frame.features.descriptors.len()
+                        && obs.key.feature_idx < kf.frame.features.keypoints_xy.len(),
+                    "record on kf {} feature {} is outside the feature arrays",
+                    obs.key.keyframe_idx,
+                    obs.key.feature_idx
+                );
+                assert_eq!(
+                    obs.descriptor, kf.frame.features.descriptors[obs.key.feature_idx],
+                    "record on kf {} feature {} carries a foreign descriptor",
+                    obs.key.keyframe_idx, obs.key.feature_idx
+                );
+
+                // The reference octave agrees with its feature, with the same
+                // fallback insertion uses when octave data is absent.
+                if obs.key.keyframe_idx == mp.keyframe_idx {
+                    let expected = kf
+                        .frame
+                        .features
+                        .octaves
+                        .get(obs.key.feature_idx)
+                        .copied()
+                        .unwrap_or(0);
+                    assert_eq!(
+                        mp.reference_octave, expected,
+                        "landmark {mp_idx} reference octave disagrees with its feature"
+                    );
+                }
             }
+        }
+
+        // IMU edges connect stored keyframes, and each directed edge is unique.
+        let mut edges: HashSet<(usize, usize)> = HashSet::new();
+        for factor in map.imu_factors() {
+            assert!(
+                map.get_keyframe(factor.prev_kf_idx).is_some()
+                    && map.get_keyframe(factor.curr_kf_idx).is_some(),
+                "imu edge {} -> {} has a missing endpoint",
+                factor.prev_kf_idx,
+                factor.curr_kf_idx
+            );
+            assert!(
+                edges.insert((factor.prev_kf_idx, factor.curr_kf_idx)),
+                "duplicate imu edge {} -> {}",
+                factor.prev_kf_idx,
+                factor.curr_kf_idx
+            );
         }
     }
 
@@ -1358,8 +1433,7 @@ mod tests {
         let mut map = Map::new();
         map.insert_keyframe(detached(0, 2)).unwrap();
         let existing = map.insert_landmark(seed(0, 0, 5.0)).unwrap();
-        let before_points = map.num_map_points();
-        let before_kfs = map.keyframes().len();
+        let before = map.state_fingerprint_for_test();
 
         let err = map
             .apply_insertion(MapInsertion {
@@ -1385,15 +1459,18 @@ mod tests {
                 holder: existing
             }
         );
-        assert_eq!(map.num_map_points(), before_points);
-        assert_eq!(map.keyframes().len(), before_kfs);
-        assert!(map.get_keyframe(1).is_none());
+        assert_eq!(
+            map.state_fingerprint_for_test(),
+            before,
+            "a rejected batch changed stored state"
+        );
         assert_map_consistent(&map);
     }
 
     #[test]
     fn an_out_of_range_new_target_is_refused() {
         let mut map = Map::new();
+        let before = map.state_fingerprint_for_test();
         let err = map
             .apply_insertion(MapInsertion {
                 keyframes: vec![detached(0, 2)],
@@ -1409,8 +1486,7 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(err, MapMutationError::InvalidNewLandmark(4));
-        assert!(map.keyframes().is_empty());
-        assert_eq!(map.num_map_points(), 0);
+        assert_eq!(map.state_fingerprint_for_test(), before);
     }
 
     #[test]
@@ -1683,6 +1759,7 @@ mod tests {
             t0: 0.0,
             t1: 1.0,
         };
+        let before = map.state_fingerprint_for_test();
 
         let err = map
             .apply_insertion(MapInsertion {
@@ -1697,9 +1774,11 @@ mod tests {
             err,
             MapMutationError::DuplicateImuFactor { prev: 10, curr: 11 }
         );
-        assert!(map.get_keyframe(11).is_none());
-        assert_eq!(map.num_map_points(), 0);
-        assert!(map.imu_factors().is_empty());
+        assert_eq!(
+            map.state_fingerprint_for_test(),
+            before,
+            "the whole request was refused, factors included"
+        );
     }
 
     /// R3: proposing the same link twice in one request is a no-op, not a

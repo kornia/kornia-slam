@@ -194,6 +194,59 @@ impl Map {
         }
     }
 
+    /// A comparable rendering of every stored value a mutation could touch.
+    ///
+    /// For unchanged-on-error assertions: comparing two of these catches a
+    /// partial write that entity counts alone would miss — a redirected
+    /// association, a lost descriptor contribution, a bumped counter, a moved
+    /// reference, a stale epoch.
+    pub(crate) fn state_fingerprint_for_test(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = writeln!(out, "epoch {}", self.world_epoch);
+        for kf in &self.keyframes {
+            let _ = writeln!(
+                out,
+                "kf {} pose {:?} vel {:?} bias {:?} slots {:?}",
+                kf.frame.idx,
+                kf.frame.pose_world_to_cam,
+                kf.velocity_world,
+                kf.imu_bias,
+                kf.map_point_by_desc_idx,
+            );
+        }
+        for (idx, mp) in self.map_points.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "mp {idx} pos {:?} desc {:?} ref {} oct {} normal {:?} dist {:?}..{:?} \
+                 seen {}/{} culled {} obs {:?}",
+                mp.position,
+                mp.descriptor,
+                mp.keyframe_idx,
+                mp.reference_octave,
+                mp.mean_viewing_direction,
+                mp.min_distance,
+                mp.max_distance,
+                mp.n_found,
+                mp.n_visible,
+                mp.culled,
+                mp.observations(),
+            );
+        }
+        for factor in &self.imu_factors {
+            let _ = writeln!(
+                out,
+                "imu {} -> {} [{}, {}] dt {}",
+                factor.prev_kf_idx,
+                factor.curr_kf_idx,
+                factor.t0,
+                factor.t1,
+                factor.preintegrated.dt,
+            );
+        }
+        out
+    }
+
     /// Applies `edit` to each stored keyframe in insertion order, for fixtures
     /// that inject deterministic noise into poses or inertial state.
     pub(crate) fn edit_keyframes_for_test(&mut self, mut edit: impl FnMut(usize, &mut Keyframe)) {
