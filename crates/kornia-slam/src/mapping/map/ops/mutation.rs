@@ -1961,4 +1961,39 @@ mod tests {
         );
         assert_map_consistent(&map);
     }
+
+    /// Two proposals naming one feature is a conflict, so a caller preparing a
+    /// batch from geometry must resolve it rather than hand the map a request
+    /// that refuses everything. Monocular bootstrap hit exactly this: the
+    /// two-view solve can triangulate two points onto one keypoint, and the
+    /// whole bootstrap was being rejected over it.
+    #[test]
+    fn two_landmarks_naming_one_feature_refuse_the_whole_batch() {
+        let mut map = Map::new();
+        let err = map
+            .apply_insertion(MapInsertion {
+                keyframes: vec![detached(0, 2)],
+                landmarks: vec![seed(0, 0, 5.0), seed(0, 0, 6.0)],
+                ..Default::default()
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, MapMutationError::FeatureOccupied { .. }));
+        assert!(
+            map.keyframes().is_empty(),
+            "the keyframe went back with the rest of the request"
+        );
+
+        // Resolved by the caller — first proposal keeps the feature — the same
+        // geometry publishes cleanly.
+        let result = map
+            .apply_insertion(MapInsertion {
+                keyframes: vec![detached(0, 2)],
+                landmarks: vec![seed(0, 0, 5.0), seed(0, 1, 6.0)],
+                ..Default::default()
+            })
+            .expect("distinct features publish");
+        assert_eq!(result.landmark_ids.len(), 2);
+        assert_map_consistent(&map);
+    }
 }

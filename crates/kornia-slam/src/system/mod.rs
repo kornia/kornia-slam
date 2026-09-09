@@ -11,6 +11,7 @@ use inertial::InertialState;
 pub use crate::loop_closure::LoopClosureEvent;
 pub use config::{LoopClosingConfig, SlamConfig};
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::Frame;
@@ -614,7 +615,17 @@ impl SlamSystem {
             keyframes: vec![reference_kf, current_kf],
             ..Default::default()
         };
+        // The two-view result can name one feature twice — two triangulated
+        // points landing on the same keypoint in either view. The old
+        // last-wins insertion hid that; a validated batch would refuse the
+        // whole bootstrap over it, so resolve it here: first proposal keeps
+        // the feature, later ones are dropped.
+        let mut claimed_current: HashSet<usize> = HashSet::new();
+        let mut claimed_reference: HashSet<usize> = HashSet::new();
         for (position, _descriptor, color, ref_desc_idx, curr_desc_idx) in &triangulated {
+            if !claimed_current.insert(*curr_desc_idx) || !claimed_reference.insert(*ref_desc_idx) {
+                continue;
+            }
             let new_index = request.landmarks.len();
             request.landmarks.push(LandmarkSeed {
                 position: *position,
@@ -907,8 +918,13 @@ impl SlamSystem {
         // tracking already owns.
         let mut claimed: Vec<Option<usize>> = vec![None; frame.features.descriptors.len()];
         let mut core = MapInsertion::default();
+        // One feature per landmark and one landmark per feature, both resolved
+        // here: a repeat would otherwise refuse the whole keyframe.
+        let mut claimed_landmarks: HashSet<usize> = HashSet::new();
         for &(mp_idx, curr_idx) in matches {
-            if claimed.get(curr_idx).copied().flatten().is_some() {
+            if claimed.get(curr_idx).copied().flatten().is_some()
+                || !claimed_landmarks.insert(mp_idx)
+            {
                 continue;
             }
             if let Some(slot) = claimed.get_mut(curr_idx) {
