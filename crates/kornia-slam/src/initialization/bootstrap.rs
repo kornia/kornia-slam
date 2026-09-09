@@ -143,7 +143,9 @@ pub(crate) fn evaluate_bootstrap(
 mod tests {
     use super::*;
     use crate::frame::Frame;
-    use crate::map::{Keyframe, MapPoint};
+    use crate::map::{
+        Keyframe, LandmarkSeed, LandmarkTarget, MapInsertion, ObservationKey, ObservationLink,
+    };
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::{Mat3F64, Vec3F64};
     use kornia_image::ImageSize;
@@ -174,21 +176,31 @@ mod tests {
     /// metres ahead of both, each associated to a distinct feature slot.
     fn bootstrap_map(n: usize) -> Map {
         let mut map = Map::new();
-        let mut reference = Keyframe::from_frame(frame(0, n, Vec3F64::ZERO));
-        let mut current = Keyframe::from_frame(frame(1, n, Vec3F64::new(-0.1, 0.0, 0.0)));
+        let mut request = MapInsertion {
+            keyframes: vec![
+                Keyframe::from_frame(frame(0, n, Vec3F64::ZERO)),
+                Keyframe::from_frame(frame(1, n, Vec3F64::new(-0.1, 0.0, 0.0))),
+            ],
+            ..Default::default()
+        };
         for i in 0..n {
-            let idx = map.push_map_point(MapPoint::new(
-                Vec3F64::new(0.0, 0.0, 5.0 + i as f64 * 0.01),
-                [0u8; 32],
-                0,
-                [0; 3],
-                0,
-            ));
-            reference.associate_map_point(i, idx);
-            current.associate_map_point(i, idx);
+            request.landmarks.push(LandmarkSeed {
+                position: Vec3F64::new(0.0, 0.0, 5.0 + i as f64 * 0.01),
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx: i,
+                },
+            });
+            request.observations.push(ObservationLink {
+                observation: ObservationKey {
+                    keyframe_idx: 1,
+                    feature_idx: i,
+                },
+                landmark: LandmarkTarget::New(i),
+            });
         }
-        map.upsert_keyframe(reference);
-        map.upsert_keyframe(current);
+        map.apply_insertion(request).expect("valid fixture");
         map
     }
 
@@ -225,7 +237,7 @@ mod tests {
         let mut map = bootstrap_map(60);
         // Drop the association from the current keyframe only. The landmark is
         // still in front of both cameras, so the union keeps counting it.
-        map.get_keyframe_mut(1).unwrap().clear_map_point(0);
+        map.unlink_observation(1, 0).unwrap();
         match evaluate_bootstrap(&map, 0, 1) {
             BootstrapOutcome::Accepted(q) => assert_eq!(q.points_in_front_of_both, 60),
             other => panic!("expected acceptance, got {other:?}"),
@@ -281,8 +293,10 @@ mod tests {
     fn points_behind_either_camera_do_not_count() {
         let mut map = bootstrap_map(60);
         // Push the current keyframe past the landmarks so they fall behind it.
-        map.get_keyframe_mut(1).unwrap().frame.pose_world_to_cam =
-            Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.0, 0.0, -20.0));
+        map.set_keyframe_pose_for_test(
+            1,
+            Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.0, 0.0, -20.0)),
+        );
         match evaluate_bootstrap(&map, 0, 1) {
             BootstrapOutcome::Rejected {
                 reason: BootstrapReject::TooFewPoints { found: 0, .. },

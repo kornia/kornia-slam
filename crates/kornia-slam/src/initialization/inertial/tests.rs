@@ -389,7 +389,7 @@ fn viba2_accel_bias_stays_bounded_under_pose_inconsistency() {
 
     // Add deterministic millimetre-scale front-end noise.
     let mut map = synth_map_with_calib(0.5, r_arb, euroc_calib, WEAK_YAW_RATE);
-    for (k, kf) in map.keyframes_mut().iter_mut().enumerate() {
+    map.edit_keyframes_for_test(|k, kf| {
         let f = k as f64;
         let jitter = Vec3F64::new(
             (3.7 * f).sin(),
@@ -399,7 +399,7 @@ fn viba2_accel_bias_stays_bounded_under_pose_inconsistency() {
         let cam_to_world = kf.frame.pose_world_to_cam.inverse();
         kf.frame.pose_world_to_cam =
             Pose3d::new(cam_to_world.rotation, cam_to_world.translation + jitter).inverse();
-    }
+    });
 
     let viba0 = initializer
         .try_initialize(

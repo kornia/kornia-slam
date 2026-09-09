@@ -112,12 +112,12 @@ impl Map {
     }
 
     /// Numeric writeback over stored keyframes, for correction and bundle
-    /// adjustment inside this module tree.
+    /// adjustment.
     ///
-    /// Private to `map`: outer mapping, tracking and the system change
-    /// structure only through the canonical operations, which keep both sides
-    /// of every link in step.
-    pub(crate) fn keyframes_mut(&mut self) -> &mut [Keyframe] {
+    /// Private to this module tree — `map` and its descendants. Everything
+    /// outside changes structure only through the canonical operations, which
+    /// keep both sides of every link in step.
+    fn keyframes_mut(&mut self) -> &mut [Keyframe] {
         &mut self.keyframes
     }
 
@@ -126,9 +126,9 @@ impl Map {
         self.keyframes.iter().find(|kf| kf.frame.idx == idx)
     }
 
-    /// Mutable access to one stored keyframe, for numeric writeback inside
-    /// this module tree. See [`Map::keyframes_mut`] on why it is not public.
-    pub(crate) fn get_keyframe_mut(&mut self, idx: usize) -> Option<&mut Keyframe> {
+    /// Mutable access to one stored keyframe, for numeric writeback. Private
+    /// for the same reason as [`Map::keyframes_mut`].
+    fn get_keyframe_mut(&mut self, idx: usize) -> Option<&mut Keyframe> {
         self.keyframes.iter_mut().find(|kf| kf.frame.idx == idx)
     }
 
@@ -139,11 +139,12 @@ impl Map {
 
     /// Numeric writeback over stored landmarks.
     ///
-    /// A slice, not the `Vec`: landmark ids are stable indices held inside
-    /// keyframes, so pushing, removing or reordering slots here would
-    /// invalidate live associations. Growth and retirement go through the
-    /// canonical operations instead.
-    pub(crate) fn map_points_mut(&mut self) -> &mut [MapPoint] {
+    /// Private, like the keyframe accessors above. A slice rather than the
+    /// `Vec` narrows the damage — no push or remove — but does not prevent it:
+    /// `swap` and `sort` would still reassign landmark identities without
+    /// repairing the associations that index them, so this stays inside the
+    /// module tree where every caller is auditable.
+    fn map_points_mut(&mut self) -> &mut [MapPoint] {
         &mut self.map_points
     }
 
@@ -160,6 +161,45 @@ impl Map {
     /// Returns all keyframe-to-keyframe IMU factors in insertion order.
     pub fn imu_factors(&self) -> &[ImuFactor] {
         &self.imu_factors
+    }
+}
+
+/// Narrowly scoped fixture helpers.
+///
+/// These reach the module-private numeric accessors so tests outside `map` do
+/// not need them made public. Each writes estimated quantities only — counters,
+/// poses, inertial state — never structure. Anything that changes which feature
+/// holds which landmark goes through the canonical operations, including in
+/// fixtures.
+#[cfg(test)]
+impl Map {
+    /// Sets a landmark's per-frame tracking statistics directly, instead of
+    /// replaying the frames that would produce them.
+    pub(crate) fn set_tracking_stats_for_test(&mut self, mp_idx: usize, visible: u32, found: u32) {
+        if let Some(mp) = self.map_points_mut().get_mut(mp_idx) {
+            mp.n_visible = visible;
+            mp.n_found = found;
+        }
+    }
+
+    /// Overrides a stored keyframe's pose, for fixtures that need a specific
+    /// geometry rather than one produced by an estimator.
+    pub(crate) fn set_keyframe_pose_for_test(
+        &mut self,
+        kf_idx: usize,
+        pose: kornia_3d::pose::Pose3d,
+    ) {
+        if let Some(kf) = self.get_keyframe_mut(kf_idx) {
+            kf.frame.pose_world_to_cam = pose;
+        }
+    }
+
+    /// Applies `edit` to each stored keyframe in insertion order, for fixtures
+    /// that inject deterministic noise into poses or inertial state.
+    pub(crate) fn edit_keyframes_for_test(&mut self, mut edit: impl FnMut(usize, &mut Keyframe)) {
+        for (index, keyframe) in self.keyframes_mut().iter_mut().enumerate() {
+            edit(index, keyframe);
+        }
     }
 }
 

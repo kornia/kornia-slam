@@ -503,14 +503,24 @@ impl SlamSystem {
                 self.inertial
                     .preintegrate_window(self.rig.imu.as_ref(), prev_ts, timestamp_sec);
             if preint.dt > 0.0 {
-                self.map.lock().unwrap().add_imu_factor(
-                    prev_idx,
-                    curr_idx,
-                    preint,
-                    raw_samples,
-                    prev_ts,
-                    timestamp_sec,
-                );
+                // Through the validated path: endpoints must exist, the edge
+                // must be new, and the interval finite and ordered.
+                let published = self.map.lock().unwrap().apply_insertion(MapInsertion {
+                    imu_factors: vec![ImuFactor {
+                        prev_kf_idx: prev_idx,
+                        curr_kf_idx: curr_idx,
+                        preintegrated: preint,
+                        raw_samples,
+                        t0: prev_ts,
+                        t1: timestamp_sec,
+                    }],
+                    ..Default::default()
+                });
+                if let Err(error) = published {
+                    self.dbg(format!(
+                        "[bootstrap] frame={curr_idx} imu edge rejected: {error}"
+                    ));
+                }
             }
             self.inertial.prune_before(timestamp_sec);
         }

@@ -7,6 +7,7 @@ use crate::map::{
     ImuFactor, Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR, ObservationKey,
 };
 use kornia_algebra::Vec3F64;
+#[cfg(test)]
 use kornia_sensors::imu::{ImuMeasurement, PreintegratedImu};
 use std::collections::{HashMap, HashSet};
 
@@ -55,6 +56,12 @@ impl Map {
         idx
     }
 
+    /// Unchecked IMU edge insertion, retained for fixtures only.
+    ///
+    /// Accepts missing endpoints, a duplicate directed edge and a malformed
+    /// interval — all of which [`Map::apply_insertion`] rejects. `#[cfg(test)]`
+    /// keeps it out of production builds; publish edges through a batch.
+    #[cfg(test)]
     /// Records preintegrated IMU measurements between two consecutive keyframes.
     /// `raw_samples` (covering `[t0, t1]`) are retained for repropagation —
     /// see `ImuFactor::raw_samples`.

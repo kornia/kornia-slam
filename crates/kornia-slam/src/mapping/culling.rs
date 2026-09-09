@@ -110,10 +110,8 @@ mod tests {
         let doomed = map.insert_landmark(seed(0)).unwrap();
         let kept = map.insert_landmark(seed(1)).unwrap();
 
-        map.map_points_mut()[doomed].n_visible = 10;
-        map.map_points_mut()[doomed].n_found = 1;
-        map.map_points_mut()[kept].n_visible = 10;
-        map.map_points_mut()[kept].n_found = 5;
+        map.set_tracking_stats_for_test(doomed, 10, 1);
+        map.set_tracking_stats_for_test(kept, 10, 5);
 
         assert_eq!(cull_landmarks(&mut map), 1);
         assert!(map.map_points()[doomed].culled);
@@ -139,8 +137,7 @@ mod tests {
                 },
             })
             .unwrap();
-        map.map_points_mut()[idx].n_visible = 4;
-        map.map_points_mut()[idx].n_found = 0;
+        map.set_tracking_stats_for_test(idx, 4, 0);
 
         assert_eq!(cull_landmarks(&mut map), 0);
         assert!(!map.map_points()[idx].culled);

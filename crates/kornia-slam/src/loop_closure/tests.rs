@@ -1,6 +1,6 @@
 use super::*;
 use crate::Frame;
-use crate::map::{Keyframe, LandmarkSeed, Map, MapPoint, ObservationKey};
+use crate::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
 use crate::pose_conversion::pose_to_se3;
 use crate::sparse_pgo::{Se3Manifold, sparse_pose_graph_optimize};
 use kornia_3d::camera::PinholeCamera;
@@ -107,10 +107,15 @@ fn synthetic_loop_map() -> (Map, Pose3d) {
     map.upsert_keyframe(candidate);
     map.upsert_keyframe(query);
     for (index, point) in world.into_iter().enumerate() {
-        let map_point = map.push_map_point(MapPoint::new(point, descriptors[index], 0, [0; 3], 0));
-        map.get_keyframe_mut(0)
-            .unwrap()
-            .associate_map_point(index, map_point);
+        map.insert_landmark(LandmarkSeed {
+            position: point,
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 0,
+                feature_idx: index,
+            },
+        })
+        .unwrap();
     }
     (map, query_pose)
 }
@@ -118,9 +123,9 @@ fn synthetic_loop_map() -> (Map, Pose3d) {
 #[test]
 fn correspondence_input_filters_unassociated_and_culled_points() {
     let (mut map, _) = synthetic_loop_map();
-    map.get_keyframe_mut(0).unwrap().clear_map_point(0);
+    map.unlink_observation(0, 0).unwrap();
     let culled = map.get_keyframe(0).unwrap().map_point(1).unwrap();
-    map.map_points_mut()[culled].mark_culled();
+    map.remove_landmark(culled).unwrap();
     let config = LoopVerificationConfig {
         min_correspondences: 1,
         ..LoopVerificationConfig::default()
@@ -303,16 +308,16 @@ fn loop_fusion_attaches_a_point_to_an_unassociated_loop_keypoint() {
         &[[320.0, 240.0]],
         vec![descriptor],
     )));
-    let point = map.push_map_point(MapPoint::new(
-        Vec3F64::new(0.0, 0.0, 5.0),
-        descriptor,
-        0,
-        [0; 3],
-        0,
-    ));
-    map.get_keyframe_mut(0)
-        .unwrap()
-        .associate_map_point(0, point);
+    let point = map
+        .insert_landmark(LandmarkSeed {
+            position: Vec3F64::new(0.0, 0.0, 5.0),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 0,
+                feature_idx: 0,
+            },
+        })
+        .unwrap();
 
     let stats = fuse_verified_loop(
         &mut map,
@@ -404,16 +409,15 @@ fn loop_fusion_rejects_descriptor_mismatch() {
         &[[320.0, 240.0]],
         vec![[u8::MAX; 32]],
     )));
-    let point = map.push_map_point(MapPoint::new(
-        Vec3F64::new(0.0, 0.0, 5.0),
-        [0; 32],
-        0,
-        [0; 3],
-        0,
-    ));
-    map.get_keyframe_mut(0)
-        .unwrap()
-        .associate_map_point(0, point);
+    map.insert_landmark(LandmarkSeed {
+        position: Vec3F64::new(0.0, 0.0, 5.0),
+        color: [0; 3],
+        reference: ObservationKey {
+            keyframe_idx: 0,
+            feature_idx: 0,
+        },
+    })
+    .unwrap();
 
     let stats = fuse_verified_loop(
         &mut map,
@@ -445,26 +449,26 @@ fn loop_fusion_rejects_duplicate_with_inconsistent_reciprocal_projection() {
         &[[320.0, 240.0]],
         vec![descriptor],
     )));
-    let source_point = map.push_map_point(MapPoint::new(
-        Vec3F64::new(0.0, 0.0, 5.0),
-        descriptor,
-        0,
-        [0; 3],
-        0,
-    ));
-    let inconsistent_target = map.push_map_point(MapPoint::new(
-        Vec3F64::new(1.0, 0.0, 5.0),
-        descriptor,
-        0,
-        [0; 3],
-        10,
-    ));
-    map.get_keyframe_mut(0)
-        .unwrap()
-        .associate_map_point(0, source_point);
-    map.get_keyframe_mut(10)
-        .unwrap()
-        .associate_map_point(0, inconsistent_target);
+    let source_point = map
+        .insert_landmark(LandmarkSeed {
+            position: Vec3F64::new(0.0, 0.0, 5.0),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 0,
+                feature_idx: 0,
+            },
+        })
+        .unwrap();
+    let inconsistent_target = map
+        .insert_landmark(LandmarkSeed {
+            position: Vec3F64::new(1.0, 0.0, 5.0),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 10,
+                feature_idx: 0,
+            },
+        })
+        .unwrap();
 
     let stats = fuse_verified_loop(
         &mut map,
@@ -575,12 +579,9 @@ fn closing_config() -> LoopClosingConfig {
 fn closing_fixture(config: Option<LoopClosingConfig>) -> (LoopCloser, Map) {
     let (mut map, _) = synthetic_loop_map();
     // The observed pixels still describe the true pose, but odometry has drifted.
-    map.get_keyframe_mut(10)
-        .unwrap()
-        .frame
-        .pose_world_to_cam
-        .translation
-        .x += 0.6;
+    let mut drifted = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    drifted.translation.x += 0.6;
+    map.set_keyframe_pose_for_test(10, drifted);
     let descriptors: Vec<_> = map
         .get_keyframe(0)
         .unwrap()
