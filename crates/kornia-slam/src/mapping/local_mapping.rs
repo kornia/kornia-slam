@@ -6,7 +6,7 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 
-use super::{LocalBaMergeResult, LocalBaSnapshot, Map};
+use crate::map::{BaSnapshot, BaUpdate, LocalBaMergeResult, Map};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LocalMappingMode {
@@ -35,17 +35,17 @@ pub struct KeyframeJob {
     pub gravity_world: Vec3F64,
 }
 
-fn solve_snapshot(
-    mut snapshot: LocalBaSnapshot,
-    camera: &PinholeCamera,
-    job: &KeyframeJob,
-) -> LocalBaSnapshot {
+fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJob) -> BaUpdate {
     if job.imu_initialized {
-        snapshot.run_inertial(camera, job.imu_t_bc, job.gravity_world);
+        super::bundle_adjustment::run_local_inertial_ba(
+            snapshot,
+            camera,
+            job.imu_t_bc,
+            job.gravity_world,
+        )
     } else {
-        snapshot.run_visual(camera);
+        super::bundle_adjustment::run_local_ba(snapshot, camera)
     }
-    snapshot
 }
 
 pub struct LocalMapping {
@@ -62,6 +62,20 @@ enum LocalMappingBackend {
         handle: LocalMappingHandle,
         publication_gate: Arc<Mutex<()>>,
     },
+}
+
+/// The coordinator's writeback decision, shared by both backends.
+///
+/// Culling runs under the caller's map lock, immediately after an accepted
+/// merge and before the result is published, so a completed result is never
+/// observable ahead of its cleanup. A refused snapshot — one whose world epoch
+/// no longer matches — publishes nothing and must therefore cull nothing.
+fn merge_and_cull(map: &mut Map, update: BaUpdate) -> Option<LocalBaMergeResult> {
+    let merged = map.apply_ba_update(update);
+    if merged.is_some() {
+        crate::mapping::culling::cull_landmarks(map);
+    }
+    merged
 }
 
 impl LocalMapping {
@@ -103,13 +117,16 @@ impl LocalMapping {
                 let snapshot = map
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .local_ba_snapshot();
-                let snapshot = solve_snapshot(snapshot, camera, &job);
-                if let Some(result) = map
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .merge_local_ba_snapshot(snapshot)
-                {
+                    .ba_snapshot();
+                let update = solve_snapshot(snapshot, camera, &job);
+                // Cull under the same lock as the merge, so a completed result
+                // is never observable before cleanup. A rejected snapshot culls
+                // nothing.
+                let merged = merge_and_cull(
+                    &mut map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    update,
+                );
+                if let Some(result) = merged {
                     results
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -210,10 +227,10 @@ impl LocalMappingHandle {
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         map.lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .local_ba_snapshot()
+                            .ba_snapshot()
                     };
 
-                    let snapshot = solve_snapshot(snapshot, &camera, &job);
+                    let update = solve_snapshot(snapshot, &camera, &job);
 
                     // Merge is short and cannot interleave with keyframe publication
                     // or a world-frame transformation. Epoch mismatch rejects stale BA.
@@ -221,10 +238,10 @@ impl LocalMappingHandle {
                         let _publication = publication_gate
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let merged = map
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .merge_local_ba_snapshot(snapshot);
+                        let merged = merge_and_cull(
+                            &mut map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            update,
+                        );
                         merged.is_some_and(|result| result_sender.send(result).is_err())
                     };
                     if should_stop {
@@ -372,5 +389,139 @@ mod tests {
             .results
             .recv_timeout(Duration::from_secs(2))
             .expect("local-mapping worker did not publish a result");
+    }
+
+    /// A map holding one landmark that fails the culling policy, with a live
+    /// association, so cleanup is observable.
+    fn map_with_a_cullable_landmark() -> (Arc<Mutex<Map>>, usize) {
+        use crate::frame::Frame;
+        use crate::map::{Keyframe, LandmarkSeed, ObservationKey};
+        use kornia_3d::pose::Pose3d;
+        use kornia_image::ImageSize;
+        use kornia_imgproc::features::OrbFeatures;
+
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(Frame {
+            idx: 0,
+            features: OrbFeatures {
+                keypoints_xy: vec![[10.0, 10.0]],
+                orientations: vec![0.0],
+                descriptors: vec![[0u8; 32]],
+                octaves: vec![0],
+            },
+            pose_world_to_cam: Pose3d::IDENTITY,
+            image_size: ImageSize {
+                width: 640,
+                height: 480,
+            },
+            keypoint_colors: vec![[0; 3]],
+            u_right: Vec::new(),
+            depth: Vec::new(),
+            keypoints_undist: Vec::new(),
+        }))
+        .unwrap();
+        let doomed = map
+            .insert_landmark(LandmarkSeed {
+                position: Vec3F64::new(0.0, 0.0, 5.0),
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx: 0,
+                },
+            })
+            .unwrap();
+        // Seen often, matched rarely: below the found-ratio threshold.
+        map.set_tracking_stats_for_test(doomed, 10, 1);
+        (Arc::new(Mutex::new(map)), doomed)
+    }
+
+    /// Culling runs under the same lock as the merge, so by the time a result
+    /// is observable the retirement and its two-sided cleanup have happened.
+    #[test]
+    fn synchronous_completion_implies_cleanup_is_already_done() {
+        let (map, doomed) = map_with_a_cullable_landmark();
+        let mapping = LocalMapping::new(
+            LocalMappingMode::Synchronous,
+            Arc::clone(&map),
+            test_camera(),
+        );
+
+        assert!(mapping.submit(visual_job()));
+        assert_eq!(mapping.drain_results().len(), 1);
+
+        let map = map.lock().unwrap();
+        assert!(map.map_points()[doomed].culled, "retired before completion");
+        assert!(map.map_points()[doomed].observations().is_empty());
+        assert_eq!(
+            map.get_keyframe(0).unwrap().map_point(0),
+            None,
+            "the keyframe side was cleaned up too"
+        );
+    }
+
+    #[test]
+    fn asynchronous_completion_implies_cleanup_is_already_done() {
+        let (map, doomed) = map_with_a_cullable_landmark();
+        let mapping = LocalMapping::new(
+            LocalMappingMode::Asynchronous,
+            Arc::clone(&map),
+            test_camera(),
+        );
+
+        assert!(mapping.submit(visual_job()));
+        let LocalMappingBackend::Asynchronous { handle, .. } = &mapping.backend else {
+            unreachable!("asynchronous mode selected the wrong backend");
+        };
+        handle
+            .results
+            .recv_timeout(Duration::from_secs(2))
+            .expect("local-mapping worker did not publish a result");
+
+        let map = map.lock().unwrap();
+        assert!(map.map_points()[doomed].culled);
+        assert_eq!(map.get_keyframe(0).unwrap().map_point(0), None);
+    }
+
+    /// An epoch-rejected snapshot publishes nothing, so it must not cull
+    /// either — the live map is left exactly as it was.
+    /// Through the coordinator's own decision, not `apply_ba_update`
+    /// directly: a test that bypassed `merge_and_cull` would pass even if the
+    /// worker culled after every refused merge.
+    #[test]
+    fn the_coordinator_does_not_cull_after_a_refused_merge() {
+        let (map, doomed) = map_with_a_cullable_landmark();
+        let snapshot = map.lock().unwrap().ba_snapshot().into_update();
+        // Advance the world frame, so the snapshot belongs to an older epoch.
+        map.lock().unwrap().scale_world(2.0);
+
+        let merged = super::merge_and_cull(&mut map.lock().unwrap(), snapshot);
+
+        assert!(merged.is_none(), "an older-epoch snapshot is refused");
+        let map = map.lock().unwrap();
+        assert!(!map.map_points()[doomed].culled, "no cull after a refusal");
+        assert_eq!(map.get_keyframe(0).unwrap().map_point(0), Some(doomed));
+    }
+
+    /// The same seam on the accepting side: an accepted merge culls, even when
+    /// it published no numerical change.
+    #[test]
+    fn the_coordinator_culls_after_an_accepted_merge() {
+        let (map, doomed) = map_with_a_cullable_landmark();
+        let snapshot = map.lock().unwrap().ba_snapshot().into_update();
+
+        let merged = super::merge_and_cull(&mut map.lock().unwrap(), snapshot);
+
+        assert!(merged.is_some(), "a current-epoch snapshot is accepted");
+        assert_eq!(
+            merged.expect("accepted").map_points_updated,
+            0,
+            "nothing moved, so the merge published no change"
+        );
+        let map = map.lock().unwrap();
+        assert!(
+            map.map_points()[doomed].culled,
+            "culling still runs after an accepted no-op merge"
+        );
+        assert_eq!(map.get_keyframe(0).unwrap().map_point(0), None);
     }
 }

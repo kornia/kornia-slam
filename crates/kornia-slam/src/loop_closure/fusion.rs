@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use kornia_3d::camera::PinholeCamera;
 use kornia_imgproc::features::hamming_distance;
 
-use crate::map::Map;
+use crate::map::{Map, MapMutationError};
 
 use super::VerifiedLoopEdge;
 
@@ -30,10 +30,13 @@ impl Default for LoopFusionConfig {
 }
 
 /// Live-map changes made while fusing a verified loop.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct LoopFusionStats {
     pub observations_added: usize,
     pub map_points_merged: usize,
+    /// Links the candidate search proposed that the map refused. Surfaced
+    /// rather than swallowed, so an unexpected conflict is visible.
+    pub link_conflicts: Vec<MapMutationError>,
 }
 
 /// Adds and merges landmark observations across a geometrically verified loop.
@@ -71,10 +74,13 @@ fn loop_side_keyframes(map: &Map, anchor: usize, config: &LoopFusionConfig) -> V
     }
     let mut side = vec![anchor];
     side.extend(
-        map.covisible_keyframes(anchor, config.min_covisibility_weight)
-            .into_iter()
-            .take(config.max_neighbors_per_side)
-            .map(|(keyframe_idx, _)| keyframe_idx),
+        crate::tracking::local_map::covisible_above_weight(
+            map.covisible_keyframes(anchor),
+            config.min_covisibility_weight,
+        )
+        .into_iter()
+        .take(config.max_neighbors_per_side)
+        .map(|(keyframe_idx, _)| keyframe_idx),
     );
     side
 }
@@ -114,9 +120,7 @@ fn fuse_loop_direction(
                 let Some(source_point) = map.map_points().get(source_point_idx) else {
                     continue;
                 };
-                if source_point.culled
-                    || source_point.observation_kf_indices.contains(&target_kf_idx)
-                {
+                if source_point.culled || source_point.is_observed_by(target_kf_idx) {
                     continue;
                 }
                 let Some(target) = map.get_keyframe(target_kf_idx) else {
@@ -176,11 +180,14 @@ fn fuse_loop_direction(
                     .is_some_and(|point| !point.culled)
             });
             let Some(target_point_idx) = target_point_idx else {
-                map.register_observation_at(source_point_idx, target_kf_idx, target_desc_idx);
-                if let Some(target) = map.get_keyframe_mut(target_kf_idx) {
-                    target.associate_map_point(target_desc_idx, source_point_idx);
+                // One canonical link, counted only when it was actually new.
+                // A conflict here means the candidate search proposed a feature
+                // that is no longer free; skip it rather than double-count.
+                match map.link_observation(target_kf_idx, target_desc_idx, source_point_idx) {
+                    Ok(true) => stats.observations_added += 1,
+                    Ok(false) => {}
+                    Err(error) => stats.link_conflicts.push(error),
                 }
-                stats.observations_added += 1;
                 continue;
             };
             if target_point_idx == source_point_idx {

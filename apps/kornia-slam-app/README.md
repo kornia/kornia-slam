@@ -1,7 +1,7 @@
 # kornia-slam-app
 
 This package is the composition root for the `kornia-slam` executable. It wires the
-`kornia_slam::SlamPipeline` runtime to four interchangeable frame sources — offline EuRoC MAV image sequences, offline MCAP recordings (e.g. bubbaloop captures), a live OAK-D camera, and any UVC-class camera (laptop webcams, USB cams, CSI-to-UVC adapters on a Pi…). All feed the same `process_frame` orchestrator, and the TUI / Rerun visualizers work for any of them. EuRoC, MCAP, and OAK-D additionally support a **stereo mode** (see below) that yields metric depth; UVC is monocular only.
+`kornia_slam::SlamSystem` runtime to four interchangeable frame sources — offline EuRoC MAV image sequences, offline MCAP recordings (e.g. bubbaloop captures), a live OAK-D camera, and any UVC-class camera (laptop webcams, USB cams, CSI-to-UVC adapters on a Pi…). All feed the same `process_frame` orchestrator, and the TUI / Rerun visualizers work for any of them. EuRoC, MCAP, and OAK-D additionally support a **stereo mode** (see below) that yields metric depth; UVC is monocular only.
 
 ## Frame sources
 

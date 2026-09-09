@@ -43,7 +43,7 @@ use source::OakdSource;
 use source::UvcSource;
 use source::{EurocSource, FrameItem, FrameSource, HiltiSource, McapSource};
 use std::time::{Duration, Instant};
-use utils::trajectory_point_from_pose;
+use utils::{trajectory_point_from_pose, tum_row_from_pose};
 
 #[cfg(feature = "viz")]
 use utils::{
@@ -570,6 +570,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let (mut est_positions, mut gt_positions): (Vec<Vec3F64>, Vec<Vec3F64>) =
         (Vec::new(), Vec::new());
+    // Timestamped full poses, written as a TUM-format trajectory alongside the
+    // evaluation CSVs so external tools can score the run.
+    let mut tum_rows: Vec<(f64, [f64; 3], [f64; 4])> = Vec::new();
+    // Per-frame foreground timing is kept separate from image decoding and the
+    // deliberate playback sleep. The benchmark harness aggregates this CSV.
+    let mut timing_rows: Vec<evaluation::FrameTiming> = Vec::new();
     // ── Main loop ──────────────────────────────────────────────────────────
     let mut trajectory: Vec<[f32; 3]> = Vec::new();
     let mut processed: usize = 0;
@@ -592,11 +598,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             right_image,
             imu_samples,
         } = item;
+        let frontend_t0 = Instant::now();
+        // Visualisation and debug printing observe the frontend rather than
+        // doing its work, so their cost is measured and taken back out of the
+        // reported frontend time.
+        #[allow(unused_mut)]
+        let mut observer_ms = 0.0_f64;
         let image_size = gray_u8.size();
         #[cfg(feature = "viz")]
         if let Some(ref rec) = rec {
+            let viz_t0 = Instant::now();
             rec.set_time_sequence("frame", idx as i64);
             rec.set_duration_secs("timestamp", timestamp_sec);
+            observer_ms += viz_t0.elapsed().as_secs_f64() * 1000.0;
         }
         let imu_measurements: Vec<ImuMeasurement> = if imu_enabled {
             imu_samples
@@ -624,6 +638,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let matches =
                     compute_stereo_matches(&left_pyr, &right_pyr, &features, &right_features, cfg);
                 if args.debug && !tui_active {
+                    let dbg_t0 = Instant::now();
                     let n = matches.num_matched();
                     let mut ds: Vec<f32> =
                         matches.depth.iter().copied().filter(|&d| d > 0.0).collect();
@@ -634,6 +649,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ds[ds.len() / 2]
                     };
                     eprintln!("[stereo] frame={idx} matched={n} median_depth={med:.3}m");
+                    observer_ms += dbg_t0.elapsed().as_secs_f64() * 1000.0;
                 }
                 (matches.u_right, matches.depth)
             }
@@ -641,7 +657,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         #[cfg(feature = "viz")]
         if let Some(ref rec) = rec {
+            let viz_t0 = Instant::now();
             log_frame_to_rerun(rec, &gray_u8, &features.keypoints_xy);
+            observer_ms += viz_t0.elapsed().as_secs_f64() * 1000.0;
         }
 
         // Undistort keypoints into the camera's coordinate frame. No-op for
@@ -674,6 +692,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             depth,
             keypoints_undist: Vec::new(),
         };
+        let frontend_ms = (frontend_t0.elapsed().as_secs_f64() * 1000.0 - observer_ms).max(0.0);
         let t0 = std::time::Instant::now();
         let result = system.process_frame(
             frame,
@@ -683,6 +702,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             imu_measurements,
         );
         let frame_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        // Rectification happens in the source; report it alongside so the
+        // per-frame cost is comparable to systems that rectify inside tracking.
+        let rectify_ms = source.last_rectify_ms();
+        let total_ms = rectify_ms + frontend_ms + frame_ms;
         let keyframe_idx = system.current_keyframe_idx().unwrap_or(idx);
         let map_point_count = system.num_active_map_points();
         let debug_msgs = system.drain_debug_messages();
@@ -711,7 +734,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("{line}");
             }
             let status_line = format!(
-                "[{idx:>5}] {:?}  kf={:<4} pts={:<5} {frame_ms:>6.1}ms",
+                "[{idx:>5}] {:?}  kf={:<4} pts={:<5} pipe={frame_ms:>6.1}ms front={frontend_ms:.1}ms rect={rectify_ms:.1}ms total={total_ms:.1}ms",
                 result.status, keyframe_idx, map_point_count,
             );
             eprintln!("{status_line}");
@@ -723,8 +746,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Evaluation collection (EuRoC, --evaluate only).
         if evaluate {
+            timing_rows.push(evaluation::FrameTiming {
+                frame_idx: idx,
+                rectify_ms,
+                frontend_ms,
+                pipeline_ms: frame_ms,
+            });
             let est_pos = Vec3F64::new(traj_pt[0] as f64, traj_pt[1] as f64, traj_pt[2] as f64);
             est_positions.push(est_pos);
+
+            let (t, q) = tum_row_from_pose(&result.pose_world_to_cam);
+            tum_rows.push((timestamp_sec, t, q));
 
             // Associate nearest ground-truth pose by timestamp.
             let gt_pos = euroc_gt
@@ -783,7 +815,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut obs_total: usize = 0;
         let mut obs_max: usize = 0;
         for mp in map_points.iter().filter(|mp| !mp.culled) {
-            let n = mp.observation_kf_indices.len();
+            let n = mp.observations().len();
             active_pts += 1;
             obs_total += n;
             if n > obs_max {
@@ -802,11 +834,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     // ── Trajectory evaluation (EuRoC, --evaluate only) ─────────────────────
     if evaluate {
-        evaluation::report(
-            &est_positions,
-            &gt_positions,
-            std::path::Path::new(&eval_out),
-        )?;
+        let out_dir = std::path::Path::new(&eval_out);
+        evaluation::report(&est_positions, &gt_positions, out_dir)?;
+        evaluation::write_tum_trajectory(&tum_rows, out_dir)?;
+        evaluation::write_frame_timings(&timing_rows, out_dir)?;
     }
     Ok(())
 }
