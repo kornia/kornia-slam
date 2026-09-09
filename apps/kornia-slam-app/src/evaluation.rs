@@ -9,6 +9,25 @@ use kornia_algebra::{Mat3F64, Vec3F64};
 
 use crate::datasets::euroc::GroundTruthPose;
 
+/// Per-frame foreground timing at the public application/pipeline boundary.
+///
+/// Image decoding is intentionally excluded. Rectification is performed by the
+/// frame source, frontend work covers measurement preparation, feature
+/// extraction and stereo matching, and pipeline work is the stateful
+/// `SlamPipeline::process_frame` call.
+pub struct FrameTiming {
+    pub frame_idx: usize,
+    pub rectify_ms: f64,
+    pub frontend_ms: f64,
+    pub pipeline_ms: f64,
+}
+
+impl FrameTiming {
+    pub fn total_ms(&self) -> f64 {
+        self.rectify_ms + self.frontend_ms + self.pipeline_ms
+    }
+}
+
 // ── Association ──────────────────────────────────────────────────────────
 
 /// Nearest ground-truth pose to timestamp `t` (by absolute time difference).
@@ -168,5 +187,43 @@ pub fn report(est: &[Vec3F64], gt: &[Vec3F64], out_dir: &Path) -> std::io::Resul
         compute_drift(&aligned, gt) * 100.0
     );
     eprintln!("=======================================================");
+    Ok(())
+}
+
+/// Write the estimated trajectory to `kornia_slam_traj_tum.txt` in TUM format
+/// (`timestamp tx ty tz qx qy qz qw`), the interchange format used by ORB-SLAM3
+/// and `evo`, so runs can be scored by external tools.
+pub fn write_tum_trajectory(
+    rows: &[(f64, [f64; 3], [f64; 4])],
+    out_dir: &Path,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(out_dir)?;
+    let mut f = std::fs::File::create(out_dir.join("kornia_slam_traj_tum.txt"))?;
+    for (t, p, q) in rows {
+        writeln!(
+            f,
+            "{t:.9} {:.9} {:.9} {:.9} {:.9} {:.9} {:.9} {:.9}",
+            p[0], p[1], p[2], q[0], q[1], q[2], q[3]
+        )?;
+    }
+    Ok(())
+}
+
+/// Write per-frame stage timings for external benchmark aggregation.
+pub fn write_frame_timings(rows: &[FrameTiming], out_dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(out_dir)?;
+    let mut f = std::fs::File::create(out_dir.join("frame_timings.csv"))?;
+    writeln!(f, "frame_idx,rectify_ms,frontend_ms,pipeline_ms,total_ms")?;
+    for row in rows {
+        writeln!(
+            f,
+            "{},{:.6},{:.6},{:.6},{:.6}",
+            row.frame_idx,
+            row.rectify_ms,
+            row.frontend_ms,
+            row.pipeline_ms,
+            row.total_ms(),
+        )?;
+    }
     Ok(())
 }

@@ -3,7 +3,6 @@
 #[cfg(feature = "viz")]
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-#[cfg(feature = "viz")]
 use kornia_algebra::Mat3F64;
 #[cfg(feature = "viz")]
 use kornia_image::{Image, ImageSize};
@@ -112,6 +111,16 @@ pub fn log_map_points_to_rerun(rec: &rerun::RecordingStream, map_points: &[MapPo
     }
 }
 
+/// Convert a world-to-camera pose into a TUM-format trajectory row: the
+/// camera-to-world translation `(x, y, z)` and orientation quaternion
+/// `(qx, qy, qz, qw)`.
+pub fn tum_row_from_pose(pose_world_to_cam: &Pose3d) -> ([f64; 3], [f64; 4]) {
+    let cam_to_world = pose_world_to_cam.inverse();
+    let t = cam_to_world.translation;
+    let (qx, qy, qz, qw) = quat_xyzw_from_matrix(&cam_to_world.rotation);
+    ([t.x, t.y, t.z], [qx, qy, qz, qw])
+}
+
 /// Convert a world-to-camera pose into a camera-to-world trajectory point.
 pub fn trajectory_point_from_pose(pose_world_to_cam: &Pose3d) -> [f32; 3] {
     let cam_to_world = pose_world_to_cam.inverse();
@@ -142,7 +151,6 @@ fn camera_visualization_spec(
     }
 }
 
-#[cfg(feature = "viz")]
 fn quat_xyzw_from_matrix(r: &Mat3F64) -> (f64, f64, f64, f64) {
     let trace = r.x_axis.x + r.y_axis.y + r.z_axis.z;
 
