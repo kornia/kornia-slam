@@ -7,8 +7,6 @@ use crate::map::{
     ImuFactor, Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR, ObservationKey,
 };
 use kornia_algebra::Vec3F64;
-#[cfg(test)]
-use kornia_sensors::imu::{ImuMeasurement, PreintegratedImu};
 use std::collections::{HashMap, HashSet};
 
 /// Result of replacing a duplicate landmark with a surviving landmark.
@@ -20,143 +18,12 @@ pub struct MapPointMergeResult {
 }
 
 impl Map {
-    /// Structural bypass retained for fixtures only.
-    ///
-    /// Predates the canonical API and can leave the two sides of a link
-    /// disagreeing — a keyframe association with no matching observation
-    /// record, or a landmark with no observer at all. `#[cfg(test)]` keeps it
-    /// out of production builds entirely; migrate the remaining fixtures to
-    /// `insert_keyframe` / `insert_landmark` / `link_observation` and delete it.
-    #[cfg(test)]
-    /// Inserts or replaces a keyframe by frame index.
-    pub fn upsert_keyframe(&mut self, keyframe: Keyframe) {
-        if let Some(pos) = self
-            .keyframes
-            .iter()
-            .position(|kf| kf.frame.idx == keyframe.frame.idx)
-        {
-            self.keyframes[pos] = keyframe;
-        } else {
-            self.keyframes.push(keyframe);
-        }
-    }
-
-    /// Structural bypass retained for fixtures only.
-    ///
-    /// Predates the canonical API and can leave the two sides of a link
-    /// disagreeing — a keyframe association with no matching observation
-    /// record, or a landmark with no observer at all. `#[cfg(test)]` keeps it
-    /// out of production builds entirely; migrate the remaining fixtures to
-    /// `insert_keyframe` / `insert_landmark` / `link_observation` and delete it.
-    #[cfg(test)]
-    /// Appends a map point and returns its index.
-    pub fn push_map_point(&mut self, map_point: MapPoint) -> usize {
-        let idx = self.map_points.len();
-        self.map_points.push(map_point);
-        idx
-    }
-
-    /// Unchecked IMU edge insertion, retained for fixtures only.
-    ///
-    /// Accepts missing endpoints, a duplicate directed edge and a malformed
-    /// interval — all of which [`Map::apply_insertion`] rejects. `#[cfg(test)]`
-    /// keeps it out of production builds; publish edges through a batch.
-    #[cfg(test)]
-    /// Records preintegrated IMU measurements between two consecutive keyframes.
-    /// `raw_samples` (covering `[t0, t1]`) are retained for repropagation —
-    /// see `ImuFactor::raw_samples`.
-    pub fn add_imu_factor(
-        &mut self,
-        prev_kf_idx: usize,
-        curr_kf_idx: usize,
-        preintegrated: PreintegratedImu,
-        raw_samples: Vec<ImuMeasurement>,
-        t0: f64,
-        t1: f64,
-    ) {
-        self.imu_factors.push(ImuFactor {
-            prev_kf_idx,
-            curr_kf_idx,
-            preintegrated,
-            raw_samples,
-            t0,
-            t1,
-        });
-    }
-
     /// Wipes all keyframes and map points. Used to discard a failed bootstrap.
     pub fn clear_active(&mut self) {
         self.world_epoch = self.world_epoch.wrapping_add(1);
         self.keyframes.clear();
         self.map_points.clear();
         self.imu_factors.clear();
-    }
-
-    /// Structural bypass retained for fixtures only.
-    ///
-    /// Predates the canonical API and can leave the two sides of a link
-    /// disagreeing — a keyframe association with no matching observation
-    /// record, or a landmark with no observer at all. `#[cfg(test)]` keeps it
-    /// out of production builds entirely; migrate the remaining fixtures to
-    /// `insert_keyframe` / `insert_landmark` / `link_observation` and delete it.
-    #[cfg(test)]
-    /// Inserts triangulated 3D points as map points and associates them to
-    /// keyframes.
-    ///
-    /// `curr_kf` becomes the reference keyframe for each new point's scale
-    /// geometry (matches ORB-SLAM3, which creates points referenced to the
-    /// newer keyframe). If `prev_kf` is provided, its observation is also
-    /// recorded. Mean viewing direction and scale-invariance bounds are
-    /// Records that an existing map point was observed at `desc_idx` in
-    /// `keyframe`, pushing the descriptor into the map point's observation
-    /// list, refreshing the representative descriptor, and recomputing the
-    /// scale geometry.
-    pub fn register_observation(&mut self, mp_idx: usize, keyframe: &Keyframe, desc_idx: usize) {
-        let Some(&descriptor) = keyframe.frame.features.descriptors.get(desc_idx) else {
-            return;
-        };
-        let kf_idx = keyframe.frame.idx;
-        if let Some(mp) = self.map_points.get_mut(mp_idx) {
-            mp.add_observation(
-                ObservationKey {
-                    keyframe_idx: kf_idx,
-                    feature_idx: desc_idx,
-                },
-                descriptor,
-            );
-        }
-        self.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
-    }
-
-    /// Structural bypass retained for fixtures only.
-    ///
-    /// Predates the canonical API and can leave the two sides of a link
-    /// disagreeing — a keyframe association with no matching observation
-    /// record, or a landmark with no observer at all. `#[cfg(test)]` keeps it
-    /// out of production builds entirely; migrate the remaining fixtures to
-    /// `insert_keyframe` / `insert_landmark` / `link_observation` and delete it.
-    #[cfg(test)]
-    /// [`Map::register_observation`] for a keyframe already stored in the
-    /// map, addressed by frame index. Lets callers register observations
-    /// while only holding `&mut Map` (no borrowed `Keyframe` clone needed).
-    pub fn register_observation_at(&mut self, mp_idx: usize, kf_idx: usize, desc_idx: usize) {
-        let Some(descriptor) = self
-            .get_keyframe(kf_idx)
-            .and_then(|kf| kf.frame.features.descriptors.get(desc_idx))
-            .copied()
-        else {
-            return;
-        };
-        if let Some(mp) = self.map_points.get_mut(mp_idx) {
-            mp.add_observation(
-                ObservationKey {
-                    keyframe_idx: kf_idx,
-                    feature_idx: desc_idx,
-                },
-                descriptor,
-            );
-        }
-        self.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
     }
 
     /// Recomputes the mean viewing direction and scale-invariance distance
@@ -878,7 +745,7 @@ mod tests {
         ImuFactor, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError, ObservationLink,
     };
     use crate::map::{
-        Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR, ObservationKey,
+        Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR, ObservationKey,
         tests::{test_frame, test_frame_with_pose},
     };
     use kornia_3d::pose::Pose3d;
@@ -919,27 +786,17 @@ mod tests {
     }
 
     #[test]
-    fn push_map_point_returns_sequential_index() {
+    fn landmark_ids_are_assigned_in_insertion_order() {
         let mut map = Map::new();
+        map.insert_keyframe(detached(0, 2)).unwrap();
 
-        let first_idx = map.push_map_point(MapPoint::new(
-            Vec3F64::new(0.0, 0.0, 1.0),
-            [0u8; 32],
-            0,
-            [0; 3],
-            0,
-        ));
-        let second_idx = map.push_map_point(MapPoint::new(
-            Vec3F64::new(1.0, 0.0, 1.0),
-            [1u8; 32],
-            0,
-            [0; 3],
-            0,
-        ));
+        let first_idx = map.insert_landmark(seed(0, 0, 1.0)).unwrap();
+        let second_idx = map.insert_landmark(seed(0, 1, 1.0)).unwrap();
 
         assert_eq!(first_idx, 0);
         assert_eq!(second_idx, 1);
         assert_eq!(map.num_map_points(), 2);
+        assert_map_consistent(&map);
     }
 
     #[test]
@@ -953,59 +810,16 @@ mod tests {
             .unwrap();
         }
 
-        let survivor = map.push_map_point(MapPoint::new(
-            Vec3F64::new(0.0, 0.0, 5.0),
-            [0; 32],
-            0,
-            [0; 3],
-            0,
-        ));
-        map.map_points_mut()[survivor].add_observation(
-            ObservationKey {
-                keyframe_idx: 0,
-                feature_idx: 0,
-            },
-            [0; 32],
-        );
-        map.map_points_mut()[survivor].add_observation(
-            ObservationKey {
-                keyframe_idx: 1,
-                feature_idx: 0,
-            },
-            [1; 32],
-        );
-        map.map_points_mut()[survivor].n_visible = 7;
-        map.map_points_mut()[survivor].n_found = 5;
-        map.get_keyframe_mut(0)
-            .unwrap()
-            .associate_map_point(0, survivor);
-        map.get_keyframe_mut(1)
-            .unwrap()
-            .associate_map_point(0, survivor);
+        // Survivor seen by KF0 and KF1; duplicate seen by KF2 and, through a
+        // different feature, KF1 — so the merge must both redirect and resolve
+        // a shared keyframe.
+        let survivor = map.insert_landmark(seed(0, 0, 5.0)).unwrap();
+        map.link_observation(1, 0, survivor).unwrap();
+        map.set_tracking_stats_for_test(survivor, 7, 5);
 
-        let replaced = map.push_map_point(MapPoint::new(
-            Vec3F64::new(0.01, 0.0, 5.0),
-            [2; 32],
-            0,
-            [0; 3],
-            2,
-        ));
-        map.map_points_mut()[replaced].add_observation(
-            ObservationKey {
-                keyframe_idx: 2,
-                feature_idx: 0,
-            },
-            [2; 32],
-        );
-        map.map_points_mut()[replaced].add_observation(
-            ObservationKey {
-                keyframe_idx: 1,
-                feature_idx: 1,
-            },
-            [11; 32],
-        );
-        map.map_points_mut()[replaced].n_visible = 4;
-        map.map_points_mut()[replaced].n_found = 3;
+        let replaced = map.insert_landmark(seed(2, 0, 5.01)).unwrap();
+        map.link_observation(1, 1, replaced).unwrap();
+        map.set_tracking_stats_for_test(replaced, 4, 3);
         map.get_keyframe_mut(2)
             .unwrap()
             .associate_map_point(0, replaced);
@@ -1045,22 +859,10 @@ mod tests {
     #[test]
     fn merge_map_points_rejects_invalid_or_culled_inputs() {
         let mut map = Map::new();
-        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0; 32]])))
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0; 32], [1; 32]])))
             .unwrap();
-        let first = map.push_map_point(MapPoint::new(
-            Vec3F64::new(0.0, 0.0, 5.0),
-            [0; 32],
-            0,
-            [0; 3],
-            0,
-        ));
-        let second = map.push_map_point(MapPoint::new(
-            Vec3F64::new(0.0, 0.0, 5.0),
-            [1; 32],
-            0,
-            [0; 3],
-            0,
-        ));
+        let first = map.insert_landmark(seed(0, 0, 5.0)).unwrap();
+        let second = map.insert_landmark(seed(0, 1, 5.0)).unwrap();
 
         assert!(map.merge_map_points(first, first).is_none());
         assert!(map.merge_map_points(first, usize::MAX).is_none());
@@ -1078,18 +880,14 @@ mod tests {
     fn scale_geometry_distance_invariants() {
         let mut map = Map::new();
         // Reference keyframe 0 at the world origin (identity pose => camera
-        // center at origin).
-        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])))
-            .unwrap();
+        // center at origin), its keypoint detected at octave 2.
+        let mut kf = Keyframe::from_frame(test_frame(0, vec![[0u8; 32]]));
+        kf.frame.features.octaves = vec![2];
+        map.insert_keyframe(kf).unwrap();
 
-        // Point referenced to KF 0, keypoint detected at octave 2, world (0,0,5).
-        let mp_idx = map.push_map_point(MapPoint::new(
-            Vec3F64::new(0.0, 0.0, 5.0),
-            [0u8; 32],
-            2,
-            [0; 3],
-            0,
-        ));
+        // Point referenced to KF 0, world (0,0,5). The octave comes from the
+        // referenced feature now, as production does.
+        let mp_idx = map.insert_landmark(seed(0, 0, 5.0)).unwrap();
         map.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
 
         let mp = &map.map_points()[mp_idx];
@@ -1114,22 +912,7 @@ mod tests {
         map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])))
             .unwrap();
 
-        let mp_idx = map.push_map_point(MapPoint::new(
-            Vec3F64::new(0.0, 0.0, 5.0),
-            [0u8; 32],
-            0,
-            [0; 3],
-            0,
-        ));
-        // The reference observation is explicit now: `MapPoint::new` no longer
-        // fabricates an observer from its reference keyframe id alone.
-        map.map_points_mut()[mp_idx].add_observation(
-            ObservationKey {
-                keyframe_idx: 0,
-                feature_idx: 0,
-            },
-            [0u8; 32],
-        );
+        let mp_idx = map.insert_landmark(seed(0, 0, 5.0)).unwrap();
         map.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
 
         // Single observation from the origin looking at (0,0,5): normal = +z.
@@ -1146,8 +929,8 @@ mod tests {
                 Vec3F64::new(-1.0, 0.0, 0.0),
             ),
         ));
-        map.register_observation(mp_idx, &kf1, 0);
         map.insert_keyframe(kf1).unwrap();
+        map.link_observation(1, 0, mp_idx).unwrap();
         map.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
 
         let n = map.map_points()[mp_idx].mean_viewing_direction;

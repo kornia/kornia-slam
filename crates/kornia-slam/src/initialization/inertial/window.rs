@@ -80,7 +80,7 @@ impl<'a> InitWindow<'a> {
 mod tests {
     use super::*;
     use crate::frame::Frame;
-    use crate::map::Keyframe;
+    use crate::map::{ImuFactor, Keyframe, MapInsertion};
     use kornia_3d::pose::Pose3d;
     use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbFeatures;
@@ -116,10 +116,26 @@ mod tests {
         }
     }
 
+    /// An edge over a valid interval carrying `dt` of integrated IMU time.
+    ///
+    /// The two are independent: insertion validates the interval, while `dt`
+    /// is whatever preintegration accumulated — zero when no samples arrived.
+    /// That is why eligibility screens `dt` separately.
     fn edge(map: &mut Map, prev: usize, curr: usize, dt: f64) {
         let mut pre = PreintegratedImu::new(Default::default(), calib());
         pre.dt = dt;
-        map.add_imu_factor(prev, curr, pre, Vec::new(), 0.0, dt);
+        map.apply_insertion(MapInsertion {
+            imu_factors: vec![ImuFactor {
+                prev_kf_idx: prev,
+                curr_kf_idx: curr,
+                preintegrated: pre,
+                raw_samples: Vec::new(),
+                t0: prev as f64,
+                t1: curr as f64,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
     }
 
     fn map_with_edges() -> Map {
@@ -153,12 +169,14 @@ mod tests {
     #[test]
     fn nonpositive_and_non_finite_durations_are_ineligible() {
         let mut map = map_with_edges();
-        edge(&mut map, 12, 13, 0.0);
-        edge(&mut map, 13, 14, f64::NAN);
         for idx in [13usize, 14] {
             map.insert_keyframe(Keyframe::from_frame(frame(idx)))
                 .unwrap();
         }
+        // Valid intervals, but no integrated time — what preintegration
+        // returns when the sample buffer had nothing to offer.
+        edge(&mut map, 12, 13, 0.0);
+        edge(&mut map, 13, 14, f64::NAN);
         let window = InitWindow::select(&map, 10);
 
         let eligible: Vec<_> = window

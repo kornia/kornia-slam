@@ -1,6 +1,6 @@
 use super::*;
 use crate::frame::Frame;
-use crate::map::{InertialAlignment, Keyframe, Map};
+use crate::map::{ImuFactor, InertialAlignment, Keyframe, Map, MapInsertion};
 use crate::pose_conversion::rotation_from_to;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
@@ -176,7 +176,18 @@ fn synth_map_with_calib(s_true: f64, r_arb: Mat3F64, calib: ImuCalib, omega: f64
                 bias_accel_true,
                 calib,
             );
-            map.add_imu_factor(k - 1, k, pim, Vec::new(), t - kf_dt, t);
+            map.apply_insertion(MapInsertion {
+                imu_factors: vec![ImuFactor {
+                    prev_kf_idx: k - 1,
+                    curr_kf_idx: k,
+                    preintegrated: pim,
+                    raw_samples: Vec::new(),
+                    t0: t - kf_dt,
+                    t1: t,
+                }],
+                ..Default::default()
+            })
+            .unwrap();
         }
     }
     map
@@ -505,7 +516,18 @@ fn recovers_scale_bias_gravity_from_synthetic_trajectory() {
                 bias_accel_true,
                 calib,
             );
-            map.add_imu_factor(k - 1, k, pim, Vec::new(), t - kf_dt, t);
+            map.apply_insertion(MapInsertion {
+                imu_factors: vec![ImuFactor {
+                    prev_kf_idx: k - 1,
+                    curr_kf_idx: k,
+                    preintegrated: pim,
+                    raw_samples: Vec::new(),
+                    t0: t - kf_dt,
+                    t1: t,
+                }],
+                ..Default::default()
+            })
+            .unwrap();
         }
     }
 

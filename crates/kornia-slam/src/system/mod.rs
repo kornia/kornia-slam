@@ -919,14 +919,18 @@ impl SlamSystem {
         // One feature per landmark and one landmark per feature; a repeat would
         // otherwise refuse the whole keyframe. Same resolution as the bootstrap
         // pair, so it uses the same helper.
-        let tracked_claims: Vec<(usize, usize)> = matches.to_vec();
+        //
+        // Out-of-range features are dropped *before* resolution: a claim that
+        // cannot be published must not win its landmark and suppress a valid
+        // later claim on the same one.
+        let tracked_claims: Vec<(usize, usize)> = matches
+            .iter()
+            .copied()
+            .filter(|&(_, curr_idx)| curr_idx < claimed.len())
+            .collect();
         for index in crate::mapping::growth::accepted_pair_claims(&tracked_claims) {
-            let (mp_idx, curr_idx) = matches[index];
-            if let Some(slot) = claimed.get_mut(curr_idx) {
-                *slot = Some(mp_idx);
-            } else {
-                continue;
-            }
+            let (mp_idx, curr_idx) = tracked_claims[index];
+            claimed[curr_idx] = Some(mp_idx);
             core.observations.push(ObservationLink {
                 observation: ObservationKey {
                     keyframe_idx: frame.idx,
