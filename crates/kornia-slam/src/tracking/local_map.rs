@@ -258,13 +258,61 @@ mod tests {
         assert_eq!(selected.len(), map.num_map_points());
     }
 
+    /// Votes must actually discriminate: a keyframe observing nothing matched
+    /// contributes nothing. The earlier version of this test used a map where
+    /// every landmark was reachable from the reference, so it passed whatever
+    /// selection did.
     #[test]
-    fn votes_from_matched_landmarks_pull_in_their_observers() {
-        let map = covis_map();
-        // Landmark 0 is seen by KF0 and KF1, so both keyframes' landmarks join.
+    fn votes_admit_only_keyframes_observing_something_matched() {
+        let mut map = Map::new();
+        // KF1 carries four features, so the landmarks its votes pull in clear
+        // the all-active fallback threshold without help.
+        for (idx, slots) in [(0usize, 1usize), (1, 4), (2, 1), (3, 1)] {
+            map.insert_keyframe(Keyframe::from_frame(test_frame(
+                idx,
+                vec![[idx as u8; 32]; slots],
+            )))
+            .unwrap();
+        }
+        let seed = |kf: usize, feature: usize| LandmarkSeed {
+            position: Vec3F64::new(0.0, 0.0, 5.0),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: kf,
+                feature_idx: feature,
+            },
+        };
+        // Matched, and the only landmark KF0 and KF1 share.
+        let shared = map.insert_landmark(seed(0, 0)).unwrap();
+        map.link_observation(1, 0, shared).unwrap();
+        // Also on KF1, so its votes should pull these in.
+        let voter_a = map.insert_landmark(seed(1, 1)).unwrap();
+        let voter_b = map.insert_landmark(seed(1, 2)).unwrap();
+        let voter_c = map.insert_landmark(seed(1, 3)).unwrap();
+        // On keyframes observing nothing matched.
+        let unrelated_a = map.insert_landmark(seed(2, 0)).unwrap();
+        let unrelated_b = map.insert_landmark(seed(3, 0)).unwrap();
+
+        let selected =
+            select_local_landmarks(&map, &[shared], None, &LocalMapSelectionConfig::default());
+
+        assert_eq!(
+            selected,
+            vec![shared, voter_a, voter_b, voter_c],
+            "only the voting keyframes' landmarks, sorted"
+        );
+        assert!(!selected.contains(&unrelated_a));
+        assert!(!selected.contains(&unrelated_b));
+    }
+
+    /// A retired landmark is never offered, even when its keyframe votes.
+    #[test]
+    fn selection_filters_retired_landmarks() {
+        let mut map = covis_map();
+        map.remove_landmark(0).unwrap();
         let selected =
             select_local_landmarks(&map, &[0], Some(0), &LocalMapSelectionConfig::default());
-        assert!(selected.contains(&0));
+        assert!(!selected.contains(&0));
         assert!(selected.iter().all(|&i| !map.map_points()[i].culled));
     }
 }

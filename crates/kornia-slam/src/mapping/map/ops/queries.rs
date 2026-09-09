@@ -47,31 +47,34 @@ impl Map {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::{Keyframe, MapPoint, tests::test_frame};
+    use crate::map::{Keyframe, LandmarkSeed, ObservationKey, tests::test_frame};
     use kornia_algebra::Vec3F64;
 
     /// KF0 shares two points with KF1 and one with KF2.
     fn covis_map() -> Map {
         let mut map = Map::new();
         for idx in 0..3 {
-            map.upsert_keyframe(Keyframe::from_frame(test_frame(
+            map.insert_keyframe(Keyframe::from_frame(test_frame(
                 idx,
                 vec![[idx as u8; 32]; 3],
-            )));
+            )))
+            .unwrap();
         }
-        for (slot, observers) in [(0usize, vec![0, 1]), (1, vec![0, 1]), (2, vec![0, 2])] {
-            let mp = map.push_map_point(MapPoint::new(
-                Vec3F64::new(0.0, 0.0, 1.0),
-                [0u8; 32],
-                0,
-                [0; 3],
-                0,
-            ));
+        for (slot, observers) in [(0usize, [0usize, 1]), (1, [0, 1]), (2, [0, 2])] {
+            let mut observers = observers.into_iter();
+            let reference = observers.next().expect("each landmark has an observer");
+            let mp = map
+                .insert_landmark(LandmarkSeed {
+                    position: Vec3F64::new(0.0, 0.0, 1.0),
+                    color: [0; 3],
+                    reference: ObservationKey {
+                        keyframe_idx: reference,
+                        feature_idx: slot,
+                    },
+                })
+                .unwrap();
             for kf in observers {
-                map.get_keyframe_mut(kf)
-                    .unwrap()
-                    .associate_map_point(slot, mp);
-                map.register_observation_at(mp, kf, slot);
+                map.link_observation(kf, slot, mp).unwrap();
             }
         }
         map
