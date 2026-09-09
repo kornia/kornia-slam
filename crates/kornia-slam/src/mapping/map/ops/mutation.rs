@@ -8,7 +8,7 @@ use crate::map::{
 };
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::{ImuMeasurement, PreintegratedImu};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Result of replacing a duplicate landmark with a surviving landmark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -457,12 +457,22 @@ impl Map {
         if let Some(kf) = self.get_keyframe_mut(keyframe_idx) {
             kf.clear_map_point(feature_idx);
         }
+        // Whether this was the reference decides if the reference moves at all.
+        // Unlinking any other observation must leave the reference keyframe and
+        // its octave alone, even though the viewing direction and distance
+        // bounds legitimately change with the remaining observers.
+        let was_reference = self
+            .map_points
+            .get(landmark_idx)
+            .is_some_and(|mp| mp.keyframe_idx == keyframe_idx);
         if let Some(mp) = self.map_points.get_mut(landmark_idx) {
             mp.remove_observation(keyframe_idx);
             if mp.observations().is_empty() {
                 self.retire_landmark(landmark_idx);
             } else {
-                self.adopt_reference(landmark_idx);
+                if was_reference {
+                    self.adopt_reference(landmark_idx);
+                }
                 self.refresh_landmark(landmark_idx);
             }
         }
@@ -523,7 +533,13 @@ impl Map {
                 .iter()
                 .find(|kf| kf.frame.idx == key.keyframe_idx)
                 .or_else(|| this.get_keyframe(key.keyframe_idx))
-                .map(|kf| kf.frame.features.descriptors.len())
+                .map(|kf| {
+                    kf.frame
+                        .features
+                        .descriptors
+                        .len()
+                        .min(kf.frame.features.keypoints_xy.len())
+                })
         };
 
         // 2. resolve landmark targets; each seed carries an implicit first link.
@@ -552,8 +568,12 @@ impl Map {
         }
 
         // 3. validate every claim against the live map and against each other.
-        let mut claimed_features: HashSet<ObservationKey> = HashSet::new();
-        let mut claimed_pairs: HashSet<(usize, usize)> = HashSet::new();
+        // Remember the resolved target for each claimed feature, and the feature
+        // for each landmark/keyframe pair, so an identical repeat is a no-op
+        // while a competing target is still a conflict.
+        let mut claimed_features: HashMap<ObservationKey, usize> = HashMap::new();
+        let mut claimed_pairs: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut accepted: Vec<(ObservationKey, usize)> = Vec::new();
         for &(key, landmark) in &claims {
             let Some(n_features) = feature_count(self, key) else {
                 return Err(MapMutationError::UnknownKeyframe(key.keyframe_idx));
@@ -566,30 +586,48 @@ impl Map {
             }
             if !reserved.contains(&key.keyframe_idx) {
                 match self.check_link(key, landmark)? {
+                    // Already in the live map: nothing to publish.
                     LinkVerdict::AlreadyLinked => continue,
                     LinkVerdict::New => {}
                 }
             }
-            if !claimed_features.insert(key) {
-                return Err(MapMutationError::FeatureOccupied {
-                    keyframe_idx: key.keyframe_idx,
-                    feature_idx: key.feature_idx,
-                    holder: landmark,
-                });
+            match claimed_features.get(&key) {
+                // The same link proposed twice in one request.
+                Some(&holder) if holder == landmark => continue,
+                Some(&holder) => {
+                    return Err(MapMutationError::FeatureOccupied {
+                        keyframe_idx: key.keyframe_idx,
+                        feature_idx: key.feature_idx,
+                        holder,
+                    });
+                }
+                None => {}
             }
-            if !claimed_pairs.insert((landmark, key.keyframe_idx)) {
+            if let Some(&feature) = claimed_pairs.get(&(landmark, key.keyframe_idx))
+                && feature != key.feature_idx
+            {
                 return Err(MapMutationError::DuplicateObservation {
                     landmark,
                     keyframe_idx: key.keyframe_idx,
                 });
             }
+            claimed_features.insert(key, landmark);
+            claimed_pairs.insert((landmark, key.keyframe_idx), key.feature_idx);
+            accepted.push((key, landmark));
         }
 
         // 4. IMU endpoints against the resulting keyframe set.
+        let mut proposed_edges: HashSet<(usize, usize)> = HashSet::new();
         for factor in &imu_factors {
             let (prev, curr) = (factor.prev_kf_idx, factor.curr_kf_idx);
             if prev == curr {
                 return Err(MapMutationError::SelfImuFactor(prev));
+            }
+            // A duplicate inside the request would double-count integrated
+            // duration in the initialization readiness gate and hand the
+            // optimizer the same constraint twice.
+            if !proposed_edges.insert((prev, curr)) {
+                return Err(MapMutationError::DuplicateImuFactor { prev, curr });
             }
             for endpoint in [prev, curr] {
                 if !reserved.contains(&endpoint) && self.get_keyframe(endpoint).is_none() {
@@ -631,15 +669,14 @@ impl Map {
             landmark_ids.push(idx);
         }
 
+        // `accepted` is the deduplicated set validation approved, in request
+        // order; nothing here may fail or be skipped.
         let mut observations_added = 0usize;
         let mut dirty: HashSet<usize> = HashSet::new();
-        for (key, landmark) in claims {
-            let Ok((descriptor, _)) = self.feature_data(key) else {
-                continue;
-            };
-            if self.check_link(key, landmark) == Ok(LinkVerdict::AlreadyLinked) {
-                continue;
-            }
+        for (key, landmark) in accepted {
+            let (descriptor, _) = self
+                .feature_data(key)
+                .expect("every accepted claim was validated above");
             self.link_unchecked(key, landmark, descriptor);
             observations_added += 1;
             dirty.insert(landmark);
@@ -662,7 +699,13 @@ impl Map {
         let Some(kf) = self.get_keyframe(key.keyframe_idx) else {
             return Err(MapMutationError::UnknownKeyframe(key.keyframe_idx));
         };
-        let Some(&descriptor) = kf.frame.features.descriptors.get(key.feature_idx) else {
+        // Both arrays are required: a descriptor with no keypoint carries no
+        // image measurement, so no geometric consumer can use the observation.
+        // Missing octave data keeps its existing fallback.
+        let (Some(&descriptor), true) = (
+            kf.frame.features.descriptors.get(key.feature_idx),
+            key.feature_idx < kf.frame.features.keypoints_xy.len(),
+        ) else {
             return Err(MapMutationError::InvalidFeature {
                 keyframe_idx: key.keyframe_idx,
                 feature_idx: key.feature_idx,
@@ -1524,6 +1567,190 @@ mod tests {
         assert_eq!(result.replaced, weak);
         assert!(map.map_points()[weak].culled);
         assert_eq!(map.map_points()[strong].observations().len(), 3);
+        assert_map_consistent(&map);
+    }
+
+    // ── review findings R1–R4 ────────────────────────────────────────────
+
+    /// R1: unlinking an observation that is not the reference must leave the
+    /// reference keyframe and its octave alone.
+    #[test]
+    fn unlinking_a_non_reference_observation_keeps_the_reference() {
+        let mut map = Map::new();
+        for idx in [10usize, 20, 30] {
+            let mut kf = detached(idx, 2);
+            // Distinct octaves make a wrongly-adopted reference visible.
+            kf.frame.features.octaves = vec![(idx / 10) as u8, 0];
+            map.insert_keyframe(kf).unwrap();
+        }
+        let point = map.insert_landmark(seed(20, 0, 5.0)).unwrap();
+        map.link_observation(10, 0, point).unwrap();
+        map.link_observation(30, 0, point).unwrap();
+        assert_eq!(map.map_points()[point].keyframe_idx, 20);
+        assert_eq!(map.map_points()[point].reference_octave, 2);
+
+        map.unlink_observation(30, 0).unwrap();
+
+        assert_eq!(
+            map.map_points()[point].keyframe_idx,
+            20,
+            "the reference observation was not the one removed"
+        );
+        assert_eq!(map.map_points()[point].reference_octave, 2);
+        assert_eq!(map.map_points()[point].observations().len(), 2);
+        assert_map_consistent(&map);
+    }
+
+    /// R1: removing the reference itself promotes the smallest remaining
+    /// (keyframe, feature) and adopts its octave.
+    #[test]
+    fn unlinking_the_reference_promotes_the_smallest_remaining() {
+        let mut map = Map::new();
+        for idx in [10usize, 20, 30] {
+            let mut kf = detached(idx, 2);
+            kf.frame.features.octaves = vec![(idx / 10) as u8, 0];
+            map.insert_keyframe(kf).unwrap();
+        }
+        let point = map.insert_landmark(seed(20, 0, 5.0)).unwrap();
+        map.link_observation(10, 0, point).unwrap();
+        map.link_observation(30, 0, point).unwrap();
+
+        map.unlink_observation(20, 0).unwrap();
+
+        assert_eq!(map.map_points()[point].keyframe_idx, 10);
+        assert_eq!(map.map_points()[point].reference_octave, 1);
+        assert_map_consistent(&map);
+    }
+
+    /// R2: a duplicate directed IMU edge inside one request rejects the batch,
+    /// leaving nothing behind — it would otherwise double-count integrated
+    /// duration in the initialization readiness gate.
+    #[test]
+    fn a_duplicate_imu_edge_within_one_batch_is_refused() {
+        let mut map = Map::new();
+        map.insert_keyframe(detached(10, 1)).unwrap();
+        let edge = |prev, curr| ImuFactor {
+            prev_kf_idx: prev,
+            curr_kf_idx: curr,
+            preintegrated: PreintegratedImu::new(Default::default(), test_calib()),
+            raw_samples: Vec::new(),
+            t0: 0.0,
+            t1: 1.0,
+        };
+
+        let err = map
+            .apply_insertion(MapInsertion {
+                keyframes: vec![detached(11, 1)],
+                landmarks: vec![seed(10, 0, 5.0)],
+                imu_factors: vec![edge(10, 11), edge(10, 11)],
+                ..Default::default()
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            MapMutationError::DuplicateImuFactor { prev: 10, curr: 11 }
+        );
+        assert!(map.get_keyframe(11).is_none());
+        assert_eq!(map.num_map_points(), 0);
+        assert!(map.imu_factors().is_empty());
+    }
+
+    /// R3: proposing the same link twice in one request is a no-op, not a
+    /// conflict — including a seed's implicit reference restated explicitly.
+    #[test]
+    fn identical_claims_within_a_batch_are_noops() {
+        let mut map = Map::new();
+        let link = |kf, feature, target| ObservationLink {
+            observation: ObservationKey {
+                keyframe_idx: kf,
+                feature_idx: feature,
+            },
+            landmark: target,
+        };
+
+        let result = map
+            .apply_insertion(MapInsertion {
+                keyframes: vec![detached(0, 2), detached(1, 2)],
+                landmarks: vec![seed(0, 0, 5.0)],
+                observations: vec![
+                    // The seed already implies this link.
+                    link(0, 0, LandmarkTarget::New(0)),
+                    link(1, 0, LandmarkTarget::New(0)),
+                    // And the same second link, restated.
+                    link(1, 0, LandmarkTarget::New(0)),
+                ],
+                ..Default::default()
+            })
+            .expect("identical repeats are not conflicts");
+
+        let point = result.landmark_ids[0];
+        assert_eq!(
+            result.observations_added, 2,
+            "each real link counted exactly once"
+        );
+        assert_eq!(map.map_points()[point].observations().len(), 2);
+        assert_map_consistent(&map);
+
+        // A different landmark wanting a claimed feature is still a conflict.
+        let err = map
+            .apply_insertion(MapInsertion {
+                keyframes: vec![detached(2, 2)],
+                landmarks: vec![seed(2, 0, 6.0)],
+                observations: vec![link(0, 0, LandmarkTarget::New(0))],
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(err, MapMutationError::FeatureOccupied { .. }));
+    }
+
+    /// R4: a feature with a descriptor but no keypoint carries no image
+    /// measurement, so it cannot anchor an observation.
+    #[test]
+    fn a_feature_without_a_keypoint_is_refused() {
+        let mut map = Map::new();
+        let mut kf = detached(0, 1);
+        kf.frame.features.keypoints_xy.clear();
+        map.insert_keyframe(kf).unwrap();
+
+        assert_eq!(
+            map.insert_landmark(seed(0, 0, 5.0)).unwrap_err(),
+            MapMutationError::InvalidFeature {
+                keyframe_idx: 0,
+                feature_idx: 0
+            }
+        );
+        assert_eq!(map.num_map_points(), 0);
+
+        let mut detached_kf = detached(1, 1);
+        detached_kf.frame.features.keypoints_xy.clear();
+        let err = map
+            .apply_insertion(MapInsertion {
+                keyframes: vec![detached_kf],
+                landmarks: vec![seed(1, 0, 5.0)],
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(
+            err,
+            MapMutationError::InvalidFeature {
+                keyframe_idx: 1,
+                feature_idx: 0
+            }
+        );
+        assert!(map.get_keyframe(1).is_none());
+    }
+
+    /// R4: absent octave data keeps its existing fallback to 0.
+    #[test]
+    fn a_valid_feature_without_octave_data_keeps_the_fallback() {
+        let mut map = Map::new();
+        let mut kf = detached(0, 1);
+        kf.frame.features.octaves.clear();
+        map.insert_keyframe(kf).unwrap();
+
+        let point = map.insert_landmark(seed(0, 0, 5.0)).unwrap();
+        assert_eq!(map.map_points()[point].reference_octave, 0);
         assert_map_consistent(&map);
     }
 }
