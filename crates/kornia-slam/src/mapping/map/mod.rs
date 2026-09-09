@@ -111,8 +111,13 @@ impl Map {
         &self.keyframes
     }
 
-    /// Returns mutable access to all keyframes.
-    pub fn keyframes_mut(&mut self) -> &mut [Keyframe] {
+    /// Numeric writeback over stored keyframes, for correction and bundle
+    /// adjustment inside this module tree.
+    ///
+    /// Private to `map`: outer mapping, tracking and the system change
+    /// structure only through the canonical operations, which keep both sides
+    /// of every link in step.
+    pub(crate) fn keyframes_mut(&mut self) -> &mut [Keyframe] {
         &mut self.keyframes
     }
 
@@ -121,10 +126,9 @@ impl Map {
         self.keyframes.iter().find(|kf| kf.frame.idx == idx)
     }
 
-    /// Mutable version of [`Map::get_keyframe`]. Needed when a triangulation
-    /// or fusion pass produces a new observation that must be recorded on the
-    /// live keyframe in the map (not a clone).
-    pub fn get_keyframe_mut(&mut self, idx: usize) -> Option<&mut Keyframe> {
+    /// Mutable access to one stored keyframe, for numeric writeback inside
+    /// this module tree. See [`Map::keyframes_mut`] on why it is not public.
+    pub(crate) fn get_keyframe_mut(&mut self, idx: usize) -> Option<&mut Keyframe> {
         self.keyframes.iter_mut().find(|kf| kf.frame.idx == idx)
     }
 
@@ -133,8 +137,13 @@ impl Map {
         &self.map_points
     }
 
-    /// Returns a mutable reference to all map points.
-    pub fn map_points_mut(&mut self) -> &mut Vec<MapPoint> {
+    /// Numeric writeback over stored landmarks.
+    ///
+    /// A slice, not the `Vec`: landmark ids are stable indices held inside
+    /// keyframes, so pushing, removing or reordering slots here would
+    /// invalidate live associations. Growth and retirement go through the
+    /// canonical operations instead.
+    pub(crate) fn map_points_mut(&mut self) -> &mut [MapPoint] {
         &mut self.map_points
     }
 

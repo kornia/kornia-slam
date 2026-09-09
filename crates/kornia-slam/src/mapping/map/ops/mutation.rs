@@ -19,6 +19,14 @@ pub struct MapPointMergeResult {
 }
 
 impl Map {
+    /// Structural bypass retained for fixtures only.
+    ///
+    /// Predates the canonical API and can leave the two sides of a link
+    /// disagreeing — a keyframe association with no matching observation
+    /// record, or a landmark with no observer at all. `#[cfg(test)]` keeps it
+    /// out of production builds entirely; migrate the remaining fixtures to
+    /// `insert_keyframe` / `insert_landmark` / `link_observation` and delete it.
+    #[cfg(test)]
     /// Inserts or replaces a keyframe by frame index.
     pub fn upsert_keyframe(&mut self, keyframe: Keyframe) {
         if let Some(pos) = self
@@ -32,6 +40,14 @@ impl Map {
         }
     }
 
+    /// Structural bypass retained for fixtures only.
+    ///
+    /// Predates the canonical API and can leave the two sides of a link
+    /// disagreeing — a keyframe association with no matching observation
+    /// record, or a landmark with no observer at all. `#[cfg(test)]` keeps it
+    /// out of production builds entirely; migrate the remaining fixtures to
+    /// `insert_keyframe` / `insert_landmark` / `link_observation` and delete it.
+    #[cfg(test)]
     /// Appends a map point and returns its index.
     pub fn push_map_point(&mut self, map_point: MapPoint) -> usize {
         let idx = self.map_points.len();
@@ -69,6 +85,14 @@ impl Map {
         self.imu_factors.clear();
     }
 
+    /// Structural bypass retained for fixtures only.
+    ///
+    /// Predates the canonical API and can leave the two sides of a link
+    /// disagreeing — a keyframe association with no matching observation
+    /// record, or a landmark with no observer at all. `#[cfg(test)]` keeps it
+    /// out of production builds entirely; migrate the remaining fixtures to
+    /// `insert_keyframe` / `insert_landmark` / `link_observation` and delete it.
+    #[cfg(test)]
     /// Inserts triangulated 3D points as map points and associates them to
     /// keyframes.
     ///
@@ -97,6 +121,14 @@ impl Map {
         self.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
     }
 
+    /// Structural bypass retained for fixtures only.
+    ///
+    /// Predates the canonical API and can leave the two sides of a link
+    /// disagreeing — a keyframe association with no matching observation
+    /// record, or a landmark with no observer at all. `#[cfg(test)]` keeps it
+    /// out of production builds entirely; migrate the remaining fixtures to
+    /// `insert_keyframe` / `insert_landmark` / `link_observation` and delete it.
+    #[cfg(test)]
     /// [`Map::register_observation`] for a keyframe already stored in the
     /// map, addressed by frame index. Lets callers register observations
     /// while only holding `&mut Map` (no borrowed `Keyframe` clone needed).
