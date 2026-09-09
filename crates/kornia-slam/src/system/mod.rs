@@ -21,7 +21,8 @@ use crate::initialization::{
 use crate::loop_closure::{InertialPgoContext, LoopCloser, LoopClosingContext, LoopClosingOutcome};
 use crate::map::{
     ImuFactor, InertialAlignment, InertialAlignmentError, Keyframe, KeyframeJob, LandmarkSeed,
-    LandmarkTarget, LocalMapping, Map, MapInsertion, MapPoint, ObservationKey, ObservationLink,
+    LandmarkTarget, LocalMapping, Map, MapInsertion, MapMutationError, MapPoint, ObservationKey,
+    ObservationLink,
 };
 use crate::place_recognition::Vocabulary;
 use crate::pose_conversion::rotation_from_to;
@@ -450,14 +451,26 @@ impl SlamSystem {
         let current_kf = Keyframe::from_frame(curr_frame);
         let curr_idx = current_kf.frame.idx;
 
-        self.build_initial_map(
+        // A rejected publication leaves no map to evaluate, and tracker state
+        // must not advertise a keyframe pair the map does not hold.
+        if let Err(error) = self.build_initial_map(
             reference_kf,
             current_kf,
             &two_view_estimate.matches,
             &two_view_estimate.points3d,
             &two_view_estimate.inlier_indices,
             two_view_estimate.median_depth,
-        );
+        ) {
+            self.dbg(format!(
+                "[bootstrap] frame={curr_idx} publication rejected: {error}"
+            ));
+            self.map.lock().unwrap().clear_active();
+            self.tracker.restart_bootstrap();
+            return TrackingResult {
+                pose_world_to_cam: self.tracker.state.pose_world_to_cam,
+                status: TrackingStatus::Skipped,
+            };
+        }
 
         // Post-BA acceptance gate. Initialization owns the metric and its
         // thresholds; the system only acts on the verdict.
@@ -540,7 +553,7 @@ impl SlamSystem {
         points3d: &[Vec3F64],
         inlier_indices: &[usize],
         median_depth: Option<f64>,
-    ) -> usize {
+    ) -> Result<usize, MapMutationError> {
         let depth_scale = median_depth.filter(|&d| d > 1e-6).unwrap_or(1.0);
         let reference_pose_inv = reference_kf.frame.pose_world_to_cam.inverse();
 
@@ -609,16 +622,13 @@ impl SlamSystem {
                 landmark: LandmarkTarget::New(new_index),
             });
         }
-        let published = self.map.lock().unwrap().apply_insertion(request);
-        let added = match published {
-            Ok(result) => result.landmark_ids.len(),
-            Err(error) => {
-                self.dbg(format!(
-                    "[bootstrap] frame={current_kf_idx} publication rejected: {error}"
-                ));
-                return 0;
-            }
-        };
+        let added = self
+            .map
+            .lock()
+            .unwrap()
+            .apply_insertion(request)?
+            .landmark_ids
+            .len();
 
         self.map.lock().unwrap().run_initial_ba(&self.rig.camera);
 
@@ -627,7 +637,7 @@ impl SlamSystem {
         self.register_place_recognition(reference_kf_idx);
         self.register_place_recognition(current_kf_idx);
 
-        added
+        Ok(added)
     }
 
     fn inertial_init_step(
@@ -1000,7 +1010,7 @@ impl SlamSystem {
         // Forward SearchInNeighbors: extend this keyframe's landmarks into
         // neighbours that don't yet observe them, before local BA so BA sees the
         // extra reprojection constraints.
-        let n_fused = {
+        let (n_fused, fuse_conflicts) = {
             let mut map = self.map.lock().unwrap();
             let links = crate::mapping::growth::neighbor_fusion_links(
                 &map,
@@ -1009,24 +1019,31 @@ impl SlamSystem {
                 &self.rig.camera,
             );
             let mut fused = 0usize;
+            let mut conflicts: Vec<MapMutationError> = Vec::new();
             for link in links {
                 let LandmarkTarget::Existing(landmark) = link.landmark else {
                     continue;
                 };
-                if map
-                    .link_observation(
-                        link.observation.keyframe_idx,
-                        link.observation.feature_idx,
-                        landmark,
-                    )
-                    .unwrap_or(false)
-                {
-                    fused += 1;
+                match map.link_observation(
+                    link.observation.keyframe_idx,
+                    link.observation.feature_idx,
+                    landmark,
+                ) {
+                    Ok(true) => fused += 1,
+                    // Already linked: the proposal was redundant, not wrong.
+                    Ok(false) => {}
+                    // Proposals are resolved against a map held under this same
+                    // lock, so a refusal means an invariant we believed held did
+                    // not. Surface it rather than counting it as a no-op.
+                    Err(error) => conflicts.push(error),
                 }
             }
-            fused
+            (fused, conflicts)
         };
         self.dbg(format!("[fuse] frame={} fused={}", frame.idx, n_fused));
+        for error in fuse_conflicts {
+            self.dbg(format!("[fuse] frame={} link refused: {error}", frame.idx));
+        }
 
         // Refinement can rotate/scale the world and update gravity. Do it before
         // constructing the BA request so the job and its future snapshot agree.

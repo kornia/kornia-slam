@@ -46,14 +46,14 @@
 //! [`local_mapping`]; extracting the numerical BA solvers remains deferred.
 
 mod keyframe;
-mod local_mapping;
 mod map_point;
 mod ops;
 
 pub use keyframe::Keyframe;
-pub use local_mapping::{KeyframeJob, LocalMapping, LocalMappingMode};
+// Compatibility: the worker now lives in `mapping`, but callers still reach it
+// through the map facade.
+pub use crate::mapping::local_mapping::{KeyframeJob, LocalMapping, LocalMappingMode};
 pub use map_point::{LandmarkObservation, MapPoint, ObservationKey};
-pub use ops::covisible_above_weight;
 pub use ops::{
     InertialAlignment, InertialAlignmentError, KeyframeBaCorrection, KeyframeVelocity,
     LocalBaMergeResult, LocalBaSnapshot, MapPointMergeResult, PoseGraphCorrectionError,

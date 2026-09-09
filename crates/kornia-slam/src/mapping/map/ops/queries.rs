@@ -44,27 +44,6 @@ impl Map {
     }
 }
 
-/// Applies a consumer's minimum-weight policy to raw covisibility.
-///
-/// Mirrors ORB-SLAM3's `KeyFrame::UpdateConnections`: links below `min_weight`
-/// are dropped, but if none reach it the single strongest link is kept so an
-/// under-connected keyframe is never orphaned. This fallback runs before any
-/// neighbour limit a caller applies afterwards.
-pub fn covisible_above_weight(
-    connections: Vec<(usize, usize)>,
-    min_weight: usize,
-) -> Vec<(usize, usize)> {
-    let strongest = connections.first().copied();
-    let mut kept: Vec<(usize, usize)> = connections
-        .into_iter()
-        .filter(|&(_, w)| w >= min_weight)
-        .collect();
-    if kept.is_empty() {
-        kept.extend(strongest);
-    }
-    kept
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,15 +86,5 @@ mod tests {
     #[test]
     fn an_unknown_keyframe_has_no_neighbours() {
         assert!(covis_map().covisible_keyframes(99).is_empty());
-    }
-
-    #[test]
-    fn a_threshold_above_every_weight_keeps_the_strongest_link() {
-        let raw = covis_map().covisible_keyframes(0);
-        // Both weights are below 5, so the fallback preserves connectivity
-        // rather than orphaning the keyframe.
-        assert_eq!(covisible_above_weight(raw.clone(), 5), vec![(1, 2)]);
-        assert_eq!(covisible_above_weight(raw.clone(), 2), vec![(1, 2)]);
-        assert_eq!(covisible_above_weight(raw, 1), vec![(1, 2), (2, 1)]);
     }
 }

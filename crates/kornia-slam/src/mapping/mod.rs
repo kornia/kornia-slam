@@ -7,6 +7,8 @@
 
 pub mod culling;
 pub mod growth;
+pub mod local_mapping;
 pub mod map;
 
-pub use map::{Keyframe, KeyframeJob, LocalMapping, LocalMappingMode, Map, MapPoint};
+pub use local_mapping::{KeyframeJob, LocalMapping, LocalMappingMode};
+pub use map::{Keyframe, Map, MapPoint};

@@ -6,7 +6,7 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 
-use super::{LocalBaMergeResult, LocalBaSnapshot, Map};
+use crate::map::{LocalBaMergeResult, LocalBaSnapshot, Map};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LocalMappingMode {

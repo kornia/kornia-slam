@@ -119,7 +119,7 @@ impl LoopCloser {
             if bow.0.is_empty() {
                 return outcome;
             }
-            let neighbors = crate::map::covisible_above_weight(
+            let neighbors = crate::tracking::local_map::covisible_above_weight(
                 map.covisible_keyframes(kf_idx),
                 MIN_COVIS_WEIGHT,
             );

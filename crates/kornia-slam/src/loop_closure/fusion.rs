@@ -74,7 +74,7 @@ fn loop_side_keyframes(map: &Map, anchor: usize, config: &LoopFusionConfig) -> V
     }
     let mut side = vec![anchor];
     side.extend(
-        crate::map::covisible_above_weight(
+        crate::tracking::local_map::covisible_above_weight(
             map.covisible_keyframes(anchor),
             config.min_covisibility_weight,
         )

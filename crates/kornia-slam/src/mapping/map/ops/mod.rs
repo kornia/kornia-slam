@@ -17,4 +17,3 @@ pub use mutation::{
     InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError,
     MapPointMergeResult, ObservationLink,
 };
-pub use queries::covisible_above_weight;
