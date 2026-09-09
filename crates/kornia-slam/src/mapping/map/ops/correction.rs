@@ -250,7 +250,7 @@ impl Map {
 mod tests {
     use super::*;
     use crate::map::{
-        Keyframe, MapPoint,
+        Keyframe, LandmarkSeed, ObservationKey,
         tests::{test_frame, test_frame_with_pose},
     };
     use kornia_3d::pose::Pose3d;
@@ -259,8 +259,10 @@ mod tests {
     #[test]
     fn inertial_alignment_assigns_velocities_by_keyframe_id() {
         let mut map = Map::new();
-        map.upsert_keyframe(Keyframe::from_frame(test_frame(20, Vec::new())));
-        map.upsert_keyframe(Keyframe::from_frame(test_frame(10, Vec::new())));
+        map.insert_keyframe(Keyframe::from_frame(test_frame(20, Vec::new())))
+            .unwrap();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(10, Vec::new())))
+            .unwrap();
         let velocity_10 = Vec3F64::new(1.0, 2.0, 3.0);
         let velocity_20 = Vec3F64::new(4.0, 5.0, 6.0);
 
@@ -290,7 +292,8 @@ mod tests {
     #[test]
     fn inertial_alignment_rejects_an_unknown_keyframe_without_mutating() {
         let mut map = Map::new();
-        map.upsert_keyframe(Keyframe::from_frame(test_frame(10, Vec::new())));
+        map.insert_keyframe(Keyframe::from_frame(test_frame(10, Vec::new())))
+            .unwrap();
 
         let error = map
             .apply_inertial_alignment(InertialAlignment {
@@ -312,7 +315,8 @@ mod tests {
     #[test]
     fn inertial_alignment_rotates_stored_velocities() {
         let mut map = Map::new();
-        map.upsert_keyframe(Keyframe::from_frame(test_frame(0, Vec::new())));
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, Vec::new())))
+            .unwrap();
         let yaw = SO3F64::exp(Vec3F64::new(0.0, 0.4, 0.0));
         let velocity = Vec3F64::new(1.0, 0.2, -0.5);
 
@@ -347,21 +351,29 @@ mod tests {
             ),
         ];
         let mut map = Map::new();
-        map.upsert_keyframe(Keyframe::from_frame(test_frame_with_pose(
+        map.insert_keyframe(Keyframe::from_frame(test_frame_with_pose(
             10,
             vec![[0; 32]],
             before[0],
-        )));
-        map.upsert_keyframe(Keyframe::from_frame(test_frame_with_pose(
+        )))
+        .unwrap();
+        map.insert_keyframe(Keyframe::from_frame(test_frame_with_pose(
             20,
             vec![[1; 32]],
             before[1],
-        )));
+        )))
+        .unwrap();
         let point_before = Vec3F64::new(1.0, 0.0, 5.0);
-        let point_idx = map.push_map_point(MapPoint::new(point_before, [1; 32], 0, [0; 3], 20));
-        map.get_keyframe_mut(20)
-            .unwrap()
-            .associate_map_point(0, point_idx);
+        let point_idx = map
+            .insert_landmark(LandmarkSeed {
+                position: point_before,
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 20,
+                    feature_idx: 0,
+                },
+            })
+            .unwrap();
         let point_in_reference_before = before[1].transform_point(&point_before);
 
         let result = map
@@ -378,14 +390,18 @@ mod tests {
     #[test]
     fn pose_graph_correction_rejects_stale_snapshot_without_mutation() {
         let mut map = Map::new();
-        map.upsert_keyframe(Keyframe::from_frame(test_frame(7, vec![[0; 32]])));
-        let point_idx = map.push_map_point(MapPoint::new(
-            Vec3F64::new(0.0, 0.0, 5.0),
-            [0; 32],
-            0,
-            [0; 3],
-            7,
-        ));
+        map.insert_keyframe(Keyframe::from_frame(test_frame(7, vec![[0; 32]])))
+            .unwrap();
+        let point_idx = map
+            .insert_landmark(LandmarkSeed {
+                position: Vec3F64::new(0.0, 0.0, 5.0),
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 7,
+                    feature_idx: 0,
+                },
+            })
+            .unwrap();
         let live_pose = map.get_keyframe(7).unwrap().frame.pose_world_to_cam;
         let live_point = map.map_points()[point_idx].position;
         let stale = Pose3d::new(

@@ -693,7 +693,7 @@ fn initial_ba_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::{LandmarkSeed, MapInsertion, MapPoint, ObservationKey, tests::test_frame};
+    use crate::map::{LandmarkSeed, MapInsertion, ObservationKey, tests::test_frame};
     #[test]
     fn stereo_depth_obs_uses_proportional_sigma_with_floor() {
         let mut frame = test_frame(0, vec![[0u8; 32], [1u8; 32]]);
@@ -722,14 +722,9 @@ mod tests {
     #[test]
     fn local_ba_snapshot_merge_updates_only_snapshot_entities() {
         let mut map = Map::new();
-        map.upsert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])));
-        map.push_map_point(MapPoint::new(
-            Vec3F64::new(0.0, 0.0, 5.0),
-            [0u8; 32],
-            0,
-            [0; 3],
-            0,
-        ));
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])))
+            .unwrap();
+        map.insert_landmark(seeded(0, 0, 5.0)).unwrap();
 
         let mut snapshot = map.local_ba_snapshot();
         snapshot.optimized.keyframes[0]
@@ -739,14 +734,11 @@ mod tests {
             .x = 2.0;
         snapshot.optimized.map_points[0].position.x = 3.0;
 
-        map.upsert_keyframe(Keyframe::from_frame(test_frame(1, vec![[1u8; 32]])));
-        let later_point = map.push_map_point(MapPoint::new(
-            Vec3F64::new(9.0, 0.0, 5.0),
-            [1u8; 32],
-            0,
-            [0; 3],
-            1,
-        ));
+        map.insert_keyframe(Keyframe::from_frame(test_frame(1, vec![[1u8; 32]])))
+            .unwrap();
+        let later_point = map
+            .insert_landmark(seeded_at(1, 0, Vec3F64::new(9.0, 0.0, 5.0)))
+            .unwrap();
 
         let merged = map
             .merge_local_ba_snapshot(snapshot)
@@ -774,14 +766,10 @@ mod tests {
     #[test]
     fn local_ba_snapshot_merge_rejects_an_obsolete_world_frame() {
         let mut map = Map::new();
-        map.upsert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])));
-        map.push_map_point(MapPoint::new(
-            Vec3F64::new(1.0, 0.0, 5.0),
-            [0u8; 32],
-            0,
-            [0; 3],
-            0,
-        ));
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])))
+            .unwrap();
+        map.insert_landmark(seeded_at(0, 0, Vec3F64::new(1.0, 0.0, 5.0)))
+            .unwrap();
 
         let mut snapshot = map.local_ba_snapshot();
         snapshot.optimized.map_points[0].position.x = 7.0;
@@ -794,7 +782,8 @@ mod tests {
     #[test]
     fn pose_graph_correction_invalidates_older_local_ba_snapshot() {
         let mut map = Map::new();
-        map.upsert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0; 32]])));
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0; 32]])))
+            .unwrap();
         let mut snapshot = map.local_ba_snapshot();
         snapshot.optimized.keyframes[0]
             .frame
@@ -819,8 +808,12 @@ mod tests {
     // ── canonical mutation vs. an in-flight BA snapshot ──────────────────
 
     fn seeded(kf: usize, feature: usize, z: f64) -> LandmarkSeed {
+        seeded_at(kf, feature, Vec3F64::new(0.0, 0.0, z))
+    }
+
+    fn seeded_at(kf: usize, feature: usize, position: Vec3F64) -> LandmarkSeed {
         LandmarkSeed {
-            position: Vec3F64::new(0.0, 0.0, z),
+            position,
             color: [0; 3],
             reference: ObservationKey {
                 keyframe_idx: kf,

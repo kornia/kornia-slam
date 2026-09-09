@@ -887,16 +887,23 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn upsert_keyframe_replaces_existing_idx() {
+    fn a_stored_keyframe_is_never_silently_replaced() {
         let mut map = Map::new();
 
-        map.upsert_keyframe(Keyframe::from_frame(test_frame(
+        map.insert_keyframe(Keyframe::from_frame(test_frame(
             10,
             vec![[0u8; 32], [1u8; 32]],
-        )));
+        )))
+        .unwrap();
         assert_eq!(map.keyframes().len(), 1);
 
-        map.upsert_keyframe(Keyframe::from_frame(test_frame(10, vec![[2u8; 32]])));
+        // `upsert_keyframe` used to overwrite here, discarding the stored
+        // keyframe's associations along with it. Insertion refuses instead.
+        assert_eq!(
+            map.insert_keyframe(Keyframe::from_frame(test_frame(10, vec![[2u8; 32]])))
+                .unwrap_err(),
+            MapMutationError::DuplicateKeyframe(10)
+        );
 
         assert_eq!(map.keyframes().len(), 1);
         assert_eq!(
@@ -906,7 +913,8 @@ mod tests {
                 .features
                 .descriptors
                 .len(),
-            1
+            2,
+            "the stored keyframe is intact"
         );
     }
 
@@ -938,10 +946,11 @@ mod tests {
     fn merge_map_points_redirects_associations_and_deduplicates_observers() {
         let mut map = Map::new();
         for idx in 0..3 {
-            map.upsert_keyframe(Keyframe::from_frame(test_frame(
+            map.insert_keyframe(Keyframe::from_frame(test_frame(
                 idx,
                 vec![[idx as u8; 32], [10 + idx as u8; 32]],
-            )));
+            )))
+            .unwrap();
         }
 
         let survivor = map.push_map_point(MapPoint::new(
@@ -1036,7 +1045,8 @@ mod tests {
     #[test]
     fn merge_map_points_rejects_invalid_or_culled_inputs() {
         let mut map = Map::new();
-        map.upsert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0; 32]])));
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0; 32]])))
+            .unwrap();
         let first = map.push_map_point(MapPoint::new(
             Vec3F64::new(0.0, 0.0, 5.0),
             [0; 32],
@@ -1069,7 +1079,8 @@ mod tests {
         let mut map = Map::new();
         // Reference keyframe 0 at the world origin (identity pose => camera
         // center at origin).
-        map.upsert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])));
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])))
+            .unwrap();
 
         // Point referenced to KF 0, keypoint detected at octave 2, world (0,0,5).
         let mp_idx = map.push_map_point(MapPoint::new(
@@ -1100,7 +1111,8 @@ mod tests {
     #[test]
     fn mean_viewing_direction_averages_observations() {
         let mut map = Map::new();
-        map.upsert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])));
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])))
+            .unwrap();
 
         let mp_idx = map.push_map_point(MapPoint::new(
             Vec3F64::new(0.0, 0.0, 5.0),
