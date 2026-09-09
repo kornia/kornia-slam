@@ -6,7 +6,7 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 
-use crate::map::{LocalBaMergeResult, LocalBaSnapshot, Map};
+use crate::map::{BaSnapshot, BaUpdate, LocalBaMergeResult, Map};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LocalMappingMode {
@@ -35,17 +35,17 @@ pub struct KeyframeJob {
     pub gravity_world: Vec3F64,
 }
 
-fn solve_snapshot(
-    mut snapshot: LocalBaSnapshot,
-    camera: &PinholeCamera,
-    job: &KeyframeJob,
-) -> LocalBaSnapshot {
+fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJob) -> BaUpdate {
     if job.imu_initialized {
-        snapshot.run_inertial(camera, job.imu_t_bc, job.gravity_world);
+        super::bundle_adjustment::run_local_inertial_ba(
+            snapshot,
+            camera,
+            job.imu_t_bc,
+            job.gravity_world,
+        )
     } else {
-        snapshot.run_visual(camera);
+        super::bundle_adjustment::run_local_ba(snapshot, camera)
     }
-    snapshot
 }
 
 pub struct LocalMapping {
@@ -70,8 +70,8 @@ enum LocalMappingBackend {
 /// merge and before the result is published, so a completed result is never
 /// observable ahead of its cleanup. A refused snapshot — one whose world epoch
 /// no longer matches — publishes nothing and must therefore cull nothing.
-fn merge_and_cull(map: &mut Map, snapshot: LocalBaSnapshot) -> Option<LocalBaMergeResult> {
-    let merged = map.merge_local_ba_snapshot(snapshot);
+fn merge_and_cull(map: &mut Map, update: BaUpdate) -> Option<LocalBaMergeResult> {
+    let merged = map.apply_ba_update(update);
     if merged.is_some() {
         crate::mapping::culling::cull_landmarks(map);
     }
@@ -117,14 +117,14 @@ impl LocalMapping {
                 let snapshot = map
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .local_ba_snapshot();
-                let snapshot = solve_snapshot(snapshot, camera, &job);
+                    .ba_snapshot();
+                let update = solve_snapshot(snapshot, camera, &job);
                 // Cull under the same lock as the merge, so a completed result
                 // is never observable before cleanup. A rejected snapshot culls
                 // nothing.
                 let merged = merge_and_cull(
                     &mut map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
-                    snapshot,
+                    update,
                 );
                 if let Some(result) = merged {
                     results
@@ -227,10 +227,10 @@ impl LocalMappingHandle {
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         map.lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .local_ba_snapshot()
+                            .ba_snapshot()
                     };
 
-                    let snapshot = solve_snapshot(snapshot, &camera, &job);
+                    let update = solve_snapshot(snapshot, &camera, &job);
 
                     // Merge is short and cannot interleave with keyframe publication
                     // or a world-frame transformation. Epoch mismatch rejects stale BA.
@@ -240,7 +240,7 @@ impl LocalMappingHandle {
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         let merged = merge_and_cull(
                             &mut map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
-                            snapshot,
+                            update,
                         );
                         merged.is_some_and(|result| result_sender.send(result).is_err())
                     };
@@ -484,13 +484,13 @@ mod tests {
 
     /// An epoch-rejected snapshot publishes nothing, so it must not cull
     /// either — the live map is left exactly as it was.
-    /// Through the coordinator's own decision, not `merge_local_ba_snapshot`
+    /// Through the coordinator's own decision, not `apply_ba_update`
     /// directly: a test that bypassed `merge_and_cull` would pass even if the
     /// worker culled after every refused merge.
     #[test]
     fn the_coordinator_does_not_cull_after_a_refused_merge() {
         let (map, doomed) = map_with_a_cullable_landmark();
-        let snapshot = map.lock().unwrap().local_ba_snapshot();
+        let snapshot = map.lock().unwrap().ba_snapshot().into_update();
         // Advance the world frame, so the snapshot belongs to an older epoch.
         map.lock().unwrap().scale_world(2.0);
 
@@ -507,7 +507,7 @@ mod tests {
     #[test]
     fn the_coordinator_culls_after_an_accepted_merge() {
         let (map, doomed) = map_with_a_cullable_landmark();
-        let snapshot = map.lock().unwrap().local_ba_snapshot();
+        let snapshot = map.lock().unwrap().ba_snapshot().into_update();
 
         let merged = super::merge_and_cull(&mut map.lock().unwrap(), snapshot);
 

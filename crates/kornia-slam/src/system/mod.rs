@@ -654,7 +654,10 @@ impl SlamSystem {
             .landmark_ids
             .len();
 
-        self.map.lock().unwrap().run_initial_ba(&self.rig.camera);
+        crate::mapping::bundle_adjustment::run_initial_ba(
+            &mut self.map.lock().unwrap(),
+            &self.rig.camera,
+        );
 
         // Seed the place-recognition database with the two bootstrap keyframes so
         // a later revisit of the start can match them.

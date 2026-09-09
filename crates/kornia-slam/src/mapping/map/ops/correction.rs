@@ -1,8 +1,9 @@
-//! Whole-map corrections: pose-graph writeback, inertial alignment, and the
+//! Geometry corrections: BA and pose-graph writeback, inertial alignment, and the
 //! scale/rotation helpers they build on. Each keeps its own validation order
 //! and world-epoch handling.
 
-use crate::map::{Map, ORB_N_LEVELS, ORB_SCALE_FACTOR};
+use super::snapshot::KeyframeBaState;
+use crate::map::{BaUpdate, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{SO3F64, Vec3F64};
 use kornia_sensors::imu::ImuBias;
@@ -246,6 +247,104 @@ impl Map {
     }
 }
 
+/// A keyframe state change accepted from a BA result.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyframeBaCorrection {
+    pub kf_idx: usize,
+    pub pose_before: Pose3d,
+    pub pose_after: Pose3d,
+    pub velocity_world: Vec3F64,
+    pub imu_bias: ImuBias,
+}
+
+/// Changes accepted by BA writeback and published by the local-mapping worker.
+#[derive(Debug, Default)]
+pub struct LocalBaMergeResult {
+    pub keyframe_corrections: Vec<KeyframeBaCorrection>,
+    pub map_points_updated: usize,
+}
+
+impl Map {
+    /// Applies solver-changed geometry from a BA update.
+    ///
+    /// Entities inserted after the snapshot are left untouched. A snapshot is
+    /// rejected wholesale if the live map has since been scaled, rotated, or
+    /// cleared, because its coordinates then belong to another world frame.
+    pub fn apply_ba_update(&mut self, update: BaUpdate) -> Option<LocalBaMergeResult> {
+        let snapshot = &update.snapshot;
+        if self.world_epoch != snapshot.world_epoch {
+            return None;
+        }
+
+        let mut result = LocalBaMergeResult::default();
+        for (before, optimized) in snapshot.keyframes.iter().zip(update.keyframes.iter()) {
+            if !keyframe_ba_state_changed(before, optimized) {
+                continue;
+            }
+            let Some(live) = self.get_keyframe_mut(before.frame.idx) else {
+                continue;
+            };
+
+            let pose_before = live.frame.pose_world_to_cam;
+            live.frame.pose_world_to_cam = optimized.pose_world_to_cam;
+            live.velocity_world = optimized.velocity_world;
+            live.imu_bias = optimized.imu_bias;
+            result.keyframe_corrections.push(KeyframeBaCorrection {
+                kf_idx: before.frame.idx,
+                pose_before,
+                pose_after: optimized.pose_world_to_cam,
+                velocity_world: optimized.velocity_world,
+                imu_bias: optimized.imu_bias,
+            });
+        }
+
+        let mut changed_points = Vec::new();
+        for (idx, (before, &optimized)) in snapshot
+            .map_points
+            .iter()
+            .zip(update.map_points.iter())
+            .enumerate()
+        {
+            if optimized == before.position {
+                continue;
+            }
+            let Some(live) = self.map_points.get_mut(idx) else {
+                continue;
+            };
+            if live.culled {
+                continue;
+            }
+            live.position = optimized;
+            changed_points.push(idx);
+        }
+        result.map_points_updated = changed_points.len();
+
+        changed_points.extend(update.refresh_points);
+        changed_points.sort_unstable();
+        changed_points.dedup();
+        for idx in changed_points {
+            self.update_map_point_geometry(idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+        }
+
+        // VI-BA may repropagate an existing preintegration on its private copy.
+        // Preserve newer live factors while copying those refreshed edges back.
+        for (edge, preintegrated) in snapshot.imu_factors.iter().zip(&update.imu_preintegrations) {
+            if let Some(live) = self.imu_factors.iter_mut().find(|live| {
+                live.prev_kf_idx == edge.prev_kf_idx && live.curr_kf_idx == edge.curr_kf_idx
+            }) {
+                live.preintegrated = preintegrated.clone();
+            }
+        }
+        Some(result)
+    }
+}
+fn keyframe_ba_state_changed(before: &crate::map::Keyframe, after: &KeyframeBaState) -> bool {
+    before.frame.pose_world_to_cam != after.pose_world_to_cam
+        || before.velocity_world != after.velocity_world
+        || before.imu_bias.gyro != after.imu_bias.gyro
+        || before.imu_bias.accel != after.imu_bias.accel
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +517,223 @@ mod tests {
             live_pose
         );
         assert_eq!(map.map_points()[point_idx].position, live_point);
+    }
+}
+
+#[cfg(test)]
+mod ba_tests {
+    use super::*;
+    use crate::map::{Keyframe, LandmarkSeed, MapInsertion, ObservationKey, tests::test_frame};
+
+    #[test]
+    fn initial_ba_can_refresh_geometry_without_moving_the_point() {
+        let (mut map, point) = snapshot_fixture();
+        let before = map.map_points()[point].position;
+        let mut update = map.ba_snapshot().into_update();
+        update.keyframes[0].pose_world_to_cam.translation.x = 1.0;
+        update.refresh_points.push(point);
+        let result = map.apply_ba_update(update).unwrap();
+        assert_eq!(result.keyframe_corrections.len(), 1);
+        assert_eq!(result.map_points_updated, 0);
+        assert_eq!(map.map_points()[point].position, before);
+        assert!((map.map_points()[point].max_distance - 26.0_f64.sqrt()).abs() < 1e-10);
+        assert!(map.map_points()[point].mean_viewing_direction.x > 0.0);
+    }
+    #[test]
+    fn local_ba_snapshot_merge_updates_only_snapshot_entities() {
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])))
+            .unwrap();
+        map.insert_landmark(seeded(0, 0, 5.0)).unwrap();
+
+        let mut snapshot = map.ba_snapshot().into_update();
+        snapshot.keyframes[0].pose_world_to_cam.translation.x = 2.0;
+        snapshot.map_points[0].x = 3.0;
+
+        map.insert_keyframe(Keyframe::from_frame(test_frame(1, vec![[1u8; 32]])))
+            .unwrap();
+        let later_point = map
+            .insert_landmark(seeded_at(1, 0, Vec3F64::new(9.0, 0.0, 5.0)))
+            .unwrap();
+
+        let merged = map
+            .apply_ba_update(snapshot)
+            .expect("snapshot should still use the live world frame");
+
+        assert_eq!(merged.keyframe_corrections.len(), 1);
+        assert_eq!(merged.keyframe_corrections[0].kf_idx, 0);
+        assert_eq!(
+            map.get_keyframe(0)
+                .unwrap()
+                .frame
+                .pose_world_to_cam
+                .translation
+                .x,
+            2.0
+        );
+        assert_eq!(map.map_points()[0].position.x, 3.0);
+        assert_eq!(
+            map.get_keyframe(1).unwrap().frame.pose_world_to_cam,
+            Pose3d::IDENTITY
+        );
+        assert_eq!(map.map_points()[later_point].position.x, 9.0);
+    }
+
+    #[test]
+    fn local_ba_snapshot_merge_rejects_an_obsolete_world_frame() {
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])))
+            .unwrap();
+        map.insert_landmark(seeded_at(0, 0, Vec3F64::new(1.0, 0.0, 5.0)))
+            .unwrap();
+
+        let mut snapshot = map.ba_snapshot().into_update();
+        snapshot.map_points[0].x = 7.0;
+        map.scale_world(2.0);
+
+        assert!(map.apply_ba_update(snapshot).is_none());
+        assert_eq!(map.map_points()[0].position.x, 2.0);
+    }
+
+    #[test]
+    fn pose_graph_correction_invalidates_older_ba_snapshot() {
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0; 32]])))
+            .unwrap();
+        let mut snapshot = map.ba_snapshot().into_update();
+        snapshot.keyframes[0].pose_world_to_cam.translation.x = 9.0;
+        let corrected = Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            Vec3F64::new(-1.0, 0.0, 0.0),
+        );
+
+        map.apply_pose_graph_correction(&[0], &[Pose3d::IDENTITY], &[corrected])
+            .unwrap();
+
+        assert!(map.apply_ba_update(snapshot).is_none());
+        assert_eq!(
+            map.get_keyframe(0).unwrap().frame.pose_world_to_cam,
+            corrected
+        );
+    }
+
+    // ── canonical mutation vs. an in-flight BA snapshot ──────────────────
+
+    fn seeded(kf: usize, feature: usize, z: f64) -> LandmarkSeed {
+        seeded_at(kf, feature, Vec3F64::new(0.0, 0.0, z))
+    }
+
+    fn seeded_at(kf: usize, feature: usize, position: Vec3F64) -> LandmarkSeed {
+        LandmarkSeed {
+            position,
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: kf,
+                feature_idx: feature,
+            },
+        }
+    }
+
+    fn snapshot_fixture() -> (Map, usize) {
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]; 2])))
+            .unwrap();
+        let point = map.insert_landmark(seeded(0, 0, 5.0)).unwrap();
+        (map, point)
+    }
+
+    /// A snapshot taken before a landmark was retired must not resurrect it.
+    #[test]
+    fn merging_an_older_snapshot_does_not_resurrect_a_retired_landmark() {
+        let (mut map, point) = snapshot_fixture();
+        let mut snapshot = map.ba_snapshot().into_update();
+        // The solver must actually have moved this landmark: writeback skips
+        // unchanged positions, so an untouched snapshot would never reach the
+        // retirement guard and the test would pass without exercising it.
+        snapshot.map_points[point].x += 1.0;
+
+        assert!(map.remove_landmark(point).unwrap());
+        let merged = map
+            .apply_ba_update(snapshot)
+            .expect("the snapshot is still in the live world frame");
+
+        assert!(map.map_points()[point].culled, "still retired");
+        assert!(map.map_points()[point].observations().is_empty());
+        assert_eq!(map.get_keyframe(0).unwrap().map_point(0), None);
+        assert_eq!(
+            merged.map_points_updated, 0,
+            "a retired landmark is not written back"
+        );
+    }
+
+    /// Entities added while BA was running must survive the writeback.
+    #[test]
+    fn entities_added_after_a_snapshot_survive_its_merge() {
+        let (mut map, _) = snapshot_fixture();
+        let snapshot = map.ba_snapshot().into_update();
+
+        let result = map
+            .apply_insertion(MapInsertion {
+                keyframes: vec![Keyframe::from_frame(test_frame(1, vec![[1u8; 32]; 2]))],
+                landmarks: vec![seeded(1, 0, 7.0)],
+                ..Default::default()
+            })
+            .expect("valid batch");
+        let newer = result.landmark_ids[0];
+
+        // Move an older entity so the merge has real work to publish; a no-op
+        // writeback would satisfy the survival assertions vacuously.
+        let mut snapshot = snapshot;
+        snapshot.map_points[0].x += 0.5;
+        let merged = map
+            .apply_ba_update(snapshot)
+            .expect("the snapshot is still in the live world frame");
+        assert_eq!(
+            merged.map_points_updated, 1,
+            "the older landmark was actually written back"
+        );
+
+        assert!(map.get_keyframe(1).is_some(), "newer keyframe survived");
+        assert!(!map.map_points()[newer].culled, "newer landmark survived");
+        assert_eq!(
+            map.get_keyframe(1).unwrap().map_point(0),
+            Some(newer),
+            "its link survived"
+        );
+    }
+
+    /// A merge must not reapply the pre-merge observation lists over a merge
+    /// that happened in the meantime.
+    #[test]
+    fn merging_after_a_landmark_merge_keeps_structure_consistent() {
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]; 2])))
+            .unwrap();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(1, vec![[1u8; 32]; 2])))
+            .unwrap();
+        let survivor = map.insert_landmark(seeded(0, 0, 5.0)).unwrap();
+        let duplicate = map.insert_landmark(seeded(0, 1, 5.01)).unwrap();
+        map.link_observation(1, 0, survivor).unwrap();
+
+        let snapshot = map.ba_snapshot().into_update();
+        map.merge_map_points(survivor, duplicate);
+        map.apply_ba_update(snapshot);
+
+        // Whatever survived, the two sides still agree everywhere.
+        for kf in map.keyframes() {
+            for (feature, slot) in kf.map_point_by_desc_idx.iter().enumerate() {
+                let Some(mp_idx) = *slot else { continue };
+                let mp = &map.map_points()[mp_idx];
+                assert!(!mp.culled, "kf {} links a retired landmark", kf.frame.idx);
+                assert!(
+                    mp.observations()
+                        .iter()
+                        .any(|o| o.key.keyframe_idx == kf.frame.idx
+                            && o.key.feature_idx == feature),
+                    "link from kf {} has no record",
+                    kf.frame.idx
+                );
+            }
+        }
     }
 }
