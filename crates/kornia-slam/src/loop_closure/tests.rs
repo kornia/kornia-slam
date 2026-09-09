@@ -1,6 +1,6 @@
 use super::*;
 use crate::Frame;
-use crate::map::{Keyframe, Map, MapPoint};
+use crate::map::{Keyframe, LandmarkSeed, Map, MapPoint, ObservationKey};
 use crate::pose_conversion::pose_to_se3;
 use crate::sparse_pgo::{Se3Manifold, sparse_pose_graph_optimize};
 use kornia_3d::camera::PinholeCamera;
@@ -346,26 +346,28 @@ fn loop_fusion_merges_consistent_duplicate_points() {
         &[[320.8, 240.0]],
         vec![descriptor],
     )));
-    let candidate_point = map.push_map_point(MapPoint::new(
-        Vec3F64::new(0.0, 0.0, 5.0),
-        descriptor,
-        0,
-        [0; 3],
-        0,
-    ));
-    let query_point = map.push_map_point(MapPoint::new(
-        Vec3F64::new(0.01, 0.0, 5.0),
-        descriptor,
-        0,
-        [0; 3],
-        10,
-    ));
-    map.get_keyframe_mut(0)
-        .unwrap()
-        .associate_map_point(0, candidate_point);
-    map.get_keyframe_mut(10)
-        .unwrap()
-        .associate_map_point(0, query_point);
+    // Seeded through the canonical API so each association has a matching
+    // observation record; merge redirects records, not bare slots.
+    let candidate_point = map
+        .insert_landmark(LandmarkSeed {
+            position: Vec3F64::new(0.0, 0.0, 5.0),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 0,
+                feature_idx: 0,
+            },
+        })
+        .unwrap();
+    let query_point = map
+        .insert_landmark(LandmarkSeed {
+            position: Vec3F64::new(0.01, 0.0, 5.0),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 10,
+                feature_idx: 0,
+            },
+        })
+        .unwrap();
 
     let stats = fuse_verified_loop(
         &mut map,

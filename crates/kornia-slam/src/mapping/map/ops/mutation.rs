@@ -287,52 +287,49 @@ impl Map {
             (first, second)
         };
 
+        // Deferred finalization: redirect every link, then retire the duplicate
+        // and refresh the survivor once. Going through `unlink_observation`
+        // per link would retire the duplicate the moment its last observation
+        // went, mid-way through a change that is not yet complete.
+        let replaced_observations: Vec<_> = self.map_points[replaced].observations().to_vec();
         let mut redirected_associations = 0;
-        for keyframe in &mut self.keyframes {
-            let survivor_slots: Vec<_> = keyframe
-                .map_point_by_desc_idx
-                .iter()
-                .enumerate()
-                .filter_map(|(slot, &point)| (point == Some(survivor)).then_some(slot))
-                .collect();
-            let replaced_slots: Vec<_> = keyframe
-                .map_point_by_desc_idx
-                .iter()
-                .enumerate()
-                .filter_map(|(slot, &point)| (point == Some(replaced)).then_some(slot))
-                .collect();
-
-            let mut keep_survivor = survivor_slots.first().copied();
-            if keep_survivor.is_none()
-                && let Some(&slot) = replaced_slots.first()
+        for observation in replaced_observations {
+            let key = observation.key;
+            // Clear the duplicate's feature either way.
+            if let Some(kf) = self.get_keyframe_mut(key.keyframe_idx)
+                && kf.map_point(key.feature_idx) == Some(replaced)
             {
-                keyframe.map_point_by_desc_idx[slot] = Some(survivor);
-                keep_survivor = Some(slot);
-                redirected_associations += 1;
+                kf.clear_map_point(key.feature_idx);
             }
-            for slot in survivor_slots.into_iter().chain(replaced_slots) {
-                if Some(slot) != keep_survivor {
-                    keyframe.map_point_by_desc_idx[slot] = None;
+            if self.map_points[survivor].is_observed_by(key.keyframe_idx) {
+                // The survivor already has a feature in this keyframe; keep it
+                // and its descriptor contribution.
+                continue;
+            }
+            self.link_unchecked(key, survivor, observation.descriptor);
+            redirected_associations += 1;
+        }
+
+        // Any remaining slot still pointing at the duplicate (a keyframe that
+        // held it without a matching record) is cleared too.
+        for keyframe in &mut self.keyframes {
+            for slot in 0..keyframe.map_point_by_desc_idx.len() {
+                if keyframe.map_point(slot) == Some(replaced) {
+                    keyframe.clear_map_point(slot);
                 }
             }
         }
 
-        let replaced_observations: Vec<_> = self.map_points[replaced].observations().to_vec();
         let replaced_visible = self.map_points[replaced].n_visible;
         let replaced_found = self.map_points[replaced].n_found;
-        // `add_observation` is a no-op where the survivor already observes that
-        // keyframe, so its own feature and descriptor contribution are kept.
-        for observation in replaced_observations {
-            self.map_points[survivor].add_observation(observation.key, observation.descriptor);
-        }
         self.map_points[survivor].n_visible = self.map_points[survivor]
             .n_visible
             .saturating_add(replaced_visible);
         self.map_points[survivor].n_found = self.map_points[survivor]
             .n_found
             .saturating_add(replaced_found);
-        self.map_points[replaced].mark_culled();
-        self.update_map_point_geometry(survivor, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+        self.retire_landmark(replaced);
+        self.refresh_landmark(survivor);
 
         Some(MapPointMergeResult {
             survivor,
@@ -1515,5 +1512,81 @@ mod tests {
             gyro_bias_noise: 1.0e-5,
             accel_bias_noise: 1.0e-3,
         }
+    }
+
+    #[test]
+    fn merge_redirects_disjoint_observers_and_keeps_counters() {
+        let mut map = Map::new();
+        for idx in 0..2 {
+            map.insert_keyframe(detached(idx, 2)).unwrap();
+        }
+        let survivor = map.insert_landmark(seed(0, 0, 5.0)).unwrap();
+        let duplicate = map.insert_landmark(seed(1, 0, 5.01)).unwrap();
+        map.map_points_mut()[survivor].n_visible = 7;
+        map.map_points_mut()[survivor].n_found = 5;
+        map.map_points_mut()[duplicate].n_visible = 4;
+        map.map_points_mut()[duplicate].n_found = 3;
+
+        let result = map.merge_map_points(survivor, duplicate).unwrap();
+
+        assert_eq!(result.survivor, survivor);
+        assert_eq!(result.redirected_associations, 1);
+        assert_eq!(map.map_points()[survivor].n_visible, 11);
+        assert_eq!(map.map_points()[survivor].n_found, 8);
+        assert!(map.map_points()[duplicate].culled);
+        // The duplicate's observer now points at the survivor, on the same
+        // feature, with a matching record.
+        assert_eq!(map.get_keyframe(1).unwrap().map_point(0), Some(survivor));
+        assert!(map.map_points()[survivor].is_observed_by(1));
+        assert_map_consistent(&map);
+    }
+
+    /// Both landmarks seen in one keyframe through different features: the
+    /// survivor keeps its own feature, the duplicate's is released.
+    #[test]
+    fn merge_keeps_the_survivors_feature_in_a_shared_keyframe() {
+        let mut map = Map::new();
+        map.insert_keyframe(detached(0, 2)).unwrap();
+        let survivor = map.insert_landmark(seed(0, 0, 5.0)).unwrap();
+        let duplicate = map.insert_landmark(seed(0, 1, 5.01)).unwrap();
+        let survivor_descriptor = map.map_points()[survivor].descriptor;
+
+        map.merge_map_points(survivor, duplicate).unwrap();
+
+        assert_eq!(map.get_keyframe(0).unwrap().map_point(0), Some(survivor));
+        assert_eq!(map.get_keyframe(0).unwrap().map_point(1), None);
+        assert_eq!(map.map_points()[survivor].observations().len(), 1);
+        assert_eq!(
+            map.map_points()[survivor].observations()[0].key.feature_idx,
+            0
+        );
+        assert_eq!(
+            map.map_points()[survivor].descriptor,
+            survivor_descriptor,
+            "kept its retained feature's contribution"
+        );
+        assert_map_consistent(&map);
+    }
+
+    /// The weaker landmark is the one retired, and the reference follows the
+    /// survivor's remaining observations.
+    #[test]
+    fn merge_picks_the_better_supported_survivor() {
+        let mut map = Map::new();
+        for idx in 0..3 {
+            map.insert_keyframe(detached(idx, 2)).unwrap();
+        }
+        let weak = map.insert_landmark(seed(0, 0, 5.0)).unwrap();
+        let strong = map.insert_landmark(seed(1, 0, 5.01)).unwrap();
+        map.link_observation(2, 0, strong).unwrap();
+
+        // Named weakest-first; support decides, not argument order.
+        let result = map.merge_map_points(weak, strong).unwrap();
+
+        assert_eq!(result.survivor, strong);
+        assert_eq!(result.replaced, weak);
+        assert!(map.map_points()[weak].culled);
+        assert_eq!(map.map_points()[strong].observations().len(), 3);
+        assert_map_consistent(&map);
     }
 }
