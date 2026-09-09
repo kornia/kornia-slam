@@ -125,7 +125,8 @@ mod tests {
     fn map_with_edges() -> Map {
         let mut map = Map::new();
         for idx in [9usize, 10, 11, 12] {
-            map.upsert_keyframe(Keyframe::from_frame(frame(idx)));
+            map.insert_keyframe(Keyframe::from_frame(frame(idx)))
+                .unwrap();
         }
         edge(&mut map, 9, 10, 0.5);
         edge(&mut map, 10, 11, 0.25);
@@ -155,7 +156,8 @@ mod tests {
         edge(&mut map, 12, 13, 0.0);
         edge(&mut map, 13, 14, f64::NAN);
         for idx in [13usize, 14] {
-            map.upsert_keyframe(Keyframe::from_frame(frame(idx)));
+            map.insert_keyframe(Keyframe::from_frame(frame(idx)))
+                .unwrap();
         }
         let window = InitWindow::select(&map, 10);
 
@@ -172,7 +174,8 @@ mod tests {
         let mut map = Map::new();
         // Inserted out of frame-index order on purpose.
         for idx in [12usize, 10, 11] {
-            map.upsert_keyframe(Keyframe::from_frame(frame(idx)));
+            map.insert_keyframe(Keyframe::from_frame(frame(idx)))
+                .unwrap();
         }
         let window = InitWindow::select(&map, 10);
 

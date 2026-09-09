@@ -11,7 +11,6 @@ use inertial::InertialState;
 pub use crate::loop_closure::LoopClosureEvent;
 pub use config::{LoopClosingConfig, SlamConfig};
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::Frame;
@@ -618,14 +617,13 @@ impl SlamSystem {
         // The two-view result can name one feature twice — two triangulated
         // points landing on the same keypoint in either view. The old
         // last-wins insertion hid that; a validated batch would refuse the
-        // whole bootstrap over it, so resolve it here: first proposal keeps
-        // the feature, later ones are dropped.
-        let mut claimed_current: HashSet<usize> = HashSet::new();
-        let mut claimed_reference: HashSet<usize> = HashSet::new();
-        for (position, _descriptor, color, ref_desc_idx, curr_desc_idx) in &triangulated {
-            if !claimed_current.insert(*curr_desc_idx) || !claimed_reference.insert(*ref_desc_idx) {
-                continue;
-            }
+        // whole bootstrap over it, so resolve it first.
+        let claims: Vec<(usize, usize)> = triangulated
+            .iter()
+            .map(|&(_, _, _, ref_desc_idx, curr_desc_idx)| (ref_desc_idx, curr_desc_idx))
+            .collect();
+        for index in crate::mapping::growth::accepted_pair_claims(&claims) {
+            let (position, _descriptor, color, ref_desc_idx, curr_desc_idx) = &triangulated[index];
             let new_index = request.landmarks.len();
             request.landmarks.push(LandmarkSeed {
                 position: *position,
@@ -918,17 +916,16 @@ impl SlamSystem {
         // tracking already owns.
         let mut claimed: Vec<Option<usize>> = vec![None; frame.features.descriptors.len()];
         let mut core = MapInsertion::default();
-        // One feature per landmark and one landmark per feature, both resolved
-        // here: a repeat would otherwise refuse the whole keyframe.
-        let mut claimed_landmarks: HashSet<usize> = HashSet::new();
-        for &(mp_idx, curr_idx) in matches {
-            if claimed.get(curr_idx).copied().flatten().is_some()
-                || !claimed_landmarks.insert(mp_idx)
-            {
-                continue;
-            }
+        // One feature per landmark and one landmark per feature; a repeat would
+        // otherwise refuse the whole keyframe. Same resolution as the bootstrap
+        // pair, so it uses the same helper.
+        let tracked_claims: Vec<(usize, usize)> = matches.to_vec();
+        for index in crate::mapping::growth::accepted_pair_claims(&tracked_claims) {
+            let (mp_idx, curr_idx) = matches[index];
             if let Some(slot) = claimed.get_mut(curr_idx) {
                 *slot = Some(mp_idx);
+            } else {
+                continue;
             }
             core.observations.push(ObservationLink {
                 observation: ObservationKey {
@@ -1269,8 +1266,8 @@ mod tests {
         let mut system = SlamSystem::new(camera, SlamConfig::default());
         {
             let mut map = system.map.lock().unwrap();
-            map.upsert_keyframe(empty_keyframe(20));
-            map.upsert_keyframe(empty_keyframe(10));
+            map.insert_keyframe(empty_keyframe(20)).unwrap();
+            map.insert_keyframe(empty_keyframe(10)).unwrap();
         }
         let velocity_10 = Vec3F64::new(1.0, 2.0, 3.0);
         let velocity_20 = Vec3F64::new(4.0, 5.0, 6.0);
@@ -1410,7 +1407,8 @@ mod tests {
                 .map
                 .lock()
                 .unwrap()
-                .upsert_keyframe(empty_keyframe(idx));
+                .insert_keyframe(empty_keyframe(idx))
+                .unwrap();
         }
         system.tracker.state.mode = crate::tracking::SystemMode::Tracking;
         system.tracker.state.last_frame_timestamp_sec = 1.0;

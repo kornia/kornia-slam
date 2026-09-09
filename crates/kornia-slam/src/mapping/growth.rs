@@ -381,6 +381,32 @@ pub fn neighbor_fusion_links(
     links
 }
 
+/// Which of `candidates`, given as `(reference feature, current feature)`, can
+/// be published together.
+///
+/// A feature may hold at most one landmark in each view, so a candidate naming
+/// a feature an earlier one took is dropped. Returns the accepted indices in
+/// input order — first claim wins, matching the order the triangulator emits.
+///
+/// A rejected candidate must not reserve anything: reserving its *other*
+/// feature would knock out a later candidate that was perfectly publishable.
+pub fn accepted_pair_claims(candidates: &[(usize, usize)]) -> Vec<usize> {
+    let mut claimed_reference: HashSet<usize> = HashSet::new();
+    let mut claimed_current: HashSet<usize> = HashSet::new();
+    let mut accepted = Vec::new();
+    for (index, &(reference_feature, current_feature)) in candidates.iter().enumerate() {
+        if claimed_reference.contains(&reference_feature)
+            || claimed_current.contains(&current_feature)
+        {
+            continue;
+        }
+        claimed_reference.insert(reference_feature);
+        claimed_current.insert(current_feature);
+        accepted.push(index);
+    }
+    accepted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,5 +592,32 @@ mod tests {
         assert_eq!(links[0].landmark, LandmarkTarget::Existing(best));
         assert_eq!(links[0].observation.feature_idx, 0);
         assert_ne!(links[0].landmark, LandmarkTarget::Existing(worse));
+    }
+
+    /// A rejected candidate must reserve nothing. `(0, 1)` is refused because
+    /// reference 0 is taken; if it still reserved current 1, the publishable
+    /// `(1, 1)` would be lost with it — enough dropped support to fail the
+    /// bootstrap acceptance threshold.
+    #[test]
+    fn a_rejected_candidate_does_not_reserve_its_other_feature() {
+        assert_eq!(
+            accepted_pair_claims(&[(0, 0), (0, 1), (1, 1)]),
+            vec![0, 2],
+            "the third candidate is publishable and must survive"
+        );
+    }
+
+    #[test]
+    fn first_claim_wins_in_either_view() {
+        // Repeated current feature.
+        assert_eq!(accepted_pair_claims(&[(0, 0), (1, 0)]), vec![0]);
+        // Repeated reference feature.
+        assert_eq!(accepted_pair_claims(&[(0, 0), (0, 1)]), vec![0]);
+        // Disjoint in both views.
+        assert_eq!(
+            accepted_pair_claims(&[(0, 0), (1, 1), (2, 2)]),
+            vec![0, 1, 2]
+        );
+        assert!(accepted_pair_claims(&[]).is_empty());
     }
 }

@@ -1147,7 +1147,7 @@ mod tests {
             ),
         ));
         map.register_observation(mp_idx, &kf1, 0);
-        map.upsert_keyframe(kf1);
+        map.insert_keyframe(kf1).unwrap();
         map.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
 
         let n = map.map_points()[mp_idx].mean_viewing_direction;

@@ -163,7 +163,8 @@ fn synth_map_with_calib(s_true: f64, r_arb: Mat3F64, calib: ImuCalib, omega: f64
         let t = k as f64 * kf_dt;
         let (p_true, _, _, r_wb_true) = circular_trajectory(t, omega);
         let pose = synth_pose_world_to_cam(r_arb, s_true, p_true, r_wb_true);
-        map.upsert_keyframe(Keyframe::from_frame(synth_frame(k, pose)));
+        map.insert_keyframe(Keyframe::from_frame(synth_frame(k, pose)))
+            .unwrap();
         if k > 0 {
             let pim = integrate_true_imu(
                 t - kf_dt,
@@ -217,7 +218,8 @@ fn readiness_reports_the_gate_that_is_short() {
     );
 
     let mut map = Map::new();
-    map.upsert_keyframe(Keyframe::from_frame(synth_frame(0, Pose3d::IDENTITY)));
+    map.insert_keyframe(Keyframe::from_frame(synth_frame(0, Pose3d::IDENTITY)))
+        .unwrap();
     let not_ready = initializer.readiness(&map, Some(0)).unwrap_err();
     assert_eq!(not_ready.reason, ImuInitNotReadyReason::Keyframes);
     assert_eq!(not_ready.keyframes, 1);
@@ -302,7 +304,8 @@ fn insufficient_keyframes_reports_found_and_required_counts() {
         ..ImuInitConfig::default()
     });
     let mut map = Map::new();
-    map.upsert_keyframe(Keyframe::from_frame(synth_frame(7, Pose3d::IDENTITY)));
+    map.insert_keyframe(Keyframe::from_frame(synth_frame(7, Pose3d::IDENTITY)))
+        .unwrap();
 
     let result = initializer.try_initialize(
         &map,
@@ -488,7 +491,8 @@ fn recovers_scale_bias_gravity_from_synthetic_trajectory() {
         let t = k as f64 * kf_dt;
         let (p_true, _, _, r_wb_true) = circular_trajectory(t, OMEGA);
         let pose = synth_pose_world_to_cam(r_arb, s_true, p_true, r_wb_true);
-        map.upsert_keyframe(Keyframe::from_frame(synth_frame(k, pose)));
+        map.insert_keyframe(Keyframe::from_frame(synth_frame(k, pose)))
+            .unwrap();
 
         if k > 0 {
             let pim = integrate_true_imu(

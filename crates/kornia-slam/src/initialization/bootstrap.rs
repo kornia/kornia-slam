@@ -221,11 +221,12 @@ mod tests {
         let mut map = bootstrap_map(60);
         // A third keyframe arrives with no associations. Evaluating the last two
         // would now see zero points; naming the pair keeps the verdict stable.
-        map.upsert_keyframe(Keyframe::from_frame(frame(
+        map.insert_keyframe(Keyframe::from_frame(frame(
             2,
             0,
             Vec3F64::new(-0.2, 0.0, 0.0),
-        )));
+        )))
+        .unwrap();
         assert!(matches!(
             evaluate_bootstrap(&map, 0, 1),
             BootstrapOutcome::Accepted(_)

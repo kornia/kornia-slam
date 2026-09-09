@@ -361,7 +361,7 @@ pub(crate) mod tests {
         carry_klt_survivors(&mut tracks, None);
         assert!(tracks.is_empty());
     }
-    use crate::map::{Keyframe, MapPoint};
+    use crate::map::{Keyframe, LandmarkSeed, ObservationKey};
     use kornia_algebra::{Mat3F64, SO3F64};
     use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbFeatures;
@@ -440,13 +440,22 @@ pub(crate) mod tests {
             }
         };
         let current = make_frame(8, pose);
-        let mut reference = Keyframe::from_frame(make_frame(0, Pose3d::IDENTITY));
         let mut map = Map::new();
+        // The keyframe goes in empty, then each landmark is seeded on its own
+        // feature: insertion refuses a keyframe that arrives already associated.
+        map.insert_keyframe(Keyframe::from_frame(make_frame(0, Pose3d::IDENTITY)))
+            .unwrap();
         for (idx, point) in points.into_iter().enumerate() {
-            let mp = map.push_map_point(MapPoint::new(point, [idx as u8; 32], 0, [0; 3], 0));
-            reference.associate_map_point(idx, mp);
+            map.insert_landmark(LandmarkSeed {
+                position: point,
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx: idx,
+                },
+            })
+            .unwrap();
         }
-        map.upsert_keyframe(reference);
         (map, current, camera)
     }
 

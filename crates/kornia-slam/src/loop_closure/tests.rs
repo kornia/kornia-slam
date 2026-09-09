@@ -104,8 +104,8 @@ fn synthetic_loop_map() -> (Map, Pose3d) {
         descriptors.clone(),
     ));
     let query = Keyframe::from_frame(frame(10, query_pose, &query_pixels, descriptors.clone()));
-    map.upsert_keyframe(candidate);
-    map.upsert_keyframe(query);
+    map.insert_keyframe(candidate).unwrap();
+    map.insert_keyframe(query).unwrap();
     for (index, point) in world.into_iter().enumerate() {
         map.insert_landmark(LandmarkSeed {
             position: point,
@@ -296,18 +296,20 @@ fn sparse_se3_pgo_matches_dense_on_rotated_drifting_loop() {
 fn loop_fusion_attaches_a_point_to_an_unassociated_loop_keypoint() {
     let mut map = Map::new();
     let descriptor = [7; 32];
-    map.upsert_keyframe(Keyframe::from_frame(frame(
+    map.insert_keyframe(Keyframe::from_frame(frame(
         0,
         Pose3d::IDENTITY,
         &[[320.0, 240.0]],
         vec![descriptor],
-    )));
-    map.upsert_keyframe(Keyframe::from_frame(frame(
+    )))
+    .unwrap();
+    map.insert_keyframe(Keyframe::from_frame(frame(
         10,
         Pose3d::IDENTITY,
         &[[320.0, 240.0]],
         vec![descriptor],
-    )));
+    )))
+    .unwrap();
     let point = map
         .insert_landmark(LandmarkSeed {
             position: Vec3F64::new(0.0, 0.0, 5.0),
@@ -339,18 +341,20 @@ fn loop_fusion_attaches_a_point_to_an_unassociated_loop_keypoint() {
 fn loop_fusion_merges_consistent_duplicate_points() {
     let mut map = Map::new();
     let descriptor = [9; 32];
-    map.upsert_keyframe(Keyframe::from_frame(frame(
+    map.insert_keyframe(Keyframe::from_frame(frame(
         0,
         Pose3d::IDENTITY,
         &[[320.0, 240.0]],
         vec![descriptor],
-    )));
-    map.upsert_keyframe(Keyframe::from_frame(frame(
+    )))
+    .unwrap();
+    map.insert_keyframe(Keyframe::from_frame(frame(
         10,
         Pose3d::IDENTITY,
         &[[320.8, 240.0]],
         vec![descriptor],
-    )));
+    )))
+    .unwrap();
     // Seeded through the canonical API so each association has a matching
     // observation record; merge redirects records, not bare slots.
     let candidate_point = map
@@ -397,18 +401,20 @@ fn loop_fusion_merges_consistent_duplicate_points() {
 #[test]
 fn loop_fusion_rejects_descriptor_mismatch() {
     let mut map = Map::new();
-    map.upsert_keyframe(Keyframe::from_frame(frame(
+    map.insert_keyframe(Keyframe::from_frame(frame(
         0,
         Pose3d::IDENTITY,
         &[[320.0, 240.0]],
         vec![[0; 32]],
-    )));
-    map.upsert_keyframe(Keyframe::from_frame(frame(
+    )))
+    .unwrap();
+    map.insert_keyframe(Keyframe::from_frame(frame(
         10,
         Pose3d::IDENTITY,
         &[[320.0, 240.0]],
         vec![[u8::MAX; 32]],
-    )));
+    )))
+    .unwrap();
     map.insert_landmark(LandmarkSeed {
         position: Vec3F64::new(0.0, 0.0, 5.0),
         color: [0; 3],
@@ -437,18 +443,20 @@ fn loop_fusion_rejects_descriptor_mismatch() {
 fn loop_fusion_rejects_duplicate_with_inconsistent_reciprocal_projection() {
     let mut map = Map::new();
     let descriptor = [5; 32];
-    map.upsert_keyframe(Keyframe::from_frame(frame(
+    map.insert_keyframe(Keyframe::from_frame(frame(
         0,
         Pose3d::IDENTITY,
         &[[320.0, 240.0]],
         vec![descriptor],
-    )));
-    map.upsert_keyframe(Keyframe::from_frame(frame(
+    )))
+    .unwrap();
+    map.insert_keyframe(Keyframe::from_frame(frame(
         10,
         Pose3d::IDENTITY,
         &[[320.0, 240.0]],
         vec![descriptor],
-    )));
+    )))
+    .unwrap();
     let source_point = map
         .insert_landmark(LandmarkSeed {
             position: Vec3F64::new(0.0, 0.0, 5.0),
@@ -490,7 +498,8 @@ fn pgo_reduces_terminal_loop_gap_without_moving_anchor() {
     let mut map = Map::new();
     for index in 0..5 {
         let pose = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(-(index as f64), 0.0, 0.0));
-        map.upsert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())));
+        map.insert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())))
+            .unwrap();
     }
     let verified = VerifiedLoopEdge {
         query_kf_idx: 4,
@@ -523,7 +532,8 @@ fn inertial_pgo_uses_four_dof_and_preserves_gravity() {
         let rotation = tilt * yaw_world;
         let center = Vec3F64::new(index as f64, index as f64 * 0.05, 0.0);
         let pose = Pose3d::new(rotation, -(rotation * center));
-        map.upsert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())));
+        map.insert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())))
+            .unwrap();
     }
     let verified = VerifiedLoopEdge {
         query_kf_idx: 4,
