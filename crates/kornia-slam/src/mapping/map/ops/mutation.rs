@@ -854,7 +854,14 @@ impl Map {
         }
     }
 
+    /// One finalization pass for a landmark whose records changed: the
+    /// representative descriptor, then the geometry derived from its
+    /// observers. Batches call this once per dirty landmark rather than per
+    /// link, so the O(n^2) descriptor selection does not repeat.
     fn refresh_landmark(&mut self, landmark_idx: usize) {
+        if let Some(mp) = self.map_points.get_mut(landmark_idx) {
+            mp.finalize_descriptor();
+        }
         self.update_map_point_geometry(landmark_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
     }
 }

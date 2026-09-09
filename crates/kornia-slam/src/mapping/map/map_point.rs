@@ -102,8 +102,7 @@ impl MapPoint {
     }
 
     /// Drops the link from `keyframe_idx`, returning the removed record.
-    // Exercised by tests today; `Map::unlink_observation` builds on it.
-    #[allow(dead_code)]
+    /// Like [`MapPoint::add_observation`], leaves finalization to the caller.
     pub(crate) fn remove_observation(
         &mut self,
         keyframe_idx: usize,
@@ -112,9 +111,12 @@ impl MapPoint {
             .observations
             .iter()
             .position(|o| o.key.keyframe_idx == keyframe_idx)?;
-        let removed = self.observations.remove(at);
+        Some(self.observations.remove(at))
+    }
+
+    /// Re-selects the representative descriptor from the current records.
+    pub(crate) fn finalize_descriptor(&mut self) {
         self.recompute_representative_descriptor();
-        Some(removed)
     }
 
     pub(crate) fn clear_observations(&mut self) {
@@ -263,6 +265,7 @@ mod tests {
         let mut mp = point();
         assert!(mp.add_observation(key(0, 0), [1u8; 32]));
         assert!(!mp.add_observation(key(0, 7), [9u8; 32]));
+        mp.finalize_descriptor();
         assert_eq!(mp.observations().len(), 1);
         assert_eq!(mp.observations()[0].key, key(0, 0));
         assert!(mp.is_observed_by(0));
@@ -289,9 +292,13 @@ mod tests {
         mp.add_observation(key(1, 0), d4);
         mp.add_observation(key(2, 0), d8);
         mp.add_observation(key(3, 0), d12);
+        // Records and finalization are separate now: the representative is
+        // stale until asked for, so a batch pays for one selection, not four.
+        mp.finalize_descriptor();
         assert_eq!(mp.descriptor, d4);
 
         let removed = mp.remove_observation(1).expect("link exists");
+        mp.finalize_descriptor();
         assert_eq!(removed.descriptor, d4);
         assert_eq!(mp.observations().len(), 3);
         assert!(!mp.is_observed_by(1));

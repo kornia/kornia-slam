@@ -841,14 +841,24 @@ mod tests {
     #[test]
     fn merging_an_older_snapshot_does_not_resurrect_a_retired_landmark() {
         let (mut map, point) = snapshot_fixture();
-        let snapshot = map.local_ba_snapshot();
+        let mut snapshot = map.local_ba_snapshot();
+        // The solver must actually have moved this landmark: writeback skips
+        // unchanged positions, so an untouched snapshot would never reach the
+        // retirement guard and the test would pass without exercising it.
+        snapshot.optimized.map_points[point].position.x += 1.0;
 
         assert!(map.remove_landmark(point).unwrap());
-        map.merge_local_ba_snapshot(snapshot);
+        let merged = map
+            .merge_local_ba_snapshot(snapshot)
+            .expect("the snapshot is still in the live world frame");
 
         assert!(map.map_points()[point].culled, "still retired");
         assert!(map.map_points()[point].observations().is_empty());
         assert_eq!(map.get_keyframe(0).unwrap().map_point(0), None);
+        assert_eq!(
+            merged.map_points_updated, 0,
+            "a retired landmark is not written back"
+        );
     }
 
     /// Entities added while BA was running must survive the writeback.
@@ -866,7 +876,17 @@ mod tests {
             .expect("valid batch");
         let newer = result.landmark_ids[0];
 
-        map.merge_local_ba_snapshot(snapshot);
+        // Move an older entity so the merge has real work to publish; a no-op
+        // writeback would satisfy the survival assertions vacuously.
+        let mut snapshot = snapshot;
+        snapshot.optimized.map_points[0].position.x += 0.5;
+        let merged = map
+            .merge_local_ba_snapshot(snapshot)
+            .expect("the snapshot is still in the live world frame");
+        assert_eq!(
+            merged.map_points_updated, 1,
+            "the older landmark was actually written back"
+        );
 
         assert!(map.get_keyframe(1).is_some(), "newer keyframe survived");
         assert!(!map.map_points()[newer].culled, "newer landmark survived");
