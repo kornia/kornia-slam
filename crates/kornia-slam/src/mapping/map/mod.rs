@@ -10,7 +10,6 @@
 //! | `mutation` | `insert_keyframe`, `insert_landmark`, `link_observation`, `apply_insertion`, `merge_map_points` |
 //! | `correction` | `apply_pose_graph_correction`, `apply_inertial_alignment`, `scale_world` |
 //! | `queries` | `covisible_keyframes` — raw weights; thresholds belong to consumers |
-//! | `growth` | `add_close_stereo_points`, `grow_map_points_from_keyframe_pair`, `fuse_into_neighbors` |
 //! | `bundle_adjustment` | `local_ba_snapshot`, `merge_local_ba_snapshot`, `run_local_ba` |
 //!
 //! ## Invariants
@@ -58,7 +57,7 @@ pub use ops::covisible_above_weight;
 pub use ops::{
     InertialAlignment, InertialAlignmentError, KeyframeBaCorrection, KeyframeVelocity,
     LocalBaMergeResult, LocalBaSnapshot, MapPointMergeResult, PoseGraphCorrectionError,
-    PoseGraphCorrectionResult, STEREO_DEPTH_MIN_SIGMA, STEREO_DEPTH_REL_SIGMA, TriangulatedPoint,
+    PoseGraphCorrectionResult, STEREO_DEPTH_MIN_SIGMA, STEREO_DEPTH_REL_SIGMA,
 };
 pub use ops::{
     InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError, ObservationLink,

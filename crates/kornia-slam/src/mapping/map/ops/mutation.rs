@@ -10,9 +10,6 @@ use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::{ImuMeasurement, PreintegratedImu};
 use std::collections::HashSet;
 
-/// A triangulated point ready for map insertion: (position, descriptor, color, prev_desc_idx, curr_desc_idx).
-pub type TriangulatedPoint = (Vec3F64, [u8; 32], [u8; 3], usize, usize);
-
 /// Result of replacing a duplicate landmark with a surviving landmark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MapPointMergeResult {
@@ -79,66 +76,6 @@ impl Map {
     /// geometry (matches ORB-SLAM3, which creates points referenced to the
     /// newer keyframe). If `prev_kf` is provided, its observation is also
     /// recorded. Mean viewing direction and scale-invariance bounds are
-    /// computed for every new point.
-    pub fn add_triangulated_points(
-        &mut self,
-        prev_kf: Option<&mut Keyframe>,
-        curr_kf: &mut Keyframe,
-        points: &[TriangulatedPoint],
-    ) -> usize {
-        let first_mp_idx = self.map_points.len();
-        let curr_kf_idx = curr_kf.frame.idx;
-        for &(position, descriptor, color, _, curr_desc_idx) in points.iter() {
-            let octave = curr_kf
-                .frame
-                .features
-                .octaves
-                .get(curr_desc_idx)
-                .copied()
-                .unwrap_or(0);
-            let desc = curr_kf
-                .frame
-                .features
-                .descriptors
-                .get(curr_desc_idx)
-                .copied()
-                .unwrap_or(descriptor);
-            let mp_idx =
-                self.push_map_point(MapPoint::new(position, desc, octave, color, curr_kf_idx));
-            self.map_points[mp_idx].add_observation(
-                ObservationKey {
-                    keyframe_idx: curr_kf_idx,
-                    feature_idx: curr_desc_idx,
-                },
-                desc,
-            );
-            curr_kf.associate_map_point(curr_desc_idx, mp_idx);
-        }
-        if let Some(prev) = prev_kf {
-            let prev_kf_idx = prev.frame.idx;
-            for (i, &(_, _, _, prev_desc_idx, _)) in points.iter().enumerate() {
-                prev.associate_map_point(prev_desc_idx, first_mp_idx + i);
-                // Feed the prev KF's descriptor as a second observation so the
-                // representative descriptor is computed from both viewpoints.
-                if let Some(&prev_desc) = prev.frame.features.descriptors.get(prev_desc_idx)
-                    && let Some(mp) = self.map_points.get_mut(first_mp_idx + i)
-                {
-                    mp.add_observation(
-                        ObservationKey {
-                            keyframe_idx: prev_kf_idx,
-                            feature_idx: prev_desc_idx,
-                        },
-                        prev_desc,
-                    );
-                }
-            }
-        }
-        for i in 0..points.len() {
-            self.update_map_point_geometry(first_mp_idx + i, ORB_SCALE_FACTOR, ORB_N_LEVELS);
-        }
-        points.len()
-    }
-
     /// Records that an existing map point was observed at `desc_idx` in
     /// `keyframe`, pushing the descriptor into the map point's observation
     /// list, refreshing the representative descriptor, and recomputing the

@@ -2,7 +2,6 @@
 
 mod bundle_adjustment;
 mod correction;
-mod growth;
 mod mutation;
 mod queries;
 
@@ -16,6 +15,6 @@ pub use correction::{
 };
 pub use mutation::{
     InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError,
-    MapPointMergeResult, ObservationLink, TriangulatedPoint,
+    MapPointMergeResult, ObservationLink,
 };
 pub use queries::covisible_above_weight;

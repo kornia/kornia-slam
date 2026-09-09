@@ -20,7 +20,8 @@ use crate::initialization::{
 };
 use crate::loop_closure::{InertialPgoContext, LoopCloser, LoopClosingContext, LoopClosingOutcome};
 use crate::map::{
-    InertialAlignment, InertialAlignmentError, Keyframe, KeyframeJob, LocalMapping, Map, MapPoint,
+    ImuFactor, InertialAlignment, InertialAlignmentError, Keyframe, KeyframeJob, LandmarkSeed,
+    LandmarkTarget, LocalMapping, Map, MapInsertion, MapPoint, ObservationKey, ObservationLink,
 };
 use crate::place_recognition::Vocabulary;
 use crate::pose_conversion::rotation_from_to;
@@ -295,28 +296,45 @@ impl SlamSystem {
         }
 
         let pose_inv = curr_frame.pose_world_to_cam.inverse();
-        let mut keyframe = Keyframe::from_frame(curr_frame);
+        let keyframe = Keyframe::from_frame(curr_frame);
         let curr_idx = keyframe.frame.idx;
 
-        let mut points = Vec::with_capacity(cam_points.len());
-        for (desc_idx, p_cam) in &cam_points {
-            let p_world = pose_inv.transform_point(p_cam);
-            let descriptor = keyframe.frame.features.descriptors[*desc_idx];
-            let color = keyframe
-                .frame
-                .keypoint_colors
-                .get(*desc_idx)
-                .copied()
-                .unwrap_or([128; 3]);
-            points.push((p_world, descriptor, color, *desc_idx, *desc_idx));
-        }
+        let landmarks: Vec<LandmarkSeed> = cam_points
+            .iter()
+            .map(|(desc_idx, p_cam)| LandmarkSeed {
+                position: pose_inv.transform_point(p_cam),
+                color: keyframe
+                    .frame
+                    .keypoint_colors
+                    .get(*desc_idx)
+                    .copied()
+                    .unwrap_or([128; 3]),
+                reference: ObservationKey {
+                    keyframe_idx: curr_idx,
+                    feature_idx: *desc_idx,
+                },
+            })
+            .collect();
 
-        let added = self
-            .map
-            .lock()
-            .unwrap()
-            .add_triangulated_points(None, &mut keyframe, &points);
-        self.map.lock().unwrap().upsert_keyframe(keyframe);
+        // The keyframe and its seeds are published together; tracker state is
+        // adopted below only once that succeeded.
+        let published = self.map.lock().unwrap().apply_insertion(MapInsertion {
+            keyframes: vec![keyframe],
+            landmarks,
+            ..Default::default()
+        });
+        let added = match published {
+            Ok(result) => result.landmark_ids.len(),
+            Err(error) => {
+                self.dbg(format!(
+                    "[bootstrap_stereo] frame={curr_idx} publication rejected: {error}"
+                ));
+                return TrackingResult {
+                    pose_world_to_cam: self.tracker.state.pose_world_to_cam,
+                    status: TrackingStatus::Skipped,
+                };
+            }
+        };
 
         self.dbg(format!(
             "[bootstrap_stereo] frame={curr_idx} metric map created with {added} points",
@@ -516,8 +534,8 @@ impl SlamSystem {
 
     fn build_initial_map(
         &mut self,
-        mut reference_kf: Keyframe,
-        mut current_kf: Keyframe,
+        reference_kf: Keyframe,
+        current_kf: Keyframe,
         matches: &[(usize, usize)],
         points3d: &[Vec3F64],
         inlier_indices: &[usize],
@@ -563,16 +581,44 @@ impl SlamSystem {
             triangulated.push((p_world, descriptor, color, ref_desc_idx, curr_desc_idx));
         }
 
-        let added = self.map.lock().unwrap().add_triangulated_points(
-            Some(&mut reference_kf),
-            &mut current_kf,
-            &triangulated,
-        );
-
         let reference_kf_idx = reference_kf.frame.idx;
         let current_kf_idx = current_kf.frame.idx;
-        self.map.lock().unwrap().upsert_keyframe(reference_kf);
-        self.map.lock().unwrap().upsert_keyframe(current_kf);
+
+        // Both keyframes, the triangulated landmarks and their second observers
+        // publish as one batch: the reference keyframe it points at arrives in
+        // the same request.
+        let mut request = MapInsertion {
+            keyframes: vec![reference_kf, current_kf],
+            ..Default::default()
+        };
+        for (position, _descriptor, color, ref_desc_idx, curr_desc_idx) in &triangulated {
+            let new_index = request.landmarks.len();
+            request.landmarks.push(LandmarkSeed {
+                position: *position,
+                color: *color,
+                reference: ObservationKey {
+                    keyframe_idx: current_kf_idx,
+                    feature_idx: *curr_desc_idx,
+                },
+            });
+            request.observations.push(ObservationLink {
+                observation: ObservationKey {
+                    keyframe_idx: reference_kf_idx,
+                    feature_idx: *ref_desc_idx,
+                },
+                landmark: LandmarkTarget::New(new_index),
+            });
+        }
+        let published = self.map.lock().unwrap().apply_insertion(request);
+        let added = match published {
+            Ok(result) => result.landmark_ids.len(),
+            Err(error) => {
+                self.dbg(format!(
+                    "[bootstrap] frame={current_kf_idx} publication rejected: {error}"
+                ));
+                return 0;
+            }
+        };
 
         self.map.lock().unwrap().run_initial_ba(&self.rig.camera);
 
@@ -815,38 +861,14 @@ impl SlamSystem {
             curr_kf.velocity_world = self.tracker.state.velocity_world;
             curr_kf.imu_bias = self.inertial.bias;
         }
-        for &(mp_idx, curr_idx) in matches {
-            curr_kf.associate_map_point(curr_idx, mp_idx);
-            self.map
-                .lock()
-                .unwrap()
-                .register_observation(mp_idx, &curr_kf, curr_idx);
-        }
 
-        // Stereo densification: back-project this keyframe's unassociated
-        // "close" stereo keypoints directly into metric map points. Mirrors
-        // ORB-SLAM3's CreateNewKeyFrame, which seeds close points from stereo
-        // and leaves far points to multi-view triangulation (the grow pass).
-        if let Some(mthdepth) = self.stereo_close_depth
-            && curr_kf.frame.is_stereo()
-        {
-            let n_close = self.map.lock().unwrap().add_close_stereo_points(
-                &mut curr_kf,
-                mthdepth,
-                &self.rig.camera,
-            );
-            self.dbg(format!(
-                "[kf_stereo] frame={} close_points={}",
-                frame.idx, n_close
-            ));
-        }
-
-        // Triangulate new map points against the last MAX_COVIS_KFS keyframes,
-        // not just the immediate predecessor. Mirrors ORB-SLAM3's
-        // CreateNewMapPoints which uses the 30 best covisible KFs; we
-        // approximate covisibility by recency until a covisibility graph is
-        // available. The grow pass works against keyframes stored in the map
-        // (addressed by frame index), so no keyframe clones are needed.
+        // Neighbours are captured BEFORE publication: growing against a list
+        // that already contains the current keyframe would triangulate it
+        // against itself and drop the oldest real neighbour.
+        //
+        // Mirrors ORB-SLAM3's CreateNewMapPoints, which uses the 30 best
+        // covisible keyframes; recency approximates covisibility until the
+        // graph is available.
         const MAX_COVIS_KFS: usize = 10;
         let neighbor_kf_indices: Vec<usize> = self
             .map
@@ -859,28 +881,44 @@ impl SlamSystem {
             .map(|kf| kf.frame.idx)
             .collect();
 
-        let imu_initialized = self.tracker.state.imu_initialized;
-        let match_config = self.two_view_init_config.match_config;
-        let triangulation_config = self.two_view_init_config.triangulation_config.clone();
+        // Core publication: the keyframe, its tracked links, the close stereo
+        // seeds and the IMU edge go in as one validated batch. Tracked links are
+        // recorded as claims first, so stereo seeding cannot take a feature
+        // tracking already owns.
+        let mut claimed: Vec<Option<usize>> = vec![None; frame.features.descriptors.len()];
+        let mut core = MapInsertion::default();
+        for &(mp_idx, curr_idx) in matches {
+            if claimed.get(curr_idx).copied().flatten().is_some() {
+                continue;
+            }
+            if let Some(slot) = claimed.get_mut(curr_idx) {
+                *slot = Some(mp_idx);
+            }
+            core.observations.push(ObservationLink {
+                observation: ObservationKey {
+                    keyframe_idx: frame.idx,
+                    feature_idx: curr_idx,
+                },
+                landmark: LandmarkTarget::Existing(mp_idx),
+            });
+        }
 
-        let mut total_grown = 0usize;
-        for &nb_kf_idx in &neighbor_kf_indices {
-            total_grown += self.map.lock().unwrap().grow_map_points_from_keyframe_pair(
-                nb_kf_idx,
-                &mut curr_kf,
-                match_config,
-                &triangulation_config,
+        // Stereo densification: close stereo keypoints become metric landmarks
+        // directly. Far points are left to the pair-growth pass, mirroring
+        // ORB-SLAM3's CreateNewKeyFrame.
+        if let Some(mthdepth) = self.stereo_close_depth
+            && curr_kf.frame.is_stereo()
+        {
+            core.landmarks = crate::mapping::growth::stereo_seeds(
+                &curr_kf.frame,
                 &self.rig.camera,
+                mthdepth,
+                &claimed,
             );
         }
-        self.dbg(format!(
-            "[kf] frame={} grown={} from {} neighbor kfs",
-            frame.idx,
-            total_grown,
-            neighbor_kf_indices.len()
-        ));
+        let n_close = core.landmarks.len();
+        core.keyframes.push(curr_kf);
 
-        self.map.lock().unwrap().upsert_keyframe(curr_kf);
         if let (Some(prev_kf_idx), Some(prev_ts)) = (
             self.tracker.state.last_keyframe_idx,
             self.inertial.last_keyframe_timestamp_sec,
@@ -889,30 +927,105 @@ impl SlamSystem {
                 self.inertial
                     .preintegrate_window(self.rig.imu.as_ref(), prev_ts, timestamp_sec);
             if preint.dt > 0.0 {
-                self.map.lock().unwrap().add_imu_factor(
+                core.imu_factors.push(ImuFactor {
                     prev_kf_idx,
-                    frame.idx,
-                    preint,
+                    curr_kf_idx: frame.idx,
+                    preintegrated: preint,
                     raw_samples,
-                    prev_ts,
-                    timestamp_sec,
-                );
+                    t0: prev_ts,
+                    t1: timestamp_sec,
+                });
             }
         }
 
-        self.inertial.last_keyframe_timestamp_sec = Some(timestamp_sec);
+        let published = self.map.lock().unwrap().apply_insertion(core);
+        if let Err(error) = published {
+            // Nothing was written, so no tracker or IMU reference may advance to
+            // a keyframe the map does not hold.
+            self.dbg(format!(
+                "[kf] frame={} publication rejected: {error}",
+                frame.idx
+            ));
+            return false;
+        }
+        if n_close > 0 {
+            self.dbg(format!(
+                "[kf_stereo] frame={} close_points={}",
+                frame.idx, n_close
+            ));
+        }
 
+        self.inertial.last_keyframe_timestamp_sec = Some(timestamp_sec);
         self.tracker.state.current_keyframe_idx = Some(frame.idx);
         self.tracker.state.last_keyframe_idx = Some(frame.idx);
 
-        // Forward SearchInNeighbors / Fuse: extend each curr_kf-observed map
-        // point's observation list to neighbor KFs that don't yet observe it.
-        // Run before local BA so BA sees the extra reprojection constraints.
-        let n_fused = self.map.lock().unwrap().fuse_into_neighbors(
+        // Optional pair growth against the stored keyframe. Each pair is its own
+        // validated batch, published before the next is prepared so a later pass
+        // sees the claims the previous one took; a skipped pair does not undo the
+        // accepted publication above.
+        let imu_initialized = self.tracker.state.imu_initialized;
+        let match_config = self.two_view_init_config.match_config;
+        let triangulation_config = self.two_view_init_config.triangulation_config.clone();
+
+        let mut total_grown = 0usize;
+        for &nb_kf_idx in &neighbor_kf_indices {
+            let mut map = self.map.lock().unwrap();
+            let Some(request) = crate::mapping::growth::pair_growth_request(
+                &map,
+                nb_kf_idx,
+                frame.idx,
+                match_config,
+                &triangulation_config,
+                &self.rig.camera,
+            ) else {
+                continue;
+            };
+            let outcome = map.apply_insertion(request);
+            drop(map);
+            match outcome {
+                Ok(result) => total_grown += result.landmark_ids.len(),
+                Err(error) => self.dbg(format!(
+                    "[kf] frame={} pair growth against {nb_kf_idx} rejected: {error}",
+                    frame.idx
+                )),
+            }
+        }
+        self.dbg(format!(
+            "[kf] frame={} grown={} from {} neighbor kfs",
             frame.idx,
-            &neighbor_kf_indices,
-            &self.rig.camera,
-        );
+            total_grown,
+            neighbor_kf_indices.len()
+        ));
+
+        // Forward SearchInNeighbors: extend this keyframe's landmarks into
+        // neighbours that don't yet observe them, before local BA so BA sees the
+        // extra reprojection constraints.
+        let n_fused = {
+            let mut map = self.map.lock().unwrap();
+            let links = crate::mapping::growth::neighbor_fusion_links(
+                &map,
+                frame.idx,
+                &neighbor_kf_indices,
+                &self.rig.camera,
+            );
+            let mut fused = 0usize;
+            for link in links {
+                let LandmarkTarget::Existing(landmark) = link.landmark else {
+                    continue;
+                };
+                if map
+                    .link_observation(
+                        link.observation.keyframe_idx,
+                        link.observation.feature_idx,
+                        landmark,
+                    )
+                    .unwrap_or(false)
+                {
+                    fused += 1;
+                }
+            }
+            fused
+        };
         self.dbg(format!("[fuse] frame={} fused={}", frame.idx, n_fused));
 
         // Refinement can rotate/scale the world and update gravity. Do it before
