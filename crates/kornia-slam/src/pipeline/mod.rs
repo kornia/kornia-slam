@@ -1311,11 +1311,11 @@ impl SlamPipeline {
             let neighbors = map.covisible_keyframes(kf_idx, MIN_COVIS_WEIGHT);
             (bow, neighbors)
         };
-        let candidates = self.kf_database.detect_loop_candidates(
-            kf_idx,
-            &bow,
-            neighbors.iter().map(|&(nb_idx, _w)| nb_idx),
-        );
+        let covisible_kf_indices: Vec<usize> =
+            neighbors.iter().map(|&(nb_idx, _w)| nb_idx).collect();
+        let candidates =
+            self.kf_database
+                .detect_loop_candidates(kf_idx, &bow, &covisible_kf_indices);
         self.kf_database.add(kf_idx, bow);
 
         if let Some(best) = candidates.first().copied() {

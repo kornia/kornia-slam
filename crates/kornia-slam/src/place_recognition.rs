@@ -45,14 +45,44 @@ pub struct KeyFrameDatabase {
     bows: HashMap<usize, BoW>,
 }
 
+/// Abstract interface for appearance-based place recognition and candidate retrieval.
+pub trait PlaceRecognizer {
+    /// The descriptor representation used for indexing and queries (e.g. [`BoW`] or an embedding vector).
+    type Descriptor;
+
+    /// Adds a keyframe's descriptor representation to the database.
+    fn add(&mut self, kf_idx: usize, desc: Self::Descriptor);
+
+    /// Removes a keyframe from the database.
+    fn erase(&mut self, kf_idx: usize);
+
+    /// Retrieves candidate keyframes for a query descriptor, sorted by descending score.
+    /// `exclude` skips designated keyframes; only keyframes scoring at least `min_score` are returned.
+    fn detect_candidates(
+        &self,
+        query: &Self::Descriptor,
+        exclude: &HashSet<usize>,
+        min_score: f32,
+    ) -> Vec<Candidate>;
+
+    /// ORB-SLAM3 style loop candidate retrieval: excludes the query keyframe and its
+    /// covisible neighbours, using the lowest similarity to those neighbours as the score floor.
+    fn detect_loop_candidates(
+        &self,
+        query_kf_idx: usize,
+        query: &Self::Descriptor,
+        covisible: &[usize],
+    ) -> Vec<Candidate>;
+}
+
 /// A retrieved place-recognition candidate.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Candidate {
     /// Keyframe index (`Keyframe::frame.idx`) of the candidate.
     pub kf_idx: usize,
-    /// Number of vocabulary words shared with the query.
+    /// Number of vocabulary words shared with the query (if computed via an inverted index).
     pub shared_words: usize,
-    /// L1 bag-of-words similarity to the query, in `[0, 1]`.
+    /// Similarity score to the query, in `[0, 1]`.
     pub score: f32,
 }
 
@@ -72,20 +102,61 @@ impl KeyFrameDatabase {
         self.bows.is_empty()
     }
 
+    /// The stored BoW vector for a keyframe, if indexed.
+    pub fn bow(&self, kf_idx: usize) -> Option<&BoW> {
+        self.bows.get(&kf_idx)
+    }
+
     /// Adds a keyframe's BoW vector to the index. Re-adding the same index
     /// first removes the previous entry so the inverted lists stay consistent.
     pub fn add(&mut self, kf_idx: usize, bow: BoW) {
-        if self.bows.contains_key(&kf_idx) {
-            self.erase(kf_idx);
-        }
-        for &(word, _) in &bow.0 {
-            self.inverted.entry(word).or_default().push(kf_idx);
-        }
-        self.bows.insert(kf_idx, bow);
+        PlaceRecognizer::add(self, kf_idx, bow);
     }
 
     /// Removes a keyframe from the index (e.g. after culling). No-op if absent.
     pub fn erase(&mut self, kf_idx: usize) {
+        PlaceRecognizer::erase(self, kf_idx);
+    }
+
+    /// Retrieves place-recognition candidates for a query BoW, sorted by
+    /// descending score. `exclude` skips the query's own neighbours; only
+    /// keyframes scoring at least `min_score` are returned.
+    pub fn detect_candidates(
+        &self,
+        query: &BoW,
+        exclude: &HashSet<usize>,
+        min_score: f32,
+    ) -> Vec<Candidate> {
+        PlaceRecognizer::detect_candidates(self, query, exclude, min_score)
+    }
+
+    /// ORB-SLAM3 `LoopClosing::DetectLoop` retrieval: excludes the query
+    /// keyframe and its covisible neighbours, and uses the lowest BoW
+    /// similarity to those neighbours as the score floor.
+    pub fn detect_loop_candidates(
+        &self,
+        query_kf_idx: usize,
+        query: &BoW,
+        covisible: &[usize],
+    ) -> Vec<Candidate> {
+        PlaceRecognizer::detect_loop_candidates(self, query_kf_idx, query, covisible)
+    }
+}
+
+impl PlaceRecognizer for KeyFrameDatabase {
+    type Descriptor = BoW;
+
+    fn add(&mut self, kf_idx: usize, desc: Self::Descriptor) {
+        if self.bows.contains_key(&kf_idx) {
+            self.erase(kf_idx);
+        }
+        for &(word, _) in &desc.0 {
+            self.inverted.entry(word).or_default().push(kf_idx);
+        }
+        self.bows.insert(kf_idx, desc);
+    }
+
+    fn erase(&mut self, kf_idx: usize) {
         let Some(bow) = self.bows.remove(&kf_idx) else {
             return;
         };
@@ -99,21 +170,9 @@ impl KeyFrameDatabase {
         }
     }
 
-    /// The stored BoW vector for a keyframe, if indexed.
-    pub fn bow(&self, kf_idx: usize) -> Option<&BoW> {
-        self.bows.get(&kf_idx)
-    }
-
-    /// Retrieves place-recognition candidates for a query BoW, sorted by
-    /// descending score. `exclude` skips the query's own neighbours; only
-    /// keyframes scoring at least `min_score` are returned.
-    ///
-    /// Mirrors the first phase of ORB-SLAM3's `DetectLoopCandidates` /
-    /// `DetectRelocalizationCandidates`; covisibility-group accumulation is the
-    /// caller's responsibility.
-    pub fn detect_candidates(
+    fn detect_candidates(
         &self,
-        query: &BoW,
+        query: &Self::Descriptor,
         exclude: &HashSet<usize>,
         min_score: f32,
     ) -> Vec<Candidate> {
@@ -160,20 +219,16 @@ impl KeyFrameDatabase {
         candidates
     }
 
-    /// ORB-SLAM3 `LoopClosing::DetectLoop` retrieval: excludes the query
-    /// keyframe and its covisible neighbours, and uses the lowest BoW
-    /// similarity to those neighbours as the score floor, so only a genuine
-    /// revisit (not the local neighbourhood) can match.
-    pub fn detect_loop_candidates(
+    fn detect_loop_candidates(
         &self,
         query_kf_idx: usize,
-        query: &BoW,
-        covisible: impl IntoIterator<Item = usize>,
+        query: &Self::Descriptor,
+        covisible: &[usize],
     ) -> Vec<Candidate> {
         let mut exclude = HashSet::new();
         exclude.insert(query_kf_idx);
         let mut min_score = 1.0f32;
-        for nb in covisible {
+        for &nb in covisible {
             exclude.insert(nb);
             if let Some(nb_bow) = self.bow(nb) {
                 min_score = min_score.min(query.l1_similarity(nb_bow));
@@ -235,7 +290,7 @@ mod tests {
 
         let query = bow(&[(10, 0.5), (20, 0.5)]);
         // kf 3 is the query; kf 1 is its covisible neighbour → both excluded.
-        let cands = db.detect_loop_candidates(3, &query, [1]);
+        let cands = db.detect_loop_candidates(3, &query, &[1]);
 
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].kf_idx, 2);
@@ -250,5 +305,34 @@ mod tests {
             db.detect_candidates(&query, &HashSet::new(), 0.5)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn trait_polymorphism_generic_and_trait_object() {
+        fn query_recognizer<R: PlaceRecognizer<Descriptor = BoW>>(
+            recognizer: &R,
+            query: &BoW,
+        ) -> Vec<Candidate> {
+            recognizer.detect_candidates(query, &HashSet::new(), 0.0)
+        }
+
+        let mut db = KeyFrameDatabase::new();
+        PlaceRecognizer::add(&mut db, 1, bow(&[(10, 0.5), (20, 0.5)]));
+        PlaceRecognizer::add(&mut db, 2, bow(&[(10, 0.5), (20, 0.3), (30, 0.2)]));
+
+        let query = bow(&[(10, 0.5), (20, 0.5)]);
+        let generic_cands = query_recognizer(&db, &query);
+        assert_eq!(generic_cands.len(), 2);
+        assert_eq!(generic_cands[0].kf_idx, 1);
+        assert_eq!(generic_cands[1].kf_idx, 2);
+
+        let dyn_recognizer: &dyn PlaceRecognizer<Descriptor = BoW> = &db;
+        let dyn_cands = dyn_recognizer.detect_candidates(&query, &HashSet::new(), 0.0);
+        assert_eq!(dyn_cands.len(), 2);
+        assert_eq!(dyn_cands[0].kf_idx, 1);
+
+        let loop_cands = dyn_recognizer.detect_loop_candidates(3, &query, &[2]);
+        assert_eq!(loop_cands.len(), 1);
+        assert_eq!(loop_cands[0].kf_idx, 1);
     }
 }
