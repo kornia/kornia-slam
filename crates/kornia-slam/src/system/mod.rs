@@ -901,22 +901,12 @@ impl SlamSystem {
 
         // Neighbours are captured BEFORE publication: growing against a list
         // that already contains the current keyframe would triangulate it
-        // against itself and drop the oldest real neighbour.
-        //
-        // Mirrors ORB-SLAM3's CreateNewMapPoints, which uses the 30 best
-        // covisible keyframes; recency approximates covisibility until the
-        // graph is available.
-        const MAX_COVIS_KFS: usize = 10;
-        let neighbor_kf_indices: Vec<usize> = self
-            .map
-            .lock()
-            .unwrap()
-            .keyframes()
-            .iter()
-            .rev()
-            .take(MAX_COVIS_KFS)
-            .map(|kf| kf.frame.idx)
-            .collect();
+        // against itself and drop the oldest real neighbour. Selection policy
+        // belongs to mapping.
+        let growth_plan = crate::mapping::keyframe_mapping::prepare_keyframe_growth(
+            &self.map.lock().unwrap(),
+            frame.idx,
+        );
 
         // Core publication: the keyframe, its tracked links, the close stereo
         // seeds and the IMU edge go in as one validated batch. Tracked links are
@@ -1004,79 +994,31 @@ impl SlamSystem {
         self.tracker.state.current_keyframe_idx = Some(frame.idx);
         self.tracker.state.last_keyframe_idx = Some(frame.idx);
 
-        // Optional pair growth against the stored keyframe. Each pair is its own
-        // validated batch, published before the next is prepared so a later pass
-        // sees the claims the previous one took; a skipped pair does not undo the
-        // accepted publication above.
+        // Optional mapping work the accepted keyframe earns. Mapping owns the
+        // sequence and its lock boundaries; the messages stay here.
         let imu_initialized = self.tracker.state.imu_initialized;
-        let match_config = self.two_view_init_config.match_config;
-        let triangulation_config = self.two_view_init_config.triangulation_config.clone();
-
-        let mut total_grown = 0usize;
-        for &nb_kf_idx in &neighbor_kf_indices {
-            let mut map = self.map.lock().unwrap();
-            let Some(request) = crate::mapping::growth::pair_growth_request(
-                &map,
-                nb_kf_idx,
-                frame.idx,
-                match_config,
-                &triangulation_config,
-                &self.rig.camera,
-            ) else {
-                continue;
-            };
-            let outcome = map.apply_insertion(request);
-            drop(map);
-            match outcome {
-                Ok(result) => total_grown += result.landmark_ids.len(),
-                Err(error) => self.dbg(format!(
-                    "[kf] frame={} pair growth against {nb_kf_idx} rejected: {error}",
-                    frame.idx
-                )),
-            }
+        let growth = crate::mapping::keyframe_mapping::grow_keyframe(
+            &self.map,
+            growth_plan,
+            &self.rig.camera,
+            self.two_view_init_config.match_config,
+            &self.two_view_init_config.triangulation_config,
+        );
+        for failure in &growth.pair_failures {
+            self.dbg(format!(
+                "[kf] frame={} pair growth against {} rejected: {}",
+                frame.idx, failure.neighbor_keyframe_idx, failure.error
+            ));
         }
         self.dbg(format!(
             "[kf] frame={} grown={} from {} neighbor kfs",
-            frame.idx,
-            total_grown,
-            neighbor_kf_indices.len()
+            frame.idx, growth.landmarks_added, growth.neighbor_count
         ));
-
-        // Forward SearchInNeighbors: extend this keyframe's landmarks into
-        // neighbours that don't yet observe them, before local BA so BA sees the
-        // extra reprojection constraints.
-        let (n_fused, fuse_conflicts) = {
-            let mut map = self.map.lock().unwrap();
-            let links = crate::mapping::growth::neighbor_fusion_links(
-                &map,
-                frame.idx,
-                &neighbor_kf_indices,
-                &self.rig.camera,
-            );
-            let mut fused = 0usize;
-            let mut conflicts: Vec<MapMutationError> = Vec::new();
-            for link in links {
-                let LandmarkTarget::Existing(landmark) = link.landmark else {
-                    continue;
-                };
-                match map.link_observation(
-                    link.observation.keyframe_idx,
-                    link.observation.feature_idx,
-                    landmark,
-                ) {
-                    Ok(true) => fused += 1,
-                    // Already linked: the proposal was redundant, not wrong.
-                    Ok(false) => {}
-                    // Proposals are resolved against a map held under this same
-                    // lock, so a refusal means an invariant we believed held did
-                    // not. Surface it rather than counting it as a no-op.
-                    Err(error) => conflicts.push(error),
-                }
-            }
-            (fused, conflicts)
-        };
-        self.dbg(format!("[fuse] frame={} fused={}", frame.idx, n_fused));
-        for error in fuse_conflicts {
+        self.dbg(format!(
+            "[fuse] frame={} fused={}",
+            frame.idx, growth.observations_added
+        ));
+        for error in &growth.fusion_failures {
             self.dbg(format!("[fuse] frame={} link refused: {error}", frame.idx));
         }
 
