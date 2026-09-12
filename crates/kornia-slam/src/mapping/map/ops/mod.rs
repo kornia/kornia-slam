@@ -1,6 +1,7 @@
 //! Map operations grouped by responsibility; storage remains owned by Map.
 
 mod correction;
+mod geometry;
 mod mutation;
 mod queries;
 mod snapshot;

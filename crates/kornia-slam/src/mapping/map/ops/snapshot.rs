@@ -38,8 +38,6 @@ pub struct BaUpdate {
     pub(crate) keyframes: Vec<KeyframeBaState>,
     pub(crate) map_points: Vec<Vec3F64>,
     pub(crate) imu_preintegrations: Vec<PreintegratedImu>,
-    // Initial BA also refreshes selected points whose positions did not move.
-    pub(crate) refresh_points: Vec<usize>,
     pub(crate) snapshot: BaSnapshot,
 }
 
@@ -75,7 +73,6 @@ impl BaSnapshot {
                 .iter()
                 .map(|factor| factor.preintegrated.clone())
                 .collect(),
-            refresh_points: Vec::new(),
             snapshot: self,
         }
     }

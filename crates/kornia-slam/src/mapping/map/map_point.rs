@@ -2,10 +2,9 @@
 //!
 //! A `MapPoint` owns what it can derive from itself. Anything needing the
 //! observing keyframes — the viewing direction and distance bounds, which read
-//! camera centres — lives on [`Map::update_map_point_geometry`] and only writes
-//! the fields back here.
-//!
-//! [`Map::update_map_point_geometry`]: super::Map::update_map_point_geometry
+//! camera centres — lives in the map's `ops::geometry` group and only writes
+//! the fields back here. Corrections decide which landmarks a moved camera
+//! made stale; nothing recomputes these fields from a `MapPoint` alone.
 
 use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::hamming_distance;

@@ -3,7 +3,7 @@
 //! and world-epoch handling.
 
 use super::snapshot::KeyframeBaState;
-use crate::map::{BaUpdate, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR};
+use crate::map::{BaUpdate, Map};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{SO3F64, Vec3F64};
 use kornia_sensors::imu::ImuBias;
@@ -125,6 +125,14 @@ impl Map {
             .zip(poses_after)
             .filter(|(before, after)| before != after)
             .count();
+        // A landmark whose reference pose is unchanged keeps its position, but
+        // any other observer that moved still invalidates its viewing direction.
+        let moved_keyframes: HashSet<usize> = keyframe_indices
+            .iter()
+            .zip(poses_before.iter().zip(poses_after))
+            .filter(|(_, (before, after))| before != after)
+            .map(|(&idx, _)| idx)
+            .collect();
 
         self.world_epoch = self.world_epoch.wrapping_add(1);
         for (node, keyframe) in self.keyframes.iter_mut().enumerate() {
@@ -144,13 +152,13 @@ impl Map {
                 changed_points.push(idx);
             }
         }
-        for &idx in &changed_points {
-            self.update_map_point_geometry(idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
-        }
+        let map_points_corrected = changed_points.len();
+        let observers_moved = self.landmarks_observed_by(&moved_keyframes);
+        self.finalize_landmark_geometry(changed_points.into_iter().chain(observers_moved));
 
         Ok(PoseGraphCorrectionResult {
             keyframes_corrected,
-            map_points_corrected: changed_points.len(),
+            map_points_corrected,
         })
     }
 
@@ -211,6 +219,11 @@ impl Map {
             keyframe.velocity_world = alignment.rotation * assignment.velocity_world;
             keyframe.imu_bias = alignment.bias;
         }
+        // Every camera centre moved, so finalize once over the whole live map
+        // after the complete correction — never between the scale and the
+        // rotation, which would derive geometry from a half-aligned world.
+        let live = self.live_landmarks();
+        self.finalize_landmark_geometry(live);
         Ok(last_keyframe_idx)
     }
 
@@ -277,6 +290,10 @@ impl Map {
         }
 
         let mut result = LocalBaMergeResult::default();
+        // Which estimates to publish is decided against the capture baseline;
+        // which landmarks became stale is decided against the *live* pose,
+        // because that is the camera centre their geometry was derived from.
+        let mut moved_keyframes = HashSet::new();
         for (before, optimized) in snapshot.keyframes.iter().zip(update.keyframes.iter()) {
             if !keyframe_ba_state_changed(before, optimized) {
                 continue;
@@ -289,6 +306,9 @@ impl Map {
             live.frame.pose_world_to_cam = optimized.pose_world_to_cam;
             live.velocity_world = optimized.velocity_world;
             live.imu_bias = optimized.imu_bias;
+            if pose_before != optimized.pose_world_to_cam {
+                moved_keyframes.insert(before.frame.idx);
+            }
             result.keyframe_corrections.push(KeyframeBaCorrection {
                 kf_idx: before.frame.idx,
                 pose_before,
@@ -319,12 +339,10 @@ impl Map {
         }
         result.map_points_updated = changed_points.len();
 
-        changed_points.extend(update.refresh_points);
-        changed_points.sort_unstable();
-        changed_points.dedup();
-        for idx in changed_points {
-            self.update_map_point_geometry(idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
-        }
+        // Counters describe position changes; the refresh set is larger,
+        // covering every live landmark whose observers moved.
+        let observers_moved = self.landmarks_observed_by(&moved_keyframes);
+        self.finalize_landmark_geometry(changed_points.into_iter().chain(observers_moved));
 
         // VI-BA may repropagate an existing preintegration on its private copy.
         // Preserve newer live factors while copying those refreshed edges back.
@@ -518,26 +536,239 @@ mod tests {
         );
         assert_eq!(map.map_points()[point_idx].position, live_point);
     }
+
+    /// A landmark transported through an unmoved reference keyframe keeps its
+    /// position exactly — but a *different* observing camera moved, so the
+    /// direction averaged over all observers is stale until refreshed.
+    #[test]
+    fn pose_graph_refreshes_a_moved_non_reference_observer() {
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0; 32]])))
+            .unwrap();
+        let moved_before = Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            Vec3F64::new(-2.0, 0.0, 0.0),
+        );
+        map.insert_keyframe(Keyframe::from_frame(test_frame_with_pose(
+            1,
+            vec![[1; 32]],
+            moved_before,
+        )))
+        .unwrap();
+        let point_idx = map
+            .insert_landmark(LandmarkSeed {
+                position: Vec3F64::new(0.0, 0.0, 5.0),
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx: 0,
+                },
+            })
+            .unwrap();
+        assert!(map.link_observation(1, 0, point_idx).unwrap());
+        let position_before = map.map_points()[point_idx].position;
+        let bounds_before = map.map_points()[point_idx].max_distance;
+
+        let moved_after = Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            Vec3F64::new(-4.0, 0.0, 0.0),
+        );
+        let result = map
+            .apply_pose_graph_correction(
+                &[0, 1],
+                &[Pose3d::IDENTITY, moved_before],
+                &[Pose3d::IDENTITY, moved_after],
+            )
+            .expect("valid pose graph correction");
+
+        assert_eq!(result.keyframes_corrected, 1);
+        assert_eq!(
+            result.map_points_corrected, 0,
+            "the reference pose is unchanged, so the position does not move"
+        );
+        assert_eq!(map.map_points()[point_idx].position, position_before);
+        assert_eq!(map.map_points()[point_idx].max_distance, bounds_before);
+        let expected =
+            (Vec3F64::new(0.0, 0.0, 1.0) + Vec3F64::new(-4.0, 0.0, 5.0) / 41.0_f64.sqrt()) / 2.0;
+        let direction = map.map_points()[point_idx].mean_viewing_direction;
+        assert!(
+            (direction - expected).length() < 1e-10,
+            "viewing direction {direction:?} should be {expected:?}"
+        );
+    }
+
+    /// Alignment scales and rotates the whole world at once. Geometry is
+    /// finalized after the complete correction, never between the scale and
+    /// the rotation, and a retired landmark stays retired with nothing stale.
+    #[test]
+    fn inertial_alignment_refreshes_geometry_and_leaves_retired_landmarks_clear() {
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0; 32], [1; 32]])))
+            .unwrap();
+        let live = map
+            .insert_landmark(LandmarkSeed {
+                position: Vec3F64::new(0.0, 0.0, 5.0),
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx: 0,
+                },
+            })
+            .unwrap();
+        let retired = map
+            .insert_landmark(LandmarkSeed {
+                position: Vec3F64::new(0.0, 1.0, 5.0),
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx: 1,
+                },
+            })
+            .unwrap();
+        assert!(map.remove_landmark(retired).unwrap());
+        assert!((map.map_points()[live].max_distance - 5.0).abs() < 1e-12);
+
+        // A quarter turn about +Y sends (0, 0, 1) to (1, 0, 0).
+        let quarter_turn = SO3F64::exp(Vec3F64::new(0.0, std::f64::consts::FRAC_PI_2, 0.0));
+        map.apply_inertial_alignment(InertialAlignment {
+            scale: 2.0,
+            rotation: quarter_turn,
+            keyframe_velocities: vec![KeyframeVelocity {
+                keyframe_idx: 0,
+                velocity_world: Vec3F64::ZERO,
+            }],
+            bias: ImuBias::default(),
+        })
+        .expect("valid alignment should apply");
+
+        let point = &map.map_points()[live];
+        assert!(
+            (point.max_distance - 10.0).abs() < 1e-9,
+            "distance bounds scale with the world: {}",
+            point.max_distance
+        );
+        assert!(
+            (point.mean_viewing_direction - Vec3F64::new(1.0, 0.0, 0.0)).length() < 1e-9,
+            "viewing direction should be rotated a quarter turn: {:?}",
+            point.mean_viewing_direction
+        );
+
+        let dead = &map.map_points()[retired];
+        assert!(dead.culled, "a retired landmark is never revived");
+        assert!(dead.observations().is_empty());
+        assert_eq!(dead.mean_viewing_direction, Vec3F64::ZERO);
+        assert_eq!(dead.min_distance, 0.0);
+        assert_eq!(dead.max_distance, 0.0);
+    }
 }
 
 #[cfg(test)]
 mod ba_tests {
     use super::*;
-    use crate::map::{Keyframe, LandmarkSeed, MapInsertion, ObservationKey, tests::test_frame};
+    use crate::map::{
+        Keyframe, LandmarkSeed, MapInsertion, ObservationKey,
+        tests::{test_frame, test_frame_with_pose},
+    };
 
+    /// Moving a landmark's reference camera changes the distance bounds and
+    /// viewing direction derived from that camera centre, even though the
+    /// landmark itself does not move. The map owes that refresh to every
+    /// caller; no solver supplies a list of points to fix up.
     #[test]
-    fn initial_ba_can_refresh_geometry_without_moving_the_point() {
+    fn ba_moving_a_reference_camera_refreshes_geometry_without_moving_the_point() {
         let (mut map, point) = snapshot_fixture();
         let before = map.map_points()[point].position;
         let mut update = map.ba_snapshot().into_update();
+        // World-to-camera translation (1, 0, 0) puts the camera centre at
+        // (-1, 0, 0), so the landmark at (0, 0, 5) sits (1, 0, 5) away.
         update.keyframes[0].pose_world_to_cam.translation.x = 1.0;
-        update.refresh_points.push(point);
         let result = map.apply_ba_update(update).unwrap();
         assert_eq!(result.keyframe_corrections.len(), 1);
         assert_eq!(result.map_points_updated, 0);
         assert_eq!(map.map_points()[point].position, before);
         assert!((map.map_points()[point].max_distance - 26.0_f64.sqrt()).abs() < 1e-10);
-        assert!(map.map_points()[point].mean_viewing_direction.x > 0.0);
+        let direction = map.map_points()[point].mean_viewing_direction;
+        let expected = Vec3F64::new(1.0, 0.0, 5.0) / 26.0_f64.sqrt();
+        assert!(
+            (direction - expected).length() < 1e-10,
+            "viewing direction {direction:?} should be {expected:?}"
+        );
+    }
+
+    /// The viewing direction averages over *all* observing camera centres, so
+    /// moving a non-reference observer changes it while the reference distance
+    /// bounds stay put.
+    #[test]
+    fn ba_moving_a_non_reference_observer_refreshes_only_the_viewing_direction() {
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])))
+            .unwrap();
+        map.insert_keyframe(Keyframe::from_frame(test_frame_with_pose(
+            1,
+            vec![[1u8; 32]],
+            Pose3d::new(
+                kornia_algebra::Mat3F64::IDENTITY,
+                Vec3F64::new(-2.0, 0.0, 0.0),
+            ),
+        )))
+        .unwrap();
+        let point = map.insert_landmark(seeded(0, 0, 5.0)).unwrap();
+        assert!(map.link_observation(1, 0, point).unwrap());
+        let bounds_before = map.map_points()[point].max_distance;
+
+        let mut update = map.ba_snapshot().into_update();
+        // Camera centre of keyframe 1 moves from (2, 0, 0) to (4, 0, 0).
+        update.keyframes[1].pose_world_to_cam.translation.x = -4.0;
+        let result = map.apply_ba_update(update).unwrap();
+
+        assert_eq!(result.keyframe_corrections.len(), 1);
+        assert_eq!(result.map_points_updated, 0);
+        assert_eq!(
+            map.map_points()[point].max_distance,
+            bounds_before,
+            "the reference camera did not move, so the bounds must not change"
+        );
+        let expected =
+            (Vec3F64::new(0.0, 0.0, 1.0) + Vec3F64::new(-4.0, 0.0, 5.0) / 41.0_f64.sqrt()) / 2.0;
+        let direction = map.map_points()[point].mean_viewing_direction;
+        assert!(
+            (direction - expected).length() < 1e-10,
+            "viewing direction {direction:?} should be {expected:?}"
+        );
+    }
+
+    /// A landmark linked while BA was running is outside the captured arrays,
+    /// so no estimate may be written back to it — but an existing camera that
+    /// BA moved is still one of its observers, so its metadata is stale.
+    #[test]
+    fn a_landmark_linked_after_capture_is_refreshed_without_writeback() {
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]; 2])))
+            .unwrap();
+        let mut update = map.ba_snapshot().into_update();
+
+        // Inserted after capture: the snapshot holds no landmarks at all.
+        let later = map.insert_landmark(seeded(0, 0, 5.0)).unwrap();
+        let position = map.map_points()[later].position;
+
+        update.keyframes[0].pose_world_to_cam.translation.x = 1.0;
+        let result = map.apply_ba_update(update).unwrap();
+
+        assert_eq!(result.map_points_updated, 0);
+        assert_eq!(
+            map.map_points()[later].position,
+            position,
+            "a landmark outside the capture keeps its own position"
+        );
+        assert_eq!(
+            map.get_keyframe(0).unwrap().map_point(0),
+            Some(later),
+            "its link survived"
+        );
+        assert!(
+            (map.map_points()[later].max_distance - 26.0_f64.sqrt()).abs() < 1e-10,
+            "its metadata reflects the camera centre BA moved"
+        );
     }
     #[test]
     fn local_ba_snapshot_merge_updates_only_snapshot_entities() {

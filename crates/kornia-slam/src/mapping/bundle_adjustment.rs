@@ -160,8 +160,6 @@ pub fn run_initial_ba(map: &mut Map, camera: &PinholeCamera) -> bool {
             *mp = ba_result.points[local_idx];
         }
     }
-    // Positions (and KF1's pose) moved: refresh scale geometry.
-    update.refresh_points = mp_global_indices.clone();
     if map.apply_ba_update(update).is_none() {
         return false;
     }
