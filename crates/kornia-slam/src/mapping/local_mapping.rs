@@ -6,7 +6,7 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 
-use crate::map::{BaSnapshot, BaUpdate, LocalBaMergeResult, Map};
+use crate::map::{BaSnapshot, BaUpdate, BaUpdateError, LocalBaMergeResult, Map};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LocalMappingMode {
@@ -70,12 +70,10 @@ enum LocalMappingBackend {
 /// merge and before the result is published, so a completed result is never
 /// observable ahead of its cleanup. A refused snapshot — one whose world epoch
 /// no longer matches — publishes nothing and must therefore cull nothing.
-fn merge_and_cull(map: &mut Map, update: BaUpdate) -> Option<LocalBaMergeResult> {
-    let merged = map.apply_ba_update(update);
-    if merged.is_some() {
-        crate::mapping::culling::cull_landmarks(map);
-    }
-    merged
+fn merge_and_cull(map: &mut Map, update: BaUpdate) -> Result<LocalBaMergeResult, BaUpdateError> {
+    let merged = map.apply_ba_update(update)?;
+    crate::mapping::culling::cull_landmarks(map);
+    Ok(merged)
 }
 
 impl LocalMapping {
@@ -126,7 +124,7 @@ impl LocalMapping {
                     &mut map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
                     update,
                 );
-                if let Some(result) = merged {
+                if let Ok(result) = merged {
                     results
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -242,7 +240,7 @@ impl LocalMappingHandle {
                             &mut map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
                             update,
                         );
-                        merged.is_some_and(|result| result_sender.send(result).is_err())
+                        merged.is_ok_and(|result| result_sender.send(result).is_err())
                     };
                     if should_stop {
                         break;
@@ -308,8 +306,10 @@ mod tests {
     use kornia_3d::camera::PinholeCamera;
     use kornia_algebra::Vec3F64;
 
-    use super::{KeyframeJob, LocalMapping, LocalMappingBackend, LocalMappingMode};
-    use crate::map::Map;
+    use super::{BaUpdateError, KeyframeJob, LocalMapping, LocalMappingBackend, LocalMappingMode};
+    use crate::map::{InertialAlignment, KeyframeVelocity, Map};
+    use kornia_algebra::SO3F64;
+    use kornia_sensors::imu::ImuBias;
 
     fn test_camera() -> PinholeCamera {
         PinholeCamera {
@@ -491,14 +491,54 @@ mod tests {
     fn the_coordinator_does_not_cull_after_a_refused_merge() {
         let (map, doomed) = map_with_a_cullable_landmark();
         let snapshot = map.lock().unwrap().ba_snapshot().into_update();
-        // Advance the world frame, so the snapshot belongs to an older epoch.
-        map.lock().unwrap().scale_world(2.0);
+        // Advance the world frame through a valid public correction, so the
+        // snapshot belongs to an older epoch. Raw scale/rotation are private
+        // precisely because they leave geometry stale.
+        map.lock()
+            .unwrap()
+            .apply_inertial_alignment(InertialAlignment {
+                scale: 2.0,
+                rotation: SO3F64::IDENTITY,
+                keyframe_velocities: vec![KeyframeVelocity {
+                    keyframe_idx: 0,
+                    velocity_world: Vec3F64::ZERO,
+                }],
+                bias: ImuBias::default(),
+            })
+            .expect("a valid alignment advances the world epoch");
 
         let merged = super::merge_and_cull(&mut map.lock().unwrap(), snapshot);
 
-        assert!(merged.is_none(), "an older-epoch snapshot is refused");
+        assert!(
+            matches!(merged, Err(BaUpdateError::ObsoleteWorldFrame)),
+            "an older-epoch snapshot is refused"
+        );
         let map = map.lock().unwrap();
         assert!(!map.map_points()[doomed].culled, "no cull after a refusal");
+        assert_eq!(map.get_keyframe(0).unwrap().map_point(0), Some(doomed));
+    }
+
+    /// A malformed result is refused at the same seam, and a refusal must not
+    /// cull: the coordinator publishes nothing, so it cleans up nothing.
+    #[test]
+    fn the_coordinator_does_not_cull_after_an_invalid_numerical_update() {
+        let (map, doomed) = map_with_a_cullable_landmark();
+        let mut update = map.lock().unwrap().ba_snapshot().into_update();
+        update.map_points[doomed].x = f64::NAN;
+
+        let merged = super::merge_and_cull(&mut map.lock().unwrap(), update);
+
+        assert_eq!(
+            merged.unwrap_err(),
+            BaUpdateError::NonFiniteLandmark {
+                landmark_idx: doomed
+            },
+        );
+        let map = map.lock().unwrap();
+        assert!(
+            !map.map_points()[doomed].culled,
+            "an invalid update must not cull"
+        );
         assert_eq!(map.get_keyframe(0).unwrap().map_point(0), Some(doomed));
     }
 
@@ -511,7 +551,7 @@ mod tests {
 
         let merged = super::merge_and_cull(&mut map.lock().unwrap(), snapshot);
 
-        assert!(merged.is_some(), "a current-epoch snapshot is accepted");
+        assert!(merged.is_ok(), "a current-epoch snapshot is accepted");
         assert_eq!(
             merged.expect("accepted").map_points_updated,
             0,

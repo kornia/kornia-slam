@@ -160,7 +160,8 @@ pub fn run_initial_ba(map: &mut Map, camera: &PinholeCamera) -> bool {
             *mp = ba_result.points[local_idx];
         }
     }
-    if map.apply_ba_update(update).is_none() {
+    if let Err(error) = map.apply_ba_update(update) {
+        eprintln!("[init_ba] writeback refused: {error}");
         return false;
     }
 

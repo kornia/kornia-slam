@@ -59,9 +59,9 @@ pub use keyframe::Keyframe;
 pub use crate::mapping::local_mapping::{KeyframeJob, LocalMapping, LocalMappingMode};
 pub use map_point::{LandmarkObservation, MapPoint, ObservationKey};
 pub use ops::{
-    BaSnapshot, BaUpdate, InertialAlignment, InertialAlignmentError, KeyframeBaCorrection,
-    KeyframeVelocity, LocalBaMergeResult, MapPointMergeResult, PoseGraphCorrectionError,
-    PoseGraphCorrectionResult,
+    BaSnapshot, BaUpdate, BaUpdateError, InertialAlignment, InertialAlignmentError,
+    KeyframeBaCorrection, KeyframeVelocity, LocalBaMergeResult, MapPointMergeResult,
+    PoseGraphCorrectionError, PoseGraphCorrectionResult,
 };
 pub use ops::{
     InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError, ObservationLink,

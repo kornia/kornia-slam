@@ -7,8 +7,8 @@ mod queries;
 mod snapshot;
 
 pub use correction::{
-    InertialAlignment, InertialAlignmentError, KeyframeBaCorrection, KeyframeVelocity,
-    LocalBaMergeResult, PoseGraphCorrectionError, PoseGraphCorrectionResult,
+    BaUpdateError, InertialAlignment, InertialAlignmentError, KeyframeBaCorrection,
+    KeyframeVelocity, LocalBaMergeResult, PoseGraphCorrectionError, PoseGraphCorrectionResult,
 };
 pub use mutation::{
     InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError,
