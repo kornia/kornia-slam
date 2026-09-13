@@ -3,3 +3,6 @@ runs/
 mono_vo_run-*/
 .worktrees/
 docs/
+
+# Pixi
+.pixi/

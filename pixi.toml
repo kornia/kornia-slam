@@ -1,0 +1,90 @@
+# Pixi environment configuration for kornia-slam
+#
+# Provides a reproducible development environment with the Rust toolchain,
+# system compilers, and standardized tasks for building, testing, and linting
+# the workspace. Mirrors the structure used in kornia-rs and sensor-rt.
+#
+# Getting started:
+#   pixi run rust-test        # run all tests
+#   pixi run rust-lint        # fmt-check + clippy + check
+#   pixi shell                # drop into the environment
+
+# ==============================================================================
+# Workspace
+# ==============================================================================
+
+[workspace]
+name = "kornia-slam"
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64", "osx-64", "win-64"]
+preview = ["pixi-build"]
+
+# ==============================================================================
+# Feature: Rust (default)
+# ==============================================================================
+
+[feature.rust.dependencies]
+rust = ">=1.80"
+cmake = "*"
+cxx-compiler = "*"
+
+[feature.rust.target.linux-64.dependencies]
+libunwind = "*"  # Linux-only
+
+[feature.rust.target.linux-aarch64.dependencies]
+libunwind = "*"  # Linux-only
+
+[feature.rust.tasks]
+rust-check = { cmd = "cargo check --workspace --all-targets", description = "Check Rust compilation (all targets)" }
+rust-clippy = { cmd = "cargo clippy --workspace --no-deps --all-targets -- -D warnings", description = "Run clippy (all targets)" }
+rust-fmt = { cmd = "cargo fmt --all", description = "Format Rust code" }
+rust-fmt-check = { cmd = "cargo fmt --all -- --check", description = "Check Rust formatting" }
+rust-lint = { depends-on = [
+  "rust-fmt",
+  "rust-clippy",
+  "rust-check",
+], description = "Run all Rust lints" }
+rust-test = { cmd = "cargo test --workspace", description = "Run Rust tests" }
+rust-test-release = { cmd = "cargo test --workspace --release", description = "Run Rust tests (release)" }
+rust-test-package = { cmd = "cargo test -p", description = "Run tests for a specific package (usage: pixi run rust-test-package <package>)" }
+rust-clean = { cmd = "cargo clean", description = "Clean Rust build artifacts" }
+
+# App-specific tasks — the SLAM executable lives in kornia-slam-app.
+rust-run = { cmd = "cargo run --release -p kornia-slam-app --", description = "Run the SLAM app (pass args after --)" }
+rust-run-help = { cmd = "cargo run -p kornia-slam-app -- --help", description = "Show SLAM app CLI help" }
+
+# Clippy with feature variants matching the CI matrix.
+rust-clippy-no-default = { cmd = "cargo clippy --manifest-path apps/kornia-slam-app/Cargo.toml --no-default-features --all-targets -- -D warnings", description = "Clippy app without default features" }
+
+# ==============================================================================
+# Feature: Dev Tools
+# ==============================================================================
+
+[feature.dev-tools.dependencies]
+git = "*"
+tombi = "*"
+
+[feature.dev-tools.tasks]
+toml-fmt = { cmd = "tombi format", description = "Format TOML files" }
+toml-fmt-check = { cmd = "tombi format --check", description = "Check TOML formatting" }
+clean-all = { depends-on = [
+  "rust-clean",
+], description = "Clean all build artifacts" }
+test-all = { depends-on = [
+  "rust-test",
+], description = "Run all tests" }
+fmt-all = { depends-on = [
+  "rust-fmt",
+  "toml-fmt",
+], description = "Format all code" }
+
+[feature.dev.dependencies]
+pre-commit = "*"
+
+# ==============================================================================
+# Environments
+# ==============================================================================
+
+[environments]
+default = { features = ["rust"], solve-group = "default" }
+dev = { features = ["rust", "dev-tools", "dev"], solve-group = "default" }

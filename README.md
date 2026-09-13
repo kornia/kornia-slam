@@ -65,6 +65,16 @@ product around them.
 
 ## Local checks
 
+With [Pixi](https://pixi.sh) (recommended — sets up the full toolchain automatically):
+
+```bash
+pixi run rust-lint           # fmt-check + clippy + check
+pixi run rust-test           # workspace tests
+pixi shell                   # drop into the environment
+```
+
+Without Pixi (requires Rust toolchain installed manually):
+
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
