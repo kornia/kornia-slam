@@ -1,6 +1,6 @@
 use super::*;
 use crate::Frame;
-use crate::map::{Keyframe, Map, MapPoint};
+use crate::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
 use crate::pose_conversion::pose_to_se3;
 use crate::sparse_pgo::{Se3Manifold, sparse_pose_graph_optimize};
 use kornia_3d::camera::PinholeCamera;
@@ -104,13 +104,18 @@ fn synthetic_loop_map() -> (Map, Pose3d) {
         descriptors.clone(),
     ));
     let query = Keyframe::from_frame(frame(10, query_pose, &query_pixels, descriptors.clone()));
-    map.upsert_keyframe(candidate);
-    map.upsert_keyframe(query);
+    map.insert_keyframe(candidate).unwrap();
+    map.insert_keyframe(query).unwrap();
     for (index, point) in world.into_iter().enumerate() {
-        let map_point = map.push_map_point(MapPoint::new(point, descriptors[index], 0, [0; 3], 0));
-        map.get_keyframe_mut(0)
-            .unwrap()
-            .associate_map_point(index, map_point);
+        map.insert_landmark(LandmarkSeed {
+            position: point,
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 0,
+                feature_idx: index,
+            },
+        })
+        .unwrap();
     }
     (map, query_pose)
 }
@@ -118,9 +123,9 @@ fn synthetic_loop_map() -> (Map, Pose3d) {
 #[test]
 fn correspondence_input_filters_unassociated_and_culled_points() {
     let (mut map, _) = synthetic_loop_map();
-    map.get_keyframe_mut(0).unwrap().clear_map_point(0);
+    map.unlink_observation(0, 0).unwrap();
     let culled = map.get_keyframe(0).unwrap().map_point(1).unwrap();
-    map.map_points_mut()[culled].mark_culled();
+    map.remove_landmark(culled).unwrap();
     let config = LoopVerificationConfig {
         min_correspondences: 1,
         ..LoopVerificationConfig::default()
@@ -291,28 +296,30 @@ fn sparse_se3_pgo_matches_dense_on_rotated_drifting_loop() {
 fn loop_fusion_attaches_a_point_to_an_unassociated_loop_keypoint() {
     let mut map = Map::new();
     let descriptor = [7; 32];
-    map.upsert_keyframe(Keyframe::from_frame(frame(
+    map.insert_keyframe(Keyframe::from_frame(frame(
         0,
         Pose3d::IDENTITY,
         &[[320.0, 240.0]],
         vec![descriptor],
-    )));
-    map.upsert_keyframe(Keyframe::from_frame(frame(
+    )))
+    .unwrap();
+    map.insert_keyframe(Keyframe::from_frame(frame(
         10,
         Pose3d::IDENTITY,
         &[[320.0, 240.0]],
         vec![descriptor],
-    )));
-    let point = map.push_map_point(MapPoint::new(
-        Vec3F64::new(0.0, 0.0, 5.0),
-        descriptor,
-        0,
-        [0; 3],
-        0,
-    ));
-    map.get_keyframe_mut(0)
-        .unwrap()
-        .associate_map_point(0, point);
+    )))
+    .unwrap();
+    let point = map
+        .insert_landmark(LandmarkSeed {
+            position: Vec3F64::new(0.0, 0.0, 5.0),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 0,
+                feature_idx: 0,
+            },
+        })
+        .unwrap();
 
     let stats = fuse_verified_loop(
         &mut map,
@@ -327,45 +334,49 @@ fn loop_fusion_attaches_a_point_to_an_unassociated_loop_keypoint() {
     assert_eq!(stats.observations_added, 1);
     assert_eq!(stats.map_points_merged, 0);
     assert_eq!(map.get_keyframe(10).unwrap().map_point(0), Some(point));
-    assert!(map.map_points()[point].observation_kf_indices.contains(&10));
+    assert!(map.map_points()[point].is_observed_by(10));
 }
 
 #[test]
 fn loop_fusion_merges_consistent_duplicate_points() {
     let mut map = Map::new();
     let descriptor = [9; 32];
-    map.upsert_keyframe(Keyframe::from_frame(frame(
+    map.insert_keyframe(Keyframe::from_frame(frame(
         0,
         Pose3d::IDENTITY,
         &[[320.0, 240.0]],
         vec![descriptor],
-    )));
-    map.upsert_keyframe(Keyframe::from_frame(frame(
+    )))
+    .unwrap();
+    map.insert_keyframe(Keyframe::from_frame(frame(
         10,
         Pose3d::IDENTITY,
         &[[320.8, 240.0]],
         vec![descriptor],
-    )));
-    let candidate_point = map.push_map_point(MapPoint::new(
-        Vec3F64::new(0.0, 0.0, 5.0),
-        descriptor,
-        0,
-        [0; 3],
-        0,
-    ));
-    let query_point = map.push_map_point(MapPoint::new(
-        Vec3F64::new(0.01, 0.0, 5.0),
-        descriptor,
-        0,
-        [0; 3],
-        10,
-    ));
-    map.get_keyframe_mut(0)
-        .unwrap()
-        .associate_map_point(0, candidate_point);
-    map.get_keyframe_mut(10)
-        .unwrap()
-        .associate_map_point(0, query_point);
+    )))
+    .unwrap();
+    // Seeded through the canonical API so each association has a matching
+    // observation record; merge redirects records, not bare slots.
+    let candidate_point = map
+        .insert_landmark(LandmarkSeed {
+            position: Vec3F64::new(0.0, 0.0, 5.0),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 0,
+                feature_idx: 0,
+            },
+        })
+        .unwrap();
+    let query_point = map
+        .insert_landmark(LandmarkSeed {
+            position: Vec3F64::new(0.01, 0.0, 5.0),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 10,
+                feature_idx: 0,
+            },
+        })
+        .unwrap();
 
     let stats = fuse_verified_loop(
         &mut map,
@@ -390,28 +401,29 @@ fn loop_fusion_merges_consistent_duplicate_points() {
 #[test]
 fn loop_fusion_rejects_descriptor_mismatch() {
     let mut map = Map::new();
-    map.upsert_keyframe(Keyframe::from_frame(frame(
+    map.insert_keyframe(Keyframe::from_frame(frame(
         0,
         Pose3d::IDENTITY,
         &[[320.0, 240.0]],
         vec![[0; 32]],
-    )));
-    map.upsert_keyframe(Keyframe::from_frame(frame(
+    )))
+    .unwrap();
+    map.insert_keyframe(Keyframe::from_frame(frame(
         10,
         Pose3d::IDENTITY,
         &[[320.0, 240.0]],
         vec![[u8::MAX; 32]],
-    )));
-    let point = map.push_map_point(MapPoint::new(
-        Vec3F64::new(0.0, 0.0, 5.0),
-        [0; 32],
-        0,
-        [0; 3],
-        0,
-    ));
-    map.get_keyframe_mut(0)
-        .unwrap()
-        .associate_map_point(0, point);
+    )))
+    .unwrap();
+    map.insert_landmark(LandmarkSeed {
+        position: Vec3F64::new(0.0, 0.0, 5.0),
+        color: [0; 3],
+        reference: ObservationKey {
+            keyframe_idx: 0,
+            feature_idx: 0,
+        },
+    })
+    .unwrap();
 
     let stats = fuse_verified_loop(
         &mut map,
@@ -431,38 +443,40 @@ fn loop_fusion_rejects_descriptor_mismatch() {
 fn loop_fusion_rejects_duplicate_with_inconsistent_reciprocal_projection() {
     let mut map = Map::new();
     let descriptor = [5; 32];
-    map.upsert_keyframe(Keyframe::from_frame(frame(
+    map.insert_keyframe(Keyframe::from_frame(frame(
         0,
         Pose3d::IDENTITY,
         &[[320.0, 240.0]],
         vec![descriptor],
-    )));
-    map.upsert_keyframe(Keyframe::from_frame(frame(
+    )))
+    .unwrap();
+    map.insert_keyframe(Keyframe::from_frame(frame(
         10,
         Pose3d::IDENTITY,
         &[[320.0, 240.0]],
         vec![descriptor],
-    )));
-    let source_point = map.push_map_point(MapPoint::new(
-        Vec3F64::new(0.0, 0.0, 5.0),
-        descriptor,
-        0,
-        [0; 3],
-        0,
-    ));
-    let inconsistent_target = map.push_map_point(MapPoint::new(
-        Vec3F64::new(1.0, 0.0, 5.0),
-        descriptor,
-        0,
-        [0; 3],
-        10,
-    ));
-    map.get_keyframe_mut(0)
-        .unwrap()
-        .associate_map_point(0, source_point);
-    map.get_keyframe_mut(10)
-        .unwrap()
-        .associate_map_point(0, inconsistent_target);
+    )))
+    .unwrap();
+    let source_point = map
+        .insert_landmark(LandmarkSeed {
+            position: Vec3F64::new(0.0, 0.0, 5.0),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 0,
+                feature_idx: 0,
+            },
+        })
+        .unwrap();
+    let inconsistent_target = map
+        .insert_landmark(LandmarkSeed {
+            position: Vec3F64::new(1.0, 0.0, 5.0),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 10,
+                feature_idx: 0,
+            },
+        })
+        .unwrap();
 
     let stats = fuse_verified_loop(
         &mut map,
@@ -484,7 +498,8 @@ fn pgo_reduces_terminal_loop_gap_without_moving_anchor() {
     let mut map = Map::new();
     for index in 0..5 {
         let pose = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(-(index as f64), 0.0, 0.0));
-        map.upsert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())));
+        map.insert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())))
+            .unwrap();
     }
     let verified = VerifiedLoopEdge {
         query_kf_idx: 4,
@@ -517,7 +532,8 @@ fn inertial_pgo_uses_four_dof_and_preserves_gravity() {
         let rotation = tilt * yaw_world;
         let center = Vec3F64::new(index as f64, index as f64 * 0.05, 0.0);
         let pose = Pose3d::new(rotation, -(rotation * center));
-        map.upsert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())));
+        map.insert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())))
+            .unwrap();
     }
     let verified = VerifiedLoopEdge {
         query_kf_idx: 4,
@@ -547,4 +563,193 @@ fn inertial_pgo_uses_four_dof_and_preserves_gravity() {
         max_gravity_alignment_error(&result.original_poses, &result.optimized_poses, gravity,)
             <= 1e-4
     );
+}
+
+fn closing_config() -> LoopClosingConfig {
+    LoopClosingConfig {
+        episode: LoopEpisodeConfig {
+            min_consistent_edges: 1,
+            ..LoopEpisodeConfig::default()
+        },
+        verification: LoopVerificationConfig {
+            min_correspondences: 20,
+            min_inliers: 20,
+            min_inlier_ratio: 0.8,
+            min_occupied_cells: 4,
+            pnp_ransac: RansacParams {
+                random_seed: Some(7),
+                ..LoopVerificationConfig::default().pnp_ransac
+            },
+            ..LoopVerificationConfig::default()
+        },
+        ..LoopClosingConfig::default()
+    }
+}
+
+fn closing_fixture(config: Option<LoopClosingConfig>) -> (LoopCloser, Map) {
+    let (mut map, _) = synthetic_loop_map();
+    // The observed pixels still describe the true pose, but odometry has drifted.
+    let mut drifted = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    drifted.translation.x += 0.6;
+    map.set_keyframe_pose_for_test(10, drifted);
+    let descriptors: Vec<_> = map
+        .get_keyframe(0)
+        .unwrap()
+        .frame
+        .features
+        .descriptors
+        .iter()
+        .map(kornia_bow::orb_slam3::pack_orb_descriptor)
+        .collect();
+    let mut closer = LoopCloser::new(config);
+    closer.set_vocabulary(Vocabulary::train(&descriptors, 1).unwrap());
+    let first = closer.on_keyframe(&mut map, &camera(), 0, LoopClosingContext::default());
+    assert!(first.events.is_empty());
+    assert!(first.debug_message.is_none());
+    assert_eq!(closer.kf_database.len(), 1);
+    (closer, map)
+}
+
+fn closing_context() -> LoopClosingContext {
+    LoopClosingContext {
+        reference_keyframe_idx: Some(10),
+        inertial: None,
+    }
+}
+
+#[test]
+fn loop_closer_without_vocabulary_does_not_index_or_mutate_map() {
+    let (mut map, _) = synthetic_loop_map();
+    let before = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    let mut closer = LoopCloser::new(Some(closing_config()));
+    let outcome = closer.on_keyframe(&mut map, &camera(), 10, closing_context());
+    assert!(closer.kf_database.is_empty());
+    assert!(outcome.events.is_empty());
+    assert!(outcome.reference_correction.is_none());
+    assert_eq!(
+        map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
+        before
+    );
+}
+
+#[test]
+fn loop_closer_detection_only_indexes_and_reports_candidate_without_correction() {
+    let (mut closer, mut map) = closing_fixture(None);
+    let before = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    let outcome = closer.on_keyframe(&mut map, &camera(), 10, closing_context());
+    assert_eq!(closer.kf_database.len(), 2);
+    assert!(outcome.debug_message.unwrap().contains("matched kf=0"));
+    assert!(outcome.events.is_empty());
+    assert!(outcome.reference_correction.is_none());
+    assert!(closer.verified_loops.is_empty());
+    assert_eq!(
+        map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
+        before
+    );
+}
+
+#[test]
+fn loop_closer_imu_gate_preserves_indexing_without_accepting_loop() {
+    let config = LoopClosingConfig {
+        require_imu_initialized: true,
+        ..closing_config()
+    };
+    let (mut closer, mut map) = closing_fixture(Some(config));
+    let outcome = closer.on_keyframe(&mut map, &camera(), 10, closing_context());
+    assert_eq!(closer.kf_database.len(), 2);
+    assert!(outcome.debug_message.is_some());
+    assert!(outcome.events.is_empty());
+    assert!(outcome.reference_correction.is_none());
+    assert!(closer.verified_loops.is_empty());
+}
+
+#[test]
+fn loop_closer_applies_map_correction_and_returns_reference_geometry() {
+    let mut config = closing_config();
+    // Make this synthetic loop strong enough to bring projections within the
+    // unchanged fusion gates; the default weight only partially corrects drift.
+    config.optimizer.loop_edge_weight = 100.0;
+    let (mut closer, mut map) = closing_fixture(Some(config));
+    let before = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    let anchor = map.get_keyframe(0).unwrap().frame.pose_world_to_cam;
+    let outcome = closer.on_keyframe(&mut map, &camera(), 10, closing_context());
+    assert!(matches!(
+        outcome.events.as_slice(),
+        [LoopClosureEvent::Accepted { applied: true, .. }]
+    ));
+    let correction = outcome.reference_correction.unwrap();
+    assert_eq!(correction.before, before);
+    assert_eq!(
+        correction.after,
+        map.get_keyframe(10).unwrap().frame.pose_world_to_cam
+    );
+    assert!((correction.after.translation - before.translation).length() > 0.01);
+    assert_eq!(map.get_keyframe(0).unwrap().frame.pose_world_to_cam, anchor);
+    assert!(map.get_keyframe(10).unwrap().num_associated_points() > 0);
+    assert_eq!(closer.verified_loops.len(), 1);
+    assert!(closer.verified_loop_pairs.contains(&(0, 10)));
+}
+
+#[test]
+fn loop_closer_skips_an_already_verified_pair() {
+    let (mut closer, mut map) = closing_fixture(Some(closing_config()));
+    closer.verified_loop_pairs.insert((0, 10));
+    let before = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    let outcome = closer.on_keyframe(&mut map, &camera(), 10, closing_context());
+    assert!(outcome.debug_message.is_some());
+    assert!(outcome.events.is_empty());
+    assert!(outcome.reference_correction.is_none());
+    assert!(closer.verified_loops.is_empty());
+    assert_eq!(
+        map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
+        before
+    );
+}
+
+#[test]
+fn loop_closer_missing_reference_records_acceptance_without_mutating_map() {
+    let (mut closer, mut map) = closing_fixture(Some(closing_config()));
+    let before = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    let context = LoopClosingContext {
+        reference_keyframe_idx: Some(999),
+        inertial: None,
+    };
+    let outcome = closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert!(matches!(outcome.events.as_slice(), [
+        LoopClosureEvent::PgoFailed { reason, .. },
+        LoopClosureEvent::Accepted { applied: false, .. }
+    ] if reason.contains("reference keyframe")));
+    assert!(outcome.reference_correction.is_none());
+    assert_eq!(
+        map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
+        before
+    );
+    assert_eq!(map.get_keyframe(10).unwrap().num_associated_points(), 0);
+    assert_eq!(closer.verified_loops.len(), 1);
+}
+
+#[test]
+fn loop_closer_solver_failure_returns_no_reference_correction() {
+    let (mut closer, mut map) = closing_fixture(Some(closing_config()));
+    let before = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    let context = LoopClosingContext {
+        inertial: Some(InertialPgoContext {
+            gravity_world: Vec3F64::ZERO,
+        }),
+        ..closing_context()
+    };
+    let outcome = closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert!(matches!(
+        outcome.events.as_slice(),
+        [
+            LoopClosureEvent::PgoFailed { .. },
+            LoopClosureEvent::Accepted { applied: false, .. }
+        ]
+    ));
+    assert!(outcome.reference_correction.is_none());
+    assert_eq!(
+        map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
+        before
+    );
+    assert_eq!(closer.verified_loops.len(), 1);
 }
