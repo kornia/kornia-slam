@@ -14,7 +14,7 @@ use crate::datasets::euroc::GroundTruthPose;
 /// Image decoding is intentionally excluded. Rectification is performed by the
 /// frame source, frontend work covers measurement preparation, feature
 /// extraction and stereo matching, and pipeline work is the stateful
-/// `SlamPipeline::process_frame` call.
+/// `SlamSystem::process_frame` call.
 pub struct FrameTiming {
     pub frame_idx: usize,
     pub rectify_ms: f64,
