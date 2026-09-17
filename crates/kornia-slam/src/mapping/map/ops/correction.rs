@@ -1060,6 +1060,32 @@ mod ba_tests {
         assert_eq!(map.map_points()[later_point].position.x, 9.0);
     }
 
+    /// A fresh bootstrap clears the active map before publishing, so any
+    /// asynchronous update still in flight for the abandoned map must be
+    /// refused: its coordinates belong to a world frame that no longer exists.
+    #[test]
+    fn clearing_the_active_map_rejects_an_in_flight_ba_snapshot() {
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])))
+            .unwrap();
+        map.insert_landmark(seeded_at(0, 0, Vec3F64::new(1.0, 0.0, 5.0)))
+            .unwrap();
+
+        let mut snapshot = map.ba_snapshot().into_update();
+        snapshot.map_points[0].x = 7.0;
+
+        map.clear_active();
+
+        assert_eq!(
+            map.apply_ba_update(snapshot).unwrap_err(),
+            BaUpdateError::ObsoleteWorldFrame
+        );
+        assert!(
+            map.keyframes().is_empty() && map.map_points().is_empty(),
+            "the refused update must not repopulate the cleared map"
+        );
+    }
+
     #[test]
     fn local_ba_snapshot_merge_rejects_an_obsolete_world_frame() {
         let mut map = Map::new();

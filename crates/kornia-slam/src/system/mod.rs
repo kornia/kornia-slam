@@ -14,6 +14,9 @@ pub use config::{LoopClosingConfig, SlamConfig};
 use std::sync::{Arc, Mutex};
 
 use crate::Frame;
+use crate::initialization::bootstrap::{
+    BootstrapPublicationReject, ClaimedView, first_duplicate_claim,
+};
 use crate::initialization::{
     ImuInitNotReadyReason, ImuInitResult, InertialInitOutcome, TwoViewInitConfig,
     try_initialize_two_view,
@@ -70,6 +73,41 @@ pub(crate) enum ImuInitApplyError {
     InvalidGravity,
     #[error(transparent)]
     Alignment(#[from] InertialAlignmentError),
+}
+
+/// Unmatched bootstrap attempts a stored reference survives.
+///
+/// The comparison is `>`, so replacement happens on the eleventh unmatched
+/// attempt against one reference.
+///
+/// `LowMatches` means the reference and the current frame no longer share
+/// enough of the scene to estimate anything, where `LowParallax` means the pair
+/// does overlap and only needs more motion. Overlap may in principle return, so
+/// this is a bounded patience policy rather than a proof that it cannot: past
+/// the bound, continuing to hold the reference is the worse bet. One run held
+/// an unusable reference for 1194 frames, matching 0-2 of the 100 descriptors
+/// required.
+///
+/// Ten attempts is half a second of failure at 20 Hz: long enough to ride out
+/// a burst of motion blur or occlusion, short enough that a lost reference is
+/// dropped while the scene is still reachable. The count is cumulative per
+/// reference, so a reference that fails persistently with varying reasons is
+/// still replaced.
+const MAX_UNMATCHED_BOOTSTRAP_ATTEMPTS: usize = 10;
+
+/// Minimum keypoints for a frame to take part in bootstrap at all.
+const MIN_KEYPOINTS_FOR_BOOTSTRAP: usize = 100;
+
+/// Why a bootstrap map could not be published.
+///
+/// Separates the acceptance decision, which happens before any write, from a
+/// rejected map mutation, which is the map refusing a batch it was handed.
+#[derive(Debug, thiserror::Error)]
+enum InitialMapError {
+    #[error("{0}")]
+    Refused(#[from] BootstrapPublicationReject),
+    #[error(transparent)]
+    Mutation(#[from] MapMutationError),
 }
 
 impl SlamSystem {
@@ -265,6 +303,26 @@ impl SlamSystem {
         }
     }
 
+    /// Stores `frame` as the bootstrap reference.
+    ///
+    /// The unmatched count belongs to the reference it was charged against, so a
+    /// newly stored reference always starts at zero: failures attributed to a
+    /// predecessor must not shorten its successor's life. The reference also
+    /// defines the inertial window origin, so its timestamp moves with it and
+    /// samples that can no longer enter an edge are dropped.
+    fn store_bootstrap_reference(&mut self, frame: Frame, timestamp_sec: f64) {
+        self.tracker.state.bootstrap_frame = Some(frame);
+        self.tracker.state.bootstrap_unmatched_attempts = 0;
+        self.inertial.bootstrap_timestamp_sec = Some(timestamp_sec);
+        self.inertial.prune_before(timestamp_sec);
+    }
+
+    /// Drops the bootstrap reference and the failures charged against it.
+    fn discard_bootstrap_reference(&mut self) {
+        self.tracker.state.bootstrap_frame = None;
+        self.tracker.state.bootstrap_unmatched_attempts = 0;
+    }
+
     fn bootstrap_step(&mut self, curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
         // Stereo frames carry metric per-keypoint depth, so we can build a
         // metric map from a single keyframe (ORB-SLAM3's StereoInitialization)
@@ -379,7 +437,6 @@ impl SlamSystem {
         // a frame with too few keypoints is neither a viable reference nor
         // a viable current frame. If we already had a reference, drop it
         // and wait for a feature-rich frame to start over.
-        const MIN_KEYPOINTS_FOR_BOOTSTRAP: usize = 100;
         if curr_frame.features.keypoints_xy.len() <= MIN_KEYPOINTS_FOR_BOOTSTRAP {
             self.dbg(format!(
                 "[bootstrap] frame={} skip: too few keypoints ({}, need > {})",
@@ -387,7 +444,7 @@ impl SlamSystem {
                 curr_frame.features.keypoints_xy.len(),
                 MIN_KEYPOINTS_FOR_BOOTSTRAP,
             ));
-            self.tracker.state.bootstrap_frame = None;
+            self.discard_bootstrap_reference();
             return TrackingResult {
                 pose_world_to_cam: self.tracker.state.pose_world_to_cam,
                 status: TrackingStatus::Skipped,
@@ -399,10 +456,7 @@ impl SlamSystem {
                 "[bootstrap] frame={} stored as reference (awaiting second frame)",
                 curr_frame.idx,
             ));
-            self.tracker.state.bootstrap_frame = Some(curr_frame);
-            self.inertial.bootstrap_timestamp_sec = Some(timestamp_sec);
-            // Samples before the reference frame can never enter an edge.
-            self.inertial.prune_before(timestamp_sec);
+            self.store_bootstrap_reference(curr_frame, timestamp_sec);
             return TrackingResult {
                 pose_world_to_cam: self.tracker.state.pose_world_to_cam,
                 status: TrackingStatus::Skipped,
@@ -423,7 +477,43 @@ impl SlamSystem {
                     "[bootstrap] frame={} (ref={}) reject: {}",
                     curr_frame.idx, prev_bootstrap_frame.idx, reason,
                 ));
-                self.tracker.state.bootstrap_frame = Some(prev_bootstrap_frame);
+                // Only a correspondence failure says the reference has lost the
+                // scene. Every other rejection — parallax, geometry, too few
+                // triangulated points — happens *because* the pair still
+                // overlaps, and those improve as the camera moves, so the
+                // reference is kept and its count is left untouched.
+                let unmatched = matches!(
+                    reason,
+                    crate::initialization::TwoViewRejectReason::LowMatches { .. }
+                );
+                // Counted cumulatively for this reference. A LowMatches
+                // refusal is evidence the reference does not overlap the current
+                // view, and an intervening rejection of another kind does not
+                // undo that evidence: with a consecutive counter, alternating
+                // reasons kept an unusable reference indefinitely. Other
+                // rejections leave the count alone. It is discarded with the
+                // reference, or on a successful pair.
+                if unmatched {
+                    self.tracker.state.bootstrap_unmatched_attempts += 1;
+                }
+                let exhausted = self.tracker.state.bootstrap_unmatched_attempts
+                    > MAX_UNMATCHED_BOOTSTRAP_ATTEMPTS;
+                // Promote the current frame only if it could serve as a
+                // reference itself; otherwise keep waiting rather than trade a
+                // stale reference for an unusable one.
+                let promotable =
+                    curr_frame.features.keypoints_xy.len() > MIN_KEYPOINTS_FOR_BOOTSTRAP;
+                if exhausted && promotable {
+                    self.dbg(format!(
+                        "[bootstrap] frame={} replacing reference {} after {} unmatched attempts",
+                        curr_frame.idx,
+                        prev_bootstrap_frame.idx,
+                        self.tracker.state.bootstrap_unmatched_attempts,
+                    ));
+                    self.store_bootstrap_reference(curr_frame, timestamp_sec);
+                } else {
+                    self.tracker.state.bootstrap_frame = Some(prev_bootstrap_frame);
+                }
                 return TrackingResult {
                     pose_world_to_cam: self.tracker.state.pose_world_to_cam,
                     status: TrackingStatus::Skipped,
@@ -448,6 +538,8 @@ impl SlamSystem {
         // once, from the stored keyframe, after both gates pass — which also
         // picks up whatever initial BA refined.
         curr_frame.pose_world_to_cam = estimated_pose;
+
+        self.tracker.state.bootstrap_unmatched_attempts = 0;
 
         // Promote to Keyframes
         let prev_idx = prev_bootstrap_frame.idx;
@@ -568,7 +660,7 @@ impl SlamSystem {
         points3d: &[Vec3F64],
         inlier_indices: &[usize],
         median_depth: Option<f64>,
-    ) -> Result<usize, MapMutationError> {
+    ) -> Result<usize, InitialMapError> {
         let depth_scale = median_depth.filter(|&d| d > 1e-6).unwrap_or(1.0);
         let reference_pose_inv = reference_kf.frame.pose_world_to_cam.inverse();
 
@@ -620,15 +712,27 @@ impl SlamSystem {
             ..Default::default()
         };
         // The two-view result can name one feature twice — two triangulated
-        // points landing on the same keypoint in either view. The old
-        // last-wins insertion hid that; a validated batch would refuse the
-        // whole bootstrap over it, so resolve it first.
+        // points landing on the same keypoint in either view. Bootstrap refuses
+        // such a pair outright and lets the coordinator retry on a later one;
+        // see `first_duplicate_claim` for why this is a compatibility guard and
+        // not a geometric verdict. Nothing has been written at this point.
         let claims: Vec<(usize, usize)> = triangulated
             .iter()
             .map(|&(_, _, _, ref_desc_idx, curr_desc_idx)| (ref_desc_idx, curr_desc_idx))
             .collect();
-        for index in crate::mapping::growth::accepted_pair_claims(&claims) {
-            let (position, _descriptor, color, ref_desc_idx, curr_desc_idx) = &triangulated[index];
+        if let Some(claim) = first_duplicate_claim(&claims) {
+            return Err(BootstrapPublicationReject::DuplicateFeatureClaim {
+                keyframe_idx: match claim.view {
+                    ClaimedView::Reference => reference_kf_idx,
+                    ClaimedView::Current => current_kf_idx,
+                },
+                claim,
+            }
+            .into());
+        }
+        // Conflict-free, so every proposal is publishable and they publish in
+        // the order the triangulator emitted them.
+        for (position, _descriptor, color, ref_desc_idx, curr_desc_idx) in &triangulated {
             let new_index = request.landmarks.len();
             request.landmarks.push(LandmarkSeed {
                 position: *position,
@@ -646,13 +750,20 @@ impl SlamSystem {
                 landmark: LandmarkTarget::New(new_index),
             });
         }
-        let added = self
-            .map
-            .lock()
-            .unwrap()
-            .apply_insertion(request)?
-            .landmark_ids
-            .len();
+        // A bootstrap publication seeds an *empty* active map: it normalises the
+        // pair's depths to a median of 1 in its own gauge and only ever creates
+        // new landmarks, so it has no way to relate itself to landmarks already
+        // there. Whatever an abandoned epoch left behind would otherwise stay in
+        // the map under an unrelated scale, where projection-guided tracking can
+        // still match it. Clearing and publishing under one lock so no other
+        // thread sees the map between the two.
+        let added = {
+            let mut map = self.map.lock().unwrap();
+            if !map.keyframes().is_empty() {
+                map.clear_active();
+            }
+            map.apply_insertion(request)?.landmark_ids.len()
+        };
 
         crate::mapping::bundle_adjustment::run_initial_ba(
             &mut self.map.lock().unwrap(),
@@ -1124,16 +1235,429 @@ impl SlamSystem {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImuInitApplyError, SlamConfig, SlamSystem};
+    use super::{ImuInitApplyError, InitialMapError, SlamConfig, SlamSystem};
     use crate::Frame;
+    use crate::initialization::bootstrap::{BootstrapPublicationReject, ClaimedView};
     use crate::initialization::{ImuInitResult, KeyframeVelocity};
     use crate::map::Keyframe;
+    use crate::tracking::TrackingStatus;
     use kornia_3d::camera::PinholeCamera;
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::{SO3F64, Vec3F64};
     use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbFeatures;
     use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias};
+
+    /// A descriptor set that is distinctive per synthetic scene.
+    fn epoch_descriptor(scene: u64, index: usize) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut x = scene
+            .wrapping_mul(0x9E3779B97F4A7C15)
+            .wrapping_add(index as u64 + 1);
+        for byte in out.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *byte = (x >> 24) as u8;
+        }
+        out
+    }
+
+    fn epoch_test_camera() -> PinholeCamera {
+        PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        }
+    }
+
+    /// A grid of landmarks spread in depth around five metres, seen from a
+    /// camera centre at `+x_offset`. 150 points clears the 100-match and
+    /// 50-triangulated gates.
+    ///
+    /// Each point keeps a fixed normalised image position and takes its own
+    /// depth, so the reference view is a clean grid while the depths differ
+    /// point by point. That gives the two-view estimator real structure —
+    /// without it, a fronto-parallel plane leaves the cheirality decomposition
+    /// ambiguous — and keeps every feature of one grid row on one image row, so
+    /// a correspondence between two features of the same row is still
+    /// epipolar-consistent under the `x`-only motion used here.
+    fn epoch_scene_frame(idx: usize, scene: u64, x_offset: f64) -> Frame {
+        let camera = epoch_test_camera();
+        let points: Vec<Vec3F64> = (0..150)
+            .map(|i| {
+                let x_norm = ((i % 15) as f64 * 0.12 - 0.84) / 5.0;
+                let y_norm = ((i / 15) as f64 * 0.12 - 0.54) / 5.0;
+                let depth = 5.0 + ((i * 7) % 5) as f64 * 0.8;
+                Vec3F64::new(x_norm * depth, y_norm * depth, depth)
+            })
+            .collect();
+        let pose = Pose3d::new(SO3F64::IDENTITY.matrix(), Vec3F64::new(-x_offset, 0.0, 0.0));
+        let n = points.len();
+        Frame {
+            idx,
+            features: OrbFeatures {
+                keypoints_xy: points
+                    .iter()
+                    .map(|p| {
+                        let c = pose.transform_point(p);
+                        [
+                            (camera.fx * c.x / c.z + camera.cx) as f32,
+                            (camera.fy * c.y / c.z + camera.cy) as f32,
+                        ]
+                    })
+                    .collect(),
+                orientations: vec![0.0; n],
+                descriptors: (0..n).map(|i| epoch_descriptor(scene, i)).collect(),
+                octaves: vec![0; n],
+            },
+            pose_world_to_cam: Pose3d::IDENTITY,
+            image_size: ImageSize {
+                width: 640,
+                height: 480,
+            },
+            keypoint_colors: vec![[0; 3]; n],
+            u_right: Vec::new(),
+            depth: Vec::new(),
+            keypoints_undist: Vec::new(),
+        }
+    }
+
+    /// The same scene, but two features in one row carry one descriptor.
+    ///
+    /// Matching is directional — each reference descriptor takes its best
+    /// current descriptor — so both of these claim the *same* current feature.
+    /// Both sit on one image row, and the synthetic motion is along `x`, so both
+    /// are epipolar-consistent and survive as inliers: exactly the duplicate
+    /// claim seen on the dataset.
+    fn epoch_scene_frame_with_duplicate_descriptor(
+        idx: usize,
+        scene: u64,
+        x_offset: f64,
+        kept: usize,
+        duplicated_onto: usize,
+    ) -> Frame {
+        let mut frame = epoch_scene_frame(idx, scene, x_offset);
+        let descriptor = frame.features.descriptors[kept];
+        frame.features.descriptors[duplicated_onto] = descriptor;
+        frame
+    }
+
+    fn epoch_test_system() -> SlamSystem {
+        SlamSystem::new(
+            epoch_test_camera(),
+            SlamConfig {
+                local_mapping: crate::map::LocalMappingMode::Synchronous,
+                debug: true,
+                ..SlamConfig::default()
+            },
+        )
+    }
+
+    /// Keyframes for the publication path: `n` features on one row, so any
+    /// feature index below `n` is a valid slot to claim.
+    fn publication_keyframe(idx: usize, n: usize) -> Keyframe {
+        let frame = Frame {
+            idx,
+            features: OrbFeatures {
+                keypoints_xy: (0..n).map(|i| [300.0 + i as f32, 240.0]).collect(),
+                orientations: vec![0.0; n],
+                descriptors: (0..n).map(|i| epoch_descriptor(9, i)).collect(),
+                octaves: vec![0; n],
+            },
+            pose_world_to_cam: Pose3d::IDENTITY,
+            image_size: ImageSize {
+                width: 640,
+                height: 480,
+            },
+            keypoint_colors: vec![[0; 3]; n],
+            u_right: Vec::new(),
+            depth: Vec::new(),
+            keypoints_undist: Vec::new(),
+        };
+        Keyframe::from_frame(frame)
+    }
+
+    /// A bootstrap publication must seed an empty active map.
+    ///
+    /// The publication normalises the pair's triangulated depths so the
+    /// reference median depth is 1, and it only ever creates new landmarks — it
+    /// cannot relate itself to landmarks already in the map. Appending it to an
+    /// abandoned epoch therefore leaves two independently scaled reconstructions
+    /// in one map, where projection-guided tracking can still match the old ones.
+    #[test]
+    fn a_second_bootstrap_epoch_does_not_publish_into_the_first() {
+        let image = kornia_image::Image::from_size_val(
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            0u8,
+        )
+        .unwrap();
+        let mut system = epoch_test_system();
+
+        // Epoch A: a pair with real parallax bootstraps a map.
+        system.process_frame(epoch_scene_frame(0, 1, 0.0), None, &image, 0.0, Vec::new());
+        system.process_frame(epoch_scene_frame(1, 1, 0.6), None, &image, 0.2, Vec::new());
+        let epoch_a: Vec<usize> = system
+            .map
+            .lock()
+            .unwrap()
+            .keyframes()
+            .iter()
+            .map(|kf| kf.frame.idx)
+            .collect();
+        assert_eq!(epoch_a, vec![0, 1], "epoch A should have seeded the map");
+
+        // Tracking gives up and restarts bootstrap, exactly as the loss path does.
+        system.tracker.restart_bootstrap();
+
+        // Epoch B: a different scene bootstraps its own pair.
+        system.process_frame(epoch_scene_frame(10, 2, 0.0), None, &image, 2.0, Vec::new());
+        system.process_frame(epoch_scene_frame(11, 2, 0.6), None, &image, 2.2, Vec::new());
+
+        let map = system.map.lock().unwrap();
+        let keyframes: Vec<usize> = map.keyframes().iter().map(|kf| kf.frame.idx).collect();
+        assert_eq!(
+            keyframes,
+            vec![10, 11],
+            "the second bootstrap must publish into a map cleared of the abandoned epoch"
+        );
+        let live = map.map_points().iter().filter(|mp| !mp.culled).count();
+        let reachable = map
+            .map_points()
+            .iter()
+            .enumerate()
+            .filter(|(id, mp)| {
+                !mp.culled
+                    && map.keyframes().iter().any(|kf| {
+                        kf.map_point_by_desc_idx
+                            .iter()
+                            .flatten()
+                            .any(|slot| slot == id)
+                    })
+            })
+            .count();
+        assert!(live > 0, "the second epoch must have published landmarks");
+        assert_eq!(
+            reachable, live,
+            "every live landmark must be observed by a keyframe of the current epoch"
+        );
+    }
+
+    /// A duplicate claim in the *current* view is reported with the identity of
+    /// the actual conflict, and nothing is published.
+    #[test]
+    fn publication_refuses_a_duplicate_current_view_claim_with_its_identity() {
+        let mut system = epoch_test_system();
+        let reference_kf = publication_keyframe(4, 8);
+        let current_kf = publication_keyframe(5, 8);
+
+        // Two reference features, 2 and 3, both claim current feature 6.
+        let matches = vec![(2, 6), (3, 6), (1, 2)];
+        let points3d = vec![
+            Vec3F64::new(0.10, 0.0, 2.0),
+            Vec3F64::new(-0.05, 0.0, 2.4),
+            Vec3F64::new(0.20, 0.0, 2.2),
+        ];
+        let inlier_indices = vec![0, 1, 2];
+
+        let error = system
+            .build_initial_map(
+                reference_kf,
+                current_kf,
+                &matches,
+                &points3d,
+                &inlier_indices,
+                Some(2.0),
+            )
+            .expect_err("a duplicate claim must refuse the publication");
+
+        match error {
+            InitialMapError::Refused(BootstrapPublicationReject::DuplicateFeatureClaim {
+                keyframe_idx,
+                claim,
+            }) => {
+                assert_eq!(
+                    keyframe_idx, 5,
+                    "the current keyframe owns the claimed slot"
+                );
+                assert_eq!(claim.view, ClaimedView::Current);
+                assert_eq!(claim.feature_idx, 6, "feature 6 is the claimed slot");
+                assert_eq!(claim.first_proposal, 0);
+                assert_eq!(claim.later_proposal, 1);
+            }
+            other => panic!("expected a duplicate-claim refusal, got {other:?}"),
+        }
+
+        let map = system.map.lock().unwrap();
+        assert!(
+            map.keyframes().is_empty(),
+            "a refused candidate must not publish keyframes"
+        );
+        assert!(
+            map.map_points().is_empty(),
+            "a refused candidate must not publish landmarks"
+        );
+    }
+
+    /// The same, for a duplicate claim in the *reference* view: the reported
+    /// keyframe and feature must be the reference ones.
+    #[test]
+    fn publication_refuses_a_duplicate_reference_view_claim_with_its_identity() {
+        let mut system = epoch_test_system();
+        let reference_kf = publication_keyframe(4, 8);
+        let current_kf = publication_keyframe(5, 8);
+
+        // Reference feature 3 is claimed by two proposals, for two different
+        // current features.
+        let matches = vec![(1, 2), (3, 4), (3, 5)];
+        let points3d = vec![
+            Vec3F64::new(0.10, 0.0, 2.0),
+            Vec3F64::new(-0.05, 0.0, 2.4),
+            Vec3F64::new(0.20, 0.0, 2.2),
+        ];
+        let inlier_indices = vec![0, 1, 2];
+
+        let error = system
+            .build_initial_map(
+                reference_kf,
+                current_kf,
+                &matches,
+                &points3d,
+                &inlier_indices,
+                Some(2.0),
+            )
+            .expect_err("a duplicate claim must refuse the publication");
+
+        match error {
+            InitialMapError::Refused(BootstrapPublicationReject::DuplicateFeatureClaim {
+                keyframe_idx,
+                claim,
+            }) => {
+                assert_eq!(
+                    keyframe_idx, 4,
+                    "the reference keyframe owns the claimed slot"
+                );
+                assert_eq!(claim.view, ClaimedView::Reference);
+                assert_eq!(claim.feature_idx, 3);
+                assert_eq!(claim.first_proposal, 1);
+                assert_eq!(claim.later_proposal, 2);
+            }
+            other => panic!("expected a duplicate-claim refusal, got {other:?}"),
+        }
+
+        assert!(system.map.lock().unwrap().keyframes().is_empty());
+    }
+
+    /// A conflict-free candidate published through the same path still works,
+    /// so the guard is not refusing everything.
+    #[test]
+    fn publication_accepts_a_conflict_free_candidate() {
+        let mut system = epoch_test_system();
+        let reference_kf = publication_keyframe(4, 8);
+        let current_kf = publication_keyframe(5, 8);
+
+        let matches = vec![(1, 2), (3, 4), (5, 6)];
+        let points3d = vec![
+            Vec3F64::new(0.10, 0.0, 2.0),
+            Vec3F64::new(-0.05, 0.0, 2.4),
+            Vec3F64::new(0.20, 0.0, 2.2),
+        ];
+        let inlier_indices = vec![0, 1, 2];
+
+        let added = system
+            .build_initial_map(
+                reference_kf,
+                current_kf,
+                &matches,
+                &points3d,
+                &inlier_indices,
+                Some(2.0),
+            )
+            .expect("a conflict-free candidate must publish");
+        assert_eq!(added, 3, "all three proposals should publish");
+        let map = system.map.lock().unwrap();
+        assert_eq!(
+            map.keyframes()
+                .iter()
+                .map(|kf| kf.frame.idx)
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+    }
+
+    /// The coordinator's rejection/retry transition, driven through
+    /// `process_frame`.
+    ///
+    /// The refused candidate must leave no map and must not be left advertised
+    /// as an accepted pair, and a later candidate must still be able to
+    /// bootstrap.
+    #[test]
+    fn a_refused_candidate_does_not_block_a_later_bootstrap() {
+        let image = kornia_image::Image::from_size_val(
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            0u8,
+        )
+        .unwrap();
+        let mut system = epoch_test_system();
+
+        // A reference frame in which features 6 and 7 — same image row — carry
+        // one descriptor, so both claim one current feature.
+        system.process_frame(
+            epoch_scene_frame_with_duplicate_descriptor(0, 1, 0.0, 6, 7),
+            None,
+            &image,
+            0.0,
+            Vec::new(),
+        );
+        let result =
+            system.process_frame(epoch_scene_frame(1, 1, 0.6), None, &image, 0.2, Vec::new());
+
+        assert_eq!(
+            result.status,
+            TrackingStatus::Skipped,
+            "a refused publication must not report an accepted keyframe"
+        );
+        assert!(
+            system.map.lock().unwrap().keyframes().is_empty(),
+            "a refused candidate must leave no keyframes in the map"
+        );
+        assert!(
+            system.map.lock().unwrap().map_points().is_empty(),
+            "a refused candidate must leave no landmarks in the map"
+        );
+        assert_eq!(
+            system.tracker.state.mode,
+            crate::tracking::SystemMode::Bootstrap,
+            "the coordinator must stay in bootstrap after a refusal"
+        );
+
+        // A later, conflict-free candidate bootstraps normally.
+        system.process_frame(epoch_scene_frame(2, 1, 0.0), None, &image, 0.4, Vec::new());
+        system.process_frame(epoch_scene_frame(3, 1, 0.6), None, &image, 0.6, Vec::new());
+        assert_eq!(
+            system
+                .map
+                .lock()
+                .unwrap()
+                .keyframes()
+                .iter()
+                .map(|kf| kf.frame.idx)
+                .collect::<Vec<_>>(),
+            vec![2, 3],
+            "bootstrap must still succeed on a later conflict-free pair"
+        );
+    }
 
     fn assert_pose_close(actual: Pose3d, expected: Pose3d) {
         assert!((actual.translation - expected.translation).length() < 1e-10);
@@ -1500,5 +2024,330 @@ mod tests {
         assert_eq!(system.tracker.state.last_frame_timestamp_sec, 1.0);
         assert!(system.tracker.state.lost_since_sec.is_none());
         assert_eq!(system.map.lock().unwrap().keyframes().len(), 2);
+    }
+    // ── bootstrap reference retention ────────────────────────────────────
+
+    /// Deterministic 256-bit descriptors, far apart in Hamming distance so a
+    /// point matches only its own counterpart (`th_low = 50`, `nn_ratio = 0.6`).
+    fn scene_descriptor(scene: u64, index: usize) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut x = scene
+            .wrapping_mul(0x9E3779B97F4A7C15)
+            .wrapping_add(index as u64 + 1);
+        for byte in out.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *byte = (x >> 24) as u8;
+        }
+        out
+    }
+
+    /// A grid of landmarks five metres out, projected from a camera centre at
+    /// `+x_offset`. 150 points clears the 100-match and 50-triangulated gates.
+    fn scene_frame(idx: usize, scene: u64, x_offset: f64) -> Frame {
+        let camera = bootstrap_test_camera();
+        let points: Vec<Vec3F64> = (0..150)
+            .map(|i| {
+                Vec3F64::new(
+                    (i % 15) as f64 * 0.12 - 0.84,
+                    (i / 15) as f64 * 0.12 - 0.54,
+                    5.0,
+                )
+            })
+            .collect();
+        let pose = Pose3d::new(SO3F64::IDENTITY.matrix(), Vec3F64::new(-x_offset, 0.0, 0.0));
+        let n = points.len();
+        Frame {
+            idx,
+            features: OrbFeatures {
+                keypoints_xy: points
+                    .iter()
+                    .map(|p| {
+                        let c = pose.transform_point(p);
+                        [
+                            (camera.fx * c.x / c.z + camera.cx) as f32,
+                            (camera.fy * c.y / c.z + camera.cy) as f32,
+                        ]
+                    })
+                    .collect(),
+                orientations: vec![0.0; n],
+                descriptors: (0..n).map(|i| scene_descriptor(scene, i)).collect(),
+                octaves: vec![0; n],
+            },
+            pose_world_to_cam: Pose3d::IDENTITY,
+            image_size: ImageSize {
+                width: 640,
+                height: 480,
+            },
+            keypoint_colors: vec![[0; 3]; n],
+            u_right: Vec::new(),
+            depth: Vec::new(),
+            keypoints_undist: Vec::new(),
+        }
+    }
+
+    fn bootstrap_test_camera() -> PinholeCamera {
+        PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        }
+    }
+
+    fn bootstrap_test_system() -> SlamSystem {
+        SlamSystem::new(
+            bootstrap_test_camera(),
+            SlamConfig {
+                local_mapping: crate::map::LocalMappingMode::Synchronous,
+                debug: true,
+                ..SlamConfig::default()
+            },
+        )
+    }
+
+    /// A stored bootstrap reference that can no longer match the scene must be
+    /// replaced, or bootstrap can never succeed again.
+    ///
+    /// Observed in `artifacts/dbgc-4.err`: after the reset at frame 305, frame
+    /// 305 stayed the reference for the remaining 1194 frames, matching 0-2
+    /// descriptors against the 100 required. `bootstrap_mono` restores
+    /// `prev_bootstrap_frame` after *every* two-view error, so a reference that
+    /// has lost the scene is retained forever.
+    #[test]
+    fn an_unusable_bootstrap_reference_is_eventually_replaced() {
+        let image = kornia_image::Image::from_size_val(
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            0u8,
+        )
+        .unwrap();
+        let mut system = bootstrap_test_system();
+
+        // Frame 0 becomes the reference, from a scene we then leave behind.
+        system.process_frame(scene_frame(0, 1, 0.0), None, &image, 0.0, Vec::new());
+        assert_eq!(
+            system.tracker.state.bootstrap_frame.as_ref().map(|f| f.idx),
+            Some(0),
+            "frame 0 should be stored as the bootstrap reference"
+        );
+
+        // A different scene arrives: no descriptor matches the old reference,
+        // so every attempt is refused for lack of correspondence. Each of
+        // these frames is itself a perfectly usable reference.
+        for idx in 1..=12 {
+            system.process_frame(
+                scene_frame(idx, 2, 0.0),
+                None,
+                &image,
+                idx as f64 * 0.05,
+                Vec::new(),
+            );
+        }
+
+        let reference = system.tracker.state.bootstrap_frame.as_ref().map(|f| f.idx);
+        assert_ne!(
+            reference,
+            Some(0),
+            "a reference that cannot match the scene for 12 consecutive frames \
+             must be replaced; it is still frame 0"
+        );
+
+        // With a usable reference from the new scene, a pair with real parallax
+        // must now be able to bootstrap.
+        system.process_frame(scene_frame(13, 2, 0.6), None, &image, 0.65, Vec::new());
+        assert!(
+            !system.map.lock().unwrap().keyframes().is_empty(),
+            "bootstrap should succeed once the reference belongs to the current scene"
+        );
+    }
+
+    /// The converse: a reference that still sees the scene but lacks parallax
+    /// must be kept, so parallax can accumulate.
+    #[test]
+    fn a_viable_bootstrap_reference_is_kept_while_parallax_accumulates() {
+        let image = kornia_image::Image::from_size_val(
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            0u8,
+        )
+        .unwrap();
+        let mut system = bootstrap_test_system();
+        system.process_frame(scene_frame(0, 1, 0.0), None, &image, 0.0, Vec::new());
+
+        // Same scene, negligible motion: matches are plentiful, parallax is not.
+        for idx in 1..=12 {
+            system.process_frame(
+                scene_frame(idx, 1, 0.001 * idx as f64),
+                None,
+                &image,
+                idx as f64 * 0.05,
+                Vec::new(),
+            );
+        }
+
+        assert_eq!(
+            system.tracker.state.bootstrap_frame.as_ref().map(|f| f.idx),
+            Some(0),
+            "a reference that still matches the scene must be retained while \
+             parallax accumulates"
+        );
+    }
+    /// The bound must survive *alternating* rejection reasons.
+    ///
+    /// Resetting the unmatched streak on every non-`LowMatches` rejection means
+    /// a reference that fails persistently — but not always for the same reason
+    /// — can be retained forever. Here the scene alternates between one the
+    /// reference cannot match at all and one it matches without usable
+    /// geometry, so a consecutive-only counter never reaches its bound.
+    #[test]
+    fn alternating_rejection_reasons_must_not_defeat_the_bound() {
+        let image = kornia_image::Image::from_size_val(
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            0u8,
+        )
+        .unwrap();
+        let mut system = bootstrap_test_system();
+        system.process_frame(scene_frame(0, 1, 0.0), None, &image, 0.0, Vec::new());
+        assert_eq!(
+            system.tracker.state.bootstrap_frame.as_ref().map(|f| f.idx),
+            Some(0)
+        );
+
+        // Alternate: an unmatchable scene (LowMatches), then the reference's own
+        // scene with no motion (a non-LowMatches rejection), repeatedly. The
+        // reference is never usable, yet never fails 10 times consecutively for
+        // the same reason.
+        for idx in 1..=40 {
+            let scene = if idx % 2 == 1 { 2 } else { 1 };
+            system.process_frame(
+                scene_frame(idx, scene, 0.0),
+                None,
+                &image,
+                idx as f64 * 0.05,
+                Vec::new(),
+            );
+        }
+
+        assert_ne!(
+            system.tracker.state.bootstrap_frame.as_ref().map(|f| f.idx),
+            Some(0),
+            "a reference failing for 40 frames must be replaced even when the \
+             rejection reason alternates"
+        );
+    }
+    /// A frame with too few keypoints to take part in bootstrap at all.
+    fn sparse_frame(idx: usize) -> Frame {
+        let mut frame = scene_frame(idx, 1, 0.0);
+        let keep = 50;
+        frame.features.keypoints_xy.truncate(keep);
+        frame.features.orientations.truncate(keep);
+        frame.features.descriptors.truncate(keep);
+        frame.features.octaves.truncate(keep);
+        frame.keypoint_colors.truncate(keep);
+        frame
+    }
+
+    /// The unmatched count belongs to the reference it was accumulated against.
+    ///
+    /// Failures charged to a discarded reference must not shorten the life of
+    /// its successor. Two transitions did not own the counter: a low-feature
+    /// frame dropping the stored reference, and the ordinary path that stores a
+    /// fresh one. A successor inherited the predecessor's failures and could be
+    /// replaced after only a few of its own.
+    #[test]
+    fn counter_ownership_survives_every_reference_transition() {
+        let image = kornia_image::Image::from_size_val(
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            0u8,
+        )
+        .unwrap();
+        let mut system = bootstrap_test_system();
+
+        // Reference A.
+        system.process_frame(scene_frame(0, 1, 0.0), None, &image, 0.0, Vec::new());
+        assert_eq!(
+            system.tracker.state.bootstrap_frame.as_ref().map(|f| f.idx),
+            Some(0)
+        );
+
+        // Eight unmatched attempts against A: below the replacement bound.
+        for idx in 1..=8 {
+            system.process_frame(
+                scene_frame(idx, 2, 0.0),
+                None,
+                &image,
+                idx as f64 * 0.05,
+                Vec::new(),
+            );
+        }
+        assert_eq!(
+            system.tracker.state.bootstrap_unmatched_attempts, 8,
+            "eight refusals should be charged to reference A"
+        );
+        assert_eq!(
+            system.tracker.state.bootstrap_frame.as_ref().map(|f| f.idx),
+            Some(0),
+            "A is below the bound and must still be held"
+        );
+
+        // A low-feature frame discards A entirely.
+        system.process_frame(sparse_frame(9), None, &image, 0.45, Vec::new());
+        assert!(
+            system.tracker.state.bootstrap_frame.is_none(),
+            "a low-feature frame drops the stored reference"
+        );
+        assert_eq!(
+            system.tracker.state.bootstrap_unmatched_attempts, 0,
+            "discarding the reference must discard its failure count"
+        );
+
+        // Reference B arrives through the ordinary path.
+        system.process_frame(scene_frame(10, 2, 0.0), None, &image, 0.5, Vec::new());
+        assert_eq!(
+            system.tracker.state.bootstrap_frame.as_ref().map(|f| f.idx),
+            Some(10),
+            "frame 10 becomes the new reference"
+        );
+        assert_eq!(
+            system.tracker.state.bootstrap_unmatched_attempts, 0,
+            "a newly stored reference starts with no failures against it"
+        );
+
+        // Three unmatched attempts against B. Inheriting A's eight would push
+        // the total past the bound and replace B far too early.
+        for (n, idx) in (11..=13).enumerate() {
+            system.process_frame(
+                scene_frame(idx, 3, 0.0),
+                None,
+                &image,
+                0.5 + (n as f64 + 1.0) * 0.05,
+                Vec::new(),
+            );
+        }
+        assert_eq!(
+            system.tracker.state.bootstrap_unmatched_attempts, 3,
+            "only B's own refusals count against B"
+        );
+        assert_eq!(
+            system.tracker.state.bootstrap_frame.as_ref().map(|f| f.idx),
+            Some(10),
+            "B must not be replaced on failures inherited from A"
+        );
     }
 }

@@ -49,6 +49,11 @@ pub struct SystemState {
     /// recently-lost grace period (mirrors ORB-SLAM3's `mTimeStampLost`).
     pub lost_since_sec: Option<f64>,
     pub bootstrap_frame: Option<Frame>,
+    /// Consecutive bootstrap attempts refused for lack of correspondence with
+    /// the stored reference. A reference that has lost the scene cannot regain
+    /// it, so this bounds how long it is kept (see
+    /// `SlamSystem::bootstrap_reference_is_exhausted`).
+    pub bootstrap_unmatched_attempts: usize,
     pub mode: SystemMode,
 }
 
@@ -73,6 +78,7 @@ impl SystemState {
             last_keyframe_idx: None,
             lost_since_sec: None,
             bootstrap_frame: None,
+            bootstrap_unmatched_attempts: 0,
             imu_initialized: false,
             imu_init_timestamp_sec: None,
             last_frame_timestamp_sec: 0.0,
@@ -87,6 +93,7 @@ impl SystemState {
         self.velocity = None;
         self.lost_since_sec = None;
         self.bootstrap_frame = None;
+        self.bootstrap_unmatched_attempts = 0;
         // The new map starts at an unknown monocular scale, so the metric
         // IMU state no longer applies until inertial init runs again.
         self.imu_initialized = false;

@@ -6,7 +6,7 @@
 //! not reinterpret the fields.
 
 use crate::map::Map;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Minimum landmarks visible in front of both bootstrap keyframes.
 ///
@@ -137,6 +137,100 @@ pub(crate) fn evaluate_bootstrap(
         };
     }
     BootstrapOutcome::Accepted(quality)
+}
+
+/// Which of the two views a duplicate feature claim was found in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimedView {
+    Reference,
+    Current,
+}
+
+impl std::fmt::Display for ClaimedView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reference => f.write_str("reference"),
+            Self::Current => f.write_str("current"),
+        }
+    }
+}
+
+/// Two triangulated proposals claiming one feature slot of one view.
+///
+/// Proposal indices are positions in the triangulated-proposal list the caller
+/// passed in, so every identifier here can be traced back to an actual input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DuplicateClaim {
+    pub view: ClaimedView,
+    pub feature_idx: usize,
+    /// The proposal that claimed the slot first and would have kept it.
+    pub first_proposal: usize,
+    /// The later proposal that claimed the same slot.
+    pub later_proposal: usize,
+}
+
+/// Why a bootstrap publication was refused, before anything was written.
+///
+/// Distinct from [`crate::map::MapMutationError`]: that reports a rejected map
+/// mutation, this reports a candidate the bootstrap acceptance policy declined
+/// to publish in the first place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum BootstrapPublicationReject {
+    #[error(
+        "proposals {} and {} both claim {} feature {} of keyframe {keyframe_idx}",
+        claim.first_proposal,
+        claim.later_proposal,
+        claim.view,
+        claim.feature_idx
+    )]
+    DuplicateFeatureClaim {
+        /// The keyframe owning the claimed feature: the reference or the
+        /// current keyframe, according to `claim.view`.
+        keyframe_idx: usize,
+        claim: DuplicateClaim,
+    },
+}
+
+/// The first proposal that claims a feature slot an earlier proposal claimed,
+/// in either view, scanning in the order the triangulator emitted them.
+///
+/// `claims` is one `(reference feature, current feature)` pair per triangulated
+/// proposal. One pass: the returned conflict is both the decision and the
+/// diagnostic.
+///
+/// **Policy.** Bootstrap refuses a pair with any such duplicate rather than
+/// resolving it. That is what the pre-regression revision did — its validated
+/// batch refused the whole publication — and on the measured prefix it is what
+/// kept badly behaved candidates from seeding the map. It is an empirical
+/// compatibility guard: a duplicate claim is *not* proof that the pair is
+/// geometrically degenerate, only that the pair is not one this publication path
+/// is known to handle. Map growth is a different situation — it adds to a map
+/// that already has a scale — and keeps its own first-claim-wins resolution in
+/// [`crate::mapping::growth::accepted_pair_claims`].
+pub(crate) fn first_duplicate_claim(claims: &[(usize, usize)]) -> Option<DuplicateClaim> {
+    let mut reference_claims: HashMap<usize, usize> = HashMap::new();
+    let mut current_claims: HashMap<usize, usize> = HashMap::new();
+    for (proposal, &(reference_feature, current_feature)) in claims.iter().enumerate() {
+        if let Some(&first_proposal) = reference_claims.get(&reference_feature) {
+            return Some(DuplicateClaim {
+                view: ClaimedView::Reference,
+                feature_idx: reference_feature,
+                first_proposal,
+                later_proposal: proposal,
+            });
+        }
+        if let Some(&first_proposal) = current_claims.get(&current_feature) {
+            return Some(DuplicateClaim {
+                view: ClaimedView::Current,
+                feature_idx: current_feature,
+                first_proposal,
+                later_proposal: proposal,
+            });
+        }
+        reference_claims.insert(reference_feature, proposal);
+        current_claims.insert(current_feature, proposal);
+    }
+    None
 }
 
 #[cfg(test)]
