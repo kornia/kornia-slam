@@ -25,6 +25,13 @@ pub struct PnpConfig {
     pub robust_scale_sq: f32,
     /// Number of hard-exclusion refit rounds.
     pub outlier_rounds: usize,
+    /// LM iteration ceiling PER refit round.
+    ///
+    /// `LMRefineParams::default()` is 50, a bundle-adjustment budget. Pose-only refinement
+    /// from a tracking prior starts close to the answer, so most of those iterations move
+    /// nothing — and with `outlier_rounds: 4` the cost is paid four times, twice per frame
+    /// (initial PnP, then `refine_with_local_map`).
+    pub lm_max_iterations: usize,
 }
 
 impl Default for PnpConfig {
@@ -38,6 +45,7 @@ impl Default for PnpConfig {
             robust: RobustKernelKind::Huber,
             robust_scale_sq: 25.0,
             outlier_rounds: 4,
+            lm_max_iterations: 50,
         }
     }
 }
@@ -210,6 +218,7 @@ pub fn solve_pnp_with_diagnostics(
             &LMRefineParams {
                 robust: config.robust,
                 robust_scale_sq: config.robust_scale_sq,
+                max_iterations: config.lm_max_iterations,
                 ..LMRefineParams::default()
             },
         ) else {
