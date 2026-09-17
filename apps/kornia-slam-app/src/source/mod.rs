@@ -78,6 +78,13 @@ pub trait FrameSource {
     /// Pull the next frame. `Ok(None)` ⇒ end of stream.
     fn next_frame(&mut self) -> Result<Option<FrameItem>, SourceError>;
 
+    /// Milliseconds the last [`Self::next_frame`] spent rectifying the stereo
+    /// pair, excluding image decode. Reported separately so per-frame cost can
+    /// be compared against systems that rectify inside their tracking call.
+    fn last_rectify_ms(&self) -> f64 {
+        0.0
+    }
+
     /// Map keypoints from raw-image pixels into the coordinate frame implied by
     /// [`Self::camera`], filtering features the camera model cannot represent.
     ///

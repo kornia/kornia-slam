@@ -1,0 +1,2353 @@
+//! SLAM runtime: orchestrates tracking, mapping, and state transitions.
+//!
+//! The runtime flow is kept in one file so it can be read from top to bottom
+//! in the same order frames move through the system.
+
+pub mod config;
+mod inertial;
+
+use inertial::InertialState;
+
+pub use crate::loop_closure::LoopClosureEvent;
+pub use config::{LoopClosingConfig, SlamConfig};
+
+use std::sync::{Arc, Mutex};
+
+use crate::Frame;
+use crate::initialization::bootstrap::{
+    BootstrapPublicationReject, ClaimedView, first_duplicate_claim,
+};
+use crate::initialization::{
+    ImuInitNotReadyReason, ImuInitResult, InertialInitOutcome, TwoViewInitConfig,
+    try_initialize_two_view,
+};
+use crate::loop_closure::{InertialPgoContext, LoopCloser, LoopClosingContext, LoopClosingOutcome};
+use crate::map::{
+    ImuFactor, InertialAlignment, InertialAlignmentError, Keyframe, KeyframeJob, LandmarkSeed,
+    LandmarkTarget, LocalMapping, Map, MapInsertion, MapMutationError, MapPoint, ObservationKey,
+    ObservationLink,
+};
+use crate::place_recognition::Vocabulary;
+use crate::pose_conversion::rotation_from_to;
+use crate::sensor_rig::{ImuCalibration, SensorRig};
+use crate::stereo::unproject_stereo;
+use crate::tracking::{
+    InertialPrediction, KeyframePolicy, RecoveryDecision, SystemMode, Tracker, TrackingInput,
+    TrackingResult, TrackingStatus,
+};
+use kornia_3d::camera::PinholeCamera;
+use kornia_3d::pose::Pose3d;
+use kornia_algebra::Vec3F64;
+use kornia_image::Image;
+use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuMeasurement};
+
+/// Top-level SLAM system: orchestrates tracking, mapping, and state transitions.
+pub struct SlamSystem {
+    // Fixed camera and IMU calibration
+    rig: SensorRig,
+    tracker: Tracker,
+    // Boostrap pose estimator
+    two_view_init_config: TwoViewInitConfig,
+    // Keyframe insertion policy
+    keyframe_policy: KeyframePolicy,
+    // mThDepth (metres): back-project close stereo points at each keyframe when set
+    stereo_close_depth: Option<f64>,
+    // Emit per-frame diagnostic logs (skip/reject reasons, growth counters)
+    debug: bool,
+    // Buffered debug messages produced during the most recent process_frame call;
+    // drained by the caller (TUI panel or stderr).
+    debug_messages: Vec<String>,
+    // Map object
+    map: Arc<Mutex<Map>>,
+    // Serializes compound map publication and short local-BA snapshot/merge phases.
+    map_publication_gate: Option<Arc<Mutex<()>>>,
+    inertial: InertialState,
+    local_mapping: LocalMapping,
+    loop_closer: LoopCloser,
+    loop_closure_events: Vec<LoopClosureEvent>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ImuInitApplyError {
+    #[error("initialization gravity vector is zero or non-finite")]
+    InvalidGravity,
+    #[error(transparent)]
+    Alignment(#[from] InertialAlignmentError),
+}
+
+/// Unmatched bootstrap attempts a stored reference survives.
+///
+/// The comparison is `>`, so replacement happens on the eleventh unmatched
+/// attempt against one reference.
+///
+/// `LowMatches` means the reference and the current frame no longer share
+/// enough of the scene to estimate anything, where `LowParallax` means the pair
+/// does overlap and only needs more motion. Overlap may in principle return, so
+/// this is a bounded patience policy rather than a proof that it cannot: past
+/// the bound, continuing to hold the reference is the worse bet. One run held
+/// an unusable reference for 1194 frames, matching 0-2 of the 100 descriptors
+/// required.
+///
+/// Ten attempts is half a second of failure at 20 Hz: long enough to ride out
+/// a burst of motion blur or occlusion, short enough that a lost reference is
+/// dropped while the scene is still reachable. The count is cumulative per
+/// reference, so a reference that fails persistently with varying reasons is
+/// still replaced.
+const MAX_UNMATCHED_BOOTSTRAP_ATTEMPTS: usize = 10;
+
+/// Minimum keypoints for a frame to take part in bootstrap at all.
+const MIN_KEYPOINTS_FOR_BOOTSTRAP: usize = 100;
+
+/// Why a bootstrap map could not be published.
+///
+/// Separates the acceptance decision, which happens before any write, from a
+/// rejected map mutation, which is the map refusing a batch it was handed.
+#[derive(Debug, thiserror::Error)]
+enum InitialMapError {
+    #[error("{0}")]
+    Refused(#[from] BootstrapPublicationReject),
+    #[error(transparent)]
+    Mutation(#[from] MapMutationError),
+}
+
+impl SlamSystem {
+    /// Creates a new SLAM system with identity pose.
+    pub fn new(camera: PinholeCamera, config: SlamConfig) -> Self {
+        Self::with_rig(SensorRig { camera, imu: None }, config)
+    }
+
+    /// Creates a SLAM system with fixed camera and optional IMU calibration.
+    pub fn with_rig(rig: SensorRig, config: SlamConfig) -> Self {
+        let map = Arc::new(Mutex::new(Map::new()));
+        let local_mapping =
+            LocalMapping::new(config.local_mapping, Arc::clone(&map), rig.camera.clone());
+        let map_publication_gate = local_mapping.publication_gate();
+        Self {
+            rig,
+            tracker: Tracker::new(config.map_projection, config.tracking_loss_recovery),
+            two_view_init_config: config.two_view_init,
+            keyframe_policy: config.keyframe_policy,
+            stereo_close_depth: config.stereo_close_depth_m,
+            debug: config.debug,
+            debug_messages: Vec::new(),
+            map,
+            map_publication_gate,
+            local_mapping,
+            inertial: InertialState::new(),
+            loop_closer: LoopCloser::new(config.pgo),
+            loop_closure_events: Vec::new(),
+        }
+    }
+
+    /// The local-mapping job description for the current system state.
+    fn keyframe_job(&self) -> KeyframeJob {
+        KeyframeJob {
+            imu_initialized: self.tracker.state.imu_initialized,
+            imu_t_bc: self.rig.imu.as_ref().map(|imu| imu.camera_to_body),
+            gravity_world: self.inertial.gravity_world,
+        }
+    }
+
+    /// Atomically validates and applies an inertial initialization result: the
+    /// map takes the scale, gravity-aligning rotation, velocities and bias;
+    /// the system then adopts the last aligned keyframe's state.
+    fn apply_inertial_initialization(
+        &mut self,
+        init: ImuInitResult,
+    ) -> Result<(), ImuInitApplyError> {
+        let gravity_norm = init.gravity_world.length();
+        if !gravity_norm.is_finite() || gravity_norm <= 1e-9 {
+            return Err(ImuInitApplyError::InvalidGravity);
+        }
+        let rotation = rotation_from_to(
+            init.gravity_world / gravity_norm,
+            Vec3F64::new(0.0, 1.0, 0.0),
+        );
+
+        let map = Arc::clone(&self.map);
+        let mut map = map.lock().unwrap();
+        let last_keyframe_idx = map.apply_inertial_alignment(InertialAlignment {
+            scale: init.scale,
+            rotation,
+            keyframe_velocities: init.keyframe_velocities,
+            bias: init.bias,
+        })?;
+
+        let last_keyframe = map
+            .get_keyframe(last_keyframe_idx)
+            .expect("last keyframe existence was checked before mutating the map");
+        self.tracker.adopt_inertial_alignment(
+            last_keyframe.frame.pose_world_to_cam,
+            last_keyframe.velocity_world,
+        );
+        self.inertial.gravity_world = Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0);
+        self.inertial.bias = init.bias;
+        Ok(())
+    }
+
+    /// Enables appearance-based loop detection with a bag-of-words vocabulary.
+    /// Without it, keyframes are not indexed and no loop candidates are emitted.
+    pub fn set_vocabulary(&mut self, vocabulary: Vocabulary) {
+        self.loop_closer.set_vocabulary(vocabulary);
+    }
+
+    pub fn drain_loop_closure_events(&mut self) -> Vec<LoopClosureEvent> {
+        std::mem::take(&mut self.loop_closure_events)
+    }
+
+    /// Enables the inertial path by providing the camera-to-body extrinsic
+    /// `T_BC` (`X_body = T_BC * X_cam`). Without it, IMU samples are ignored.
+    pub fn set_imu_extrinsics(&mut self, t_bc: Pose3d) {
+        match &mut self.rig.imu {
+            Some(imu) => imu.camera_to_body = t_bc,
+            None => self.rig.imu = Some(ImuCalibration::new(t_bc)),
+        }
+    }
+
+    /// Processes one frame (pre-extracted features) and returns the tracking result.
+    pub fn process_frame(
+        &mut self,
+        mut frame: Frame,
+        previous_image: Option<&Image<u8, 1>>,
+        current_image: &Image<u8, 1>,
+        timestamp_sec: f64,
+        imu_samples: Vec<ImuMeasurement>,
+    ) -> TrackingResult {
+        // Local-BA snapshots, merges, and their correction messages can only
+        // cross this boundary between complete tracking frames.
+        let publication_gate = self.map_publication_gate.clone();
+        let _publication = publication_gate
+            .as_ref()
+            .map(|gate| gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+        self.apply_local_mapping_results();
+        // Fill the per-frame undistortion cache once; tracking, BA gathering,
+        // growth, and fuse all read from it.
+        frame.ensure_undistorted(&self.rig.camera);
+        self.inertial.buffer_samples(imu_samples);
+
+        match self.tracker.state.mode {
+            SystemMode::Bootstrap => self.bootstrap_step(frame, timestamp_sec),
+            SystemMode::ImuInit => {
+                self.inertial_init_step(frame, previous_image, current_image, timestamp_sec)
+            }
+            SystemMode::Tracking => {
+                self.tracking_step(frame, previous_image, current_image, timestamp_sec)
+            }
+        }
+    }
+
+    /// Runs `f` against the live map points, holding the map lock only for the
+    /// duration of the call. Avoids cloning the whole point list (descriptors
+    /// included) for read-only consumers such as viz logging and summaries.
+    pub fn with_map_points<R>(&self, f: impl FnOnce(&[MapPoint]) -> R) -> R {
+        f(self.map.lock().unwrap().map_points())
+    }
+
+    /// Returns the index of the current reference keyframe, if tracking has one.
+    pub fn current_keyframe_idx(&self) -> Option<usize> {
+        self.tracker.state.current_keyframe_idx.and_then(|ki| {
+            self.map
+                .lock()
+                .unwrap()
+                .get_keyframe(ki)
+                .map(|kf| kf.frame.idx)
+        })
+    }
+
+    /// Returns the number of active (non-culled) map points.
+    pub fn num_active_map_points(&self) -> usize {
+        self.map.lock().unwrap().num_active_map_points()
+    }
+
+    /// Drain any debug messages accumulated since the last call.
+    pub fn drain_debug_messages(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.debug_messages)
+    }
+
+    /// Toggle whether the system buffers per-frame debug messages.
+    pub fn set_debug(&mut self, on: bool) {
+        self.debug = on;
+        if !on {
+            self.debug_messages.clear();
+        }
+    }
+
+    fn apply_local_mapping_results(&mut self) {
+        let Some(reference_idx) = self.tracker.state.current_keyframe_idx else {
+            // Still drain results so a completed worker cannot build a result backlog.
+            let _ = self.local_mapping.drain_results();
+            return;
+        };
+
+        for result in self.local_mapping.drain_results() {
+            let Some(correction) = result
+                .keyframe_corrections
+                .iter()
+                .find(|correction| correction.kf_idx == reference_idx)
+            else {
+                continue;
+            };
+
+            self.tracker.apply_local_ba_correction(
+                correction.pose_before,
+                correction.pose_after,
+                correction.velocity_world,
+            );
+            self.inertial.bias = correction.imu_bias;
+        }
+    }
+
+    fn dbg(&mut self, msg: String) {
+        if self.debug {
+            self.debug_messages.push(msg);
+        }
+    }
+
+    /// Stores `frame` as the bootstrap reference.
+    ///
+    /// The unmatched count belongs to the reference it was charged against, so a
+    /// newly stored reference always starts at zero: failures attributed to a
+    /// predecessor must not shorten its successor's life. The reference also
+    /// defines the inertial window origin, so its timestamp moves with it and
+    /// samples that can no longer enter an edge are dropped.
+    fn store_bootstrap_reference(&mut self, frame: Frame, timestamp_sec: f64) {
+        self.tracker.state.bootstrap_frame = Some(frame);
+        self.tracker.state.bootstrap_unmatched_attempts = 0;
+        self.inertial.bootstrap_timestamp_sec = Some(timestamp_sec);
+        self.inertial.prune_before(timestamp_sec);
+    }
+
+    /// Drops the bootstrap reference and the failures charged against it.
+    fn discard_bootstrap_reference(&mut self) {
+        self.tracker.state.bootstrap_frame = None;
+        self.tracker.state.bootstrap_unmatched_attempts = 0;
+    }
+
+    fn bootstrap_step(&mut self, curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
+        // Stereo frames carry metric per-keypoint depth, so we can build a
+        // metric map from a single keyframe (ORB-SLAM3's StereoInitialization)
+        // instead of waiting for two-view parallax.
+        if curr_frame.is_stereo() {
+            return self.bootstrap_stereo(curr_frame, timestamp_sec);
+        }
+        self.bootstrap_mono(curr_frame, timestamp_sec)
+    }
+
+    /// Single-frame metric initialization from stereo depth.
+    fn bootstrap_stereo(&mut self, mut curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
+        // Build the new map in the current odometry frame (identity at start,
+        // or the recovery pose after a tracking loss).
+        curr_frame.pose_world_to_cam = self.tracker.state.pose_world_to_cam;
+
+        const MIN_STEREO_POINTS: usize = 50;
+        let cam_points = unproject_stereo(&curr_frame, &self.rig.camera);
+        if cam_points.len() < MIN_STEREO_POINTS {
+            self.dbg(format!(
+                "[bootstrap_stereo] frame={} skip: only {} stereo points (need >= {})",
+                curr_frame.idx,
+                cam_points.len(),
+                MIN_STEREO_POINTS,
+            ));
+            return TrackingResult {
+                pose_world_to_cam: self.tracker.state.pose_world_to_cam,
+                status: TrackingStatus::Skipped,
+            };
+        }
+
+        let pose_inv = curr_frame.pose_world_to_cam.inverse();
+        let keyframe = Keyframe::from_frame(curr_frame);
+        let curr_idx = keyframe.frame.idx;
+
+        let landmarks: Vec<LandmarkSeed> = cam_points
+            .iter()
+            .map(|(desc_idx, p_cam)| LandmarkSeed {
+                position: pose_inv.transform_point(p_cam),
+                color: keyframe
+                    .frame
+                    .keypoint_colors
+                    .get(*desc_idx)
+                    .copied()
+                    .unwrap_or([128; 3]),
+                reference: ObservationKey {
+                    keyframe_idx: curr_idx,
+                    feature_idx: *desc_idx,
+                },
+            })
+            .collect();
+
+        // The keyframe and its seeds are published together; tracker state is
+        // adopted below only once that succeeded.
+        let published = self.map.lock().unwrap().apply_insertion(MapInsertion {
+            keyframes: vec![keyframe],
+            landmarks,
+            ..Default::default()
+        });
+        let added = match published {
+            Ok(result) => result.landmark_ids.len(),
+            Err(error) => {
+                self.dbg(format!(
+                    "[bootstrap_stereo] frame={curr_idx} publication rejected: {error}"
+                ));
+                return TrackingResult {
+                    pose_world_to_cam: self.tracker.state.pose_world_to_cam,
+                    status: TrackingStatus::Skipped,
+                };
+            }
+        };
+
+        self.dbg(format!(
+            "[bootstrap_stereo] frame={curr_idx} metric map created with {added} points",
+        ));
+
+        self.tracker.state.current_keyframe_idx = Some(curr_idx);
+        self.tracker.state.last_keyframe_idx = Some(curr_idx);
+        self.tracker.state.velocity = None;
+        // The map is already metric (stereo baseline), but gravity, velocities,
+        // and the gyro bias still need the inertial init before IMU prediction
+        // can run; the solve there keeps scale fixed at 1.
+        self.tracker.state.mode = if self
+            .rig
+            .imu
+            .as_ref()
+            .map(|imu| imu.camera_to_body)
+            .is_some()
+        {
+            self.inertial
+                .initializer
+                .begin_window(curr_idx, timestamp_sec);
+            SystemMode::ImuInit
+        } else {
+            SystemMode::Tracking
+        };
+        self.inertial.last_keyframe_timestamp_sec = Some(timestamp_sec);
+        self.inertial.prune_before(timestamp_sec);
+
+        TrackingResult {
+            pose_world_to_cam: self.tracker.state.pose_world_to_cam,
+            status: TrackingStatus::KeyframeAccepted,
+        }
+    }
+
+    fn bootstrap_mono(&mut self, mut curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
+        // Stamp frames with current odometry pose so bootstrap builds
+        // the new map in the existing coordinate frame.
+        curr_frame.pose_world_to_cam = self.tracker.state.pose_world_to_cam;
+
+        // Staleness guard (mirrors ORB-SLAM3's MonocularInitialization):
+        // a frame with too few keypoints is neither a viable reference nor
+        // a viable current frame. If we already had a reference, drop it
+        // and wait for a feature-rich frame to start over.
+        if curr_frame.features.keypoints_xy.len() <= MIN_KEYPOINTS_FOR_BOOTSTRAP {
+            self.dbg(format!(
+                "[bootstrap] frame={} skip: too few keypoints ({}, need > {})",
+                curr_frame.idx,
+                curr_frame.features.keypoints_xy.len(),
+                MIN_KEYPOINTS_FOR_BOOTSTRAP,
+            ));
+            self.discard_bootstrap_reference();
+            return TrackingResult {
+                pose_world_to_cam: self.tracker.state.pose_world_to_cam,
+                status: TrackingStatus::Skipped,
+            };
+        }
+
+        let Some(prev_bootstrap_frame) = self.tracker.state.bootstrap_frame.take() else {
+            self.dbg(format!(
+                "[bootstrap] frame={} stored as reference (awaiting second frame)",
+                curr_frame.idx,
+            ));
+            self.store_bootstrap_reference(curr_frame, timestamp_sec);
+            return TrackingResult {
+                pose_world_to_cam: self.tracker.state.pose_world_to_cam,
+                status: TrackingStatus::Skipped,
+            };
+        };
+
+        let result = try_initialize_two_view(
+            &prev_bootstrap_frame.features,
+            &prev_bootstrap_frame.pose_world_to_cam,
+            &curr_frame.features,
+            &self.rig.camera,
+            &self.two_view_init_config,
+        );
+
+        let two_view_estimate = match result {
+            Err(reason) => {
+                self.dbg(format!(
+                    "[bootstrap] frame={} (ref={}) reject: {}",
+                    curr_frame.idx, prev_bootstrap_frame.idx, reason,
+                ));
+                // Only a correspondence failure says the reference has lost the
+                // scene. Every other rejection — parallax, geometry, too few
+                // triangulated points — happens *because* the pair still
+                // overlaps, and those improve as the camera moves, so the
+                // reference is kept and its count is left untouched.
+                let unmatched = matches!(
+                    reason,
+                    crate::initialization::TwoViewRejectReason::LowMatches { .. }
+                );
+                // Counted cumulatively for this reference. A LowMatches
+                // refusal is evidence the reference does not overlap the current
+                // view, and an intervening rejection of another kind does not
+                // undo that evidence: with a consecutive counter, alternating
+                // reasons kept an unusable reference indefinitely. Other
+                // rejections leave the count alone. It is discarded with the
+                // reference, or on a successful pair.
+                if unmatched {
+                    self.tracker.state.bootstrap_unmatched_attempts += 1;
+                }
+                let exhausted = self.tracker.state.bootstrap_unmatched_attempts
+                    > MAX_UNMATCHED_BOOTSTRAP_ATTEMPTS;
+                // Promote the current frame only if it could serve as a
+                // reference itself; otherwise keep waiting rather than trade a
+                // stale reference for an unusable one.
+                let promotable =
+                    curr_frame.features.keypoints_xy.len() > MIN_KEYPOINTS_FOR_BOOTSTRAP;
+                if exhausted && promotable {
+                    self.dbg(format!(
+                        "[bootstrap] frame={} replacing reference {} after {} unmatched attempts",
+                        curr_frame.idx,
+                        prev_bootstrap_frame.idx,
+                        self.tracker.state.bootstrap_unmatched_attempts,
+                    ));
+                    self.store_bootstrap_reference(curr_frame, timestamp_sec);
+                } else {
+                    self.tracker.state.bootstrap_frame = Some(prev_bootstrap_frame);
+                }
+                return TrackingResult {
+                    pose_world_to_cam: self.tracker.state.pose_world_to_cam,
+                    status: TrackingStatus::Skipped,
+                };
+            }
+            Ok(tv) => tv,
+        };
+
+        self.dbg(format!(
+            "[bootstrap] frame={} accept: model={} triangulated={} inliers={}",
+            curr_frame.idx,
+            two_view_estimate.model_kind,
+            two_view_estimate.points3d.len(),
+            two_view_estimate.inliers,
+        ));
+
+        let estimated_pose = two_view_estimate.pose;
+        let prev_pose_world_to_cam = curr_frame.pose_world_to_cam;
+        // The frame carries the estimate into the keyframe it becomes, but the
+        // tracker does not adopt it yet: a map that fails publication or the
+        // health gate below must not leave its pose behind. Adoption happens
+        // once, from the stored keyframe, after both gates pass — which also
+        // picks up whatever initial BA refined.
+        curr_frame.pose_world_to_cam = estimated_pose;
+
+        self.tracker.state.bootstrap_unmatched_attempts = 0;
+
+        // Promote to Keyframes
+        let prev_idx = prev_bootstrap_frame.idx;
+        let reference_kf = Keyframe::from_frame(prev_bootstrap_frame);
+        let current_kf = Keyframe::from_frame(curr_frame);
+        let curr_idx = current_kf.frame.idx;
+
+        // A rejected publication leaves no map to evaluate, and tracker state
+        // must not advertise a keyframe pair the map does not hold.
+        if let Err(error) = self.build_initial_map(
+            reference_kf,
+            current_kf,
+            &two_view_estimate.matches,
+            &two_view_estimate.points3d,
+            &two_view_estimate.inlier_indices,
+            two_view_estimate.median_depth,
+        ) {
+            self.dbg(format!(
+                "[bootstrap] frame={curr_idx} publication rejected: {error}"
+            ));
+            self.map.lock().unwrap().clear_active();
+            self.tracker.restart_bootstrap();
+            return TrackingResult {
+                pose_world_to_cam: self.tracker.state.pose_world_to_cam,
+                status: TrackingStatus::Skipped,
+            };
+        }
+
+        // Post-BA acceptance gate. Initialization owns the metric and its
+        // thresholds; the system only acts on the verdict.
+        let outcome = {
+            let map = self.map.lock().unwrap();
+            crate::initialization::bootstrap::evaluate_bootstrap(&map, prev_idx, curr_idx)
+        };
+        if let crate::initialization::bootstrap::BootstrapOutcome::Rejected { reason, quality } =
+            outcome
+        {
+            self.dbg(format!(
+                "[init_gate] reject: {reason:?} quality={quality:?}"
+            ));
+            self.map.lock().unwrap().clear_active();
+            self.tracker.state.reset();
+            return TrackingResult {
+                pose_world_to_cam: self.tracker.state.pose_world_to_cam,
+                status: TrackingStatus::Skipped,
+            };
+        }
+
+        // Both gates passed, so the map is committed: adopt its pose. This is
+        // the only place bootstrap moves the tracker, and it reads the stored
+        // keyframe, so it picks up whatever initial BA refined.
+        if let Some(kf) = self.map.lock().unwrap().get_keyframe(curr_idx) {
+            self.tracker.state.pose_world_to_cam = kf.frame.pose_world_to_cam;
+        }
+
+        if let Some(prev_ts) = self.inertial.bootstrap_timestamp_sec {
+            let (preint, raw_samples) =
+                self.inertial
+                    .preintegrate_window(self.rig.imu.as_ref(), prev_ts, timestamp_sec);
+            if preint.dt > 0.0 {
+                // Through the validated path: endpoints must exist, the edge
+                // must be new, and the interval finite and ordered.
+                let published = self.map.lock().unwrap().apply_insertion(MapInsertion {
+                    imu_factors: vec![ImuFactor {
+                        prev_kf_idx: prev_idx,
+                        curr_kf_idx: curr_idx,
+                        preintegrated: preint,
+                        raw_samples,
+                        t0: prev_ts,
+                        t1: timestamp_sec,
+                    }],
+                    ..Default::default()
+                });
+                if let Err(error) = published {
+                    self.dbg(format!(
+                        "[bootstrap] frame={curr_idx} imu edge rejected: {error}"
+                    ));
+                }
+            }
+            self.inertial.prune_before(timestamp_sec);
+        }
+
+        self.tracker.state.current_keyframe_idx = Some(curr_idx);
+        self.tracker.state.last_keyframe_idx = Some(curr_idx);
+        self.tracker.state.velocity = Some(Pose3d::between(
+            &prev_pose_world_to_cam,
+            &self.tracker.state.pose_world_to_cam,
+        ));
+        // Inertial init needs the camera-to-body extrinsic to relate IMU deltas
+        // to camera poses; without it, run visual-only as before.
+        self.tracker.state.mode = if self
+            .rig
+            .imu
+            .as_ref()
+            .map(|imu| imu.camera_to_body)
+            .is_some()
+        {
+            self.inertial
+                .initializer
+                .begin_window(curr_idx, timestamp_sec);
+            SystemMode::ImuInit
+        } else {
+            SystemMode::Tracking
+        };
+        self.inertial.last_keyframe_timestamp_sec = Some(timestamp_sec);
+
+        TrackingResult {
+            pose_world_to_cam: self.tracker.state.pose_world_to_cam,
+            status: TrackingStatus::KeyframeAccepted,
+        }
+    }
+
+    fn build_initial_map(
+        &mut self,
+        reference_kf: Keyframe,
+        current_kf: Keyframe,
+        matches: &[(usize, usize)],
+        points3d: &[Vec3F64],
+        inlier_indices: &[usize],
+        median_depth: Option<f64>,
+    ) -> Result<usize, InitialMapError> {
+        let depth_scale = median_depth.filter(|&d| d > 1e-6).unwrap_or(1.0);
+        let reference_pose_inv = reference_kf.frame.pose_world_to_cam.inverse();
+
+        let mut triangulated = Vec::new();
+        for (p_cam, &match_idx) in points3d.iter().zip(inlier_indices.iter()) {
+            let Some(&(ref_desc_idx, curr_desc_idx)) = matches.get(match_idx) else {
+                continue;
+            };
+            if ref_desc_idx >= reference_kf.map_point_by_desc_idx.len()
+                || curr_desc_idx >= current_kf.map_point_by_desc_idx.len()
+            {
+                continue;
+            }
+            let descriptor = current_kf
+                .frame
+                .features
+                .descriptors
+                .get(curr_desc_idx)
+                .copied()
+                .or_else(|| {
+                    reference_kf
+                        .frame
+                        .features
+                        .descriptors
+                        .get(ref_desc_idx)
+                        .copied()
+                });
+            let Some(descriptor) = descriptor else {
+                continue;
+            };
+            let color = current_kf
+                .frame
+                .keypoint_colors
+                .get(curr_desc_idx)
+                .copied()
+                .unwrap_or([128; 3]);
+            let p_world = reference_pose_inv.transform_point(&(*p_cam / depth_scale));
+            triangulated.push((p_world, descriptor, color, ref_desc_idx, curr_desc_idx));
+        }
+
+        let reference_kf_idx = reference_kf.frame.idx;
+        let current_kf_idx = current_kf.frame.idx;
+
+        // Both keyframes, the triangulated landmarks and their second observers
+        // publish as one batch: the reference keyframe it points at arrives in
+        // the same request.
+        let mut request = MapInsertion {
+            keyframes: vec![reference_kf, current_kf],
+            ..Default::default()
+        };
+        // The two-view result can name one feature twice — two triangulated
+        // points landing on the same keypoint in either view. Bootstrap refuses
+        // such a pair outright and lets the coordinator retry on a later one;
+        // see `first_duplicate_claim` for why this is a compatibility guard and
+        // not a geometric verdict. Nothing has been written at this point.
+        let claims: Vec<(usize, usize)> = triangulated
+            .iter()
+            .map(|&(_, _, _, ref_desc_idx, curr_desc_idx)| (ref_desc_idx, curr_desc_idx))
+            .collect();
+        if let Some(claim) = first_duplicate_claim(&claims) {
+            return Err(BootstrapPublicationReject::DuplicateFeatureClaim {
+                keyframe_idx: match claim.view {
+                    ClaimedView::Reference => reference_kf_idx,
+                    ClaimedView::Current => current_kf_idx,
+                },
+                claim,
+            }
+            .into());
+        }
+        // Conflict-free, so every proposal is publishable and they publish in
+        // the order the triangulator emitted them.
+        for (position, _descriptor, color, ref_desc_idx, curr_desc_idx) in &triangulated {
+            let new_index = request.landmarks.len();
+            request.landmarks.push(LandmarkSeed {
+                position: *position,
+                color: *color,
+                reference: ObservationKey {
+                    keyframe_idx: current_kf_idx,
+                    feature_idx: *curr_desc_idx,
+                },
+            });
+            request.observations.push(ObservationLink {
+                observation: ObservationKey {
+                    keyframe_idx: reference_kf_idx,
+                    feature_idx: *ref_desc_idx,
+                },
+                landmark: LandmarkTarget::New(new_index),
+            });
+        }
+        // A bootstrap publication seeds an *empty* active map: it normalises the
+        // pair's depths to a median of 1 in its own gauge and only ever creates
+        // new landmarks, so it has no way to relate itself to landmarks already
+        // there. Whatever an abandoned epoch left behind would otherwise stay in
+        // the map under an unrelated scale, where projection-guided tracking can
+        // still match it. Clearing and publishing under one lock so no other
+        // thread sees the map between the two.
+        let added = {
+            let mut map = self.map.lock().unwrap();
+            if !map.keyframes().is_empty() {
+                map.clear_active();
+            }
+            map.apply_insertion(request)?.landmark_ids.len()
+        };
+
+        crate::mapping::bundle_adjustment::run_initial_ba(
+            &mut self.map.lock().unwrap(),
+            &self.rig.camera,
+        );
+
+        // Seed the place-recognition database with the two bootstrap keyframes so
+        // a later revisit of the start can match them.
+        self.register_place_recognition(reference_kf_idx);
+        self.register_place_recognition(current_kf_idx);
+
+        Ok(added)
+    }
+
+    fn inertial_init_step(
+        &mut self,
+        frame: Frame,
+        previous_image: Option<&Image<u8, 1>>,
+        current_image: &Image<u8, 1>,
+        timestamp_sec: f64,
+    ) -> TrackingResult {
+        let result = self.tracking_step(frame, previous_image, current_image, timestamp_sec);
+        if result.status != TrackingStatus::KeyframeAccepted {
+            return result;
+        }
+
+        // Drop the solve's map lock before applying its result with a new lock.
+        let outcome = {
+            let map = self.map.lock().unwrap();
+            self.inertial.initializer.on_keyframe_uninitialized(
+                &map,
+                timestamp_sec,
+                self.rig.imu.as_ref().map(|imu| imu.camera_to_body),
+                self.inertial.bias,
+            )
+        };
+
+        match outcome {
+            InertialInitOutcome::NotDue => {}
+            InertialInitOutcome::NotReady(not_ready) => {
+                if not_ready.reason != ImuInitNotReadyReason::NoWindow {
+                    self.dbg(not_ready.to_string());
+                }
+            }
+            InertialInitOutcome::Attempted {
+                stage,
+                result: init,
+            } => match init {
+                Ok(init) => {
+                    let label = stage.label();
+                    let scale = init.scale;
+                    let gravity = init.gravity_world;
+                    let bg = init.bias.gyro;
+                    if let Err(error) = self.apply_inertial_initialization(init) {
+                        self.dbg(format!("[imu_init] {label} apply rejected: {error}"));
+                        return result;
+                    }
+                    // Mirrors ORB-SLAM3: IMU is marked initialized (and
+                    // tracking resumes) immediately after VIBA0 succeeds —
+                    // VIBA1/VIBA2 refine bg/ba/scale/gravity further in the
+                    // background (see try_insert_keyframe), they don't gate
+                    // resuming tracking.
+                    self.tracker.state.mode = SystemMode::Tracking;
+                    self.tracker.state.imu_init_timestamp_sec = Some(timestamp_sec);
+                    let job = self.keyframe_job();
+                    if !self.local_mapping.submit(job) {
+                        self.dbg("[local_mapping] worker is unavailable".into());
+                    }
+                    self.apply_local_mapping_results();
+                    self.dbg(format!(
+                        "[imu_init] {label} accepted: scale={scale:.4} gravity=({:.3},{:.3},{:.3}) \
+                         gyro_bias=({:.4},{:.4},{:.4})",
+                        gravity.x, gravity.y, gravity.z, bg.x, bg.y, bg.z
+                    ));
+                }
+                Err(error) => {
+                    self.dbg(format!("[imu_init] {} rejected: {error}", stage.label()));
+                }
+            },
+        }
+
+        result
+    }
+
+    fn tracking_step(
+        &mut self,
+        frame: Frame,
+        previous_image: Option<&Image<u8, 1>>,
+        current_image: &Image<u8, 1>,
+        timestamp_sec: f64,
+    ) -> TrackingResult {
+        // Preserve reference-state refresh before building the IMU window.
+        if let Some(kf_idx) = self.tracker.state.current_keyframe_idx
+            && let Some(kf) = self.map.lock().unwrap().get_keyframe(kf_idx)
+        {
+            self.tracker.state.velocity_world = kf.velocity_world;
+            self.inertial.bias = kf.imu_bias;
+        }
+        let prev_timestamp = self.tracker.state.last_frame_timestamp_sec;
+        let preint = (self.tracker.state.imu_initialized && prev_timestamp > 0.0).then(|| {
+            self.inertial
+                .preintegrate_window(self.rig.imu.as_ref(), prev_timestamp, timestamp_sec)
+                .0
+        });
+        let outcome = {
+            let map = self.map.lock().unwrap();
+            self.tracker.track(
+                TrackingInput {
+                    frame: &frame,
+                    previous_image,
+                    current_image,
+                    timestamp_sec,
+                    inertial: preint.as_ref().map(|preintegrated| InertialPrediction {
+                        preintegrated,
+                        t_bc: self.rig.imu.as_ref().map(|imu| imu.camera_to_body),
+                        gravity_world: self.inertial.gravity_world,
+                    }),
+                },
+                &map,
+                &self.rig.camera,
+            )
+        };
+        let mut status = if outcome.rejection.is_some() {
+            TrackingStatus::Skipped
+        } else {
+            TrackingStatus::Tracked
+        };
+        if self.debug {
+            let msg = match outcome.rejection {
+                Some(reason) => format!("[track] frame={} reject: {:?}", frame.idx, reason),
+                None => format!(
+                    "[track] frame={} ok: matches={} inliers={}",
+                    frame.idx,
+                    outcome.matches.len(),
+                    outcome.inliers,
+                ),
+            };
+            self.debug_messages.push(msg);
+        }
+        if status == TrackingStatus::Tracked {
+            // Keep visibility accounting on the predicted pose and local map.
+            // Release the map borrow before publication can lock it again.
+            {
+                let mut map = self.map.lock().unwrap();
+                let matched_ids: Vec<usize> =
+                    outcome.matches.iter().map(|&(mp_idx, _)| mp_idx).collect();
+                let local_indices = crate::tracking::local_map::select_local_landmarks(
+                    &map,
+                    &matched_ids,
+                    self.tracker.state.current_keyframe_idx,
+                    &Default::default(),
+                );
+                let visible = crate::tracking::local_map::landmarks_in_frustum(
+                    &map,
+                    &local_indices,
+                    &self.rig.camera,
+                    &outcome.candidate_pose,
+                    frame.image_size,
+                );
+                map.update_observation_counts(&visible, &outcome.matches);
+            }
+            if self.try_insert_keyframe(&frame, timestamp_sec, outcome.inliers, &outcome.matches) {
+                status = TrackingStatus::KeyframeAccepted;
+            }
+        }
+        if outcome.recovery == RecoveryDecision::RestartBootstrap {
+            let lost_for_sec = self
+                .tracker
+                .state
+                .lost_since_sec
+                .map_or(0.0, |since| timestamp_sec - since);
+            self.dbg(format!(
+                "[lost] frame={} giving up after {:.2}s: resetting",
+                frame.idx, lost_for_sec,
+            ));
+            self.tracker.restart_bootstrap();
+            return self.bootstrap_step(frame, timestamp_sec);
+        }
+        // Keyframe insertion may have corrected the live pose. Finalize and
+        // return that state, not a pose captured before BA or loop closing.
+        if status != TrackingStatus::Skipped {
+            self.tracker.state.lost_since_sec = None;
+        }
+        self.tracker.state.last_frame_timestamp_sec = timestamp_sec;
+        if let Some(kf_ts) = self.inertial.last_keyframe_timestamp_sec {
+            self.inertial.prune_before(kf_ts.min(timestamp_sec));
+        }
+        TrackingResult {
+            pose_world_to_cam: self.tracker.state.pose_world_to_cam,
+            status,
+        }
+    }
+
+    fn try_insert_keyframe(
+        &mut self,
+        frame: &Frame,
+        timestamp_sec: f64,
+        tracked_inliers: usize,
+        matches: &[(usize, usize)],
+    ) -> bool {
+        let n_ref_map_points = if let Some(ki) = self.tracker.state.current_keyframe_idx {
+            let map = self.map.lock().unwrap();
+            map.get_keyframe(ki)
+                .map(|kf| kf.num_associated_points())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        if !self.keyframe_policy.should_insert(
+            frame.idx,
+            self.tracker.state.last_keyframe_idx,
+            tracked_inliers,
+            n_ref_map_points,
+        ) {
+            return false;
+        }
+
+        // Guard: reference KF must exist before we can triangulate.
+        if let Some(ki) = self.tracker.state.current_keyframe_idx {
+            let map = self.map.lock().unwrap();
+            if map.get_keyframe(ki).is_none() {
+                return false;
+            }
+        } else {
+            return false;
+        }
+
+        let mut curr_kf = Keyframe::from_frame(Frame {
+            idx: frame.idx,
+            features: frame.features.clone(),
+            pose_world_to_cam: self.tracker.state.pose_world_to_cam,
+            image_size: frame.image_size,
+            keypoint_colors: frame.keypoint_colors.clone(),
+            u_right: frame.u_right.clone(),
+            depth: frame.depth.clone(),
+            keypoints_undist: frame.keypoints_undist.clone(),
+        });
+        // Seed the new keyframe with the IMU-propagated velocity and current bias
+        // estimate so that VI-BA starts from a reasonable linearisation point rather
+        // than zero, which would produce huge residuals on the newest IMU edge.
+        if self.tracker.state.imu_initialized {
+            curr_kf.velocity_world = self.tracker.state.velocity_world;
+            curr_kf.imu_bias = self.inertial.bias;
+        }
+
+        // Neighbours are captured BEFORE publication: growing against a list
+        // that already contains the current keyframe would triangulate it
+        // against itself and drop the oldest real neighbour. Selection policy
+        // belongs to mapping.
+        let growth_plan = crate::mapping::keyframe_mapping::prepare_keyframe_growth(
+            &self.map.lock().unwrap(),
+            frame.idx,
+        );
+
+        // Core publication: the keyframe, its tracked links, the close stereo
+        // seeds and the IMU edge go in as one validated batch. Tracked links are
+        // recorded as claims first, so stereo seeding cannot take a feature
+        // tracking already owns.
+        let mut claimed: Vec<Option<usize>> = vec![None; frame.features.descriptors.len()];
+        let mut core = MapInsertion::default();
+        // One feature per landmark and one landmark per feature; a repeat would
+        // otherwise refuse the whole keyframe. Same resolution as the bootstrap
+        // pair, so it uses the same helper.
+        //
+        // Out-of-range features are dropped *before* resolution: a claim that
+        // cannot be published must not win its landmark and suppress a valid
+        // later claim on the same one.
+        let tracked_claims: Vec<(usize, usize)> = matches
+            .iter()
+            .copied()
+            .filter(|&(_, curr_idx)| curr_idx < claimed.len())
+            .collect();
+        for index in crate::mapping::growth::accepted_pair_claims(&tracked_claims) {
+            let (mp_idx, curr_idx) = tracked_claims[index];
+            claimed[curr_idx] = Some(mp_idx);
+            core.observations.push(ObservationLink {
+                observation: ObservationKey {
+                    keyframe_idx: frame.idx,
+                    feature_idx: curr_idx,
+                },
+                landmark: LandmarkTarget::Existing(mp_idx),
+            });
+        }
+
+        // Stereo densification: close stereo keypoints become metric landmarks
+        // directly. Far points are left to the pair-growth pass, mirroring
+        // ORB-SLAM3's CreateNewKeyFrame.
+        if let Some(mthdepth) = self.stereo_close_depth
+            && curr_kf.frame.is_stereo()
+        {
+            core.landmarks = crate::mapping::growth::stereo_seeds(
+                &curr_kf.frame,
+                &self.rig.camera,
+                mthdepth,
+                &claimed,
+            );
+        }
+        let n_close = core.landmarks.len();
+        core.keyframes.push(curr_kf);
+
+        if let (Some(prev_kf_idx), Some(prev_ts)) = (
+            self.tracker.state.last_keyframe_idx,
+            self.inertial.last_keyframe_timestamp_sec,
+        ) {
+            let (preint, raw_samples) =
+                self.inertial
+                    .preintegrate_window(self.rig.imu.as_ref(), prev_ts, timestamp_sec);
+            if preint.dt > 0.0 {
+                core.imu_factors.push(ImuFactor {
+                    prev_kf_idx,
+                    curr_kf_idx: frame.idx,
+                    preintegrated: preint,
+                    raw_samples,
+                    t0: prev_ts,
+                    t1: timestamp_sec,
+                });
+            }
+        }
+
+        let published = self.map.lock().unwrap().apply_insertion(core);
+        if let Err(error) = published {
+            // Nothing was written, so no tracker or IMU reference may advance to
+            // a keyframe the map does not hold.
+            self.dbg(format!(
+                "[kf] frame={} publication rejected: {error}",
+                frame.idx
+            ));
+            return false;
+        }
+        if n_close > 0 {
+            self.dbg(format!(
+                "[kf_stereo] frame={} close_points={}",
+                frame.idx, n_close
+            ));
+        }
+
+        self.inertial.last_keyframe_timestamp_sec = Some(timestamp_sec);
+        self.tracker.state.current_keyframe_idx = Some(frame.idx);
+        self.tracker.state.last_keyframe_idx = Some(frame.idx);
+
+        // Optional mapping work the accepted keyframe earns. Mapping owns the
+        // sequence and its lock boundaries; the messages stay here.
+        let imu_initialized = self.tracker.state.imu_initialized;
+        let growth = crate::mapping::keyframe_mapping::grow_keyframe(
+            &self.map,
+            growth_plan,
+            &self.rig.camera,
+            self.two_view_init_config.match_config,
+            &self.two_view_init_config.triangulation_config,
+        );
+        for failure in &growth.pair_failures {
+            self.dbg(format!(
+                "[kf] frame={} pair growth against {} rejected: {}",
+                frame.idx, failure.neighbor_keyframe_idx, failure.error
+            ));
+        }
+        self.dbg(format!(
+            "[kf] frame={} grown={} from {} neighbor kfs",
+            frame.idx, growth.landmarks_added, growth.neighbor_count
+        ));
+        self.dbg(format!(
+            "[fuse] frame={} fused={}",
+            frame.idx, growth.observations_added
+        ));
+        for error in &growth.fusion_failures {
+            self.dbg(format!("[fuse] frame={} link refused: {error}", frame.idx));
+        }
+
+        // Refinement can rotate/scale the world and update gravity. Do it before
+        // constructing the BA request so the job and its future snapshot agree.
+        if imu_initialized {
+            // Drop the solve's map lock before applying its result with a new lock.
+            let outcome = {
+                let map = self.map.lock().unwrap();
+                self.inertial.initializer.on_keyframe_initialized(
+                    &map,
+                    timestamp_sec,
+                    self.rig.imu.as_ref().map(|imu| imu.camera_to_body),
+                    self.inertial.bias,
+                    self.inertial.gravity_world,
+                )
+            };
+            self.apply_inertial_refinement(outcome);
+        }
+
+        let job = self.keyframe_job();
+        if !self.local_mapping.submit(job) {
+            self.dbg("[local_mapping] worker is unavailable".into());
+        }
+        // Synchronous mode has a completed correction available immediately;
+        // asynchronous mode will deliver it at a later frame boundary.
+        self.apply_local_mapping_results();
+
+        // Index this keyframe for appearance-based place recognition and surface
+        // any loop candidates (no-op unless a vocabulary was provided).
+        self.register_place_recognition(frame.idx);
+
+        true
+    }
+
+    /// Applies a VIBA1/VIBA2 refinement outcome produced by the initializer.
+    fn apply_inertial_refinement(&mut self, outcome: InertialInitOutcome) {
+        let InertialInitOutcome::Attempted { stage, result } = outcome else {
+            return;
+        };
+        let stage_label = stage.label();
+        match result {
+            Ok(init) => {
+                let scale = init.scale;
+                let bg = init.bias.gyro;
+                match self.apply_inertial_initialization(init) {
+                    Ok(()) => self.dbg(format!(
+                        "[imu_init] {stage_label} accepted: scale_correction={scale:.4} gyro_bias=({:.4},{:.4},{:.4})",
+                        bg.x, bg.y, bg.z
+                    )),
+                    Err(error) => {
+                        self.dbg(format!("[imu_init] {stage_label} apply rejected: {error}"));
+                    }
+                }
+            }
+            Err(error) => {
+                self.dbg(format!("[imu_init] {stage_label} rejected: {error}"));
+            }
+        }
+    }
+
+    /// Runs map-side loop closing, then applies its live tracking consequences.
+    fn register_place_recognition(&mut self, kf_idx: usize) {
+        let context = LoopClosingContext {
+            reference_keyframe_idx: self.tracker.state.current_keyframe_idx,
+            inertial: self
+                .tracker
+                .state
+                .imu_initialized
+                .then_some(InertialPgoContext {
+                    gravity_world: self.inertial.gravity_world,
+                }),
+        };
+        let outcome = {
+            let mut map = self.map.lock().unwrap();
+            self.loop_closer
+                .on_keyframe(&mut map, &self.rig.camera, kf_idx, context)
+        };
+        self.apply_loop_closure_outcome(outcome);
+    }
+
+    fn apply_loop_closure_outcome(&mut self, outcome: LoopClosingOutcome) {
+        if let Some(message) = outcome.debug_message {
+            self.dbg(message);
+        }
+        if let Some(correction) = outcome.reference_correction {
+            self.tracker.apply_loop_correction(
+                correction.before,
+                correction.after,
+                correction.world,
+            );
+            if self.tracker.state.imu_initialized {
+                let job = self.keyframe_job();
+                if !self.local_mapping.submit(job) {
+                    self.dbg("[local_mapping] worker is unavailable after PGO".into());
+                }
+                self.apply_local_mapping_results();
+            }
+        }
+        self.loop_closure_events.extend(outcome.events);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ImuInitApplyError, InitialMapError, SlamConfig, SlamSystem};
+    use crate::Frame;
+    use crate::initialization::bootstrap::{BootstrapPublicationReject, ClaimedView};
+    use crate::initialization::{ImuInitResult, KeyframeVelocity};
+    use crate::map::Keyframe;
+    use crate::tracking::TrackingStatus;
+    use kornia_3d::camera::PinholeCamera;
+    use kornia_3d::pose::Pose3d;
+    use kornia_algebra::{SO3F64, Vec3F64};
+    use kornia_image::ImageSize;
+    use kornia_imgproc::features::OrbFeatures;
+    use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias};
+
+    /// A descriptor set that is distinctive per synthetic scene.
+    fn epoch_descriptor(scene: u64, index: usize) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut x = scene
+            .wrapping_mul(0x9E3779B97F4A7C15)
+            .wrapping_add(index as u64 + 1);
+        for byte in out.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *byte = (x >> 24) as u8;
+        }
+        out
+    }
+
+    fn epoch_test_camera() -> PinholeCamera {
+        PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        }
+    }
+
+    /// A grid of landmarks spread in depth around five metres, seen from a
+    /// camera centre at `+x_offset`. 150 points clears the 100-match and
+    /// 50-triangulated gates.
+    ///
+    /// Each point keeps a fixed normalised image position and takes its own
+    /// depth, so the reference view is a clean grid while the depths differ
+    /// point by point. That gives the two-view estimator real structure —
+    /// without it, a fronto-parallel plane leaves the cheirality decomposition
+    /// ambiguous — and keeps every feature of one grid row on one image row, so
+    /// a correspondence between two features of the same row is still
+    /// epipolar-consistent under the `x`-only motion used here.
+    fn epoch_scene_frame(idx: usize, scene: u64, x_offset: f64) -> Frame {
+        let camera = epoch_test_camera();
+        let points: Vec<Vec3F64> = (0..150)
+            .map(|i| {
+                let x_norm = ((i % 15) as f64 * 0.12 - 0.84) / 5.0;
+                let y_norm = ((i / 15) as f64 * 0.12 - 0.54) / 5.0;
+                let depth = 5.0 + ((i * 7) % 5) as f64 * 0.8;
+                Vec3F64::new(x_norm * depth, y_norm * depth, depth)
+            })
+            .collect();
+        let pose = Pose3d::new(SO3F64::IDENTITY.matrix(), Vec3F64::new(-x_offset, 0.0, 0.0));
+        let n = points.len();
+        Frame {
+            idx,
+            features: OrbFeatures {
+                keypoints_xy: points
+                    .iter()
+                    .map(|p| {
+                        let c = pose.transform_point(p);
+                        [
+                            (camera.fx * c.x / c.z + camera.cx) as f32,
+                            (camera.fy * c.y / c.z + camera.cy) as f32,
+                        ]
+                    })
+                    .collect(),
+                orientations: vec![0.0; n],
+                descriptors: (0..n).map(|i| epoch_descriptor(scene, i)).collect(),
+                octaves: vec![0; n],
+            },
+            pose_world_to_cam: Pose3d::IDENTITY,
+            image_size: ImageSize {
+                width: 640,
+                height: 480,
+            },
+            keypoint_colors: vec![[0; 3]; n],
+            u_right: Vec::new(),
+            depth: Vec::new(),
+            keypoints_undist: Vec::new(),
+        }
+    }
+
+    /// The same scene, but two features in one row carry one descriptor.
+    ///
+    /// Matching is directional — each reference descriptor takes its best
+    /// current descriptor — so both of these claim the *same* current feature.
+    /// Both sit on one image row, and the synthetic motion is along `x`, so both
+    /// are epipolar-consistent and survive as inliers: exactly the duplicate
+    /// claim seen on the dataset.
+    fn epoch_scene_frame_with_duplicate_descriptor(
+        idx: usize,
+        scene: u64,
+        x_offset: f64,
+        kept: usize,
+        duplicated_onto: usize,
+    ) -> Frame {
+        let mut frame = epoch_scene_frame(idx, scene, x_offset);
+        let descriptor = frame.features.descriptors[kept];
+        frame.features.descriptors[duplicated_onto] = descriptor;
+        frame
+    }
+
+    fn epoch_test_system() -> SlamSystem {
+        SlamSystem::new(
+            epoch_test_camera(),
+            SlamConfig {
+                local_mapping: crate::map::LocalMappingMode::Synchronous,
+                debug: true,
+                ..SlamConfig::default()
+            },
+        )
+    }
+
+    /// Keyframes for the publication path: `n` features on one row, so any
+    /// feature index below `n` is a valid slot to claim.
+    fn publication_keyframe(idx: usize, n: usize) -> Keyframe {
+        let frame = Frame {
+            idx,
+            features: OrbFeatures {
+                keypoints_xy: (0..n).map(|i| [300.0 + i as f32, 240.0]).collect(),
+                orientations: vec![0.0; n],
+                descriptors: (0..n).map(|i| epoch_descriptor(9, i)).collect(),
+                octaves: vec![0; n],
+            },
+            pose_world_to_cam: Pose3d::IDENTITY,
+            image_size: ImageSize {
+                width: 640,
+                height: 480,
+            },
+            keypoint_colors: vec![[0; 3]; n],
+            u_right: Vec::new(),
+            depth: Vec::new(),
+            keypoints_undist: Vec::new(),
+        };
+        Keyframe::from_frame(frame)
+    }
+
+    /// A bootstrap publication must seed an empty active map.
+    ///
+    /// The publication normalises the pair's triangulated depths so the
+    /// reference median depth is 1, and it only ever creates new landmarks — it
+    /// cannot relate itself to landmarks already in the map. Appending it to an
+    /// abandoned epoch therefore leaves two independently scaled reconstructions
+    /// in one map, where projection-guided tracking can still match the old ones.
+    #[test]
+    fn a_second_bootstrap_epoch_does_not_publish_into_the_first() {
+        let image = kornia_image::Image::from_size_val(
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            0u8,
+        )
+        .unwrap();
+        let mut system = epoch_test_system();
+
+        // Epoch A: a pair with real parallax bootstraps a map.
+        system.process_frame(epoch_scene_frame(0, 1, 0.0), None, &image, 0.0, Vec::new());
+        system.process_frame(epoch_scene_frame(1, 1, 0.6), None, &image, 0.2, Vec::new());
+        let epoch_a: Vec<usize> = system
+            .map
+            .lock()
+            .unwrap()
+            .keyframes()
+            .iter()
+            .map(|kf| kf.frame.idx)
+            .collect();
+        assert_eq!(epoch_a, vec![0, 1], "epoch A should have seeded the map");
+
+        // Tracking gives up and restarts bootstrap, exactly as the loss path does.
+        system.tracker.restart_bootstrap();
+
+        // Epoch B: a different scene bootstraps its own pair.
+        system.process_frame(epoch_scene_frame(10, 2, 0.0), None, &image, 2.0, Vec::new());
+        system.process_frame(epoch_scene_frame(11, 2, 0.6), None, &image, 2.2, Vec::new());
+
+        let map = system.map.lock().unwrap();
+        let keyframes: Vec<usize> = map.keyframes().iter().map(|kf| kf.frame.idx).collect();
+        assert_eq!(
+            keyframes,
+            vec![10, 11],
+            "the second bootstrap must publish into a map cleared of the abandoned epoch"
+        );
+        let live = map.map_points().iter().filter(|mp| !mp.culled).count();
+        let reachable = map
+            .map_points()
+            .iter()
+            .enumerate()
+            .filter(|(id, mp)| {
+                !mp.culled
+                    && map.keyframes().iter().any(|kf| {
+                        kf.map_point_by_desc_idx
+                            .iter()
+                            .flatten()
+                            .any(|slot| slot == id)
+                    })
+            })
+            .count();
+        assert!(live > 0, "the second epoch must have published landmarks");
+        assert_eq!(
+            reachable, live,
+            "every live landmark must be observed by a keyframe of the current epoch"
+        );
+    }
+
+    /// A duplicate claim in the *current* view is reported with the identity of
+    /// the actual conflict, and nothing is published.
+    #[test]
+    fn publication_refuses_a_duplicate_current_view_claim_with_its_identity() {
+        let mut system = epoch_test_system();
+        let reference_kf = publication_keyframe(4, 8);
+        let current_kf = publication_keyframe(5, 8);
+
+        // Two reference features, 2 and 3, both claim current feature 6.
+        let matches = vec![(2, 6), (3, 6), (1, 2)];
+        let points3d = vec![
+            Vec3F64::new(0.10, 0.0, 2.0),
+            Vec3F64::new(-0.05, 0.0, 2.4),
+            Vec3F64::new(0.20, 0.0, 2.2),
+        ];
+        let inlier_indices = vec![0, 1, 2];
+
+        let error = system
+            .build_initial_map(
+                reference_kf,
+                current_kf,
+                &matches,
+                &points3d,
+                &inlier_indices,
+                Some(2.0),
+            )
+            .expect_err("a duplicate claim must refuse the publication");
+
+        match error {
+            InitialMapError::Refused(BootstrapPublicationReject::DuplicateFeatureClaim {
+                keyframe_idx,
+                claim,
+            }) => {
+                assert_eq!(
+                    keyframe_idx, 5,
+                    "the current keyframe owns the claimed slot"
+                );
+                assert_eq!(claim.view, ClaimedView::Current);
+                assert_eq!(claim.feature_idx, 6, "feature 6 is the claimed slot");
+                assert_eq!(claim.first_proposal, 0);
+                assert_eq!(claim.later_proposal, 1);
+            }
+            other => panic!("expected a duplicate-claim refusal, got {other:?}"),
+        }
+
+        let map = system.map.lock().unwrap();
+        assert!(
+            map.keyframes().is_empty(),
+            "a refused candidate must not publish keyframes"
+        );
+        assert!(
+            map.map_points().is_empty(),
+            "a refused candidate must not publish landmarks"
+        );
+    }
+
+    /// The same, for a duplicate claim in the *reference* view: the reported
+    /// keyframe and feature must be the reference ones.
+    #[test]
+    fn publication_refuses_a_duplicate_reference_view_claim_with_its_identity() {
+        let mut system = epoch_test_system();
+        let reference_kf = publication_keyframe(4, 8);
+        let current_kf = publication_keyframe(5, 8);
+
+        // Reference feature 3 is claimed by two proposals, for two different
+        // current features.
+        let matches = vec![(1, 2), (3, 4), (3, 5)];
+        let points3d = vec![
+            Vec3F64::new(0.10, 0.0, 2.0),
+            Vec3F64::new(-0.05, 0.0, 2.4),
+            Vec3F64::new(0.20, 0.0, 2.2),
+        ];
+        let inlier_indices = vec![0, 1, 2];
+
+        let error = system
+            .build_initial_map(
+                reference_kf,
+                current_kf,
+                &matches,
+                &points3d,
+                &inlier_indices,
+                Some(2.0),
+            )
+            .expect_err("a duplicate claim must refuse the publication");
+
+        match error {
+            InitialMapError::Refused(BootstrapPublicationReject::DuplicateFeatureClaim {
+                keyframe_idx,
+                claim,
+            }) => {
+                assert_eq!(
+                    keyframe_idx, 4,
+                    "the reference keyframe owns the claimed slot"
+                );
+                assert_eq!(claim.view, ClaimedView::Reference);
+                assert_eq!(claim.feature_idx, 3);
+                assert_eq!(claim.first_proposal, 1);
+                assert_eq!(claim.later_proposal, 2);
+            }
+            other => panic!("expected a duplicate-claim refusal, got {other:?}"),
+        }
+
+        assert!(system.map.lock().unwrap().keyframes().is_empty());
+    }
+
+    /// A conflict-free candidate published through the same path still works,
+    /// so the guard is not refusing everything.
+    #[test]
+    fn publication_accepts_a_conflict_free_candidate() {
+        let mut system = epoch_test_system();
+        let reference_kf = publication_keyframe(4, 8);
+        let current_kf = publication_keyframe(5, 8);
+
+        let matches = vec![(1, 2), (3, 4), (5, 6)];
+        let points3d = vec![
+            Vec3F64::new(0.10, 0.0, 2.0),
+            Vec3F64::new(-0.05, 0.0, 2.4),
+            Vec3F64::new(0.20, 0.0, 2.2),
+        ];
+        let inlier_indices = vec![0, 1, 2];
+
+        let added = system
+            .build_initial_map(
+                reference_kf,
+                current_kf,
+                &matches,
+                &points3d,
+                &inlier_indices,
+                Some(2.0),
+            )
+            .expect("a conflict-free candidate must publish");
+        assert_eq!(added, 3, "all three proposals should publish");
+        let map = system.map.lock().unwrap();
+        assert_eq!(
+            map.keyframes()
+                .iter()
+                .map(|kf| kf.frame.idx)
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+    }
+
+    /// The coordinator's rejection/retry transition, driven through
+    /// `process_frame`.
+    ///
+    /// The refused candidate must leave no map and must not be left advertised
+    /// as an accepted pair, and a later candidate must still be able to
+    /// bootstrap.
+    #[test]
+    fn a_refused_candidate_does_not_block_a_later_bootstrap() {
+        let image = kornia_image::Image::from_size_val(
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            0u8,
+        )
+        .unwrap();
+        let mut system = epoch_test_system();
+
+        // A reference frame in which features 6 and 7 — same image row — carry
+        // one descriptor, so both claim one current feature.
+        system.process_frame(
+            epoch_scene_frame_with_duplicate_descriptor(0, 1, 0.0, 6, 7),
+            None,
+            &image,
+            0.0,
+            Vec::new(),
+        );
+        let result =
+            system.process_frame(epoch_scene_frame(1, 1, 0.6), None, &image, 0.2, Vec::new());
+
+        assert_eq!(
+            result.status,
+            TrackingStatus::Skipped,
+            "a refused publication must not report an accepted keyframe"
+        );
+        assert!(
+            system.map.lock().unwrap().keyframes().is_empty(),
+            "a refused candidate must leave no keyframes in the map"
+        );
+        assert!(
+            system.map.lock().unwrap().map_points().is_empty(),
+            "a refused candidate must leave no landmarks in the map"
+        );
+        assert_eq!(
+            system.tracker.state.mode,
+            crate::tracking::SystemMode::Bootstrap,
+            "the coordinator must stay in bootstrap after a refusal"
+        );
+
+        // A later, conflict-free candidate bootstraps normally.
+        system.process_frame(epoch_scene_frame(2, 1, 0.0), None, &image, 0.4, Vec::new());
+        system.process_frame(epoch_scene_frame(3, 1, 0.6), None, &image, 0.6, Vec::new());
+        assert_eq!(
+            system
+                .map
+                .lock()
+                .unwrap()
+                .keyframes()
+                .iter()
+                .map(|kf| kf.frame.idx)
+                .collect::<Vec<_>>(),
+            vec![2, 3],
+            "bootstrap must still succeed on a later conflict-free pair"
+        );
+    }
+
+    fn assert_pose_close(actual: Pose3d, expected: Pose3d) {
+        assert!((actual.translation - expected.translation).length() < 1e-10);
+        for (actual, expected) in actual
+            .rotation
+            .to_cols_array()
+            .iter()
+            .zip(expected.rotation.to_cols_array())
+        {
+            assert!((actual - expected).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn legacy_extrinsics_setter_preserves_configured_imu_noise() {
+        let (_, _, camera) = crate::tracking::tests::synthetic_scene();
+        let mut calibration = crate::ImuCalibration::new(Pose3d::IDENTITY);
+        calibration.noise.gyro_noise = 0.123;
+        calibration.noise.accel_noise = 0.456;
+        let mut system = SlamSystem::with_rig(
+            crate::SensorRig {
+                camera,
+                imu: Some(calibration),
+            },
+            SlamConfig::default(),
+        );
+        let extrinsic = Pose3d::new(SO3F64::IDENTITY.matrix(), Vec3F64::new(0.1, 0.2, 0.3));
+        system.set_imu_extrinsics(extrinsic);
+        let imu = system.rig.imu.as_ref().unwrap();
+        assert_eq!(imu.noise.gyro_noise, 0.123);
+        assert_eq!(imu.noise.accel_noise, 0.456);
+        assert_pose_close(imu.camera_to_body, extrinsic);
+        assert_pose_close(system.keyframe_job().imu_t_bc.unwrap(), extrinsic);
+    }
+
+    #[test]
+    fn legacy_constructor_enables_imu_with_historical_noise() {
+        let (_, _, camera) = crate::tracking::tests::synthetic_scene();
+        let mut system = SlamSystem::new(camera, SlamConfig::default());
+        assert!(system.rig.imu.is_none());
+        system.set_imu_extrinsics(Pose3d::IDENTITY);
+        let imu = system.rig.imu.as_ref().unwrap();
+        assert_eq!(imu.noise.gyro_noise, 1.6968e-4);
+        assert_eq!(imu.noise.accel_noise, 2.0e-3);
+        assert_eq!(imu.noise.gyro_bias_noise, 1.9393e-5);
+        assert_eq!(imu.noise.accel_bias_noise, 3.0e-3);
+    }
+
+    fn empty_keyframe(idx: usize) -> Keyframe {
+        Keyframe::from_frame(Frame {
+            idx,
+            features: OrbFeatures {
+                keypoints_xy: Vec::new(),
+                orientations: Vec::new(),
+                descriptors: Vec::new(),
+                octaves: Vec::new(),
+            },
+            pose_world_to_cam: Pose3d::IDENTITY,
+            image_size: ImageSize {
+                width: 640,
+                height: 480,
+            },
+            keypoint_colors: Vec::new(),
+            u_right: Vec::new(),
+            depth: Vec::new(),
+            keypoints_undist: Vec::new(),
+        })
+    }
+
+    /// The map-side alignment is covered in `map`; this checks the system
+    /// state the application adopts from the last aligned keyframe.
+    #[test]
+    fn inertial_initialization_adopts_the_last_keyframe_state() {
+        let camera = PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let mut system = SlamSystem::new(camera, SlamConfig::default());
+        {
+            let mut map = system.map.lock().unwrap();
+            map.insert_keyframe(empty_keyframe(20)).unwrap();
+            map.insert_keyframe(empty_keyframe(10)).unwrap();
+        }
+        let velocity_10 = Vec3F64::new(1.0, 2.0, 3.0);
+        let velocity_20 = Vec3F64::new(4.0, 5.0, 6.0);
+        let result = ImuInitResult {
+            scale: 1.0,
+            // Already at the canonical gravity direction, so the alignment
+            // rotation is identity and the velocities pass through unchanged.
+            gravity_world: Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0),
+            keyframe_velocities: vec![
+                KeyframeVelocity {
+                    keyframe_idx: 10,
+                    velocity_world: velocity_10,
+                },
+                KeyframeVelocity {
+                    keyframe_idx: 20,
+                    velocity_world: velocity_20,
+                },
+            ],
+            bias: ImuBias::default(),
+        };
+
+        system
+            .apply_inertial_initialization(result)
+            .expect("valid initialization should apply");
+
+        assert!((system.tracker.state.velocity_world - velocity_20).length() < 1e-12);
+        assert!(system.tracker.state.imu_initialized);
+        assert!(system.tracker.state.velocity.is_none());
+        assert!(
+            (system.inertial.gravity_world - Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0)).length()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn inertial_initialization_rejects_zero_gravity() {
+        let camera = PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let mut system = SlamSystem::new(camera, SlamConfig::default());
+        let result = ImuInitResult {
+            scale: 1.0,
+            gravity_world: Vec3F64::ZERO,
+            keyframe_velocities: Vec::new(),
+            bias: ImuBias::default(),
+        };
+
+        assert!(matches!(
+            system.apply_inertial_initialization(result),
+            Err(ImuInitApplyError::InvalidGravity)
+        ));
+    }
+
+    #[test]
+    fn loop_closure_outcome_only_changes_tracking_after_map_correction() {
+        use crate::loop_closure::{LoopClosingOutcome, LoopClosureEvent, ReferencePoseCorrection};
+        use crate::map::LocalMappingMode;
+        let camera = PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let mut system = SlamSystem::new(
+            camera,
+            SlamConfig {
+                local_mapping: LocalMappingMode::Synchronous,
+                ..SlamConfig::default()
+            },
+        );
+        let before = Pose3d::new(SO3F64::IDENTITY.matrix(), Vec3F64::new(-1.0, 0.0, 0.0));
+        let relative = Pose3d::new(SO3F64::IDENTITY.matrix(), Vec3F64::new(0.0, 0.0, 0.2));
+        let live_pose = relative.compose(&before);
+        let velocity = Vec3F64::new(1.0, 0.2, -0.5);
+        system.tracker.state.pose_world_to_cam = live_pose;
+        system.tracker.state.velocity_world = velocity;
+        system.apply_loop_closure_outcome(LoopClosingOutcome {
+            events: vec![LoopClosureEvent::PgoFailed {
+                query_kf_idx: 10,
+                candidate_kf_idx: 0,
+                reason: "rejected".into(),
+            }],
+            ..LoopClosingOutcome::default()
+        });
+        assert_eq!(system.tracker.state.pose_world_to_cam, live_pose);
+        assert_eq!(system.tracker.state.velocity_world, velocity);
+        assert_eq!(system.drain_loop_closure_events().len(), 1);
+        assert!(system.drain_loop_closure_events().is_empty());
+
+        let yaw = SO3F64::exp(Vec3F64::new(0.0, 0.4, 0.0)).matrix();
+        let after = Pose3d::new(yaw.transpose(), Vec3F64::new(-2.0, 0.0, 0.0));
+        system.apply_loop_closure_outcome(LoopClosingOutcome {
+            reference_correction: Some(ReferencePoseCorrection {
+                before,
+                after,
+                world: after.inverse().compose(&before),
+            }),
+            ..LoopClosingOutcome::default()
+        });
+        assert_pose_close(
+            Pose3d::between(&after, &system.tracker.state.pose_world_to_cam),
+            relative,
+        );
+        assert!((system.tracker.state.velocity_world - yaw * velocity).length() < 1e-10);
+    }
+    fn tracking_test_system(map_size: usize) -> SlamSystem {
+        let camera = PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let mut system = SlamSystem::new(
+            camera,
+            SlamConfig {
+                local_mapping: crate::map::LocalMappingMode::Synchronous,
+                ..SlamConfig::default()
+            },
+        );
+        for idx in 0..map_size {
+            system
+                .map
+                .lock()
+                .unwrap()
+                .insert_keyframe(empty_keyframe(idx))
+                .unwrap();
+        }
+        system.tracker.state.mode = crate::tracking::SystemMode::Tracking;
+        system.tracker.state.last_frame_timestamp_sec = 1.0;
+        system.tracker.state.velocity = Some(Pose3d::new(
+            SO3F64::IDENTITY.matrix(),
+            Vec3F64::new(0.1, 0.0, 0.0),
+        ));
+        system
+    }
+
+    #[test]
+    fn tracking_rejection_carries_visual_prediction_during_grace() {
+        let mut system = tracking_test_system(11);
+        let image = kornia_image::Image::from_size_val(
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            0u8,
+        )
+        .unwrap();
+        for (idx, timestamp) in [(20, 2.0), (21, 2.25)] {
+            let result = system.tracking_step(empty_keyframe(idx).frame, None, &image, timestamp);
+            assert_eq!(result.status, crate::tracking::TrackingStatus::Skipped);
+            assert_eq!(
+                system.tracker.state.mode,
+                crate::tracking::SystemMode::Tracking
+            );
+            assert_eq!(system.tracker.state.last_frame_timestamp_sec, timestamp);
+            assert_eq!(system.tracker.state.lost_since_sec, Some(2.0));
+        }
+        assert!((system.tracker.state.pose_world_to_cam.translation.x - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn tracking_loss_boundaries_preserve_same_frame_bootstrap_and_map() {
+        let image = kornia_image::Image::from_size_val(
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            0u8,
+        )
+        .unwrap();
+        // Exactly the minimum map size is not established; timeout is inclusive.
+        for (map_size, lost_since, timestamp, expect_reset) in [
+            (10, None, 2.0, true),
+            (11, None, 2.0, false),
+            (11, Some(2.0), 2.499, false),
+            (11, Some(2.0), 2.5, true),
+        ] {
+            let mut system = tracking_test_system(map_size);
+            system.tracker.state.lost_since_sec = lost_since;
+            let mut frame = empty_keyframe(30).frame;
+            frame.features.keypoints_xy = vec![[320.0, 240.0]; 101];
+            frame.features.descriptors = vec![[0; 32]; 101];
+            frame.features.orientations = vec![0.0; 101];
+            frame.features.octaves = vec![0; 101];
+            system.tracking_step(frame, None, &image, timestamp);
+            assert_eq!(system.map.lock().unwrap().keyframes().len(), map_size);
+            assert!((system.tracker.state.pose_world_to_cam.translation.x - 0.1).abs() < 1e-12);
+            if expect_reset {
+                assert_eq!(
+                    system.tracker.state.mode,
+                    crate::tracking::SystemMode::Bootstrap
+                );
+                assert_eq!(
+                    system.tracker.state.bootstrap_frame.as_ref().unwrap().idx,
+                    30
+                );
+                assert_eq!(system.inertial.bootstrap_timestamp_sec, Some(timestamp));
+                assert_eq!(system.tracker.state.last_frame_timestamp_sec, 1.0);
+                assert!(system.tracker.state.velocity.is_none());
+            } else {
+                assert_eq!(
+                    system.tracker.state.mode,
+                    crate::tracking::SystemMode::Tracking
+                );
+                assert_eq!(system.tracker.state.last_frame_timestamp_sec, timestamp);
+            }
+        }
+    }
+
+    #[test]
+    fn tracking_imu_confidence_boundary_selects_longer_grace() {
+        let image = kornia_image::Image::from_size_val(
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            0u8,
+        )
+        .unwrap();
+        for (initialized_at, timestamp, reset) in
+            [(0.5, 2.5, false), (0.501, 2.5, true), (0.5, 3.0, true)]
+        {
+            let mut system = tracking_test_system(11);
+            system.tracker.state.imu_initialized = true;
+            system.tracker.state.imu_init_timestamp_sec = Some(initialized_at);
+            system.tracker.state.lost_since_sec = Some(2.0);
+            system.tracking_step(empty_keyframe(20).frame, None, &image, timestamp);
+            assert_eq!(
+                system.tracker.state.mode == crate::tracking::SystemMode::Bootstrap,
+                reset
+            );
+        }
+    }
+
+    #[test]
+    fn tracked_keyframe_result_uses_live_state_after_synchronous_mapping() {
+        let (map, frame, camera) = crate::tracking::tests::synthetic_scene();
+        let image = kornia_image::Image::from_size_val(frame.image_size, 0u8).unwrap();
+        let mut system = SlamSystem::new(
+            camera,
+            SlamConfig {
+                local_mapping: crate::map::LocalMappingMode::Synchronous,
+                ..SlamConfig::default()
+            },
+        );
+        *system.map.lock().unwrap() = map;
+        system.tracker.state.mode = crate::tracking::SystemMode::Tracking;
+        system.tracker.state.current_keyframe_idx = Some(0);
+        system.tracker.state.last_keyframe_idx = Some(0);
+        system.tracker.state.lost_since_sec = Some(0.9);
+        let result = system.tracking_step(frame, None, &image, 1.0);
+        assert_eq!(
+            result.status,
+            crate::tracking::TrackingStatus::KeyframeAccepted
+        );
+        assert_eq!(system.current_keyframe_idx(), Some(8));
+        assert_eq!(
+            result.pose_world_to_cam,
+            system.tracker.state.pose_world_to_cam
+        );
+        assert_eq!(system.tracker.state.last_frame_timestamp_sec, 1.0);
+        assert!(system.tracker.state.lost_since_sec.is_none());
+        assert_eq!(system.map.lock().unwrap().keyframes().len(), 2);
+    }
+    // ── bootstrap reference retention ────────────────────────────────────
+
+    /// Deterministic 256-bit descriptors, far apart in Hamming distance so a
+    /// point matches only its own counterpart (`th_low = 50`, `nn_ratio = 0.6`).
+    fn scene_descriptor(scene: u64, index: usize) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut x = scene
+            .wrapping_mul(0x9E3779B97F4A7C15)
+            .wrapping_add(index as u64 + 1);
+        for byte in out.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *byte = (x >> 24) as u8;
+        }
+        out
+    }
+
+    /// A grid of landmarks five metres out, projected from a camera centre at
+    /// `+x_offset`. 150 points clears the 100-match and 50-triangulated gates.
+    fn scene_frame(idx: usize, scene: u64, x_offset: f64) -> Frame {
+        let camera = bootstrap_test_camera();
+        let points: Vec<Vec3F64> = (0..150)
+            .map(|i| {
+                Vec3F64::new(
+                    (i % 15) as f64 * 0.12 - 0.84,
+                    (i / 15) as f64 * 0.12 - 0.54,
+                    5.0,
+                )
+            })
+            .collect();
+        let pose = Pose3d::new(SO3F64::IDENTITY.matrix(), Vec3F64::new(-x_offset, 0.0, 0.0));
+        let n = points.len();
+        Frame {
+            idx,
+            features: OrbFeatures {
+                keypoints_xy: points
+                    .iter()
+                    .map(|p| {
+                        let c = pose.transform_point(p);
+                        [
+                            (camera.fx * c.x / c.z + camera.cx) as f32,
+                            (camera.fy * c.y / c.z + camera.cy) as f32,
+                        ]
+                    })
+                    .collect(),
+                orientations: vec![0.0; n],
+                descriptors: (0..n).map(|i| scene_descriptor(scene, i)).collect(),
+                octaves: vec![0; n],
+            },
+            pose_world_to_cam: Pose3d::IDENTITY,
+            image_size: ImageSize {
+                width: 640,
+                height: 480,
+            },
+            keypoint_colors: vec![[0; 3]; n],
+            u_right: Vec::new(),
+            depth: Vec::new(),
+            keypoints_undist: Vec::new(),
+        }
+    }
+
+    fn bootstrap_test_camera() -> PinholeCamera {
+        PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        }
+    }
+
+    fn bootstrap_test_system() -> SlamSystem {
+        SlamSystem::new(
+            bootstrap_test_camera(),
+            SlamConfig {
+                local_mapping: crate::map::LocalMappingMode::Synchronous,
+                debug: true,
+                ..SlamConfig::default()
+            },
+        )
+    }
+
+    /// A stored bootstrap reference that can no longer match the scene must be
+    /// replaced, or bootstrap can never succeed again.
+    ///
+    /// Observed in `artifacts/dbgc-4.err`: after the reset at frame 305, frame
+    /// 305 stayed the reference for the remaining 1194 frames, matching 0-2
+    /// descriptors against the 100 required. `bootstrap_mono` restores
+    /// `prev_bootstrap_frame` after *every* two-view error, so a reference that
+    /// has lost the scene is retained forever.
+    #[test]
+    fn an_unusable_bootstrap_reference_is_eventually_replaced() {
+        let image = kornia_image::Image::from_size_val(
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            0u8,
+        )
+        .unwrap();
+        let mut system = bootstrap_test_system();
+
+        // Frame 0 becomes the reference, from a scene we then leave behind.
+        system.process_frame(scene_frame(0, 1, 0.0), None, &image, 0.0, Vec::new());
+        assert_eq!(
+            system.tracker.state.bootstrap_frame.as_ref().map(|f| f.idx),
+            Some(0),
+            "frame 0 should be stored as the bootstrap reference"
+        );
+
+        // A different scene arrives: no descriptor matches the old reference,
+        // so every attempt is refused for lack of correspondence. Each of
+        // these frames is itself a perfectly usable reference.
+        for idx in 1..=12 {
+            system.process_frame(
+                scene_frame(idx, 2, 0.0),
+                None,
+                &image,
+                idx as f64 * 0.05,
+                Vec::new(),
+            );
+        }
+
+        let reference = system.tracker.state.bootstrap_frame.as_ref().map(|f| f.idx);
+        assert_ne!(
+            reference,
+            Some(0),
+            "a reference that cannot match the scene for 12 consecutive frames \
+             must be replaced; it is still frame 0"
+        );
+
+        // With a usable reference from the new scene, a pair with real parallax
+        // must now be able to bootstrap.
+        system.process_frame(scene_frame(13, 2, 0.6), None, &image, 0.65, Vec::new());
+        assert!(
+            !system.map.lock().unwrap().keyframes().is_empty(),
+            "bootstrap should succeed once the reference belongs to the current scene"
+        );
+    }
+
+    /// The converse: a reference that still sees the scene but lacks parallax
+    /// must be kept, so parallax can accumulate.
+    #[test]
+    fn a_viable_bootstrap_reference_is_kept_while_parallax_accumulates() {
+        let image = kornia_image::Image::from_size_val(
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            0u8,
+        )
+        .unwrap();
+        let mut system = bootstrap_test_system();
+        system.process_frame(scene_frame(0, 1, 0.0), None, &image, 0.0, Vec::new());
+
+        // Same scene, negligible motion: matches are plentiful, parallax is not.
+        for idx in 1..=12 {
+            system.process_frame(
+                scene_frame(idx, 1, 0.001 * idx as f64),
+                None,
+                &image,
+                idx as f64 * 0.05,
+                Vec::new(),
+            );
+        }
+
+        assert_eq!(
+            system.tracker.state.bootstrap_frame.as_ref().map(|f| f.idx),
+            Some(0),
+            "a reference that still matches the scene must be retained while \
+             parallax accumulates"
+        );
+    }
+    /// The bound must survive *alternating* rejection reasons.
+    ///
+    /// Resetting the unmatched streak on every non-`LowMatches` rejection means
+    /// a reference that fails persistently — but not always for the same reason
+    /// — can be retained forever. Here the scene alternates between one the
+    /// reference cannot match at all and one it matches without usable
+    /// geometry, so a consecutive-only counter never reaches its bound.
+    #[test]
+    fn alternating_rejection_reasons_must_not_defeat_the_bound() {
+        let image = kornia_image::Image::from_size_val(
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            0u8,
+        )
+        .unwrap();
+        let mut system = bootstrap_test_system();
+        system.process_frame(scene_frame(0, 1, 0.0), None, &image, 0.0, Vec::new());
+        assert_eq!(
+            system.tracker.state.bootstrap_frame.as_ref().map(|f| f.idx),
+            Some(0)
+        );
+
+        // Alternate: an unmatchable scene (LowMatches), then the reference's own
+        // scene with no motion (a non-LowMatches rejection), repeatedly. The
+        // reference is never usable, yet never fails 10 times consecutively for
+        // the same reason.
+        for idx in 1..=40 {
+            let scene = if idx % 2 == 1 { 2 } else { 1 };
+            system.process_frame(
+                scene_frame(idx, scene, 0.0),
+                None,
+                &image,
+                idx as f64 * 0.05,
+                Vec::new(),
+            );
+        }
+
+        assert_ne!(
+            system.tracker.state.bootstrap_frame.as_ref().map(|f| f.idx),
+            Some(0),
+            "a reference failing for 40 frames must be replaced even when the \
+             rejection reason alternates"
+        );
+    }
+    /// A frame with too few keypoints to take part in bootstrap at all.
+    fn sparse_frame(idx: usize) -> Frame {
+        let mut frame = scene_frame(idx, 1, 0.0);
+        let keep = 50;
+        frame.features.keypoints_xy.truncate(keep);
+        frame.features.orientations.truncate(keep);
+        frame.features.descriptors.truncate(keep);
+        frame.features.octaves.truncate(keep);
+        frame.keypoint_colors.truncate(keep);
+        frame
+    }
+
+    /// The unmatched count belongs to the reference it was accumulated against.
+    ///
+    /// Failures charged to a discarded reference must not shorten the life of
+    /// its successor. Two transitions did not own the counter: a low-feature
+    /// frame dropping the stored reference, and the ordinary path that stores a
+    /// fresh one. A successor inherited the predecessor's failures and could be
+    /// replaced after only a few of its own.
+    #[test]
+    fn counter_ownership_survives_every_reference_transition() {
+        let image = kornia_image::Image::from_size_val(
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            0u8,
+        )
+        .unwrap();
+        let mut system = bootstrap_test_system();
+
+        // Reference A.
+        system.process_frame(scene_frame(0, 1, 0.0), None, &image, 0.0, Vec::new());
+        assert_eq!(
+            system.tracker.state.bootstrap_frame.as_ref().map(|f| f.idx),
+            Some(0)
+        );
+
+        // Eight unmatched attempts against A: below the replacement bound.
+        for idx in 1..=8 {
+            system.process_frame(
+                scene_frame(idx, 2, 0.0),
+                None,
+                &image,
+                idx as f64 * 0.05,
+                Vec::new(),
+            );
+        }
+        assert_eq!(
+            system.tracker.state.bootstrap_unmatched_attempts, 8,
+            "eight refusals should be charged to reference A"
+        );
+        assert_eq!(
+            system.tracker.state.bootstrap_frame.as_ref().map(|f| f.idx),
+            Some(0),
+            "A is below the bound and must still be held"
+        );
+
+        // A low-feature frame discards A entirely.
+        system.process_frame(sparse_frame(9), None, &image, 0.45, Vec::new());
+        assert!(
+            system.tracker.state.bootstrap_frame.is_none(),
+            "a low-feature frame drops the stored reference"
+        );
+        assert_eq!(
+            system.tracker.state.bootstrap_unmatched_attempts, 0,
+            "discarding the reference must discard its failure count"
+        );
+
+        // Reference B arrives through the ordinary path.
+        system.process_frame(scene_frame(10, 2, 0.0), None, &image, 0.5, Vec::new());
+        assert_eq!(
+            system.tracker.state.bootstrap_frame.as_ref().map(|f| f.idx),
+            Some(10),
+            "frame 10 becomes the new reference"
+        );
+        assert_eq!(
+            system.tracker.state.bootstrap_unmatched_attempts, 0,
+            "a newly stored reference starts with no failures against it"
+        );
+
+        // Three unmatched attempts against B. Inheriting A's eight would push
+        // the total past the bound and replace B far too early.
+        for (n, idx) in (11..=13).enumerate() {
+            system.process_frame(
+                scene_frame(idx, 3, 0.0),
+                None,
+                &image,
+                0.5 + (n as f64 + 1.0) * 0.05,
+                Vec::new(),
+            );
+        }
+        assert_eq!(
+            system.tracker.state.bootstrap_unmatched_attempts, 3,
+            "only B's own refusals count against B"
+        );
+        assert_eq!(
+            system.tracker.state.bootstrap_frame.as_ref().map(|f| f.idx),
+            Some(10),
+            "B must not be replaced on failures inherited from A"
+        );
+    }
+}

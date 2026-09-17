@@ -1,7 +1,6 @@
 //! `Factor` adapter wiring `PreintegratedImu` into `kornia_algebra::optim`'s
 //! generic Levenberg-Marquardt solver, for the ORB-SLAM3-style joint
-//! inertial-initialization optimization (`Optimizer::InertialOptimization`,
-//! `docs/imu_init_guide.md`).
+//! inertial-initialization optimization (`Optimizer::InertialOptimization`).
 //!
 //! Variable order for every edge added via `Problem::add_factor` MUST be
 //! `[v_i, v_j, bg, ba, gdir, scale]` — this matches `variable_local_dim`
@@ -71,13 +70,6 @@ pub struct InertialInitFactor {
     /// (unlike g2o's `VS->setFixed(!bMono)`), so this reproduces the same
     /// effect from inside the factor instead.
     is_mono: bool,
-    /// `true` for the ORB-SLAM3 `ScaleRefinement()` mode (`Optimizer::
-    /// InertialOptimization(Map*, Rwg, scale)`, Optimizer.cc:3389): poses,
-    /// velocities, and bias are ALL fixed there (`VV->setFixed(true)`,
-    /// `VG/VA->setFixed(true)`) — only gravity direction and scale are free.
-    /// Same zero-Jacobian-column trick as `is_mono` above, extended to the
-    /// v_i/v_j/bg/ba columns.
-    fixed_bias_vel: bool,
 }
 
 impl InertialInitFactor {
@@ -89,14 +81,7 @@ impl InertialInitFactor {
             pim,
             sqrt_info,
             is_mono,
-            fixed_bias_vel: false,
         }
-    }
-
-    /// See `ScaleRefinement` doc on `fixed_bias_vel`.
-    pub fn with_fixed_bias_vel(mut self, fixed: bool) -> Self {
-        self.fixed_bias_vel = fixed;
-        self
     }
 }
 
@@ -148,7 +133,7 @@ impl Factor for InertialInitFactor {
 
         // Gravity: g = Rwg · gI, ORB-SLAM3's own internal convention gI=(0,0,-G).
         // Converted to kornia's +Y convention only once, at the very end in
-        // `apply_initialization` — never mix conventions mid-solve.
+        // the system's initialization application — never mix conventions mid-solve.
         let rwg = SO3F64::from_array(gdir_arr).matrix();
         let g_i = Vec3F64::new(0.0, 0.0, -GRAVITY_MAGNITUDE);
         let g = rwg * g_i;
@@ -172,29 +157,22 @@ impl Factor for InertialInitFactor {
 
             let jr_inv = SO3F64::right_jacobian(er).inverse();
 
-            // `fixed_bias_vel` (ScaleRefinement mode): v_i/v_j/bg/ba columns
-            // (0..12) stay at zero, pinning them at their seed values under
-            // LM exactly like `is_mono=false` already does for the scale
-            // column below.
-            if !self.fixed_bias_vel {
-                // ∂er/∂bg   (cols 6..9)
-                let d_er_d_bg =
-                    (jr_inv * e_r_mat.transpose() * self.pim.d_rotation_d_bias_gyro) * -1.0;
-                set_block3(&mut jac, 0, 6, d_er_d_bg);
+            // ∂er/∂bg   (cols 6..9)
+            let d_er_d_bg = (jr_inv * e_r_mat.transpose() * self.pim.d_rotation_d_bias_gyro) * -1.0;
+            set_block3(&mut jac, 0, 6, d_er_d_bg);
 
-                // ∂ev/∂v_i, ∂ev/∂v_j   (cols 0..3, 3..6)
-                set_block3(&mut jac, 3, 0, r_bw_i * -scale);
-                set_block3(&mut jac, 3, 3, r_bw_i * scale);
-                // ∂ev/∂bg, ∂ev/∂ba    (cols 6..9, 9..12)
-                set_block3(&mut jac, 3, 6, self.pim.d_velocity_d_bias_gyro * -1.0);
-                set_block3(&mut jac, 3, 9, self.pim.d_velocity_d_bias_accel * -1.0);
+            // ∂ev/∂v_i, ∂ev/∂v_j   (cols 0..3, 3..6)
+            set_block3(&mut jac, 3, 0, r_bw_i * -scale);
+            set_block3(&mut jac, 3, 3, r_bw_i * scale);
+            // ∂ev/∂bg, ∂ev/∂ba    (cols 6..9, 9..12)
+            set_block3(&mut jac, 3, 6, self.pim.d_velocity_d_bias_gyro * -1.0);
+            set_block3(&mut jac, 3, 9, self.pim.d_velocity_d_bias_accel * -1.0);
 
-                // ∂ep/∂v_i            (cols 0..3)
-                set_block3(&mut jac, 6, 0, r_bw_i * (-scale * dt));
-                // ∂ep/∂bg, ∂ep/∂ba    (cols 6..9, 9..12)
-                set_block3(&mut jac, 6, 6, self.pim.d_position_d_bias_gyro * -1.0);
-                set_block3(&mut jac, 6, 9, self.pim.d_position_d_bias_accel * -1.0);
-            }
+            // ∂ep/∂v_i            (cols 0..3)
+            set_block3(&mut jac, 6, 0, r_bw_i * (-scale * dt));
+            // ∂ep/∂bg, ∂ep/∂ba    (cols 6..9, 9..12)
+            set_block3(&mut jac, 6, 6, self.pim.d_position_d_bias_gyro * -1.0);
+            set_block3(&mut jac, 6, 9, self.pim.d_position_d_bias_accel * -1.0);
 
             // gravity-direction block (cols 12..15) — 3-DOF SO3 tangent;
             // the column along gI itself is exactly zero (gauge freedom),
