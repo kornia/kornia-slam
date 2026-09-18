@@ -28,12 +28,10 @@ use std::sync::{Arc, Mutex};
 use crate::Frame;
 use crate::initialization::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use crate::initialization::{ImuInitConfig, ImuInitializer};
-use crate::loop_closure::{
-    InertialPgoContext, LoopEpisodeDecision, LoopEpisodeTracker, VerifiedLoopEdge,
-    fuse_verified_loop, optimize_pose_graph, verify_loop_candidate,
-};
+use crate::loop_closure::{LoopCloser, LoopClosingContext};
 use crate::map::{Keyframe, KeyframeJob, LocalMapping, Map, MapPoint, ORB_SCALE_FACTOR};
 use crate::place_recognition::{KeyFrameDatabase, Vocabulary, compute_bow};
+use crate::pose_conversion::apply_reference_pose_correction;
 use crate::stereo::unproject_stereo;
 use crate::tracking::optical_flow::{
     FlowSurvivor, KltTracker, MapKeypointMatch, TrackSet, snap_unique,
@@ -106,28 +104,13 @@ pub struct SlamSystem {
     // and the inverted-index keyframe database queried at each keyframe insert.
     vocabulary: Option<Vocabulary>,
     kf_database: KeyFrameDatabase,
-    pgo_config: Option<LoopClosingConfig>,
-    loop_episode_tracker: Option<LoopEpisodeTracker>,
-    verified_loops: Vec<VerifiedLoopEdge>,
-    verified_loop_pairs: HashSet<(usize, usize)>,
+    loop_closer: Option<LoopCloser>,
     loop_closure_events: Vec<LoopClosureEvent>,
     // System state
     state: SystemState,
 }
 
-/// Concise externally visible result of a loop-closure attempt.
-#[derive(Debug, Clone)]
-pub enum LoopClosureEvent {
-    Accepted {
-        edge: VerifiedLoopEdge,
-        applied: bool,
-    },
-    PgoFailed {
-        query_kf_idx: usize,
-        candidate_kf_idx: usize,
-        reason: String,
-    },
-}
+pub use crate::loop_closure::LoopClosureEvent;
 
 impl SlamSystem {
     /// Creates a new system with identity pose.
@@ -136,10 +119,7 @@ impl SlamSystem {
         let local_mapping =
             LocalMapping::new(config.local_mapping, Arc::clone(&map), camera.clone());
         let map_publication_gate = local_mapping.publication_gate();
-        let pgo_config = config.pgo;
-        let loop_episode_tracker = pgo_config
-            .as_ref()
-            .map(|config| LoopEpisodeTracker::new(config.episode));
+        let loop_closer = config.pgo.map(LoopCloser::new);
         Self {
             camera,
             estimator: MapProjectionEstimator::new(config.map_projection),
@@ -184,10 +164,7 @@ impl SlamSystem {
             track_set: TrackSet::new(),
             vocabulary: None,
             kf_database: KeyFrameDatabase::new(),
-            pgo_config,
-            loop_episode_tracker,
-            verified_loops: Vec::new(),
-            verified_loop_pairs: HashSet::new(),
+            loop_closer,
             loop_closure_events: Vec::new(),
         }
     }
@@ -1339,149 +1316,28 @@ impl SlamSystem {
             ));
         }
 
-        let Some(pgo_config) = self.pgo_config.clone() else {
+        let Some(loop_closer) = self.loop_closer.as_mut() else {
             return;
         };
-        if pgo_config.require_imu_initialized && !self.state.imu_initialized {
+        if loop_closer.requires_imu_initialized() && !self.state.imu_initialized {
             return;
         }
-        let inertial_pgo = self.state.imu_initialized.then_some(InertialPgoContext {
+        let context = LoopClosingContext {
+            pose_world_to_cam: self.state.pose_world_to_cam,
+            velocity_world: self.state.velocity_world,
+            current_keyframe_idx: self.state.current_keyframe_idx,
+            imu_initialized: self.state.imu_initialized,
             gravity_world: self.gravity_world,
-        });
-        let (events, accepted, corrected_tracking_state, pgo_applied) = {
-            let mut map = self.map.lock().unwrap();
-            let mut events = Vec::new();
-            let mut accepted = None;
-            let mut corrected_tracking_state = None;
-            let mut pgo_applied = false;
-            for candidate in &candidates {
-                let pair = normalized_loop_pair(kf_idx, candidate.kf_idx);
-                if self.verified_loop_pairs.contains(&pair) {
-                    continue;
-                }
-                if let Ok(edge) = verify_loop_candidate(
-                    &map,
-                    &self.camera,
-                    kf_idx,
-                    candidate.kf_idx,
-                    &pgo_config.verification,
-                ) {
-                    let query_order = map
-                        .keyframes()
-                        .iter()
-                        .position(|keyframe| keyframe.frame.idx == kf_idx)
-                        .expect("verified query keyframe must be in the map");
-                    let candidate_order = map
-                        .keyframes()
-                        .iter()
-                        .position(|keyframe| keyframe.frame.idx == candidate.kf_idx)
-                        .expect("verified candidate keyframe must be in the map");
-                    let decision = self
-                        .loop_episode_tracker
-                        .as_mut()
-                        .expect("PGO config must create an episode tracker")
-                        .observe(query_order, candidate_order, edge.clone());
-                    match decision {
-                        LoopEpisodeDecision::Pending { .. }
-                        | LoopEpisodeDecision::Suppressed { .. } => {}
-                        LoopEpisodeDecision::Ready { representative, .. } => {
-                            let pair = normalized_loop_pair(
-                                representative.query_kf_idx,
-                                representative.candidate_kf_idx,
-                            );
-                            let mut loops = self.verified_loops.clone();
-                            loops.push(representative.clone());
-                            match optimize_pose_graph(
-                                &map,
-                                &loops,
-                                &pgo_config.optimizer,
-                                inertial_pgo,
-                            ) {
-                                Ok(result) => {
-                                    if result.usable {
-                                        let tracking_correction = self
-                                            .state
-                                            .current_keyframe_idx
-                                            .and_then(|reference_kf_idx| {
-                                                pose_graph_reference_correction(
-                                                    reference_kf_idx,
-                                                    &result.keyframe_indices,
-                                                    &result.original_poses,
-                                                    &result.optimized_poses,
-                                                )
-                                            })
-                                            .map(|(reference_before, reference_after, world)| {
-                                                (
-                                                    apply_reference_pose_correction(
-                                                        self.state.pose_world_to_cam,
-                                                        reference_before,
-                                                        reference_after,
-                                                    ),
-                                                    world.rotation * self.state.velocity_world,
-                                                )
-                                            });
-                                        if let Some(tracking_correction) = tracking_correction {
-                                            match map.apply_pose_graph_correction(
-                                                &result.keyframe_indices,
-                                                &result.original_poses,
-                                                &result.optimized_poses,
-                                            ) {
-                                                Ok(_) => {
-                                                    fuse_verified_loop(
-                                                        &mut map,
-                                                        &self.camera,
-                                                        &representative,
-                                                        &pgo_config.fusion,
-                                                    );
-                                                    corrected_tracking_state =
-                                                        Some(tracking_correction);
-                                                    pgo_applied = true;
-                                                }
-                                                Err(error) => {
-                                                    events.push(LoopClosureEvent::PgoFailed {
-                                                        query_kf_idx: representative.query_kf_idx,
-                                                        candidate_kf_idx: representative
-                                                            .candidate_kf_idx,
-                                                        reason: format!(
-                                                            "live map correction rejected: {error}"
-                                                        ),
-                                                    })
-                                                }
-                                            }
-                                        } else {
-                                            events.push(LoopClosureEvent::PgoFailed {
-                                                    query_kf_idx: representative.query_kf_idx,
-                                                    candidate_kf_idx: representative
-                                                        .candidate_kf_idx,
-                                                    reason: "current reference keyframe is outside the PGO snapshot"
-                                                        .into(),
-                                                });
-                                        }
-                                    }
-                                }
-                                Err(error) => events.push(LoopClosureEvent::PgoFailed {
-                                    query_kf_idx: representative.query_kf_idx,
-                                    candidate_kf_idx: representative.candidate_kf_idx,
-                                    reason: error.to_string(),
-                                }),
-                            }
-                            events.push(LoopClosureEvent::Accepted {
-                                edge: representative.clone(),
-                                applied: pgo_applied,
-                            });
-                            accepted = Some((pair, representative));
-                        }
-                    }
-                    break;
-                }
-            }
-            (events, accepted, corrected_tracking_state, pgo_applied)
         };
-        if let Some((corrected_tracking_pose, corrected_velocity)) = corrected_tracking_state {
+        let outcome = {
+            let mut map = self.map.lock().unwrap();
+            loop_closer.close(&mut map, &self.camera, kf_idx, &candidates, context)
+        };
+        if let Some((corrected_tracking_pose, corrected_velocity)) = outcome.tracking_correction {
             self.state.pose_world_to_cam = corrected_tracking_pose;
             self.state.velocity_world = corrected_velocity;
         }
-        if pgo_applied {
+        if outcome.pgo_applied {
             self.track_set = TrackSet::new();
             if self.state.imu_initialized {
                 if !self.local_mapping.submit(KeyframeJob {
@@ -1494,11 +1350,7 @@ impl SlamSystem {
                 self.apply_local_mapping_results();
             }
         }
-        self.loop_closure_events.extend(events);
-        if let Some((pair, edge)) = accepted {
-            self.verified_loop_pairs.insert(pair);
-            self.verified_loops.push(edge);
-        }
+        self.loop_closure_events.extend(outcome.events);
     }
 
     fn grow_map_points_from_keyframe_pair(
@@ -1877,10 +1729,6 @@ impl SlamSystem {
     }
 }
 
-fn normalized_loop_pair(a: usize, b: usize) -> (usize, usize) {
-    if a <= b { (a, b) } else { (b, a) }
-}
-
 fn carry_klt_survivors(track_set: &mut TrackSet, survivors: Option<Vec<FlowSurvivor>>) {
     if survivors.is_none_or(|survivors| track_set.advance(survivors).is_err()) {
         *track_set = TrackSet::new();
@@ -1901,153 +1749,10 @@ fn format_imu_init_gate(
     )
 }
 
-/// Carries a reference-keyframe BA correction into the current tracking pose
-/// while preserving the current camera's pose relative to that reference.
-fn apply_reference_pose_correction(
-    current_pose: Pose3d,
-    reference_before: Pose3d,
-    reference_after: Pose3d,
-) -> Pose3d {
-    let current_from_reference = Pose3d::between(&reference_before, &current_pose);
-    current_from_reference.compose(&reference_after)
-}
-
-#[cfg(test)]
-fn pose_graph_tracking_correction(
-    current_pose: Pose3d,
-    reference_kf_idx: usize,
-    keyframe_indices: &[usize],
-    poses_before: &[Pose3d],
-    poses_after: &[Pose3d],
-) -> Option<Pose3d> {
-    let (reference_before, reference_after, _) = pose_graph_reference_correction(
-        reference_kf_idx,
-        keyframe_indices,
-        poses_before,
-        poses_after,
-    )?;
-    Some(apply_reference_pose_correction(
-        current_pose,
-        reference_before,
-        reference_after,
-    ))
-}
-
-fn pose_graph_reference_correction(
-    reference_kf_idx: usize,
-    keyframe_indices: &[usize],
-    poses_before: &[Pose3d],
-    poses_after: &[Pose3d],
-) -> Option<(Pose3d, Pose3d, Pose3d)> {
-    let node = keyframe_indices
-        .iter()
-        .position(|&keyframe_idx| keyframe_idx == reference_kf_idx)?;
-    let reference_before = *poses_before.get(node)?;
-    let reference_after = *poses_after.get(node)?;
-    let world_correction = reference_after.inverse().compose(&reference_before);
-    Some((reference_before, reference_after, world_correction))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        apply_reference_pose_correction, carry_klt_survivors, format_imu_init_gate,
-        pose_graph_reference_correction, pose_graph_tracking_correction,
-    };
+    use super::{carry_klt_survivors, format_imu_init_gate};
     use crate::tracking::optical_flow::{FlowSurvivor, MapKeypointMatch, TrackSet};
-    use kornia_3d::pose::Pose3d;
-    use kornia_algebra::{SO3F64, Vec3F64};
-
-    fn assert_pose_close(actual: Pose3d, expected: Pose3d) {
-        assert!((actual.translation - expected.translation).length() < 1e-10);
-        for (actual, expected) in actual
-            .rotation
-            .to_cols_array()
-            .iter()
-            .zip(expected.rotation.to_cols_array())
-        {
-            assert!((actual - expected).abs() < 1e-10);
-        }
-    }
-
-    #[test]
-    fn reference_pose_correction_preserves_relative_camera_pose() {
-        let reference_before = Pose3d::new(
-            SO3F64::exp(Vec3F64::new(0.1, -0.2, 0.3)).matrix(),
-            Vec3F64::new(-1.0, 0.5, 0.2),
-        );
-        let relative_pose = Pose3d::new(
-            SO3F64::exp(Vec3F64::new(-0.15, 0.05, 0.2)).matrix(),
-            Vec3F64::new(-0.5, 0.1, 0.3),
-        );
-        let current_before = relative_pose.compose(&reference_before);
-        let reference_after = Pose3d::new(
-            SO3F64::exp(Vec3F64::new(0.25, 0.1, -0.1)).matrix(),
-            Vec3F64::new(-2.0, -0.3, 0.8),
-        );
-
-        let corrected =
-            apply_reference_pose_correction(current_before, reference_before, reference_after);
-
-        assert_pose_close(Pose3d::between(&reference_after, &corrected), relative_pose);
-    }
-
-    #[test]
-    fn pose_graph_tracking_correction_uses_current_reference_keyframe() {
-        let reference_before = Pose3d::new(
-            SO3F64::exp(Vec3F64::new(0.1, -0.2, 0.3)).matrix(),
-            Vec3F64::new(-1.0, 0.5, 0.2),
-        );
-        let reference_after = Pose3d::new(
-            SO3F64::exp(Vec3F64::new(0.25, 0.1, -0.1)).matrix(),
-            Vec3F64::new(-2.0, -0.3, 0.8),
-        );
-        let relative_pose = Pose3d::new(
-            SO3F64::exp(Vec3F64::new(-0.15, 0.05, 0.2)).matrix(),
-            Vec3F64::new(-0.5, 0.1, 0.3),
-        );
-        let current_before = relative_pose.compose(&reference_before);
-
-        let corrected = pose_graph_tracking_correction(
-            current_before,
-            20,
-            &[10, 20],
-            &[Pose3d::IDENTITY, reference_before],
-            &[Pose3d::IDENTITY, reference_after],
-        )
-        .unwrap();
-
-        assert_pose_close(Pose3d::between(&reference_after, &corrected), relative_pose);
-        assert!(
-            pose_graph_tracking_correction(
-                current_before,
-                99,
-                &[10, 20],
-                &[Pose3d::IDENTITY, reference_before],
-                &[Pose3d::IDENTITY, reference_after],
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn pose_graph_reference_correction_rotates_live_world_velocity() {
-        let yaw = SO3F64::exp(Vec3F64::new(0.0, 0.4, 0.0)).matrix();
-        let reference_before = Pose3d::IDENTITY;
-        let reference_after = Pose3d::new(yaw.transpose(), Vec3F64::ZERO);
-        let (_, _, correction) = pose_graph_reference_correction(
-            20,
-            &[10, 20],
-            &[Pose3d::IDENTITY, reference_before],
-            &[Pose3d::IDENTITY, reference_after],
-        )
-        .unwrap();
-        let velocity = Vec3F64::new(1.0, 0.2, -0.5);
-
-        let corrected = correction.rotation * velocity;
-
-        assert!((corrected - yaw * velocity).length() < 1e-10);
-    }
 
     #[test]
     fn formats_compact_imu_init_gate() {
