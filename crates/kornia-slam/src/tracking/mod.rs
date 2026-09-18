@@ -1,6 +1,7 @@
 //! Frame-to-map tracking: pose estimation, optical flow, state and policies.
 
 pub mod local_map;
+pub(crate) mod motion;
 pub mod optical_flow;
 mod policy;
 pub mod pose_estimation;
