@@ -32,6 +32,7 @@ use crate::loop_closure::{LoopCloser, LoopClosingContext};
 use crate::map::{Keyframe, KeyframeJob, LocalMapping, Map, MapPoint, ORB_SCALE_FACTOR};
 use crate::place_recognition::{KeyFrameDatabase, Vocabulary, compute_bow};
 use crate::pose_conversion::apply_reference_pose_correction;
+use crate::sensor_rig::{ImuCalibration, SensorRig};
 use crate::stereo::unproject_stereo;
 use crate::tracking::optical_flow::{
     FlowSurvivor, KltTracker, MapKeypointMatch, TrackSet, snap_unique,
@@ -42,12 +43,12 @@ use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
 use kornia_algebra::{Mat3F64, Vec2F64, Vec3F64};
 use kornia_image::Image;
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
-use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
+use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuMeasurement, PreintegratedImu};
 
 /// Top-level ORB-SLAM system: orchestrates tracking, mapping, and state transitions.
 pub struct SlamSystem {
     // Camera model
-    camera: PinholeCamera,
+    rig: SensorRig,
     // Primary pose estimator
     estimator: MapProjectionEstimator,
     // Boostrap pose estimator
@@ -68,12 +69,9 @@ pub struct SlamSystem {
     // Serializes compound map publication and short local-BA snapshot/merge phases.
     map_publication_gate: Option<Arc<Mutex<()>>>,
     // IMU states
-    imu_calib: ImuCalib,
     imu_bias: ImuBias,
     // Camera-to-body extrinsic T_BC (X_body = T_BC * X_cam). IMU deltas live in
     // the body frame, so every place that mixes them with camera poses must go
-    // through this; None disables the inertial path entirely.
-    imu_t_bc: Option<Pose3d>,
     pending_imu: Vec<ImuMeasurement>,
     gravity_world: Vec3F64,
     bootstrap_timestamp_sec: Option<f64>,
@@ -115,13 +113,20 @@ pub use crate::loop_closure::LoopClosureEvent;
 impl SlamSystem {
     /// Creates a new system with identity pose.
     pub fn new(camera: PinholeCamera, config: SlamConfig) -> Self {
+        Self::with_rig(SensorRig::new(camera), config)
+    }
+
+    /// Builds a system from an explicit sensor rig, so IMU noise parameters and
+    /// extrinsics can be supplied for the actual sensor.
+    pub fn with_rig(rig: SensorRig, config: SlamConfig) -> Self {
+        let camera = rig.camera.clone();
         let map = Arc::new(Mutex::new(Map::new()));
         let local_mapping =
             LocalMapping::new(config.local_mapping, Arc::clone(&map), camera.clone());
         let map_publication_gate = local_mapping.publication_gate();
         let loop_closer = config.pgo.map(LoopCloser::new);
         Self {
-            camera,
+            rig,
             estimator: MapProjectionEstimator::new(config.map_projection),
             two_view_init_config: config.two_view_init,
             keyframe_policy: config.keyframe_policy,
@@ -133,14 +138,7 @@ impl SlamSystem {
             map_publication_gate,
             local_mapping,
             state: SystemState::new(),
-            imu_calib: ImuCalib {
-                gyro_noise: 1.6968e-4,
-                accel_noise: 2.0e-3,
-                gyro_bias_noise: 1.9393e-5,
-                accel_bias_noise: 3.0e-3,
-            },
             imu_bias: ImuBias::default(),
-            imu_t_bc: None,
             pending_imu: Vec::new(),
             gravity_world: Vec3F64::new(0.0, 0.0, -GRAVITY_MAGNITUDE),
             bootstrap_timestamp_sec: None,
@@ -182,7 +180,12 @@ impl SlamSystem {
     /// Enables the inertial path by providing the camera-to-body extrinsic
     /// `T_BC` (`X_body = T_BC * X_cam`). Without it, IMU samples are ignored.
     pub fn set_imu_extrinsics(&mut self, t_bc: Pose3d) {
-        self.imu_t_bc = Some(t_bc);
+        self.rig.imu = Some(ImuCalibration::new(t_bc));
+    }
+
+    /// The system's fixed sensor calibration.
+    pub fn rig(&self) -> &SensorRig {
+        &self.rig
     }
 
     /// Processes one frame (pre-extracted features) and returns the tracking result.
@@ -203,7 +206,7 @@ impl SlamSystem {
         self.apply_local_mapping_results();
         // Fill the per-frame undistortion cache once; tracking, BA gathering,
         // growth, and fuse all read from it.
-        frame.ensure_undistorted(&self.camera);
+        frame.ensure_undistorted(&self.rig.camera);
         self.pending_imu.extend(imu_samples);
 
         match self.state.mode {
@@ -302,7 +305,7 @@ impl SlamSystem {
         curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
 
         const MIN_STEREO_POINTS: usize = 50;
-        let cam_points = unproject_stereo(&curr_frame, &self.camera);
+        let cam_points = unproject_stereo(&curr_frame, &self.rig.camera);
         if cam_points.len() < MIN_STEREO_POINTS {
             self.dbg(format!(
                 "[bootstrap_stereo] frame={} skip: only {} stereo points (need >= {})",
@@ -350,7 +353,7 @@ impl SlamSystem {
         // The map is already metric (stereo baseline), but gravity, velocities,
         // and the gyro bias still need the inertial init before IMU prediction
         // can run; the solve there keeps scale fixed at 1.
-        self.state.mode = if self.imu_t_bc.is_some() {
+        self.state.mode = if self.rig.camera_to_body().is_some() {
             self.inertial_init_start_kf_idx = Some(curr_idx);
             self.imu_init_window_start_sec = Some(timestamp_sec);
             self.imu_viba1_done = false;
@@ -372,7 +375,7 @@ impl SlamSystem {
     /// (`z < mthdepth`) into new metric map points, associating them to the
     /// keyframe. Returns the number of points created.
     fn add_close_stereo_points(&mut self, curr_kf: &mut Keyframe, mthdepth: f64) -> usize {
-        let cam_points = unproject_stereo(&curr_kf.frame, &self.camera);
+        let cam_points = unproject_stereo(&curr_kf.frame, &self.rig.camera);
         if cam_points.is_empty() {
             return 0;
         }
@@ -448,7 +451,7 @@ impl SlamSystem {
             &prev_bootstrap_frame.features,
             &prev_bootstrap_frame.pose_world_to_cam,
             &curr_frame.features,
-            &self.camera,
+            &self.rig.camera,
             &self.two_view_init_config,
         );
 
@@ -543,7 +546,7 @@ impl SlamSystem {
         self.state.last_keyframe_idx = Some(curr_idx);
         // Inertial init needs the camera-to-body extrinsic to relate IMU deltas
         // to camera poses; without it, run visual-only as before.
-        self.state.mode = if self.imu_t_bc.is_some() {
+        self.state.mode = if self.rig.camera_to_body().is_some() {
             self.inertial_init_start_kf_idx = Some(curr_idx);
             self.imu_init_window_start_sec = Some(timestamp_sec);
             self.imu_viba1_done = false;
@@ -620,7 +623,7 @@ impl SlamSystem {
         self.map.lock().unwrap().upsert_keyframe(reference_kf);
         self.map.lock().unwrap().upsert_keyframe(current_kf);
 
-        self.map.lock().unwrap().run_initial_ba(&self.camera);
+        self.map.lock().unwrap().run_initial_ba(&self.rig.camera);
 
         // Seed the place-recognition database with the two bootstrap keyframes so
         // a later revisit of the start can match them.
@@ -646,8 +649,13 @@ impl SlamSystem {
             .filter(|m| m.timestamp >= t0 && m.timestamp <= t1)
             .copied()
             .collect();
-        let pre =
-            PreintegratedImu::from_measurements(self.imu_bias, self.imu_calib, &samples, t0, t1);
+        let pre = PreintegratedImu::from_measurements(
+            self.imu_bias,
+            self.rig.imu_noise(),
+            &samples,
+            t0,
+            t1,
+        );
         (pre, samples)
     }
 
@@ -661,7 +669,7 @@ impl SlamSystem {
     /// `T_WB = T_WC ∘ T_CB`. Treats camera == body when no extrinsic is set.
     fn body_to_world(&self, pose_w2c: &Pose3d) -> Pose3d {
         let cam_to_world = pose_w2c.inverse();
-        match &self.imu_t_bc {
+        match &self.rig.camera_to_body() {
             Some(t_bc) => cam_to_world.compose(&t_bc.inverse()),
             None => cam_to_world,
         }
@@ -685,7 +693,7 @@ impl SlamSystem {
         );
 
         let pred_body_to_world = Pose3d::from_rt(r_j, p_j);
-        let pred_cam_to_world = match &self.imu_t_bc {
+        let pred_cam_to_world = match &self.rig.camera_to_body() {
             Some(t_bc) => pred_body_to_world.compose(t_bc),
             None => pred_body_to_world,
         };
@@ -771,7 +779,7 @@ impl SlamSystem {
             // Drop the solve's map lock before applying its result with a new lock.
             let init_result = self.inertial_init.try_initialize(
                 &self.map.lock().unwrap(),
-                self.imu_t_bc,
+                self.rig.camera_to_body(),
                 self.imu_bias,
                 start_idx,
                 1e2,
@@ -800,7 +808,7 @@ impl SlamSystem {
                     self.state.imu_init_timestamp_sec = Some(timestamp_sec);
                     if !self.local_mapping.submit(KeyframeJob {
                         imu_initialized: true,
-                        imu_t_bc: self.imu_t_bc,
+                        imu_t_bc: self.rig.camera_to_body(),
                         gravity_world: self.gravity_world,
                     }) {
                         self.dbg("[local_mapping] worker is unavailable".into());
@@ -903,7 +911,7 @@ impl SlamSystem {
             &candidate_pose,
             &pose_before,
             &self.map.lock().unwrap(),
-            &self.camera,
+            &self.rig.camera,
             self.state.current_keyframe_idx,
             search_scale,
             pre_seeded,
@@ -988,7 +996,7 @@ impl SlamSystem {
                 let local_indices = map_guard.build_local_map_point_indices(&matches, current_kf);
                 let visible = map_guard.map_points_in_frustum(
                     &local_indices,
-                    &self.camera,
+                    &self.rig.camera,
                     &candidate_pose,
                     image_size,
                 );
@@ -1188,7 +1196,7 @@ impl SlamSystem {
 
         if !self.local_mapping.submit(KeyframeJob {
             imu_initialized,
-            imu_t_bc: self.imu_t_bc,
+            imu_t_bc: self.rig.camera_to_body(),
             gravity_world: self.gravity_world,
         }) {
             self.dbg("[local_mapping] worker is unavailable".into());
@@ -1237,7 +1245,7 @@ impl SlamSystem {
         // Drop the solve's map lock before applying its result with a new lock.
         let init_result = self.inertial_init.try_initialize(
             &self.map.lock().unwrap(),
-            self.imu_t_bc,
+            self.rig.camera_to_body(),
             self.imu_bias,
             start_idx,
             prior_g,
@@ -1331,7 +1339,7 @@ impl SlamSystem {
         };
         let outcome = {
             let mut map = self.map.lock().unwrap();
-            loop_closer.close(&mut map, &self.camera, kf_idx, &candidates, context)
+            loop_closer.close(&mut map, &self.rig.camera, kf_idx, &candidates, context)
         };
         if let Some((corrected_tracking_pose, corrected_velocity)) = outcome.tracking_correction {
             self.state.pose_world_to_cam = corrected_tracking_pose;
@@ -1342,7 +1350,7 @@ impl SlamSystem {
             if self.state.imu_initialized {
                 if !self.local_mapping.submit(KeyframeJob {
                     imu_initialized: true,
-                    imu_t_bc: self.imu_t_bc,
+                    imu_t_bc: self.rig.camera_to_body(),
                     gravity_world: self.gravity_world,
                 }) {
                     self.dbg("[local_mapping] worker is unavailable after PGO".into());
@@ -1408,7 +1416,7 @@ impl SlamSystem {
                 Vec3F64::new(-t.z, 0.0, t.x),
                 Vec3F64::new(t.y, -t.x, 0.0),
             );
-            let camera = &self.camera;
+            let camera = &self.rig.camera;
             let k_inv = Mat3F64::from_cols(
                 Vec3F64::new(1.0 / camera.fx, 0.0, 0.0),
                 Vec3F64::new(0.0, 1.0 / camera.fy, 0.0),
@@ -1651,7 +1659,8 @@ impl SlamSystem {
                         continue;
                     }
                     let Ok(pixel) =
-                        self.camera
+                        self.rig
+                            .camera
                             .project_to_image(&p_cam, 0.0, nb_kf.frame.image_size)
                     else {
                         continue;
@@ -1667,7 +1676,7 @@ impl SlamSystem {
                         if nb_kf.map_point(kp_idx).is_some() {
                             continue;
                         }
-                        let Some(kp) = nb_kf.frame.undistorted_xy(kp_idx, &self.camera) else {
+                        let Some(kp) = nb_kf.frame.undistorted_xy(kp_idx, &self.rig.camera) else {
                             continue;
                         };
                         let dx = kp[0] - u;
