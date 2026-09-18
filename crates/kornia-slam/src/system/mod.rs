@@ -31,7 +31,10 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::Frame;
-use crate::initialization::two_view::{TwoViewInitConfig, try_initialize_two_view};
+use crate::initialization::bootstrap::{
+    BootstrapDecision, MIN_KEYPOINTS_FOR_BOOTSTRAP, evaluate_bootstrap,
+};
+use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{LoopCloser, LoopClosingContext};
 use crate::map::{Keyframe, KeyframeJob, LocalMapping, Map, MapPoint, ORB_SCALE_FACTOR};
 use crate::place_recognition::{KeyFrameDatabase, Vocabulary, compute_bow};
@@ -391,62 +394,60 @@ impl SlamSystem {
         // the new map in the existing coordinate frame.
         curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
 
-        // Staleness guard (mirrors ORB-SLAM3's MonocularInitialization):
-        // a frame with too few keypoints is neither a viable reference nor
-        // a viable current frame. If we already had a reference, drop it
-        // and wait for a feature-rich frame to start over.
-        const MIN_KEYPOINTS_FOR_BOOTSTRAP: usize = 100;
-        if curr_frame.features.keypoints_xy.len() <= MIN_KEYPOINTS_FOR_BOOTSTRAP {
-            self.dbg(format!(
-                "[bootstrap] frame={} skip: too few keypoints ({}, need > {})",
-                curr_frame.idx,
-                curr_frame.features.keypoints_xy.len(),
-                MIN_KEYPOINTS_FOR_BOOTSTRAP,
-            ));
-            self.state.bootstrap_frame = None;
-            return TrackingResult {
-                pose_world_to_cam: self.state.pose_world_to_cam,
-                status: TrackingStatus::Skipped,
-            };
-        }
-
-        let Some(prev_bootstrap_frame) = self.state.bootstrap_frame.take() else {
-            self.dbg(format!(
-                "[bootstrap] frame={} stored as reference (awaiting second frame)",
-                curr_frame.idx,
-            ));
-            self.state.bootstrap_frame = Some(curr_frame);
-            self.inertial.bootstrap_timestamp_sec = Some(timestamp_sec);
-            // Samples before the reference frame can never enter an edge.
-            self.prune_imu_before(timestamp_sec);
-            return TrackingResult {
-                pose_world_to_cam: self.state.pose_world_to_cam,
-                status: TrackingStatus::Skipped,
-            };
-        };
-
-        let result = try_initialize_two_view(
-            &prev_bootstrap_frame.features,
-            &prev_bootstrap_frame.pose_world_to_cam,
-            &curr_frame.features,
+        let decision = evaluate_bootstrap(
+            self.state.bootstrap_frame.as_ref(),
+            &curr_frame,
             &self.rig.camera,
             &self.two_view_init_config,
         );
-
-        let two_view_estimate = match result {
-            Err(reason) => {
+        let two_view_estimate = match decision {
+            // A stale reference is dropped with the frame: neither is viable.
+            BootstrapDecision::Unusable { keypoints } => {
                 self.dbg(format!(
-                    "[bootstrap] frame={} (ref={}) reject: {:?}",
-                    curr_frame.idx, prev_bootstrap_frame.idx, reason,
+                    "[bootstrap] frame={} skip: too few keypoints ({}, need > {})",
+                    curr_frame.idx, keypoints, MIN_KEYPOINTS_FOR_BOOTSTRAP,
                 ));
-                self.state.bootstrap_frame = Some(prev_bootstrap_frame);
+                self.state.bootstrap_frame = None;
                 return TrackingResult {
                     pose_world_to_cam: self.state.pose_world_to_cam,
                     status: TrackingStatus::Skipped,
                 };
             }
-            Ok(tv) => tv,
+            BootstrapDecision::StoreAsReference => {
+                self.dbg(format!(
+                    "[bootstrap] frame={} stored as reference (awaiting second frame)",
+                    curr_frame.idx,
+                ));
+                self.state.bootstrap_frame = Some(curr_frame);
+                self.inertial.bootstrap_timestamp_sec = Some(timestamp_sec);
+                // Samples before the reference frame can never enter an edge.
+                self.prune_imu_before(timestamp_sec);
+                return TrackingResult {
+                    pose_world_to_cam: self.state.pose_world_to_cam,
+                    status: TrackingStatus::Skipped,
+                };
+            }
+            // The reference is kept: only the second frame was unsuitable.
+            BootstrapDecision::Rejected {
+                reference_idx,
+                reason,
+            } => {
+                self.dbg(format!(
+                    "[bootstrap] frame={} (ref={}) reject: {:?}",
+                    curr_frame.idx, reference_idx, reason,
+                ));
+                return TrackingResult {
+                    pose_world_to_cam: self.state.pose_world_to_cam,
+                    status: TrackingStatus::Skipped,
+                };
+            }
+            BootstrapDecision::Initialized(estimate) => *estimate,
         };
+        let prev_bootstrap_frame = self
+            .state
+            .bootstrap_frame
+            .take()
+            .expect("an accepted bootstrap consumes the reference it matched against");
 
         self.dbg(format!(
             "[bootstrap] frame={} accept: model={} triangulated={} inliers={}",
