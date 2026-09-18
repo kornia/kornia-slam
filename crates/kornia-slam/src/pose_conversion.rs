@@ -52,3 +52,15 @@ pub(crate) fn se3_to_pose(se3: &SE3F32) -> Pose3d {
         Vec3F64::new(se3.t.x as f64, se3.t.y as f64, se3.t.z as f64),
     )
 }
+
+/// Carries a reference-keyframe correction into the current tracking pose while
+/// preserving the current camera's pose relative to that reference. Used for
+/// both bundle-adjustment and pose-graph corrections.
+pub(crate) fn apply_reference_pose_correction(
+    current_pose: Pose3d,
+    reference_before: Pose3d,
+    reference_after: Pose3d,
+) -> Pose3d {
+    let current_from_reference = Pose3d::between(&reference_before, &current_pose);
+    current_from_reference.compose(&reference_after)
+}

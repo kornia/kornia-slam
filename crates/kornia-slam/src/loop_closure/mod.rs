@@ -1,10 +1,12 @@
 //! Geometric loop verification, consistency, fusion, and pose-graph optimization.
 
+mod closer;
 mod episode;
 mod fusion;
 mod pose_graph;
 mod verification;
 
+pub use closer::{LoopCloser, LoopClosingContext, LoopClosingOutcome, LoopClosureEvent};
 pub use episode::{LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker};
 pub use fusion::{LoopFusionConfig, LoopFusionStats, fuse_verified_loop};
 pub use pose_graph::{InertialPgoContext, PgoConfig, PgoError, PgoResult, optimize_pose_graph};
