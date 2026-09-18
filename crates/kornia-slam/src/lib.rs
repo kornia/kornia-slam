@@ -4,19 +4,19 @@ pub mod estimation;
 pub mod frame;
 pub mod loop_closure;
 pub mod map;
-pub mod pipeline;
 pub mod place_recognition;
 mod pose_conversion;
 mod sparse_pgo;
 pub mod stereo;
 pub mod system;
+pub mod tracking;
 pub mod vi_ba_schur;
 
 pub use estimation::MapProjectionEstimator;
 pub use frame::Frame;
 pub use kornia_imgproc::features::OrbFeatures;
-pub use pipeline::{LoopClosingConfig, LoopClosureEvent, SlamConfig, SlamSystem};
+pub use system::{LoopClosingConfig, LoopClosureEvent, SlamConfig, SlamSystem};
 
 #[allow(deprecated)]
-pub use pipeline::{PgoPipelineConfig, PipelineConfig, SlamPipeline};
-pub use system::{KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus};
+pub use system::{PgoPipelineConfig, PipelineConfig, SlamPipeline};
+pub use tracking::{KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus};

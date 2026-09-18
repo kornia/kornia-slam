@@ -29,7 +29,7 @@ use crate::loop_closure::{
 use crate::map::{Keyframe, KeyframeJob, LocalMapping, Map, MapPoint, ORB_SCALE_FACTOR};
 use crate::place_recognition::{KeyFrameDatabase, Vocabulary, compute_bow};
 use crate::stereo::unproject_stereo;
-use crate::system::{
+use crate::tracking::{
     KeyframePolicy, SystemMode, SystemState, TrackingLossRecoveryPolicy, TrackingResult,
     TrackingStatus,
 };

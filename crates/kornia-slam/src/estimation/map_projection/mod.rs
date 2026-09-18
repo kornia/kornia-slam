@@ -615,7 +615,7 @@ impl MapProjectionEstimator {
 
 #[cfg(test)]
 mod estimator_tests {
-    use crate::system::KeyframePolicy;
+    use crate::tracking::KeyframePolicy;
 
     #[test]
     fn test_need_new_keyframe_forced_by_gap() {
