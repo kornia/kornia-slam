@@ -1,8 +1,11 @@
+//! The deprecated aliases must keep constructing the runtime.
+#![allow(deprecated)]
+
 use kornia_3d::camera::PinholeCamera;
 use kornia_slam::{PgoPipelineConfig, PipelineConfig, SlamPipeline};
 
 #[test]
-fn slam_pipeline_is_constructible_from_the_public_api() {
+fn deprecated_aliases_construct_the_runtime() {
     let camera = PinholeCamera {
         fx: 400.0,
         fy: 400.0,
@@ -18,5 +21,5 @@ fn slam_pipeline_is_constructible_from_the_public_api() {
         ..PipelineConfig::default()
     };
 
-    let _pipeline = SlamPipeline::new(camera, config);
+    let _pipeline: SlamPipeline = SlamPipeline::new(camera, config);
 }

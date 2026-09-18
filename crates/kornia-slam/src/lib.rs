@@ -15,5 +15,8 @@ pub mod vi_ba_schur;
 pub use estimation::MapProjectionEstimator;
 pub use frame::Frame;
 pub use kornia_imgproc::features::OrbFeatures;
-pub use pipeline::{LoopClosureEvent, PgoPipelineConfig, PipelineConfig, SlamPipeline};
+pub use pipeline::{LoopClosingConfig, LoopClosureEvent, SlamConfig, SlamSystem};
+
+#[allow(deprecated)]
+pub use pipeline::{PgoPipelineConfig, PipelineConfig, SlamPipeline};
 pub use system::{KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus};

@@ -5,6 +5,12 @@
 
 mod config;
 
+pub use config::{LoopClosingConfig, SlamConfig};
+
+#[deprecated(since = "0.1.0", note = "use `SlamSystem`")]
+pub type SlamPipeline = SlamSystem;
+
+#[allow(deprecated)]
 pub use config::{PgoPipelineConfig, PipelineConfig};
 
 use std::collections::HashSet;
@@ -35,8 +41,8 @@ use kornia_image::Image;
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 
-/// Top-level ORB-SLAM pipeline: orchestrates tracking, mapping, and state transitions.
-pub struct SlamPipeline {
+/// Top-level ORB-SLAM system: orchestrates tracking, mapping, and state transitions.
+pub struct SlamSystem {
     // Camera model
     camera: PinholeCamera,
     // Primary pose estimator
@@ -95,7 +101,7 @@ pub struct SlamPipeline {
     // and the inverted-index keyframe database queried at each keyframe insert.
     vocabulary: Option<Vocabulary>,
     kf_database: KeyFrameDatabase,
-    pgo_config: Option<PgoPipelineConfig>,
+    pgo_config: Option<LoopClosingConfig>,
     loop_episode_tracker: Option<LoopEpisodeTracker>,
     verified_loops: Vec<VerifiedLoopEdge>,
     verified_loop_pairs: HashSet<(usize, usize)>,
@@ -118,9 +124,9 @@ pub enum LoopClosureEvent {
     },
 }
 
-impl SlamPipeline {
-    /// Creates a new pipeline with identity pose.
-    pub fn new(camera: PinholeCamera, config: PipelineConfig) -> Self {
+impl SlamSystem {
+    /// Creates a new system with identity pose.
+    pub fn new(camera: PinholeCamera, config: SlamConfig) -> Self {
         let map = Arc::new(Mutex::new(Map::new()));
         let local_mapping =
             LocalMapping::new(config.local_mapping, Arc::clone(&map), camera.clone());
