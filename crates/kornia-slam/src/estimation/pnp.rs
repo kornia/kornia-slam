@@ -25,13 +25,6 @@ pub struct PnpConfig {
     pub robust_scale_sq: f32,
     /// Number of hard-exclusion refit rounds.
     pub outlier_rounds: usize,
-    /// LM iteration ceiling PER refit round. Clamped to at least 1 at use.
-    ///
-    /// `LMRefineParams::default()` is 50, a bundle-adjustment budget. Pose-only refinement
-    /// from a tracking prior starts close to the answer, so most of those iterations move
-    /// nothing — and with `outlier_rounds: 4` the cost is paid four times, twice per frame
-    /// (initial PnP, then `refine_with_local_map`).
-    pub lm_max_iterations: usize,
 }
 
 impl Default for PnpConfig {
@@ -45,7 +38,6 @@ impl Default for PnpConfig {
             robust: RobustKernelKind::Huber,
             robust_scale_sq: 25.0,
             outlier_rounds: 4,
-            lm_max_iterations: 50,
         }
     }
 }
@@ -218,10 +210,6 @@ pub fn solve_pnp_with_diagnostics(
             &LMRefineParams {
                 robust: config.robust,
                 robust_scale_sq: config.robust_scale_sq,
-                // At least one: zero iterations returns the PRIOR pose unrefined, and
-                // `solve_pnp` would report that as a successful solve with a full inlier
-                // count — tracking that never actually estimates anything, silently.
-                max_iterations: config.lm_max_iterations.max(1),
                 ..LMRefineParams::default()
             },
         ) else {
@@ -343,73 +331,6 @@ mod tests {
         assert_eq!(config.robust, RobustKernelKind::Huber);
         assert_eq!(config.robust_scale_sq, 25.0);
         assert_eq!(config.outlier_rounds, 4);
-        // Pinned so a change to the LM budget is a deliberate edit here, not a silent
-        // behaviour change: it multiplies by `outlier_rounds` and runs twice per frame.
-        assert_eq!(config.lm_max_iterations, 50);
-    }
-
-    /// The configured budget must actually reach the solver.
-    ///
-    /// Deleting `max_iterations: config.lm_max_iterations` left the entire suite green — the
-    /// plumbing had no test at all, so the knob could silently do nothing. A budget of 1 on a
-    /// prior far from truth cannot converge; the default can. That difference is the wiring.
-    #[test]
-    fn the_configured_lm_budget_reaches_the_solver() {
-        let camera = test_camera();
-        let truth = Pose3d::from_rt(Mat3F64::IDENTITY, Vec3F64::new(0.12, -0.08, 0.0));
-        let (points_world, points_image) = synthetic_correspondences(&camera, &truth, 60);
-        let err_with = |iters: usize| {
-            let cfg = PnpConfig {
-                lm_max_iterations: iters,
-                outlier_rounds: 1,
-                ..PnpConfig::default()
-            };
-            solve_pnp(
-                &points_world,
-                &points_image,
-                &camera,
-                &Pose3d::IDENTITY,
-                &cfg,
-            )
-            .map(|(p, _)| (p.translation - truth.translation).length())
-        };
-        let tight = err_with(1).expect("1-iteration case must still solve");
-        let loose = err_with(50).expect("50-iteration case must solve");
-        assert!(
-            loose < tight * 0.5,
-            "the budget is not reaching the solver: 1 iter {tight:.4} m vs 50 iter {loose:.4} m"
-        );
-    }
-
-    /// A zero iteration budget must not read as a successful solve.
-    ///
-    /// `refine_pose_lm` with `max_iterations: 0` returns the prior pose untouched, and
-    /// `solve_pnp` would report it with a full inlier count — a tracker that estimates
-    /// nothing while every counter looks healthy. Clamped to 1 at use.
-    #[test]
-    fn a_zero_lm_budget_still_refines_at_least_once() {
-        let camera = test_camera();
-        // A pose the prior is genuinely wrong about, so "unrefined" is distinguishable.
-        let truth = Pose3d::from_rt(Mat3F64::IDENTITY, Vec3F64::new(0.15, -0.08, 0.0));
-        let (points_world, points_image) = synthetic_correspondences(&camera, &truth, 40);
-
-        let cfg = PnpConfig {
-            lm_max_iterations: 0,
-            ..PnpConfig::default()
-        };
-        let (pose, _) = solve_pnp(
-            &points_world,
-            &points_image,
-            &camera,
-            &Pose3d::IDENTITY,
-            &cfg,
-        )
-        .expect("a well-posed 40-point problem must solve");
-        let err = (pose.translation - truth.translation).length();
-        assert!(
-            err < 0.02,
-            "a zero budget returned the unrefined prior: {err:.4} m from truth"
-        );
     }
 
     #[test]
