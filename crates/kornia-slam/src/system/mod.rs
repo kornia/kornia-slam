@@ -4,8 +4,11 @@
 //! in the same order frames move through the system.
 
 mod config;
+mod inertial;
 
 pub use config::{LoopClosingConfig, SlamConfig};
+
+use inertial::InertialState;
 
 #[deprecated(since = "0.1.0", note = "use `SlamSystem`")]
 pub type SlamPipeline = SlamSystem;
@@ -29,7 +32,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::Frame;
 use crate::initialization::two_view::{TwoViewInitConfig, try_initialize_two_view};
-use crate::initialization::{ImuInitConfig, ImuInitializer};
 use crate::loop_closure::{LoopCloser, LoopClosingContext};
 use crate::map::{Keyframe, KeyframeJob, LocalMapping, Map, MapPoint, ORB_SCALE_FACTOR};
 use crate::place_recognition::{KeyFrameDatabase, Vocabulary, compute_bow};
@@ -42,7 +44,7 @@ use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
 use kornia_algebra::{Mat3F64, Vec2F64, Vec3F64};
 use kornia_image::Image;
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
-use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuMeasurement, PreintegratedImu};
+use kornia_sensors::imu::{ImuMeasurement, PreintegratedImu};
 
 /// Top-level ORB-SLAM system: orchestrates tracking, mapping, and state transitions.
 pub struct SlamSystem {
@@ -68,15 +70,10 @@ pub struct SlamSystem {
     // Serializes compound map publication and short local-BA snapshot/merge phases.
     map_publication_gate: Option<Arc<Mutex<()>>>,
     // IMU states
-    imu_bias: ImuBias,
+    inertial: InertialState,
     // Camera-to-body extrinsic T_BC (X_body = T_BC * X_cam). IMU deltas live in
     // the body frame, so every place that mixes them with camera poses must go
-    pending_imu: Vec<ImuMeasurement>,
-    gravity_world: Vec3F64,
-    bootstrap_timestamp_sec: Option<f64>,
-    last_keyframe_timestamp_sec: Option<f64>,
     inertial_init_start_kf_idx: Option<usize>,
-    inertial_init: ImuInitializer,
     // Timestamp of the last try_initialize attempt (successful or not), so
     // retries are throttled to a fixed cadence instead of firing on every
     // single keyframe forever once `ready()` is true — with an ever-growing
@@ -135,22 +132,8 @@ impl SlamSystem {
             map_publication_gate,
             local_mapping,
             state: SystemState::new(),
-            imu_bias: ImuBias::default(),
-            pending_imu: Vec::new(),
-            gravity_world: Vec3F64::new(0.0, 0.0, -GRAVITY_MAGNITUDE),
-            bootstrap_timestamp_sec: None,
-            last_keyframe_timestamp_sec: None,
+            inertial: InertialState::new(),
             inertial_init_start_kf_idx: None,
-            // Matches ORB-SLAM3's LocalMapping::InitializeIMU VIBA0 gate
-            // (nMinKF=10; minTime=1.0s stereo/2.0s mono — `ready()` doubles
-            // this for mono). The previous min_keyframes=30/min_time_sec=15.0
-            // was effectively skipping VIBA0/VIBA1 and attempting a
-            // VIBA2-strength window on the very first try.
-            inertial_init: ImuInitializer::new(ImuInitConfig {
-                min_keyframes: 10,
-                min_time_sec: 1.0,
-                min_motion: 0.05,
-            }),
             inertial_init_last_attempt_sec: None,
             imu_init_window_start_sec: None,
             imu_viba1_done: false,
@@ -202,7 +185,7 @@ impl SlamSystem {
         // Fill the per-frame undistortion cache once; tracking, BA gathering,
         // growth, and fuse all read from it.
         frame.ensure_undistorted(&self.rig.camera);
-        self.pending_imu.extend(imu_samples);
+        self.inertial.buffer_samples(imu_samples);
 
         match self.state.mode {
             SystemMode::Bootstrap => self.bootstrap_step(frame, timestamp_sec),
@@ -273,7 +256,7 @@ impl SlamSystem {
                 correction.pose_after,
             );
             self.state.velocity_world = correction.velocity_world;
-            self.imu_bias = correction.imu_bias;
+            self.inertial.bias = correction.imu_bias;
         }
     }
 
@@ -357,7 +340,7 @@ impl SlamSystem {
         } else {
             SystemMode::Tracking
         };
-        self.last_keyframe_timestamp_sec = Some(timestamp_sec);
+        self.inertial.last_keyframe_timestamp_sec = Some(timestamp_sec);
         self.prune_imu_before(timestamp_sec);
 
         TrackingResult {
@@ -433,7 +416,7 @@ impl SlamSystem {
                 curr_frame.idx,
             ));
             self.state.bootstrap_frame = Some(curr_frame);
-            self.bootstrap_timestamp_sec = Some(timestamp_sec);
+            self.inertial.bootstrap_timestamp_sec = Some(timestamp_sec);
             // Samples before the reference frame can never enter an edge.
             self.prune_imu_before(timestamp_sec);
             return TrackingResult {
@@ -517,7 +500,7 @@ impl SlamSystem {
             self.state.pose_world_to_cam = kf.frame.pose_world_to_cam;
         }
 
-        if let Some(prev_ts) = self.bootstrap_timestamp_sec {
+        if let Some(prev_ts) = self.inertial.bootstrap_timestamp_sec {
             let (preint, raw_samples) = self.preintegrate_window(prev_ts, timestamp_sec);
             if preint.dt > 0.0 {
                 self.map.lock().unwrap().add_imu_factor(
@@ -550,7 +533,7 @@ impl SlamSystem {
         } else {
             SystemMode::Tracking
         };
-        self.last_keyframe_timestamp_sec = Some(timestamp_sec);
+        self.inertial.last_keyframe_timestamp_sec = Some(timestamp_sec);
 
         TrackingResult {
             pose_world_to_cam: self.state.pose_world_to_cam,
@@ -635,29 +618,17 @@ impl SlamSystem {
     /// Preintegrates over `[t0, t1]` and also returns the raw samples used,
     /// so the caller can hand them to `Map::add_imu_factor` for later
     /// repropagation (see `PreintegratedImu::from_measurements` doc) — once
-    /// this returns, `prune_imu_before` is free to drop them from
-    /// `self.pending_imu`, since the edge now carries its own copy.
+    /// this returns, `prune_imu_before` is free to drop them from the buffer,
+    /// since the edge now carries its own copy.
     fn preintegrate_window(&self, t0: f64, t1: f64) -> (PreintegratedImu, Vec<ImuMeasurement>) {
-        let samples: Vec<ImuMeasurement> = self
-            .pending_imu
-            .iter()
-            .filter(|m| m.timestamp >= t0 && m.timestamp <= t1)
-            .copied()
-            .collect();
-        let pre = PreintegratedImu::from_measurements(
-            self.imu_bias,
-            self.rig.imu_noise(),
-            &samples,
-            t0,
-            t1,
-        );
-        (pre, samples)
+        self.inertial
+            .preintegrate_window(self.rig.imu_noise(), t0, t1)
     }
 
     /// Drops buffered IMU samples strictly older than `t` (typically the last
     /// keyframe timestamp: the next edge and all per-frame windows start there).
     fn prune_imu_before(&mut self, t: f64) {
-        self.pending_imu.retain(|m| m.timestamp >= t);
+        self.inertial.prune_before(t);
     }
 
     /// Body-to-world pose `T_WB` for a world-to-camera pose, via
@@ -698,9 +669,9 @@ impl SlamSystem {
                 kfs.first().copied(),
                 kfs.last().copied(),
                 kfs.len(),
-                self.inertial_init.config.min_keyframes,
+                self.inertial.initializer.config.min_keyframes,
                 imu_time,
-                self.inertial_init.config.min_time_sec,
+                self.inertial.initializer.config.min_time_sec,
             );
             self.dbg(gate_msg);
         }
@@ -716,7 +687,8 @@ impl SlamSystem {
             .inertial_init_last_attempt_sec
             .is_none_or(|last| timestamp_sec - last >= RETRY_INTERVAL_SEC);
         let imu_init_ready = self
-            .inertial_init
+            .inertial
+            .initializer
             .ready(&self.map.lock().unwrap(), self.inertial_init_start_kf_idx);
 
         if result.status == TrackingStatus::KeyframeAccepted && due_for_retry && imu_init_ready {
@@ -739,10 +711,10 @@ impl SlamSystem {
                 .unwrap_or(false);
             let prior_a0 = if is_mono { 1e10 } else { 1e5 };
             // Drop the solve's map lock before applying its result with a new lock.
-            let init_result = self.inertial_init.try_initialize(
+            let init_result = self.inertial.initializer.try_initialize(
                 &self.map.lock().unwrap(),
                 self.rig.camera_to_body(),
-                self.imu_bias,
+                self.inertial.bias,
                 start_idx,
                 1e2,
                 prior_a0,
@@ -753,11 +725,11 @@ impl SlamSystem {
                     let scale = init.scale;
                     let gravity = init.gravity_world;
                     let bg = init.bias.gyro;
-                    self.inertial_init.apply_initialization(
+                    self.inertial.initializer.apply_initialization(
                         &mut self.map.lock().unwrap(),
                         &mut self.state,
-                        &mut self.imu_bias,
-                        &mut self.gravity_world,
+                        &mut self.inertial.bias,
+                        &mut self.inertial.gravity_world,
                         init,
                         start_idx,
                     );
@@ -771,7 +743,7 @@ impl SlamSystem {
                     if !self.local_mapping.submit(KeyframeJob {
                         imu_initialized: true,
                         imu_t_bc: self.rig.camera_to_body(),
-                        gravity_world: self.gravity_world,
+                        gravity_world: self.inertial.gravity_world,
                     }) {
                         self.dbg("[local_mapping] worker is unavailable".into());
                     }
@@ -807,7 +779,7 @@ impl SlamSystem {
             && let Some(kf) = self.map.lock().unwrap().get_keyframe(kf_idx)
         {
             self.state.velocity_world = kf.velocity_world;
-            self.imu_bias = kf.imu_bias;
+            self.inertial.bias = kf.imu_bias;
         }
 
         // Preintegration is prepared here: the system owns bias and the sample
@@ -823,7 +795,7 @@ impl SlamSystem {
                 .map(|preintegrated| InertialPrediction {
                     preintegrated,
                     camera_to_body: self.rig.camera_to_body(),
-                    gravity_world: self.gravity_world,
+                    gravity_world: self.inertial.gravity_world,
                 }),
         );
         if let Some(velocity_world) = predicted_velocity {
@@ -959,7 +931,7 @@ impl SlamSystem {
         self.state.last_frame_timestamp_sec = timestamp_sec;
         // Samples older than the last keyframe can't enter any future window
         // (the next edge and all per-frame predictions start at or after it).
-        if let Some(kf_ts) = self.last_keyframe_timestamp_sec {
+        if let Some(kf_ts) = self.inertial.last_keyframe_timestamp_sec {
             self.prune_imu_before(kf_ts.min(timestamp_sec));
         }
         TrackingResult {
@@ -1018,7 +990,7 @@ impl SlamSystem {
         // than zero, which would produce huge residuals on the newest IMU edge.
         if self.state.imu_initialized {
             curr_kf.velocity_world = self.state.velocity_world;
-            curr_kf.imu_bias = self.imu_bias;
+            curr_kf.imu_bias = self.inertial.bias;
         }
         for &(mp_idx, curr_idx) in matches {
             curr_kf.associate_map_point(curr_idx, mp_idx);
@@ -1083,7 +1055,7 @@ impl SlamSystem {
         self.map.lock().unwrap().upsert_keyframe(curr_kf);
         if let (Some(prev_kf_idx), Some(prev_ts)) = (
             self.state.last_keyframe_idx,
-            self.last_keyframe_timestamp_sec,
+            self.inertial.last_keyframe_timestamp_sec,
         ) {
             let (preint, raw_samples) = self.preintegrate_window(prev_ts, timestamp_sec);
             if preint.dt > 0.0 {
@@ -1098,7 +1070,7 @@ impl SlamSystem {
             }
         }
 
-        self.last_keyframe_timestamp_sec = Some(timestamp_sec);
+        self.inertial.last_keyframe_timestamp_sec = Some(timestamp_sec);
 
         self.state.current_keyframe_idx = Some(frame.idx);
         self.state.last_keyframe_idx = Some(frame.idx);
@@ -1118,7 +1090,7 @@ impl SlamSystem {
         if !self.local_mapping.submit(KeyframeJob {
             imu_initialized,
             imu_t_bc: self.rig.camera_to_body(),
-            gravity_world: self.gravity_world,
+            gravity_world: self.inertial.gravity_world,
         }) {
             self.dbg("[local_mapping] worker is unavailable".into());
         }
@@ -1164,10 +1136,10 @@ impl SlamSystem {
         };
 
         // Drop the solve's map lock before applying its result with a new lock.
-        let init_result = self.inertial_init.try_initialize(
+        let init_result = self.inertial.initializer.try_initialize(
             &self.map.lock().unwrap(),
             self.rig.camera_to_body(),
-            self.imu_bias,
+            self.inertial.bias,
             start_idx,
             prior_g,
             prior_a,
@@ -1177,11 +1149,11 @@ impl SlamSystem {
             Some(init) => {
                 let scale = init.scale;
                 let bg = init.bias.gyro;
-                self.inertial_init.apply_initialization(
+                self.inertial.initializer.apply_initialization(
                     &mut self.map.lock().unwrap(),
                     &mut self.state,
-                    &mut self.imu_bias,
-                    &mut self.gravity_world,
+                    &mut self.inertial.bias,
+                    &mut self.inertial.gravity_world,
                     init,
                     start_idx,
                 );
@@ -1256,7 +1228,7 @@ impl SlamSystem {
             velocity_world: self.state.velocity_world,
             current_keyframe_idx: self.state.current_keyframe_idx,
             imu_initialized: self.state.imu_initialized,
-            gravity_world: self.gravity_world,
+            gravity_world: self.inertial.gravity_world,
         };
         let outcome = {
             let mut map = self.map.lock().unwrap();
@@ -1272,7 +1244,7 @@ impl SlamSystem {
                 if !self.local_mapping.submit(KeyframeJob {
                     imu_initialized: true,
                     imu_t_bc: self.rig.camera_to_body(),
-                    gravity_world: self.gravity_world,
+                    gravity_world: self.inertial.gravity_world,
                 }) {
                     self.dbg("[local_mapping] worker is unavailable after PGO".into());
                 }
