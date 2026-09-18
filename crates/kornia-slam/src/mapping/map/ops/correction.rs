@@ -20,7 +20,7 @@ struct KeyframeBaState {
 /// holding the live map lock.
 #[derive(Debug, Clone)]
 pub struct LocalBaSnapshot {
-    pub(in crate::map) optimized: Map,
+    pub(in crate::mapping::map) optimized: Map,
     world_epoch: u64,
     keyframes_before: Vec<KeyframeBaState>,
     map_points_before: Vec<Vec3F64>,
