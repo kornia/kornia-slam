@@ -35,6 +35,7 @@ use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
 use crate::frame::Frame;
 use crate::map::{Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
+use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 
 use super::Estimate;
 use keypoint_grid::KeypointGrid;
@@ -179,7 +180,8 @@ impl MapProjectionEstimator {
         // per-frame tracking cost is independent of total map size. With no
         // reference KF yet the builder falls back to all non-culled points.
         let current_kf = current_keyframe_idx.and_then(|ki| map.get_keyframe(ki));
-        let local_indices = map.build_local_map_point_indices(&[], current_kf);
+        let local_indices =
+            select_local_map_points(map, &[], current_kf, LocalMapSelectionConfig::default());
 
         let (projection_matches, curr_keypoints_undist, grid) = self.match_map_to_frame(
             map,
@@ -376,7 +378,12 @@ impl MapProjectionEstimator {
         search_scale: f32,
     ) -> Option<Estimate> {
         let current_kf = current_kf_idx.and_then(|ki| map.get_keyframe(ki));
-        let local_indices = map.build_local_map_point_indices(tracked_matches, current_kf);
+        let local_indices = select_local_map_points(
+            map,
+            tracked_matches,
+            current_kf,
+            LocalMapSelectionConfig::default(),
+        );
         let min_corr = self.config.pnp.min_correspondences;
         if local_indices.len() < min_corr {
             return None;

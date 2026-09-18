@@ -21,6 +21,7 @@ pub use crate::tracking::{
 };
 
 use crate::tracking::MapProjectionEstimator;
+use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -993,7 +994,12 @@ impl SlamSystem {
                     .state
                     .current_keyframe_idx
                     .and_then(|ki| map_guard.get_keyframe(ki));
-                let local_indices = map_guard.build_local_map_point_indices(&matches, current_kf);
+                let local_indices = select_local_map_points(
+                    &map_guard,
+                    &matches,
+                    current_kf,
+                    LocalMapSelectionConfig::default(),
+                );
                 let visible = map_guard.map_points_in_frustum(
                     &local_indices,
                     &self.rig.camera,
