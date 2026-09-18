@@ -1,7 +1,7 @@
-use crate::estimation::map_projection::MapProjectionConfig;
 use crate::estimation::two_view::TwoViewInitConfig;
 use crate::loop_closure::{LoopEpisodeConfig, LoopFusionConfig, LoopVerificationConfig, PgoConfig};
 use crate::map::LocalMappingMode;
+use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
 /// Runtime preset for [`SlamSystem`](super::SlamSystem).
