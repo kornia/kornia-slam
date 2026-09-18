@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/kornia-slam-logo.png" alt="kornia-slam" width="420">
+<img src="assets/kornia-slam-logo.png" alt="kornia-slam" width="300">
 
 # 🚧 kornia-slam 📷🧭🗺️📍🤖
 
