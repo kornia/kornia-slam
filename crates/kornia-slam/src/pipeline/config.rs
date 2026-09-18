@@ -4,8 +4,8 @@ use crate::loop_closure::{LoopEpisodeConfig, LoopFusionConfig, LoopVerificationC
 use crate::map::LocalMappingMode;
 use crate::system::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
-/// Runtime preset for [`SlamPipeline`](super::SlamPipeline).
-pub struct PipelineConfig {
+/// Runtime preset for [`SlamSystem`](super::SlamSystem).
+pub struct SlamConfig {
     pub two_view_init: TwoViewInitConfig,
     pub map_projection: MapProjectionConfig,
     pub keyframe_policy: KeyframePolicy,
@@ -20,11 +20,11 @@ pub struct PipelineConfig {
     /// in tracking, keyframe-growth and fuse counters.
     pub debug: bool,
     /// Optional verified loop closure and live pose-graph correction.
-    pub pgo: Option<PgoPipelineConfig>,
+    pub pgo: Option<LoopClosingConfig>,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct PgoPipelineConfig {
+pub struct LoopClosingConfig {
     /// Mono+IMU maps become metric only after inertial initialization. Stereo
     /// maps are metric from bootstrap and leave this disabled.
     pub require_imu_initialized: bool,
@@ -34,7 +34,7 @@ pub struct PgoPipelineConfig {
     pub optimizer: PgoConfig,
 }
 
-impl Default for PipelineConfig {
+impl Default for SlamConfig {
     fn default() -> Self {
         let mut two_view_init = TwoViewInitConfig::default();
         two_view_init.triangulation_config.max_midpoint_gap = 0.25;
@@ -52,3 +52,9 @@ impl Default for PipelineConfig {
         }
     }
 }
+
+#[deprecated(since = "0.1.0", note = "use `SlamConfig`")]
+pub type PipelineConfig = SlamConfig;
+
+#[deprecated(since = "0.1.0", note = "use `LoopClosingConfig`")]
+pub type PgoPipelineConfig = LoopClosingConfig;

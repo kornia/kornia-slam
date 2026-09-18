@@ -4,7 +4,7 @@ Spatial runtime for real-time pose estimation, mapping, and agent interaction.
 
 > **Early stage, active development.** Today this is an ORB-based visual (and visual-inertial)
 > SLAM pipeline that runs end-to-end on EuRoC, Hilti, MCAP recordings, and live cameras.
-> System orchestration now lives in the library as `SlamPipeline`, but the API and module
+> System orchestration now lives in the library as `SlamSystem`, but the API and module
 > layout are still moving. Expect breaking changes, and treat the roadmap below as a
 > direction that is subject to change rather than a commitment.
 > Contributions and feedback welcome.
@@ -52,7 +52,7 @@ Full source, calibration, and stereo docs: [apps/kornia-slam-app/README.md](apps
 ## Layout
 
 ```text
-crates/kornia-slam     library: the SlamPipeline runtime plus frame, map, estimation (two-view,
+crates/kornia-slam     library: the SlamSystem runtime plus frame, map, estimation (two-view,
                        PnP, map projection, IMU init), stereo, visual-inertial BA, place
                        recognition, and loop closure
 crates/kornia-sensors  sensor types (IMU)
@@ -94,7 +94,7 @@ Everything below is a roadmap entry, not a shipped capability.
       descriptors (and their matchers) drop in, with an async, device-capable variant
 - [x] Move temporal orchestration (state machine, keyframe policy, map-update ordering) into the
       library; `apps/` holds composition roots rather than a second pipeline
-- [ ] Split `SlamPipeline` into tracking, mapping, inertial, and loop-closing subsystems
+- [ ] Split `SlamSystem` into tracking, mapping, inertial, and loop-closing subsystems
 - [ ] Telemetry contract: one canonical per-frame outcome, a stable diagnostic vocabulary, and
       versioned run artifacts that tooling and agents can read
 - [ ] Crate split — `kornia-slam-telemetry`, `kornia-slam-eval`, and an isolated crate for
