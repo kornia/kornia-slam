@@ -71,3 +71,17 @@ fn estimation_module_path_resolves_pose_estimation_and_flow() {
     let _survivor = kornia_slam::estimation::SurvivorFilterConfig::default();
     let _estimate_is_reachable = |e: kornia_slam::estimation::Estimate| e.inliers;
 }
+
+#[test]
+fn estimation_module_path_resolves_initialization() {
+    // Owned by `initialization`, still reachable where they used to live.
+    let _two_view = kornia_slam::estimation::two_view::TwoViewInitConfig::default();
+    let _imu: kornia_slam::estimation::ImuInitConfig =
+        kornia_slam::estimation::imu_init::ImuInitConfig {
+            min_keyframes: 10,
+            min_time_sec: 1.0,
+            min_motion: 0.1,
+        };
+    let _factor_mod_is_reachable =
+        std::marker::PhantomData::<kornia_slam::estimation::inertial_init_factor::KfConst>;
+}

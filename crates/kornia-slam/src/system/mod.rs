@@ -26,8 +26,8 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::Frame;
-use crate::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
-use crate::estimation::{ImuInitConfig, ImuInitializer};
+use crate::initialization::two_view::{TwoViewInitConfig, try_initialize_two_view};
+use crate::initialization::{ImuInitConfig, ImuInitializer};
 use crate::loop_closure::{
     InertialPgoContext, LoopEpisodeDecision, LoopEpisodeTracker, VerifiedLoopEdge,
     fuse_verified_loop, optimize_pose_graph, verify_loop_candidate,
