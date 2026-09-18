@@ -1,6 +1,12 @@
+<div align="center">
+
+<img src="assets/kornia-slam-logo.png" alt="kornia-slam" width="300">
+
 # 🚧 kornia-slam 📷🧭🗺️📍🤖
 
 Spatial runtime for real-time pose estimation, mapping, and agent interaction.
+
+</div>
 
 > **Early stage, active development.** Today this is an ORB-based visual (and visual-inertial)
 > SLAM pipeline that runs end-to-end on EuRoC, Hilti, MCAP recordings, and live cameras.
