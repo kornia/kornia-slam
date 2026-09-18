@@ -6,6 +6,7 @@ pub mod optical_flow;
 mod policy;
 pub mod pose_estimation;
 mod state;
+pub(crate) mod tracker;
 
 pub use local_map::{LocalMapSelectionConfig, select_local_map_points};
 pub use policy::{KeyframePolicy, TrackingLossRecoveryPolicy};

@@ -20,9 +20,9 @@ pub use crate::tracking::{
     TrackingStatus,
 };
 
-use crate::tracking::MapProjectionEstimator;
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 use crate::tracking::motion::{InertialPrediction, predict_pose};
+use crate::tracking::tracker::{FrameInput, Tracker};
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -36,9 +36,6 @@ use crate::place_recognition::{KeyFrameDatabase, Vocabulary, compute_bow};
 use crate::pose_conversion::apply_reference_pose_correction;
 use crate::sensor_rig::{ImuCalibration, SensorRig};
 use crate::stereo::unproject_stereo;
-use crate::tracking::optical_flow::{
-    KltTracker, MapKeypointMatch, TrackSet, carry_klt_survivors, snap_unique,
-};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
@@ -52,7 +49,7 @@ pub struct SlamSystem {
     // Camera model
     rig: SensorRig,
     // Primary pose estimator
-    estimator: MapProjectionEstimator,
+    tracker: Tracker,
     // Boostrap pose estimator
     two_view_init_config: TwoViewInitConfig,
     // Keyframe insertion policy
@@ -98,8 +95,6 @@ pub struct SlamSystem {
     imu_viba1_done: bool,
     imu_viba2_done: bool,
     local_mapping: LocalMapping,
-    klt_tracker: KltTracker,
-    track_set: TrackSet,
     // Place recognition: bag-of-words vocabulary (None disables loop detection)
     // and the inverted-index keyframe database queried at each keyframe insert.
     vocabulary: Option<Vocabulary>,
@@ -129,7 +124,7 @@ impl SlamSystem {
         let loop_closer = config.pgo.map(LoopCloser::new);
         Self {
             rig,
-            estimator: MapProjectionEstimator::new(config.map_projection),
+            tracker: Tracker::new(config.map_projection),
             two_view_init_config: config.two_view_init,
             keyframe_policy: config.keyframe_policy,
             tracking_loss_recovery: config.tracking_loss_recovery,
@@ -160,8 +155,6 @@ impl SlamSystem {
             imu_init_window_start_sec: None,
             imu_viba1_done: false,
             imu_viba2_done: false,
-            klt_tracker: KltTracker::default(),
-            track_set: TrackSet::new(),
             vocabulary: None,
             kf_database: KeyFrameDatabase::new(),
             loop_closer,
@@ -841,45 +834,22 @@ impl SlamSystem {
             .state
             .lost_since_sec
             .map_or(0.0, |t0| timestamp_sec - t0);
-        let search_scale = self.estimator.config().search_scale_for(currently_lost_for);
-
-        let klt_survivors = if self.track_set.is_empty() {
-            None
-        } else {
-            previous_image.and_then(|previous_image| {
-                self.klt_tracker
-                    .track(self.track_set.tracks(), previous_image, current_image)
-                    .ok()
-            })
+        let result = {
+            let map = self.map.lock().unwrap();
+            self.tracker.estimate(
+                FrameInput {
+                    frame: &frame,
+                    previous_image,
+                    current_image,
+                    candidate_pose,
+                    pose_before,
+                    current_keyframe_idx: self.state.current_keyframe_idx,
+                    lost_for_sec: currently_lost_for,
+                },
+                &map,
+                &self.rig.camera,
+            )
         };
-        let pre_seeded = klt_survivors
-            .as_ref()
-            .and_then(|survivors| {
-                snap_unique(
-                    &self.track_set,
-                    survivors,
-                    &frame.features.keypoints_xy,
-                    3.0,
-                )
-                .ok()
-            })
-            .map(|matches| {
-                matches
-                    .into_iter()
-                    .map(|matched| (matched.map_point_idx, matched.keypoint_idx))
-                    .collect()
-            });
-
-        let result = self.estimator.estimate_pose(
-            &frame,
-            &candidate_pose,
-            &pose_before,
-            &self.map.lock().unwrap(),
-            &self.rig.camera,
-            self.state.current_keyframe_idx,
-            search_scale,
-            pre_seeded,
-        );
 
         let (mut status, matches, tracked_inliers, reject_reason) = match result {
             Ok(estimate) => {
@@ -895,22 +865,6 @@ impl SlamSystem {
                     self.state.velocity = Some(Pose3d::between(&pose_before, &estimate.pose));
                 }
 
-                let track_matches: Vec<MapKeypointMatch> = estimate
-                    .matches
-                    .iter()
-                    .map(|&(map_point_idx, keypoint_idx)| MapKeypointMatch {
-                        map_point_idx,
-                        keypoint_idx,
-                    })
-                    .collect();
-                if self
-                    .track_set
-                    .reconcile_from_matches(&track_matches, &frame.features.keypoints_xy)
-                    .is_err()
-                {
-                    self.track_set = TrackSet::new();
-                }
-
                 (
                     TrackingStatus::Tracked,
                     estimate.matches,
@@ -919,8 +873,6 @@ impl SlamSystem {
                 )
             }
             Err(reason) => {
-                carry_klt_survivors(&mut self.track_set, klt_survivors);
-
                 // Carry the predicted pose forward instead of freezing at
                 // pose_before. state.velocity_world was already advanced by
                 // predict_pose_imu above regardless of visual outcome, so
@@ -997,7 +949,7 @@ impl SlamSystem {
                     "[lost] frame={} giving up after {:.2}s (map_established={}): resetting",
                     frame.idx, recently_lost_for, map_established,
                 ));
-                self.track_set = TrackSet::new();
+                self.tracker.reset_tracks();
                 self.state.reset();
                 return self.bootstrap_step(frame, timestamp_sec);
             }
@@ -1315,7 +1267,7 @@ impl SlamSystem {
             self.state.velocity_world = corrected_velocity;
         }
         if outcome.pgo_applied {
-            self.track_set = TrackSet::new();
+            self.tracker.reset_tracks();
             if self.state.imu_initialized {
                 if !self.local_mapping.submit(KeyframeJob {
                     imu_initialized: true,
