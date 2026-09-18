@@ -4,7 +4,7 @@ pub mod estimation;
 pub mod frame;
 pub mod initialization;
 pub mod loop_closure;
-pub mod map;
+pub mod mapping;
 pub mod pipeline;
 pub mod place_recognition;
 mod pose_conversion;
@@ -16,6 +16,7 @@ pub mod vi_ba_schur;
 
 pub use frame::Frame;
 pub use kornia_imgproc::features::OrbFeatures;
+pub use mapping::map;
 pub use system::{LoopClosingConfig, LoopClosureEvent, SlamConfig, SlamSystem};
 pub use tracking::MapProjectionEstimator;
 
