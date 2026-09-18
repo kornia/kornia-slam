@@ -468,6 +468,15 @@ pub fn snap_unique(
     Ok(accepted)
 }
 
+/// Advances the track set onto this frame's optical-flow survivors, clearing it
+/// when flow failed or the survivors cannot be applied. A cleared set simply
+/// re-seeds from the next successful frame.
+pub(crate) fn carry_klt_survivors(track_set: &mut TrackSet, survivors: Option<Vec<FlowSurvivor>>) {
+    if survivors.is_none_or(|survivors| track_set.advance(survivors).is_err()) {
+        *track_set = TrackSet::new();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,5 +938,37 @@ mod tests {
         let matches = snap_unique(&tracks, &survivors, &[[10.0, 10.0], [20.0, 20.0]], 1.0).unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].map_point_idx, 42);
+    }
+    #[test]
+    fn klt_tracks_survive_skipped_frame_and_clear_without_survivors() {
+        let mut tracks = TrackSet::new();
+        tracks
+            .reconcile_from_matches(
+                &[MapKeypointMatch {
+                    map_point_idx: 42,
+                    keypoint_idx: 0,
+                }],
+                &[[10.0, 20.0]],
+            )
+            .unwrap();
+        let track_id = tracks.tracks()[0].id();
+
+        carry_klt_survivors(
+            &mut tracks,
+            Some(vec![FlowSurvivor {
+                track_id,
+                pixel: [12.0, 21.0],
+                error: 0.5,
+            }]),
+        );
+
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks.tracks()[0].id(), track_id);
+        assert_eq!(tracks.tracks()[0].map_point_idx(), Some(42));
+        assert_eq!(tracks.tracks()[0].pixel(), [12.0, 21.0]);
+        assert_eq!(tracks.tracks()[0].age(), 2);
+
+        carry_klt_survivors(&mut tracks, None);
+        assert!(tracks.is_empty());
     }
 }

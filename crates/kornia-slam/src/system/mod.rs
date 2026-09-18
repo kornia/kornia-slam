@@ -22,6 +22,7 @@ pub use crate::tracking::{
 
 use crate::tracking::MapProjectionEstimator;
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
+use crate::tracking::motion::{InertialPrediction, predict_pose};
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -36,7 +37,7 @@ use crate::pose_conversion::apply_reference_pose_correction;
 use crate::sensor_rig::{ImuCalibration, SensorRig};
 use crate::stereo::unproject_stereo;
 use crate::tracking::optical_flow::{
-    FlowSurvivor, KltTracker, MapKeypointMatch, TrackSet, snap_unique,
+    KltTracker, MapKeypointMatch, TrackSet, carry_klt_survivors, snap_unique,
 };
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
@@ -668,39 +669,6 @@ impl SlamSystem {
 
     /// Body-to-world pose `T_WB` for a world-to-camera pose, via
     /// `T_WB = T_WC ∘ T_CB`. Treats camera == body when no extrinsic is set.
-    fn body_to_world(&self, pose_w2c: &Pose3d) -> Pose3d {
-        let cam_to_world = pose_w2c.inverse();
-        match &self.rig.camera_to_body() {
-            Some(t_bc) => cam_to_world.compose(&t_bc.inverse()),
-            None => cam_to_world,
-        }
-    }
-
-    /// Propagates the camera pose and body velocity through one preintegrated
-    /// IMU window.
-    fn predict_pose_imu(
-        &self,
-        pose_w2c: Pose3d,
-        vel_world: Vec3F64,
-        gravity_world: Vec3F64,
-        preint: &PreintegratedImu,
-    ) -> (Pose3d, Vec3F64) {
-        let body_to_world = self.body_to_world(&pose_w2c);
-        let (r_j, v_j, p_j) = preint.predict(
-            &body_to_world.rotation,
-            &vel_world,
-            &body_to_world.translation,
-            &gravity_world,
-        );
-
-        let pred_body_to_world = Pose3d::from_rt(r_j, p_j);
-        let pred_cam_to_world = match &self.rig.camera_to_body() {
-            Some(t_bc) => pred_body_to_world.compose(t_bc),
-            None => pred_body_to_world,
-        };
-        (pred_cam_to_world.inverse(), v_j)
-    }
-
     fn inertial_init_step(
         &mut self,
         frame: Frame,
@@ -849,30 +817,25 @@ impl SlamSystem {
             self.imu_bias = kf.imu_bias;
         }
 
-        let candidate_pose = if self.state.imu_initialized && prev_timestamp > 0.0 {
-            let (preint, _) = self.preintegrate_window(prev_timestamp, timestamp_sec);
-            if preint.dt > 0.0 {
-                let (pred_pose, pred_vel) = self.predict_pose_imu(
-                    pose_before,
-                    self.state.velocity_world,
-                    self.gravity_world,
-                    &preint,
-                );
-                self.state.velocity_world = pred_vel; // propagate for next frame
-                pred_pose
-            } else {
-                // IMU stalled, fall back to visual constant velocity
-                self.state
-                    .velocity
-                    .map(|v| v.compose(&pose_before))
-                    .unwrap_or(pose_before)
-            }
-        } else {
-            self.state
-                .velocity
-                .map(|v| v.compose(&pose_before))
-                .unwrap_or(pose_before)
-        };
+        // Preintegration is prepared here: the system owns bias and the sample
+        // buffer. The motion model chooses between it and the visual model.
+        let preintegrated = (self.state.imu_initialized && prev_timestamp > 0.0)
+            .then(|| self.preintegrate_window(prev_timestamp, timestamp_sec).0);
+        let (candidate_pose, predicted_velocity) = predict_pose(
+            pose_before,
+            self.state.velocity,
+            self.state.velocity_world,
+            preintegrated
+                .as_ref()
+                .map(|preintegrated| InertialPrediction {
+                    preintegrated,
+                    camera_to_body: self.rig.camera_to_body(),
+                    gravity_world: self.gravity_world,
+                }),
+        );
+        if let Some(velocity_world) = predicted_velocity {
+            self.state.velocity_world = velocity_world; // propagate for next frame
+        }
 
         let currently_lost_for = self
             .state
@@ -1744,12 +1707,6 @@ impl SlamSystem {
     }
 }
 
-fn carry_klt_survivors(track_set: &mut TrackSet, survivors: Option<Vec<FlowSurvivor>>) {
-    if survivors.is_none_or(|survivors| track_set.advance(survivors).is_err()) {
-        *track_set = TrackSet::new();
-    }
-}
-
 fn format_imu_init_gate(
     start_idx: usize,
     first_idx: Option<usize>,
@@ -1766,8 +1723,7 @@ fn format_imu_init_gate(
 
 #[cfg(test)]
 mod tests {
-    use super::{carry_klt_survivors, format_imu_init_gate};
-    use crate::tracking::optical_flow::{FlowSurvivor, MapKeypointMatch, TrackSet};
+    use super::format_imu_init_gate;
 
     #[test]
     fn formats_compact_imu_init_gate() {
@@ -1775,38 +1731,5 @@ mod tests {
             format_imu_init_gate(12, Some(12), Some(32), 7, 10, 1.05, 1.0),
             "[imu_init_gate] start_idx=12 first_idx=Some(12) last_idx=Some(32) kfs=7/10 imu_time=1.05/1.0s"
         );
-    }
-
-    #[test]
-    fn klt_tracks_survive_skipped_frame_and_clear_without_survivors() {
-        let mut tracks = TrackSet::new();
-        tracks
-            .reconcile_from_matches(
-                &[MapKeypointMatch {
-                    map_point_idx: 42,
-                    keypoint_idx: 0,
-                }],
-                &[[10.0, 20.0]],
-            )
-            .unwrap();
-        let track_id = tracks.tracks()[0].id();
-
-        carry_klt_survivors(
-            &mut tracks,
-            Some(vec![FlowSurvivor {
-                track_id,
-                pixel: [12.0, 21.0],
-                error: 0.5,
-            }]),
-        );
-
-        assert_eq!(tracks.len(), 1);
-        assert_eq!(tracks.tracks()[0].id(), track_id);
-        assert_eq!(tracks.tracks()[0].map_point_idx(), Some(42));
-        assert_eq!(tracks.tracks()[0].pixel(), [12.0, 21.0]);
-        assert_eq!(tracks.tracks()[0].age(), 2);
-
-        carry_klt_survivors(&mut tracks, None);
-        assert!(tracks.is_empty());
     }
 }
