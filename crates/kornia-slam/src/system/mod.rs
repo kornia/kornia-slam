@@ -13,6 +13,13 @@ pub type SlamPipeline = SlamSystem;
 #[allow(deprecated)]
 pub use config::{PgoPipelineConfig, PipelineConfig};
 
+// Re-exported so `kornia_slam::system::*` keeps resolving the state and policy
+// types; `tracking` owns them.
+pub use crate::tracking::{
+    KeyframePolicy, SystemMode, SystemState, TrackingLossRecoveryPolicy, TrackingResult,
+    TrackingStatus,
+};
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -29,10 +36,6 @@ use crate::loop_closure::{
 use crate::map::{Keyframe, KeyframeJob, LocalMapping, Map, MapPoint, ORB_SCALE_FACTOR};
 use crate::place_recognition::{KeyFrameDatabase, Vocabulary, compute_bow};
 use crate::stereo::unproject_stereo;
-use crate::tracking::{
-    KeyframePolicy, SystemMode, SystemState, TrackingLossRecoveryPolicy, TrackingResult,
-    TrackingStatus,
-};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};

@@ -4,6 +4,7 @@ pub mod estimation;
 pub mod frame;
 pub mod loop_closure;
 pub mod map;
+pub mod pipeline;
 pub mod place_recognition;
 mod pose_conversion;
 mod sparse_pgo;
