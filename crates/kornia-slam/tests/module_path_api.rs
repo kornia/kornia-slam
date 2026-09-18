@@ -58,3 +58,16 @@ fn tracking_module_path_resolves_the_same_types() {
     let _: kornia_slam::tracking::SystemState = SystemState::new();
     let _: kornia_slam::tracking::KeyframePolicy = KeyframePolicy::default();
 }
+
+#[test]
+fn estimation_module_path_resolves_pose_estimation_and_flow() {
+    // Owned by `tracking`, still reachable where they used to live.
+    let _: kornia_slam::estimation::MapProjectionEstimator =
+        kornia_slam::tracking::pose_estimation::MapProjectionEstimator::new(Default::default());
+    let _cfg = kornia_slam::estimation::map_projection::MapProjectionConfig::default();
+    let _pnp = kornia_slam::estimation::pnp::PnpConfig::default();
+    let _flow: kornia_slam::estimation::optical_flow::TrackSet =
+        kornia_slam::tracking::optical_flow::TrackSet::default();
+    let _survivor = kornia_slam::estimation::SurvivorFilterConfig::default();
+    let _estimate_is_reachable = |e: kornia_slam::estimation::Estimate| e.inliers;
+}

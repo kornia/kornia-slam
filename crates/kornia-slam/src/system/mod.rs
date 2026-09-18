@@ -20,15 +20,14 @@ pub use crate::tracking::{
     TrackingStatus,
 };
 
+use crate::tracking::MapProjectionEstimator;
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::Frame;
-use crate::estimation::optical_flow::{
-    FlowSurvivor, KltTracker, MapKeypointMatch, TrackSet, snap_unique,
-};
 use crate::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
-use crate::estimation::{ImuInitConfig, ImuInitializer, MapProjectionEstimator};
+use crate::estimation::{ImuInitConfig, ImuInitializer};
 use crate::loop_closure::{
     InertialPgoContext, LoopEpisodeDecision, LoopEpisodeTracker, VerifiedLoopEdge,
     fuse_verified_loop, optimize_pose_graph, verify_loop_candidate,
@@ -36,6 +35,9 @@ use crate::loop_closure::{
 use crate::map::{Keyframe, KeyframeJob, LocalMapping, Map, MapPoint, ORB_SCALE_FACTOR};
 use crate::place_recognition::{KeyFrameDatabase, Vocabulary, compute_bow};
 use crate::stereo::unproject_stereo;
+use crate::tracking::optical_flow::{
+    FlowSurvivor, KltTracker, MapKeypointMatch, TrackSet, snap_unique,
+};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
@@ -1952,7 +1954,7 @@ mod tests {
         apply_reference_pose_correction, carry_klt_survivors, format_imu_init_gate,
         pose_graph_reference_correction, pose_graph_tracking_correction,
     };
-    use crate::estimation::optical_flow::{FlowSurvivor, MapKeypointMatch, TrackSet};
+    use crate::tracking::optical_flow::{FlowSurvivor, MapKeypointMatch, TrackSet};
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::{SO3F64, Vec3F64};
 

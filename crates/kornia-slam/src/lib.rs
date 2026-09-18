@@ -13,10 +13,10 @@ pub mod system;
 pub mod tracking;
 pub mod vi_ba_schur;
 
-pub use estimation::MapProjectionEstimator;
 pub use frame::Frame;
 pub use kornia_imgproc::features::OrbFeatures;
 pub use system::{LoopClosingConfig, LoopClosureEvent, SlamConfig, SlamSystem};
+pub use tracking::MapProjectionEstimator;
 
 #[allow(deprecated)]
 pub use system::{PgoPipelineConfig, PipelineConfig, SlamPipeline};
