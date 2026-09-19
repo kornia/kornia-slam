@@ -1,5 +1,6 @@
 //! Mutating the map: inserting keyframes and points, and recording observations.
 
+use crate::map::ObservationKey;
 use crate::map::{
     ImuFactor, Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR, TriangulatedPoint,
 };
@@ -60,7 +61,14 @@ impl Map {
                 .get(curr_desc_idx)
                 .copied()
                 .unwrap_or(descriptor);
-            self.push_map_point(MapPoint::new(position, desc, octave, color, curr_kf_idx));
+            self.push_map_point(MapPoint::new(
+                position,
+                desc,
+                octave,
+                color,
+                curr_kf_idx,
+                curr_desc_idx,
+            ));
             curr_kf.associate_map_point(curr_desc_idx, first_mp_idx + i);
         }
         if let Some(prev) = prev_kf {
@@ -72,7 +80,13 @@ impl Map {
                 if let Some(&prev_desc) = prev.frame.features.descriptors.get(prev_desc_idx)
                     && let Some(mp) = self.map_points.get_mut(first_mp_idx + i)
                 {
-                    mp.add_observation_descriptor(prev_kf_idx, prev_desc);
+                    mp.add_observation(
+                        ObservationKey {
+                            keyframe_idx: prev_kf_idx,
+                            feature_idx: prev_desc_idx,
+                        },
+                        prev_desc,
+                    );
                 }
             }
         }
@@ -89,9 +103,12 @@ impl Map {
         let Some(&descriptor) = keyframe.frame.features.descriptors.get(desc_idx) else {
             return;
         };
-        let kf_idx = keyframe.frame.idx;
+        let key = ObservationKey {
+            keyframe_idx: keyframe.frame.idx,
+            feature_idx: desc_idx,
+        };
         if let Some(mp) = self.map_points.get_mut(mp_idx) {
-            mp.add_observation_descriptor(kf_idx, descriptor);
+            mp.add_observation(key, descriptor);
         }
         self.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
     }
@@ -106,8 +123,12 @@ impl Map {
         else {
             return;
         };
+        let key = ObservationKey {
+            keyframe_idx: kf_idx,
+            feature_idx: desc_idx,
+        };
         if let Some(mp) = self.map_points.get_mut(mp_idx) {
-            mp.add_observation_descriptor(kf_idx, descriptor);
+            mp.add_observation(key, descriptor);
         }
         self.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
     }
@@ -125,7 +146,7 @@ impl Map {
             }
             (
                 mp.position,
-                mp.observation_kf_indices.clone(),
+                mp.observer_keyframes().collect::<Vec<_>>(),
                 mp.keyframe_idx,
                 mp.reference_octave,
             )
@@ -190,14 +211,7 @@ impl Map {
             return None;
         }
 
-        let support = |point: &MapPoint| {
-            point
-                .observation_kf_indices
-                .iter()
-                .copied()
-                .collect::<HashSet<_>>()
-                .len()
-        };
+        let support = |point: &MapPoint| point.observer_keyframes().collect::<HashSet<_>>().len();
         let first_support = support(first_point);
         let second_support = support(second_point);
         let second_is_stronger = second_support > first_support
@@ -242,25 +256,16 @@ impl Map {
         }
 
         let replaced_observations: Vec<_> = self.map_points[replaced]
-            .observation_kf_indices
+            .observations()
             .iter()
-            .copied()
-            .zip(
-                self.map_points[replaced]
-                    .observed_descriptors
-                    .iter()
-                    .copied(),
-            )
+            .map(|observation| (observation.key, observation.descriptor))
             .collect();
         let replaced_visible = self.map_points[replaced].n_visible;
         let replaced_found = self.map_points[replaced].n_found;
-        for (keyframe_idx, descriptor) in replaced_observations {
-            if !self.map_points[survivor]
-                .observation_kf_indices
-                .contains(&keyframe_idx)
-            {
-                self.map_points[survivor].add_observation_descriptor(keyframe_idx, descriptor);
-            }
+        for (key, descriptor) in replaced_observations {
+            // add_observation refuses a keyframe already linked, so the
+            // survivor keeps its own record where both observed the same frame.
+            self.map_points[survivor].add_observation(key, descriptor);
         }
         self.map_points[survivor].n_visible = self.map_points[survivor]
             .n_visible

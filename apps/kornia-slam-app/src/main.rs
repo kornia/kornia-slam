@@ -783,7 +783,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut obs_total: usize = 0;
         let mut obs_max: usize = 0;
         for mp in map_points.iter().filter(|mp| !mp.culled) {
-            let n = mp.observation_kf_indices.len();
+            let n = mp.observations().len();
             active_pts += 1;
             obs_total += n;
             if n > obs_max {

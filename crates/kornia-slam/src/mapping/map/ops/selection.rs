@@ -70,7 +70,7 @@ impl Map {
     /// observed map points with it, as `(frame_idx, weight)` where `weight` is
     /// the number of map points both observe, sorted by descending weight.
     ///
-    /// Derived on demand by inverting `MapPoint::observation_kf_indices` — no
+    /// Derived on demand by inverting the landmark observations — no
     /// cached graph state, so it stays correct across culls and fuses. Mirrors
     /// ORB-SLAM3's `KeyFrame::UpdateConnections`: links below `min_weight` are
     /// dropped, but if none reach the threshold the single strongest link is
@@ -88,7 +88,7 @@ impl Map {
             if mp.culled {
                 continue;
             }
-            for &obs_kf in &mp.observation_kf_indices {
+            for obs_kf in mp.observer_keyframes() {
                 if obs_kf != kf_idx {
                     *weights.entry(obs_kf).or_insert(0) += 1;
                 }

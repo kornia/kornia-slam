@@ -107,7 +107,8 @@ fn synthetic_loop_map() -> (Map, Pose3d) {
     map.upsert_keyframe(candidate);
     map.upsert_keyframe(query);
     for (index, point) in world.into_iter().enumerate() {
-        let map_point = map.push_map_point(MapPoint::new(point, descriptors[index], 0, [0; 3], 0));
+        let map_point =
+            map.push_map_point(MapPoint::new(point, descriptors[index], 0, [0; 3], 0, 0));
         map.get_keyframe_mut(0)
             .unwrap()
             .associate_map_point(index, map_point);
@@ -309,6 +310,7 @@ fn loop_fusion_attaches_a_point_to_an_unassociated_loop_keypoint() {
         0,
         [0; 3],
         0,
+        0,
     ));
     map.get_keyframe_mut(0)
         .unwrap()
@@ -327,7 +329,7 @@ fn loop_fusion_attaches_a_point_to_an_unassociated_loop_keypoint() {
     assert_eq!(stats.observations_added, 1);
     assert_eq!(stats.map_points_merged, 0);
     assert_eq!(map.get_keyframe(10).unwrap().map_point(0), Some(point));
-    assert!(map.map_points()[point].observation_kf_indices.contains(&10));
+    assert!(map.map_points()[point].is_observed_by(10));
 }
 
 #[test]
@@ -352,6 +354,7 @@ fn loop_fusion_merges_consistent_duplicate_points() {
         0,
         [0; 3],
         0,
+        0,
     ));
     let query_point = map.push_map_point(MapPoint::new(
         Vec3F64::new(0.01, 0.0, 5.0),
@@ -359,6 +362,7 @@ fn loop_fusion_merges_consistent_duplicate_points() {
         0,
         [0; 3],
         10,
+        0,
     ));
     map.get_keyframe_mut(0)
         .unwrap()
@@ -408,6 +412,7 @@ fn loop_fusion_rejects_descriptor_mismatch() {
         0,
         [0; 3],
         0,
+        0,
     ));
     map.get_keyframe_mut(0)
         .unwrap()
@@ -449,6 +454,7 @@ fn loop_fusion_rejects_duplicate_with_inconsistent_reciprocal_projection() {
         0,
         [0; 3],
         0,
+        0,
     ));
     let inconsistent_target = map.push_map_point(MapPoint::new(
         Vec3F64::new(1.0, 0.0, 5.0),
@@ -456,6 +462,7 @@ fn loop_fusion_rejects_duplicate_with_inconsistent_reciprocal_projection() {
         0,
         [0; 3],
         10,
+        0,
     ));
     map.get_keyframe_mut(0)
         .unwrap()

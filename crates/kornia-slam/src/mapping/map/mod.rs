@@ -42,7 +42,10 @@ use std::collections::HashSet;
 
 pub(crate) use keyframe::stereo_depth_obs;
 pub use keyframe::{ImuFactor, Keyframe, STEREO_DEPTH_MIN_SIGMA, STEREO_DEPTH_REL_SIGMA};
-pub use map_point::{MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR, TriangulatedPoint};
+pub use map_point::{
+    LandmarkObservation, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR, ObservationKey,
+    TriangulatedPoint,
+};
 pub use ops::{
     InitialMapHealth, KeyframeBaCorrection, LocalBaMergeResult, LocalBaSnapshot,
     MapPointMergeResult, PoseGraphCorrectionError, PoseGraphCorrectionResult,
@@ -128,7 +131,7 @@ mod tests {
 
     #[test]
     fn map_point_new_sets_active_defaults() {
-        let mp = MapPoint::new(Vec3F64::new(1.0, 2.0, 3.0), [9u8; 32], 0, [0; 3], 5);
+        let mp = MapPoint::new(Vec3F64::new(1.0, 2.0, 3.0), [9u8; 32], 0, [0; 3], 5, 0);
 
         assert_eq!(mp.position, Vec3F64::new(1.0, 2.0, 3.0));
         assert_eq!(mp.descriptor, [9u8; 32]);
@@ -140,7 +143,7 @@ mod tests {
 
     #[test]
     fn map_point_tracking_helpers_work() {
-        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0, [0; 3], 0);
+        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0, [0; 3], 0, 0);
         mp.n_visible = 10;
         mp.n_found = 4;
 
@@ -172,12 +175,19 @@ mod tests {
                 0,
                 [0; 3],
                 observers[0],
+                0,
             ));
             for (slot, &kf_idx) in observers.iter().enumerate() {
                 if slot > 0
                     && let Some(mp) = map.map_points.get_mut(mp_idx)
                 {
-                    mp.add_observation_descriptor(kf_idx, [0u8; 32]);
+                    mp.add_observation(
+                        ObservationKey {
+                            keyframe_idx: kf_idx,
+                            feature_idx: 0,
+                        },
+                        [0u8; 32],
+                    );
                 }
                 // Associate a free descriptor slot in that keyframe.
                 let kf = map.get_keyframe_mut(kf_idx).unwrap();
@@ -263,12 +273,14 @@ mod tests {
             0,
             [0; 3],
             0,
+            0,
         ));
         let second_idx = map.push_map_point(MapPoint::new(
             Vec3F64::new(1.0, 0.0, 1.0),
             [1u8; 32],
             0,
             [0; 3],
+            0,
             0,
         ));
 
@@ -287,12 +299,14 @@ mod tests {
             0,
             [0; 3],
             0,
+            0,
         ));
         let second_idx = map.push_map_point(MapPoint::new(
             Vec3F64::new(1.0, 0.0, 5.0),
             [1u8; 32],
             0,
             [0; 3],
+            0,
             0,
         ));
         map.map_points_mut()[first_idx].n_visible = 10;
@@ -316,6 +330,7 @@ mod tests {
             0,
             [0; 3],
             0,
+            0,
         ));
 
         let mut snapshot = map.local_ba_snapshot();
@@ -333,6 +348,7 @@ mod tests {
             0,
             [0; 3],
             1,
+            0,
         ));
 
         let merged = map
@@ -367,6 +383,7 @@ mod tests {
             [0u8; 32],
             0,
             [0; 3],
+            0,
             0,
         ));
 
@@ -406,7 +423,7 @@ mod tests {
             before[1],
         )));
         let point_before = Vec3F64::new(1.0, 0.0, 5.0);
-        let point_idx = map.push_map_point(MapPoint::new(point_before, [1; 32], 0, [0; 3], 20));
+        let point_idx = map.push_map_point(MapPoint::new(point_before, [1; 32], 0, [0; 3], 20, 0));
         map.get_keyframe_mut(20)
             .unwrap()
             .associate_map_point(0, point_idx);
@@ -433,6 +450,7 @@ mod tests {
             0,
             [0; 3],
             7,
+            0,
         ));
         let live_pose = map.get_keyframe(7).unwrap().frame.pose_world_to_cam;
         let live_point = map.map_points()[point_idx].position;
@@ -493,8 +511,15 @@ mod tests {
             0,
             [0; 3],
             0,
+            0,
         ));
-        map.map_points_mut()[survivor].add_observation_descriptor(1, [1; 32]);
+        map.map_points_mut()[survivor].add_observation(
+            ObservationKey {
+                keyframe_idx: 1,
+                feature_idx: 0,
+            },
+            [1; 32],
+        );
         map.map_points_mut()[survivor].n_visible = 7;
         map.map_points_mut()[survivor].n_found = 5;
         map.get_keyframe_mut(0)
@@ -510,8 +535,15 @@ mod tests {
             0,
             [0; 3],
             2,
+            0,
         ));
-        map.map_points_mut()[replaced].add_observation_descriptor(1, [11; 32]);
+        map.map_points_mut()[replaced].add_observation(
+            ObservationKey {
+                keyframe_idx: 1,
+                feature_idx: 1,
+            },
+            [11; 32],
+        );
         map.map_points_mut()[replaced].n_visible = 4;
         map.map_points_mut()[replaced].n_found = 3;
         map.get_keyframe_mut(2)
@@ -531,9 +563,7 @@ mod tests {
         assert_eq!(map.map_points()[survivor].n_found, 8);
         assert_eq!(
             map.map_points()[survivor]
-                .observation_kf_indices
-                .iter()
-                .copied()
+                .observer_keyframes()
                 .collect::<HashSet<_>>(),
             HashSet::from([0, 1, 2])
         );
@@ -562,12 +592,14 @@ mod tests {
             0,
             [0; 3],
             0,
+            0,
         ));
         let second = map.push_map_point(MapPoint::new(
             Vec3F64::new(0.0, 0.0, 5.0),
             [1; 32],
             0,
             [0; 3],
+            0,
             0,
         ));
 
@@ -584,7 +616,7 @@ mod tests {
     /// `nScale = clamp(ceil(log(maxDist/dist) / log(scaleFactor)), 0, nLevels-1)`.
     #[test]
     fn predict_scale_matches_orbslam3_closed_form() {
-        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0, [0; 3], 0);
+        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0, [0; 3], 0, 0);
         mp.max_distance = 10.0;
         let sf = ORB_SCALE_FACTOR;
         let n = ORB_N_LEVELS;
@@ -604,7 +636,7 @@ mod tests {
 
         // Degenerate inputs return level 0.
         assert_eq!(mp.predict_scale(0.0, sf, n), 0);
-        let mut unset = MapPoint::new(Vec3F64::ZERO, [0u8; 32], 0, [0; 3], 0);
+        let mut unset = MapPoint::new(Vec3F64::ZERO, [0u8; 32], 0, [0; 3], 0, 0);
         unset.max_distance = 0.0;
         assert_eq!(unset.predict_scale(5.0, sf, n), 0);
     }
@@ -625,6 +657,7 @@ mod tests {
             [0u8; 32],
             2,
             [0; 3],
+            0,
             0,
         ));
         map.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
@@ -655,6 +688,7 @@ mod tests {
             [0u8; 32],
             0,
             [0; 3],
+            0,
             0,
         ));
         map.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
