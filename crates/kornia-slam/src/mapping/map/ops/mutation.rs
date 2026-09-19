@@ -327,4 +327,241 @@ impl Map {
         self.map_points.clear();
         self.imu_factors.clear();
     }
+    /// Links a feature to a landmark, updating both sides.
+    ///
+    /// Returns `true` for a new link and `false` when this exact link already
+    /// exists. A feature held by another landmark, or a landmark already seen
+    /// by this keyframe through a different feature, is a conflict.
+    pub fn link_observation(
+        &mut self,
+        keyframe_idx: usize,
+        feature_idx: usize,
+        landmark_idx: usize,
+    ) -> Result<bool, MapMutationError> {
+        let key = ObservationKey {
+            keyframe_idx,
+            feature_idx,
+        };
+        let (descriptor, _) = self.feature_data(key)?;
+        self.require_active_landmark(landmark_idx)?;
+        match self.check_link(key, landmark_idx)? {
+            LinkVerdict::AlreadyLinked => Ok(false),
+            LinkVerdict::New => {
+                self.link_unchecked(key, landmark_idx, descriptor);
+                self.refresh_landmark(landmark_idx);
+                Ok(true)
+            }
+        }
+    }
+
+    /// Clears a feature's link, returning the landmark it held. Retires that
+    /// landmark when this was its last observation.
+    pub fn unlink_observation(
+        &mut self,
+        keyframe_idx: usize,
+        feature_idx: usize,
+    ) -> Result<Option<usize>, MapMutationError> {
+        let key = ObservationKey {
+            keyframe_idx,
+            feature_idx,
+        };
+        self.feature_data(key)?;
+        let Some(landmark_idx) = self
+            .get_keyframe(keyframe_idx)
+            .and_then(|kf| kf.map_point(feature_idx))
+        else {
+            return Ok(None);
+        };
+        if let Some(kf) = self.get_keyframe_mut(keyframe_idx) {
+            kf.clear_map_point(feature_idx);
+        }
+        if let Some(mp) = self.map_points.get_mut(landmark_idx) {
+            mp.remove_observation(keyframe_idx);
+            if mp.observations().is_empty() {
+                self.retire_landmark(landmark_idx);
+            } else {
+                self.adopt_reference(landmark_idx);
+                self.refresh_landmark(landmark_idx);
+            }
+        }
+        Ok(Some(landmark_idx))
+    }
+
+    /// Retires a landmark and clears every feature that referenced it.
+    ///
+    /// Deletion is logical: the slot stays, so all other ids keep their
+    /// meaning. Removing an already-retired landmark is a no-op.
+    pub fn remove_landmark(&mut self, landmark_idx: usize) -> Result<bool, MapMutationError> {
+        let Some(mp) = self.map_points.get(landmark_idx) else {
+            return Err(MapMutationError::UnknownLandmark(landmark_idx));
+        };
+        if mp.culled {
+            return Ok(false);
+        }
+        let keys: Vec<ObservationKey> = mp.observations().iter().map(|o| o.key).collect();
+        for key in keys {
+            if let Some(kf) = self.get_keyframe_mut(key.keyframe_idx)
+                && kf.map_point(key.feature_idx) == Some(landmark_idx)
+            {
+                kf.clear_map_point(key.feature_idx);
+            }
+        }
+        self.retire_landmark(landmark_idx);
+        Ok(true)
+    }
+
+    fn feature_data(&self, key: ObservationKey) -> Result<([u8; 32], u8), MapMutationError> {
+        let Some(kf) = self.get_keyframe(key.keyframe_idx) else {
+            return Err(MapMutationError::UnknownKeyframe(key.keyframe_idx));
+        };
+        let Some(&descriptor) = kf.frame.features.descriptors.get(key.feature_idx) else {
+            return Err(MapMutationError::InvalidFeature {
+                keyframe_idx: key.keyframe_idx,
+                feature_idx: key.feature_idx,
+            });
+        };
+        let octave = kf
+            .frame
+            .features
+            .octaves
+            .get(key.feature_idx)
+            .copied()
+            .unwrap_or(0);
+        Ok((descriptor, octave))
+    }
+
+    fn require_active_landmark(&self, landmark_idx: usize) -> Result<(), MapMutationError> {
+        match self.map_points.get(landmark_idx) {
+            None => Err(MapMutationError::UnknownLandmark(landmark_idx)),
+            Some(mp) if mp.culled => Err(MapMutationError::RetiredLandmark(landmark_idx)),
+            Some(_) => Ok(()),
+        }
+    }
+
+    fn check_link(
+        &self,
+        key: ObservationKey,
+        landmark_idx: usize,
+    ) -> Result<LinkVerdict, MapMutationError> {
+        let held = self
+            .get_keyframe(key.keyframe_idx)
+            .and_then(|kf| kf.map_point(key.feature_idx));
+        match held {
+            Some(existing) if existing == landmark_idx => return Ok(LinkVerdict::AlreadyLinked),
+            Some(holder) => {
+                return Err(MapMutationError::FeatureOccupied {
+                    keyframe_idx: key.keyframe_idx,
+                    feature_idx: key.feature_idx,
+                    holder,
+                });
+            }
+            None => {}
+        }
+        if self
+            .map_points
+            .get(landmark_idx)
+            .is_some_and(|mp| mp.is_observed_by(key.keyframe_idx))
+        {
+            return Err(MapMutationError::DuplicateObservation {
+                landmark: landmark_idx,
+                keyframe_idx: key.keyframe_idx,
+            });
+        }
+        Ok(LinkVerdict::New)
+    }
+
+    fn link_unchecked(&mut self, key: ObservationKey, landmark_idx: usize, descriptor: [u8; 32]) {
+        if let Some(kf) = self.get_keyframe_mut(key.keyframe_idx) {
+            kf.associate_map_point(key.feature_idx, landmark_idx);
+        }
+        if let Some(mp) = self.map_points.get_mut(landmark_idx) {
+            mp.add_observation(key, descriptor);
+        }
+    }
+
+    /// Smallest `(keyframe_idx, feature_idx)` becomes the reference.
+    fn adopt_reference(&mut self, landmark_idx: usize) {
+        let Some(mp) = self.map_points.get(landmark_idx) else {
+            return;
+        };
+        let Some(next) = mp
+            .observations()
+            .iter()
+            .min_by_key(|o| (o.key.keyframe_idx, o.key.feature_idx))
+            .map(|o| o.key)
+        else {
+            return;
+        };
+        let octave = self.feature_data(next).map(|(_, o)| o).unwrap_or(0);
+        if let Some(mp) = self.map_points.get_mut(landmark_idx) {
+            mp.keyframe_idx = next.keyframe_idx;
+            mp.reference_octave = octave;
+        }
+    }
+
+    /// Retires a landmark. Deletion is logical: the slot stays, so every other
+    /// landmark id keeps its meaning.
+    ///
+    /// The observation records are deliberately left in place. Clearing them is
+    /// the more obviously correct thing to do — a retired landmark should not
+    /// claim observers — but it is a behavior change, not a cleanup: the
+    /// local-map keyframe vote in `tracking::local_map` reads
+    /// `observer_keyframes()` without filtering culled landmarks, so a tracked
+    /// match whose landmark was culled still votes through its stale records.
+    /// Removing those votes changes local keyframe selection and moves the
+    /// trajectory (measured: stereo MH_01_easy scale 1.008968 -> 1.007150).
+    /// That belongs in a separate, measured change together with a decision
+    /// about whether the vote should filter culled landmarks instead.
+    fn retire_landmark(&mut self, landmark_idx: usize) {
+        if let Some(mp) = self.map_points.get_mut(landmark_idx) {
+            mp.mark_culled();
+        }
+    }
+
+    fn refresh_landmark(&mut self, landmark_idx: usize) {
+        self.update_map_point_geometry(landmark_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum MapMutationError {
+    #[error("keyframe {0} is not in the map")]
+    UnknownKeyframe(usize),
+    #[error("landmark {0} is not in the map")]
+    UnknownLandmark(usize),
+    #[error("landmark {0} has been retired")]
+    RetiredLandmark(usize),
+    #[error("keyframe {keyframe_idx} has no feature {feature_idx}")]
+    InvalidFeature {
+        keyframe_idx: usize,
+        feature_idx: usize,
+    },
+    #[error("feature {feature_idx} of keyframe {keyframe_idx} already holds landmark {holder}")]
+    FeatureOccupied {
+        keyframe_idx: usize,
+        feature_idx: usize,
+        holder: usize,
+    },
+    #[error("landmark {landmark} is already observed by keyframe {keyframe_idx}")]
+    DuplicateObservation {
+        landmark: usize,
+        keyframe_idx: usize,
+    },
+    #[error("imu factor connects keyframe {0} to itself")]
+    SelfImuFactor(usize),
+    #[error("imu factor {prev} -> {curr} already exists")]
+    DuplicateImuFactor { prev: usize, curr: usize },
+    #[error("imu factor {prev} -> {curr} has invalid interval [{t0}, {t1}]")]
+    InvalidImuInterval {
+        prev: usize,
+        curr: usize,
+        t0: f64,
+        t1: f64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkVerdict {
+    New,
+    AlreadyLinked,
 }

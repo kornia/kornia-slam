@@ -47,7 +47,7 @@ pub use map_point::{
     TriangulatedPoint,
 };
 pub use ops::{
-    InitialMapHealth, KeyframeBaCorrection, LocalBaMergeResult, LocalBaSnapshot,
+    InitialMapHealth, KeyframeBaCorrection, LocalBaMergeResult, LocalBaSnapshot, MapMutationError,
     MapPointMergeResult, PoseGraphCorrectionError, PoseGraphCorrectionResult,
 };
 
