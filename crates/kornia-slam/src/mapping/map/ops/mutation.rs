@@ -499,14 +499,22 @@ impl Map {
         }
     }
 
-    /// Clears derived geometry so a retired landmark keeps nothing stale.
+    /// Retires a landmark. Deletion is logical: the slot stays, so every other
+    /// landmark id keeps its meaning.
+    ///
+    /// The observation records are deliberately left in place. Clearing them is
+    /// the more obviously correct thing to do — a retired landmark should not
+    /// claim observers — but it is a behavior change, not a cleanup: the
+    /// local-map keyframe vote in `tracking::local_map` reads
+    /// `observer_keyframes()` without filtering culled landmarks, so a tracked
+    /// match whose landmark was culled still votes through its stale records.
+    /// Removing those votes changes local keyframe selection and moves the
+    /// trajectory (measured: stereo MH_01_easy scale 1.008968 -> 1.007150).
+    /// That belongs in a separate, measured change together with a decision
+    /// about whether the vote should filter culled landmarks instead.
     fn retire_landmark(&mut self, landmark_idx: usize) {
         if let Some(mp) = self.map_points.get_mut(landmark_idx) {
-            mp.clear_observations();
             mp.mark_culled();
-            mp.mean_viewing_direction = Vec3F64::ZERO;
-            mp.min_distance = 0.0;
-            mp.max_distance = 0.0;
         }
     }
 
