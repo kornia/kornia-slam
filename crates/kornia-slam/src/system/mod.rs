@@ -8,7 +8,7 @@ mod inertial;
 
 pub use config::{LoopClosingConfig, SlamConfig};
 
-use inertial::InertialState;
+use inertial::{AppliedInitialization, InertialState, due_for_retry, viba0_accel_bias_prior};
 
 #[deprecated(since = "0.1.0", note = "use `SlamSystem`")]
 pub type SlamPipeline = SlamSystem;
@@ -677,16 +677,7 @@ impl SlamSystem {
             self.dbg(gate_msg);
         }
 
-        // Throttle retries: without this, once `ready()` is true, a rejected
-        // attempt keeps mode at ImuInit and never resets start_idx, so the
-        // exact same (growing) window gets re-solved from scratch on every
-        // single subsequent keyframe forever — an ever-more-expensive no-op
-        // once a call starts failing. Re-attempt at most once every 5s of
-        // new data (mirrors the VIBA1 5s cadence), not every keyframe.
-        const RETRY_INTERVAL_SEC: f64 = 5.0;
-        let due_for_retry = self
-            .inertial_init_last_attempt_sec
-            .is_none_or(|last| timestamp_sec - last >= RETRY_INTERVAL_SEC);
+        let due_for_retry = due_for_retry(self.inertial_init_last_attempt_sec, timestamp_sec);
         let imu_init_ready = self
             .inertial
             .initializer
@@ -697,10 +688,6 @@ impl SlamSystem {
                 return result;
             };
             self.inertial_init_last_attempt_sec = Some(timestamp_sec);
-            // VIBA0: ORB-SLAM3's first InitializeIMU call
-            // (LocalMapping.cc:183-186) — heavily-regularized, mono suppresses
-            // accel bias almost entirely (priorA=1e10) since a short/early
-            // window can't yet observe it; stereo uses priorA=1e5.
             let is_mono = !self
                 .map
                 .lock()
@@ -710,7 +697,7 @@ impl SlamSystem {
                 .find(|kf| kf.frame.idx >= start_idx)
                 .map(|kf| kf.frame.is_stereo())
                 .unwrap_or(false);
-            let prior_a0 = if is_mono { 1e10 } else { 1e5 };
+            let prior_a0 = viba0_accel_bias_prior(is_mono);
             // Drop the solve's map lock before applying its result with a new lock.
             let init_result = self.inertial.initializer.try_initialize(
                 &self.map.lock().unwrap(),
@@ -723,14 +710,9 @@ impl SlamSystem {
             );
             match init_result {
                 Some(init) => {
-                    let scale = init.scale;
-                    let gravity = init.gravity_world;
-                    let bg = init.bias.gyro;
-                    self.inertial.initializer.apply_initialization(
+                    let applied = self.inertial.apply_initialization(
                         &mut self.map.lock().unwrap(),
                         &mut self.state,
-                        &mut self.inertial.bias,
-                        &mut self.inertial.gravity_world,
                         init,
                         start_idx,
                     );
@@ -749,6 +731,11 @@ impl SlamSystem {
                         self.dbg("[local_mapping] worker is unavailable".into());
                     }
                     self.apply_local_mapping_results();
+                    let AppliedInitialization {
+                        scale,
+                        gravity_world: gravity,
+                        gyro_bias: bg,
+                    } = applied;
                     self.dbg(format!(
                         "[imu_init] VIBA0 accepted: scale={scale:.4} gravity=({:.3},{:.3},{:.3}) \
                          gyro_bias=({:.4},{:.4},{:.4})",

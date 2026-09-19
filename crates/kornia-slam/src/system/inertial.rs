@@ -4,7 +4,9 @@
 //! the estimated part — bias, gravity, the buffered samples and the
 //! initializer. The system coordinates writeback to the map and the tracker.
 
-use crate::initialization::{ImuInitConfig, ImuInitializer};
+use crate::initialization::{ImuInitConfig, ImuInitResult, ImuInitializer};
+use crate::mapping::Map;
+use crate::tracking::SystemState;
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 
@@ -69,11 +71,70 @@ impl InertialState {
     pub(super) fn prune_before(&mut self, timestamp: f64) {
         self.pending_samples.retain(|m| m.timestamp >= timestamp);
     }
+
+    /// Applies an accepted initialization to the map and the tracking state,
+    /// taking the new bias and gravity for itself, and reports what changed.
+    ///
+    /// The caller still owns what happens next — the mode transition and the
+    /// mapping-worker handoff are its decisions, not this one's.
+    pub(super) fn apply_initialization(
+        &mut self,
+        map: &mut Map,
+        state: &mut SystemState,
+        init: ImuInitResult,
+        start_kf_idx: usize,
+    ) -> AppliedInitialization {
+        let applied = AppliedInitialization {
+            scale: init.scale,
+            gravity_world: init.gravity_world,
+            gyro_bias: init.bias.gyro,
+        };
+        self.initializer.apply_initialization(
+            map,
+            state,
+            &mut self.bias,
+            &mut self.gravity_world,
+            init,
+            start_kf_idx,
+        );
+        applied
+    }
+}
+
+/// Re-attempt interval for inertial initialization, in seconds of new data.
+///
+/// Without a throttle, once `ready()` is true a rejected attempt keeps the mode
+/// at `ImuInit` and never resets the start index, so the same (growing) window
+/// is re-solved from scratch on every subsequent keyframe forever — an
+/// ever-more-expensive no-op once a call starts failing. Mirrors the VIBA1 5 s
+/// cadence.
+const RETRY_INTERVAL_SEC: f64 = 5.0;
+
+/// Whether enough new data has arrived to justify another attempt.
+pub(super) fn due_for_retry(last_attempt_sec: Option<f64>, timestamp_sec: f64) -> bool {
+    last_attempt_sec.is_none_or(|last| timestamp_sec - last >= RETRY_INTERVAL_SEC)
+}
+
+/// Accelerometer-bias prior for the first attempt.
+///
+/// VIBA0 is ORB-SLAM3's first `InitializeIMU` call (LocalMapping.cc:183-186):
+/// heavily regularized, with mono suppressing accel bias almost entirely
+/// because a short and early window cannot yet observe it.
+pub(super) fn viba0_accel_bias_prior(is_mono: bool) -> f64 {
+    if is_mono { 1e10 } else { 1e5 }
+}
+
+/// What an accepted initialization changed, for the caller to report and to
+/// hand on to the mapping worker.
+pub(super) struct AppliedInitialization {
+    pub(super) scale: f64,
+    pub(super) gravity_world: Vec3F64,
+    pub(super) gyro_bias: Vec3F64,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::InertialState;
+    use super::{InertialState, due_for_retry, viba0_accel_bias_prior};
     use kornia_algebra::Vec3F64;
     use kornia_sensors::imu::{ImuCalib, ImuMeasurement};
 
@@ -136,5 +197,31 @@ mod tests {
         assert_eq!(pre.bias.gyro, state.bias.gyro);
         assert_eq!(pre.bias.accel, state.bias.accel);
         assert_eq!(pre.calib.gyro_noise, noise().gyro_noise);
+    }
+
+    /// The first attempt is never throttled; later ones wait for 5 s of new
+    /// data. Without this, a rejected attempt re-solves an ever-growing window
+    /// on every keyframe forever.
+    #[test]
+    fn retries_are_throttled_to_five_seconds_of_new_data() {
+        assert!(due_for_retry(None, 0.0), "the first attempt is always due");
+        assert!(due_for_retry(None, 1234.5));
+
+        assert!(!due_for_retry(Some(10.0), 10.0));
+        assert!(!due_for_retry(Some(10.0), 14.999));
+        assert!(due_for_retry(Some(10.0), 15.0), "the boundary is inclusive");
+        assert!(due_for_retry(Some(10.0), 20.0));
+    }
+
+    /// Mono suppresses the accelerometer bias almost entirely at VIBA0; stereo
+    /// can observe it and regularizes far less.
+    #[test]
+    fn mono_suppresses_the_accel_bias_prior_far_harder_than_stereo() {
+        let mono = viba0_accel_bias_prior(true);
+        let stereo = viba0_accel_bias_prior(false);
+
+        assert_eq!(mono, 1e10);
+        assert_eq!(stereo, 1e5);
+        assert!(mono > stereo);
     }
 }
