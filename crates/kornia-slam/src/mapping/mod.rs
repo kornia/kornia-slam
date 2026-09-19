@@ -4,6 +4,7 @@
 //! mutation operations. Growth, culling and bundle-adjustment scheduling are
 //! mapping algorithms layered on top.
 
+pub(crate) mod growth;
 pub mod map;
 
 pub use map::{Keyframe, KeyframeJob, LocalMapping, LocalMappingMode, Map, MapPoint};
