@@ -51,7 +51,7 @@ pub fn select_local_map_points(
     let mut keyframe_votes: HashMap<usize, usize> = HashMap::new();
     for &(mp_idx, _) in tracked_matches {
         if let Some(mp) = map.map_points().get(mp_idx) {
-            for &obs_kf in &mp.observation_kf_indices {
+            for obs_kf in mp.observer_keyframes() {
                 *keyframe_votes.entry(obs_kf).or_insert(0) += 1;
             }
         }

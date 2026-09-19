@@ -3,6 +3,21 @@
 use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::hamming_distance;
 
+/// Identifies one feature slot in one keyframe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObservationKey {
+    pub keyframe_idx: usize,
+    pub feature_idx: usize,
+}
+
+/// One landmark observation: where it was seen, and the descriptor that
+/// feature contributed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandmarkObservation {
+    pub key: ObservationKey,
+    pub descriptor: [u8; 32],
+}
+
 /// ORB pyramid scale factor between adjacent levels (matches the kornia-imgproc
 /// ORB extractor default `downscale = 1.2`, which equals ORB-SLAM3's default).
 pub const ORB_SCALE_FACTOR: f64 = 1.2;
@@ -18,13 +33,10 @@ pub struct MapPoint {
     /// all observations whenever a new observation is added (mirrors
     /// ORB-SLAM3's `MapPoint::ComputeDistinctiveDescriptors`).
     pub descriptor: [u8; 32],
-    /// All descriptors of this point across observing keyframes. Parallel to
-    /// `observation_kf_indices`. Used to recompute `descriptor`.
-    pub observed_descriptors: Vec<[u8; 32]>,
-    /// Frame indices (`Keyframe::frame.idx`) of the keyframes observing this
-    /// point, parallel to `observed_descriptors`. Used to recompute the
-    /// viewing direction.
-    pub observation_kf_indices: Vec<usize>,
+    /// Where this landmark has been seen, in insertion order. One record per
+    /// link, and a keyframe appears at most once — enforced by
+    /// [`MapPoint::add_observation`] rather than left to each caller.
+    observations: Vec<LandmarkObservation>,
     /// Pyramid octave of this point's keypoint in the reference keyframe
     /// (`keyframe_idx`). Drives the scale-invariance distance bounds.
     pub reference_octave: u8,
@@ -56,12 +68,18 @@ impl MapPoint {
         octave: u8,
         color: [u8; 3],
         keyframe_idx: usize,
+        feature_idx: usize,
     ) -> Self {
         Self {
             position,
             descriptor,
-            observed_descriptors: vec![descriptor],
-            observation_kf_indices: vec![keyframe_idx],
+            observations: vec![LandmarkObservation {
+                key: ObservationKey {
+                    keyframe_idx,
+                    feature_idx,
+                },
+                descriptor,
+            }],
             reference_octave: octave,
             mean_viewing_direction: Vec3F64::ZERO,
             min_distance: 0.0,
@@ -94,25 +112,70 @@ impl MapPoint {
     /// Hamming distance to all others (ORB-SLAM3's
     /// `ComputeDistinctiveDescriptors`). With <=2 observations the choice is
     /// trivial; with >=3 we run the O(n^2) pairwise distance scan.
-    pub fn add_observation_descriptor(&mut self, kf_idx: usize, descriptor: [u8; 32]) {
-        self.observed_descriptors.push(descriptor);
-        self.observation_kf_indices.push(kf_idx);
+    /// Links this landmark to one feature slot, and reports whether the link
+    /// was new.
+    ///
+    /// A keyframe that already observes this landmark is refused. Duplicate
+    /// links inflate covisibility weights and local-map keyframe votes, both of
+    /// which count entries, so the invariant is enforced here rather than left
+    /// to each caller to remember.
+    pub fn add_observation(&mut self, key: ObservationKey, descriptor: [u8; 32]) -> bool {
+        if self.is_observed_by(key.keyframe_idx) {
+            return false;
+        }
+        self.observations
+            .push(LandmarkObservation { key, descriptor });
         self.recompute_representative_descriptor();
+        true
+    }
+
+    /// Every link, in insertion order.
+    pub fn observations(&self) -> &[LandmarkObservation] {
+        &self.observations
+    }
+
+    /// Whether `keyframe_idx` observes this landmark.
+    pub fn is_observed_by(&self, keyframe_idx: usize) -> bool {
+        self.observations
+            .iter()
+            .any(|observation| observation.key.keyframe_idx == keyframe_idx)
+    }
+
+    /// The observing keyframes, in insertion order.
+    pub fn observer_keyframes(&self) -> impl Iterator<Item = usize> + '_ {
+        self.observations
+            .iter()
+            .map(|observation| observation.key.keyframe_idx)
+    }
+
+    /// Removes the link from `keyframe_idx`, if any, and reports whether one
+    /// was removed. The representative descriptor is refreshed, so it can move
+    /// when the winning observation goes.
+    pub fn remove_observation(&mut self, keyframe_idx: usize) -> bool {
+        let before = self.observations.len();
+        self.observations
+            .retain(|observation| observation.key.keyframe_idx != keyframe_idx);
+        let removed = self.observations.len() != before;
+        if removed {
+            self.recompute_representative_descriptor();
+        }
+        removed
     }
 
     fn recompute_representative_descriptor(&mut self) {
-        let n = self.observed_descriptors.len();
+        let n = self.observations.len();
         match n {
             0 => {}
-            1 => self.descriptor = self.observed_descriptors[0],
-            2 => self.descriptor = self.observed_descriptors[0],
+            1 => self.descriptor = self.observations[0].descriptor,
+            2 => self.descriptor = self.observations[0].descriptor,
             _ => {
                 let mut dist_buf = vec![0u32; n];
                 let mut best_idx = 0usize;
                 let mut best_median = u32::MAX;
                 for i in 0..n {
-                    for (slot, other) in dist_buf.iter_mut().zip(self.observed_descriptors.iter()) {
-                        *slot = hamming_distance(&self.observed_descriptors[i], other);
+                    for (slot, other) in dist_buf.iter_mut().zip(self.observations.iter()) {
+                        *slot =
+                            hamming_distance(&self.observations[i].descriptor, &other.descriptor);
                     }
                     let mid = n / 2;
                     dist_buf.select_nth_unstable(mid);
@@ -122,7 +185,7 @@ impl MapPoint {
                         best_idx = i;
                     }
                 }
-                self.descriptor = self.observed_descriptors[best_idx];
+                self.descriptor = self.observations[best_idx].descriptor;
             }
         }
     }
@@ -156,3 +219,98 @@ impl MapPoint {
 
 /// A triangulated point ready for map insertion: (position, descriptor, color, prev_desc_idx, curr_desc_idx).
 pub type TriangulatedPoint = (Vec3F64, [u8; 32], [u8; 3], usize, usize);
+
+#[cfg(test)]
+mod tests {
+    use super::{MapPoint, ObservationKey};
+    use kornia_algebra::Vec3F64;
+
+    fn landmark() -> MapPoint {
+        MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0, [0; 3], 0, 0)
+    }
+
+    fn key(keyframe_idx: usize, feature_idx: usize) -> ObservationKey {
+        ObservationKey {
+            keyframe_idx,
+            feature_idx,
+        }
+    }
+
+    /// A keyframe already observing the landmark is refused, whatever feature
+    /// slot it offers. Duplicate links inflate covisibility weights and
+    /// local-map votes, both of which count entries.
+    #[test]
+    fn a_keyframe_cannot_observe_the_same_landmark_twice() {
+        let mut mp = landmark();
+        assert_eq!(mp.observations().len(), 1, "the reference observation");
+
+        assert!(!mp.add_observation(key(0, 7), [1u8; 32]), "same keyframe");
+        assert_eq!(mp.observations().len(), 1);
+
+        assert!(
+            mp.add_observation(key(1, 7), [1u8; 32]),
+            "different keyframe"
+        );
+        assert_eq!(mp.observations().len(), 2);
+    }
+
+    /// Insertion order is preserved, which the representative-descriptor
+    /// tie-break depends on.
+    #[test]
+    fn observations_keep_insertion_order() {
+        let mut mp = landmark();
+        mp.add_observation(key(5, 1), [5u8; 32]);
+        mp.add_observation(key(3, 2), [3u8; 32]);
+
+        assert_eq!(
+            mp.observer_keyframes().collect::<Vec<_>>(),
+            vec![0, 5, 3],
+            "not sorted — insertion order"
+        );
+    }
+
+    /// Each record carries the feature that produced its descriptor, so a
+    /// descriptor can be traced back to the keypoint it came from.
+    #[test]
+    fn each_observation_names_the_feature_that_produced_it() {
+        let mut mp = landmark();
+        mp.add_observation(key(4, 11), [7u8; 32]);
+
+        let observation = mp
+            .observations()
+            .iter()
+            .find(|o| o.key.keyframe_idx == 4)
+            .expect("the link was added");
+        assert_eq!(observation.key.feature_idx, 11);
+        assert_eq!(observation.descriptor, [7u8; 32]);
+    }
+
+    /// Removing the winning observation must move the representative, not leave
+    /// a descriptor no observation supports.
+    #[test]
+    fn the_representative_moves_when_its_observation_is_removed() {
+        let mut mp = landmark();
+        mp.add_observation(key(1, 0), [0xFFu8; 32]);
+        mp.add_observation(key(2, 0), [0xFFu8; 32]);
+        assert_eq!(mp.descriptor, [0xFFu8; 32], "the majority descriptor wins");
+
+        assert!(mp.remove_observation(1));
+        assert!(mp.remove_observation(2));
+
+        assert_eq!(mp.descriptor, [0u8; 32], "only the reference remains");
+        assert!(
+            !mp.remove_observation(99),
+            "removing an absent link is a no-op"
+        );
+    }
+
+    #[test]
+    fn is_observed_by_reports_membership() {
+        let mut mp = landmark();
+        mp.add_observation(key(9, 3), [1u8; 32]);
+
+        assert!(mp.is_observed_by(0));
+        assert!(mp.is_observed_by(9));
+        assert!(!mp.is_observed_by(4));
+    }
+}

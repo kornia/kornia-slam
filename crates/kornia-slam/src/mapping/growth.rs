@@ -309,7 +309,7 @@ pub(crate) fn fuse_into_neighbors(
                     _ => continue,
                 };
                 // Skip if neighbor already observes this map point.
-                if mp.observation_kf_indices.contains(&nb_kf_idx) {
+                if mp.is_observed_by(nb_kf_idx) {
                     continue;
                 }
 
