@@ -12,4 +12,4 @@ pub use correction::{
     KeyframeBaCorrection, LocalBaMergeResult, LocalBaSnapshot, PoseGraphCorrectionError,
     PoseGraphCorrectionResult,
 };
-pub use mutation::MapPointMergeResult;
+pub use mutation::{MapMutationError, MapPointMergeResult};

@@ -134,6 +134,11 @@ impl MapPoint {
         &self.observations
     }
 
+    /// Drops every link. Used when retiring a landmark.
+    pub fn clear_observations(&mut self) {
+        self.observations.clear();
+    }
+
     /// Whether `keyframe_idx` observes this landmark.
     pub fn is_observed_by(&self, keyframe_idx: usize) -> bool {
         self.observations
