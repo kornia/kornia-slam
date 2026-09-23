@@ -12,13 +12,15 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 
+use crate::loop_closure::place_recognition::{
+    Candidate, KeyFrameDatabase, Vocabulary, compute_bow,
+};
 use crate::loop_closure::{
     InertialPgoContext, LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker,
     LoopFusionConfig, LoopVerificationConfig, PgoConfig, VerifiedLoopEdge, fuse_verified_loop,
     optimize_pose_graph, verify_loop_candidate,
 };
 use crate::mapping::Map;
-use crate::place_recognition::{Candidate, KeyFrameDatabase, Vocabulary, compute_bow};
 use crate::pose_conversion::apply_reference_pose_correction;
 
 #[derive(Debug, Clone, Default)]
@@ -392,8 +394,8 @@ mod tests {
         LoopAcceptance, LoopClosingContext, pose_graph_reference_correction,
         pose_graph_tracking_correction,
     };
+    use crate::loop_closure::place_recognition::Candidate;
     use crate::mapping::Map;
-    use crate::place_recognition::Candidate;
     use crate::pose_conversion::apply_reference_pose_correction;
     use kornia_3d::camera::PinholeCamera;
     use kornia_3d::pose::Pose3d;

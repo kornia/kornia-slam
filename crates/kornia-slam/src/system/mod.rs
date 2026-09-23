@@ -26,13 +26,13 @@ use crate::initialization::bootstrap::{
     BootstrapDecision, MIN_KEYPOINTS_FOR_BOOTSTRAP, evaluate_bootstrap,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
+use crate::loop_closure::place_recognition::Vocabulary;
 use crate::loop_closure::{LoopCloser, LoopClosingContext, LoopClosureEvent};
 use crate::mapping::map::{
     ImuFactor, Keyframe, LandmarkSeed, LandmarkTarget, Map, MapInsertion, MapMutationError,
     MapPoint, ObservationKey, ObservationLink,
 };
 use crate::mapping::{KeyframeJob, LocalMapping};
-use crate::place_recognition::Vocabulary;
 use crate::pose_conversion::apply_reference_pose_correction;
 use crate::sensor_rig::{ImuCalibration, SensorRig};
 use crate::stereo::unproject_stereo;
