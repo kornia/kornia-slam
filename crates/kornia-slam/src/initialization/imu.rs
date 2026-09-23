@@ -5,7 +5,7 @@ use kornia_algebra::{Mat3F64, QuatF64, SO3F64, Vec3F64};
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias};
 
 use crate::initialization::inertial_factor::{InertialInitFactor, KfConst, WeightedZeroPrior};
-use crate::map::{Keyframe, Map};
+use crate::map::{Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR};
 use crate::tracking::SystemState;
 use kornia_algebra::optim::{LevenbergMarquardt, Problem, Variable, VariableType};
 // ─────────────────────────────────────────────────────────────────────────────
@@ -503,6 +503,14 @@ impl ImuInitializer {
                 kf.velocity_world = rwg * v;
                 kf.imu_bias = init.bias;
             }
+        }
+
+        // Every camera centre moved, so each landmark's distance bounds and
+        // viewing direction are stale: without this they stay at the pre-metric
+        // scale, and matching gates on the wrong range. Refreshed once, after
+        // the whole alignment, never between the scale and the rotation.
+        for mp_idx in 0..map.num_map_points() {
+            map.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
         }
 
         // 4. Update the tracker state from the last initialized keyframe.
