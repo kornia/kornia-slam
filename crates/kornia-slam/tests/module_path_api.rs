@@ -93,3 +93,19 @@ fn map_module_path_resolves_under_both_spellings() {
     let _mode = kornia_slam::map::LocalMappingMode::Asynchronous;
     let _health = kornia_slam::initialization::InitialMapHealth::default();
 }
+
+#[test]
+fn inertial_initialization_resolves_under_both_paths() {
+    // Now grouped under `initialization::inertial`; the flat paths stay.
+    let config = kornia_slam::initialization::inertial::ImuInitConfig {
+        min_keyframes: 10,
+        min_time_sec: 1.0,
+        min_motion: 0.1,
+    };
+    let _old: kornia_slam::initialization::imu::ImuInitializer =
+        kornia_slam::initialization::inertial::ImuInitializer::new(config);
+    let _new_factor =
+        std::marker::PhantomData::<kornia_slam::initialization::inertial::factor::KfConst>;
+    let _old_factor =
+        std::marker::PhantomData::<kornia_slam::initialization::inertial_factor::KfConst>;
+}
