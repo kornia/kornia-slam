@@ -27,6 +27,7 @@ use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_point
 use crate::tracking::motion::{InertialPrediction, predict_pose};
 use crate::tracking::tracker::{FrameInput, Tracker};
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::Frame;
@@ -588,6 +589,21 @@ impl SlamSystem {
             let p_world = reference_pose_inv.transform_point(&(*p_cam / depth_scale));
             triangulated.push((p_world, descriptor, color, ref_desc_idx, curr_desc_idx));
         }
+
+        // The two-view result can name one feature twice — two triangulated
+        // points landing on the same keypoint in either view. A feature holds
+        // one landmark, so the first claim wins, as in pair growth; a refused
+        // point reserves neither feature.
+        let mut claimed_ref: HashSet<usize> = HashSet::new();
+        let mut claimed_curr: HashSet<usize> = HashSet::new();
+        triangulated.retain(|&(_, _, _, ref_desc_idx, curr_desc_idx)| {
+            if claimed_ref.contains(&ref_desc_idx) || claimed_curr.contains(&curr_desc_idx) {
+                return false;
+            }
+            claimed_ref.insert(ref_desc_idx);
+            claimed_curr.insert(curr_desc_idx);
+            true
+        });
 
         let added = self.map.lock().unwrap().add_triangulated_points(
             Some(&mut reference_kf),
