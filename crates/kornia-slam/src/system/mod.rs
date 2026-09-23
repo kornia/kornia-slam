@@ -5,15 +5,14 @@
 
 mod config;
 mod inertial;
+mod state;
 
 pub use config::SlamConfig;
+pub use state::{SystemMode, SystemState, TrackingResult, TrackingStatus};
 
 use inertial::{AppliedInitialization, InertialState, viba0_accel_bias_prior};
 
-use crate::tracking::{
-    KeyframePolicy, SystemMode, SystemState, TrackingLossRecoveryPolicy, TrackingResult,
-    TrackingStatus,
-};
+use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 use crate::tracking::motion::{InertialPrediction, predict_pose};
@@ -988,14 +987,16 @@ impl SlamSystem {
             Some(init) => {
                 let scale = init.scale;
                 let bg = init.bias.gyro;
-                self.inertial.initializer.apply_initialization(
+                let aligned = self.inertial.initializer.apply_initialization(
                     &mut self.map.lock().unwrap(),
-                    &mut self.state,
                     &mut self.inertial.bias,
                     &mut self.inertial.gravity_world,
                     init,
                     start_idx,
                 );
+                if let Ok(aligned) = aligned {
+                    self.state.adopt_inertial_initialization(aligned);
+                }
                 self.dbg(format!(
                     "[imu_init] {stage} accepted: scale_correction={scale:.4} gyro_bias=({:.4},{:.4},{:.4})",
                     bg.x, bg.y, bg.z

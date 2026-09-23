@@ -4,10 +4,10 @@
 //! the estimated part — bias, gravity, the buffered samples and the
 //! initializer. The system coordinates writeback to the map and the tracker.
 
+use super::state::SystemState;
 use crate::initialization::{ImuInitConfig, ImuInitResult, ImuInitializer};
 use crate::mapping::Map;
 use crate::mapping::map::ImuFactor;
-use crate::tracking::SystemState;
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 
@@ -113,14 +113,15 @@ impl InertialState {
             gravity_world: init.gravity_world,
             gyro_bias: init.bias.gyro,
         };
-        self.initializer.apply_initialization(
+        if let Ok(aligned) = self.initializer.apply_initialization(
             map,
-            state,
             &mut self.bias,
             &mut self.gravity_world,
             init,
             start_kf_idx,
-        );
+        ) {
+            state.adopt_inertial_initialization(aligned);
+        }
         applied
     }
 }

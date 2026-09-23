@@ -14,6 +14,5 @@ pub use frame::Frame;
 pub use kornia_imgproc::features::OrbFeatures;
 pub use loop_closure::{LoopClosingConfig, LoopClosureEvent};
 pub use sensor_rig::{ImuCalibration, SensorRig};
-pub use system::{SlamConfig, SlamSystem};
-pub use tracking::MapProjectionEstimator;
-pub use tracking::{KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus};
+pub use system::{SlamConfig, SlamSystem, SystemMode, SystemState, TrackingResult, TrackingStatus};
+pub use tracking::{KeyframePolicy, MapProjectionEstimator};
