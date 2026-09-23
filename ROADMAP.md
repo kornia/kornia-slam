@@ -16,6 +16,13 @@ This roadmap will keep evolving. It sets a direction, not a commitment.
 - [ ] Pluggable feature frontend for non-ORB and learned features
 - [ ] Split `SlamSystem` into tracking, mapping, inertial, and loop-closing subsystems
 
+## Tooling and integrations
+
+- [ ] Pixi environment and tasks for reproducible cross-platform builds
+      ([#77](https://github.com/kornia/kornia-slam/issues/77), [#79](https://github.com/kornia/kornia-slam/pull/79))
+- [ ] ROS 2 integration via [ros2_rust](https://github.com/ros2-rust/ros2_rust)
+      ([#75](https://github.com/kornia/kornia-slam/issues/75))
+
 ## Experimental — sensors, maps, agents
 
 - [ ] RGB-D, LiDAR and GNSS estimators, estimator fusion in odometry
