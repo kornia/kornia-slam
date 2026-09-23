@@ -7,7 +7,32 @@
 
 use std::collections::{HashMap, HashSet};
 
+use kornia_3d::camera::PinholeCamera;
+use kornia_3d::pose::Pose3d;
+use kornia_image::ImageSize;
+
 use crate::mapping::{Keyframe, Map};
+
+/// Applies a consumer's minimum-weight policy to raw covisibility.
+///
+/// Mirrors ORB-SLAM3's `KeyFrame::UpdateConnections`: links below `min_weight`
+/// are dropped, but if none reach it the single strongest link is kept so an
+/// under-connected keyframe is never orphaned. This fallback runs before any
+/// neighbour limit a caller applies afterwards.
+pub(crate) fn covisible_above_weight(
+    connections: Vec<(usize, usize)>,
+    min_weight: usize,
+) -> Vec<(usize, usize)> {
+    let strongest = connections.first().copied();
+    let mut kept: Vec<(usize, usize)> = connections
+        .into_iter()
+        .filter(|&(_, w)| w >= min_weight)
+        .collect();
+    if kept.is_empty() {
+        kept.extend(strongest);
+    }
+    kept
+}
 
 /// Bounds on the local-map search. The defaults are the values this system has
 /// been running, lifted out of the function body unchanged.
@@ -69,10 +94,12 @@ pub fn select_local_map_points(
     if let Some(kf) = current_keyframe {
         local_kf_indices.insert(kf.frame.idx);
         if voted_kfs.is_empty() {
-            for (nb_idx, _) in map
-                .covisible_keyframes(kf.frame.idx, config.min_covis_weight)
-                .into_iter()
-                .take(config.max_covis_neighbors)
+            for (nb_idx, _) in covisible_above_weight(
+                map.covisible_keyframes(kf.frame.idx),
+                config.min_covis_weight,
+            )
+            .into_iter()
+            .take(config.max_covis_neighbors)
             {
                 local_kf_indices.insert(nb_idx);
             }
@@ -113,4 +140,31 @@ pub fn select_local_map_points(
     }
 
     global_indices
+}
+
+/// The subset of `candidates` that are active and project inside the image.
+///
+/// A projection test only: it says nothing about occlusion, descriptor
+/// distance, or the scale and viewing-angle gates the matcher applies later.
+pub fn landmarks_in_frustum(
+    map: &Map,
+    candidates: &[usize],
+    camera: &PinholeCamera,
+    pose_world_to_cam: &Pose3d,
+    image_size: ImageSize,
+) -> HashSet<usize> {
+    let mut visible = HashSet::new();
+    for &mp_idx in candidates {
+        let Some(mp) = map.map_points().get(mp_idx) else {
+            continue;
+        };
+        if mp.culled {
+            continue;
+        }
+        let p_cam = pose_world_to_cam.transform_point(&mp.position);
+        if camera.project_to_image(&p_cam, 0.0, image_size).is_ok() {
+            visible.insert(mp_idx);
+        }
+    }
+    visible
 }

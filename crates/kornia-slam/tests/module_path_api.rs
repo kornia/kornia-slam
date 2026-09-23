@@ -91,5 +91,5 @@ fn map_module_path_resolves_under_both_spellings() {
     // Owned by `mapping`, still reachable at its original crate-root path.
     let _map: kornia_slam::map::Map = kornia_slam::mapping::Map::default();
     let _mode = kornia_slam::map::LocalMappingMode::Asynchronous;
-    let _health = kornia_slam::mapping::map::InitialMapHealth::default();
+    let _health = kornia_slam::initialization::InitialMapHealth::default();
 }

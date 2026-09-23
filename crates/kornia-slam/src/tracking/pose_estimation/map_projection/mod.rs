@@ -797,7 +797,6 @@ mod matching_tests {
             0,
             [0; 3],
             0,
-            0,
         )];
 
         let keypoints_xy = vec![[320.0f32, 240.0], [100.0, 100.0]];
@@ -842,7 +841,6 @@ mod matching_tests {
             0,
             [0; 3],
             0,
-            0,
         )];
 
         let keypoints_xy = vec![[320.0f32, 240.0]];
@@ -883,7 +881,6 @@ mod matching_tests {
             [0u8; 32],
             0,
             [0; 3],
-            0,
             0,
         )];
 
