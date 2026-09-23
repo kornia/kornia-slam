@@ -4,6 +4,9 @@ This roadmap will keep evolving. It sets a direction, not a commitment.
 
 ## Next — complete the SLAM stack
 
+- [ ] GPU acceleration of the per-frame hot paths (feature extraction, matching, KLT
+      tracking) via [CubeCL](https://github.com/tracel-ai/cubecl), starting with the KLT
+      frontend from Rerun's [slam-rs](https://github.com/rerun-io/examples-monorepo/tree/main/packages/slam-rs)
 - [ ] Relocalization on tracking loss
 - [ ] Metric scale for monocular maps: Sim3 loop closure, and AprilTag anchoring
       ([#72](https://github.com/kornia/kornia-slam/pull/72))
@@ -14,8 +17,10 @@ This roadmap will keep evolving. It sets a direction, not a commitment.
 ## Library structure
 
 - [ ] Pluggable feature frontend for non-ORB and learned features
-- [ ] GPU KLT frontend (CubeCL) and multi-camera rigs (2+ cameras), ported from Rerun's
+- [ ] Multi-camera rigs (2+ cameras), ported from Rerun's
       [slam-rs](https://github.com/rerun-io/examples-monorepo/tree/main/packages/slam-rs)
+- [ ] Explore an Atlas: multiple maps per session that are created on tracking loss and
+      merged when places are recognized again (as in ORB-SLAM3)
 - [ ] Split `SlamSystem` into tracking, mapping, inertial, and loop-closing subsystems
 
 ## Tooling and integrations
