@@ -5,14 +5,13 @@ This roadmap will keep evolving. It sets a direction, not a commitment.
 ## Next — complete the SLAM stack
 
 - [ ] GPU acceleration of the per-frame hot paths (feature extraction, matching, KLT
-      tracking) via [CubeCL](https://github.com/tracel-ai/cubecl), starting with the KLT
-      frontend from Rerun's [slam-rs](https://github.com/rerun-io/examples-monorepo/tree/main/packages/slam-rs)
+      tracking), starting with the KLT frontend from Rerun's
+      [slam-rs](https://github.com/rerun-io/examples-monorepo/tree/main/packages/slam-rs)
 - [ ] Relocalization on tracking loss, robust to appearance change (day/night, lighting) —
       measure the degradation first ([#68](https://github.com/kornia/kornia-slam/issues/68))
 - [ ] Metric scale for monocular maps: Sim3 loop closure, and AprilTag anchoring
       ([#71](https://github.com/kornia/kornia-slam/issues/71), [#72](https://github.com/kornia/kornia-slam/pull/72))
 - [ ] Match ORB-SLAM3 on trajectory accuracy and tracking robustness
-- [ ] Submit to the [LaMAria](https://www.lamaria.ethz.ch/leaderboard) SLAM leaderboard ([#78](https://github.com/kornia/kornia-slam/issues/78))
 - [ ] Upstream general-purpose code (solvers, camera models, image ops) to
       [kornia-rs](https://github.com/kornia/kornia-rs)
 
@@ -31,7 +30,6 @@ This roadmap will keep evolving. It sets a direction, not a commitment.
 
 - [ ] Pixi environment and tasks for reproducible cross-platform builds
       ([#77](https://github.com/kornia/kornia-slam/issues/77), [#79](https://github.com/kornia/kornia-slam/pull/79))
-- [ ] Luxonis OAK-D stereo-inertial support ([#70](https://github.com/kornia/kornia-slam/issues/70))
 - [ ] ROS 2 integration via [ros2_rust](https://github.com/ros2-rust/ros2_rust)
       ([#75](https://github.com/kornia/kornia-slam/issues/75))
 
