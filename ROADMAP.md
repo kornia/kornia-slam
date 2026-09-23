@@ -5,9 +5,9 @@ Direction, not commitment. Items move as the project evolves.
 ## Next — complete the SLAM stack
 
 - [ ] Relocalization on tracking loss
-- [ ] Sim3 loop closure and scale correction for non-metric monocular maps
-- [ ] Redundant keyframe culling
-- [ ] Robust visual-inertial initialization and scale stability
+- [ ] Metric scale for monocular maps: Sim3 loop closure, and AprilTag anchoring
+      ([#72](https://github.com/kornia/kornia-slam/pull/72))
+- [ ] Match ORB-SLAM3 on trajectory accuracy and tracking robustness
 
 ## Structure — turn the pipeline into a library API
 
@@ -25,7 +25,6 @@ Direction, not commitment. Items move as the project evolves.
 
 - [ ] Profiles — one app binary with `--profile`, where a profile is earned by a
       composition-root recipe, a CI-gated dataset metric, and a stated compute budget
-- [ ] Match a strong ORB-SLAM baseline on trajectory quality and tracking robustness
 - [ ] Evaluation across datasets (EuRoC, TUM-VI, Hilti) and challenging scenarios
 
 ## Later — sensors, maps, agents
