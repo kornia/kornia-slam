@@ -8,7 +8,7 @@ mod inertial;
 
 pub use config::SlamConfig;
 
-use inertial::{AppliedInitialization, InertialState, due_for_retry, viba0_accel_bias_prior};
+use inertial::{AppliedInitialization, InertialState, viba0_accel_bias_prior};
 
 use crate::tracking::{
     KeyframePolicy, SystemMode, SystemState, TrackingLossRecoveryPolicy, TrackingResult,
@@ -30,8 +30,8 @@ use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::place_recognition::Vocabulary;
 use crate::loop_closure::{LoopCloser, LoopClosingContext, LoopClosureEvent};
 use crate::mapping::map::{
-    ImuFactor, Keyframe, LandmarkTarget, Map, MapInsertion, MapMutationError, MapPoint,
-    ObservationKey, ObservationLink,
+    Keyframe, LandmarkTarget, Map, MapInsertion, MapMutationError, MapPoint, ObservationKey,
+    ObservationLink,
 };
 use crate::mapping::{KeyframeJob, LocalMapping};
 use crate::pose_conversion::apply_reference_pose_correction;
@@ -39,7 +39,7 @@ use crate::sensor_rig::{ImuCalibration, SensorRig};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
-use kornia_sensors::imu::{ImuMeasurement, PreintegratedImu};
+use kornia_sensors::imu::ImuMeasurement;
 
 /// Top-level ORB-SLAM system: orchestrates tracking, mapping, and state transitions.
 pub struct SlamSystem {
@@ -64,28 +64,8 @@ pub struct SlamSystem {
     map: Arc<Mutex<Map>>,
     // Serializes compound map publication and short local-BA snapshot/merge phases.
     map_publication_gate: Option<Arc<Mutex<()>>>,
-    // IMU states
+    // IMU estimates, sample buffer and the inertial-initialization schedule
     inertial: InertialState,
-    // Camera-to-body extrinsic T_BC (X_body = T_BC * X_cam). IMU deltas live in
-    // the body frame, so every place that mixes them with camera poses must go
-    inertial_init_start_kf_idx: Option<usize>,
-    // Timestamp of the last try_initialize attempt (successful or not), so
-    // retries are throttled to a fixed cadence instead of firing on every
-    // single keyframe forever once `ready()` is true — with an ever-growing
-    // window (start_idx never resets) and a solve that scales with window
-    // size, unthrottled per-keyframe retries turn into an ever-more-expensive
-    // no-op once a call starts getting rejected.
-    inertial_init_last_attempt_sec: Option<f64>,
-    // Timestamp the current inertial-init window started (first keyframe at
-    // or after `inertial_init_start_kf_idx`). Mirrors ORB-SLAM3's `mFirstTs`
-    // / `mTinit` — used to gate the VIBA1/VIBA2 progressive visual-inertial
-    // BA refinement passes (mTinit>5s / mTinit>15s respectively, after the
-    // initial VIBA0 solve) at LocalMapping.cc:200-228.
-    imu_init_window_start_sec: Option<f64>,
-    // VIBA1/VIBA2 fire at most once each, mirroring
-    // Map::GetIniertialBA1()/GetIniertialBA2() latching in ORB-SLAM3.
-    imu_viba1_done: bool,
-    imu_viba2_done: bool,
     local_mapping: LocalMapping,
     // Place recognition for every keyframe, and loop closing when configured.
     loop_closer: LoopCloser,
@@ -123,11 +103,6 @@ impl SlamSystem {
             local_mapping,
             state: SystemState::new(),
             inertial: InertialState::new(),
-            inertial_init_start_kf_idx: None,
-            inertial_init_last_attempt_sec: None,
-            imu_init_window_start_sec: None,
-            imu_viba1_done: false,
-            imu_viba2_done: false,
             loop_closer,
             loop_closure_events: Vec::new(),
         }
@@ -413,19 +388,17 @@ impl SlamSystem {
         }
 
         if let Some(prev_ts) = self.inertial.bootstrap_timestamp_sec {
-            let (preint, raw_samples) = self.preintegrate_window(prev_ts, timestamp_sec);
-            if preint.dt > 0.0 {
+            if let Some(edge) = self.inertial.keyframe_edge(
+                self.rig.imu_noise(),
+                prev_idx,
+                curr_idx,
+                prev_ts,
+                timestamp_sec,
+            ) {
                 // Through the validated path: endpoints must exist, the edge
                 // must be new, and the interval finite and ordered.
                 let published = self.map.lock().unwrap().apply_insertion(MapInsertion {
-                    imu_factors: vec![ImuFactor {
-                        prev_kf_idx: prev_idx,
-                        curr_kf_idx: curr_idx,
-                        preintegrated: preint,
-                        raw_samples,
-                        t0: prev_ts,
-                        t1: timestamp_sec,
-                    }],
+                    imu_factors: vec![edge],
                     ..Default::default()
                 });
                 if let Err(error) = published {
@@ -473,10 +446,7 @@ impl SlamSystem {
         self.state.current_keyframe_idx = Some(kf_idx);
         self.state.last_keyframe_idx = Some(kf_idx);
         self.state.mode = if self.rig.camera_to_body().is_some() {
-            self.inertial_init_start_kf_idx = Some(kf_idx);
-            self.imu_init_window_start_sec = Some(timestamp_sec);
-            self.imu_viba1_done = false;
-            self.imu_viba2_done = false;
+            self.inertial.schedule.start(kf_idx, timestamp_sec);
             SystemMode::ImuInit
         } else {
             SystemMode::Tracking
@@ -491,28 +461,14 @@ impl SlamSystem {
         }
     }
 
-    /// Preintegrates buffered IMU samples over `[t0, t1]` without consuming
-    /// them: the same samples serve both per-frame pose prediction and the
-    /// keyframe-to-keyframe edges. [`Self::prune_imu_before`] discards samples
-    /// once no future window can need them.
-    /// Preintegrates over `[t0, t1]` and also returns the raw samples used,
-    /// so the caller can hand them to `Map::add_imu_factor` for later
-    /// repropagation (see `PreintegratedImu::from_measurements` doc) — once
-    /// this returns, `prune_imu_before` is free to drop them from the buffer,
-    /// since the edge now carries its own copy.
-    fn preintegrate_window(&self, t0: f64, t1: f64) -> (PreintegratedImu, Vec<ImuMeasurement>) {
-        self.inertial
-            .preintegrate_window(self.rig.imu_noise(), t0, t1)
-    }
-
     /// Drops buffered IMU samples strictly older than `t` (typically the last
     /// keyframe timestamp: the next edge and all per-frame windows start there).
     fn prune_imu_before(&mut self, t: f64) {
         self.inertial.prune_before(t);
     }
 
-    /// Body-to-world pose `T_WB` for a world-to-camera pose, via
-    /// `T_WB = T_WC ∘ T_CB`. Treats camera == body when no extrinsic is set.
+    /// Tracks the frame, then attempts VIBA0 on accepted keyframes once the
+    /// window is ready and a retry is due.
     fn inertial_init_step(
         &mut self,
         frame: Frame,
@@ -523,7 +479,7 @@ impl SlamSystem {
         let result = self.tracking_step(frame, previous_image, current_image, timestamp_sec);
 
         if result.status == TrackingStatus::KeyframeAccepted
-            && let Some(start_idx) = self.inertial_init_start_kf_idx
+            && let Some(start_idx) = self.inertial.schedule.start_kf_idx()
         {
             // Snapshot the fields needed after releasing the map lock.
             let kfs: Vec<usize> = self
@@ -556,17 +512,17 @@ impl SlamSystem {
             self.dbg(gate_msg);
         }
 
-        let due_for_retry = due_for_retry(self.inertial_init_last_attempt_sec, timestamp_sec);
-        let imu_init_ready = self
-            .inertial
-            .initializer
-            .ready(&self.map.lock().unwrap(), self.inertial_init_start_kf_idx);
+        let due_for_retry = self.inertial.schedule.retry_due(timestamp_sec);
+        let imu_init_ready = self.inertial.initializer.ready(
+            &self.map.lock().unwrap(),
+            self.inertial.schedule.start_kf_idx(),
+        );
 
         if result.status == TrackingStatus::KeyframeAccepted && due_for_retry && imu_init_ready {
-            let Some(start_idx) = self.inertial_init_start_kf_idx else {
+            let Some(start_idx) = self.inertial.schedule.start_kf_idx() else {
                 return result;
             };
-            self.inertial_init_last_attempt_sec = Some(timestamp_sec);
+            self.inertial.schedule.record_attempt(timestamp_sec);
             let is_mono = !self
                 .map
                 .lock()
@@ -651,8 +607,11 @@ impl SlamSystem {
 
         // Preintegration is prepared here: the system owns bias and the sample
         // buffer. The motion model chooses between it and the visual model.
-        let preintegrated = (self.state.imu_initialized && prev_timestamp > 0.0)
-            .then(|| self.preintegrate_window(prev_timestamp, timestamp_sec).0);
+        let preintegrated = (self.state.imu_initialized && prev_timestamp > 0.0).then(|| {
+            self.inertial
+                .preintegrate_window(self.rig.imu_noise(), prev_timestamp, timestamp_sec)
+                .0
+        });
         let (candidate_pose, predicted_velocity) = predict_pose(
             pose_before,
             self.state.velocity,
@@ -918,17 +877,13 @@ impl SlamSystem {
             self.state.last_keyframe_idx,
             self.inertial.last_keyframe_timestamp_sec,
         ) {
-            let (preint, raw_samples) = self.preintegrate_window(prev_ts, timestamp_sec);
-            if preint.dt > 0.0 {
-                core.imu_factors.push(ImuFactor {
-                    prev_kf_idx,
-                    curr_kf_idx: frame.idx,
-                    preintegrated: preint,
-                    raw_samples,
-                    t0: prev_ts,
-                    t1: timestamp_sec,
-                });
-            }
+            core.imu_factors.extend(self.inertial.keyframe_edge(
+                self.rig.imu_noise(),
+                prev_kf_idx,
+                frame.idx,
+                prev_ts,
+                timestamp_sec,
+            ));
         }
 
         let published = self.map.lock().unwrap().apply_insertion(core);
@@ -1006,35 +961,18 @@ impl SlamSystem {
         true
     }
 
-    /// Kept at VIBA2 because this pipeline lacks the intervening pose-adjusting
-    /// inertial BA that lets ORB-SLAM3 safely remove the prior (kornia-slam#51).
-    const VIBA_PRIOR_A: f64 = 1e5;
-
-    /// VIBA1 (mTinit>5s) / VIBA2 (mTinit>15s): progressive re-solves with
-    /// relaxed priors over the same (now-growing) window that VIBA0 used,
-    /// mirroring LocalMapping.cc:200-228. Each fires at most once and refines
-    /// bg/ba/scale/gravity further — tracking is already running on VIBA0's
-    /// result by the time these get a chance to fire, so a rejection here
-    /// just means "try again never" for that stage, not a tracking failure.
+    /// VIBA1/VIBA2: progressive re-solves with relaxed priors over the same
+    /// (now-growing) window VIBA0 used, mirroring LocalMapping.cc:200-228.
+    /// Tracking already runs on VIBA0's result, so a rejection here only means
+    /// that stage never runs, not a tracking failure.
     fn refine_inertial_init(&mut self, timestamp_sec: f64) {
-        let (Some(start_idx), Some(window_start_sec)) = (
-            self.inertial_init_start_kf_idx,
-            self.imu_init_window_start_sec,
+        let (Some(start_idx), Some(refinement)) = (
+            self.inertial.schedule.start_kf_idx(),
+            self.inertial.schedule.due_refinement(timestamp_sec),
         ) else {
             return;
         };
-        let mtinit = timestamp_sec - window_start_sec;
-        if mtinit >= 50.0 {
-            return;
-        }
-
-        let (prior_g, prior_a, stage) = if !self.imu_viba1_done && mtinit > 5.0 {
-            (1.0, Self::VIBA_PRIOR_A, "VIBA1")
-        } else if self.imu_viba1_done && !self.imu_viba2_done && mtinit > 15.0 {
-            (0.0, Self::VIBA_PRIOR_A, "VIBA2")
-        } else {
-            return;
-        };
+        let stage = refinement.name();
 
         // Drop the solve's map lock before applying its result with a new lock.
         let init_result = self.inertial.initializer.try_initialize(
@@ -1042,8 +980,8 @@ impl SlamSystem {
             self.rig.camera_to_body(),
             self.inertial.bias,
             start_idx,
-            prior_g,
-            prior_a,
+            refinement.prior_g(),
+            refinement.prior_a(),
             true,
         );
         match init_result {
@@ -1070,11 +1008,7 @@ impl SlamSystem {
             }
         }
 
-        if stage == "VIBA1" {
-            self.imu_viba1_done = true;
-        } else {
-            self.imu_viba2_done = true;
-        }
+        self.inertial.schedule.complete(refinement);
     }
 
     /// Offers a freshly inserted keyframe to place recognition and, when
