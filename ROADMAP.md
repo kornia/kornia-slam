@@ -14,6 +14,8 @@ This roadmap will keep evolving. It sets a direction, not a commitment.
 ## Library structure
 
 - [ ] Pluggable feature frontend for non-ORB and learned features
+- [ ] GPU KLT frontend (CubeCL) and multi-camera rigs (2+ cameras), ported from Rerun's
+      [slam-rs](https://github.com/rerun-io/examples-monorepo/tree/main/packages/slam-rs)
 - [ ] Split `SlamSystem` into tracking, mapping, inertial, and loop-closing subsystems
 
 ## Tooling and integrations
