@@ -5,7 +5,7 @@ use kornia_algebra::{Mat3F64, QuatF64, SO3F64, Vec3F64};
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias};
 
 use crate::initialization::inertial_factor::{InertialInitFactor, KfConst, WeightedZeroPrior};
-use crate::map::{Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR};
+use crate::map::{InertialAlignment, Keyframe, KeyframeVelocity, Map};
 use crate::tracking::SystemState;
 use kornia_algebra::optim::{LevenbergMarquardt, Problem, Variable, VariableType};
 // ─────────────────────────────────────────────────────────────────────────────
@@ -484,33 +484,30 @@ impl ImuInitializer {
             init.scale, init.gravity_world.x, init.gravity_world.y, init.gravity_world.z
         );
 
-        // 1. Bring the monocular map to metric scale.
-        map.scale_world(init.scale);
-
-        // 2. Rotate world so that gravity aligns with +Y (OpenCV convention).
+        // 1–3. Scale to metric, rotate gravity onto +Y, and write each
+        // keyframe's velocity and bias, as one validated map correction.
+        // Velocities pair with the window's keyframes in map order, as the
+        // solver produced them, but are published by keyframe identity.
         let g_norm = init.gravity_world / init.gravity_world.length();
         let rwg = rotation_from_to(g_norm, Vec3F64::new(0.0, 1.0, 0.0));
-        map.rotate_world(&rwg);
-
-        // 3. Assign velocities and biases to every keyframe in the window.
-        let mut vel_iter = init.velocities_world.into_iter();
-        for kf in map
-            .keyframes_mut()
-            .iter_mut()
+        let keyframe_velocities: Vec<KeyframeVelocity> = map
+            .keyframes()
+            .iter()
             .filter(|kf| kf.frame.idx >= start_idx)
-        {
-            if let Some(v) = vel_iter.next() {
-                kf.velocity_world = rwg * v;
-                kf.imu_bias = init.bias;
-            }
-        }
-
-        // Every camera centre moved, so each landmark's distance bounds and
-        // viewing direction are stale: without this they stay at the pre-metric
-        // scale, and matching gates on the wrong range. Refreshed once, after
-        // the whole alignment, never between the scale and the rotation.
-        for mp_idx in 0..map.num_map_points() {
-            map.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+            .zip(init.velocities_world)
+            .map(|(kf, velocity_world)| KeyframeVelocity {
+                keyframe_idx: kf.frame.idx,
+                velocity_world,
+            })
+            .collect();
+        if let Err(error) = map.apply_inertial_alignment(InertialAlignment {
+            scale: init.scale,
+            rotation: rwg,
+            keyframe_velocities,
+            bias: init.bias,
+        }) {
+            eprintln!("[imu_init] alignment refused, map left unchanged: {error}");
+            return;
         }
 
         // 4. Update the tracker state from the last initialized keyframe.
@@ -530,6 +527,7 @@ impl ImuInitializer {
 mod tests {
     use super::*;
     use crate::frame::Frame;
+    use crate::map::{ImuFactor, MapInsertion};
     use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbFeatures;
     use kornia_sensors::imu::{ImuCalib, ImuMeasurement};
@@ -663,7 +661,8 @@ mod tests {
             let t = k as f64 * kf_dt;
             let (p_true, _, _, r_wb_true) = circular_trajectory(t, omega);
             let pose = synth_pose_world_to_cam(r_arb, s_true, p_true, r_wb_true);
-            map.upsert_keyframe(Keyframe::from_frame(synth_frame(k, pose)));
+            map.insert_keyframe(Keyframe::from_frame(synth_frame(k, pose)))
+                .unwrap();
             if k > 0 {
                 let pim = integrate_true_imu(
                     t - kf_dt,
@@ -675,7 +674,18 @@ mod tests {
                     bias_accel_true,
                     calib,
                 );
-                map.add_imu_factor(k - 1, k, pim, Vec::new(), t - kf_dt, t);
+                map.apply_insertion(MapInsertion {
+                    imu_factors: vec![ImuFactor {
+                        prev_kf_idx: k - 1,
+                        curr_kf_idx: k,
+                        preintegrated: pim,
+                        raw_samples: Vec::new(),
+                        t0: t - kf_dt,
+                        t1: t,
+                    }],
+                    ..Default::default()
+                })
+                .unwrap();
             }
         }
         map
@@ -747,7 +757,7 @@ mod tests {
 
         // Add deterministic millimetre-scale front-end noise.
         let mut map = synth_map_with_calib(0.5, r_arb, euroc_calib, WEAK_YAW_RATE);
-        for (k, kf) in map.keyframes_mut().iter_mut().enumerate() {
+        map.edit_keyframes_for_test(|k, kf| {
             let f = k as f64;
             let jitter = Vec3F64::new(
                 (3.7 * f).sin(),
@@ -757,7 +767,7 @@ mod tests {
             let cam_to_world = kf.frame.pose_world_to_cam.inverse();
             kf.frame.pose_world_to_cam =
                 Pose3d::new(cam_to_world.rotation, cam_to_world.translation + jitter).inverse();
-        }
+        });
 
         let viba0 = initializer
             .try_initialize(
@@ -852,7 +862,8 @@ mod tests {
             let t = k as f64 * kf_dt;
             let (p_true, _, _, r_wb_true) = circular_trajectory(t, OMEGA);
             let pose = synth_pose_world_to_cam(r_arb, s_true, p_true, r_wb_true);
-            map.upsert_keyframe(Keyframe::from_frame(synth_frame(k, pose)));
+            map.insert_keyframe(Keyframe::from_frame(synth_frame(k, pose)))
+                .unwrap();
 
             if k > 0 {
                 let pim = integrate_true_imu(
@@ -865,7 +876,18 @@ mod tests {
                     bias_accel_true,
                     calib,
                 );
-                map.add_imu_factor(k - 1, k, pim, Vec::new(), t - kf_dt, t);
+                map.apply_insertion(MapInsertion {
+                    imu_factors: vec![ImuFactor {
+                        prev_kf_idx: k - 1,
+                        curr_kf_idx: k,
+                        preintegrated: pim,
+                        raw_samples: Vec::new(),
+                        t0: t - kf_dt,
+                        t1: t,
+                    }],
+                    ..Default::default()
+                })
+                .unwrap();
             }
         }
 
