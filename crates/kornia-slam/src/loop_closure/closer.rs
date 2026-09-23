@@ -387,6 +387,7 @@ fn pose_graph_reference_correction(
 
 #[cfg(test)]
 mod tests {
+    use super::LoopClosingConfig;
     use super::{
         LoopAcceptance, LoopClosingContext, pose_graph_reference_correction,
         pose_graph_tracking_correction,
@@ -394,7 +395,6 @@ mod tests {
     use crate::mapping::Map;
     use crate::place_recognition::Candidate;
     use crate::pose_conversion::apply_reference_pose_correction;
-    use crate::system::LoopClosingConfig;
     use kornia_3d::camera::PinholeCamera;
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::{SO3F64, Vec3F64};

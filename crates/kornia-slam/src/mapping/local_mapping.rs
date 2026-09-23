@@ -6,7 +6,7 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 
-use crate::map::{BaSnapshot, BaUpdate, BaUpdateError, LocalBaMergeResult, Map};
+use crate::mapping::map::{BaSnapshot, BaUpdate, BaUpdateError, LocalBaMergeResult, Map};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LocalMappingMode {
@@ -307,7 +307,7 @@ mod tests {
     use kornia_algebra::Vec3F64;
 
     use super::{BaUpdateError, KeyframeJob, LocalMapping, LocalMappingBackend, LocalMappingMode};
-    use crate::map::{InertialAlignment, KeyframeVelocity, Map};
+    use crate::mapping::map::{InertialAlignment, KeyframeVelocity, Map};
     use kornia_algebra::SO3F64;
     use kornia_sensors::imu::ImuBias;
 
@@ -395,7 +395,7 @@ mod tests {
     /// association, so cleanup is observable.
     fn map_with_a_cullable_landmark() -> (Arc<Mutex<Map>>, usize) {
         use crate::frame::Frame;
-        use crate::map::{Keyframe, LandmarkSeed, ObservationKey};
+        use crate::mapping::map::{Keyframe, LandmarkSeed, ObservationKey};
         use kornia_3d::pose::Pose3d;
         use kornia_image::ImageSize;
         use kornia_imgproc::features::OrbFeatures;

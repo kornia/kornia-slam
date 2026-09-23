@@ -8,7 +8,7 @@ use kornia_algebra::Mat3F64;
 #[cfg(feature = "viz")]
 use kornia_image::{Image, ImageSize};
 #[cfg(feature = "viz")]
-use kornia_slam::map::MapPoint;
+use kornia_slam::mapping::MapPoint;
 
 #[cfg(feature = "viz")]
 const CAMERA_IMAGE_PLANE_DISTANCE: f32 = 0.15;

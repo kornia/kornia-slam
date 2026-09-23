@@ -13,7 +13,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, QuatF64, SO3F64, Vec3F64};
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias};
 
-use crate::map::{InertialAlignment, Keyframe, KeyframeVelocity, Map};
+use crate::mapping::map::{InertialAlignment, Keyframe, KeyframeVelocity, Map};
 use crate::tracking::SystemState;
 use factor::{InertialInitFactor, KfConst, WeightedZeroPrior};
 use kornia_algebra::optim::{LevenbergMarquardt, Problem, Variable, VariableType};

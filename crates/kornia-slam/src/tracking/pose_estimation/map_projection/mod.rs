@@ -34,7 +34,7 @@ use super::pnp::{self, PnpConfig};
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
 use crate::frame::Frame;
-use crate::map::{Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
+use crate::mapping::map::{Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 
 use super::Estimate;

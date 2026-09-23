@@ -54,9 +54,6 @@ mod ops;
 
 pub use imu_factor::ImuFactor;
 pub use keyframe::Keyframe;
-// Compatibility: the worker now lives in `mapping`, but callers still reach it
-// through the map facade.
-pub use crate::mapping::local_mapping::{KeyframeJob, LocalMapping, LocalMappingMode};
 pub use map_point::{LandmarkObservation, MapPoint, ObservationKey};
 pub use ops::{
     BaSnapshot, BaUpdate, BaUpdateError, InertialAlignment, InertialAlignmentError,

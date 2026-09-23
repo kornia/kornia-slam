@@ -6,7 +6,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3AF32, Mat3F64, Vec2F32, Vec3AF32, Vec3F64};
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
-use crate::map::Map;
+use crate::mapping::map::Map;
 
 /// Acceptance thresholds for geometric loop verification.
 #[derive(Debug, Clone)]

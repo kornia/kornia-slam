@@ -6,19 +6,11 @@
 mod config;
 mod inertial;
 
-pub use config::{LoopClosingConfig, SlamConfig};
+pub use config::SlamConfig;
 
 use inertial::{AppliedInitialization, InertialState, due_for_retry, viba0_accel_bias_prior};
 
-#[deprecated(since = "0.1.0", note = "use `SlamSystem`")]
-pub type SlamPipeline = SlamSystem;
-
-#[allow(deprecated)]
-pub use config::{PgoPipelineConfig, PipelineConfig};
-
-// Re-exported so `kornia_slam::system::*` keeps resolving the state and policy
-// types; `tracking` owns them.
-pub use crate::tracking::{
+use crate::tracking::{
     KeyframePolicy, SystemMode, SystemState, TrackingLossRecoveryPolicy, TrackingResult,
     TrackingStatus,
 };
@@ -34,8 +26,8 @@ use crate::initialization::bootstrap::{
     BootstrapDecision, MIN_KEYPOINTS_FOR_BOOTSTRAP, evaluate_bootstrap,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
-use crate::loop_closure::{LoopCloser, LoopClosingContext};
-use crate::map::{
+use crate::loop_closure::{LoopCloser, LoopClosingContext, LoopClosureEvent};
+use crate::mapping::map::{
     ImuFactor, Keyframe, LandmarkSeed, LandmarkTarget, Map, MapInsertion, MapMutationError,
     MapPoint, ObservationKey, ObservationLink,
 };
@@ -102,8 +94,6 @@ pub struct SlamSystem {
     // System state
     state: SystemState,
 }
-
-pub use crate::loop_closure::LoopClosureEvent;
 
 impl SlamSystem {
     /// Creates a new system with identity pose.

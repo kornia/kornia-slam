@@ -1,6 +1,6 @@
 use super::*;
 use crate::frame::Frame;
-use crate::map::{ImuFactor, MapInsertion};
+use crate::mapping::map::{ImuFactor, MapInsertion};
 use kornia_image::ImageSize;
 use kornia_imgproc::features::OrbFeatures;
 use kornia_sensors::imu::{ImuCalib, ImuMeasurement};

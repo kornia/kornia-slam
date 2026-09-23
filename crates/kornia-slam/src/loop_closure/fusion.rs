@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use kornia_3d::camera::PinholeCamera;
 use kornia_imgproc::features::hamming_distance;
 
-use crate::map::{Map, MapMutationError};
+use crate::mapping::map::{Map, MapMutationError};
 
 use super::VerifiedLoopEdge;
 

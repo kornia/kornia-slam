@@ -3,7 +3,7 @@
 //! Solvers consume immutable map snapshots and return numerical updates. The
 //! map owns capture and writeback; the local-mapping worker owns scheduling.
 
-use crate::map::{BaSnapshot, BaUpdate, Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR};
+use crate::mapping::map::{BaSnapshot, BaUpdate, Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR};
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::bundle_adjust_schur;
 use kornia_3d::camera::PinholeCamera;

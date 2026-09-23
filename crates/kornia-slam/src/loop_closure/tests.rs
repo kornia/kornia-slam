@@ -1,6 +1,6 @@
 use super::*;
 use crate::Frame;
-use crate::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
+use crate::mapping::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
 use crate::pose_conversion::pose_to_se3;
 use crate::sparse_pgo::{Se3Manifold, sparse_pose_graph_optimize};
 use kornia_3d::camera::PinholeCamera;
