@@ -18,8 +18,22 @@ pub struct MapPointMergeResult {
 }
 
 impl Map {
-    /// Inserts or replaces a keyframe by frame index.
+    /// Inserts or replaces a keyframe by frame index, then refreshes the
+    /// derived geometry of every landmark it observes.
+    ///
+    /// Callers link landmarks to a keyframe before storing it, and the
+    /// geometry update reads observers from the map, so until now the keyframe
+    /// was never part of it: a landmark it created kept zero viewing direction
+    /// and distance bounds (its reference keyframe was missing), and one it
+    /// tracked averaged its viewing direction without the newest observer.
+    /// Matching treats zero bounds as unset and skips its scale gates.
     pub fn upsert_keyframe(&mut self, keyframe: Keyframe) {
+        let landmarks: Vec<usize> = keyframe
+            .map_point_by_desc_idx
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
         if let Some(pos) = self
             .keyframes
             .iter()
@@ -28,6 +42,9 @@ impl Map {
             self.keyframes[pos] = keyframe;
         } else {
             self.keyframes.push(keyframe);
+        }
+        for mp_idx in landmarks {
+            self.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
         }
     }
     /// Inserts triangulated 3D points as map points and associates them to
