@@ -205,6 +205,8 @@ pub(crate) fn grow_map_points_from_keyframe_pair(
         };
 
         let mut points = Vec::new();
+        let mut claimed_prev: HashSet<usize> = HashSet::new();
+        let mut claimed_curr: HashSet<usize> = HashSet::new();
         for tp in &triangulated {
             let Some(&(prev_idx, curr_idx)) = pair_indices.get(tp.pair_index) else {
                 continue;
@@ -212,6 +214,17 @@ pub(crate) fn grow_map_points_from_keyframe_pair(
             if curr_kf.map_point(curr_idx).is_some() {
                 continue;
             }
+            // The triangulator can emit two points on one feature in either
+            // view. A feature holds one landmark, so the first claim wins:
+            // publishing both left the loser with an observation record for a
+            // feature the keyframe had reassigned to the winner. A refused
+            // point reserves neither feature, so it cannot knock out a later
+            // point that only shares its other one.
+            if claimed_prev.contains(&prev_idx) || claimed_curr.contains(&curr_idx) {
+                continue;
+            }
+            claimed_prev.insert(prev_idx);
+            claimed_curr.insert(curr_idx);
             let color = curr_kf
                 .frame
                 .keypoint_colors
