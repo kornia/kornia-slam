@@ -40,7 +40,7 @@ use crate::map::{
     MapPoint, ObservationKey, ObservationLink,
 };
 use crate::mapping::{KeyframeJob, LocalMapping};
-use crate::place_recognition::{KeyFrameDatabase, Vocabulary, compute_bow};
+use crate::place_recognition::Vocabulary;
 use crate::pose_conversion::apply_reference_pose_correction;
 use crate::sensor_rig::{ImuCalibration, SensorRig};
 use crate::stereo::unproject_stereo;
@@ -96,11 +96,8 @@ pub struct SlamSystem {
     imu_viba1_done: bool,
     imu_viba2_done: bool,
     local_mapping: LocalMapping,
-    // Place recognition: bag-of-words vocabulary (None disables loop detection)
-    // and the inverted-index keyframe database queried at each keyframe insert.
-    vocabulary: Option<Vocabulary>,
-    kf_database: KeyFrameDatabase,
-    loop_closer: Option<LoopCloser>,
+    // Place recognition for every keyframe, and loop closing when configured.
+    loop_closer: LoopCloser,
     loop_closure_events: Vec<LoopClosureEvent>,
     // System state
     state: SystemState,
@@ -122,7 +119,7 @@ impl SlamSystem {
         let local_mapping =
             LocalMapping::new(config.local_mapping, Arc::clone(&map), camera.clone());
         let map_publication_gate = local_mapping.publication_gate();
-        let loop_closer = config.pgo.map(LoopCloser::new);
+        let loop_closer = LoopCloser::new(config.pgo);
         Self {
             rig,
             tracker: Tracker::new(config.map_projection),
@@ -142,8 +139,6 @@ impl SlamSystem {
             imu_init_window_start_sec: None,
             imu_viba1_done: false,
             imu_viba2_done: false,
-            vocabulary: None,
-            kf_database: KeyFrameDatabase::new(),
             loop_closer,
             loop_closure_events: Vec::new(),
         }
@@ -152,7 +147,7 @@ impl SlamSystem {
     /// Enables appearance-based loop detection with a bag-of-words vocabulary.
     /// Without it, keyframes are not indexed and no loop candidates are emitted.
     pub fn set_vocabulary(&mut self, vocabulary: Vocabulary) {
-        self.vocabulary = Some(vocabulary);
+        self.loop_closer.set_vocabulary(vocabulary);
     }
 
     pub fn drain_loop_closure_events(&mut self) -> Vec<LoopClosureEvent> {
@@ -1234,56 +1229,9 @@ impl SlamSystem {
         }
     }
 
-    /// Indexes a freshly inserted keyframe for place recognition and queries the
-    /// database for appearance-based loop candidates.
-    ///
-    /// Mirrors ORB-SLAM3's `LoopClosing::DetectLoop`: the acceptance threshold is
-    /// the lowest BoW similarity to a covisible neighbour, and the covisibility
-    /// set is excluded so only a revisited place can match. The query runs before
-    /// this keyframe is added, so it never matches itself.
+    /// Offers a freshly inserted keyframe to place recognition and, when
+    /// configured, loop closing; applies whatever the closer reports back.
     fn register_place_recognition(&mut self, kf_idx: usize) {
-        let Some(vocabulary) = self.vocabulary.as_ref() else {
-            return;
-        };
-        const MIN_COVIS_WEIGHT: usize = 15;
-        let (bow, neighbors) = {
-            let map = self.map.lock().unwrap();
-            let Some(kf) = map.get_keyframe(kf_idx) else {
-                return;
-            };
-            let bow = compute_bow(vocabulary, &kf.frame.features.descriptors);
-            if bow.0.is_empty() {
-                return;
-            }
-            let neighbors = crate::tracking::local_map::covisible_above_weight(
-                map.covisible_keyframes(kf_idx),
-                MIN_COVIS_WEIGHT,
-            );
-            (bow, neighbors)
-        };
-        let candidates = self.kf_database.detect_loop_candidates(
-            kf_idx,
-            &bow,
-            neighbors.iter().map(|&(nb_idx, _w)| nb_idx),
-        );
-        self.kf_database.add(kf_idx, bow);
-
-        if let Some(best) = candidates.first().copied() {
-            self.dbg(format!(
-                "[loop] kf={kf_idx} matched kf={} score={:.3} shared_words={} ({} candidates)",
-                best.kf_idx,
-                best.score,
-                best.shared_words,
-                candidates.len()
-            ));
-        }
-
-        let Some(loop_closer) = self.loop_closer.as_mut() else {
-            return;
-        };
-        if loop_closer.requires_imu_initialized() && !self.state.imu_initialized {
-            return;
-        }
         let context = LoopClosingContext {
             pose_world_to_cam: self.state.pose_world_to_cam,
             velocity_world: self.state.velocity_world,
@@ -1293,8 +1241,12 @@ impl SlamSystem {
         };
         let outcome = {
             let mut map = self.map.lock().unwrap();
-            loop_closer.close(&mut map, &self.rig.camera, kf_idx, &candidates, context)
+            self.loop_closer
+                .on_keyframe(&mut map, &self.rig.camera, kf_idx, context)
         };
+        if let Some(message) = outcome.debug_message {
+            self.dbg(message);
+        }
         if let Some((corrected_tracking_pose, corrected_velocity)) = outcome.tracking_correction {
             self.state.pose_world_to_cam = corrected_tracking_pose;
             self.state.velocity_world = corrected_velocity;

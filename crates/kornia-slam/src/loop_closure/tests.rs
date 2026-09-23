@@ -564,3 +564,177 @@ fn inertial_pgo_uses_four_dof_and_preserves_gravity() {
             <= 1e-4
     );
 }
+
+fn closing_config() -> LoopClosingConfig {
+    LoopClosingConfig {
+        episode: LoopEpisodeConfig {
+            min_consistent_edges: 1,
+            ..LoopEpisodeConfig::default()
+        },
+        verification: LoopVerificationConfig {
+            min_correspondences: 20,
+            min_inliers: 20,
+            min_inlier_ratio: 0.8,
+            min_occupied_cells: 4,
+            pnp_ransac: RansacParams {
+                random_seed: Some(7),
+                ..LoopVerificationConfig::default().pnp_ransac
+            },
+            ..LoopVerificationConfig::default()
+        },
+        ..LoopClosingConfig::default()
+    }
+}
+
+/// Tracking state at the drifted query keyframe 10.
+fn closing_context(map: &Map) -> LoopClosingContext {
+    LoopClosingContext {
+        pose_world_to_cam: map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
+        velocity_world: Vec3F64::ZERO,
+        current_keyframe_idx: Some(10),
+        imu_initialized: false,
+        gravity_world: Vec3F64::ZERO,
+    }
+}
+
+/// The synthetic loop with keyframe 10 drifted, a vocabulary trained on its
+/// descriptors, and keyframe 0 already indexed.
+fn closing_fixture(config: Option<LoopClosingConfig>) -> (LoopCloser, Map) {
+    let (mut map, _) = synthetic_loop_map();
+    // The observed pixels still describe the true pose, but odometry has drifted.
+    let mut drifted = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    drifted.translation.x += 0.6;
+    map.set_keyframe_pose_for_test(10, drifted);
+    let descriptors: Vec<_> = map
+        .get_keyframe(0)
+        .unwrap()
+        .frame
+        .features
+        .descriptors
+        .iter()
+        .map(kornia_bow::orb_slam3::pack_orb_descriptor)
+        .collect();
+    let mut closer = LoopCloser::new(config);
+    closer.set_vocabulary(crate::place_recognition::Vocabulary::train(&descriptors, 1).unwrap());
+    let context = closing_context(&map);
+    let first = closer.on_keyframe(&mut map, &camera(), 0, context);
+    assert!(first.events.is_empty());
+    assert!(first.debug_message.is_none());
+    assert_eq!(closer.indexed_keyframes(), 1);
+    (closer, map)
+}
+
+#[test]
+fn loop_closer_without_vocabulary_does_not_index_or_mutate_map() {
+    let (mut map, _) = synthetic_loop_map();
+    let before = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    let mut closer = LoopCloser::new(Some(closing_config()));
+    let context = closing_context(&map);
+    let outcome = closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert_eq!(closer.indexed_keyframes(), 0);
+    assert!(outcome.events.is_empty());
+    assert!(outcome.tracking_correction.is_none());
+    assert_eq!(
+        map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
+        before
+    );
+}
+
+#[test]
+fn loop_closer_detection_only_indexes_and_reports_candidate_without_correction() {
+    let (mut closer, mut map) = closing_fixture(None);
+    let before = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    let context = closing_context(&map);
+    let outcome = closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert_eq!(closer.indexed_keyframes(), 2);
+    assert!(outcome.debug_message.unwrap().contains("matched kf=0"));
+    assert!(outcome.events.is_empty());
+    assert!(outcome.tracking_correction.is_none());
+    assert!(!outcome.pgo_applied);
+    assert_eq!(closer.verified_loop_count(), 0);
+    assert_eq!(
+        map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
+        before
+    );
+}
+
+#[test]
+fn loop_closer_imu_gate_preserves_indexing_without_accepting_loop() {
+    let config = LoopClosingConfig {
+        require_imu_initialized: true,
+        ..closing_config()
+    };
+    let (mut closer, mut map) = closing_fixture(Some(config));
+    let context = closing_context(&map);
+    let outcome = closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert_eq!(closer.indexed_keyframes(), 2);
+    assert!(outcome.debug_message.is_some());
+    assert!(outcome.events.is_empty());
+    assert!(outcome.tracking_correction.is_none());
+    assert_eq!(closer.verified_loop_count(), 0);
+}
+
+#[test]
+fn loop_closer_applies_map_correction_and_returns_tracking_correction() {
+    let mut config = closing_config();
+    // Make this synthetic loop strong enough to bring projections within the
+    // unchanged fusion gates; the default weight only partially corrects drift.
+    config.optimizer.loop_edge_weight = 100.0;
+    let (mut closer, mut map) = closing_fixture(Some(config));
+    let before = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    let anchor = map.get_keyframe(0).unwrap().frame.pose_world_to_cam;
+    let context = closing_context(&map);
+    let outcome = closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert!(matches!(
+        outcome.events.as_slice(),
+        [LoopClosureEvent::Accepted { applied: true, .. }]
+    ));
+    assert!(outcome.pgo_applied);
+    let (corrected_pose, _) = outcome.tracking_correction.unwrap();
+    let after = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    // The tracking pose sat on keyframe 10, so it follows the keyframe.
+    assert!((corrected_pose.translation - after.translation).length() < 1e-9);
+    assert!((after.translation - before.translation).length() > 0.01);
+    assert_eq!(map.get_keyframe(0).unwrap().frame.pose_world_to_cam, anchor);
+    assert!(map.get_keyframe(10).unwrap().num_associated_points() > 0);
+    assert_eq!(closer.verified_loop_count(), 1);
+}
+
+#[test]
+fn loop_closer_skips_an_already_verified_pair() {
+    let (mut closer, mut map) = closing_fixture(Some(closing_config()));
+    closer.mark_verified_for_test(0, 10);
+    let before = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    let context = closing_context(&map);
+    let outcome = closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert!(outcome.debug_message.is_some());
+    assert!(outcome.events.is_empty());
+    assert!(outcome.tracking_correction.is_none());
+    assert_eq!(closer.verified_loop_count(), 0);
+    assert_eq!(
+        map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
+        before
+    );
+}
+
+#[test]
+fn loop_closer_missing_reference_records_acceptance_without_mutating_map() {
+    let (mut closer, mut map) = closing_fixture(Some(closing_config()));
+    let before = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    let context = LoopClosingContext {
+        current_keyframe_idx: Some(999),
+        ..closing_context(&map)
+    };
+    let outcome = closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert!(matches!(outcome.events.as_slice(), [
+        LoopClosureEvent::PgoFailed { reason, .. },
+        LoopClosureEvent::Accepted { applied: false, .. }
+    ] if reason.contains("reference keyframe")));
+    assert!(outcome.tracking_correction.is_none());
+    assert_eq!(
+        map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
+        before
+    );
+    assert_eq!(map.get_keyframe(10).unwrap().num_associated_points(), 0);
+    assert_eq!(closer.verified_loop_count(), 1);
+}
