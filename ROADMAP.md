@@ -7,26 +7,31 @@ This roadmap will keep evolving. It sets a direction, not a commitment.
 - [ ] GPU acceleration of the per-frame hot paths (feature extraction, matching, KLT
       tracking) via [CubeCL](https://github.com/tracel-ai/cubecl), starting with the KLT
       frontend from Rerun's [slam-rs](https://github.com/rerun-io/examples-monorepo/tree/main/packages/slam-rs)
-- [ ] Relocalization on tracking loss
+- [ ] Relocalization on tracking loss, robust to appearance change (day/night, lighting) —
+      measure the degradation first ([#68](https://github.com/kornia/kornia-slam/issues/68))
 - [ ] Metric scale for monocular maps: Sim3 loop closure, and AprilTag anchoring
-      ([#72](https://github.com/kornia/kornia-slam/pull/72))
+      ([#71](https://github.com/kornia/kornia-slam/issues/71), [#72](https://github.com/kornia/kornia-slam/pull/72))
 - [ ] Match ORB-SLAM3 on trajectory accuracy and tracking robustness
+- [ ] Submit to the [LaMAria](https://www.lamaria.ethz.ch/leaderboard) SLAM leaderboard ([#78](https://github.com/kornia/kornia-slam/issues/78))
 - [ ] Upstream general-purpose code (solvers, camera models, image ops) to
       [kornia-rs](https://github.com/kornia/kornia-rs)
 
 ## Library structure
 
-- [ ] Pluggable feature frontend for non-ORB and learned features
+- [ ] Pluggable feature frontend for non-ORB and learned features, e.g. XFeat ([#49](https://github.com/kornia/kornia-slam/issues/49))
+- [ ] Pluggable place recognition, including learned global descriptors such as DINOv3
+      ([#48](https://github.com/kornia/kornia-slam/issues/48))
 - [ ] Multi-camera rigs (2+ cameras), ported from Rerun's
       [slam-rs](https://github.com/rerun-io/examples-monorepo/tree/main/packages/slam-rs)
-- [ ] Explore an Atlas: multiple maps per session that are created on tracking loss and
-      merged when places are recognized again (as in ORB-SLAM3)
+- [ ] Explore [Atlas](https://github.com/kornia/kornia-slam/issues/59), a manifold-native estimation and factor-graph foundation, as
+      the base for BA, VI-BA and pose-graph optimization
 - [ ] Split `SlamSystem` into tracking, mapping, inertial, and loop-closing subsystems
 
 ## Tooling and integrations
 
 - [ ] Pixi environment and tasks for reproducible cross-platform builds
       ([#77](https://github.com/kornia/kornia-slam/issues/77), [#79](https://github.com/kornia/kornia-slam/pull/79))
+- [ ] Luxonis OAK-D stereo-inertial support ([#70](https://github.com/kornia/kornia-slam/issues/70))
 - [ ] ROS 2 integration via [ros2_rust](https://github.com/ros2-rust/ros2_rust)
       ([#75](https://github.com/kornia/kornia-slam/issues/75))
 
