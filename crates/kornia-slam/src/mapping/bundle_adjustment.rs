@@ -3,9 +3,11 @@
 //! Solvers consume immutable map snapshots and return numerical updates. The
 //! map owns capture and writeback; the local-mapping worker owns scheduling.
 
-use crate::mapping::map::{BaSnapshot, BaUpdate, Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR};
+use crate::mapping::map::{
+    BaSnapshot, BaUpdate, BaUpdateError, Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR,
+};
 use kornia_3d::ba::{BaObservation, BaParams};
-use kornia_3d::ba_schur::bundle_adjust_schur;
+use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::ransac::RobustKernelKind;
@@ -21,6 +23,23 @@ pub const STEREO_DEPTH_REL_SIGMA: f32 = 0.05;
 /// points.
 pub const STEREO_DEPTH_MIN_SIGMA: f32 = 0.02;
 
+/// Whether [`run_initial_ba`] refined the map or had too little to work with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialBaOutcome {
+    Refined,
+    /// Fewer than two keyframes, no live landmarks, or too few observations.
+    Skipped,
+}
+
+/// Why [`run_initial_ba`] left the map unrefined.
+#[derive(Debug, thiserror::Error)]
+pub enum InitialBaError {
+    #[error("bundle adjustment failed: {0}")]
+    Solver(#[from] SchurBaError),
+    #[error("writeback refused: {0}")]
+    Writeback(#[from] BaUpdateError),
+}
+
 /// Run a 2-keyframe bundle adjustment over the bootstrap pair.
 ///
 /// Operates on the two most recently inserted keyframes (the bootstrap
@@ -29,10 +48,11 @@ pub const STEREO_DEPTH_MIN_SIGMA: f32 = 0.02;
 /// ORB-SLAM3's `GlobalBundleAdjustemnt(map, 20)` in
 /// `CreateInitialMapMonocular`.
 ///
-/// Returns `true` if BA ran and wrote back optimized values; `false` if
-/// there were too few observations or the optimizer errored (map left
-/// untouched in that case).
-pub fn run_initial_ba(map: &mut Map, camera: &PinholeCamera) -> bool {
+/// The map is left untouched unless the outcome is [`InitialBaOutcome::Refined`].
+pub fn run_initial_ba(
+    map: &mut Map,
+    camera: &PinholeCamera,
+) -> Result<InitialBaOutcome, InitialBaError> {
     let mut update = map.ba_snapshot().into_update();
     let snapshot = &update.snapshot;
     const MAX_ITERS: usize = 5;
@@ -41,7 +61,7 @@ pub fn run_initial_ba(map: &mut Map, camera: &PinholeCamera) -> bool {
 
     let n = snapshot.keyframes().len();
     if n < 2 {
-        return false;
+        return Ok(InitialBaOutcome::Skipped);
     }
 
     // Last two keyframes; older is gauge-fixed.
@@ -62,7 +82,7 @@ pub fn run_initial_ba(map: &mut Map, camera: &PinholeCamera) -> bool {
         }
     }
     if mp_set.is_empty() {
-        return false;
+        return Ok(InitialBaOutcome::Skipped);
     }
 
     let mut mp_global_indices: Vec<usize> = mp_set.iter().copied().collect();
@@ -110,7 +130,7 @@ pub fn run_initial_ba(map: &mut Map, camera: &PinholeCamera) -> bool {
     }
 
     if observations.len() < MIN_OBSERVATIONS {
-        return false;
+        return Ok(InitialBaOutcome::Skipped);
     }
 
     let (sq_err_before, depth_before, kf1_t_before) =
@@ -127,13 +147,7 @@ pub fn run_initial_ba(map: &mut Map, camera: &PinholeCamera) -> bool {
         ..BaParams::default()
     };
 
-    let ba_result = match bundle_adjust_schur(&poses, &points, &observations, camera, &params) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("[init_ba] bundle_adjust failed: {e}");
-            return false;
-        }
-    };
+    let ba_result = bundle_adjust_schur(&poses, &points, &observations, camera, &params)?;
 
     let (sq_err_after, depth_after, kf1_t_after) =
         initial_ba_diagnostics(&ba_result.poses, &ba_result.points, &observations, camera);
@@ -160,10 +174,7 @@ pub fn run_initial_ba(map: &mut Map, camera: &PinholeCamera) -> bool {
             *mp = ba_result.points[local_idx];
         }
     }
-    if let Err(error) = map.apply_ba_update(update) {
-        eprintln!("[init_ba] writeback refused: {error}");
-        return false;
-    }
+    map.apply_ba_update(update)?;
 
     // Diagnostics: sample one point's scale state for a sanity check.
     if let Some(&sample) = mp_global_indices.first()
@@ -177,7 +188,7 @@ pub fn run_initial_ba(map: &mut Map, camera: &PinholeCamera) -> bool {
         );
     }
 
-    true
+    Ok(InitialBaOutcome::Refined)
 }
 
 /// Run local bundle adjustment over recent keyframes and their observed map points.

@@ -113,7 +113,10 @@ fn local_visual_ba_preserves_fixed_entities_and_solves_outside_the_live_map() {
 fn initial_ba_uses_the_last_inserted_pair_and_keeps_the_older_pose_fixed() {
     let mut map = fixture();
     let before = map.clone();
-    assert!(run_initial_ba(&mut map, &camera()));
+    assert_eq!(
+        run_initial_ba(&mut map, &camera()).unwrap(),
+        InitialBaOutcome::Refined
+    );
     for id in &KF_IDS[..4] {
         assert_eq!(
             map.get_keyframe(*id).unwrap().frame.pose_world_to_cam,
@@ -140,11 +143,35 @@ fn skipped_visual_and_inertial_solves_leave_the_map_unchanged() {
     map.insert_keyframe(Keyframe::from_frame(test_frame(19, vec![[0; 32]])))
         .unwrap();
     let before = map.state_fingerprint_for_test();
-    assert!(!run_initial_ba(&mut map, &camera()));
+    assert_eq!(
+        run_initial_ba(&mut map, &camera()).unwrap(),
+        InitialBaOutcome::Skipped
+    );
     let visual = run_local_ba(map.ba_snapshot(), &camera());
     assert_eq!(map.apply_ba_update(visual).unwrap().map_points_updated, 0);
     let inertial = run_local_inertial_ba(map.ba_snapshot(), &camera(), None, Vec3F64::ZERO);
     assert_eq!(map.apply_ba_update(inertial).unwrap().map_points_updated, 0);
+    assert_eq!(map.state_fingerprint_for_test(), before);
+}
+
+#[test]
+fn refused_initial_ba_writeback_is_an_error_and_leaves_the_map_unchanged() {
+    let mut map = fixture();
+    // A corrupt pose outside the bootstrap pair makes the whole update unpublishable.
+    map.edit_keyframes_for_test(|slot, kf| {
+        if slot == 0 {
+            kf.frame.pose_world_to_cam.translation.x = f64::NAN;
+        }
+    });
+    let before = map.state_fingerprint_for_test();
+    let error = run_initial_ba(&mut map, &camera()).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            InitialBaError::Writeback(BaUpdateError::NonFiniteKeyframe { .. })
+        ),
+        "{error:?}"
+    );
     assert_eq!(map.state_fingerprint_for_test(), before);
 }
 

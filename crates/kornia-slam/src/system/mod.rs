@@ -426,10 +426,13 @@ impl SlamSystem {
         keyframes: [usize; 2],
     ) -> Result<(), MapMutationError> {
         self.map.lock().unwrap().apply_insertion(insertion)?;
-        crate::mapping::bundle_adjustment::run_initial_ba(
+        let refined = crate::mapping::bundle_adjustment::run_initial_ba(
             &mut self.map.lock().unwrap(),
             &self.rig.camera,
         );
+        if let Err(error) = refined {
+            self.dbg(format!("[init_ba] {error}; keeping the unrefined map"));
+        }
         for kf_idx in keyframes {
             self.register_place_recognition(kf_idx);
         }
