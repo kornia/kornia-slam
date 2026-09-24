@@ -1,8 +1,8 @@
 //! Map storage and the operations that read and change it.
 //!
 //! [`Map`] owns the keyframes, map points, IMU factors and the world epoch;
-//! nothing else stores them. Entities live beside it in [`keyframe`] and
-//! [`map_point`], and every operation is an inherent `impl Map` block under the
+//! nothing else stores them. Entities live beside it as [`Keyframe`] and
+//! [`MapPoint`], and every operation is an inherent `impl Map` block under the
 //! private `ops` module, grouped by responsibility:
 //!
 //! | Group | Examples |
