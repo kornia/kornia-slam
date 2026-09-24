@@ -20,8 +20,8 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::TriangulationConfig;
 use kornia_imgproc::features::OrbMatchConfig;
 
-use crate::map::{LandmarkTarget, Map, MapMutationError};
 use crate::mapping::growth;
+use crate::mapping::map::{LandmarkTarget, Map, MapMutationError};
 
 /// Neighbours captured before the core keyframe is published.
 ///
@@ -163,7 +163,7 @@ pub(crate) fn grow_keyframe(
 mod tests {
     use super::*;
     use crate::frame::Frame;
-    use crate::map::Keyframe;
+    use crate::mapping::map::Keyframe;
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::Vec3F64;
     use kornia_image::ImageSize;

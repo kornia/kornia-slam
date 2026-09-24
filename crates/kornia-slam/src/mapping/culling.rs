@@ -5,7 +5,7 @@
 //! canonical operation, so this selects ids and delegates — there is no second
 //! cleanup loop, and the map never calls back into mapping.
 
-use crate::map::Map;
+use crate::mapping::map::Map;
 use std::collections::HashSet;
 
 /// Minimum times a landmark must have been in view before its match rate is
@@ -66,7 +66,7 @@ pub fn cull_landmarks(map: &mut Map) -> usize {
 mod tests {
     use super::*;
     use crate::frame::Frame;
-    use crate::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
+    use crate::mapping::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::Vec3F64;
     use kornia_image::ImageSize;

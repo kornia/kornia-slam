@@ -11,7 +11,7 @@
 //! depends on a camera centre that solve moved, even though its own position
 //! must never be written back from that stale capture.
 
-use crate::map::{Map, ORB_N_LEVELS, ORB_SCALE_FACTOR};
+use crate::mapping::map::{Map, ORB_N_LEVELS, ORB_SCALE_FACTOR};
 use kornia_algebra::Vec3F64;
 use std::collections::HashSet;
 

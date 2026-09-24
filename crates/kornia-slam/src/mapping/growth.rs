@@ -8,7 +8,7 @@
 //! from pair triangulation — both paths build the same request.
 
 use crate::frame::Frame;
-use crate::map::{
+use crate::mapping::map::{
     LandmarkSeed, LandmarkTarget, Map, MapInsertion, ORB_SCALE_FACTOR, ObservationKey,
     ObservationLink,
 };
@@ -410,7 +410,7 @@ pub fn accepted_pair_claims(candidates: &[(usize, usize)]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::Keyframe;
+    use crate::mapping::map::Keyframe;
     use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbFeatures;
 

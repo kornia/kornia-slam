@@ -5,7 +5,7 @@
 //! thresholds, neighbour limits and connectivity fallback that used to be baked
 //! in here now live with the callers that choose them.
 
-use crate::map::Map;
+use crate::mapping::map::Map;
 use std::collections::HashMap;
 
 impl Map {
@@ -47,7 +47,7 @@ impl Map {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::{Keyframe, LandmarkSeed, ObservationKey, tests::test_frame};
+    use crate::mapping::map::{Keyframe, LandmarkSeed, ObservationKey, tests::test_frame};
     use kornia_algebra::Vec3F64;
 
     /// KF0 shares two points with KF1 and one with KF2.

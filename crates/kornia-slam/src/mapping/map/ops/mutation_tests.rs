@@ -1,7 +1,7 @@
 use super::{
     ImuFactor, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError, ObservationLink,
 };
-use crate::map::{
+use crate::mapping::map::{
     Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR, ObservationKey,
     tests::{test_frame, test_frame_with_pose},
 };

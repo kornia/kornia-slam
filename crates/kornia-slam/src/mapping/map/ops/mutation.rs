@@ -3,7 +3,7 @@
 //! Canonical mutations maintain both sides of observation links and finalize
 //! affected landmark metadata. Batch insertion validates before its first write.
 
-use crate::map::{
+use crate::mapping::map::{
     ImuFactor, Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR, ObservationKey,
 };
 use kornia_algebra::Vec3F64;

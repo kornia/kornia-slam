@@ -3,7 +3,7 @@
 //! Capture has no window or solver policy. Mapping selects its optimization
 //! problem from these immutable inputs; correction applies the numeric result.
 
-use crate::map::{ImuFactor, Keyframe, Map, MapPoint};
+use crate::mapping::map::{ImuFactor, Keyframe, Map, MapPoint};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::{ImuBias, PreintegratedImu};

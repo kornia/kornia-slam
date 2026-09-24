@@ -1,7 +1,6 @@
 use crate::initialization::two_view::TwoViewInitConfig;
-/// Owned by [`crate::loop_closure`]; re-exported where it used to live.
-pub use crate::loop_closure::LoopClosingConfig;
-use crate::map::LocalMappingMode;
+use crate::loop_closure::LoopClosingConfig;
+use crate::mapping::LocalMappingMode;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
@@ -42,9 +41,3 @@ impl Default for SlamConfig {
         }
     }
 }
-
-#[deprecated(since = "0.1.0", note = "use `SlamConfig`")]
-pub type PipelineConfig = SlamConfig;
-
-#[deprecated(since = "0.1.0", note = "use `LoopClosingConfig`")]
-pub type PgoPipelineConfig = LoopClosingConfig;

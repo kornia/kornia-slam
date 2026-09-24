@@ -1,6 +1,6 @@
 use super::*;
-use crate::map::tests::test_frame;
-use crate::map::{ImuFactor, LandmarkSeed, MapInsertion, ObservationKey};
+use crate::mapping::map::tests::test_frame;
+use crate::mapping::map::{ImuFactor, LandmarkSeed, MapInsertion, ObservationKey};
 use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement};
 
 const KF_IDS: [usize; 5] = [80, 10, 90, 30, 120];

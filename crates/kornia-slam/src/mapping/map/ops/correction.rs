@@ -7,7 +7,7 @@
 //! derived geometry stale. Finalizing that geometry is `ops::geometry`.
 
 use super::snapshot::KeyframeBaState;
-use crate::map::{BaUpdate, Map};
+use crate::mapping::map::{BaUpdate, Map};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{SO3F64, Vec3F64};
 use kornia_sensors::imu::ImuBias;
@@ -605,7 +605,10 @@ fn valid_preintegration(preintegrated: &kornia_sensors::imu::PreintegratedImu) -
         && finite_mat3(&preintegrated.d_position_d_bias_accel)
 }
 
-fn keyframe_ba_state_changed(before: &crate::map::Keyframe, after: &KeyframeBaState) -> bool {
+fn keyframe_ba_state_changed(
+    before: &crate::mapping::map::Keyframe,
+    after: &KeyframeBaState,
+) -> bool {
     before.frame.pose_world_to_cam != after.pose_world_to_cam
         || before.velocity_world != after.velocity_world
         || before.imu_bias.gyro != after.imu_bias.gyro
@@ -615,7 +618,7 @@ fn keyframe_ba_state_changed(before: &crate::map::Keyframe, after: &KeyframeBaSt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::{
+    use crate::mapping::map::{
         Keyframe, LandmarkSeed, ObservationKey,
         tests::{test_frame, test_frame_with_pose},
     };
@@ -931,7 +934,7 @@ mod tests {
 #[cfg(test)]
 mod ba_tests {
     use super::*;
-    use crate::map::{
+    use crate::mapping::map::{
         Keyframe, LandmarkSeed, MapInsertion, ObservationKey,
         tests::{test_frame, test_frame_with_pose},
     };
@@ -1291,7 +1294,7 @@ mod ba_tests {
 #[cfg(test)]
 mod validation_tests {
     use super::*;
-    use crate::map::{
+    use crate::mapping::map::{
         ImuFactor, Keyframe, LandmarkSeed, MapInsertion, ObservationKey, tests::test_frame,
     };
     use kornia_algebra::{Mat3F64, SO3F64};

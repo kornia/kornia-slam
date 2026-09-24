@@ -5,7 +5,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use thiserror::Error;
 
-use crate::map::Map;
+use crate::mapping::map::Map;
 use crate::pose_conversion::pose_to_se3;
 use crate::sparse_pgo::{
     GravityManifold, Se3Manifold, sparse_pose_graph_optimize, weighted_relative_residual,
