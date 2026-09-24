@@ -1,7 +1,6 @@
 //! `Factor` adapter wiring `PreintegratedImu` into `kornia_algebra::optim`'s
 //! generic Levenberg-Marquardt solver, for the ORB-SLAM3-style joint
-//! inertial-initialization optimization (`Optimizer::InertialOptimization`,
-//! `docs/imu_init_guide.md`).
+//! inertial-initialization optimization (`Optimizer::InertialOptimization`).
 //!
 //! Variable order for every edge added via `Problem::add_factor` MUST be
 //! `[v_i, v_j, bg, ba, gdir, scale]` — this matches `variable_local_dim`
@@ -11,7 +10,7 @@
 //!   rows:  er(0..3)   ev(3..6)   ep(6..9)
 //!
 //! Keyframe poses are NOT `Problem` variables (the optimizer has no "fixed
-//! vertex" concept — see the previous discussion) — they're baked into
+//! vertex" concept) — they're baked into
 //! `KfConst` as plain constant data, exactly matching ORB-SLAM3's
 //! `VP->setFixed(true)`.
 
@@ -197,8 +196,8 @@ impl Factor for InertialInitFactor {
             }
 
             // gravity-direction block (cols 12..15) — 3-DOF SO3 tangent;
-            // the column along gI itself is exactly zero (gauge freedom),
-            // see the derivation in the previous message.
+            // the column along gI itself is exactly zero (gauge freedom):
+            // rotating g about its own axis leaves it unchanged.
             let d_g_d_theta = (rwg * SO3F64::hat(g_i)) * -1.0;
             set_block3(&mut jac, 3, 12, (r_bw_i * d_g_d_theta) * dt * -1.0);
             set_block3(

@@ -124,8 +124,8 @@ pub(crate) struct KeyframeGrowthResult {
 
 /// Maximum neighbours one keyframe grows against.
 ///
-/// Mirrors ORB-SLAM3's `CreateNewMapPoints`, which uses the 30 best covisible
-/// keyframes; recency approximates covisibility until the graph is available.
+/// ORB-SLAM3's `CreateNewMapPoints` takes the 10 best covisible keyframes (30
+/// in monocular); this takes the 10 most recent instead.
 const MAX_COVIS_KFS: usize = 10;
 
 /// Picks the neighbours for `keyframe_idx` by recency.

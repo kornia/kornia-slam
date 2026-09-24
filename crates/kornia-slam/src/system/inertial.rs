@@ -50,7 +50,7 @@ impl InertialState {
 
     /// Integrates the inclusive window `[t0, t1]` without consuming the
     /// measurements: frame prediction and keyframe edges need overlapping
-    /// windows. The returned sample copy is what `Map::add_imu_factor` keeps
+    /// windows. The returned sample copy is what the published `ImuFactor` keeps
     /// for later repropagation, so once this returns [`Self::prune_before`] is
     /// free to drop them from the buffer.
     pub(super) fn preintegrate_window(
