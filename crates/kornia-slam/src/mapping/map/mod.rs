@@ -10,7 +10,7 @@
 //! | `mutation` | `insert_keyframe`, `insert_landmark`, `link_observation`, `apply_insertion`, `merge_map_points` |
 //! | `correction` | `apply_pose_graph_correction`, `apply_inertial_alignment`, `apply_ba_update` |
 //! | `geometry` | derived landmark geometry and the refresh set each correction owes |
-//! | `queries` | `covisible_keyframes` — raw weights; thresholds belong to consumers |
+//! | `queries` | `covisible_keyframes`, `covisible_keyframes_min_weight` — thresholds belong to consumers |
 //! | `snapshot` | `ba_snapshot` — owned, immutable optimization inputs |
 //!
 //! ## Invariants
