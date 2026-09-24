@@ -5,7 +5,7 @@
 //! scheduling are mapping algorithms layered on top; they read the map
 //! immutably and write only through its operations.
 //!
-//! [`keyframe_mapping`] coordinates the optional work an accepted keyframe
+//! `keyframe_mapping` coordinates the optional work an accepted keyframe
 //! earns — neighbour selection, pair growth, forward fusion — so the system
 //! keeps admission, core publication and the tracker/IMU lifecycle.
 //!

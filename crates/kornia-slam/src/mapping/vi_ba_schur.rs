@@ -27,7 +27,7 @@
 //! we walk observations and accumulate per-point contributions into M
 //! directly.
 //!
-//! Jacobian conventions match [`kornia_3d::ba::ReprojFactor`]:
+//! Jacobian conventions match `ReprojFactor` in [`kornia_3d::ba`]:
 //!
 //!   * Pose tangent layout `[ρ; ω]` (upsilon then omega), 6-dim.
 //!   * Point parameters are the 3-dim world coordinates.

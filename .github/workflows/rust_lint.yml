@@ -35,6 +35,18 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
+  rustdoc:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-cache
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo doc
+        run: cargo doc --locked --no-deps -p kornia-slam -p kornia-sensors
+
   clippy:
     name: Clippy (${{ matrix.name }})
     runs-on: ubuntu-latest
