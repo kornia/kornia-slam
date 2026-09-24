@@ -3,10 +3,11 @@ use std::collections::HashSet;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pnp::{PnPMethod, RansacParams, solve_pnp_ransac};
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat3AF32, Mat3F64, Vec2F32, Vec3AF32, Vec3F64};
+use kornia_algebra::{Mat3AF32, Vec2F32, Vec3AF32};
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
 use crate::mapping::map::Map;
+use crate::pose_conversion::{mat3_to_f64, vec3_to_f32, vec3_to_f64};
 
 /// Acceptance thresholds for geometric loop verification.
 #[derive(Debug, Clone)]
@@ -112,7 +113,7 @@ pub(super) fn verification_input(
         let Some(query_xy) = query.frame.undistorted_xy(query_desc_idx, camera) else {
             continue;
         };
-        world_points.push(vec3_f32(map_point.position));
+        world_points.push(vec3_to_f32(map_point.position));
         image_points.push(Vec2F32::new(query_xy[0], query_xy[1]));
     }
 
@@ -172,7 +173,7 @@ pub fn verify_loop_candidate(
         .inliers
         .iter()
         .filter_map(|&index| {
-            let point = vec3_f64(input.world_points[index]);
+            let point = vec3_to_f64(input.world_points[index]);
             let pixel = input.image_points[index];
             camera.reprojection_error_sq_world(&query_pose, &point, pixel.x as f64, pixel.y as f64)
         })
@@ -243,21 +244,5 @@ fn occupied_image_cells(
 }
 
 fn pnp_pose(pose: &kornia_3d::pnp::PnPResult) -> Pose3d {
-    let rotation = pose.rotation;
-    Pose3d::new(
-        Mat3F64::from_cols(
-            vec3_f64(rotation.col(0).into()),
-            vec3_f64(rotation.col(1).into()),
-            vec3_f64(rotation.col(2).into()),
-        ),
-        vec3_f64(pose.translation),
-    )
-}
-
-fn vec3_f32(value: Vec3F64) -> Vec3AF32 {
-    Vec3AF32::new(value.x as f32, value.y as f32, value.z as f32)
-}
-
-fn vec3_f64(value: Vec3AF32) -> Vec3F64 {
-    Vec3F64::new(value.x as f64, value.y as f64, value.z as f64)
+    Pose3d::new(mat3_to_f64(pose.rotation), vec3_to_f64(pose.translation))
 }

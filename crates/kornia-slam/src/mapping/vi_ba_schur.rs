@@ -41,10 +41,10 @@
 
 use faer::Mat;
 use faer::prelude::Solve;
-use kornia_algebra::{Mat3F64, SE3F32, SO3F64, Vec3AF32, Vec3F64};
+use kornia_algebra::{Mat3F64, SE3F32, SO3F64, Vec3F64};
 use thiserror::Error;
 
-use crate::pose_conversion::{pose_to_se3, se3_to_pose};
+use crate::pose_conversion::{pose_to_se3, se3_to_pose, vec3_to_f32};
 
 use kornia_3d::ba::{BaError, BaObservation};
 use kornia_3d::camera::PinholeCamera;
@@ -217,7 +217,7 @@ fn residual_and_jacobians(
     let cx = camera.cx as f32;
     let cy = camera.cy as f32;
 
-    let pw = Vec3AF32::new(point_w.x as f32, point_w.y as f32, point_w.z as f32);
+    let pw = vec3_to_f32(*point_w);
     let pc = *pose * pw;
     let z = if pc.z.abs() < MIN_Z {
         if pc.z >= 0.0 { MIN_Z } else { -MIN_Z }
@@ -307,7 +307,7 @@ fn depth_residual_and_jacobian(
     d_meas: f64,
     sigma: f64,
 ) -> (f64, [f64; 6], [f64; 3]) {
-    let pw = Vec3AF32::new(point_w.x as f32, point_w.y as f32, point_w.z as f32);
+    let pw = vec3_to_f32(*point_w);
     let pc = *pose * pw;
     let z_pred = if pc.z.abs() < MIN_Z {
         if pc.z >= 0.0 { MIN_Z } else { -MIN_Z }

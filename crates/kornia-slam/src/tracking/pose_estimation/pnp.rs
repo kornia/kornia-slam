@@ -4,7 +4,9 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pnp::{LMRefineParams, refine_pose_lm};
 use kornia_3d::pose::Pose3d;
 use kornia_3d::ransac::RobustKernelKind;
-use kornia_algebra::{Mat3AF32, Mat3F64, Vec2F32, Vec3AF32, Vec3F64};
+use kornia_algebra::{Mat3AF32, Vec2F32, Vec3AF32, Vec3F64};
+
+use crate::pose_conversion::{mat3_to_f32, mat3_to_f64, vec3_to_f32, vec3_to_f64};
 
 /// PnP pose-estimation thresholds.
 #[derive(Debug, Clone)]
@@ -140,27 +142,11 @@ pub fn solve_pnp_with_diagnostics(
     let mut image_inliers = Vec::with_capacity(prior_inlier_indices.len());
     for &i in &prior_inlier_indices {
         let pw = (points_world_f64[i] - center) * scale;
-        world_inliers.push(Vec3AF32::new(pw.x as f32, pw.y as f32, pw.z as f32));
+        world_inliers.push(vec3_to_f32(pw));
         image_inliers.push(points_image[i]);
     }
 
-    let r_init_f32 = Mat3AF32::from_cols(
-        Vec3AF32::new(
-            pose_init.rotation.col(0).x as f32,
-            pose_init.rotation.col(0).y as f32,
-            pose_init.rotation.col(0).z as f32,
-        ),
-        Vec3AF32::new(
-            pose_init.rotation.col(1).x as f32,
-            pose_init.rotation.col(1).y as f32,
-            pose_init.rotation.col(1).z as f32,
-        ),
-        Vec3AF32::new(
-            pose_init.rotation.col(2).x as f32,
-            pose_init.rotation.col(2).y as f32,
-            pose_init.rotation.col(2).z as f32,
-        ),
-    );
+    let r_init_f32 = mat3_to_f32(pose_init.rotation);
     // Normalized prior translation: t' = s * (t + R * center) = 0.
     let t_init_f32 = Vec3AF32::new(0.0, 0.0, 0.0);
 
@@ -168,28 +154,8 @@ pub fn solve_pnp_with_diagnostics(
     // s*(w - center) -> cam, so the world-frame pose is
     // (R_lm, t_lm / s - R_lm * center).
     let unnormalize = |rotation: &Mat3AF32, translation: Vec3AF32| -> Pose3d {
-        let rotation = Mat3F64::from_cols(
-            Vec3F64::new(
-                rotation.col(0).x as f64,
-                rotation.col(0).y as f64,
-                rotation.col(0).z as f64,
-            ),
-            Vec3F64::new(
-                rotation.col(1).x as f64,
-                rotation.col(1).y as f64,
-                rotation.col(1).z as f64,
-            ),
-            Vec3F64::new(
-                rotation.col(2).x as f64,
-                rotation.col(2).y as f64,
-                rotation.col(2).z as f64,
-            ),
-        );
-        let translation = Vec3F64::new(
-            translation.x as f64,
-            translation.y as f64,
-            translation.z as f64,
-        );
+        let rotation = mat3_to_f64(*rotation);
+        let translation = vec3_to_f64(translation);
         Pose3d::new(rotation, translation / scale - rotation * center)
     };
 
@@ -288,6 +254,7 @@ pub fn count_reprojection_inliers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kornia_algebra::Mat3F64;
 
     fn test_camera() -> PinholeCamera {
         PinholeCamera {
