@@ -23,6 +23,9 @@ pub const STEREO_DEPTH_REL_SIGMA: f32 = 0.05;
 /// points.
 pub const STEREO_DEPTH_MIN_SIGMA: f32 = 0.02;
 
+/// Keyframes a local BA optimizes; older keyframes enter only as fixed poses.
+const MAX_ACTIVE_KFS: usize = 3;
+
 /// Whether [`run_initial_ba`] refined the map or had too little to work with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitialBaOutcome {
@@ -67,74 +70,33 @@ pub fn run_initial_ba(
     // Last two keyframes; older is gauge-fixed.
     let kf_indices = [n - 2, n - 1];
 
-    let mut mp_set: HashSet<usize> = HashSet::new();
-    for &kf_idx in &kf_indices {
-        for mp_idx in snapshot.keyframes()[kf_idx]
-            .map_point_by_desc_idx
-            .iter()
-            .flatten()
-        {
-            if let Some(mp) = snapshot.map_points().get(*mp_idx)
-                && !mp.culled
-            {
-                mp_set.insert(*mp_idx);
-            }
-        }
-    }
-    if mp_set.is_empty() {
+    let window = WindowPoints::collect(
+        snapshot,
+        kf_indices.iter().map(|&i| &snapshot.keyframes()[i]),
+    );
+    if window.is_empty() {
         return Ok(InitialBaOutcome::Skipped);
     }
-
-    let mut mp_global_indices: Vec<usize> = mp_set.iter().copied().collect();
-    mp_global_indices.sort_unstable();
-
-    let mp_global_to_local: HashMap<usize, usize> = mp_global_indices
-        .iter()
-        .enumerate()
-        .map(|(local, &global)| (global, local))
-        .collect();
-
-    let points: Vec<Vec3F64> = mp_global_indices
-        .iter()
-        .map(|&idx| snapshot.map_points()[idx].position)
-        .collect();
 
     let poses: Vec<Pose3d> = kf_indices
         .iter()
         .map(|&i| snapshot.keyframes()[i].frame.pose_world_to_cam)
         .collect();
 
-    let mut observations = Vec::new();
-    for (pose_idx, &kf_idx) in kf_indices.iter().enumerate() {
-        let is_fixed = pose_idx == 0;
-        let kf = &snapshot.keyframes()[kf_idx];
-        for (desc_idx, mp_opt) in kf.map_point_by_desc_idx.iter().enumerate() {
-            if let Some(mp_idx) = mp_opt {
-                let Some(&point_idx) = mp_global_to_local.get(mp_idx) else {
-                    continue;
-                };
-                if let Some(p) = kf.frame.undistorted_xy(desc_idx, camera) {
-                    let (depth_meas, depth_sigma) = stereo_depth_obs(kf, desc_idx);
-                    observations.push(BaObservation {
-                        pose_idx,
-                        point_idx,
-                        pixel: p,
-                        fixed_pose: is_fixed,
-                        fixed_point: false,
-                        depth_meas,
-                        depth_sigma,
-                    });
-                }
-            }
-        }
-    }
+    let observations = window.observations(
+        kf_indices
+            .iter()
+            .enumerate()
+            .map(|(pose_idx, &kf_idx)| (pose_idx, &snapshot.keyframes()[kf_idx], pose_idx == 0)),
+        camera,
+    );
 
     if observations.len() < MIN_OBSERVATIONS {
         return Ok(InitialBaOutcome::Skipped);
     }
 
     let (sq_err_before, depth_before, kf1_t_before) =
-        initial_ba_diagnostics(&poses, &points, &observations, camera);
+        initial_ba_diagnostics(&poses, &window.positions, &observations, camera);
 
     let params = BaParams {
         max_iterations: MAX_ITERS,
@@ -147,7 +109,7 @@ pub fn run_initial_ba(
         ..BaParams::default()
     };
 
-    let ba_result = bundle_adjust_schur(&poses, &points, &observations, camera, &params)?;
+    let ba_result = bundle_adjust_schur(&poses, &window.positions, &observations, camera, &params)?;
 
     let (sq_err_after, depth_after, kf1_t_after) =
         initial_ba_diagnostics(&ba_result.poses, &ba_result.points, &observations, camera);
@@ -169,15 +131,11 @@ pub fn run_initial_ba(
     );
 
     update.keyframes[kf_indices[1]].pose_world_to_cam = ba_result.poses[1];
-    for (local_idx, &global_idx) in mp_global_indices.iter().enumerate() {
-        if let Some(mp) = update.map_points.get_mut(global_idx) {
-            *mp = ba_result.points[local_idx];
-        }
-    }
+    window.write_back(&ba_result.points, &mut update.map_points);
     map.apply_ba_update(update)?;
 
     // Diagnostics: sample one point's scale state for a sanity check.
-    if let Some(&sample) = mp_global_indices.first()
+    if let Some(&sample) = window.global.first()
         && let Some(mp) = map.map_points().get(sample)
     {
         let normal_len = mp.mean_viewing_direction.length();
@@ -199,7 +157,6 @@ pub fn run_initial_ba(
 pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
-    const MAX_ACTIVE_KFS: usize = 3;
     const MIN_OBSERVATIONS: usize = 8;
 
     let n_kfs = snapshot.keyframes().len();
@@ -209,33 +166,10 @@ pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
 
     let active_start = n_kfs.saturating_sub(MAX_ACTIVE_KFS);
 
-    let mut mp_set: HashSet<usize> = HashSet::new();
-    for kf in &snapshot.keyframes()[active_start..] {
-        for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
-            if let Some(mp) = snapshot.map_points().get(*mp_idx)
-                && !mp.culled
-            {
-                mp_set.insert(*mp_idx);
-            }
-        }
-    }
-    if mp_set.is_empty() {
+    let window = WindowPoints::collect(snapshot, &snapshot.keyframes()[active_start..]);
+    if window.is_empty() {
         return update;
     }
-
-    let mut mp_global_indices: Vec<usize> = mp_set.iter().copied().collect();
-    mp_global_indices.sort_unstable();
-
-    let mp_global_to_local: HashMap<usize, usize> = mp_global_indices
-        .iter()
-        .enumerate()
-        .map(|(local, &global)| (global, local))
-        .collect();
-
-    let points: Vec<Vec3F64> = mp_global_indices
-        .iter()
-        .map(|&idx| snapshot.map_points()[idx].position)
-        .collect();
 
     let poses: Vec<Pose3d> = snapshot
         .keyframes()
@@ -243,39 +177,29 @@ pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
         .map(|kf| kf.frame.pose_world_to_cam)
         .collect();
 
-    let mut observations = Vec::new();
-    for (kf_idx, kf) in snapshot.keyframes().iter().enumerate() {
-        let is_fixed = kf_idx < active_start;
-        for (desc_idx, mp_opt) in kf.map_point_by_desc_idx.iter().enumerate() {
-            if let Some(mp_idx) = mp_opt {
-                let Some(&point_idx) = mp_global_to_local.get(mp_idx) else {
-                    continue;
-                };
-                if let Some(p) = kf.frame.undistorted_xy(desc_idx, camera) {
-                    let (depth_meas, depth_sigma) = stereo_depth_obs(kf, desc_idx);
-                    observations.push(BaObservation {
-                        pose_idx: kf_idx,
-                        point_idx,
-                        pixel: p,
-                        fixed_pose: is_fixed,
-                        fixed_point: false,
-                        depth_meas,
-                        depth_sigma,
-                    });
-                }
-            }
-        }
-    }
+    let observations = window.observations(
+        snapshot
+            .keyframes()
+            .iter()
+            .enumerate()
+            .map(|(kf_idx, kf)| (kf_idx, kf, kf_idx < active_start)),
+        camera,
+    );
 
     if observations.len() < MIN_OBSERVATIONS {
         return update;
     }
 
-    let ba_result =
-        match bundle_adjust_schur(&poses, &points, &observations, camera, &BaParams::default()) {
-            Ok(r) => r,
-            Err(_) => return update,
-        };
+    let ba_result = match bundle_adjust_schur(
+        &poses,
+        &window.positions,
+        &observations,
+        camera,
+        &BaParams::default(),
+    ) {
+        Ok(r) => r,
+        Err(_) => return update,
+    };
 
     for (kf_idx, pose) in ba_result.poses.iter().enumerate() {
         if kf_idx >= active_start {
@@ -283,11 +207,7 @@ pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
         }
     }
 
-    for (local_idx, &global_idx) in mp_global_indices.iter().enumerate() {
-        if let Some(mp) = update.map_points.get_mut(global_idx) {
-            *mp = ba_result.points[local_idx];
-        }
-    }
+    window.write_back(&ba_result.points, &mut update.map_points);
     update
 }
 
@@ -305,7 +225,6 @@ pub fn run_local_inertial_ba(
         ImuFactor as ViBaImuFactor, ViBaKeyframe, ViBaParams, visual_inertial_bundle_adjust,
     };
 
-    const MAX_ACTIVE_KFS: usize = 3;
     const MIN_OBSERVATIONS: usize = 8;
 
     let n_kfs = snapshot.keyframes().len();
@@ -315,33 +234,10 @@ pub fn run_local_inertial_ba(
 
     let active_start = n_kfs.saturating_sub(MAX_ACTIVE_KFS);
 
-    let mut mp_set: HashSet<usize> = HashSet::new();
-    for kf in &snapshot.keyframes()[active_start..] {
-        for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
-            if let Some(mp) = snapshot.map_points().get(*mp_idx)
-                && !mp.culled
-            {
-                mp_set.insert(*mp_idx);
-            }
-        }
-    }
-    if mp_set.is_empty() {
+    let window = WindowPoints::collect(snapshot, &snapshot.keyframes()[active_start..]);
+    if window.is_empty() {
         return update;
     }
-
-    let mut mp_global_indices: Vec<usize> = mp_set.iter().copied().collect();
-    mp_global_indices.sort_unstable();
-
-    let mp_global_to_local: HashMap<usize, usize> = mp_global_indices
-        .iter()
-        .enumerate()
-        .map(|(local, &global)| (global, local))
-        .collect();
-
-    let points: Vec<Vec3F64> = mp_global_indices
-        .iter()
-        .map(|&idx| snapshot.map_points()[idx].position)
-        .collect();
 
     // Build VI-BA keyframes (all KFs; fixed flag controls which are optimised).
     let vi_keyframes: Vec<ViBaKeyframe> = snapshot
@@ -356,29 +252,14 @@ pub fn run_local_inertial_ba(
         })
         .collect();
 
-    let mut observations = Vec::new();
-    for (kf_idx, kf) in snapshot.keyframes().iter().enumerate() {
-        let is_fixed = kf_idx < active_start;
-        for (desc_idx, mp_opt) in kf.map_point_by_desc_idx.iter().enumerate() {
-            if let Some(mp_idx) = mp_opt {
-                let Some(&point_idx) = mp_global_to_local.get(mp_idx) else {
-                    continue;
-                };
-                if let Some(p) = kf.frame.undistorted_xy(desc_idx, camera) {
-                    let (depth_meas, depth_sigma) = stereo_depth_obs(kf, desc_idx);
-                    observations.push(BaObservation {
-                        pose_idx: kf_idx,
-                        point_idx,
-                        pixel: p,
-                        fixed_pose: is_fixed,
-                        fixed_point: false,
-                        depth_meas,
-                        depth_sigma,
-                    });
-                }
-            }
-        }
-    }
+    let observations = window.observations(
+        snapshot
+            .keyframes()
+            .iter()
+            .enumerate()
+            .map(|(kf_idx, kf)| (kf_idx, kf, kf_idx < active_start)),
+        camera,
+    );
 
     if observations.len() < MIN_OBSERVATIONS {
         return update;
@@ -457,7 +338,7 @@ pub fn run_local_inertial_ba(
     // that did converge), not diverging. Give it more room.
     let vi_result = match visual_inertial_bundle_adjust(
         &vi_keyframes,
-        &points,
+        &window.positions,
         &observations,
         &imu_edges,
         camera,
@@ -480,13 +361,94 @@ pub fn run_local_inertial_ba(
         update.keyframes[kf_idx].imu_bias = vi_kf.bias;
     }
 
-    for (local_idx, &global_idx) in mp_global_indices.iter().enumerate() {
-        if let Some(mp) = update.map_points.get_mut(global_idx) {
-            *mp = vi_result.points[local_idx];
-        }
-    }
+    window.write_back(&vi_result.points, &mut update.map_points);
     update
 }
+
+/// Live landmarks a BA window observes, ordered by ascending map index; a
+/// landmark's position in `global` is its solver index.
+struct WindowPoints {
+    global: Vec<usize>,
+    local_of: HashMap<usize, usize>,
+    positions: Vec<Vec3F64>,
+}
+
+impl WindowPoints {
+    fn collect<'a>(
+        snapshot: &BaSnapshot,
+        keyframes: impl IntoIterator<Item = &'a Keyframe>,
+    ) -> Self {
+        let mut unique: HashSet<usize> = HashSet::new();
+        for kf in keyframes {
+            for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
+                if let Some(mp) = snapshot.map_points().get(*mp_idx)
+                    && !mp.culled
+                {
+                    unique.insert(*mp_idx);
+                }
+            }
+        }
+        let mut global: Vec<usize> = unique.into_iter().collect();
+        global.sort_unstable();
+        let local_of = global
+            .iter()
+            .enumerate()
+            .map(|(local, &global)| (global, local))
+            .collect();
+        let positions = global
+            .iter()
+            .map(|&idx| snapshot.map_points()[idx].position)
+            .collect();
+        Self {
+            global,
+            local_of,
+            positions,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.global.is_empty()
+    }
+
+    /// Reprojection (and stereo depth) observations of the window's landmarks
+    /// from each `(pose_idx, keyframe, fixed)` in order.
+    fn observations<'a>(
+        &self,
+        poses: impl IntoIterator<Item = (usize, &'a Keyframe, bool)>,
+        camera: &PinholeCamera,
+    ) -> Vec<BaObservation> {
+        let mut observations = Vec::new();
+        for (pose_idx, kf, fixed_pose) in poses {
+            for (desc_idx, mp_opt) in kf.map_point_by_desc_idx.iter().enumerate() {
+                let Some(&point_idx) = mp_opt.and_then(|mp_idx| self.local_of.get(&mp_idx)) else {
+                    continue;
+                };
+                if let Some(pixel) = kf.frame.undistorted_xy(desc_idx, camera) {
+                    let (depth_meas, depth_sigma) = stereo_depth_obs(kf, desc_idx);
+                    observations.push(BaObservation {
+                        pose_idx,
+                        point_idx,
+                        pixel,
+                        fixed_pose,
+                        fixed_point: false,
+                        depth_meas,
+                        depth_sigma,
+                    });
+                }
+            }
+        }
+        observations
+    }
+
+    fn write_back(&self, optimized: &[Vec3F64], map_points: &mut [Vec3F64]) {
+        for (&global_idx, point) in self.global.iter().zip(optimized) {
+            if let Some(mp) = map_points.get_mut(global_idx) {
+                *mp = *point;
+            }
+        }
+    }
+}
+
 /// Depth measurement + sigma for a BA observation at `desc_idx` of `kf`.
 ///
 /// Returns `(Some(z), sigma)` when the keyframe's keypoint has a valid stereo
