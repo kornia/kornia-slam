@@ -1,4 +1,5 @@
-//! What to do with a frame offered to monocular bootstrap.
+//! Bootstrap: deciding what a frame offered to initialization is worth, and
+//! building the initial map from it.
 //!
 //! The decision is separated from acting on it: [`evaluate_bootstrap`] reads
 //! the reference frame and the incoming one and says which case this is, and
@@ -6,6 +7,10 @@
 //! apart matters here because the cases differ in how they treat the stored
 //! reference — one drops it, one keeps it, one consumes it — and that was
 //! previously expressed as scattered assignments amongst early returns.
+//!
+//! [`stereo_initial_map`] and [`two_view_initial_map`] build the initial map
+//! as one [`MapInsertion`] without touching the map; publishing it, and the
+//! state that follows, stay with the caller.
 
 use std::collections::HashSet;
 
@@ -16,10 +21,22 @@ use crate::initialization::two_view::{
     TwoViewEstimate, TwoViewInitConfig, TwoViewRejectReason, try_initialize_two_view,
 };
 use crate::mapping::Map;
+use crate::mapping::growth::{accepted_pair_claims, stereo_seeds};
+use crate::mapping::map::{
+    Keyframe, LandmarkSeed, LandmarkTarget, MapInsertion, ObservationKey, ObservationLink,
+};
+use kornia_algebra::Vec3F64;
 
 /// A frame with fewer keypoints than this is neither a viable reference nor a
 /// viable current frame (mirrors ORB-SLAM3's `MonocularInitialization`).
 pub(crate) const MIN_KEYPOINTS_FOR_BOOTSTRAP: usize = 100;
+
+/// Fewest stereo points a single keyframe needs to seed a metric map.
+pub(crate) const MIN_STEREO_POINTS: usize = 50;
+
+/// Fewest landmarks with positive depth in both bootstrap keyframes for the
+/// two-view map to be kept (ORB-SLAM3's `CreateInitialMapMonocular`).
+pub(crate) const MIN_VALID_POINTS: usize = 50;
 
 /// What the caller should do with the frame it offered.
 pub(crate) enum BootstrapDecision {
@@ -75,6 +92,115 @@ pub(crate) fn evaluate_bootstrap(
     }
 }
 
+/// A stereo keyframe with too few valid depths to seed the initial map.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TooFewStereoPoints {
+    pub(crate) found: usize,
+}
+
+/// The initial map from a single stereo keyframe: every keypoint with valid
+/// depth becomes a metric landmark (ORB-SLAM3's `StereoInitialization`).
+///
+/// `camera` must be the rectified camera the depths were computed against.
+pub(crate) fn stereo_initial_map(
+    keyframe: Keyframe,
+    camera: &PinholeCamera,
+) -> Result<MapInsertion, TooFewStereoPoints> {
+    let landmarks = stereo_seeds(&keyframe.frame, camera, f64::INFINITY, &[]);
+    if landmarks.len() < MIN_STEREO_POINTS {
+        return Err(TooFewStereoPoints {
+            found: landmarks.len(),
+        });
+    }
+    Ok(MapInsertion {
+        keyframes: vec![keyframe],
+        landmarks,
+        ..Default::default()
+    })
+}
+
+/// The initial map from an accepted two-view estimate: both keyframes, the
+/// triangulated landmarks, and each landmark's second observation.
+///
+/// Points are rescaled so the median depth is one, and landmarks are
+/// referenced to the newer keyframe, as ORB-SLAM3 creates them.
+pub(crate) fn two_view_initial_map(
+    reference: Keyframe,
+    current: Keyframe,
+    estimate: &TwoViewEstimate,
+) -> MapInsertion {
+    let depth_scale = estimate.median_depth.filter(|&d| d > 1e-6).unwrap_or(1.0);
+    let reference_pose_inv = reference.frame.pose_world_to_cam.inverse();
+    let reference_kf_idx = reference.frame.idx;
+    let current_kf_idx = current.frame.idx;
+    let matches = &estimate.estimate.matches;
+
+    let mut candidates: Vec<(Vec3F64, [u8; 3], usize, usize)> = Vec::new();
+    for (p_cam, &match_idx) in estimate.points3d.iter().zip(estimate.inlier_indices.iter()) {
+        let Some(&(ref_desc_idx, curr_desc_idx)) = matches.get(match_idx) else {
+            continue;
+        };
+        if ref_desc_idx >= reference.map_point_by_desc_idx.len()
+            || curr_desc_idx >= current.map_point_by_desc_idx.len()
+        {
+            continue;
+        }
+        if current
+            .frame
+            .features
+            .descriptors
+            .get(curr_desc_idx)
+            .or_else(|| reference.frame.features.descriptors.get(ref_desc_idx))
+            .is_none()
+        {
+            continue;
+        }
+        let color = current
+            .frame
+            .keypoint_colors
+            .get(curr_desc_idx)
+            .copied()
+            .unwrap_or([128; 3]);
+        let position = reference_pose_inv.transform_point(&(*p_cam / depth_scale));
+        candidates.push((position, color, ref_desc_idx, curr_desc_idx));
+    }
+
+    // The two-view result can name one feature twice — two triangulated
+    // points landing on the same keypoint in either view. A feature holds
+    // at most one landmark, so the first claim wins and the rest are
+    // dropped, as in pair growth; refusing the whole pair instead would
+    // throw away an otherwise good bootstrap for one duplicate.
+    let claims: Vec<(usize, usize)> = candidates
+        .iter()
+        .map(|&(_, _, ref_desc_idx, curr_desc_idx)| (ref_desc_idx, curr_desc_idx))
+        .collect();
+
+    // Both keyframes publish in the same request as the landmarks, so the
+    // reference keyframe each second observation points at arrives with it.
+    let mut request = MapInsertion::default();
+    for index in accepted_pair_claims(&claims) {
+        let (position, color, ref_desc_idx, curr_desc_idx) = candidates[index];
+        let new_index = request.landmarks.len();
+        request.landmarks.push(LandmarkSeed {
+            position,
+            color,
+            reference: ObservationKey {
+                keyframe_idx: current_kf_idx,
+                feature_idx: curr_desc_idx,
+            },
+        });
+        request.observations.push(ObservationLink {
+            observation: ObservationKey {
+                keyframe_idx: reference_kf_idx,
+                feature_idx: ref_desc_idx,
+            },
+            landmark: LandmarkTarget::New(new_index),
+        });
+    }
+    request.keyframes = vec![reference, current];
+    request
+}
+
 /// Quality metrics for a freshly-bootstrapped 2-keyframe map.
 ///
 /// Used as the gate for accepting a bootstrap result. Mirrors
@@ -86,6 +212,13 @@ pub struct InitialMapHealth {
     pub valid_in_both: usize,
     /// Median depth of valid points in the older KF's frame.
     pub median_depth_older_kf: f64,
+}
+
+impl InitialMapHealth {
+    /// Whether the map meets ORB-SLAM3's reset criteria and must be discarded.
+    pub fn is_degenerate(&self) -> bool {
+        self.valid_in_both < MIN_VALID_POINTS || self.median_depth_older_kf <= 0.0
+    }
 }
 
 /// Health metrics for the just-bootstrapped pair of keyframes.
@@ -150,10 +283,17 @@ pub fn initial_map_health(map: &Map) -> InitialMapHealth {
 
 #[cfg(test)]
 mod tests {
-    use super::{BootstrapDecision, MIN_KEYPOINTS_FOR_BOOTSTRAP, evaluate_bootstrap};
+    use super::{
+        BootstrapDecision, MIN_KEYPOINTS_FOR_BOOTSTRAP, MIN_STEREO_POINTS, evaluate_bootstrap,
+        stereo_initial_map, two_view_initial_map,
+    };
     use crate::Frame;
+    use crate::initialization::two_view::TwoViewEstimate;
+    use crate::mapping::map::{Keyframe, LandmarkTarget};
+    use crate::tracking::pose_estimation::Estimate;
     use kornia_3d::camera::PinholeCamera;
     use kornia_3d::pose::Pose3d;
+    use kornia_algebra::Vec3F64;
     use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbFeatures;
 
@@ -267,5 +407,73 @@ mod tests {
         assert_eq!(reference.features.keypoints_xy.len(), reference_before);
         assert_eq!(current.features.keypoints_xy.len(), current_before);
         assert_eq!(reference.pose_world_to_cam, Pose3d::IDENTITY);
+    }
+
+    fn stereo_frame(idx: usize, valid_depths: usize) -> Frame {
+        let mut frame = frame(idx, valid_depths + 5);
+        frame.depth = (0..valid_depths + 5)
+            .map(|i| if i < valid_depths { 2.0 } else { -1.0 })
+            .collect();
+        frame
+    }
+
+    #[test]
+    fn a_stereo_frame_needs_enough_valid_depths_to_seed_a_map() {
+        let too_few = stereo_frame(1, MIN_STEREO_POINTS - 1);
+        let error = stereo_initial_map(Keyframe::from_frame(too_few), &camera()).unwrap_err();
+        assert_eq!(error.found, MIN_STEREO_POINTS - 1);
+
+        let insertion = stereo_initial_map(
+            Keyframe::from_frame(stereo_frame(1, MIN_STEREO_POINTS)),
+            &camera(),
+        )
+        .unwrap();
+        assert_eq!(insertion.keyframes.len(), 1);
+        assert_eq!(insertion.landmarks.len(), MIN_STEREO_POINTS);
+        assert!(insertion.observations.is_empty());
+    }
+
+    #[test]
+    fn a_two_view_map_keeps_the_first_claim_on_each_feature_and_normalizes_depth() {
+        let reference = Keyframe::from_frame(frame(3, 500));
+        let current = Keyframe::from_frame(frame(4, 500));
+        let estimate = TwoViewEstimate {
+            estimate: Estimate {
+                pose: Pose3d::IDENTITY,
+                // Match 1 reuses reference feature 10; match 2 is out of range.
+                matches: vec![(10, 20), (10, 21), (11, 999), (12, 22)],
+                inliers: 4,
+            },
+            points3d: vec![
+                Vec3F64::new(0.0, 0.0, 4.0),
+                Vec3F64::new(0.0, 0.0, 4.0),
+                Vec3F64::new(0.0, 0.0, 4.0),
+                Vec3F64::new(0.0, 0.0, 8.0),
+            ],
+            inlier_indices: vec![0, 1, 2, 3],
+            median_depth: Some(4.0),
+            model_kind: 'F',
+        };
+
+        let insertion = two_view_initial_map(reference, current, &estimate);
+
+        assert_eq!(insertion.keyframes.len(), 2);
+        let features: Vec<usize> = insertion
+            .landmarks
+            .iter()
+            .map(|seed| seed.reference.feature_idx)
+            .collect();
+        assert_eq!(features, vec![20, 22]);
+        assert!(
+            insertion
+                .landmarks
+                .iter()
+                .all(|seed| seed.reference.keyframe_idx == 4)
+        );
+        assert_eq!(insertion.landmarks[0].position.z, 1.0);
+        assert_eq!(insertion.landmarks[1].position.z, 2.0);
+        assert!(insertion.observations.iter().all(|link| {
+            link.observation.keyframe_idx == 3 && matches!(link.landmark, LandmarkTarget::New(_))
+        }));
     }
 }
