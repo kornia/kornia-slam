@@ -1,8 +1,11 @@
-//! Coordination of the optional mapping work an accepted keyframe earns.
+//! Mapping work for an accepted keyframe: its core insertion, and the optional
+//! work it earns afterwards.
 //!
-//! Admission, core publication and the tracker/IMU lifecycle stay with the
-//! system. What belongs here is the sequence mapping owns: which neighbours to
-//! grow against, growing each pair, then extending observations into those
+//! [`keyframe_insertion`] builds the core request — the keyframe, its tracked
+//! links, its close stereo seeds and its IMU edge — without touching the map.
+//! Admission, publishing that request and the tracker/IMU lifecycle stay with
+//! the system. The rest is the sequence mapping owns: which neighbours to grow
+//! against, growing each pair, then extending observations into those
 //! neighbours. None of it is allowed to undo the accepted keyframe.
 //!
 //! ## Why a `Mutex` and not `&mut Map`
@@ -21,7 +24,73 @@ use kornia_3d::pose::TriangulationConfig;
 use kornia_imgproc::features::OrbMatchConfig;
 
 use crate::mapping::growth;
-use crate::mapping::map::{LandmarkTarget, Map, MapMutationError};
+use crate::mapping::map::{
+    ImuFactor, Keyframe, LandmarkTarget, Map, MapInsertion, MapMutationError, ObservationKey,
+    ObservationLink,
+};
+
+/// The core request for an accepted keyframe, and how many of its landmarks
+/// are close stereo seeds.
+pub(crate) struct KeyframeInsertion {
+    pub insertion: MapInsertion,
+    pub close_points: usize,
+}
+
+/// Builds the core insertion for `keyframe`, published as one validated batch.
+///
+/// `tracked` holds `(landmark, feature)` matches from tracking. With
+/// `stereo_close_depth` set, close stereo keypoints (`z <= threshold`, metres)
+/// become metric landmarks directly; far ones are left to pair growth,
+/// mirroring ORB-SLAM3's `CreateNewKeyFrame`.
+pub(crate) fn keyframe_insertion(
+    keyframe: Keyframe,
+    tracked: &[(usize, usize)],
+    stereo_close_depth: Option<f64>,
+    camera: &PinholeCamera,
+    imu_edge: Option<ImuFactor>,
+) -> KeyframeInsertion {
+    let keyframe_idx = keyframe.frame.idx;
+    // Tracked links are recorded as claims first, so stereo seeding cannot
+    // take a feature tracking already owns.
+    let mut claimed: Vec<Option<usize>> = vec![None; keyframe.frame.features.descriptors.len()];
+    let mut insertion = MapInsertion::default();
+    // One feature per landmark and one landmark per feature; a repeat would
+    // otherwise refuse the whole keyframe.
+    //
+    // Out-of-range features are dropped *before* resolution: a claim that
+    // cannot be published must not win its landmark and suppress a valid
+    // later claim on the same one.
+    let tracked_claims: Vec<(usize, usize)> = tracked
+        .iter()
+        .copied()
+        .filter(|&(_, feature_idx)| feature_idx < claimed.len())
+        .collect();
+    for index in growth::accepted_pair_claims(&tracked_claims) {
+        let (landmark_idx, feature_idx) = tracked_claims[index];
+        claimed[feature_idx] = Some(landmark_idx);
+        insertion.observations.push(ObservationLink {
+            observation: ObservationKey {
+                keyframe_idx,
+                feature_idx,
+            },
+            landmark: LandmarkTarget::Existing(landmark_idx),
+        });
+    }
+
+    if let Some(threshold) = stereo_close_depth
+        && keyframe.frame.is_stereo()
+    {
+        insertion.landmarks = growth::stereo_seeds(&keyframe.frame, camera, threshold, &claimed);
+    }
+    let close_points = insertion.landmarks.len();
+    insertion.keyframes.push(keyframe);
+    insertion.imu_factors.extend(imu_edge);
+
+    KeyframeInsertion {
+        insertion,
+        close_points,
+    }
+}
 
 /// Neighbours captured before the core keyframe is published.
 ///
@@ -168,6 +237,55 @@ mod tests {
     use kornia_algebra::Vec3F64;
     use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbFeatures;
+
+    fn stereo_keyframe(idx: usize, depths: Vec<f32>) -> Keyframe {
+        let mut frame = empty_frame(idx);
+        let n = depths.len();
+        frame.features.keypoints_xy = vec![[320.0, 240.0]; n];
+        frame.features.orientations = vec![0.0; n];
+        frame.features.descriptors = vec![[0; 32]; n];
+        frame.features.octaves = vec![0; n];
+        frame.depth = depths;
+        Keyframe::from_frame(frame)
+    }
+
+    /// Tracked links claim their features first, so a close stereo point on a
+    /// tracked feature is not seeded twice; far points are left to growth.
+    #[test]
+    fn keyframe_insertion_seeds_only_close_unclaimed_stereo_points() {
+        let keyframe = stereo_keyframe(9, vec![2.0, 2.0, 30.0, 2.0]);
+        // Landmark 5 is claimed twice and feature 99 is out of range.
+        let tracked = [(5, 0), (5, 3), (6, 99)];
+
+        let KeyframeInsertion {
+            insertion,
+            close_points,
+        } = keyframe_insertion(keyframe, &tracked, Some(10.0), &camera(), None);
+
+        assert_eq!(insertion.observations.len(), 1);
+        assert_eq!(insertion.observations[0].observation.feature_idx, 0);
+        assert!(matches!(
+            insertion.observations[0].landmark,
+            LandmarkTarget::Existing(5)
+        ));
+        let seeded: Vec<usize> = insertion
+            .landmarks
+            .iter()
+            .map(|seed| seed.reference.feature_idx)
+            .collect();
+        assert_eq!(seeded, vec![1, 3]);
+        assert_eq!(close_points, 2);
+        assert_eq!(insertion.keyframes.len(), 1);
+        assert!(insertion.imu_factors.is_empty());
+    }
+
+    #[test]
+    fn keyframe_insertion_skips_stereo_seeds_when_densification_is_off() {
+        let keyframe = stereo_keyframe(9, vec![2.0, 2.0]);
+        let KeyframeInsertion { close_points, .. } =
+            keyframe_insertion(keyframe, &[], None, &camera(), None);
+        assert_eq!(close_points, 0);
+    }
 
     fn camera() -> PinholeCamera {
         PinholeCamera {

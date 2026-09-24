@@ -28,10 +28,8 @@ use crate::initialization::bootstrap::{
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::place_recognition::Vocabulary;
 use crate::loop_closure::{LoopCloser, LoopClosingContext, LoopClosureEvent};
-use crate::mapping::map::{
-    Keyframe, LandmarkTarget, Map, MapInsertion, MapMutationError, MapPoint, ObservationKey,
-    ObservationLink,
-};
+use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
+use crate::mapping::map::{Keyframe, Map, MapInsertion, MapMutationError, MapPoint};
 use crate::mapping::{KeyframeJob, LocalMapping};
 use crate::pose_conversion::apply_reference_pose_correction;
 use crate::sensor_rig::{ImuCalibration, SensorRig};
@@ -799,14 +797,8 @@ impl SlamSystem {
         }
 
         let mut curr_kf = Keyframe::from_frame(Frame {
-            idx: frame.idx,
-            features: frame.features.clone(),
             pose_world_to_cam: self.state.pose_world_to_cam,
-            image_size: frame.image_size,
-            keypoint_colors: frame.keypoint_colors.clone(),
-            u_right: frame.u_right.clone(),
-            depth: frame.depth.clone(),
-            keypoints_undist: frame.keypoints_undist.clone(),
+            ..frame.clone()
         });
         // Seed the new keyframe with the IMU-propagated velocity and current bias
         // estimate so that VI-BA starts from a reasonable linearisation point rather
@@ -816,76 +808,40 @@ impl SlamSystem {
             curr_kf.imu_bias = self.inertial.bias;
         }
         let imu_initialized = self.state.imu_initialized;
+        let is_stereo = curr_kf.frame.is_stereo();
 
         // Neighbours are captured BEFORE publication: growing against a list
         // that already contains the current keyframe would triangulate it
         // against itself and drop the oldest real neighbour. Selection policy
         // belongs to mapping.
-        let growth_plan = crate::mapping::keyframe_mapping::prepare_keyframe_growth(
-            &self.map.lock().unwrap(),
-            frame.idx,
-        );
+        let growth_plan =
+            keyframe_mapping::prepare_keyframe_growth(&self.map.lock().unwrap(), frame.idx);
 
-        // Core publication: the keyframe, its tracked links, the close stereo
-        // seeds and the IMU edge go in as one validated batch. Tracked links are
-        // recorded as claims first, so stereo seeding cannot take a feature
-        // tracking already owns.
-        let mut claimed: Vec<Option<usize>> = vec![None; frame.features.descriptors.len()];
-        let mut core = MapInsertion::default();
-        // One feature per landmark and one landmark per feature; a repeat would
-        // otherwise refuse the whole keyframe.
-        //
-        // Out-of-range features are dropped *before* resolution: a claim that
-        // cannot be published must not win its landmark and suppress a valid
-        // later claim on the same one.
-        let tracked_claims: Vec<(usize, usize)> = matches
-            .iter()
-            .copied()
-            .filter(|&(_, curr_idx)| curr_idx < claimed.len())
-            .collect();
-        for index in crate::mapping::growth::accepted_pair_claims(&tracked_claims) {
-            let (mp_idx, curr_idx) = tracked_claims[index];
-            claimed[curr_idx] = Some(mp_idx);
-            core.observations.push(ObservationLink {
-                observation: ObservationKey {
-                    keyframe_idx: frame.idx,
-                    feature_idx: curr_idx,
-                },
-                landmark: LandmarkTarget::Existing(mp_idx),
-            });
-        }
-
-        // Stereo densification: close stereo keypoints become metric landmarks
-        // directly. Far points are left to the pair-growth pass, mirroring
-        // ORB-SLAM3's CreateNewKeyFrame.
-        if let Some(mthdepth) = self.stereo_close_depth
-            && curr_kf.frame.is_stereo()
-        {
-            core.landmarks = crate::mapping::growth::stereo_seeds(
-                &curr_kf.frame,
-                &self.rig.camera,
-                mthdepth,
-                &claimed,
-            );
-        }
-        let n_close = core.landmarks.len();
-        let is_stereo = curr_kf.frame.is_stereo();
-        core.keyframes.push(curr_kf);
-
-        if let (Some(prev_kf_idx), Some(prev_ts)) = (
+        let imu_edge = match (
             self.state.last_keyframe_idx,
             self.inertial.last_keyframe_timestamp_sec,
         ) {
-            core.imu_factors.extend(self.inertial.keyframe_edge(
+            (Some(prev_kf_idx), Some(prev_ts)) => self.inertial.keyframe_edge(
                 self.rig.imu_noise(),
                 prev_kf_idx,
                 frame.idx,
                 prev_ts,
                 timestamp_sec,
-            ));
-        }
+            ),
+            _ => None,
+        };
+        let KeyframeInsertion {
+            insertion,
+            close_points: n_close,
+        } = keyframe_mapping::keyframe_insertion(
+            curr_kf,
+            matches,
+            self.stereo_close_depth,
+            &self.rig.camera,
+            imu_edge,
+        );
 
-        let published = self.map.lock().unwrap().apply_insertion(core);
+        let published = self.map.lock().unwrap().apply_insertion(insertion);
         if let Err(error) = published {
             // Nothing was written, so no tracker or IMU reference may advance to
             // a keyframe the map does not hold.
@@ -911,30 +867,14 @@ impl SlamSystem {
         // captured neighbours, then forward SearchInNeighbors / Fuse, before
         // local BA so BA sees the extra constraints. Mapping owns the sequence
         // and its lock boundaries; the messages stay here.
-        let growth = crate::mapping::keyframe_mapping::grow_keyframe(
+        let growth = keyframe_mapping::grow_keyframe(
             &self.map,
             growth_plan,
             &self.rig.camera,
             self.two_view_init_config.match_config,
             &self.two_view_init_config.triangulation_config,
         );
-        for failure in &growth.pair_failures {
-            self.dbg(format!(
-                "[kf] frame={} pair growth against {} rejected: {}",
-                frame.idx, failure.neighbor_keyframe_idx, failure.error
-            ));
-        }
-        self.dbg(format!(
-            "[kf] frame={} grown={} from {} neighbor kfs",
-            frame.idx, growth.landmarks_added, growth.neighbor_count
-        ));
-        self.dbg(format!(
-            "[fuse] frame={} fused={}",
-            frame.idx, growth.observations_added
-        ));
-        for error in &growth.fusion_failures {
-            self.dbg(format!("[fuse] frame={} link refused: {error}", frame.idx));
-        }
+        self.report_growth(frame.idx, &growth);
 
         // Refinement can rotate/scale the world and update gravity. Do it before
         // constructing the BA request so the job and its future snapshot agree.
@@ -958,6 +898,29 @@ impl SlamSystem {
         self.register_place_recognition(frame.idx);
 
         true
+    }
+
+    fn report_growth(&mut self, frame_idx: usize, growth: &KeyframeGrowthResult) {
+        if !self.debug {
+            return;
+        }
+        for failure in &growth.pair_failures {
+            self.dbg(format!(
+                "[kf] frame={frame_idx} pair growth against {} rejected: {}",
+                failure.neighbor_keyframe_idx, failure.error
+            ));
+        }
+        self.dbg(format!(
+            "[kf] frame={frame_idx} grown={} from {} neighbor kfs",
+            growth.landmarks_added, growth.neighbor_count
+        ));
+        self.dbg(format!(
+            "[fuse] frame={frame_idx} fused={}",
+            growth.observations_added
+        ));
+        for error in &growth.fusion_failures {
+            self.dbg(format!("[fuse] frame={frame_idx} link refused: {error}"));
+        }
     }
 
     /// VIBA1/VIBA2: progressive re-solves with relaxed priors over the same
