@@ -35,7 +35,7 @@ pub struct KfConst {
 }
 
 impl KfConst {
-    /// Mirrors `vi_ba_schur::body_frame` (`crates/kornia-slam/src/vi_ba_schur.rs:364-383`):
+    /// Mirrors `vi_ba_schur::body_frame` (`crates/kornia-slam/src/mapping/vi_ba_schur.rs`):
     /// `R_bw = R_bc · R_cw`, `t_wb = -R_bw^T · (R_bc·t_cw + t_bc)`.
     pub fn new(pose_world_to_cam: &Pose3d, imu_t_bc: &Pose3d) -> Self {
         let r_bc = imu_t_bc.rotation;

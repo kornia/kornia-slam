@@ -18,7 +18,7 @@ use kornia_bow::BoW;
 use kornia_bow::orb_slam3::{OrbVocabulary, pack_orb_descriptor};
 
 // Re-export so downstream crates can load and hold a vocabulary through
-// `kornia_slam::place_recognition` without depending on `kornia-bow` directly.
+// `kornia_slam::loop_closure::place_recognition` without depending on `kornia-bow` directly.
 pub use kornia_bow::BoW as BagOfWords;
 pub use kornia_bow::orb_slam3::{OrbVocabulary as Vocabulary, load_orb_slam3_vocabulary};
 

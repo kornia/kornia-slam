@@ -1,8 +1,8 @@
 use super::*;
 use crate::Frame;
+use crate::loop_closure::sparse_pgo::{Se3Manifold, sparse_pose_graph_optimize};
 use crate::mapping::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
 use crate::pose_conversion::pose_to_se3;
-use crate::sparse_pgo::{Se3Manifold, sparse_pose_graph_optimize};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pgo::{PgoEdge, PgoParams, pose_graph_optimize};
 use kornia_3d::pnp::RansacParams;
@@ -615,7 +615,9 @@ fn closing_fixture(config: Option<LoopClosingConfig>) -> (LoopCloser, Map) {
         .map(kornia_bow::orb_slam3::pack_orb_descriptor)
         .collect();
     let mut closer = LoopCloser::new(config);
-    closer.set_vocabulary(crate::place_recognition::Vocabulary::train(&descriptors, 1).unwrap());
+    closer.set_vocabulary(
+        crate::loop_closure::place_recognition::Vocabulary::train(&descriptors, 1).unwrap(),
+    );
     let context = closing_context(&map);
     let first = closer.on_keyframe(&mut map, &camera(), 0, context);
     assert!(first.events.is_empty());

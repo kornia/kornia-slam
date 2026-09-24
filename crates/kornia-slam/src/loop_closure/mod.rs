@@ -4,7 +4,9 @@
 mod closer;
 mod episode;
 mod fusion;
+pub mod place_recognition;
 mod pose_graph;
+mod sparse_pgo;
 mod verification;
 
 pub(crate) use closer::{LoopCloser, LoopClosingContext};

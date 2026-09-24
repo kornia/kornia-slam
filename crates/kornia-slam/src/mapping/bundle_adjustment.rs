@@ -290,7 +290,7 @@ pub fn run_local_inertial_ba(
 ) -> BaUpdate {
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
-    use crate::vi_ba_schur::{
+    use crate::mapping::vi_ba_schur::{
         ImuFactor as ViBaImuFactor, ViBaKeyframe, ViBaParams, visual_inertial_bundle_adjust,
     };
 

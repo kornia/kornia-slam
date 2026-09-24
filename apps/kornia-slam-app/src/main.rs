@@ -525,7 +525,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut system = SlamSystem::new(camera.clone(), slam_config);
     if let Some(vocab_path) = args.vocab.as_deref() {
-        use kornia_slam::place_recognition::{Vocabulary, load_orb_slam3_vocabulary};
+        use kornia_slam::loop_closure::place_recognition::{Vocabulary, load_orb_slam3_vocabulary};
         let vocab = if vocab_path.ends_with(".txt") {
             load_orb_slam3_vocabulary(vocab_path)
                 .map_err(|e| format!("failed to load text vocabulary {vocab_path}: {e}"))?
