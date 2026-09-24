@@ -6,6 +6,7 @@
 
 use crate::initialization::{ImuInitConfig, ImuInitResult, ImuInitializer};
 use crate::mapping::Map;
+use crate::mapping::map::ImuFactor;
 use crate::tracking::SystemState;
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
@@ -17,6 +18,7 @@ pub(super) struct InertialState {
     pub(super) bootstrap_timestamp_sec: Option<f64>,
     pub(super) last_keyframe_timestamp_sec: Option<f64>,
     pub(super) initializer: ImuInitializer,
+    pub(super) schedule: InertialInitSchedule,
     pending_samples: Vec<ImuMeasurement>,
 }
 
@@ -37,6 +39,7 @@ impl InertialState {
                 min_time_sec: 1.0,
                 min_motion: 0.05,
             }),
+            schedule: InertialInitSchedule::default(),
             pending_samples: Vec::new(),
         }
     }
@@ -64,6 +67,27 @@ impl InertialState {
             .collect();
         let pre = PreintegratedImu::from_measurements(self.bias, noise, &samples, t0, t1);
         (pre, samples)
+    }
+
+    /// The IMU edge between two keyframes, carrying its raw samples for later
+    /// repropagation, or `None` when the window holds no time.
+    pub(super) fn keyframe_edge(
+        &self,
+        noise: ImuCalib,
+        prev_kf_idx: usize,
+        curr_kf_idx: usize,
+        t0: f64,
+        t1: f64,
+    ) -> Option<ImuFactor> {
+        let (preintegrated, raw_samples) = self.preintegrate_window(noise, t0, t1);
+        (preintegrated.dt > 0.0).then_some(ImuFactor {
+            prev_kf_idx,
+            curr_kf_idx,
+            preintegrated,
+            raw_samples,
+            t0,
+            t1,
+        })
     }
 
     /// Drops buffered samples strictly older than `timestamp` (typically the
@@ -101,6 +125,101 @@ impl InertialState {
     }
 }
 
+/// When inertial initialization runs: the keyframe window it solves over, the
+/// throttle on VIBA0 retries, and the one-shot VIBA1/VIBA2 refinements.
+#[derive(Debug, Default)]
+pub(super) struct InertialInitSchedule {
+    start_kf_idx: Option<usize>,
+    /// ORB-SLAM3's `mFirstTs`; the refinements are gated on `mTinit`, the time
+    /// since it (LocalMapping.cc:200-228).
+    window_start_sec: Option<f64>,
+    last_attempt_sec: Option<f64>,
+    // Each refinement fires at most once, mirroring ORB-SLAM3's
+    // `GetIniertialBA1()`/`GetIniertialBA2()` latches.
+    viba1_done: bool,
+    viba2_done: bool,
+}
+
+/// A progressive re-solve over the initialization window, with relaxed priors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Refinement {
+    Viba1,
+    Viba2,
+}
+
+impl Refinement {
+    /// Kept at VIBA2 because this pipeline lacks the intervening pose-adjusting
+    /// inertial BA that lets ORB-SLAM3 safely remove the prior (kornia-slam#51).
+    const PRIOR_A: f64 = 1e5;
+
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Viba1 => "VIBA1",
+            Self::Viba2 => "VIBA2",
+        }
+    }
+
+    pub(super) fn prior_g(self) -> f64 {
+        match self {
+            Self::Viba1 => 1.0,
+            Self::Viba2 => 0.0,
+        }
+    }
+
+    pub(super) fn prior_a(self) -> f64 {
+        Self::PRIOR_A
+    }
+}
+
+impl InertialInitSchedule {
+    /// Opens a new window at `kf_idx`, re-arming both refinements.
+    pub(super) fn start(&mut self, kf_idx: usize, timestamp_sec: f64) {
+        self.start_kf_idx = Some(kf_idx);
+        self.window_start_sec = Some(timestamp_sec);
+        self.viba1_done = false;
+        self.viba2_done = false;
+    }
+
+    pub(super) fn start_kf_idx(&self) -> Option<usize> {
+        self.start_kf_idx
+    }
+
+    pub(super) fn retry_due(&self, timestamp_sec: f64) -> bool {
+        due_for_retry(self.last_attempt_sec, timestamp_sec)
+    }
+
+    pub(super) fn record_attempt(&mut self, timestamp_sec: f64) {
+        self.last_attempt_sec = Some(timestamp_sec);
+    }
+
+    /// The refinement due at `timestamp_sec`: VIBA1 after 5 s of window, VIBA2
+    /// after 15 s, and nothing once the window is 50 s old.
+    pub(super) fn due_refinement(&self, timestamp_sec: f64) -> Option<Refinement> {
+        let (Some(_), Some(window_start_sec)) = (self.start_kf_idx, self.window_start_sec) else {
+            return None;
+        };
+        let mtinit = timestamp_sec - window_start_sec;
+        if mtinit >= 50.0 {
+            return None;
+        }
+        if !self.viba1_done && mtinit > 5.0 {
+            Some(Refinement::Viba1)
+        } else if self.viba1_done && !self.viba2_done && mtinit > 15.0 {
+            Some(Refinement::Viba2)
+        } else {
+            None
+        }
+    }
+
+    /// Marks a refinement as spent, whether or not its solve was accepted.
+    pub(super) fn complete(&mut self, refinement: Refinement) {
+        match refinement {
+            Refinement::Viba1 => self.viba1_done = true,
+            Refinement::Viba2 => self.viba2_done = true,
+        }
+    }
+}
+
 /// Re-attempt interval for inertial initialization, in seconds of new data.
 ///
 /// Without a throttle, once `ready()` is true a rejected attempt keeps the mode
@@ -134,7 +253,9 @@ pub(super) struct AppliedInitialization {
 
 #[cfg(test)]
 mod tests {
-    use super::{InertialState, due_for_retry, viba0_accel_bias_prior};
+    use super::{
+        InertialInitSchedule, InertialState, Refinement, due_for_retry, viba0_accel_bias_prior,
+    };
     use kornia_algebra::Vec3F64;
     use kornia_sensors::imu::{ImuCalib, ImuMeasurement};
 
@@ -223,5 +344,65 @@ mod tests {
         assert_eq!(mono, 1e10);
         assert_eq!(stereo, 1e5);
         assert!(mono > stereo);
+    }
+
+    /// VIBA1 waits for 5 s of window and VIBA2 for 15 s after VIBA1; each
+    /// fires once, and neither fires once the window is 50 s old.
+    #[test]
+    fn refinements_fire_once_each_in_order() {
+        let mut schedule = InertialInitSchedule::default();
+        assert_eq!(schedule.due_refinement(100.0), None, "no window yet");
+
+        schedule.start(7, 100.0);
+        assert_eq!(schedule.due_refinement(105.0), None);
+        assert_eq!(schedule.due_refinement(105.1), Some(Refinement::Viba1));
+        assert_eq!(
+            schedule.due_refinement(120.0),
+            Some(Refinement::Viba1),
+            "VIBA2 never runs before VIBA1"
+        );
+
+        schedule.complete(Refinement::Viba1);
+        assert_eq!(schedule.due_refinement(115.0), None);
+        assert_eq!(schedule.due_refinement(115.1), Some(Refinement::Viba2));
+
+        schedule.complete(Refinement::Viba2);
+        assert_eq!(schedule.due_refinement(130.0), None);
+    }
+
+    #[test]
+    fn refinements_stop_once_the_window_is_fifty_seconds_old() {
+        let mut schedule = InertialInitSchedule::default();
+        schedule.start(0, 0.0);
+        assert_eq!(schedule.due_refinement(49.9), Some(Refinement::Viba1));
+        assert_eq!(schedule.due_refinement(50.0), None);
+    }
+
+    /// A new window re-arms both refinements but keeps the retry throttle.
+    #[test]
+    fn starting_a_window_rearms_refinements_but_not_the_retry_throttle() {
+        let mut schedule = InertialInitSchedule::default();
+        schedule.start(0, 0.0);
+        schedule.record_attempt(10.0);
+        schedule.complete(Refinement::Viba1);
+        schedule.complete(Refinement::Viba2);
+
+        schedule.start(40, 11.0);
+        assert_eq!(schedule.start_kf_idx(), Some(40));
+        assert_eq!(schedule.due_refinement(16.5), Some(Refinement::Viba1));
+        assert!(!schedule.retry_due(12.0));
+    }
+
+    #[test]
+    fn a_keyframe_edge_needs_a_window_with_time_in_it() {
+        let mut state = InertialState::new();
+        state.buffer_samples(vec![sample(0.0), sample(0.5), sample(1.0)]);
+
+        assert!(state.keyframe_edge(noise(), 1, 2, 1.0, 1.0).is_none());
+
+        let edge = state.keyframe_edge(noise(), 1, 2, 0.0, 1.0).unwrap();
+        assert_eq!((edge.prev_kf_idx, edge.curr_kf_idx), (1, 2));
+        assert_eq!((edge.t0, edge.t1), (0.0, 1.0));
+        assert_eq!(edge.raw_samples.len(), 3);
     }
 }
