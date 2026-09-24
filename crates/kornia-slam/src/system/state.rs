@@ -28,7 +28,7 @@ pub struct TrackingResult {
 
 /// Mutable pipeline state carried across frames.
 #[derive(Debug, Clone)]
-pub struct SystemState {
+pub(crate) struct SystemState {
     pub pose_world_to_cam: Pose3d,
     pub velocity: Option<Pose3d>,
     /// Metric body velocity in the world frame (m/s); valid once `imu_initialized`.
@@ -59,7 +59,7 @@ pub struct SystemState {
 
 /// Which stage the system is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SystemMode {
+pub(crate) enum SystemMode {
     /// Bootstrap from two-view geometry before any map exists.
     Bootstrap,
     /// IMU initialization for scale and gravity

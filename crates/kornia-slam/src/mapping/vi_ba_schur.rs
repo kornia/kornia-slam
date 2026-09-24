@@ -54,20 +54,6 @@ use kornia_sensors::imu::{ImuBias, PreintegratedImu};
 
 const MIN_Z: f32 = 1e-3;
 
-/// Errors specific to the Schur BA driver. Wraps existing [`BaError`].
-#[derive(Debug, Error)]
-pub enum SchurBaError {
-    /// Linear system is rank-deficient / Cholesky failed.
-    #[error("Reduced camera Cholesky failed (likely rank-deficient): {0}")]
-    CholeskyFailed(String),
-    /// No free variables after applying anchors.
-    #[error("All variables are fixed — nothing to optimise")]
-    NoFreeVariables,
-    /// Other BA setup error.
-    #[error(transparent)]
-    Ba(#[from] BaError),
-}
-
 /// Errors specific to VI-BA.
 #[derive(Debug, Error)]
 pub enum ViBaError {
