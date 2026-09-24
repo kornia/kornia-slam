@@ -13,8 +13,9 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, QuatF64, SO3F64, Vec3F64};
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias};
 
-use crate::mapping::map::{InertialAlignment, Keyframe, KeyframeVelocity, Map};
-use crate::tracking::SystemState;
+use crate::mapping::map::{
+    InertialAlignment, InertialAlignmentError, Keyframe, KeyframeVelocity, Map,
+};
 use factor::{InertialInitFactor, KfConst, WeightedZeroPrior};
 use kornia_algebra::optim::{LevenbergMarquardt, Problem, Variable, VariableType};
 // ─────────────────────────────────────────────────────────────────────────────
@@ -138,18 +139,31 @@ impl ImuInitializer {
     }
 }
 
-impl ImuInitializer {
-    // ── apply to map & state ──────────────────────────────────────────────────
+/// Where tracking resumes after an initialization is applied: the newest
+/// window keyframe's world-to-camera pose and metric world-frame velocity.
+#[derive(Debug, Clone, Copy)]
+pub struct AlignedTrackingState {
+    pub pose_world_to_cam: Pose3d,
+    pub velocity_world: Vec3F64,
+}
 
+impl ImuInitializer {
+    // ── apply to map ──────────────────────────────────────────────────────────
+
+    /// Aligns the map to the solved scale and gravity and writes the window's
+    /// velocities and bias, then takes the new bias and canonical gravity.
+    ///
+    /// Returns where tracking resumes, or `None` if the window has no
+    /// keyframe; a refused alignment leaves the map, bias and gravity as they
+    /// were.
     pub fn apply_initialization(
         &self,
         map: &mut Map,
-        state: &mut SystemState,
         imu_bias: &mut ImuBias,
         gravity_world: &mut Vec3F64,
         init: ImuInitResult,
         start_idx: usize,
-    ) {
+    ) -> Result<Option<AlignedTrackingState>, InertialAlignmentError> {
         eprintln!(
             "[imu_init] applying: scale={:.4}  g=({:.3},{:.3},{:.3})",
             init.scale, init.gravity_world.x, init.gravity_world.y, init.gravity_world.z
@@ -178,19 +192,21 @@ impl ImuInitializer {
             bias: init.bias,
         }) {
             eprintln!("[imu_init] alignment refused, map left unchanged: {error}");
-            return;
+            return Err(error);
         }
 
-        // 4. Update the tracker state from the last initialized keyframe.
-        if let Some(last_kf) = map.keyframes().iter().rfind(|kf| kf.frame.idx >= start_idx) {
-            state.velocity_world = last_kf.velocity_world;
-            state.pose_world_to_cam = last_kf.frame.pose_world_to_cam;
-        }
-
-        state.velocity = None;
-        state.imu_initialized = true;
         *gravity_world = Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0);
         *imu_bias = init.bias;
+
+        // 4. Tracking resumes from the last initialized keyframe.
+        Ok(map
+            .keyframes()
+            .iter()
+            .rfind(|kf| kf.frame.idx >= start_idx)
+            .map(|last_kf| AlignedTrackingState {
+                pose_world_to_cam: last_kf.frame.pose_world_to_cam,
+                velocity_world: last_kf.velocity_world,
+            }))
     }
 }
 

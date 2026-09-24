@@ -1,8 +1,9 @@
-//! Tracking runtime state, mode transitions, and per-frame results.
+//! Runtime state carried across frames, the system mode, and per-frame results.
 
 use kornia_3d::pose::Pose3d;
 
 use crate::frame::Frame;
+use crate::initialization::AlignedTrackingState;
 use kornia_algebra::Vec3F64;
 
 /// Status of processing one frame.
@@ -93,10 +94,49 @@ impl SystemState {
         self.imu_init_timestamp_sec = None;
         self.velocity_world = Vec3F64::ZERO;
     }
+
+    /// Resumes tracking from an applied inertial initialization.
+    pub(crate) fn adopt_inertial_initialization(&mut self, aligned: Option<AlignedTrackingState>) {
+        if let Some(aligned) = aligned {
+            self.velocity_world = aligned.velocity_world;
+            self.pose_world_to_cam = aligned.pose_world_to_cam;
+        }
+        self.velocity = None;
+        self.imu_initialized = true;
+    }
 }
 
 impl Default for SystemState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SystemState;
+    use crate::initialization::AlignedTrackingState;
+    use kornia_3d::pose::Pose3d;
+    use kornia_algebra::Vec3F64;
+
+    #[test]
+    fn adopting_an_initialization_resumes_from_the_aligned_keyframe() {
+        let mut state = SystemState::new();
+        state.velocity = Some(Pose3d::IDENTITY);
+        let mut pose = Pose3d::IDENTITY;
+        pose.translation = Vec3F64::new(1.0, 2.0, 3.0);
+
+        state.adopt_inertial_initialization(Some(AlignedTrackingState {
+            pose_world_to_cam: pose,
+            velocity_world: Vec3F64::new(0.5, 0.0, 0.0),
+        }));
+
+        assert!(state.imu_initialized);
+        assert!(
+            state.velocity.is_none(),
+            "the visual motion model is dropped"
+        );
+        assert_eq!(state.pose_world_to_cam, pose);
+        assert_eq!(state.velocity_world, Vec3F64::new(0.5, 0.0, 0.0));
     }
 }

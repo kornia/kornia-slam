@@ -253,17 +253,11 @@ fn viba2_accel_bias_stays_bounded_under_pose_inconsistency() {
             false,
         )
         .expect("VIBA0 should solve");
-    let mut state = SystemState::new();
     let mut bias = ImuBias::default();
     let mut gravity_world = Vec3F64::ZERO;
-    initializer.apply_initialization(
-        &mut map,
-        &mut state,
-        &mut bias,
-        &mut gravity_world,
-        viba0,
-        0,
-    );
+    initializer
+        .apply_initialization(&mut map, &mut bias, &mut gravity_world, viba0, 0)
+        .expect("VIBA0 alignment should be accepted");
 
     let solve_viba2 = |prior_a: f64| -> Vec3F64 {
         initializer
@@ -396,17 +390,11 @@ fn recovers_scale_bias_gravity_from_synthetic_trajectory() {
     let rwg_viba0 =
         rotation_from_to(viba0.gravity_world.normalize(), Vec3F64::new(0.0, 1.0, 0.0)).matrix();
 
-    let mut state = SystemState::new();
     let mut bias = ImuBias::default();
     let mut gravity_world = Vec3F64::ZERO;
-    initializer.apply_initialization(
-        &mut map,
-        &mut state,
-        &mut bias,
-        &mut gravity_world,
-        viba0,
-        0,
-    );
+    initializer
+        .apply_initialization(&mut map, &mut bias, &mut gravity_world, viba0, 0)
+        .expect("VIBA0 alignment should be accepted");
 
     let result = initializer
         .try_initialize(&map, Some(Pose3d::IDENTITY), bias, 0, 0.0, 0.0, true)
