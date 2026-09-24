@@ -7,17 +7,13 @@
 pub mod factor;
 mod solve;
 
-use std::collections::HashMap;
-
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat3F64, QuatF64, SO3F64, Vec3F64};
+use kornia_algebra::{QuatF64, SO3F64, Vec3F64};
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias};
 
 use crate::mapping::map::{
     InertialAlignment, InertialAlignmentError, Keyframe, KeyframeVelocity, Map,
 };
-use factor::{InertialInitFactor, KfConst, WeightedZeroPrior};
-use kornia_algebra::optim::{LevenbergMarquardt, Problem, Variable, VariableType};
 // ─────────────────────────────────────────────────────────────────────────────
 // Small numeric helpers
 // ─────────────────────────────────────────────────────────────────────────────
