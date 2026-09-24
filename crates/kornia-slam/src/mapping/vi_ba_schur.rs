@@ -1,31 +1,33 @@
-//! Schur-complement bundle adjustment with dense reduced camera system.
+//! Visual-inertial bundle adjustment with a dense Schur-reduced keyframe system.
 //!
-//! The standard bipartite-Schur trick from Triggs et al. (1999). Each LM
-//! iteration builds the Hessian in BLOCK form
+//! The bipartite-Schur trick from Triggs et al. (1999). Each LM iteration
+//! builds the Hessian in BLOCK form
 //!
 //! ```text
-//!     H = [ A   B  ]    A = 6P × 6P pose blocks (block-diagonal),
+//!     H = [ A   B  ]    A = 15P × 15P keyframe blocks,
 //!         [ Bᵀ  C  ]    C = 3N × 3N point blocks (BLOCK-DIAGONAL),
-//!                       B = 6P × 3N pose-point cross terms (sparse).
+//!                       B = 15P × 3N keyframe-point cross terms (sparse).
 //! ```
+//!
+//! Each free keyframe carries 15 DOF: pose `[ρ; ω]` (0..6), velocity (6..9),
+//! gyro bias (9..12) and accel bias (12..15). Reprojection terms touch only the
+//! pose DOF; IMU edges couple consecutive keyframes across all 15.
 //!
 //! Block-diagonal C means C⁻¹ is cheap (per-3×3 invert). The **reduced
-//! camera system**
+//! keyframe system**
 //!
 //! ```text
-//!     M = A − B C⁻¹ Bᵀ           (dense 6P × 6P)
-//!     m = g_pose − B C⁻¹ g_point
+//!     M = A − B C⁻¹ Bᵀ           (dense 15P × 15P)
+//!     m = g_kf − B C⁻¹ g_point
 //! ```
 //!
-//! is solved with `faer`'s dense Cholesky on the small matrix; points are
-//! recovered by back-substitution. For our SLAM problem (~170 poses ×
-//! ~3000 points × ~15000 observations) the reduced system is just
-//! 1020 × 1020 — Ceres's `DENSE_SCHUR` is exactly this regime.
+//! is solved with `faer`'s dense Cholesky; points are recovered by
+//! back-substitution. Local windows hold few keyframes, so M stays small —
+//! Ceres's `DENSE_SCHUR` regime.
 //!
 //! No sparse-matrix dependency is needed because the only "large" object
-//! the Schur trick has to manipulate (B, 6P × 3N) is never materialised:
-//! we walk observations and accumulate per-point contributions into M
-//! directly.
+//! the Schur trick has to manipulate (B) is never materialised: we walk
+//! observations and accumulate per-point contributions into M directly.
 //!
 //! Jacobian conventions match `ReprojFactor` in [`kornia_3d::ba`]:
 //!
@@ -33,9 +35,9 @@
 //!   * Point parameters are the 3-dim world coordinates.
 //!   * z is clamped to `MIN_Z` to handle mid-iteration cheirality flips.
 //!
-//! Currently supports: Huber-robustified reprojection and IMU-nav
-//! residuals, fixed-pose anchors, fixed-point gauge (motion-only BA).
-//! Full LM-with-backtracking is still TODO.
+//! Supports Huber-robustified reprojection, stereo depth and IMU residuals,
+//! an accel-bias prior, fixed keyframes and fixed points. A damped step is
+//! kept only if it lowers the cost; otherwise λ grows and the step is retried.
 
 use faer::Mat;
 use faer::prelude::Solve;
@@ -295,14 +297,10 @@ fn residual_and_jacobians(
 /// derivation) applied to the scalar predicted-depth observation
 /// `BaObservation::depth_meas` carries for stereo keyframes.
 ///
-/// `visual_inertial_bundle_adjust` previously ignored `depth_meas` entirely
-/// (unlike the plain-visual `kornia_3d::ba_schur` BA, which
-/// honours it), so stereo+IMU local BA had nothing anchoring absolute scale
-/// beyond the IMU factor's gravity magnitude in a 3-keyframe window — while
-/// stereo-only BA (which does use this term) stayed scale-consistent. That
-/// asymmetry is the reason stereo+IMU accumulated ~25% scale drift where
-/// stereo-only and mono+IMU (which never had depth to anchor with anyway)
-/// did not.
+/// Without this term stereo+IMU local BA has nothing anchoring absolute scale
+/// beyond the IMU factor's gravity magnitude in a 3-keyframe window; leaving
+/// it out measured ~25% scale drift, where stereo-only BA (which uses it, as
+/// `kornia_3d::ba_schur` does) stayed scale-consistent.
 fn depth_residual_and_jacobian(
     pose: &SE3F32,
     point_w: &Vec3F64,
@@ -588,9 +586,8 @@ fn visual_huber_weight(chi2: f64, chi2_threshold: f64) -> f64 {
     HuberKernel.weight(chi2, chi2_threshold)
 }
 
-/// Diagonal information matrix from preintegrated IMU covariances.
-/// Uses diagonal approximation (off-diagonal terms ignored).
-/// Replace with full 15×15 inversion once FD tests pass.
+/// IMU edge information matrix: the full inverse of the 9×9 navigation
+/// covariance (diagonal if it is singular) plus the diagonal bias random walk.
 fn imu_information_matrix(pim: &PreintegratedImu, weight: f64) -> [f64; 225] {
     let mut omega = [0.0f64; 225];
 

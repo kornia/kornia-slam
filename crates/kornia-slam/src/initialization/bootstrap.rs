@@ -5,8 +5,7 @@
 //! the reference frame and the incoming one and says which case this is, and
 //! the caller performs the state changes each case implies. Keeping the two
 //! apart matters here because the cases differ in how they treat the stored
-//! reference — one drops it, one keeps it, one consumes it — and that was
-//! previously expressed as scattered assignments amongst early returns.
+//! reference — one drops it, one keeps it, one consumes it.
 //!
 //! [`stereo_initial_map`] and [`two_view_initial_map`] build the initial map
 //! as one [`MapInsertion`] without touching the map; publishing it, and the

@@ -43,7 +43,11 @@ pub struct SystemState {
     /// so a tracking loss shortly after init is treated as fully lost rather
     /// than granted the longer inertial grace period.
     pub imu_init_timestamp_sec: Option<f64>,
+    /// Reference keyframe tracking runs against (ORB-SLAM3's `mpReferenceKF`).
     pub current_keyframe_idx: Option<usize>,
+    /// Most recently inserted keyframe (ORB-SLAM3's `mpLastKeyFrame`); spaces
+    /// keyframe insertion and anchors the next IMU edge. Equal to
+    /// `current_keyframe_idx` until the reference keyframe can change on its own.
     pub last_keyframe_idx: Option<usize>,
     /// Timestamp (sec) of the first frame in the current run of tracking
     /// failures, or `None` while tracking is healthy. Drives the
@@ -53,7 +57,7 @@ pub struct SystemState {
     pub mode: SystemMode,
 }
 
-/// Pipeline mode.
+/// Which stage the system is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemMode {
     /// Bootstrap from two-view geometry before any map exists.

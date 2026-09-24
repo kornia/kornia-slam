@@ -378,7 +378,7 @@ impl SlamSystem {
             return self.frame_result(TrackingStatus::Skipped);
         }
 
-        // BA inside build_initial_map may have refined KF1's pose; sync state
+        // Initial BA in publish_initial_map may have refined KF1's pose; sync state
         // and recompute velocity from the post-BA pose.
         if let Some(kf) = self.map.lock().unwrap().get_keyframe(curr_idx) {
             self.state.pose_world_to_cam = kf.frame.pose_world_to_cam;

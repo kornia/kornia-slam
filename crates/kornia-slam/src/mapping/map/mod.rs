@@ -22,10 +22,11 @@
 //! with a typed error; re-stating a link that already exists is a no-op, not an
 //! error.
 //!
-//! Deletion is logical. `remove_landmark` clears every referencing feature,
-//! empties the landmark's records and zeroes its derived geometry, but leaves
-//! the slot in place — landmark ids are stable indices held inside keyframes,
-//! so the vector is never compacted and a retired id is never reused.
+//! Deletion is logical. `remove_landmark` clears every referencing feature and
+//! marks the landmark culled; its slot, observation records and derived
+//! geometry stay in place, so readers must check `culled`. Landmark ids are
+//! stable indices held inside keyframes, so the vector is never compacted and a
+//! retired id is never reused.
 //! Unlinking the last observation retires the landmark; unlinking the reference
 //! observation promotes the smallest remaining `(keyframe, feature)` in its
 //! place.
