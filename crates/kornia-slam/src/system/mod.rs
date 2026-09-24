@@ -8,9 +8,10 @@ mod inertial;
 mod state;
 
 pub use config::SlamConfig;
-pub use state::{SystemMode, SystemState, TrackingResult, TrackingStatus};
+pub use state::{TrackingResult, TrackingStatus};
 
 use inertial::{AppliedInitialization, InertialState, viba0_accel_bias_prior};
+use state::{SystemMode, SystemState};
 
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
