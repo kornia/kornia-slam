@@ -7,7 +7,7 @@
 use super::state::SystemState;
 use crate::initialization::{ImuInitConfig, ImuInitResult, ImuInitializer};
 use crate::mapping::Map;
-use crate::mapping::map::ImuFactor;
+use crate::mapping::map::{ImuFactor, InertialAlignmentError};
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 
@@ -96,33 +96,33 @@ impl InertialState {
         self.pending_samples.retain(|m| m.timestamp >= timestamp);
     }
 
-    /// Applies an accepted initialization to the map and the tracking state,
-    /// taking the new bias and gravity for itself, and reports what changed.
+    /// Applies an initialization to the map and the tracking state, taking the
+    /// new bias and gravity for itself, and reports what changed.
     ///
-    /// The caller still owns what happens next — the mode transition and the
-    /// mapping-worker handoff are its decisions, not this one's.
+    /// A refused alignment leaves the map, the tracking state and this state
+    /// untouched. The caller still owns the mode transition and the
+    /// mapping-worker handoff.
     pub(super) fn apply_initialization(
         &mut self,
         map: &mut Map,
         state: &mut SystemState,
         init: ImuInitResult,
         start_kf_idx: usize,
-    ) -> AppliedInitialization {
+    ) -> Result<AppliedInitialization, InertialAlignmentError> {
         let applied = AppliedInitialization {
             scale: init.scale,
             gravity_world: init.gravity_world,
             gyro_bias: init.bias.gyro,
         };
-        if let Ok(aligned) = self.initializer.apply_initialization(
+        let aligned = self.initializer.apply_initialization(
             map,
             &mut self.bias,
             &mut self.gravity_world,
             init,
             start_kf_idx,
-        ) {
-            state.adopt_inertial_initialization(aligned);
-        }
-        applied
+        )?;
+        state.adopt_inertial_initialization(aligned);
+        Ok(applied)
     }
 }
 
@@ -255,10 +255,11 @@ pub(super) struct AppliedInitialization {
 #[cfg(test)]
 mod tests {
     use super::{
-        InertialInitSchedule, InertialState, Refinement, due_for_retry, viba0_accel_bias_prior,
+        ImuInitResult, InertialAlignmentError, InertialInitSchedule, InertialState, Map,
+        Refinement, SystemState, due_for_retry, viba0_accel_bias_prior,
     };
     use kornia_algebra::Vec3F64;
-    use kornia_sensors::imu::{ImuCalib, ImuMeasurement};
+    use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement};
 
     fn noise() -> ImuCalib {
         ImuCalib {
@@ -405,5 +406,34 @@ mod tests {
         assert_eq!((edge.prev_kf_idx, edge.curr_kf_idx), (1, 2));
         assert_eq!((edge.t0, edge.t1), (0.0, 1.0));
         assert_eq!(edge.raw_samples.len(), 3);
+    }
+
+    /// A refused alignment must not be reported as applied, nor leave the
+    /// system believing the IMU is initialized.
+    #[test]
+    fn a_refused_alignment_is_an_error_and_adopts_nothing() {
+        let mut inertial = InertialState::new();
+        let mut state = SystemState::new();
+        let default_gravity = inertial.gravity_world;
+        let init = ImuInitResult {
+            scale: 0.0,
+            gravity_world: Vec3F64::new(0.0, 0.0, -9.81),
+            velocities_world: Vec::new(),
+            bias: ImuBias {
+                gyro: Vec3F64::new(0.01, 0.02, 0.03),
+                accel: Vec3F64::new(0.1, 0.2, 0.3),
+            },
+        };
+
+        let result = inertial.apply_initialization(&mut Map::new(), &mut state, init, 0);
+
+        assert!(matches!(
+            result,
+            Err(InertialAlignmentError::InvalidScale(scale)) if scale == 0.0
+        ));
+        assert_eq!(inertial.bias.gyro, Vec3F64::ZERO);
+        assert_eq!(inertial.bias.accel, Vec3F64::ZERO);
+        assert_eq!(inertial.gravity_world, default_gravity);
+        assert!(!state.imu_initialized);
     }
 }
