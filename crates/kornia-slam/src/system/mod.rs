@@ -548,31 +548,13 @@ impl SlamSystem {
                         init,
                         start_idx,
                     );
-                    // Mirrors ORB-SLAM3: IMU is marked initialized (and
-                    // tracking resumes) immediately after VIBA0 succeeds —
-                    // VIBA1/VIBA2 refine bg/ba/scale/gravity further in the
-                    // background (see try_insert_keyframe), they don't gate
-                    // resuming tracking.
-                    self.state.mode = SystemMode::Tracking;
-                    self.state.imu_init_timestamp_sec = Some(timestamp_sec);
-                    if !self.local_mapping.submit(KeyframeJob {
-                        imu_initialized: true,
-                        imu_t_bc: self.rig.camera_to_body(),
-                        gravity_world: self.inertial.gravity_world,
-                    }) {
-                        self.dbg("[local_mapping] worker is unavailable".into());
+                    match applied {
+                        Ok(applied) => self.resume_tracking_after_viba0(timestamp_sec, applied),
+                        // Staying in ImuInit lets the retry throttle re-solve later.
+                        Err(error) => {
+                            self.dbg(format!("[imu_init] VIBA0 alignment refused: {error}"));
+                        }
                     }
-                    self.apply_local_mapping_results();
-                    let AppliedInitialization {
-                        scale,
-                        gravity_world: gravity,
-                        gyro_bias: bg,
-                    } = applied;
-                    self.dbg(format!(
-                        "[imu_init] VIBA0 accepted: scale={scale:.4} gravity=({:.3},{:.3},{:.3}) \
-                         gyro_bias=({:.4},{:.4},{:.4})",
-                        gravity.x, gravity.y, gravity.z, bg.x, bg.y, bg.z
-                    ));
                 }
                 None => {
                     self.dbg("[imu_init] VIBA0 rejected: solve failed or invalid scale".into());
@@ -581,6 +563,33 @@ impl SlamSystem {
         }
 
         result
+    }
+
+    fn resume_tracking_after_viba0(&mut self, timestamp_sec: f64, applied: AppliedInitialization) {
+        // Mirrors ORB-SLAM3: IMU is marked initialized (and tracking resumes)
+        // immediately after VIBA0 succeeds — VIBA1/VIBA2 refine
+        // bg/ba/scale/gravity further in the background (see
+        // try_insert_keyframe), they don't gate resuming tracking.
+        self.state.mode = SystemMode::Tracking;
+        self.state.imu_init_timestamp_sec = Some(timestamp_sec);
+        if !self.local_mapping.submit(KeyframeJob {
+            imu_initialized: true,
+            imu_t_bc: self.rig.camera_to_body(),
+            gravity_world: self.inertial.gravity_world,
+        }) {
+            self.dbg("[local_mapping] worker is unavailable".into());
+        }
+        self.apply_local_mapping_results();
+        let AppliedInitialization {
+            scale,
+            gravity_world: gravity,
+            gyro_bias: bg,
+        } = applied;
+        self.dbg(format!(
+            "[imu_init] VIBA0 accepted: scale={scale:.4} gravity=({:.3},{:.3},{:.3}) \
+             gyro_bias=({:.4},{:.4},{:.4})",
+            gravity.x, gravity.y, gravity.z, bg.x, bg.y, bg.z
+        ));
     }
 
     fn tracking_step(
@@ -948,22 +957,25 @@ impl SlamSystem {
         );
         match init_result {
             Some(init) => {
-                let scale = init.scale;
-                let bg = init.bias.gyro;
-                let aligned = self.inertial.initializer.apply_initialization(
+                let applied = self.inertial.apply_initialization(
                     &mut self.map.lock().unwrap(),
-                    &mut self.inertial.bias,
-                    &mut self.inertial.gravity_world,
+                    &mut self.state,
                     init,
                     start_idx,
                 );
-                if let Ok(aligned) = aligned {
-                    self.state.adopt_inertial_initialization(aligned);
+                match applied {
+                    Ok(AppliedInitialization {
+                        scale,
+                        gyro_bias: bg,
+                        ..
+                    }) => self.dbg(format!(
+                        "[imu_init] {stage} accepted: scale_correction={scale:.4} gyro_bias=({:.4},{:.4},{:.4})",
+                        bg.x, bg.y, bg.z
+                    )),
+                    Err(error) => {
+                        self.dbg(format!("[imu_init] {stage} alignment refused: {error}"));
+                    }
                 }
-                self.dbg(format!(
-                    "[imu_init] {stage} accepted: scale_correction={scale:.4} gyro_bias=({:.4},{:.4},{:.4})",
-                    bg.x, bg.y, bg.z
-                ));
             }
             None => {
                 self.dbg(format!(
