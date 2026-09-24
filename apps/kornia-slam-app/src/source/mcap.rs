@@ -22,7 +22,7 @@ use kornia_imgproc::color::gray_from_rgb_u8;
 use kornia_io::jpeg::{decode_image_jpeg_layout, decode_image_jpeg_mono8, decode_image_jpeg_rgb8};
 use mcap::McapError;
 
-use super::{FrameItem, FrameSource, SourceError};
+use super::{FrameItem, FrameSource, SourceError, rectify_pair};
 use crate::datasets::StereoCalib;
 
 /// A timestamped grayscale frame, `(log_time_sec, image)`.
@@ -146,10 +146,11 @@ impl McapSource {
         let prepared: Vec<PreparedFrame> = sel
             .into_iter()
             .map(|(t, limg, rimg)| {
+                let (image, right_image) = rectify_pair(&rectifier, &limg, &rimg)?;
                 Ok(PreparedFrame {
                     timestamp_sec: t - t0,
-                    image: rectifier.rectify_left(&limg).map_err(SourceError::other)?,
-                    right_image: Some(rectifier.rectify_right(&rimg).map_err(SourceError::other)?),
+                    image,
+                    right_image: Some(right_image),
                 })
             })
             .collect::<Result<_, SourceError>>()?;

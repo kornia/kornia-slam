@@ -14,7 +14,7 @@ use depthai::{Device, Pipeline as DaiPipeline};
 use kornia_3d::camera::PinholeCamera;
 use kornia_image::{Image, ImageSize};
 
-use super::{FrameItem, FrameSource, SourceError};
+use super::{FrameItem, FrameSource, SourceError, rectify_pair};
 use crate::datasets::{StereoCalib, StereoRectifier};
 
 /// Live OAK-D frame source. `right_queue`/`rectifier`/`stereo_bf` are populated
@@ -207,10 +207,8 @@ impl FrameSource for OakdSource {
         let (image, right_image) =
             if let (Some(rq), Some(rect)) = (self.right_queue.as_mut(), self.rectifier.as_ref()) {
                 let right_raw = pull_gray8(rq, &self.image_size, self.n_pixels)?;
-                (
-                    rect.rectify_left(&left_raw).map_err(SourceError::other)?,
-                    Some(rect.rectify_right(&right_raw).map_err(SourceError::other)?),
-                )
+                let (left, right) = rectify_pair(rect, &left_raw, &right_raw)?;
+                (left, Some(right))
             } else {
                 (left_raw, None)
             };
