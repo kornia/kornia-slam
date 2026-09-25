@@ -17,6 +17,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
 use kornia_imgproc::features::OrbFeatures;
 
+use crate::datasets::StereoRectifier;
 use crate::datasets::euroc::ImuSample;
 
 pub use euroc::EurocSource;
@@ -110,4 +111,21 @@ impl SourceError {
     {
         Self::Other(err.into())
     }
+}
+
+/// Rectify a raw stereo pair into freshly allocated `(left, right)` images.
+fn rectify_pair(
+    rectifier: &StereoRectifier,
+    left: &Image<u8, 1>,
+    right: &Image<u8, 1>,
+) -> Result<(Image<u8, 1>, Image<u8, 1>), SourceError> {
+    let mut left_rect = Image::from_size_val(left.size(), 0).map_err(SourceError::other)?;
+    let mut right_rect = Image::from_size_val(right.size(), 0).map_err(SourceError::other)?;
+    rectifier
+        .rectify_left(left, &mut left_rect)
+        .map_err(SourceError::other)?;
+    rectifier
+        .rectify_right(right, &mut right_rect)
+        .map_err(SourceError::other)?;
+    Ok((left_rect, right_rect))
 }

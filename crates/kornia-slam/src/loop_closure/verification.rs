@@ -40,6 +40,7 @@ impl Default for LoopVerificationConfig {
                 confidence: 0.999,
                 random_seed: None,
                 refine: true,
+                sprt: None,
             },
         }
     }
