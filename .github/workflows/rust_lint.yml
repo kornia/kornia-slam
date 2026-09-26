@@ -1,55 +1,78 @@
 name: Rust Lint
 
+# Runs on every push and PR so the required checks always report. A PR that
+# touches no Rust inputs still gets green checks — the `changes` job gates the
+# steps rather than the trigger, because a path-filtered trigger never reports
+# and leaves required checks pending forever.
 on:
   workflow_dispatch:
   push:
     branches: [main, develop]
-    paths:
-      - "crates/**"
-      - "apps/**"
-      - "tests/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/rust_lint.yml"
-      - ".github/actions/setup-rust-cache/**"
   pull_request:
     branches: [main, develop]
-    paths:
-      - "crates/**"
-      - "apps/**"
-      - "tests/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/rust_lint.yml"
-      - ".github/actions/setup-rust-cache/**"
 
 jobs:
-  fmt:
-    name: Rustfmt
+  changes:
+    name: Detect Rust changes
     runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.rust == 'true' }}
     steps:
       - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            rust:
+              - "crates/**"
+              - "apps/**"
+              - "tests/**"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - ".github/workflows/rust_lint.yml"
+              - ".github/actions/setup-rust-cache/**"
+
+  fmt:
+    name: Rustfmt
+    needs: changes
+    runs-on: ubuntu-latest
+    env:
+      RUST_CHANGED: ${{ needs.changes.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.RUST_CHANGED == 'true'
       - uses: dtolnay/rust-toolchain@stable
+        if: env.RUST_CHANGED == 'true'
         with:
           components: rustfmt
       - name: cargo fmt --check
+        if: env.RUST_CHANGED == 'true'
         run: cargo fmt --all -- --check
 
   rustdoc:
     name: Rustdoc
+    needs: changes
     runs-on: ubuntu-latest
     env:
+      RUST_CHANGED: ${{ needs.changes.outputs.rust }}
       RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
+        if: env.RUST_CHANGED == 'true'
       - uses: ./.github/actions/setup-rust-cache
+        if: env.RUST_CHANGED == 'true'
       - uses: dtolnay/rust-toolchain@stable
+        if: env.RUST_CHANGED == 'true'
       - name: cargo doc
+        if: env.RUST_CHANGED == 'true'
         run: cargo doc --locked --no-deps -p kornia-slam -p kornia-sensors
 
   clippy:
     name: Clippy (${{ matrix.name }})
+    needs: changes
     runs-on: ubuntu-latest
+    env:
+      RUST_CHANGED: ${{ needs.changes.outputs.rust }}
     strategy:
       fail-fast: false
       matrix:
@@ -91,22 +114,26 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        if: env.RUST_CHANGED == 'true'
 
       - uses: ./.github/actions/setup-rust-cache
+        if: env.RUST_CHANGED == 'true'
 
       - uses: dtolnay/rust-toolchain@stable
+        if: env.RUST_CHANGED == 'true'
         with:
           components: clippy
 
       - name: Install apt deps
-        if: matrix.apt != ''
+        if: env.RUST_CHANGED == 'true' && matrix.apt != ''
         run: |
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt }}
 
       - name: ${{ matrix.command }}
+        if: env.RUST_CHANGED == 'true'
         run: ${{ matrix.command }}
 
       - name: Show sccache stats
-        if: always()
+        if: always() && env.RUST_CHANGED == 'true'
         run: sccache --show-stats 2>&1 || echo "::warning::sccache stats unavailable"
