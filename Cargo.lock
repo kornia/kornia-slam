@@ -277,7 +277,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -288,7 +288,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3298,7 +3298,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3903,7 +3903,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5995,8 +5995,9 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
 name = "kornia-3d"
-version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#6c9f2d6bc0a375a182dbe2a28f0e7ae8b82af2a6"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e75de04f82c685342ee3e3c1cfdd4f86e918751a360b9cfdb02f5218e5d2f6f"
 dependencies = [
  "bincode 2.0.1",
  "faer 0.24.4",
@@ -6014,8 +6015,9 @@ dependencies = [
 
 [[package]]
 name = "kornia-algebra"
-version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#6c9f2d6bc0a375a182dbe2a28f0e7ae8b82af2a6"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38badefbffb6b402e956af3908ea1658438e692502db5d7f01d9798f63e1a3af"
 dependencies = [
  "glam 0.33.2",
  "nalgebra 0.35.0",
@@ -6025,8 +6027,9 @@ dependencies = [
 
 [[package]]
 name = "kornia-bow"
-version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#6c9f2d6bc0a375a182dbe2a28f0e7ae8b82af2a6"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f56365c5b88412594d0164be70c4ab639d9e674bdea0756d48c3515394713d2c"
 dependencies = [
  "bincode 2.0.1",
  "rand 0.10.2",
@@ -6038,8 +6041,9 @@ dependencies = [
 
 [[package]]
 name = "kornia-image"
-version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#6c9f2d6bc0a375a182dbe2a28f0e7ae8b82af2a6"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7baeb89055e61de6ca0580e9dd04893052ff4da619836f993dd7ec998b4a128b"
 dependencies = [
  "kornia-tensor",
  "num-traits",
@@ -6049,8 +6053,9 @@ dependencies = [
 
 [[package]]
 name = "kornia-imgproc"
-version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#6c9f2d6bc0a375a182dbe2a28f0e7ae8b82af2a6"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3eeca083d17c225e16b40dde8153d00e846a655c9d250e8690ce6a9ee22070cb"
 dependencies = [
  "kornia-algebra",
  "kornia-image",
@@ -6063,8 +6068,9 @@ dependencies = [
 
 [[package]]
 name = "kornia-io"
-version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#6c9f2d6bc0a375a182dbe2a28f0e7ae8b82af2a6"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6c8ffe23b6781f704817483d051af459078446b0c79b53b816b87f2d32cf69c"
 dependencies = [
  "image-webp",
  "jpeg-encoder",
@@ -6128,8 +6134,9 @@ dependencies = [
 
 [[package]]
 name = "kornia-tensor"
-version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#6c9f2d6bc0a375a182dbe2a28f0e7ae8b82af2a6"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e7dc445092435019b0fe1599c95ab4c23aa17f1a8a092403c08765cf059d06a"
 dependencies = [
  "num-traits",
  "rayon",
@@ -7289,7 +7296,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8827,7 +8834,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11547,7 +11554,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12181,7 +12188,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12443,7 +12450,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -13050,7 +13057,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -13840,7 +13847,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

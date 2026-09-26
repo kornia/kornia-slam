@@ -8,11 +8,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-kornia-3d = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
-kornia-algebra = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
-kornia-image = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
-kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
-kornia-bow = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
+kornia-3d = "0.2.0"
+kornia-algebra = "0.2.0"
+kornia-image = "0.2.0"
+kornia-imgproc = "0.2.0"
+kornia-bow = "0.2.0"
 kornia-sensors = { path = "../kornia-sensors" }
 # Sparse LLT for pose-graph optimization and dense Cholesky for the reduced
 # camera system in visual-inertial Schur-complement BA.

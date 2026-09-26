@@ -8,5 +8,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-kornia-algebra = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
+kornia-algebra = "0.2.0"
 glam = "0.33"
