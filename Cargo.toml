@@ -9,3 +9,11 @@ authors = [
 ]
 license = "Apache-2.0"
 repository = "https://github.com/kornia/kornia-slam"
+
+# Minimum supported Rust version for this workspace.
+# Matches the README and the CI's use of the stable toolchain.
+rust-version = "1.85"
+
+[workspace.lints.rust]
+# Prefer to surface any new unsafe usages during review.
+unsafe_code = "warn"
