@@ -1,0 +1,1058 @@
+//! SLAM runtime: orchestrates tracking, mapping, and state transitions.
+//!
+//! The runtime flow is kept in one file so it can be read from top to bottom
+//! in the same order frames move through the system.
+
+mod config;
+mod inertial;
+mod state;
+
+pub use config::SlamConfig;
+pub use state::{TrackingResult, TrackingStatus};
+
+use inertial::{AppliedInitialization, InertialState, viba0_accel_bias_prior};
+use state::{SystemMode, SystemState};
+
+use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
+
+use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
+use crate::tracking::motion::{InertialPrediction, predict_pose};
+use crate::tracking::tracker::{FrameInput, Tracker};
+
+use std::sync::{Arc, Mutex};
+
+use crate::Frame;
+use crate::initialization::bootstrap::{
+    self, BootstrapDecision, MIN_KEYPOINTS_FOR_BOOTSTRAP, MIN_STEREO_POINTS, MIN_VALID_POINTS,
+    TooFewStereoPoints, evaluate_bootstrap,
+};
+use crate::initialization::two_view::TwoViewInitConfig;
+use crate::loop_closure::place_recognition::Vocabulary;
+use crate::loop_closure::{LoopCloser, LoopClosingContext, LoopClosureEvent};
+use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
+use crate::mapping::map::{Keyframe, Map, MapInsertion, MapMutationError, MapPoint};
+use crate::mapping::{KeyframeJob, LocalMapping};
+use crate::pose_conversion::apply_reference_pose_correction;
+use crate::sensor_rig::{ImuCalibration, SensorRig};
+use kornia_3d::camera::PinholeCamera;
+use kornia_3d::pose::Pose3d;
+use kornia_image::Image;
+use kornia_sensors::imu::ImuMeasurement;
+
+/// Top-level ORB-SLAM system: orchestrates tracking, mapping, and state transitions.
+pub struct SlamSystem {
+    // Camera model
+    rig: SensorRig,
+    // Primary pose estimator
+    tracker: Tracker,
+    // Boostrap pose estimator
+    two_view_init_config: TwoViewInitConfig,
+    // Keyframe insertion policy
+    keyframe_policy: KeyframePolicy,
+    // Recently-lost grace period policy
+    tracking_loss_recovery: TrackingLossRecoveryPolicy,
+    // mThDepth (metres): back-project close stereo points at each keyframe when set
+    stereo_close_depth: Option<f64>,
+    // Emit per-frame diagnostic logs (skip/reject reasons, growth counters)
+    debug: bool,
+    // Buffered debug messages produced during the most recent process_frame call;
+    // drained by the caller (TUI panel or stderr).
+    debug_messages: Vec<String>,
+    // Map object
+    map: Arc<Mutex<Map>>,
+    // Serializes compound map publication and short local-BA snapshot/merge phases.
+    map_publication_gate: Option<Arc<Mutex<()>>>,
+    // IMU estimates, sample buffer and the inertial-initialization schedule
+    inertial: InertialState,
+    local_mapping: LocalMapping,
+    // Place recognition for every keyframe, and loop closing when configured.
+    loop_closer: LoopCloser,
+    loop_closure_events: Vec<LoopClosureEvent>,
+    // System state
+    state: SystemState,
+}
+
+impl SlamSystem {
+    /// Creates a new system with identity pose.
+    pub fn new(camera: PinholeCamera, config: SlamConfig) -> Self {
+        Self::with_rig(SensorRig::new(camera), config)
+    }
+
+    /// Builds a system from an explicit sensor rig, so IMU noise parameters and
+    /// extrinsics can be supplied for the actual sensor.
+    pub fn with_rig(rig: SensorRig, config: SlamConfig) -> Self {
+        let camera = rig.camera.clone();
+        let map = Arc::new(Mutex::new(Map::new()));
+        let local_mapping =
+            LocalMapping::new(config.local_mapping, Arc::clone(&map), camera.clone());
+        let map_publication_gate = local_mapping.publication_gate();
+        let loop_closer = LoopCloser::new(config.pgo);
+        Self {
+            rig,
+            tracker: Tracker::new(config.map_projection),
+            two_view_init_config: config.two_view_init,
+            keyframe_policy: config.keyframe_policy,
+            tracking_loss_recovery: config.tracking_loss_recovery,
+            stereo_close_depth: config.stereo_close_depth_m,
+            debug: config.debug,
+            debug_messages: Vec::new(),
+            map,
+            map_publication_gate,
+            local_mapping,
+            state: SystemState::new(),
+            inertial: InertialState::new(),
+            loop_closer,
+            loop_closure_events: Vec::new(),
+        }
+    }
+
+    /// Enables appearance-based loop detection with a bag-of-words vocabulary.
+    /// Without it, keyframes are not indexed and no loop candidates are emitted.
+    pub fn set_vocabulary(&mut self, vocabulary: Vocabulary) {
+        self.loop_closer.set_vocabulary(vocabulary);
+    }
+
+    pub fn drain_loop_closure_events(&mut self) -> Vec<LoopClosureEvent> {
+        std::mem::take(&mut self.loop_closure_events)
+    }
+
+    /// Enables the inertial path by providing the camera-to-body extrinsic
+    /// `T_BC` (`X_body = T_BC * X_cam`). Without it, IMU samples are ignored.
+    pub fn set_imu_extrinsics(&mut self, t_bc: Pose3d) {
+        self.rig.imu = Some(ImuCalibration::new(t_bc));
+    }
+
+    /// The system's fixed sensor calibration.
+    pub fn rig(&self) -> &SensorRig {
+        &self.rig
+    }
+
+    /// Processes one frame (pre-extracted features) and returns the tracking result.
+    pub fn process_frame(
+        &mut self,
+        mut frame: Frame,
+        previous_image: Option<&Image<u8, 1>>,
+        current_image: &Image<u8, 1>,
+        timestamp_sec: f64,
+        imu_samples: Vec<ImuMeasurement>,
+    ) -> TrackingResult {
+        // Local-BA snapshots, merges, and their correction messages can only
+        // cross this boundary between complete tracking frames.
+        let publication_gate = self.map_publication_gate.clone();
+        let _publication = publication_gate
+            .as_ref()
+            .map(|gate| gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+        self.apply_local_mapping_results();
+        // Fill the per-frame undistortion cache once; tracking, BA gathering,
+        // growth, and fuse all read from it.
+        frame.ensure_undistorted(&self.rig.camera);
+        self.inertial.buffer_samples(imu_samples);
+
+        match self.state.mode {
+            SystemMode::Bootstrap => self.bootstrap_step(frame, timestamp_sec),
+            SystemMode::ImuInit => {
+                self.inertial_init_step(frame, previous_image, current_image, timestamp_sec)
+            }
+            SystemMode::Tracking => {
+                self.tracking_step(frame, previous_image, current_image, timestamp_sec)
+            }
+        }
+    }
+
+    /// Runs `f` against the live map points, holding the map lock only for the
+    /// duration of the call. Avoids cloning the whole point list (descriptors
+    /// included) for read-only consumers such as viz logging and summaries.
+    pub fn with_map_points<R>(&self, f: impl FnOnce(&[MapPoint]) -> R) -> R {
+        f(self.map.lock().unwrap().map_points())
+    }
+
+    /// Returns the index of the current reference keyframe, if tracking has one.
+    pub fn current_keyframe_idx(&self) -> Option<usize> {
+        self.state.current_keyframe_idx.and_then(|ki| {
+            self.map
+                .lock()
+                .unwrap()
+                .get_keyframe(ki)
+                .map(|kf| kf.frame.idx)
+        })
+    }
+
+    /// Returns the number of active (non-culled) map points.
+    pub fn num_active_map_points(&self) -> usize {
+        self.map.lock().unwrap().num_active_map_points()
+    }
+
+    /// Drain any debug messages accumulated since the last call.
+    pub fn drain_debug_messages(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.debug_messages)
+    }
+
+    /// Toggle whether the pipeline buffers per-frame debug messages.
+    pub fn set_debug(&mut self, on: bool) {
+        self.debug = on;
+        if !on {
+            self.debug_messages.clear();
+        }
+    }
+
+    fn apply_local_mapping_results(&mut self) {
+        let Some(reference_idx) = self.state.current_keyframe_idx else {
+            // Still drain results so a completed worker cannot build a result backlog.
+            let _ = self.local_mapping.drain_results();
+            return;
+        };
+
+        for result in self.local_mapping.drain_results() {
+            let Some(correction) = result
+                .keyframe_corrections
+                .iter()
+                .find(|correction| correction.kf_idx == reference_idx)
+            else {
+                continue;
+            };
+
+            self.state.pose_world_to_cam = apply_reference_pose_correction(
+                self.state.pose_world_to_cam,
+                correction.pose_before,
+                correction.pose_after,
+            );
+            self.state.velocity_world = correction.velocity_world;
+            self.inertial.bias = correction.imu_bias;
+        }
+    }
+
+    fn dbg(&mut self, msg: String) {
+        if self.debug {
+            self.debug_messages.push(msg);
+        }
+    }
+
+    fn bootstrap_step(&mut self, curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
+        // Stereo frames carry metric per-keypoint depth, so we can build a
+        // metric map from a single keyframe (ORB-SLAM3's StereoInitialization)
+        // instead of waiting for two-view parallax.
+        if curr_frame.is_stereo() {
+            return self.bootstrap_stereo(curr_frame, timestamp_sec);
+        }
+        self.bootstrap_mono(curr_frame, timestamp_sec)
+    }
+
+    /// Single-frame metric initialization from stereo depth.
+    fn bootstrap_stereo(&mut self, mut curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
+        // Build the new map in the current odometry frame (identity at start,
+        // or the recovery pose after a tracking loss).
+        curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
+        let curr_idx = curr_frame.idx;
+
+        let insertion =
+            match bootstrap::stereo_initial_map(Keyframe::from_frame(curr_frame), &self.rig.camera)
+            {
+                Ok(insertion) => insertion,
+                Err(TooFewStereoPoints { found }) => {
+                    self.dbg(format!(
+                        "[bootstrap_stereo] frame={curr_idx} skip: only {found} stereo points \
+                     (need >= {MIN_STEREO_POINTS})"
+                    ));
+                    return self.frame_result(TrackingStatus::Skipped);
+                }
+            };
+
+        // The keyframe and its seeds are published together; tracker state is
+        // adopted below only once that succeeded.
+        let published = self.map.lock().unwrap().apply_insertion(insertion);
+        let added = match published {
+            Ok(result) => result.landmark_ids.len(),
+            Err(error) => {
+                self.dbg(format!(
+                    "[bootstrap_stereo] frame={curr_idx} publication rejected: {error}"
+                ));
+                return self.frame_result(TrackingStatus::Skipped);
+            }
+        };
+
+        self.dbg(format!(
+            "[bootstrap_stereo] frame={curr_idx} metric map created with {added} points",
+        ));
+
+        self.state.velocity = None;
+        // The map is already metric (stereo baseline), but gravity, velocities,
+        // and the gyro bias still need the inertial init before IMU prediction
+        // can run; the solve there keeps scale fixed at 1.
+        self.finish_bootstrap(curr_idx, timestamp_sec);
+        self.prune_imu_before(timestamp_sec);
+
+        self.frame_result(TrackingStatus::KeyframeAccepted)
+    }
+
+    fn bootstrap_mono(&mut self, mut curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
+        // Stamp frames with current odometry pose so bootstrap builds
+        // the new map in the existing coordinate frame.
+        curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
+
+        let decision = evaluate_bootstrap(
+            self.state.bootstrap_frame.as_ref(),
+            &curr_frame,
+            &self.rig.camera,
+            &self.two_view_init_config,
+        );
+        let two_view_estimate = match decision {
+            // A stale reference is dropped with the frame: neither is viable.
+            BootstrapDecision::Unusable { keypoints } => {
+                self.dbg(format!(
+                    "[bootstrap] frame={} skip: too few keypoints ({}, need > {})",
+                    curr_frame.idx, keypoints, MIN_KEYPOINTS_FOR_BOOTSTRAP,
+                ));
+                self.state.bootstrap_frame = None;
+                return self.frame_result(TrackingStatus::Skipped);
+            }
+            BootstrapDecision::StoreAsReference => {
+                self.dbg(format!(
+                    "[bootstrap] frame={} stored as reference (awaiting second frame)",
+                    curr_frame.idx,
+                ));
+                self.state.bootstrap_frame = Some(curr_frame);
+                self.inertial.bootstrap_timestamp_sec = Some(timestamp_sec);
+                // Samples before the reference frame can never enter an edge.
+                self.prune_imu_before(timestamp_sec);
+                return self.frame_result(TrackingStatus::Skipped);
+            }
+            // The reference is kept: only the second frame was unsuitable.
+            BootstrapDecision::Rejected {
+                reference_idx,
+                reason,
+            } => {
+                self.dbg(format!(
+                    "[bootstrap] frame={} (ref={}) reject: {:?}",
+                    curr_frame.idx, reference_idx, reason,
+                ));
+                return self.frame_result(TrackingStatus::Skipped);
+            }
+            BootstrapDecision::Initialized(estimate) => *estimate,
+        };
+        let prev_bootstrap_frame = self
+            .state
+            .bootstrap_frame
+            .take()
+            .expect("an accepted bootstrap consumes the reference it matched against");
+
+        self.dbg(format!(
+            "[bootstrap] frame={} accept: model={} triangulated={} inliers={}",
+            curr_frame.idx,
+            two_view_estimate.model_kind,
+            two_view_estimate.points3d.len(),
+            two_view_estimate.estimate.inliers,
+        ));
+
+        let estimated_pose = two_view_estimate.estimate.pose;
+        let prev_pose_world_to_cam = curr_frame.pose_world_to_cam;
+        self.state.pose_world_to_cam = estimated_pose;
+        curr_frame.pose_world_to_cam = estimated_pose;
+
+        // Promote to Keyframes
+        let prev_idx = prev_bootstrap_frame.idx;
+        let reference_kf = Keyframe::from_frame(prev_bootstrap_frame);
+        let current_kf = Keyframe::from_frame(curr_frame);
+        let curr_idx = current_kf.frame.idx;
+
+        // A rejected publication writes nothing, so there is no map to
+        // evaluate; treat it like a failed health gate.
+        let insertion =
+            bootstrap::two_view_initial_map(reference_kf, current_kf, &two_view_estimate);
+        if let Err(error) = self.publish_initial_map(insertion, [prev_idx, curr_idx]) {
+            self.dbg(format!(
+                "[bootstrap] frame={curr_idx} publication rejected: {error}"
+            ));
+            self.state.reset();
+            return self.frame_result(TrackingStatus::Skipped);
+        }
+
+        // The gate runs after initial BA, which can collapse a badly
+        // conditioned pair.
+        let health = crate::initialization::initial_map_health(&self.map.lock().unwrap());
+        if health.is_degenerate() {
+            self.dbg(format!(
+                "[init_gate] reject: valid_in_both={} median_depth={:.3} (need >= {} and > 0)",
+                health.valid_in_both, health.median_depth_older_kf, MIN_VALID_POINTS,
+            ));
+            self.map.lock().unwrap().clear_active();
+            self.state.reset();
+            return self.frame_result(TrackingStatus::Skipped);
+        }
+
+        // Initial BA in publish_initial_map may have refined KF1's pose; sync state
+        // and recompute velocity from the post-BA pose.
+        if let Some(kf) = self.map.lock().unwrap().get_keyframe(curr_idx) {
+            self.state.pose_world_to_cam = kf.frame.pose_world_to_cam;
+        }
+
+        if let Some(prev_ts) = self.inertial.bootstrap_timestamp_sec {
+            if let Some(edge) = self.inertial.keyframe_edge(
+                self.rig.imu_noise(),
+                prev_idx,
+                curr_idx,
+                prev_ts,
+                timestamp_sec,
+            ) {
+                // Through the validated path: endpoints must exist, the edge
+                // must be new, and the interval finite and ordered.
+                let published = self.map.lock().unwrap().apply_insertion(MapInsertion {
+                    imu_factors: vec![edge],
+                    ..Default::default()
+                });
+                if let Err(error) = published {
+                    self.dbg(format!(
+                        "[bootstrap] frame={curr_idx} imu edge rejected: {error}"
+                    ));
+                }
+            }
+            self.prune_imu_before(timestamp_sec);
+        }
+
+        self.state.velocity = Some(Pose3d::between(
+            &prev_pose_world_to_cam,
+            &self.state.pose_world_to_cam,
+        ));
+
+        self.finish_bootstrap(curr_idx, timestamp_sec);
+
+        self.frame_result(TrackingStatus::KeyframeAccepted)
+    }
+
+    /// Publishes the two-view map, refines it with initial BA, and offers both
+    /// keyframes to place recognition so a later revisit of the start can
+    /// match them.
+    fn publish_initial_map(
+        &mut self,
+        insertion: MapInsertion,
+        keyframes: [usize; 2],
+    ) -> Result<(), MapMutationError> {
+        self.map.lock().unwrap().apply_insertion(insertion)?;
+        let refined = crate::mapping::bundle_adjustment::run_initial_ba(
+            &mut self.map.lock().unwrap(),
+            &self.rig.camera,
+        );
+        if let Err(error) = refined {
+            self.dbg(format!("[init_ba] {error}; keeping the unrefined map"));
+        }
+        for kf_idx in keyframes {
+            self.register_place_recognition(kf_idx);
+        }
+        Ok(())
+    }
+
+    /// Leaves bootstrap with `kf_idx` as the reference keyframe. Inertial
+    /// initialization follows when the camera-to-body extrinsic is known, since
+    /// it relates IMU deltas to camera poses; otherwise tracking is visual-only.
+    fn finish_bootstrap(&mut self, kf_idx: usize, timestamp_sec: f64) {
+        self.state.current_keyframe_idx = Some(kf_idx);
+        self.state.last_keyframe_idx = Some(kf_idx);
+        self.state.mode = if self.rig.camera_to_body().is_some() {
+            self.inertial.schedule.start(kf_idx, timestamp_sec);
+            SystemMode::ImuInit
+        } else {
+            SystemMode::Tracking
+        };
+        self.inertial.last_keyframe_timestamp_sec = Some(timestamp_sec);
+    }
+
+    fn frame_result(&self, status: TrackingStatus) -> TrackingResult {
+        TrackingResult {
+            pose_world_to_cam: self.state.pose_world_to_cam,
+            status,
+        }
+    }
+
+    /// Drops buffered IMU samples strictly older than `t` (typically the last
+    /// keyframe timestamp: the next edge and all per-frame windows start there).
+    fn prune_imu_before(&mut self, t: f64) {
+        self.inertial.prune_before(t);
+    }
+
+    /// Tracks the frame, then attempts VIBA0 on accepted keyframes once the
+    /// window is ready and a retry is due.
+    fn inertial_init_step(
+        &mut self,
+        frame: Frame,
+        previous_image: Option<&Image<u8, 1>>,
+        current_image: &Image<u8, 1>,
+        timestamp_sec: f64,
+    ) -> TrackingResult {
+        let result = self.tracking_step(frame, previous_image, current_image, timestamp_sec);
+
+        if result.status == TrackingStatus::KeyframeAccepted
+            && let Some(start_idx) = self.inertial.schedule.start_kf_idx()
+        {
+            // Snapshot the fields needed after releasing the map lock.
+            let kfs: Vec<usize> = self
+                .map
+                .lock()
+                .unwrap()
+                .keyframes()
+                .iter()
+                .filter(|kf| kf.frame.idx >= start_idx)
+                .map(|kf| kf.frame.idx)
+                .collect();
+            let imu_time: f64 = self
+                .map
+                .lock()
+                .unwrap()
+                .imu_factors()
+                .iter()
+                .filter(|f| f.curr_kf_idx >= start_idx)
+                .map(|f| f.preintegrated.dt)
+                .sum();
+            let gate_msg = format_imu_init_gate(
+                start_idx,
+                kfs.first().copied(),
+                kfs.last().copied(),
+                kfs.len(),
+                self.inertial.initializer.config.min_keyframes,
+                imu_time,
+                self.inertial.initializer.config.min_time_sec,
+            );
+            self.dbg(gate_msg);
+        }
+
+        let due_for_retry = self.inertial.schedule.retry_due(timestamp_sec);
+        let imu_init_ready = self.inertial.initializer.ready(
+            &self.map.lock().unwrap(),
+            self.inertial.schedule.start_kf_idx(),
+        );
+
+        if result.status == TrackingStatus::KeyframeAccepted && due_for_retry && imu_init_ready {
+            let Some(start_idx) = self.inertial.schedule.start_kf_idx() else {
+                return result;
+            };
+            self.inertial.schedule.record_attempt(timestamp_sec);
+            let is_mono = !self
+                .map
+                .lock()
+                .unwrap()
+                .keyframes()
+                .iter()
+                .find(|kf| kf.frame.idx >= start_idx)
+                .map(|kf| kf.frame.is_stereo())
+                .unwrap_or(false);
+            let prior_a0 = viba0_accel_bias_prior(is_mono);
+            // Drop the solve's map lock before applying its result with a new lock.
+            let init_result = self.inertial.initializer.try_initialize(
+                &self.map.lock().unwrap(),
+                self.rig.camera_to_body(),
+                self.inertial.bias,
+                start_idx,
+                1e2,
+                prior_a0,
+                false,
+            );
+            match init_result {
+                Some(init) => {
+                    let applied = self.inertial.apply_initialization(
+                        &mut self.map.lock().unwrap(),
+                        &mut self.state,
+                        init,
+                        start_idx,
+                    );
+                    match applied {
+                        Ok(applied) => self.resume_tracking_after_viba0(timestamp_sec, applied),
+                        // Staying in ImuInit lets the retry throttle re-solve later.
+                        Err(error) => {
+                            self.dbg(format!("[imu_init] VIBA0 alignment refused: {error}"));
+                        }
+                    }
+                }
+                None => {
+                    self.dbg("[imu_init] VIBA0 rejected: solve failed or invalid scale".into());
+                }
+            }
+        }
+
+        result
+    }
+
+    fn resume_tracking_after_viba0(&mut self, timestamp_sec: f64, applied: AppliedInitialization) {
+        // Mirrors ORB-SLAM3: IMU is marked initialized (and tracking resumes)
+        // immediately after VIBA0 succeeds — VIBA1/VIBA2 refine
+        // bg/ba/scale/gravity further in the background (see
+        // try_insert_keyframe), they don't gate resuming tracking.
+        self.state.mode = SystemMode::Tracking;
+        self.state.imu_init_timestamp_sec = Some(timestamp_sec);
+        if !self.local_mapping.submit(KeyframeJob {
+            imu_initialized: true,
+            imu_t_bc: self.rig.camera_to_body(),
+            gravity_world: self.inertial.gravity_world,
+        }) {
+            self.dbg("[local_mapping] worker is unavailable".into());
+        }
+        self.apply_local_mapping_results();
+        let AppliedInitialization {
+            scale,
+            gravity_world: gravity,
+            gyro_bias: bg,
+        } = applied;
+        self.dbg(format!(
+            "[imu_init] VIBA0 accepted: scale={scale:.4} gravity=({:.3},{:.3},{:.3}) \
+             gyro_bias=({:.4},{:.4},{:.4})",
+            gravity.x, gravity.y, gravity.z, bg.x, bg.y, bg.z
+        ));
+    }
+
+    fn tracking_step(
+        &mut self,
+        frame: Frame,
+        previous_image: Option<&Image<u8, 1>>,
+        current_image: &Image<u8, 1>,
+        timestamp_sec: f64,
+    ) -> TrackingResult {
+        let image_size = frame.image_size;
+        let pose_before = self.state.pose_world_to_cam;
+        let prev_timestamp = self.state.last_frame_timestamp_sec;
+
+        // Local BA updates keyframe state asynchronously, so refresh cached IMU state.
+        if let Some(kf_idx) = self.state.current_keyframe_idx
+            && let Some(kf) = self.map.lock().unwrap().get_keyframe(kf_idx)
+        {
+            self.state.velocity_world = kf.velocity_world;
+            self.inertial.bias = kf.imu_bias;
+        }
+
+        // Preintegration is prepared here: the system owns bias and the sample
+        // buffer. The motion model chooses between it and the visual model.
+        let preintegrated = (self.state.imu_initialized && prev_timestamp > 0.0).then(|| {
+            self.inertial
+                .preintegrate_window(self.rig.imu_noise(), prev_timestamp, timestamp_sec)
+                .0
+        });
+        let (candidate_pose, predicted_velocity) = predict_pose(
+            pose_before,
+            self.state.velocity,
+            self.state.velocity_world,
+            preintegrated
+                .as_ref()
+                .map(|preintegrated| InertialPrediction {
+                    preintegrated,
+                    camera_to_body: self.rig.camera_to_body(),
+                    gravity_world: self.inertial.gravity_world,
+                }),
+        );
+        if let Some(velocity_world) = predicted_velocity {
+            self.state.velocity_world = velocity_world; // propagate for next frame
+        }
+
+        let currently_lost_for = self
+            .state
+            .lost_since_sec
+            .map_or(0.0, |t0| timestamp_sec - t0);
+        let result = {
+            let map = self.map.lock().unwrap();
+            self.tracker.estimate(
+                FrameInput {
+                    frame: &frame,
+                    previous_image,
+                    current_image,
+                    candidate_pose,
+                    pose_before,
+                    current_keyframe_idx: self.state.current_keyframe_idx,
+                    lost_for_sec: currently_lost_for,
+                },
+                &map,
+                &self.rig.camera,
+            )
+        };
+
+        let (mut status, matches, tracked_inliers, reject_reason) = match result {
+            Ok(estimate) => {
+                self.state.pose_world_to_cam = estimate.pose;
+
+                // When IMU-initialized, velocity_world was already updated by IMU
+                // preintegration (predict_pose_imu → pred_vel) before PnP ran; don't
+                // overwrite it with a visual finite-difference, since at 30 fps the
+                // inter-frame displacement is noise-dominated during low-translation
+                // segments, which would collapse velocity to zero and permanently
+                // freeze the IMU pose prediction.
+                if !self.state.imu_initialized {
+                    self.state.velocity = Some(Pose3d::between(&pose_before, &estimate.pose));
+                }
+
+                (
+                    TrackingStatus::Tracked,
+                    estimate.matches,
+                    estimate.inliers,
+                    None,
+                )
+            }
+            Err(reason) => {
+                // Carry the predicted pose forward instead of freezing at
+                // pose_before. state.velocity_world was already advanced by
+                // predict_pose_imu above regardless of visual outcome, so
+                // anchoring the next frame's prediction on a stale position
+                // would desync position/rotation from velocity: every
+                // subsequent frame's candidate pose would drift further from
+                // reality, making the projection search miss again and
+                // compounding a single bad frame into a full tracking loss.
+                self.state.pose_world_to_cam = candidate_pose;
+                (TrackingStatus::Skipped, Vec::new(), 0, Some(reason))
+            }
+        };
+        if self.debug {
+            let msg = match reject_reason {
+                Some(reason) => format!("[track] frame={} reject: {:?}", frame.idx, reason),
+                None => format!(
+                    "[track] frame={} ok: matches={} inliers={}",
+                    frame.idx,
+                    matches.len(),
+                    tracked_inliers,
+                ),
+            };
+            self.debug_messages.push(msg);
+        }
+
+        if status == TrackingStatus::Tracked {
+            // Visibility bookkeeping over the local map only (mirrors
+            // ORB-SLAM3, which counts mnVisible on local-map points): full-map
+            // scans here would grow with trajectory length.
+            // Release this non-reentrant lock before keyframe insertion locks the map.
+            {
+                let mut map_guard = self.map.lock().unwrap();
+                let current_kf = self
+                    .state
+                    .current_keyframe_idx
+                    .and_then(|ki| map_guard.get_keyframe(ki));
+                let local_indices = select_local_map_points(
+                    &map_guard,
+                    &matches,
+                    current_kf,
+                    LocalMapSelectionConfig::default(),
+                );
+                let visible = crate::tracking::local_map::landmarks_in_frustum(
+                    &map_guard,
+                    &local_indices,
+                    &self.rig.camera,
+                    &candidate_pose,
+                    image_size,
+                );
+                map_guard.update_observation_counts(&visible, &matches);
+            }
+
+            if self.try_insert_keyframe(&frame, timestamp_sec, tracked_inliers, &matches) {
+                status = TrackingStatus::KeyframeAccepted;
+            }
+        }
+
+        if status == TrackingStatus::Skipped {
+            let policy = &self.tracking_loss_recovery;
+
+            let lost_since = *self.state.lost_since_sec.get_or_insert(timestamp_sec);
+            let recently_lost_for = timestamp_sec - lost_since;
+
+            let imu_confident = self.state.imu_initialized
+                && self
+                    .state
+                    .imu_init_timestamp_sec
+                    .is_some_and(|t0| timestamp_sec - t0 >= policy.min_imu_confidence_sec);
+            let grace_period_sec = policy.grace_period_sec(imu_confident);
+            let map_established =
+                self.map.lock().unwrap().keyframes().len() > policy.min_keyframes_for_grace;
+
+            if !map_established || recently_lost_for >= grace_period_sec {
+                self.dbg(format!(
+                    "[lost] frame={} giving up after {:.2}s (map_established={}): resetting",
+                    frame.idx, recently_lost_for, map_established,
+                ));
+                self.tracker.reset_tracks();
+                self.state.reset();
+                return self.bootstrap_step(frame, timestamp_sec);
+            }
+        } else {
+            self.state.lost_since_sec = None;
+        }
+        self.state.last_frame_timestamp_sec = timestamp_sec;
+        // Samples older than the last keyframe can't enter any future window
+        // (the next edge and all per-frame predictions start at or after it).
+        if let Some(kf_ts) = self.inertial.last_keyframe_timestamp_sec {
+            self.prune_imu_before(kf_ts.min(timestamp_sec));
+        }
+        self.frame_result(status)
+    }
+
+    fn try_insert_keyframe(
+        &mut self,
+        frame: &Frame,
+        timestamp_sec: f64,
+        tracked_inliers: usize,
+        matches: &[(usize, usize)],
+    ) -> bool {
+        let n_ref_map_points = if let Some(ki) = self.state.current_keyframe_idx {
+            let map = self.map.lock().unwrap();
+            map.get_keyframe(ki)
+                .map(|kf| kf.num_associated_points())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        if !self.keyframe_policy.should_insert(
+            frame.idx,
+            self.state.last_keyframe_idx,
+            tracked_inliers,
+            n_ref_map_points,
+        ) {
+            return false;
+        }
+
+        // Guard: reference KF must exist before we can triangulate.
+        if let Some(ki) = self.state.current_keyframe_idx {
+            let map = self.map.lock().unwrap();
+            if map.get_keyframe(ki).is_none() {
+                return false;
+            }
+        } else {
+            return false;
+        }
+
+        let mut curr_kf = Keyframe::from_frame(Frame {
+            pose_world_to_cam: self.state.pose_world_to_cam,
+            ..frame.clone()
+        });
+        // Seed the new keyframe with the IMU-propagated velocity and current bias
+        // estimate so that VI-BA starts from a reasonable linearisation point rather
+        // than zero, which would produce huge residuals on the newest IMU edge.
+        if self.state.imu_initialized {
+            curr_kf.velocity_world = self.state.velocity_world;
+            curr_kf.imu_bias = self.inertial.bias;
+        }
+        let imu_initialized = self.state.imu_initialized;
+        let is_stereo = curr_kf.frame.is_stereo();
+
+        // Neighbours are captured BEFORE publication: growing against a list
+        // that already contains the current keyframe would triangulate it
+        // against itself and drop the oldest real neighbour. Selection policy
+        // belongs to mapping.
+        let growth_plan =
+            keyframe_mapping::prepare_keyframe_growth(&self.map.lock().unwrap(), frame.idx);
+
+        let imu_edge = match (
+            self.state.last_keyframe_idx,
+            self.inertial.last_keyframe_timestamp_sec,
+        ) {
+            (Some(prev_kf_idx), Some(prev_ts)) => self.inertial.keyframe_edge(
+                self.rig.imu_noise(),
+                prev_kf_idx,
+                frame.idx,
+                prev_ts,
+                timestamp_sec,
+            ),
+            _ => None,
+        };
+        let KeyframeInsertion {
+            insertion,
+            close_points: n_close,
+        } = keyframe_mapping::keyframe_insertion(
+            curr_kf,
+            matches,
+            self.stereo_close_depth,
+            &self.rig.camera,
+            imu_edge,
+        );
+
+        let published = self.map.lock().unwrap().apply_insertion(insertion);
+        if let Err(error) = published {
+            // Nothing was written, so no tracker or IMU reference may advance to
+            // a keyframe the map does not hold.
+            self.dbg(format!(
+                "[kf] frame={} publication rejected: {error}",
+                frame.idx
+            ));
+            return false;
+        }
+        if self.stereo_close_depth.is_some() && is_stereo {
+            self.dbg(format!(
+                "[kf_stereo] frame={} close_points={}",
+                frame.idx, n_close
+            ));
+        }
+
+        self.inertial.last_keyframe_timestamp_sec = Some(timestamp_sec);
+
+        self.state.current_keyframe_idx = Some(frame.idx);
+        self.state.last_keyframe_idx = Some(frame.idx);
+
+        // Optional mapping work the accepted keyframe earns: grow against the
+        // captured neighbours, then forward SearchInNeighbors / Fuse, before
+        // local BA so BA sees the extra constraints. Mapping owns the sequence
+        // and its lock boundaries; the messages stay here.
+        let growth = keyframe_mapping::grow_keyframe(
+            &self.map,
+            growth_plan,
+            &self.rig.camera,
+            self.two_view_init_config.match_config,
+            &self.two_view_init_config.triangulation_config,
+        );
+        self.report_growth(frame.idx, &growth);
+
+        // Refinement can rotate/scale the world and update gravity. Do it before
+        // constructing the BA request so the job and its future snapshot agree.
+        if imu_initialized {
+            self.refine_inertial_init(timestamp_sec);
+        }
+
+        if !self.local_mapping.submit(KeyframeJob {
+            imu_initialized,
+            imu_t_bc: self.rig.camera_to_body(),
+            gravity_world: self.inertial.gravity_world,
+        }) {
+            self.dbg("[local_mapping] worker is unavailable".into());
+        }
+        // Synchronous mode has a completed correction available immediately;
+        // asynchronous mode will deliver it at a later frame boundary.
+        self.apply_local_mapping_results();
+
+        // Index this keyframe for appearance-based place recognition and surface
+        // any loop candidates (no-op unless a vocabulary was provided).
+        self.register_place_recognition(frame.idx);
+
+        true
+    }
+
+    fn report_growth(&mut self, frame_idx: usize, growth: &KeyframeGrowthResult) {
+        if !self.debug {
+            return;
+        }
+        for failure in &growth.pair_failures {
+            self.dbg(format!(
+                "[kf] frame={frame_idx} pair growth against {} rejected: {}",
+                failure.neighbor_keyframe_idx, failure.error
+            ));
+        }
+        self.dbg(format!(
+            "[kf] frame={frame_idx} grown={} from {} neighbor kfs",
+            growth.landmarks_added, growth.neighbor_count
+        ));
+        self.dbg(format!(
+            "[fuse] frame={frame_idx} fused={}",
+            growth.observations_added
+        ));
+        for error in &growth.fusion_failures {
+            self.dbg(format!("[fuse] frame={frame_idx} link refused: {error}"));
+        }
+    }
+
+    /// VIBA1/VIBA2: progressive re-solves with relaxed priors over the same
+    /// (now-growing) window VIBA0 used, mirroring LocalMapping.cc:200-228.
+    /// Tracking already runs on VIBA0's result, so a rejection here only means
+    /// that stage never runs, not a tracking failure.
+    fn refine_inertial_init(&mut self, timestamp_sec: f64) {
+        let (Some(start_idx), Some(refinement)) = (
+            self.inertial.schedule.start_kf_idx(),
+            self.inertial.schedule.due_refinement(timestamp_sec),
+        ) else {
+            return;
+        };
+        let stage = refinement.name();
+
+        // Drop the solve's map lock before applying its result with a new lock.
+        let init_result = self.inertial.initializer.try_initialize(
+            &self.map.lock().unwrap(),
+            self.rig.camera_to_body(),
+            self.inertial.bias,
+            start_idx,
+            refinement.prior_g(),
+            refinement.prior_a(),
+            true,
+        );
+        match init_result {
+            Some(init) => {
+                let applied = self.inertial.apply_initialization(
+                    &mut self.map.lock().unwrap(),
+                    &mut self.state,
+                    init,
+                    start_idx,
+                );
+                match applied {
+                    Ok(AppliedInitialization {
+                        scale,
+                        gyro_bias: bg,
+                        ..
+                    }) => self.dbg(format!(
+                        "[imu_init] {stage} accepted: scale_correction={scale:.4} gyro_bias=({:.4},{:.4},{:.4})",
+                        bg.x, bg.y, bg.z
+                    )),
+                    Err(error) => {
+                        self.dbg(format!("[imu_init] {stage} alignment refused: {error}"));
+                    }
+                }
+            }
+            None => {
+                self.dbg(format!(
+                    "[imu_init] {stage} rejected: solve failed or invalid scale"
+                ));
+            }
+        }
+
+        self.inertial.schedule.complete(refinement);
+    }
+
+    /// Offers a freshly inserted keyframe to place recognition and, when
+    /// configured, loop closing; applies whatever the closer reports back.
+    fn register_place_recognition(&mut self, kf_idx: usize) {
+        let context = LoopClosingContext {
+            pose_world_to_cam: self.state.pose_world_to_cam,
+            velocity_world: self.state.velocity_world,
+            current_keyframe_idx: self.state.current_keyframe_idx,
+            imu_initialized: self.state.imu_initialized,
+            gravity_world: self.inertial.gravity_world,
+        };
+        let outcome = {
+            let mut map = self.map.lock().unwrap();
+            self.loop_closer
+                .on_keyframe(&mut map, &self.rig.camera, kf_idx, context)
+        };
+        if let Some(message) = outcome.debug_message {
+            self.dbg(message);
+        }
+        if let Some((corrected_tracking_pose, corrected_velocity)) = outcome.tracking_correction {
+            self.state.pose_world_to_cam = corrected_tracking_pose;
+            self.state.velocity_world = corrected_velocity;
+        }
+        if outcome.pgo_applied {
+            self.tracker.reset_tracks();
+            if self.state.imu_initialized {
+                if !self.local_mapping.submit(KeyframeJob {
+                    imu_initialized: true,
+                    imu_t_bc: self.rig.camera_to_body(),
+                    gravity_world: self.inertial.gravity_world,
+                }) {
+                    self.dbg("[local_mapping] worker is unavailable after PGO".into());
+                }
+                self.apply_local_mapping_results();
+            }
+        }
+        self.loop_closure_events.extend(outcome.events);
+    }
+}
+
+fn format_imu_init_gate(
+    start_idx: usize,
+    first_idx: Option<usize>,
+    last_idx: Option<usize>,
+    keyframes: usize,
+    min_keyframes: usize,
+    imu_time: f64,
+    min_time_sec: f64,
+) -> String {
+    format!(
+        "[imu_init_gate] start_idx={start_idx} first_idx={first_idx:?} last_idx={last_idx:?} kfs={keyframes}/{min_keyframes} imu_time={imu_time:.2}/{min_time_sec:.1}s"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_imu_init_gate;
+
+    #[test]
+    fn formats_compact_imu_init_gate() {
+        assert_eq!(
+            format_imu_init_gate(12, Some(12), Some(32), 7, 10, 1.05, 1.0),
+            "[imu_init_gate] start_idx=12 first_idx=Some(12) last_idx=Some(32) kfs=7/10 imu_time=1.05/1.0s"
+        );
+    }
+}

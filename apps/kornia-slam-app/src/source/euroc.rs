@@ -7,7 +7,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::Mat3F64;
 use kornia_io::png::read_image_png_mono8;
 
-use super::{FrameItem, FrameSource, SourceError};
+use super::{FrameItem, FrameSource, SourceError, rectify_pair};
 use crate::datasets::EurocDataset;
 use crate::datasets::euroc::{GroundTruthPose, ImuSample};
 use crate::datasets::{StereoRectifier, rectifier_from_euroc};
@@ -167,10 +167,8 @@ impl FrameSource for EurocSource {
                 let right_raw = read_image_png_mono8(right_path)
                     .map_err(SourceError::other)?
                     .into_inner();
-                (
-                    rect.rectify_left(&left_raw).map_err(SourceError::other)?,
-                    Some(rect.rectify_right(&right_raw).map_err(SourceError::other)?),
-                )
+                let (left, right) = rectify_pair(rect, &left_raw, &right_raw)?;
+                (left, Some(right))
             }
             None => (left_raw, None),
         };

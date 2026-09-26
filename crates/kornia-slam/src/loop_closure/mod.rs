@@ -1,10 +1,16 @@
-//! Geometric loop verification, consistency, fusion, and pose-graph optimization.
+//! Loop closing: place recognition, geometric verification, consistency,
+//! fusion, and pose-graph optimization.
 
+mod closer;
 mod episode;
 mod fusion;
+pub mod place_recognition;
 mod pose_graph;
+mod sparse_pgo;
 mod verification;
 
+pub(crate) use closer::{LoopCloser, LoopClosingContext};
+pub use closer::{LoopClosingConfig, LoopClosureEvent};
 pub use episode::{LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker};
 pub use fusion::{LoopFusionConfig, LoopFusionStats, fuse_verified_loop};
 pub use pose_graph::{InertialPgoContext, PgoConfig, PgoError, PgoResult, optimize_pose_graph};
