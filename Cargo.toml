@@ -27,3 +27,11 @@ kornia-image = "0.2.0"
 kornia-imgproc = "0.2.0"
 kornia-io = "0.2.0"
 kornia-tensor = "0.2.0"
+
+# Release binaries only (binary_release.yml). Kept out of `release` so local
+# benchmark builds stay fast and comparable with earlier runs.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+strip = true

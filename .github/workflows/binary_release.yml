@@ -19,12 +19,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # 22.04 sets the glibc floor to 2.35: Ubuntu 22.04+ and Jetson JetPack 6.
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
+    env:
+      MAX_GLIBC: "2.35"
     steps:
       - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          cache-prefix: cargo-dist
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -44,13 +51,22 @@ jobs:
           fi
 
       - name: Build
-        run: cargo build --release --locked -p kornia-slam-app
+        run: cargo build --profile dist --locked -p kornia-slam-app
+
+      - name: Check the glibc floor
+        run: |
+          needed=$(objdump -T target/dist/kornia-slam | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "requires glibc $needed (limit $MAX_GLIBC)"
+          if [ "$(printf '%s\n%s\n' "$needed" "$MAX_GLIBC" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
+            echo "::error::kornia-slam needs glibc $needed, above the supported $MAX_GLIBC"
+            exit 1
+          fi
 
       - name: Package
         run: |
           name="kornia-slam-v${{ steps.version.outputs.version }}-${{ matrix.target }}"
           mkdir "$name"
-          cp target/release/kornia-slam LICENSE README.md CHANGELOG.md "$name/"
+          cp target/dist/kornia-slam LICENSE README.md CHANGELOG.md "$name/"
           tar -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
 
