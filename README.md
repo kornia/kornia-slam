@@ -73,6 +73,17 @@ cargo clippy --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+## Paper
+
+**Kornia-SLAM: An End-to-End Visual-Inertial SLAM System in Rust**\
+Christie J. Purackal, Edgar Riba, Astik Srivastava.\
+Rust for Robotics workshop at IROS 2026 (preprint).\
+[Paper (PDF)](https://github.com/kornia/kornia-slam/releases/download/v0.1.0/kornia-slam-iros2026-r4r-paper.pdf) · [Poster (PDF)](https://github.com/kornia/kornia-slam/releases/download/v0.1.0/kornia-slam-iros2026-r4r-poster.pdf)
+
+The paper's EuRoC results come from the August 2026 code, before v0.1.0. To cite
+kornia-slam, use GitHub's "Cite this repository" button, which reads
+[CITATION.cff](CITATION.cff).
+
 ## License
 
 Apache-2.0

@@ -1,0 +1,34 @@
+cff-version: 1.2.0
+message: "If you use kornia-slam, please cite the paper below."
+title: kornia-slam
+type: software
+version: 0.1.0
+date-released: 2026-09-27
+license: Apache-2.0
+repository-code: https://github.com/kornia/kornia-slam
+url: https://kornia.org
+authors:
+  - given-names: Christie J.
+    family-names: Purackal
+    affiliation: Kornia AI Research Organization
+  - given-names: Edgar
+    family-names: Riba
+    affiliation: Kornia AI Research Organization
+  - given-names: Astik
+    family-names: Srivastava
+    affiliation: Robotics Research Center, IIIT Hyderabad
+preferred-citation:
+  type: conference-paper
+  title: "Kornia-SLAM: An End-to-End Visual-Inertial SLAM System in Rust"
+  authors:
+    - given-names: Christie J.
+      family-names: Purackal
+    - given-names: Edgar
+      family-names: Riba
+    - given-names: Astik
+      family-names: Srivastava
+  collection-title: Rust for Robotics Workshop at IROS 2026
+  conference:
+    name: IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS) 2026
+  year: 2026
+  url: https://github.com/kornia/kornia-slam/releases/download/v0.1.0/kornia-slam-iros2026-r4r-paper.pdf
