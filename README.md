@@ -35,6 +35,12 @@ cargo run --release -p kornia-slam-app -- euroc --data /path/to/MH_01_easy --ste
 
 More sources and options: [apps/kornia-slam-app](apps/kornia-slam-app/README.md).
 
+## Integrations
+
+- **[Copper](https://github.com/copper-project/copper-rs):** stereo visual-inertial odometry as
+  Copper tasks via [cu-kornia-vio](https://github.com/kornia/cu-kornia-vio). See
+  [INTEGRATIONS.md](INTEGRATIONS.md#copper) for setup, graph wiring and timing requirements.
+
 ## Development
 
 With [Pixi](https://pixi.sh), which sets up the toolchain for you:
