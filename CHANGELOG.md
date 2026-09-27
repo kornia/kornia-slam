@@ -28,6 +28,7 @@ OAK-D (behind the `uvc` and `oakd` features). It has a terminal UI, Rerun stream
 and ATE/RPE evaluation against ground truth.
 
 **Development.** A Pixi environment with the standard lint and test tasks. The
-minimum supported Rust version is 1.89, set by kornia-rs.
+minimum supported Rust version of the library crates is 1.89, set by kornia-rs;
+building the CLI needs 1.91 because of Rerun.
 
 [Unreleased]: https://github.com/kornia/kornia-slam/commits/develop

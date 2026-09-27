@@ -1,0 +1,83 @@
+name: Binary Release
+
+# Builds the `kornia-slam` CLI for each target on a v* tag and attaches the
+# archives to a draft GitHub Release, which a maintainer reviews and publishes.
+# A manual run builds and uploads the archives as run artifacts only.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Read the workspace version
+        id: version
+        run: |
+          version=$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c "import sys,json; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name'] == 'kornia-slam'))")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Tag matches the workspace version
+        if: github.ref_type == 'tag'
+        run: |
+          if [ "v${{ steps.version.outputs.version }}" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match workspace version ${{ steps.version.outputs.version }}"
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo build --release --locked -p kornia-slam-app
+
+      - name: Package
+        run: |
+          name="kornia-slam-v${{ steps.version.outputs.version }}-${{ matrix.target }}"
+          mkdir "$name"
+          cp target/release/kornia-slam LICENSE README.md CHANGELOG.md "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: kornia-slam-*.tar.gz*
+
+  release:
+    name: Draft GitHub Release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" kornia-slam-*.tar.gz* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes "See [CHANGELOG.md](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/CHANGELOG.md) for what changed."

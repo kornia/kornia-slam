@@ -24,7 +24,7 @@ preview = ["pixi-build"]
 # ==============================================================================
 
 [feature.rust.dependencies]
-rust = ">=1.89"  # kornia-rs 0.2 MSRV
+rust = ">=1.91"  # the app via rerun; the libraries need 1.89
 cmake = "*"
 cxx-compiler = "*"
 

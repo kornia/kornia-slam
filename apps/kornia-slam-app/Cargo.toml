@@ -4,7 +4,8 @@ publish = false
 description = "Runnable visual and visual-inertial SLAM application"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# rerun 0.29 needs 1.90 and its build tooling 1.91.
+rust-version = "1.91"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

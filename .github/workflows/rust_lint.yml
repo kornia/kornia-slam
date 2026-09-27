@@ -30,6 +30,7 @@ jobs:
               - "Cargo.toml"
               - "Cargo.lock"
               - ".github/workflows/rust_lint.yml"
+              - "scripts/check_version_pins.py"
               - ".github/actions/setup-rust-cache/**"
 
   fmt:
@@ -66,6 +67,46 @@ jobs:
       - name: cargo doc
         if: env.RUST_CHANGED == 'true'
         run: cargo doc --locked --no-deps -p kornia-slam -p kornia-sensors
+
+  pins:
+    name: Version pins
+    needs: changes
+    runs-on: ubuntu-latest
+    env:
+      RUST_CHANGED: ${{ needs.changes.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.RUST_CHANGED == 'true'
+      - name: check_version_pins.py
+        if: env.RUST_CHANGED == 'true'
+        run: python3 scripts/check_version_pins.py
+
+  # The published library crates only: the app's rerun dependency needs a newer
+  # toolchain and declares its own rust-version.
+  msrv:
+    name: MSRV
+    needs: changes
+    runs-on: ubuntu-latest
+    env:
+      RUST_CHANGED: ${{ needs.changes.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.RUST_CHANGED == 'true'
+      - name: Read rust-version
+        id: msrv
+        if: env.RUST_CHANGED == 'true'
+        run: python3 -c "import tomllib; print('version=' + tomllib.load(open('Cargo.toml','rb'))['workspace']['package']['rust-version'])" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/setup-rust-cache
+        if: env.RUST_CHANGED == 'true'
+        with:
+          cache-prefix: cargo-msrv
+      - uses: dtolnay/rust-toolchain@master
+        if: env.RUST_CHANGED == 'true'
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - name: cargo check on ${{ steps.msrv.outputs.version }}
+        if: env.RUST_CHANGED == 'true'
+        run: cargo check -p kornia-sensors -p kornia-slam --all-targets --locked
 
   clippy:
     name: Clippy (${{ matrix.name }})
