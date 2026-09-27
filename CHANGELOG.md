@@ -31,4 +31,4 @@ and ATE/RPE evaluation against ground truth.
 minimum supported Rust version of the library crates is 1.89, set by kornia-rs;
 building the CLI needs 1.91 because of Rerun.
 
-[Unreleased]: https://github.com/kornia/kornia-slam/commits/develop
+[Unreleased]: https://github.com/kornia/kornia-slam/commits/main

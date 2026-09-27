@@ -7,9 +7,9 @@ name: Rust Lint
 on:
   workflow_dispatch:
   push:
-    branches: [main, develop]
+    branches: [main]
   pull_request:
-    branches: [main, develop]
+    branches: [main]
 
 jobs:
   changes:

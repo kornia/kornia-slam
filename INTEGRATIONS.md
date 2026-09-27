@@ -40,7 +40,7 @@ cu-sensor-payloads = { path = "components/payloads/cu_sensor_payloads" }
 cu-spatial-payloads = { path = "components/payloads/cu_spatial_payloads" }
 ```
 
-`cu-kornia-vio` currently builds against kornia-slam `294b00b`, not `develop` HEAD. A new lockfile
+`cu-kornia-vio` currently builds against kornia-slam `294b00b`, not `main` HEAD. A new lockfile
 resolves HEAD, so pin both repos to the revisions in `cu-kornia-vio`'s own `Cargo.lock`:
 
 ```bash

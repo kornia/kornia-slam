@@ -3,7 +3,7 @@ name: Doc links
 on:
   pull_request:
   push:
-    branches: [develop]
+    branches: [main]
   schedule:
     - cron: '29 6 * * 1'  # Mondays, 06:29 UTC
   workflow_dispatch:
@@ -28,7 +28,7 @@ jobs:
         if: github.event_name == 'pull_request'
         run: python3 .github/scripts/check_doc_links.py --offline
 
-      # Networked on schedule and on develop, where a failure is a red
+      # Networked on schedule and on main, where a failure is a red
       # cron job rather than a blocked pull request.
       - name: Check links (including external)
         if: github.event_name != 'pull_request'
