@@ -10,8 +10,10 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
-First public release, planned as 0.1.0. The API will change between minor versions
-through the 0.x series.
+## [0.1.0] — 2026-09-27
+
+First public release. The API will change between minor versions through the 0.x
+series.
 
 **Visual and visual-inertial SLAM on kornia-rs.** An ORB-based pipeline for
 monocular, stereo and stereo-inertial input, built on the kornia-rs 0.2 crates.
@@ -25,10 +27,17 @@ calibration types, usable independently of the SLAM runtime.
 **The `kornia-slam` CLI** (`kornia-slam-app`, not published to crates.io) runs the
 pipeline on EuRoC, Hilti and MCAP recordings, and live on UVC cameras and Luxonis
 OAK-D (behind the `uvc` and `oakd` features). It has a terminal UI, Rerun streaming,
-and ATE/RPE evaluation against ground truth.
+and ATE/RPE evaluation against ground truth. Prebuilt binaries for linux x86_64 and
+aarch64 (glibc 2.35+: Ubuntu 22.04 and later, Jetson JetPack 6) are attached to the
+GitHub release.
+
+**Integrations.** [INTEGRATIONS.md](INTEGRATIONS.md) shows how to run kornia-slam as a
+visual-inertial odometry task inside [Copper](https://github.com/copper-project/copper-rs)
+through `cu-kornia-vio`.
 
 **Development.** A Pixi environment with the standard lint and test tasks. The
 minimum supported Rust version of the library crates is 1.89, set by kornia-rs;
 building the CLI needs 1.91 because of Rerun.
 
-[Unreleased]: https://github.com/kornia/kornia-slam/commits/main
+[Unreleased]: https://github.com/kornia/kornia-slam/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/kornia/kornia-slam/releases/tag/v0.1.0
