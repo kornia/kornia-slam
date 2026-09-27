@@ -3,9 +3,27 @@ members = ["crates/*", "apps/*"]
 resolver = "3"
 
 [workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
 authors = [
     "Christie Purackal <christie@kornia.org>",
     "Edgar Riba <edgar@kornia.org>",
 ]
 license = "Apache-2.0"
 repository = "https://github.com/kornia/kornia-slam"
+homepage = "https://kornia.org"
+categories = ["computer-vision", "science::robotics"]
+
+[workspace.dependencies]
+# Cargo cannot inherit workspace.package.version here: bump these with it.
+kornia-sensors = { path = "crates/kornia-sensors", version = "0.1.0" }
+kornia-slam = { path = "crates/kornia-slam", version = "0.1.0" }
+
+kornia-3d = "0.2.0"
+kornia-algebra = "0.2.0"
+kornia-bow = "0.2.0"
+kornia-image = "0.2.0"
+kornia-imgproc = "0.2.0"
+kornia-io = "0.2.0"
+kornia-tensor = "0.2.0"

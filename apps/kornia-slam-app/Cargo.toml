@@ -1,12 +1,14 @@
 [package]
 name = "kornia-slam-app"
-version = "0.1.0"
-edition = "2024"
 publish = false
 description = "Runnable visual and visual-inertial SLAM application"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "kornia-slam"
@@ -14,15 +16,15 @@ path = "src/main.rs"
 
 [dependencies]
 argh = "0.1"
-kornia-slam = { path = "../../crates/kornia-slam" }
-kornia-sensors = { path = "../../crates/kornia-sensors" }
+kornia-slam.workspace = true
+kornia-sensors.workspace = true
 
-kornia-3d = "0.2.0"
-kornia-algebra = "0.2.0"
-kornia-image = "0.2.0"
-kornia-imgproc = "0.2.0"
-kornia-io = "0.2.0"
-kornia-tensor = "0.2.0"
+kornia-3d.workspace = true
+kornia-algebra.workspace = true
+kornia-image.workspace = true
+kornia-imgproc.workspace = true
+kornia-io.workspace = true
+kornia-tensor.workspace = true
 
 rerun = { version = "0.29.2", optional = true }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }

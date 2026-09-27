@@ -1,12 +1,16 @@
 [package]
 name = "kornia-sensors"
-version = "0.1.0"
-edition = "2024"
 description = "Physical sensor processing for kornia: IMU preintegration, noise models, and calibration."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+keywords = ["imu", "preintegration", "sensors", "robotics", "kornia"]
 
 [dependencies]
-kornia-algebra = "0.2.0"
+kornia-algebra.workspace = true
 glam = "0.33"

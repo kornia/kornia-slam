@@ -24,7 +24,7 @@ preview = ["pixi-build"]
 # ==============================================================================
 
 [feature.rust.dependencies]
-rust = ">=1.85"  # edition 2024
+rust = ">=1.89"  # kornia-rs 0.2 MSRV
 cmake = "*"
 cxx-compiler = "*"
 

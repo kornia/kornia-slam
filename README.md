@@ -51,7 +51,7 @@ pixi run rust-test           # workspace tests
 pixi shell                   # drop into the environment
 ```
 
-Or with a Rust toolchain (1.85+) installed yourself:
+Or with a Rust toolchain (1.89+) installed yourself:
 
 ```bash
 cargo fmt --all -- --check

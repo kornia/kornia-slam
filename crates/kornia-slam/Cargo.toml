@@ -1,19 +1,24 @@
 [package]
 name = "kornia-slam"
-version = "0.1.0"
-edition = "2024"
 description = "Real-time visual-inertial SLAM in Rust, built on kornia-rs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+keywords = ["slam", "vio", "visual-odometry", "robotics", "kornia"]
 
 [dependencies]
-kornia-3d = "0.2.0"
-kornia-algebra = "0.2.0"
-kornia-image = "0.2.0"
-kornia-imgproc = "0.2.0"
-kornia-bow = "0.2.0"
-kornia-sensors = { path = "../kornia-sensors" }
+kornia-3d.workspace = true
+kornia-algebra.workspace = true
+kornia-image.workspace = true
+kornia-imgproc.workspace = true
+kornia-bow.workspace = true
+kornia-sensors.workspace = true
 # Sparse LLT for pose-graph optimization and dense Cholesky for the reduced
 # camera system in visual-inertial Schur-complement BA.
 faer = "0.22"
