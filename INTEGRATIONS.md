@@ -11,6 +11,11 @@ visual-inertial odometry as [Copper](https://github.com/copper-project/copper-rs
 - The wire types live in the separate `cu-stereo-payloads` crate, so a camera driver can produce
   them without depending on kornia-slam.
 
+<img src="assets/demo-copper-vio.gif" alt="cu-kornia-vio stereo-inertial odometry in the Copper drone simulator">
+
+<sub>Stereo + IMU inside Copper's `cu_flight_controller` drone simulator, at 2× speed. Dots on the
+camera image are the tracker's map points projected through the estimated pose.</sub>
+
 ### Dependencies
 
 Name both crates with the identical git spec:

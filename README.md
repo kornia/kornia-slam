@@ -10,6 +10,20 @@ Real-time visual-inertial SLAM in Rust, built on [kornia-rs](https://github.com/
 
 > **v0.1 — early release.** The API will change between minor versions.
 
+<table>
+  <tr>
+    <td><img src="assets/demo-euroc-mh01.gif" alt="kornia-slam stereo-inertial on EuRoC MH_01_easy"></td>
+    <td><img src="assets/demo-euroc-v101.gif" alt="kornia-slam stereo-inertial on EuRoC V1_01_easy"></td>
+  </tr>
+  <tr>
+    <td align="center">EuRoC MH_01_easy</td>
+    <td align="center">EuRoC V1_01_easy</td>
+  </tr>
+</table>
+
+<sub>Stereo + IMU at 2× speed. Each shows the map and trajectory, the left camera with its ORB
+keypoints, and a follow view.</sub>
+
 ## Features
 
 - Monocular, stereo, and visual-inertial ORB SLAM
