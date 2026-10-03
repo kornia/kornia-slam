@@ -11,7 +11,7 @@
 //! | `correction` | `apply_pose_graph_correction`, `apply_inertial_alignment`, `apply_ba_update` |
 //! | `geometry` | derived landmark geometry and the refresh set each correction owes |
 //! | `queries` | `covisible_keyframes`, `covisible_keyframes_min_weight` — thresholds belong to consumers |
-//! | `snapshot` | `ba_snapshot` — owned, immutable optimization inputs |
+//! | `snapshot` | `ba_snapshot` — owned, immutable copies of a BA window |
 //!
 //! ## Invariants
 //!
@@ -57,7 +57,7 @@ pub use imu_factor::ImuFactor;
 pub use keyframe::Keyframe;
 pub use map_point::{LandmarkObservation, MapPoint, ObservationKey};
 pub use ops::{
-    BaSnapshot, BaUpdate, BaUpdateError, InertialAlignment, InertialAlignmentError,
+    BaSnapshot, BaUpdate, BaUpdateError, BaWindow, InertialAlignment, InertialAlignmentError,
     KeyframeBaCorrection, KeyframeVelocity, LocalBaMergeResult, MapPointMergeResult,
     PoseGraphCorrectionError, PoseGraphCorrectionResult,
 };

@@ -4,7 +4,7 @@
 //! map owns capture and writeback; the local-mapping worker owns scheduling.
 
 use crate::mapping::map::{
-    BaSnapshot, BaUpdate, BaUpdateError, Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR,
+    BaSnapshot, BaUpdate, BaUpdateError, BaWindow, Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR,
 };
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
@@ -25,6 +25,65 @@ pub const STEREO_DEPTH_MIN_SIGMA: f32 = 0.02;
 
 /// Keyframes a local BA optimizes; older keyframes enter only as fixed poses.
 const MAX_ACTIVE_KFS: usize = 3;
+
+/// The local BA window: the newest [`MAX_ACTIVE_KFS`] keyframes and the live
+/// landmarks they observe, plus, as fixed context, every other keyframe that
+/// observes those landmarks and the IMU neighbours of the active keyframes.
+///
+/// Mirrors ORB-SLAM3's `LocalBundleAdjustment` selection. Fixed keyframes
+/// always precede the active ones in slot order, because the active keyframes
+/// are the newest.
+pub fn local_window(map: &Map) -> BaWindow {
+    let keyframes = map.keyframes();
+    let active_start = keyframes.len().saturating_sub(MAX_ACTIVE_KFS);
+    let active = &keyframes[active_start..];
+    let landmark_ids = live_landmarks_of(map, active);
+
+    let active_ids: HashSet<usize> = active.iter().map(|kf| kf.frame.idx).collect();
+    let mut context: HashSet<usize> = landmark_ids
+        .iter()
+        .flat_map(|&id| map.map_points()[id].observer_keyframes())
+        .collect();
+    for factor in map.imu_factors() {
+        if active_ids.contains(&factor.prev_kf_idx) || active_ids.contains(&factor.curr_kf_idx) {
+            context.insert(factor.prev_kf_idx);
+            context.insert(factor.curr_kf_idx);
+        }
+    }
+
+    let keyframe_slots = keyframes
+        .iter()
+        .enumerate()
+        .filter(|(slot, kf)| *slot >= active_start || context.contains(&kf.frame.idx))
+        .map(|(slot, _)| slot)
+        .collect();
+    BaWindow {
+        keyframe_slots,
+        landmark_ids,
+    }
+}
+
+/// The bootstrap pair (the two newest keyframes) and the live landmarks they observe.
+fn initial_window(map: &Map) -> BaWindow {
+    let keyframes = map.keyframes();
+    let start = keyframes.len().saturating_sub(2);
+    BaWindow {
+        keyframe_slots: (start..keyframes.len()).collect(),
+        landmark_ids: live_landmarks_of(map, &keyframes[start..]),
+    }
+}
+
+/// Live landmark ids observed by `keyframes`, ascending.
+fn live_landmarks_of(map: &Map, keyframes: &[Keyframe]) -> Vec<usize> {
+    let mut ids: Vec<usize> = keyframes
+        .iter()
+        .flat_map(|kf| kf.map_point_by_desc_idx.iter().flatten().copied())
+        .filter(|&id| map.map_points().get(id).is_some_and(|mp| !mp.culled))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
 
 /// Whether [`run_initial_ba`] refined the map or had too little to work with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +115,7 @@ pub fn run_initial_ba(
     map: &mut Map,
     camera: &PinholeCamera,
 ) -> Result<InitialBaOutcome, InitialBaError> {
-    let mut update = map.ba_snapshot().into_update();
+    let mut update = map.ba_snapshot(&initial_window(map)).into_update();
     let snapshot = &update.snapshot;
     const MAX_ITERS: usize = 5;
     const HUBER_SCALE_SQ: f32 = 5.991;
@@ -369,6 +428,8 @@ pub fn run_local_inertial_ba(
 /// landmark's position in `global` is its solver index.
 struct WindowPoints {
     global: Vec<usize>,
+    /// Snapshot slot of each landmark in `global`.
+    slots: Vec<usize>,
     local_of: HashMap<usize, usize>,
     positions: Vec<Vec3F64>,
 }
@@ -380,27 +441,32 @@ impl WindowPoints {
     ) -> Self {
         let mut unique: HashSet<usize> = HashSet::new();
         for kf in keyframes {
-            for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
-                if let Some(mp) = snapshot.map_points().get(*mp_idx)
-                    && !mp.culled
+            for &mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
+                if let Some(slot) = snapshot.landmark_slot(mp_idx)
+                    && !snapshot.map_points()[slot].culled
                 {
-                    unique.insert(*mp_idx);
+                    unique.insert(mp_idx);
                 }
             }
         }
         let mut global: Vec<usize> = unique.into_iter().collect();
         global.sort_unstable();
+        let slots: Vec<usize> = global
+            .iter()
+            .filter_map(|&idx| snapshot.landmark_slot(idx))
+            .collect();
         let local_of = global
             .iter()
             .enumerate()
             .map(|(local, &global)| (global, local))
             .collect();
-        let positions = global
+        let positions = slots
             .iter()
-            .map(|&idx| snapshot.map_points()[idx].position)
+            .map(|&slot| snapshot.map_points()[slot].position)
             .collect();
         Self {
             global,
+            slots,
             local_of,
             positions,
         }
@@ -441,8 +507,8 @@ impl WindowPoints {
     }
 
     fn write_back(&self, optimized: &[Vec3F64], map_points: &mut [Vec3F64]) {
-        for (&global_idx, point) in self.global.iter().zip(optimized) {
-            if let Some(mp) = map_points.get_mut(global_idx) {
+        for (&slot, point) in self.slots.iter().zip(optimized) {
+            if let Some(mp) = map_points.get_mut(slot) {
                 *mp = *point;
             }
         }

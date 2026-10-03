@@ -10,6 +10,12 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**Local BA no longer copies the whole map.** Each local bundle adjustment
+captured every keyframe, landmark and IMU factor under the map lock, so its
+cost, and the stall it caused tracking, grew with the map. It now captures only
+the local window. **Breaking:** `Map::ba_snapshot` takes a `BaWindow`; use
+`mapping::bundle_adjustment::local_window` for the standard selection.
+
 ## [0.1.0] — 2026-09-27
 
 First public release. The API will change between minor versions through the 0.x

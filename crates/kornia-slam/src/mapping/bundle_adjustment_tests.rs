@@ -75,7 +75,7 @@ fn fixture() -> Map {
 fn local_visual_ba_preserves_fixed_entities_and_solves_outside_the_live_map() {
     let mut map = fixture();
     let before = map.clone();
-    let update = run_local_ba(map.ba_snapshot(), &camera());
+    let update = run_local_ba(map.ba_snapshot(&local_window(&map)), &camera());
     assert_eq!(
         map.state_fingerprint_for_test(),
         before.state_fingerprint_for_test()
@@ -106,6 +106,77 @@ fn local_visual_ba_preserves_fixed_entities_and_solves_outside_the_live_map() {
     assert_eq!(
         map.map_points().last().unwrap().position,
         before.map_points().last().unwrap().position
+    );
+}
+
+#[test]
+fn local_window_holds_active_keyframes_their_landmarks_and_fixed_context() {
+    let mut map = Map::new();
+    for id in [50, 40, 30, 20, 10] {
+        map.insert_keyframe(Keyframe::from_frame(test_frame(id, vec![[0; 32]; 2])))
+            .unwrap();
+    }
+    let seed = |keyframe_idx| LandmarkSeed {
+        position: Vec3F64::new(0.0, 0.0, 5.0),
+        color: [0; 3],
+        reference: ObservationKey {
+            keyframe_idx,
+            feature_idx: 0,
+        },
+    };
+    map.insert_landmark(seed(50)).unwrap();
+    let retired = map.insert_landmark(seed(20)).unwrap();
+    map.remove_landmark(retired).unwrap();
+    let active = map.insert_landmark(seed(30)).unwrap();
+    map.link_observation(10, 1, active).unwrap();
+    map.apply_insertion(MapInsertion {
+        imu_factors: vec![imu_edge(40, 30), imu_edge(50, 40)],
+        ..Default::default()
+    })
+    .unwrap();
+
+    let window = local_window(&map);
+
+    // Slot 0 observes only an older landmark and its IMU edge has no active
+    // endpoint; slot 1 is in only as the IMU neighbour of the oldest active one.
+    assert_eq!(window.keyframe_slots, vec![1, 2, 3, 4]);
+    assert_eq!(window.landmark_ids, vec![active]);
+    let snapshot = map.ba_snapshot(&window);
+    assert_eq!(snapshot.landmark_ids(), &[active]);
+    assert_eq!(snapshot.imu_factors().len(), 1);
+}
+
+/// Behaviour-preserving: solving the local window must give exactly what
+/// solving a capture of the whole map gave before the window existed.
+#[test]
+fn local_window_solves_match_a_full_map_capture() {
+    let mut map = fixture();
+    map.edit_keyframes_for_test(|_, kf| kf.imu_bias.accel.x = 0.05);
+    map.apply_insertion(MapInsertion {
+        imu_factors: vec![
+            imu_edge(KF_IDS[0], KF_IDS[1]),
+            imu_edge(KF_IDS[2], KF_IDS[3]),
+        ],
+        ..Default::default()
+    })
+    .unwrap();
+
+    let merged = |update| {
+        let mut map = map.clone();
+        map.apply_ba_update(update).unwrap();
+        map.state_fingerprint_for_test()
+    };
+    assert_eq!(
+        merged(run_local_ba(
+            map.ba_snapshot(&local_window(&map)),
+            &camera()
+        )),
+        merged(run_local_ba(map.full_ba_snapshot(), &camera())),
+    );
+    let inertial = |snapshot| run_local_inertial_ba(snapshot, &camera(), None, Vec3F64::ZERO);
+    assert_eq!(
+        merged(inertial(map.ba_snapshot(&local_window(&map)))),
+        merged(inertial(map.full_ba_snapshot())),
     );
 }
 
@@ -147,9 +218,14 @@ fn skipped_visual_and_inertial_solves_leave_the_map_unchanged() {
         run_initial_ba(&mut map, &camera()).unwrap(),
         InitialBaOutcome::Skipped
     );
-    let visual = run_local_ba(map.ba_snapshot(), &camera());
+    let visual = run_local_ba(map.ba_snapshot(&local_window(&map)), &camera());
     assert_eq!(map.apply_ba_update(visual).unwrap().map_points_updated, 0);
-    let inertial = run_local_inertial_ba(map.ba_snapshot(), &camera(), None, Vec3F64::ZERO);
+    let inertial = run_local_inertial_ba(
+        map.ba_snapshot(&local_window(&map)),
+        &camera(),
+        None,
+        Vec3F64::ZERO,
+    );
     assert_eq!(map.apply_ba_update(inertial).unwrap().map_points_updated, 0);
     assert_eq!(map.state_fingerprint_for_test(), before);
 }
@@ -157,10 +233,11 @@ fn skipped_visual_and_inertial_solves_leave_the_map_unchanged() {
 #[test]
 fn refused_initial_ba_writeback_is_an_error_and_leaves_the_map_unchanged() {
     let mut map = fixture();
-    // A corrupt pose outside the bootstrap pair makes the whole update unpublishable.
+    // Visual BA carries velocity through unchanged, so a corrupt one in the
+    // bootstrap pair reaches writeback and makes the whole update unpublishable.
     map.edit_keyframes_for_test(|slot, kf| {
-        if slot == 0 {
-            kf.frame.pose_world_to_cam.translation.x = f64::NAN;
+        if slot == KF_IDS.len() - 1 {
+            kf.velocity_world.x = f64::NAN;
         }
     });
     let before = map.state_fingerprint_for_test();
@@ -223,7 +300,12 @@ fn inertial_ba_repropagates_active_edges_and_preserves_new_live_edges() {
     })
     .unwrap();
     let before = map.state_fingerprint_for_test();
-    let update = run_local_inertial_ba(map.ba_snapshot(), &camera(), None, Vec3F64::ZERO);
+    let update = run_local_inertial_ba(
+        map.ba_snapshot(&local_window(&map)),
+        &camera(),
+        None,
+        Vec3F64::ZERO,
+    );
     assert_eq!(map.state_fingerprint_for_test(), before);
     // A boundary edge has one fixed endpoint and must still be repropagated.
     assert_eq!(update.imu_preintegrations[0].bias.accel.x, 0.0);
@@ -254,7 +336,12 @@ fn failed_inertial_solve_still_returns_repropagated_measurements() {
     // on solver error would lose the refreshed measurement.
     let mut invalid_camera = camera();
     invalid_camera.fx = f64::NAN;
-    let update = run_local_inertial_ba(map.ba_snapshot(), &invalid_camera, None, Vec3F64::ZERO);
+    let update = run_local_inertial_ba(
+        map.ba_snapshot(&local_window(&map)),
+        &invalid_camera,
+        None,
+        Vec3F64::ZERO,
+    );
     assert_eq!(update.imu_preintegrations[0].bias.accel.x, 0.05);
     let result = map.apply_ba_update(update).unwrap();
     assert!(result.keyframe_corrections.is_empty());

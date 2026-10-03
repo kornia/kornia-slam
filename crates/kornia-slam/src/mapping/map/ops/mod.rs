@@ -14,4 +14,4 @@ pub use mutation::{
     InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError,
     MapPointMergeResult, ObservationLink,
 };
-pub use snapshot::{BaSnapshot, BaUpdate};
+pub use snapshot::{BaSnapshot, BaUpdate, BaWindow};

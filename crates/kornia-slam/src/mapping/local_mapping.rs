@@ -35,6 +35,10 @@ pub struct KeyframeJob {
     pub gravity_world: Vec3F64,
 }
 
+fn capture_local_window(map: &Map) -> BaSnapshot {
+    map.ba_snapshot(&super::bundle_adjustment::local_window(map))
+}
+
 fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJob) -> BaUpdate {
     if job.imu_initialized {
         super::bundle_adjustment::run_local_inertial_ba(
@@ -112,10 +116,9 @@ impl LocalMapping {
                 camera,
                 results,
             } => {
-                let snapshot = map
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .ba_snapshot();
+                let snapshot = capture_local_window(
+                    &map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+                );
                 let update = solve_snapshot(snapshot, camera, &job);
                 // Cull under the same lock as the merge, so a completed result
                 // is never observable before cleanup. A rejected snapshot culls
@@ -218,14 +221,14 @@ impl LocalMappingHandle {
                     };
 
                     // The gate makes compound keyframe publication atomic to local
-                    // mapping. The map lock is held only for the private clone.
+                    // mapping. The map lock is held only to copy the local window.
                     let snapshot = {
                         let _publication = publication_gate
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        map.lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .ba_snapshot()
+                        capture_local_window(
+                            &map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+                        )
                     };
 
                     let update = solve_snapshot(snapshot, &camera, &job);
@@ -491,7 +494,7 @@ mod tests {
     #[test]
     fn the_coordinator_does_not_cull_after_a_refused_merge() {
         let (map, doomed) = map_with_a_cullable_landmark();
-        let snapshot = map.lock().unwrap().ba_snapshot().into_update();
+        let snapshot = map.lock().unwrap().full_ba_snapshot().into_update();
         // Advance the world frame through a valid public correction, so the
         // snapshot belongs to an older epoch. Raw scale/rotation are private
         // precisely because they leave geometry stale.
@@ -524,7 +527,7 @@ mod tests {
     #[test]
     fn the_coordinator_does_not_cull_after_an_invalid_numerical_update() {
         let (map, doomed) = map_with_a_cullable_landmark();
-        let mut update = map.lock().unwrap().ba_snapshot().into_update();
+        let mut update = map.lock().unwrap().full_ba_snapshot().into_update();
         update.map_points[doomed].x = f64::NAN;
 
         let merged = super::merge_and_cull(&mut map.lock().unwrap(), update);
@@ -548,7 +551,7 @@ mod tests {
     #[test]
     fn the_coordinator_culls_after_an_accepted_merge() {
         let (map, doomed) = map_with_a_cullable_landmark();
-        let snapshot = map.lock().unwrap().ba_snapshot().into_update();
+        let snapshot = map.lock().unwrap().full_ba_snapshot().into_update();
 
         let merged = super::merge_and_cull(&mut map.lock().unwrap(), snapshot);
 

@@ -426,7 +426,8 @@ pub struct LocalBaMergeResult {
 impl Map {
     /// Applies solver-changed geometry from a BA update.
     ///
-    /// Entities inserted after the snapshot are left untouched. A snapshot is
+    /// Only captured entities are written; anything outside the window or
+    /// inserted after the snapshot is left untouched. A snapshot is
     /// rejected wholesale if the live map has since been scaled, rotated, or
     /// cleared, because its coordinates then belong to another world frame.
     ///
@@ -445,7 +446,7 @@ impl Map {
         // Lengths are checked rather than left to `zip`, which would silently
         // truncate a malformed result and publish the prefix.
         if update.keyframes.len() != snapshot.keyframes.len()
-            || update.map_points.len() != snapshot.map_points.len()
+            || update.map_points.len() != snapshot.landmark_ids.len()
             || update.imu_preintegrations.len() != snapshot.imu_factors.len()
         {
             return Err(BaUpdateError::LengthMismatch);
@@ -460,8 +461,7 @@ impl Map {
                 });
             }
         }
-        // Landmark slots are stable, so the captured index is the landmark id.
-        for (landmark_idx, &position) in update.map_points.iter().enumerate() {
+        for (&landmark_idx, &position) in snapshot.landmark_ids.iter().zip(&update.map_points) {
             if !finite_vec3(position) {
                 return Err(BaUpdateError::NonFiniteLandmark { landmark_idx });
             }
@@ -505,11 +505,11 @@ impl Map {
         }
 
         let mut changed_points = Vec::new();
-        for (idx, (before, &optimized)) in snapshot
-            .map_points
+        for ((&idx, before), &optimized) in snapshot
+            .landmark_ids
             .iter()
-            .zip(update.map_points.iter())
-            .enumerate()
+            .zip(&snapshot.map_points)
+            .zip(&update.map_points)
         {
             if optimized == before.position {
                 continue;
@@ -948,7 +948,7 @@ mod ba_tests {
     fn ba_moving_a_reference_camera_refreshes_geometry_without_moving_the_point() {
         let (mut map, point) = snapshot_fixture();
         let before = map.map_points()[point].position;
-        let mut update = map.ba_snapshot().into_update();
+        let mut update = map.full_ba_snapshot().into_update();
         // World-to-camera translation (1, 0, 0) puts the camera centre at
         // (-1, 0, 0), so the landmark at (0, 0, 5) sits (1, 0, 5) away.
         update.keyframes[0].pose_world_to_cam.translation.x = 1.0;
@@ -986,7 +986,7 @@ mod ba_tests {
         assert!(map.link_observation(1, 0, point).unwrap());
         let bounds_before = map.map_points()[point].max_distance;
 
-        let mut update = map.ba_snapshot().into_update();
+        let mut update = map.full_ba_snapshot().into_update();
         // Camera centre of keyframe 1 moves from (2, 0, 0) to (4, 0, 0).
         update.keyframes[1].pose_world_to_cam.translation.x = -4.0;
         let result = map.apply_ba_update(update).unwrap();
@@ -1015,7 +1015,7 @@ mod ba_tests {
         let mut map = Map::new();
         map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]; 2])))
             .unwrap();
-        let mut update = map.ba_snapshot().into_update();
+        let mut update = map.full_ba_snapshot().into_update();
 
         // Inserted after capture: the snapshot holds no landmarks at all.
         let later = map.insert_landmark(seeded(0, 0, 5.0)).unwrap();
@@ -1047,7 +1047,7 @@ mod ba_tests {
             .unwrap();
         map.insert_landmark(seeded(0, 0, 5.0)).unwrap();
 
-        let mut snapshot = map.ba_snapshot().into_update();
+        let mut snapshot = map.full_ba_snapshot().into_update();
         snapshot.keyframes[0].pose_world_to_cam.translation.x = 2.0;
         snapshot.map_points[0].x = 3.0;
 
@@ -1091,7 +1091,7 @@ mod ba_tests {
         map.insert_landmark(seeded_at(0, 0, Vec3F64::new(1.0, 0.0, 5.0)))
             .unwrap();
 
-        let mut snapshot = map.ba_snapshot().into_update();
+        let mut snapshot = map.full_ba_snapshot().into_update();
         snapshot.map_points[0].x = 7.0;
 
         map.clear_active();
@@ -1114,7 +1114,7 @@ mod ba_tests {
         map.insert_landmark(seeded_at(0, 0, Vec3F64::new(1.0, 0.0, 5.0)))
             .unwrap();
 
-        let mut snapshot = map.ba_snapshot().into_update();
+        let mut snapshot = map.full_ba_snapshot().into_update();
         snapshot.map_points[0].x = 7.0;
         map.apply_inertial_alignment(InertialAlignment {
             scale: 2.0,
@@ -1139,7 +1139,7 @@ mod ba_tests {
         let mut map = Map::new();
         map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0; 32]])))
             .unwrap();
-        let mut snapshot = map.ba_snapshot().into_update();
+        let mut snapshot = map.full_ba_snapshot().into_update();
         snapshot.keyframes[0].pose_world_to_cam.translation.x = 9.0;
         let corrected = Pose3d::new(
             kornia_algebra::Mat3F64::IDENTITY,
@@ -1188,7 +1188,7 @@ mod ba_tests {
     #[test]
     fn merging_an_older_snapshot_does_not_resurrect_a_retired_landmark() {
         let (mut map, point) = snapshot_fixture();
-        let mut snapshot = map.ba_snapshot().into_update();
+        let mut snapshot = map.full_ba_snapshot().into_update();
         // The solver must actually have moved this landmark: writeback skips
         // unchanged positions, so an untouched snapshot would never reach the
         // retirement guard and the test would pass without exercising it.
@@ -1213,7 +1213,7 @@ mod ba_tests {
     #[test]
     fn entities_added_after_a_snapshot_survive_its_merge() {
         let (mut map, _) = snapshot_fixture();
-        let snapshot = map.ba_snapshot().into_update();
+        let snapshot = map.full_ba_snapshot().into_update();
 
         let result = map
             .apply_insertion(MapInsertion {
@@ -1258,7 +1258,7 @@ mod ba_tests {
         let duplicate = map.insert_landmark(seeded(0, 1, 5.01)).unwrap();
         map.link_observation(1, 0, survivor).unwrap();
 
-        let snapshot = map.ba_snapshot().into_update();
+        let snapshot = map.full_ba_snapshot().into_update();
         map.merge_map_points(survivor, duplicate);
         // A landmark merge is not a world correction, so the capture is still
         // publishable — asserting that keeps the consistency checks below from
@@ -1395,7 +1395,7 @@ mod validation_tests {
             for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
                 let mut map = fixture();
                 let before = map.state_fingerprint_for_test();
-                let mut update = map.ba_snapshot().into_update();
+                let mut update = map.full_ba_snapshot().into_update();
                 // A genuine, publishable change early in the arrays.
                 update.keyframes[0].pose_world_to_cam.translation.x = 1.0;
                 update.map_points[0].z = 6.0;
@@ -1444,7 +1444,7 @@ mod validation_tests {
             })
             .unwrap();
             let before = map.state_fingerprint_for_test();
-            let mut update = map.ba_snapshot().into_update();
+            let mut update = map.full_ba_snapshot().into_update();
             update.keyframes[0].pose_world_to_cam.translation.x = 1.0;
             truncate(&mut update);
 
@@ -1500,7 +1500,7 @@ mod validation_tests {
             })
             .unwrap();
             let before = map.state_fingerprint_for_test();
-            let mut update = map.ba_snapshot().into_update();
+            let mut update = map.full_ba_snapshot().into_update();
             update.keyframes[0].pose_world_to_cam.translation.x = 1.0;
             corrupt(&mut update.imu_preintegrations[0]);
 
@@ -1530,7 +1530,7 @@ mod validation_tests {
             ..Default::default()
         })
         .unwrap();
-        let update = map.ba_snapshot().into_update();
+        let update = map.full_ba_snapshot().into_update();
         assert_eq!(update.imu_preintegrations[0].dt, 0.0);
 
         let result = map
