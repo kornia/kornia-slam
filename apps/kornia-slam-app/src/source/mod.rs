@@ -14,7 +14,7 @@ pub mod uvc;
 
 use kornia_image::Image;
 use kornia_imgproc::features::OrbFeatures;
-use kornia_slam::SensorRig;
+use kornia_sensors::SensorRig;
 
 use crate::datasets::StereoRectifier;
 use crate::datasets::euroc::ImuSample;

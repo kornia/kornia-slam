@@ -1,14 +1,15 @@
-//! Fixed sensor calibration, independent of the estimated SLAM state.
+//! Fixed calibration of a camera rig with optional stereo and IMU, independent
+//! of any estimated state.
 
+use crate::imu::ImuCalib;
 use kornia_3d::{camera::PinholeCamera, pose::Pose3d};
-use kornia_sensors::imu::ImuCalib;
 
-/// Camera calibration plus optional stereo and IMU calibration used by a SLAM system.
+/// Camera calibration plus optional stereo and IMU calibration.
 ///
-/// The camera model describes the images supplied to the system. For rectified
+/// The camera model describes the images the rig supplies. For rectified
 /// images, its intrinsics, the stereo baseline and the IMU extrinsics must all
 /// refer to that camera.
-/// Estimated bias, gravity, poses and buffered measurements are runtime state.
+/// Estimated bias, gravity and poses are runtime state of the consumer.
 #[derive(Debug, Clone)]
 pub struct SensorRig {
     pub camera: PinholeCamera,
@@ -35,8 +36,8 @@ impl SensorRig {
         self
     }
 
-    /// Enables the inertial path with the given camera-to-body extrinsic and
-    /// the default noise parameters.
+    /// Adds an IMU with the given camera-to-body extrinsic and the default
+    /// noise parameters (see [`ImuCalibration::new`]).
     pub fn with_imu(mut self, camera_to_body: Pose3d) -> Self {
         self.imu = Some(ImuCalibration::new(camera_to_body));
         self
@@ -53,8 +54,8 @@ impl SensorRig {
         self.imu.as_ref().map(|imu| imu.camera_to_body)
     }
 
-    /// Noise parameters to preintegrate with. Visual-only rigs still need these
-    /// for the map paths that preintegrate buffered samples.
+    /// Noise parameters to preintegrate with; the defaults for a rig without IMU
+    /// calibration.
     pub fn imu_noise(&self) -> ImuCalib {
         self.imu
             .as_ref()
@@ -72,7 +73,7 @@ pub struct ImuCalibration {
 }
 
 impl ImuCalibration {
-    /// Uses the system's historical IMU noise values with the given extrinsic.
+    /// Uses the EuRoC ADIS16448 noise densities with the given extrinsic.
     /// Supply `noise` explicitly when calibration for the actual sensor is
     /// available.
     pub fn new(camera_to_body: Pose3d) -> Self {
@@ -83,13 +84,60 @@ impl ImuCalibration {
     }
 }
 
-/// The noise values the system has always used, kept as the default so a rig
-/// built without explicit calibration behaves as before.
-pub(crate) fn default_imu_noise() -> ImuCalib {
+/// EuRoC MAV ADIS16448 noise densities and random walks (`imu0/sensor.yaml`).
+fn default_imu_noise() -> ImuCalib {
     ImuCalib {
         gyro_noise: 1.6968e-4,
         accel_noise: 2.0e-3,
         gyro_bias_noise: 1.9393e-5,
         accel_bias_noise: 3.0e-3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_camera() -> PinholeCamera {
+        PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_rig_without_imu_is_visual_only() {
+        let rig = SensorRig::new(test_camera());
+        assert!(rig.imu.is_none());
+        assert!(rig.camera_to_body().is_none());
+    }
+
+    #[test]
+    fn stereo_bf_is_focal_times_baseline() {
+        let rig = SensorRig::new(test_camera());
+        assert!(rig.stereo_bf().is_none());
+
+        let rig = rig.with_stereo_baseline(0.11);
+        assert_eq!(rig.stereo_bf(), Some(rig.camera.fx * 0.11));
+    }
+
+    #[test]
+    fn default_imu_noise_is_euroc() {
+        for rig in [
+            SensorRig::new(test_camera()),
+            SensorRig::new(test_camera()).with_imu(Pose3d::IDENTITY),
+        ] {
+            let noise = rig.imu_noise();
+            assert_eq!(noise.gyro_noise, 1.6968e-4);
+            assert_eq!(noise.accel_noise, 2.0e-3);
+            assert_eq!(noise.gyro_bias_noise, 1.9393e-5);
+            assert_eq!(noise.accel_bias_noise, 3.0e-3);
+        }
     }
 }

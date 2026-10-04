@@ -29,7 +29,7 @@ fn try_open(index: u32, width: u32, height: u32, fmt: FrameFormat) -> Result<Cam
         .map_err(SourceError::other)
 }
 
-use kornia_slam::SensorRig;
+use kornia_sensors::SensorRig;
 
 use super::{FrameItem, FrameSource, SourceError};
 

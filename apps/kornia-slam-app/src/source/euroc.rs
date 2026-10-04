@@ -6,7 +6,7 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Mat3F64;
 use kornia_io::png::read_image_png_mono8;
-use kornia_slam::SensorRig;
+use kornia_sensors::SensorRig;
 
 use super::{FrameItem, FrameSource, SourceError, rectify_pair};
 use crate::datasets::EurocDataset;

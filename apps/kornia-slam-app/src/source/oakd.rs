@@ -14,7 +14,7 @@ use depthai::{Device, Pipeline as DaiPipeline};
 use kornia_3d::camera::PinholeCamera;
 use kornia_image::{Image, ImageSize};
 
-use kornia_slam::SensorRig;
+use kornia_sensors::SensorRig;
 
 use super::{FrameItem, FrameSource, SourceError, rectify_pair};
 use crate::datasets::{StereoCalib, StereoRectifier};

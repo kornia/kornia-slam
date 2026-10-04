@@ -1,6 +1,6 @@
 [package]
 name = "kornia-sensors"
-description = "Physical sensor processing for kornia: IMU preintegration, noise models, and calibration."
+description = "Physical sensor processing for kornia: IMU preintegration, noise models, and sensor-rig calibration."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,5 +12,6 @@ categories.workspace = true
 keywords = ["imu", "preintegration", "sensors", "robotics", "kornia"]
 
 [dependencies]
+kornia-3d.workspace = true
 kornia-algebra.workspace = true
 glam = "0.33"

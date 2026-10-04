@@ -22,7 +22,7 @@ use kornia_imgproc::color::gray_from_rgb_u8;
 use kornia_io::jpeg::{decode_image_jpeg_layout, decode_image_jpeg_mono8, decode_image_jpeg_rgb8};
 use mcap::McapError;
 
-use kornia_slam::SensorRig;
+use kornia_sensors::SensorRig;
 
 use super::{FrameItem, FrameSource, SourceError, rectify_pair};
 use crate::datasets::StereoCalib;

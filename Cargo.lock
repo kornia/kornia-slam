@@ -6089,6 +6089,7 @@ name = "kornia-sensors"
 version = "0.1.0"
 dependencies = [
  "glam 0.33.2",
+ "kornia-3d",
  "kornia-algebra",
 ]
 

@@ -33,11 +33,11 @@ use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInser
 use crate::mapping::map::{Keyframe, Map, MapInsertion, MapMutationError, MapPoint};
 use crate::mapping::{KeyframeJob, LocalMapping};
 use crate::pose_conversion::apply_reference_pose_correction;
-use crate::sensor_rig::{ImuCalibration, SensorRig};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
 use kornia_sensors::imu::ImuMeasurement;
+use kornia_sensors::{ImuCalibration, SensorRig};
 
 /// Top-level ORB-SLAM system: orchestrates tracking, mapping, and state transitions.
 pub struct SlamSystem {

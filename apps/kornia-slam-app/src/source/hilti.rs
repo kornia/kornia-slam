@@ -28,7 +28,7 @@ use kornia_image::Image;
 use kornia_imgproc::features::OrbFeatures;
 use kornia_io::png::read_image_png_mono8;
 
-use kornia_slam::SensorRig;
+use kornia_sensors::SensorRig;
 
 use super::{FrameItem, FrameSource, SourceError};
 use crate::datasets::euroc::GroundTruthPose;

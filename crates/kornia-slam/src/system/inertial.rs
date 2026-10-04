@@ -1,6 +1,6 @@
 //! Ongoing inertial estimation state and measurement-window management.
 //!
-//! Calibration lives in [`SensorRig`](crate::sensor_rig::SensorRig); this is
+//! Calibration lives in [`SensorRig`](kornia_sensors::SensorRig); this is
 //! the estimated part — bias, gravity, the buffered samples and the
 //! initializer. The system coordinates writeback to the map and the tracker.
 
