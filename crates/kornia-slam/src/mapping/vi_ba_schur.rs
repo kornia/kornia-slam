@@ -375,7 +375,6 @@ fn imu_residual_and_jacobians(
     //   T_bw = T_bc · T_cw  →  R_bw = R_bc · R_cw,  t_bw = R_bc · t_cw + t_bc
     // Otherwise camera == body and R_bw = R_cw.
     // World-frame body position: twb = -R_bw^T · t_bw.
-    //
     // Key property: right-SE3 perturbation of T_cw = same right-SE3 perturbation
     // of T_bw (since T_bc is fixed), so Jacobian column layout is unchanged.
     let (r_bw_i, twb_i) = body_frame(&kf_i.pose, imu_t_bc);

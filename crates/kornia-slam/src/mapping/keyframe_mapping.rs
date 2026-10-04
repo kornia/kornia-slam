@@ -56,7 +56,6 @@ pub(crate) fn keyframe_insertion(
     let mut insertion = MapInsertion::default();
     // One feature per landmark and one landmark per feature; a repeat would
     // otherwise refuse the whole keyframe.
-    //
     // Out-of-range features are dropped *before* resolution: a claim that
     // cannot be published must not win its landmark and suppress a valid
     // later claim on the same one.
