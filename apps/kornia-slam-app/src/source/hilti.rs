@@ -28,6 +28,8 @@ use kornia_image::Image;
 use kornia_imgproc::features::OrbFeatures;
 use kornia_io::png::read_image_png_mono8;
 
+use kornia_slam::SensorRig;
+
 use super::{FrameItem, FrameSource, SourceError};
 use crate::datasets::euroc::GroundTruthPose;
 use crate::datasets::hilti::HiltiDataset;
@@ -110,8 +112,8 @@ fn rotate_180_mono(img: &Image<u8, 1>) -> Image<u8, 1> {
 }
 
 impl FrameSource for HiltiSource {
-    fn camera(&self) -> PinholeCamera {
-        self.camera.clone()
+    fn rig(&self) -> SensorRig {
+        SensorRig::new(self.camera.clone())
     }
 
     fn n_frames_hint(&self) -> Option<usize> {

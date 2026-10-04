@@ -6,6 +6,7 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Mat3F64;
 use kornia_io::png::read_image_png_mono8;
+use kornia_slam::SensorRig;
 
 use super::{FrameItem, FrameSource, SourceError, rectify_pair};
 use crate::datasets::EurocDataset;
@@ -118,32 +119,15 @@ impl EurocSource {
 }
 
 impl FrameSource for EurocSource {
-    fn camera(&self) -> PinholeCamera {
-        match &self.rectifier {
-            Some(rect) => rect.rectified_camera(),
-            None => self.dataset.camera(),
+    fn rig(&self) -> SensorRig {
+        let mut rig = SensorRig::new(self.camera());
+        if let Some(rect) = &self.rectifier {
+            rig = rig.with_stereo_baseline(rect.baseline());
         }
-    }
-
-    fn stereo_bf(&self) -> Option<f64> {
-        self.rectifier.as_ref().map(|r| r.bf())
-    }
-
-    fn imu_extrinsics(&self) -> Option<Pose3d> {
-        if !self.with_imu {
-            return None;
+        if let Some(t_bc) = self.camera_to_body() {
+            rig = rig.with_imu(t_bc);
         }
-        let (rotation, translation) = self.dataset.left_calibration.body_from_camera();
-        match &self.rectifier {
-            // The rectified virtual camera is the raw cam0 rotated by the
-            // rectifying rotation (p_rect = R_rect · p_cam0), so
-            // T_B,rect = T_BS · R_rectᵀ; the translation is unchanged.
-            Some(rect) => {
-                let r_rect_t = Mat3F64(*rect.left_rectifying_rotation().transpose());
-                Some(Pose3d::from_rt(rotation * r_rect_t, translation))
-            }
-            None => Some(Pose3d::from_rt(rotation, translation)),
-        }
+        rig
     }
 
     fn n_frames_hint(&self) -> Option<usize> {
@@ -186,6 +170,31 @@ impl FrameSource for EurocSource {
 }
 
 impl EurocSource {
+    fn camera(&self) -> PinholeCamera {
+        match &self.rectifier {
+            Some(rect) => rect.rectified_camera(),
+            None => self.dataset.camera(),
+        }
+    }
+
+    /// `T_BC` for the camera returned by [`Self::camera`], when IMU data is present.
+    fn camera_to_body(&self) -> Option<Pose3d> {
+        if !self.with_imu {
+            return None;
+        }
+        let (rotation, translation) = self.dataset.left_calibration.body_from_camera();
+        match &self.rectifier {
+            // The rectified virtual camera is the raw cam0 rotated by the
+            // rectifying rotation (p_rect = R_rect · p_cam0), so
+            // T_B,rect = T_BS · R_rectᵀ; the translation is unchanged.
+            Some(rect) => {
+                let r_rect_t = Mat3F64(*rect.left_rectifying_rotation().transpose());
+                Some(Pose3d::from_rt(rotation * r_rect_t, translation))
+            }
+            None => Some(Pose3d::from_rt(rotation, translation)),
+        }
+    }
+
     fn imu_samples_until(&mut self, timestamp_sec: f64) -> Vec<ImuSample> {
         if !self.with_imu {
             return Vec::new();

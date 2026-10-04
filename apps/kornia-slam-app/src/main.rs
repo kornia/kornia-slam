@@ -474,17 +474,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let camera = source.camera();
+    let mut rig = source.rig();
+    if !imu_enabled {
+        rig.imu = None;
+    } else if rig.imu.is_none() {
+        return Err(
+            "--imu requested but the source has no camera-IMU extrinsic or IMU samples".into(),
+        );
+    }
+    let camera = rig.camera.clone();
     let n_frames_hint = source.n_frames_hint();
 
-    // Stereo config (when the source yields rectified pairs).
-    let stereo_bf = source.stereo_bf();
     // Near/far split: close points (z < baseline * TH_DEPTH) get direct stereo
     // back-projection at each keyframe (ORB-SLAM3's ThDepth ~ 35 for EuRoC).
     const TH_DEPTH: f64 = 35.0;
-    let stereo_close_depth_m = stereo_bf.map(|bf| (bf / camera.fx) * TH_DEPTH);
-    let stereo_config = stereo_bf.map(|bf| {
-        let baseline = bf / camera.fx;
+    let stereo_close_depth_m = rig.stereo_baseline_m.map(|baseline| baseline * TH_DEPTH);
+    let stereo_config = rig.stereo_baseline_m.map(|baseline| {
+        let bf = baseline * camera.fx;
         if !tui_active {
             eprintln!(
                 "Stereo: rectified fx={:.2} baseline={:.4}m bf={:.2} close_depth={:.2}m",
@@ -523,7 +529,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         ..SlamConfig::default()
     };
-    let mut system = SlamSystem::new(camera.clone(), slam_config);
+    let mut system = SlamSystem::with_rig(rig, slam_config);
     if let Some(vocab_path) = args.vocab.as_deref() {
         use kornia_slam::loop_closure::place_recognition::{Vocabulary, load_orb_slam3_vocabulary};
         let vocab = if vocab_path.ends_with(".txt") {
@@ -535,17 +541,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         eprintln!("[place-recognition] loaded vocabulary from {vocab_path}");
         system.set_vocabulary(vocab);
-    }
-    if imu_enabled {
-        match source.imu_extrinsics() {
-            Some(t_bc) => system.set_imu_extrinsics(t_bc),
-            None => {
-                return Err(
-                    "--imu requested but the source has no camera-IMU extrinsic or IMU samples"
-                        .into(),
-                );
-            }
-        }
     }
 
     // ── Rerun ──────────────────────────────────────────────────────────────

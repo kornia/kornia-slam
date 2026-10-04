@@ -3,14 +3,18 @@
 use kornia_3d::{camera::PinholeCamera, pose::Pose3d};
 use kornia_sensors::imu::ImuCalib;
 
-/// Camera calibration and optional IMU calibration used by a SLAM system.
+/// Camera calibration plus optional stereo and IMU calibration used by a SLAM system.
 ///
 /// The camera model describes the images supplied to the system. For rectified
-/// images, both its intrinsics and the IMU extrinsics must refer to that camera.
+/// images, its intrinsics, the stereo baseline and the IMU extrinsics must all
+/// refer to that camera.
 /// Estimated bias, gravity, poses and buffered measurements are runtime state.
 #[derive(Debug, Clone)]
 pub struct SensorRig {
     pub camera: PinholeCamera,
+    /// Metric baseline (metres) of a rectified stereo pair whose left view is
+    /// `camera`. `None` for a monocular rig.
+    pub stereo_baseline_m: Option<f64>,
     /// `None` selects visual-only operation.
     pub imu: Option<ImuCalibration>,
 }
@@ -18,7 +22,17 @@ pub struct SensorRig {
 impl SensorRig {
     /// A visual-only rig. Add IMU calibration with [`SensorRig::with_imu`].
     pub fn new(camera: PinholeCamera) -> Self {
-        Self { camera, imu: None }
+        Self {
+            camera,
+            stereo_baseline_m: None,
+            imu: None,
+        }
+    }
+
+    /// Declares the images as a rectified stereo pair with the given baseline in metres.
+    pub fn with_stereo_baseline(mut self, baseline_m: f64) -> Self {
+        self.stereo_baseline_m = Some(baseline_m);
+        self
     }
 
     /// Enables the inertial path with the given camera-to-body extrinsic and
@@ -26,6 +40,12 @@ impl SensorRig {
     pub fn with_imu(mut self, camera_to_body: Pose3d) -> Self {
         self.imu = Some(ImuCalibration::new(camera_to_body));
         self
+    }
+
+    /// Stereo `bf = fx * baseline` (pixel·metres), the constant in
+    /// `depth = bf / disparity`. `None` for a monocular rig.
+    pub fn stereo_bf(&self) -> Option<f64> {
+        self.stereo_baseline_m.map(|b| self.camera.fx * b)
     }
 
     /// Camera-to-body transform `T_BC`, or `None` for a visual-only rig.

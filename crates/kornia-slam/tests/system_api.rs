@@ -41,6 +41,15 @@ fn a_rig_without_imu_is_visual_only() {
     assert!(rig.camera_to_body().is_none());
 }
 
+#[test]
+fn stereo_bf_is_focal_times_baseline() {
+    let rig = SensorRig::new(test_camera());
+    assert!(rig.stereo_bf().is_none());
+
+    let rig = rig.with_stereo_baseline(0.11);
+    assert_eq!(rig.stereo_bf(), Some(rig.camera.fx * 0.11));
+}
+
 /// The rig must default to the noise values the system previously hard-coded,
 /// so constructing one without explicit calibration changes nothing.
 #[test]

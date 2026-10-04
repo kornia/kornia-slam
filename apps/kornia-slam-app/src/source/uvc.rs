@@ -29,6 +29,8 @@ fn try_open(index: u32, width: u32, height: u32, fmt: FrameFormat) -> Result<Cam
         .map_err(SourceError::other)
 }
 
+use kornia_slam::SensorRig;
+
 use super::{FrameItem, FrameSource, SourceError};
 
 /// Live UVC frame source.
@@ -102,8 +104,8 @@ impl UvcSource {
 }
 
 impl FrameSource for UvcSource {
-    fn camera(&self) -> PinholeCamera {
-        self.camera.clone()
+    fn rig(&self) -> SensorRig {
+        SensorRig::new(self.camera.clone())
     }
 
     fn n_frames_hint(&self) -> Option<usize> {

@@ -12,10 +12,9 @@ pub mod oakd;
 #[cfg(feature = "uvc")]
 pub mod uvc;
 
-use kornia_3d::camera::PinholeCamera;
-use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
 use kornia_imgproc::features::OrbFeatures;
+use kornia_slam::SensorRig;
 
 use crate::datasets::StereoRectifier;
 use crate::datasets::euroc::ImuSample;
@@ -50,25 +49,10 @@ pub struct FrameItem {
 /// datasets exhaust after their last sample; live sources may exhaust when
 /// a CLI-imposed cap is reached.
 pub trait FrameSource {
-    /// Camera intrinsics. Must be valid before the first `next_frame` call.
-    /// For a stereo source this is the rectified camera shared by both views.
-    fn camera(&self) -> PinholeCamera;
-
-    /// Stereo baseline `bf = focal * baseline` in pixel·metre units, when the
-    /// source yields rectified stereo pairs. `None` for monocular sources.
-    fn stereo_bf(&self) -> Option<f64> {
-        None
-    }
-
-    /// Camera-to-body (IMU) extrinsic `T_BC` (`X_body = T_BC * X_cam`), in the
-    /// coordinate frame implied by [`Self::camera`]. `None` when the source has
-    /// no IMU, or when its IMU samples cannot be related to the camera frame
-    /// (e.g. rectified stereo, where the extrinsic of the virtual rectified
-    /// camera is not exposed yet). IMU samples without this extrinsic are
-    /// ignored by the pipeline.
-    fn imu_extrinsics(&self) -> Option<Pose3d> {
-        None
-    }
+    /// Calibration of the sensors behind this source. Must be valid before the
+    /// first `next_frame` call. For a stereo source the camera is the rectified
+    /// one shared by both views, and the IMU extrinsic (when present) refers to it.
+    fn rig(&self) -> SensorRig;
 
     /// Total frames the source will yield, if known.
     ///
@@ -80,7 +64,7 @@ pub trait FrameSource {
     fn next_frame(&mut self) -> Result<Option<FrameItem>, SourceError>;
 
     /// Map keypoints from raw-image pixels into the coordinate frame implied by
-    /// [`Self::camera`], filtering features the camera model cannot represent.
+    /// [`Self::rig`]'s camera, filtering features the camera model cannot represent.
     ///
     /// Default is a no-op: sources that yield images already in `camera()`'s
     /// frame (EuRoC, rectified stereo) leave features untouched. A fisheye

@@ -22,6 +22,8 @@ use kornia_imgproc::color::gray_from_rgb_u8;
 use kornia_io::jpeg::{decode_image_jpeg_layout, decode_image_jpeg_mono8, decode_image_jpeg_rgb8};
 use mcap::McapError;
 
+use kornia_slam::SensorRig;
+
 use super::{FrameItem, FrameSource, SourceError, rectify_pair};
 use crate::datasets::StereoCalib;
 
@@ -43,7 +45,7 @@ pub struct McapSource {
     n_total: usize,
     cursor: usize,
     camera: PinholeCamera,
-    stereo_bf: Option<f64>,
+    stereo_baseline_m: Option<f64>,
 }
 
 impl McapSource {
@@ -101,14 +103,14 @@ impl McapSource {
             n_total,
             cursor: 0,
             camera,
-            stereo_bf: None,
+            stereo_baseline_m: None,
         })
     }
 
     /// Open a rectified stereo pair from the `left_suffix`/`right_suffix`
     /// channels, using `calib_path` (a [`StereoCalib`] YAML) to undistort and
     /// row-align each frame. Left/right messages are paired by nearest
-    /// timestamp. Yields rectified pairs with metric `stereo_bf`.
+    /// timestamp. Yields rectified pairs with a metric stereo baseline.
     pub fn open_stereo(
         path: &Path,
         left_suffix: &str,
@@ -169,18 +171,18 @@ impl McapSource {
             n_total,
             cursor: 0,
             camera: rect_cam,
-            stereo_bf: Some(rectifier.bf()),
+            stereo_baseline_m: Some(rectifier.baseline()),
         })
     }
 }
 
 impl FrameSource for McapSource {
-    fn camera(&self) -> PinholeCamera {
-        self.camera.clone()
-    }
-
-    fn stereo_bf(&self) -> Option<f64> {
-        self.stereo_bf
+    fn rig(&self) -> SensorRig {
+        let rig = SensorRig::new(self.camera.clone());
+        match self.stereo_baseline_m {
+            Some(baseline_m) => rig.with_stereo_baseline(baseline_m),
+            None => rig,
+        }
     }
 
     fn n_frames_hint(&self) -> Option<usize> {

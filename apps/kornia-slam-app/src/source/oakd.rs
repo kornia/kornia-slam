@@ -14,10 +14,12 @@ use depthai::{Device, Pipeline as DaiPipeline};
 use kornia_3d::camera::PinholeCamera;
 use kornia_image::{Image, ImageSize};
 
+use kornia_slam::SensorRig;
+
 use super::{FrameItem, FrameSource, SourceError, rectify_pair};
 use crate::datasets::{StereoCalib, StereoRectifier};
 
-/// Live OAK-D frame source. `right_queue`/`rectifier`/`stereo_bf` are populated
+/// Live OAK-D frame source. `right_queue`/`rectifier`/`stereo_baseline_m` are populated
 /// when the source was opened via `open_stereo`; in mono mode they're `None`.
 pub struct OakdSource {
     // Order matters for drop: the queue must outlive the pipeline/device only
@@ -32,7 +34,7 @@ pub struct OakdSource {
     n_pixels: usize,
     camera: PinholeCamera,
     rectifier: Option<StereoRectifier>,
-    stereo_bf: Option<f64>,
+    stereo_baseline_m: Option<f64>,
     max_frames: usize,
     cursor: usize,
     start: Instant,
@@ -99,7 +101,7 @@ impl OakdSource {
             n_pixels,
             camera,
             rectifier: None,
-            stereo_bf: None,
+            stereo_baseline_m: None,
             max_frames,
             cursor: 0,
             start: Instant::now(),
@@ -108,8 +110,7 @@ impl OakdSource {
 
     /// Opens CamB + CamC GRAY8 streams at the resolution recorded in the
     /// calibration YAML and rectifies each pair online. The rectified camera
-    /// is the one exposed via `camera()`; `stereo_bf` carries the metric
-    /// `f * baseline` for the depth formula.
+    /// is the one exposed via `rig()`, together with the metric baseline.
     pub fn open_stereo(
         fps: f32,
         calib_path: &Path,
@@ -153,14 +154,14 @@ impl OakdSource {
         };
         let n_pixels = image_size.width * image_size.height;
         let rect_cam = rectifier.rectified_camera();
-        let stereo_bf = rectifier.bf();
+        let baseline_m = rectifier.baseline();
         eprintln!(
             "[oakd] stereo: {}x{} @ {fps}fps  rectified fx={:.2} baseline={:.4}m bf={:.2}",
             width,
             height,
             rect_cam.fx,
-            rectifier.baseline(),
-            stereo_bf,
+            baseline_m,
+            rectifier.bf(),
         );
 
         Ok(Self {
@@ -172,7 +173,7 @@ impl OakdSource {
             n_pixels,
             camera: rect_cam,
             rectifier: Some(rectifier),
-            stereo_bf: Some(stereo_bf),
+            stereo_baseline_m: Some(baseline_m),
             max_frames,
             cursor: 0,
             start: Instant::now(),
@@ -181,12 +182,12 @@ impl OakdSource {
 }
 
 impl FrameSource for OakdSource {
-    fn camera(&self) -> PinholeCamera {
-        self.camera.clone()
-    }
-
-    fn stereo_bf(&self) -> Option<f64> {
-        self.stereo_bf
+    fn rig(&self) -> SensorRig {
+        let rig = SensorRig::new(self.camera.clone());
+        match self.stereo_baseline_m {
+            Some(baseline_m) => rig.with_stereo_baseline(baseline_m),
+            None => rig,
+        }
     }
 
     fn n_frames_hint(&self) -> Option<usize> {
