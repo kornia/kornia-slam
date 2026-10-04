@@ -2,6 +2,19 @@
 
 This roadmap will keep evolving. It sets a direction, not a commitment.
 
+## Deployment realism
+
+Themes derived from ongoing studies of industrial and egocentric deployments. These guide our backlog and evaluation, not parity with MicroAGI microSLAM or any external system, and we do not claim SOTA.
+
+- Dynamic‑object‑aware tracking — https://github.com/kornia/kornia-slam/issues/139
+- Long‑sequence consistency — https://github.com/kornia/kornia-slam/issues/140
+- Dense/TSDF consistency from fixed poses — https://github.com/kornia/kornia-slam/issues/141
+- Monocular scale (already covered) — https://github.com/kornia/kornia-slam/issues/71
+- Place recognition / loop features — https://github.com/kornia/kornia-slam/issues/48
+- Appearance‑robust relocalization — https://github.com/kornia/kornia-slam/issues/68
+- LaMAria / egocentric evaluation — https://github.com/kornia/kornia-slam/issues/78
+- Multi‑camera + IMU — https://github.com/kornia/kornia-slam/issues/138
+
 ## Next — complete the SLAM stack
 
 - [ ] GPU acceleration of the per-frame hot paths (feature extraction, matching, KLT
@@ -36,7 +49,7 @@ This roadmap will keep evolving. It sets a direction, not a commitment.
 ## Experimental — sensors, maps, agents
 
 - [ ] RGB-D, LiDAR and GNSS estimators, estimator fusion in odometry
-- [ ] Map representations beyond sparse landmarks — dense, TSDF, voxel, Gaussian splats
+- [ ] Map representations beyond sparse landmarks — dense, TSDF, voxel, Gaussian splats ([#141](https://github.com/kornia/kornia-slam/issues/141))
 - [ ] Embedded compute targets alongside desktop/server
 - [ ] Map server exposing pose and map queries over MCP
 - [ ] Agentic SLAM — agents monitoring subsystems at runtime, switching strategies and tuning parameters
