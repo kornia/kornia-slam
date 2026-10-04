@@ -26,7 +26,7 @@ pub const STEREO_DEPTH_MIN_SIGMA: f32 = 0.02;
 /// Keyframes a local BA optimizes; older keyframes enter only as fixed poses.
 const MAX_ACTIVE_KFS: usize = 3;
 
-/// The local BA window: the newest [`MAX_ACTIVE_KFS`] keyframes and the live
+/// The local BA window: the three newest keyframes and the live
 /// landmarks they observe, plus, as fixed context, every other keyframe that
 /// observes those landmarks and the IMU neighbours of the active keyframes.
 ///
