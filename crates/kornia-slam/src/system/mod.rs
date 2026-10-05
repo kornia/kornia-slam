@@ -41,15 +41,10 @@ use kornia_sensors::{ImuCalibration, SensorRig};
 
 /// Top-level ORB-SLAM system: orchestrates tracking, mapping, and state transitions.
 pub struct SlamSystem {
-    // Camera model
     rig: SensorRig,
-    // Primary pose estimator
     tracker: Tracker,
-    // Boostrap pose estimator
     two_view_init_config: TwoViewInitConfig,
-    // Keyframe insertion policy
     keyframe_policy: KeyframePolicy,
-    // Recently-lost grace period policy
     tracking_loss_recovery: TrackingLossRecoveryPolicy,
     // mThDepth (metres): back-project close stereo points at each keyframe when set
     stereo_close_depth: Option<f64>,
@@ -58,7 +53,6 @@ pub struct SlamSystem {
     // Buffered debug messages produced during the most recent process_frame call;
     // drained by the caller (TUI panel or stderr).
     debug_messages: Vec<String>,
-    // Map object
     map: Arc<Mutex<Map>>,
     // Serializes compound map publication and short local-BA snapshot/merge phases.
     map_publication_gate: Option<Arc<Mutex<()>>>,
@@ -68,7 +62,6 @@ pub struct SlamSystem {
     // Place recognition for every keyframe, and loop closing when configured.
     loop_closer: LoopCloser,
     loop_closure_events: Vec<LoopClosureEvent>,
-    // System state
     state: SystemState,
 }
 
