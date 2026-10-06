@@ -48,6 +48,12 @@ jobs:
             test_cmd: cargo test --workspace
             build_cmd: cargo run -p kornia-slam-app -- --help
 
+          # Library with pipeline-config serialization and RON loading.
+          - name: slam-serde
+            apt: ""
+            test_cmd: cargo test -p kornia-slam --features serde
+            build_cmd: cargo build -p kornia-slam --features serde
+
           # App with no default features — just confirms the non-viz build
           # links and the CLI parses.
           - name: app-no-default

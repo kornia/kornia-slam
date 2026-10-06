@@ -4,6 +4,7 @@ pub mod frame;
 pub mod initialization;
 pub mod loop_closure;
 pub mod mapping;
+pub mod pipeline;
 mod pose_conversion;
 pub mod stereo;
 pub mod system;
