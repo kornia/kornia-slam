@@ -34,11 +34,7 @@ use kornia_algebra::Vec3F64;
 use kornia_image::{Image, ImageSize, InterpolationMode};
 use kornia_imgproc::resize::resize_fast_mono;
 use kornia_sensors::imu::ImuMeasurement;
-use kornia_slam::mapping::LocalMappingMode;
-use kornia_slam::pipeline::{
-    CameraSelection, FrontendConfig, LoopClosingMode, MappingConfig, MappingExecution,
-    OrbFrontendConfig, OrbSlamPipeline, PipelineConfig, PipelineDefinition, SensorSelection,
-};
+use kornia_slam::pipeline::{CameraSelection, PipelineConfig, PipelineDefinition};
 use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches};
 use kornia_slam::{Frame, LoopClosureEvent, SlamConfig, SlamSystem};
 #[cfg(feature = "oakd")]
@@ -55,7 +51,7 @@ use utils::{
 };
 /// CLI arguments.
 #[derive(argh::FromArgs)]
-#[argh(description = "Monocular ORB-SLAM (EuRoC dataset or live OAK-D)")]
+#[argh(description = "Visual and visual-inertial ORB-SLAM over a selectable frame source")]
 struct Args {
     #[argh(subcommand)]
     source: SourceCmd,
@@ -74,24 +70,10 @@ struct Args {
     #[argh(switch)]
     debug: bool,
 
-    /// local mapping mode: sync or async
-    #[argh(option, default = "LocalMappingMode::Asynchronous")]
-    local_mapping: LocalMappingMode,
-
-    /// ORB keypoints to extract per frame (default 1000; the 2 MP Hilti fisheye
-    /// frames need ~3000 to bootstrap)
-    #[argh(option, default = "1000")]
-    n_keypoints: usize,
-
-    /// path to a bag-of-words vocabulary (`.bin` from `convert_orbvoc`, or a
-    /// DBoW2 `ORBvoc.txt`) to enable appearance-based loop detection
+    /// pipeline configuration (RON): sensors, ORB settings and loop closing.
+    /// Defaults to monocular ORB without loop closing; see configs/
     #[argh(option)]
-    vocab: Option<String>,
-
-    /// apply usable pose-graph corrections to the live metric map; initialized
-    /// IMU input uses gravity-preserving four-degree-of-freedom optimization
-    #[argh(switch)]
-    apply_pgo: bool,
+    config: Option<String>,
 }
 
 #[derive(argh::FromArgs)]
@@ -122,15 +104,6 @@ struct EurocCmd {
     #[argh(option, default = "0")]
     start_frame: usize,
 
-    /// rectify the left+right cameras and compute per-keypoint stereo depth
-    #[argh(switch)]
-    stereo: bool,
-
-    /// enable IMU preintegration from mav0/imu0 (mono: metric scale + gravity;
-    /// stereo: gravity + velocities, scale fixed). Errors if the dataset has no IMU
-    #[argh(switch)]
-    imu: bool,
-
     /// after the run, align the trajectory to ground truth and report
     /// ATE/RPE/drift (writes kornia_slam_raw.csv and kornia_slam_aligned.csv)
     #[argh(switch)]
@@ -147,8 +120,8 @@ struct EurocCmd {
 /// ORB runs on the raw fisheye `cam0` image; keypoints (not pixels) are
 /// undistorted into a virtual pinhole, preserving the full field of view. Images
 /// are rotated 180° by default (inverted sensor mount); pass `--no-rotate` if the
-/// extraction already rotated them. These 2 MP frames need `--n-keypoints ~3000`
-/// to bootstrap.
+/// extraction already rotated them. These 2 MP frames need about 3000 keypoints
+/// to bootstrap (`configs/hilti.ron`).
 #[derive(argh::FromArgs)]
 #[argh(subcommand, name = "hilti")]
 struct HiltiCmd {
@@ -199,15 +172,11 @@ struct McapCmd {
     #[argh(option, default = "String::from(\"mono_left\")")]
     channel: String,
 
-    /// rectify a stereo pair and compute per-keypoint depth; requires --calib
-    #[argh(switch)]
-    stereo: bool,
-
     /// right stereo channel suffix (stereo mode)
     #[argh(option, default = "String::from(\"mono_right\")")]
     right_channel: String,
 
-    /// path to a stereo calibration YAML (required for --stereo)
+    /// path to a stereo calibration YAML (required for stereo cameras)
     #[argh(option)]
     calib: Option<String>,
 
@@ -220,7 +189,7 @@ struct McapCmd {
     start_frame: usize,
 }
 
-/// Run live on an OAK-D camera (CamB mono, or CamB+CamC stereo with --stereo).
+/// Run live on an OAK-D camera (CamB mono, or CamB+CamC stereo).
 #[cfg(feature = "oakd")]
 #[derive(argh::FromArgs)]
 #[argh(subcommand, name = "oakd")]
@@ -241,11 +210,7 @@ struct OakdCmd {
     #[argh(option, default = "30.0")]
     fps: f32,
 
-    /// open CamB+CamC and rectify online; requires --calib
-    #[argh(switch)]
-    stereo: bool,
-
-    /// path to a stereo calibration YAML (required for --stereo)
+    /// path to a stereo calibration YAML (required for stereo cameras)
     #[argh(option)]
     calib: Option<String>,
 }
@@ -344,47 +309,6 @@ fn build_u8_pyramid(img: &Image<u8, 1>) -> Vec<Image<u8, 1>> {
     pyramid
 }
 
-/// Expresses the algorithm flags as a pipeline definition. Stereo follows the
-/// mode the source was opened in.
-fn pipeline_config_from_args(
-    n_keypoints: usize,
-    local_mapping: LocalMappingMode,
-    vocab: Option<&str>,
-    apply_pgo: bool,
-    stereo: bool,
-    imu: bool,
-) -> Result<PipelineConfig, &'static str> {
-    let loop_closing = match (vocab, apply_pgo) {
-        (None, true) => return Err("--apply-pgo requires --vocab"),
-        (None, false) => LoopClosingMode::Disabled,
-        (Some(vocabulary), false) => LoopClosingMode::DetectOnly {
-            vocabulary: vocabulary.into(),
-        },
-        (Some(vocabulary), true) => LoopClosingMode::DetectAndCorrect {
-            vocabulary: vocabulary.into(),
-        },
-    };
-    let execution = match local_mapping {
-        LocalMappingMode::Synchronous => MappingExecution::Synchronous,
-        LocalMappingMode::Asynchronous => MappingExecution::Asynchronous,
-    };
-    let cameras = if stereo {
-        CameraSelection::Stereo
-    } else {
-        CameraSelection::Mono
-    };
-    Ok(PipelineConfig {
-        sensors: SensorSelection { cameras, imu },
-        pipeline: PipelineDefinition::OrbSlam(OrbSlamPipeline {
-            frontend: FrontendConfig::Orb(OrbFrontendConfig { n_keypoints }),
-            mapping: MappingConfig { execution },
-            loop_closing,
-            ..OrbSlamPipeline::default()
-        }),
-        ..PipelineConfig::default()
-    })
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Args = argh::from_env();
 
@@ -394,10 +318,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "viz"))]
     let tui_active = !args.no_tui;
 
+    // ── Pipeline ───────────────────────────────────────────────────────────
+    let pipeline = match args.config.as_deref() {
+        Some(path) => PipelineConfig::from_ron_file(path).map_err(|e| format!("{path}: {e}"))?,
+        None => PipelineConfig::default(),
+    };
+    let stereo = pipeline.sensors.cameras == CameraSelection::Stereo;
+    let imu_enabled = pipeline.sensors.imu;
+    if !tui_active {
+        eprint!("{pipeline}");
+    }
+
     // ── Source ─────────────────────────────────────────────────────────────
     let mut evaluate = false;
     let mut eval_out = String::from(".");
-    let mut imu_enabled = false;
     let target_dt = Duration::from_secs_f64(1.0 / 30.0);
     let mut last_frame_walltime = Instant::now();
     let (mut source, euroc_gt): (Box<dyn FrameSource>, Option<Vec<GroundTruthPose>>) = match args
@@ -406,8 +340,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         SourceCmd::Euroc(e) => {
             evaluate = e.evaluate;
             eval_out = e.eval_out.clone();
-            imu_enabled = e.imu;
-            let src = if e.stereo {
+            let src = if stereo {
                 EurocSource::open_stereo(&e.data, e.start_frame, e.max_frames)?
             } else {
                 EurocSource::open(&e.data, e.start_frame, e.max_frames)?
@@ -445,11 +378,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         SourceCmd::Mcap(m) => {
             let path = std::path::Path::new(&m.path);
-            let src = if m.stereo {
+            let src = if stereo {
                 let calib = m
                     .calib
                     .as_deref()
-                    .ok_or("mcap --stereo requires --calib <stereo calibration YAML>")?;
+                    .ok_or("mcap stereo cameras require --calib <stereo calibration YAML>")?;
                 McapSource::open_stereo(
                     path,
                     &m.channel,
@@ -468,11 +401,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(feature = "oakd")]
         SourceCmd::Oakd(o) => {
-            let src = if o.stereo {
+            let src = if stereo {
                 let calib = o
                     .calib
                     .as_deref()
-                    .ok_or("oakd --stereo requires --calib <stereo calibration YAML>")?;
+                    .ok_or("oakd stereo cameras require --calib <stereo calibration YAML>")?;
                 OakdSource::open_stereo(o.fps, std::path::Path::new(calib), o.max_frames)?
             } else {
                 OakdSource::open(o.width, o.height, o.fps, o.max_frames)?
@@ -504,18 +437,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // ── Pipeline ───────────────────────────────────────────────────────────
-    let source_rig = source.rig();
-    let pipeline = pipeline_config_from_args(
-        args.n_keypoints,
-        args.local_mapping,
-        args.vocab.as_deref(),
-        args.apply_pgo,
-        source_rig.stereo_baseline_m.is_some(),
-        imu_enabled,
-    )?;
-    pipeline.validate()?;
-    let rig = pipeline.sensors.select_rig(source_rig)?;
+    let rig = pipeline
+        .sensors
+        .select_rig(source.rig())
+        .map_err(|e| e.to_string())?;
     let camera = rig.camera.clone();
     let n_frames_hint = source.n_frames_hint();
     let slam_config = SlamConfig {
@@ -539,7 +464,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let detector = pipeline.orb_detector();
     let mut system = SlamSystem::with_rig(rig, slam_config);
-    if let Some(vocab) = pipeline.load_vocabulary()? {
+    if let Some(vocab) = pipeline.load_vocabulary().map_err(|e| e.to_string())? {
         let PipelineDefinition::OrbSlam(orb) = &pipeline.pipeline;
         if let Some(path) = orb.loop_closing.vocabulary() {
             eprintln!(
@@ -814,68 +739,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(test)]
-mod pipeline_args_tests {
+mod cli_tests {
+    use argh::FromArgs;
+
     use super::*;
-    use kornia_slam::pipeline::ConfigError;
 
-    fn from_flags(
-        vocab: Option<&str>,
-        apply_pgo: bool,
-        stereo: bool,
-        imu: bool,
-    ) -> Result<PipelineConfig, &'static str> {
-        pipeline_config_from_args(
-            1000,
-            LocalMappingMode::Asynchronous,
-            vocab,
-            apply_pgo,
-            stereo,
-            imu,
-        )
-    }
-
-    fn loop_closing(config: &PipelineConfig) -> &LoopClosingMode {
-        let PipelineDefinition::OrbSlam(orb) = &config.pipeline;
-        &orb.loop_closing
+    fn parse(args: &[&str]) -> Result<Args, argh::EarlyExit> {
+        Args::from_args(&["kornia-slam"], args)
     }
 
     #[test]
-    fn default_flags_match_default_pipeline() {
-        assert_eq!(
-            from_flags(None, false, false, false).unwrap(),
-            PipelineConfig::default()
-        );
+    fn config_selects_the_pipeline() {
+        let args = parse(&["--config", "configs/stereo-imu.ron", "euroc", "--data", "d"]).unwrap();
+        assert_eq!(args.config.as_deref(), Some("configs/stereo-imu.ron"));
+        assert!(parse(&["euroc", "--data", "d"]).unwrap().config.is_none());
     }
 
     #[test]
-    fn vocab_and_apply_pgo_select_loop_branches() {
-        assert_eq!(
-            from_flags(None, true, true, false).unwrap_err(),
-            "--apply-pgo requires --vocab"
-        );
-        let detect = from_flags(Some("ORBvoc.txt"), false, false, false).unwrap();
-        assert!(matches!(
-            loop_closing(&detect),
-            LoopClosingMode::DetectOnly { .. }
-        ));
-        let correct = from_flags(Some("ORBvoc.txt"), true, false, true).unwrap();
-        assert!(matches!(
-            loop_closing(&correct),
-            LoopClosingMode::DetectAndCorrect { .. }
-        ));
-        assert_eq!(correct.validate(), Ok(()));
-    }
-
-    #[test]
-    fn apply_pgo_requires_metric_input() {
-        let config = from_flags(Some("ORBvoc.txt"), true, false, false).unwrap();
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::CorrectionWithoutMetricScale)
-        );
-        for (stereo, imu) in [(true, false), (true, true)] {
-            let config = from_flags(Some("ORBvoc.txt"), true, stereo, imu).unwrap();
-            assert_eq!(config.validate(), Ok(()));
+    fn algorithm_and_sensor_flags_are_rejected() {
+        for removed in [
+            &["--n-keypoints", "3000", "euroc", "--data", "d"][..],
+            &["--local-mapping", "sync", "euroc", "--data", "d"],
+            &["--vocab", "ORBvoc.txt", "euroc", "--data", "d"],
+            &["--apply-pgo", "euroc", "--data", "d"],
+            &["euroc", "--data", "d", "--stereo"],
+            &["euroc", "--data", "d", "--imu"],
+            &["mcap", "--path", "r.mcap", "--stereo"],
+        ] {
+            assert!(parse(removed).is_err(), "{removed:?}");
         }
+    }
+
+    #[test]
+    fn shipped_configs_load() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+        let mut loaded = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "ron") {
+                PipelineConfig::from_ron_file(&path)
+                    .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+                loaded += 1;
+            }
+        }
+        assert!(loaded > 0, "no configs in {}", dir.display());
     }
 }

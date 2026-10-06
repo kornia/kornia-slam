@@ -6,7 +6,7 @@ use super::validation::ConfigError;
 /// Failure to read, parse or serialize a RON pipeline configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
-    #[error("failed to read pipeline config {path}: {source}")]
+    #[error("failed to read pipeline config: {source}")]
     Io {
         path: PathBuf,
         #[source]

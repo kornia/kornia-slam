@@ -1,0 +1,5 @@
+// Monocular visual-inertial: the IMU gives metric scale and gravity.
+(
+    version: 1,
+    sensors: ( cameras: Mono, imu: true ),
+)

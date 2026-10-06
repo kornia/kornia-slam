@@ -3,15 +3,40 @@
 This package is the composition root for the `kornia-slam` executable. It wires the
 `kornia_slam::SlamSystem` runtime to four interchangeable frame sources — offline EuRoC MAV image sequences, offline MCAP recordings (e.g. bubbaloop captures), a live OAK-D camera, and any UVC-class camera (laptop webcams, USB cams, CSI-to-UVC adapters on a Pi…). All feed the same `process_frame` orchestrator, and the TUI / Rerun visualizers work for any of them. EuRoC, MCAP, and OAK-D additionally support a **stereo mode** (see below) that yields metric depth; UVC is monocular only.
 
+## Pipeline configuration
+
+What the pipeline runs is set by a RON file passed with `--config`: which sensors it uses, the ORB settings, keyframe policy, local-mapping execution and loop closing. Without `--config` it runs monocular ORB with loop closing disabled. [`configs/`](../../configs) has ready-made files:
+
+| File | Pipeline |
+| --- | --- |
+| `mono.ron` | Monocular; lists every setting with its default |
+| `mono-imu.ron` | Monocular + IMU |
+| `stereo.ron` | Rectified stereo |
+| `stereo-imu.ron` | Stereo + IMU |
+| `stereo-imu-loop.ron` | Stereo + IMU with loop detection and pose-graph correction |
+| `hilti.ron` | Monocular with 3000 keypoints for the Hilti fisheye frames |
+
+Omitted fields keep their defaults, so a file only lists what it changes. Unknown fields and invalid values are rejected before any data is read, and a configuration that selects a sensor the source cannot provide fails with an explicit error. Loop closing needs an ORB vocabulary (DBoW2 `ORBvoc.txt`, or a `.bin` from `convert_orbvoc`); relative vocabulary paths resolve against the config file's directory.
+
+Sensors each source can provide:
+
+| Source | Stereo | IMU |
+| --- | --- | --- |
+| `euroc` | yes | yes |
+| `mcap` | yes, with `--calib` | no |
+| `oakd` | yes, with `--calib` | no |
+| `hilti` | no | no |
+| `uvc` | no | no |
+
 ## Frame sources
 
-Selectable via subcommand:
+Selectable via subcommand, after the global options (`--config`, visualizer flags):
 
 ```text
-kornia-slam euroc --data /path/to/V1_01_easy [--start-frame N] [--max-frames N] [--stereo] [--evaluate] [--eval-out DIR]
-kornia-slam mcap  --path FILE.mcap [--channel mono_left] [--max-frames N] [--stereo --calib calib.yaml --right-channel mono_right]
-kornia-slam oakd  [--width 640 --height 400 --fps 30] [--max-frames N] [--stereo --calib calib.yaml]
-kornia-slam uvc   --fx F --fy F --cx C --cy C [--index 0] [--width 640 --height 480] [--max-frames N]
+kornia-slam [--config FILE.ron] euroc --data /path/to/V1_01_easy [--start-frame N] [--max-frames N] [--evaluate] [--eval-out DIR]
+kornia-slam [--config FILE.ron] mcap  --path FILE.mcap [--channel mono_left] [--max-frames N] [--calib calib.yaml --right-channel mono_right]
+kornia-slam [--config FILE.ron] oakd  [--width 640 --height 400 --fps 30] [--max-frames N] [--calib calib.yaml]
+kornia-slam [--config FILE.ron] uvc   --fx F --fy F --cx C --cy C [--index 0] [--width 640 --height 480] [--max-frames N]
 ```
 
 `oakd` requires `--features oakd`; `uvc` requires `--features uvc`. The default build needs no extra system dependencies.
@@ -77,17 +102,17 @@ RUSTFLAGS="-C link-arg=-Wl,--allow-multiple-definition" \
 cargo run --release -p kornia-slam-app --no-default-features --features oakd -- oakd
 ```
 
-In **mono** mode intrinsics are placeholder (rough scale of the OAK-D Pro factory fx/fy at 1280×800); reading the on-device factory calibration is a TODO. In **stereo** mode (`--stereo --calib …`) the intrinsics come from the calibration YAML and online rectification produces metric pairs — see [Stereo mode](#stereo-mode).
+In **mono** mode intrinsics are placeholder (rough scale of the OAK-D Pro factory fx/fy at 1280×800); reading the on-device factory calibration is a TODO. In **stereo** mode (a stereo config plus `--calib …`) the intrinsics come from the calibration YAML and online rectification produces metric pairs — see [Stereo mode](#stereo-mode).
 
 ## Stereo mode
 
-`--stereo` opens a left/right pair instead of a single image. Each rectified pair is matched along its rows (`compute_stereo_matches`) to recover per-keypoint disparity, and `depth = bf / disparity` (with `bf = fx · baseline`) gives **metric** depth. This makes initialization metric (no scale ambiguity) and feeds depth into bundle adjustment.
+Selecting `cameras: Stereo` in the configuration opens a left/right pair instead of a single image. Each rectified pair is matched along its rows (`compute_stereo_matches`) to recover per-keypoint disparity, and `depth = bf / disparity` (with `bf = fx · baseline`) gives **metric** depth. This makes initialization metric (no scale ambiguity) and feeds depth into bundle adjustment.
 
-| Source  | How rectification is obtained                                            | Extra flags                                  |
-| ------- | ------------------------------------------------------------------------ | -------------------------------------------- |
-| `euroc` | From `cam0`/`cam1` `sensor.yaml` (intrinsics + `T_BS`), computed in-proc | `--stereo`                                   |
-| `mcap`  | From a calibration YAML; left/right channels paired by timestamp         | `--stereo --calib c.yaml [--right-channel …]` |
-| `oakd`  | From a calibration YAML; CamB+CamC streamed and rectified online         | `--stereo --calib c.yaml`                    |
+| Source  | How rectification is obtained                                            | Extra flags                          |
+| ------- | ------------------------------------------------------------------------ | ------------------------------------ |
+| `euroc` | From `cam0`/`cam1` `sensor.yaml` (intrinsics + `T_BS`), computed in-proc | none                                 |
+| `mcap`  | From a calibration YAML; left/right channels paired by timestamp         | `--calib c.yaml [--right-channel …]` |
+| `oakd`  | From a calibration YAML; CamB+CamC streamed and rectified online         | `--calib c.yaml`                     |
 
 EuRoC is already rectifiable from its `sensor.yaml`, so it needs no `--calib`. MCAP and OAK-D record **raw** (unrectified) frames, so they need a calibration YAML.
 
@@ -120,18 +145,18 @@ For an OAK-D this is the device's factory calibration (readable once via the dep
 
 ```bash
 # EuRoC stereo (metric), first 500 frames, with evaluation CSVs:
-cargo run --release -p kornia-slam-app -- \
-    euroc --data /path/to/MH_01_easy --stereo --max-frames 500 --evaluate
+cargo run --release -p kornia-slam-app -- --config configs/stereo.ron \
+    euroc --data /path/to/MH_01_easy --max-frames 500 --evaluate
 
 # Offline MCAP stereo (raw OAK-D recording + calibration):
-cargo run --release -p kornia-slam-app -- \
-    mcap --path recording.mcap --stereo --calib calib.yaml \
+cargo run --release -p kornia-slam-app -- --config configs/stereo.ron \
+    mcap --path recording.mcap --calib calib.yaml \
     --channel mono_left --right-channel mono_right
 
 # Live OAK-D stereo (free the device first if a daemon holds it, e.g.
 # `bubbaloop node stop oak-camera`):
 cargo run --release -p kornia-slam-app --no-default-features --features oakd -- \
-    oakd --stereo --calib calib.yaml --fps 30
+    --config configs/stereo.ron oakd --calib calib.yaml --fps 30
 ```
 
 For the live OAK-D case, stereo uses the `width`/`height` from the YAML; `--width`/`--height` apply to mono only. CamB/CamC are hardware-synced, so consecutive items from each queue are paired directly.

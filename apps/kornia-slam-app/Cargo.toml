@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 argh = "0.1"
-kornia-slam.workspace = true
+kornia-slam = { workspace = true, features = ["serde"] }
 kornia-sensors.workspace = true
 
 kornia-3d.workspace = true

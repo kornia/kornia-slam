@@ -10,6 +10,19 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**Pipelines are defined by a configuration file.** The CLI's `--config` takes a
+versioned RON file that selects the sensors, ORB settings, keyframe policy,
+local-mapping execution and loop-closing branch; `configs/` has ready-made
+files for each sensor combination and for Hilti. Invalid settings, and sensors
+the source cannot provide, are rejected before any data is read. The library
+gains `kornia_slam::pipeline`, with RON loading behind the optional `serde`
+feature. **Breaking (CLI):** `--n-keypoints`, `--local-mapping`, `--vocab`,
+`--apply-pgo` and the sources' `--stereo`/`--imu` switches are removed; for
+example `euroc --stereo --imu` becomes `--config configs/stereo-imu.ron euroc`.
+
+**Loop correction replays identically.** Loop-verification RANSAC now uses a
+fixed seed, so runs with loop correction are reproducible.
+
 **Local BA no longer copies the whole map.** Each local bundle adjustment
 captured every keyframe, landmark and IMU factor under the map lock, so its
 cost, and the stall it caused tracking, grew with the map. It now captures only

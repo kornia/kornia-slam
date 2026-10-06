@@ -1,0 +1,10 @@
+// Stereo visual-inertial with loop detection and pose-graph correction.
+// Expects the DBoW2 ORB vocabulary at weights/ORBvoc.txt in the repository
+// root (a .bin from convert_orbvoc also works); adjust the path otherwise.
+(
+    version: 1,
+    sensors: ( cameras: Stereo, imu: true ),
+    pipeline: OrbSlam((
+        loop_closing: DetectAndCorrect(vocabulary: "../weights/ORBvoc.txt"),
+    )),
+)

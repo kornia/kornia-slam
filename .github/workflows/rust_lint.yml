@@ -124,11 +124,12 @@ jobs:
             apt: ""
             command: cargo clippy --all-targets -- -D warnings
 
-          # Library with pipeline-config serialization and RON loading.
-          - name: slam-serde
+          # Library on its own: the workspace build enables `serde` through
+          # the app, so this covers the default feature set.
+          - name: slam-default-features
             apt: ""
             command: >-
-              cargo clippy -p kornia-slam --features serde --all-targets -- -D warnings
+              cargo clippy -p kornia-slam --all-targets -- -D warnings
 
           # App with no default features — exercises the non-viz, non-rerun
           # build path. TUI deps are now unconditional, so this also verifies

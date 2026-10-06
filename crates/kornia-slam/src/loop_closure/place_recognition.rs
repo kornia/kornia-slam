@@ -25,11 +25,19 @@ pub use kornia_bow::orb_slam3::{OrbVocabulary as Vocabulary, load_orb_slam3_voca
 
 /// Failure to load an ORB vocabulary file.
 #[derive(Debug, thiserror::Error)]
-#[error("failed to load vocabulary {}: {source}", path.display())]
+#[error("failed to load vocabulary {}: {}", path.display(), with_cause(source))]
 pub struct VocabularyLoadError {
     pub path: PathBuf,
     #[source]
     pub source: kornia_bow::BowError,
+}
+
+// `BowError::Io` displays only "Io error"; append the underlying reason.
+fn with_cause(error: &kornia_bow::BowError) -> String {
+    match std::error::Error::source(error) {
+        Some(cause) => format!("{error}: {cause}"),
+        None => error.to_string(),
+    }
 }
 
 /// Loads a DBoW2 `ORBvoc.txt` (by `.txt` extension) or a binary vocabulary

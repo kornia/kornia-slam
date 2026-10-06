@@ -44,7 +44,8 @@ sequence (ASL format), then:
 cargo run --release -p kornia-slam-app -- euroc --data /path/to/MH_01_easy
 
 # stereo + IMU, with evaluation against ground truth
-cargo run --release -p kornia-slam-app -- euroc --data /path/to/MH_01_easy --stereo --imu --evaluate
+cargo run --release -p kornia-slam-app -- --config configs/stereo-imu.ron \
+    euroc --data /path/to/MH_01_easy --evaluate
 ```
 
 More sources and options: [apps/kornia-slam-app](apps/kornia-slam-app/README.md).

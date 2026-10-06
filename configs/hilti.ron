@@ -1,0 +1,8 @@
+// Hilti-Trimble SLAM Challenge sequences: the 2 MP fisheye frames need about
+// 3000 keypoints to bootstrap.
+(
+    version: 1,
+    pipeline: OrbSlam((
+        frontend: Orb(( n_keypoints: 3000 )),
+    )),
+)
