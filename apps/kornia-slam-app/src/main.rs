@@ -35,8 +35,12 @@ use kornia_image::{Image, ImageSize, InterpolationMode};
 use kornia_imgproc::resize::resize_fast_mono;
 use kornia_sensors::imu::ImuMeasurement;
 use kornia_slam::mapping::LocalMappingMode;
+use kornia_slam::pipeline::{
+    CameraSelection, FrontendConfig, LoopClosingMode, MappingConfig, MappingExecution,
+    OrbFrontendConfig, OrbSlamPipeline, PipelineConfig, PipelineDefinition, SensorSelection,
+};
 use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches};
-use kornia_slam::{Frame, LoopClosingConfig, LoopClosureEvent, SlamConfig, SlamSystem};
+use kornia_slam::{Frame, LoopClosureEvent, SlamConfig, SlamSystem};
 #[cfg(feature = "oakd")]
 use source::OakdSource;
 #[cfg(feature = "uvc")]
@@ -340,19 +344,45 @@ fn build_u8_pyramid(img: &Image<u8, 1>) -> Vec<Image<u8, 1>> {
     pyramid
 }
 
-fn validate_pgo_mode(
+/// Expresses the algorithm flags as a pipeline definition. Stereo follows the
+/// mode the source was opened in.
+fn pipeline_config_from_args(
+    n_keypoints: usize,
+    local_mapping: LocalMappingMode,
+    vocab: Option<&str>,
     apply_pgo: bool,
-    has_vocabulary: bool,
-    has_stereo: bool,
-    has_imu: bool,
-) -> Result<(), &'static str> {
-    if apply_pgo && !has_vocabulary {
-        return Err("--apply-pgo requires --vocab");
-    }
-    if apply_pgo && !has_stereo && !has_imu {
-        return Err("--apply-pgo requires stereo or IMU input");
-    }
-    Ok(())
+    stereo: bool,
+    imu: bool,
+) -> Result<PipelineConfig, &'static str> {
+    let loop_closing = match (vocab, apply_pgo) {
+        (None, true) => return Err("--apply-pgo requires --vocab"),
+        (None, false) => LoopClosingMode::Disabled,
+        (Some(vocabulary), false) => LoopClosingMode::DetectOnly {
+            vocabulary: vocabulary.into(),
+        },
+        (Some(vocabulary), true) => LoopClosingMode::DetectAndCorrect {
+            vocabulary: vocabulary.into(),
+        },
+    };
+    let execution = match local_mapping {
+        LocalMappingMode::Synchronous => MappingExecution::Synchronous,
+        LocalMappingMode::Asynchronous => MappingExecution::Asynchronous,
+    };
+    let cameras = if stereo {
+        CameraSelection::Stereo
+    } else {
+        CameraSelection::Mono
+    };
+    Ok(PipelineConfig {
+        sensors: SensorSelection { cameras, imu },
+        pipeline: PipelineDefinition::OrbSlam(OrbSlamPipeline {
+            frontend: FrontendConfig::Orb(OrbFrontendConfig { n_keypoints }),
+            mapping: MappingConfig { execution },
+            loop_closing,
+            ..OrbSlamPipeline::default()
+        }),
+        ..PipelineConfig::default()
+    })
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -474,72 +504,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let mut rig = source.rig();
-    if !imu_enabled {
-        rig.imu = None;
-    } else if rig.imu.is_none() {
-        return Err(
-            "--imu requested but the source has no camera-IMU extrinsic or IMU samples".into(),
-        );
-    }
+    // ── Pipeline ───────────────────────────────────────────────────────────
+    let source_rig = source.rig();
+    let pipeline = pipeline_config_from_args(
+        args.n_keypoints,
+        args.local_mapping,
+        args.vocab.as_deref(),
+        args.apply_pgo,
+        source_rig.stereo_baseline_m.is_some(),
+        imu_enabled,
+    )?;
+    pipeline.validate()?;
+    let rig = pipeline.sensors.select_rig(source_rig)?;
     let camera = rig.camera.clone();
     let n_frames_hint = source.n_frames_hint();
-
-    // Near/far split: close points (z < baseline * TH_DEPTH) get direct stereo
-    // back-projection at each keyframe (ORB-SLAM3's ThDepth ~ 35 for EuRoC).
-    const TH_DEPTH: f64 = 35.0;
-    let stereo_close_depth_m = rig.stereo_baseline_m.map(|baseline| baseline * TH_DEPTH);
-    let stereo_config = rig.stereo_baseline_m.map(|baseline| {
-        let bf = baseline * camera.fx;
-        if !tui_active {
-            eprintln!(
-                "Stereo: rectified fx={:.2} baseline={:.4}m bf={:.2} close_depth={:.2}m",
-                camera.fx,
-                baseline,
-                bf,
-                baseline * TH_DEPTH,
-            );
-        }
-        StereoMatchConfig::new(baseline as f32, camera.fx as f32, ORB_SCALE, ORB_LEVELS)
-    });
-
-    if let Err(error) = validate_pgo_mode(
-        args.apply_pgo,
-        args.vocab.is_some(),
-        stereo_config.is_some(),
-        imu_enabled,
-    ) {
-        return Err(error.into());
-    }
-
-    // ── ORB detector ───────────────────────────────────────────────────────
-    let detector = kornia_imgproc::features::OrbDetector {
-        n_keypoints: args.n_keypoints,
-        ..Default::default()
-    };
-
-    // ── SLAM system ────────────────────────────────────────────────────────
     let slam_config = SlamConfig {
         debug: args.debug,
-        local_mapping: args.local_mapping,
-        stereo_close_depth_m,
-        pgo: args.apply_pgo.then(|| LoopClosingConfig {
-            require_imu_initialized: imu_enabled,
-            ..LoopClosingConfig::default()
-        }),
-        ..SlamConfig::default()
+        ..pipeline.slam_config(&rig)
     };
+
+    let stereo_config = rig
+        .stereo_baseline_m
+        .zip(slam_config.stereo_close_depth_m)
+        .map(|(baseline, close_depth)| {
+            let bf = baseline * camera.fx;
+            if !tui_active {
+                eprintln!(
+                    "Stereo: rectified fx={:.2} baseline={baseline:.4}m bf={bf:.2} close_depth={close_depth:.2}m",
+                    camera.fx,
+                );
+            }
+            StereoMatchConfig::new(baseline as f32, camera.fx as f32, ORB_SCALE, ORB_LEVELS)
+        });
+
+    let detector = pipeline.orb_detector();
     let mut system = SlamSystem::with_rig(rig, slam_config);
-    if let Some(vocab_path) = args.vocab.as_deref() {
-        use kornia_slam::loop_closure::place_recognition::{Vocabulary, load_orb_slam3_vocabulary};
-        let vocab = if vocab_path.ends_with(".txt") {
-            load_orb_slam3_vocabulary(vocab_path)
-                .map_err(|e| format!("failed to load text vocabulary {vocab_path}: {e}"))?
-        } else {
-            Vocabulary::load(vocab_path)
-                .map_err(|e| format!("failed to load vocabulary {vocab_path}: {e}"))?
-        };
-        eprintln!("[place-recognition] loaded vocabulary from {vocab_path}");
+    if let Some(vocab) = pipeline.load_vocabulary()? {
+        let PipelineDefinition::OrbSlam(orb) = &pipeline.pipeline;
+        if let Some(path) = orb.loop_closing.vocabulary() {
+            eprintln!(
+                "[place-recognition] loaded vocabulary from {}",
+                path.display()
+            );
+        }
         system.set_vocabulary(vocab);
     }
 
@@ -807,22 +814,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(test)]
-mod pgo_mode_tests {
-    use super::validate_pgo_mode;
+mod pipeline_args_tests {
+    use super::*;
+    use kornia_slam::pipeline::ConfigError;
+
+    fn from_flags(
+        vocab: Option<&str>,
+        apply_pgo: bool,
+        stereo: bool,
+        imu: bool,
+    ) -> Result<PipelineConfig, &'static str> {
+        pipeline_config_from_args(
+            1000,
+            LocalMappingMode::Asynchronous,
+            vocab,
+            apply_pgo,
+            stereo,
+            imu,
+        )
+    }
+
+    fn loop_closing(config: &PipelineConfig) -> &LoopClosingMode {
+        let PipelineDefinition::OrbSlam(orb) = &config.pipeline;
+        &orb.loop_closing
+    }
 
     #[test]
-    fn apply_pgo_requires_metric_input_and_accepts_mono_imu() {
+    fn default_flags_match_default_pipeline() {
         assert_eq!(
-            validate_pgo_mode(true, false, true, false).unwrap_err(),
+            from_flags(None, false, false, false).unwrap(),
+            PipelineConfig::default()
+        );
+    }
+
+    #[test]
+    fn vocab_and_apply_pgo_select_loop_branches() {
+        assert_eq!(
+            from_flags(None, true, true, false).unwrap_err(),
             "--apply-pgo requires --vocab"
         );
+        let detect = from_flags(Some("ORBvoc.txt"), false, false, false).unwrap();
+        assert!(matches!(
+            loop_closing(&detect),
+            LoopClosingMode::DetectOnly { .. }
+        ));
+        let correct = from_flags(Some("ORBvoc.txt"), true, false, true).unwrap();
+        assert!(matches!(
+            loop_closing(&correct),
+            LoopClosingMode::DetectAndCorrect { .. }
+        ));
+        assert_eq!(correct.validate(), Ok(()));
+    }
+
+    #[test]
+    fn apply_pgo_requires_metric_input() {
+        let config = from_flags(Some("ORBvoc.txt"), true, false, false).unwrap();
         assert_eq!(
-            validate_pgo_mode(true, true, false, false).unwrap_err(),
-            "--apply-pgo requires stereo or IMU input"
+            config.validate(),
+            Err(ConfigError::CorrectionWithoutMetricScale)
         );
-        assert!(validate_pgo_mode(true, true, false, true).is_ok());
-        assert!(validate_pgo_mode(true, true, true, true).is_ok());
-        assert!(validate_pgo_mode(true, true, true, false).is_ok());
-        assert!(validate_pgo_mode(false, false, false, false).is_ok());
+        for (stereo, imu) in [(true, false), (true, true)] {
+            let config = from_flags(Some("ORBvoc.txt"), true, stereo, imu).unwrap();
+            assert_eq!(config.validate(), Ok(()));
+        }
     }
 }

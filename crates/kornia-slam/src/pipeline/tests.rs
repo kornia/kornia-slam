@@ -232,6 +232,135 @@ fn rig_must_provide_selected_sensors() {
     );
 }
 
+mod runtime_settings {
+    use super::*;
+    use crate::mapping::LocalMappingMode;
+    use crate::tracking::KeyframePolicy;
+
+    fn stereo_imu_rig() -> SensorRig {
+        rig().with_stereo_baseline(0.11).with_imu(Pose3d::IDENTITY)
+    }
+
+    #[test]
+    fn select_rig_keeps_only_selected_sensors() {
+        let mono = SensorSelection::default()
+            .select_rig(stereo_imu_rig())
+            .unwrap();
+        assert!(mono.stereo_baseline_m.is_none() && mono.imu.is_none());
+
+        let all = sensors(CameraSelection::Stereo, true)
+            .select_rig(stereo_imu_rig())
+            .unwrap();
+        assert_eq!(all.stereo_baseline_m, Some(0.11));
+        assert!(all.imu.is_some());
+
+        assert_eq!(
+            sensors(CameraSelection::Mono, true)
+                .select_rig(rig())
+                .unwrap_err(),
+            ConfigError::MissingSensor("an IMU")
+        );
+    }
+
+    #[test]
+    fn default_maps_to_current_runtime_defaults() {
+        let config = PipelineConfig::default();
+        let slam = config.slam_config(&rig());
+        let policy = KeyframePolicy::default();
+        assert_eq!(
+            slam.keyframe_policy.min_frames_between,
+            policy.min_frames_between
+        );
+        assert_eq!(
+            slam.keyframe_policy.max_frames_between,
+            policy.max_frames_between
+        );
+        assert_eq!(slam.keyframe_policy.ref_ratio, policy.ref_ratio);
+        assert_eq!(slam.local_mapping, LocalMappingMode::Asynchronous);
+        assert_eq!(slam.stereo_close_depth_m, None);
+        assert!(slam.pgo.is_none());
+        assert!(!slam.debug);
+        assert_eq!(config.orb_detector().n_keypoints, 1000);
+    }
+
+    #[test]
+    fn stage_settings_reach_runtime() {
+        let mut config = PipelineConfig::default();
+        let orb = orb_mut(&mut config);
+        orb.frontend = FrontendConfig::Orb(OrbFrontendConfig { n_keypoints: 3000 });
+        orb.keyframes = KeyframeConfig {
+            min_frames_between: 2,
+            max_frames_between: 5,
+            ref_ratio: 0.8,
+        };
+        orb.mapping.execution = MappingExecution::Synchronous;
+
+        let slam = config.slam_config(&rig());
+        assert_eq!(slam.keyframe_policy.min_frames_between, 2);
+        assert_eq!(slam.keyframe_policy.max_frames_between, 5);
+        assert_eq!(slam.keyframe_policy.ref_ratio, 0.8);
+        assert_eq!(slam.local_mapping, LocalMappingMode::Synchronous);
+        assert_eq!(config.orb_detector().n_keypoints, 3000);
+    }
+
+    #[test]
+    fn stereo_close_depth_derives_from_baseline() {
+        let selected = sensors(CameraSelection::Stereo, false)
+            .select_rig(stereo_imu_rig())
+            .unwrap();
+        let slam = PipelineConfig::default().slam_config(&selected);
+        assert_eq!(slam.stereo_close_depth_m, Some(0.11 * 35.0));
+    }
+
+    #[test]
+    fn only_correction_branch_configures_pgo() {
+        let detect_only = LoopClosingMode::DetectOnly {
+            vocabulary: PathBuf::from("ORBvoc.txt"),
+        };
+        let stereo = sensors(CameraSelection::Stereo, false);
+        let stereo_rig = stereo.select_rig(stereo_imu_rig()).unwrap();
+        assert!(
+            with_loop_closing(detect_only, stereo)
+                .slam_config(&stereo_rig)
+                .pgo
+                .is_none()
+        );
+
+        let pgo = with_loop_closing(detect_and_correct(), stereo)
+            .slam_config(&stereo_rig)
+            .pgo
+            .unwrap();
+        assert!(!pgo.require_imu_initialized);
+
+        let mono_imu = sensors(CameraSelection::Mono, true);
+        let imu_rig = mono_imu.select_rig(stereo_imu_rig()).unwrap();
+        let pgo = with_loop_closing(detect_and_correct(), mono_imu)
+            .slam_config(&imu_rig)
+            .pgo
+            .unwrap();
+        assert!(pgo.require_imu_initialized);
+    }
+
+    #[test]
+    fn vocabulary_loads_only_for_enabled_branches() {
+        assert!(
+            PipelineConfig::default()
+                .load_vocabulary()
+                .unwrap()
+                .is_none()
+        );
+
+        let missing = PathBuf::from("/nonexistent/ORBvoc.txt");
+        let config = with_loop_closing(
+            LoopClosingMode::DetectOnly {
+                vocabulary: missing.clone(),
+            },
+            SensorSelection::default(),
+        );
+        assert_eq!(config.load_vocabulary().err().unwrap().path, missing);
+    }
+}
+
 #[cfg(feature = "serde")]
 mod ron_files {
     use std::path::Path;

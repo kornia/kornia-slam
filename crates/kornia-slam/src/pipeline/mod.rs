@@ -6,6 +6,7 @@
 mod config;
 #[cfg(feature = "serde")]
 mod file;
+mod runtime;
 mod stages;
 mod validation;
 

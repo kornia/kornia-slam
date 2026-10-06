@@ -13,6 +13,7 @@
 //! returns the per-keyframe shared-word-filtered, L1-scored candidates.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use kornia_bow::BoW;
 use kornia_bow::orb_slam3::{OrbVocabulary, pack_orb_descriptor};
@@ -21,6 +22,32 @@ use kornia_bow::orb_slam3::{OrbVocabulary, pack_orb_descriptor};
 // `kornia_slam::loop_closure::place_recognition` without depending on `kornia-bow` directly.
 pub use kornia_bow::BoW as BagOfWords;
 pub use kornia_bow::orb_slam3::{OrbVocabulary as Vocabulary, load_orb_slam3_vocabulary};
+
+/// Failure to load an ORB vocabulary file.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to load vocabulary {}: {source}", path.display())]
+pub struct VocabularyLoadError {
+    pub path: PathBuf,
+    #[source]
+    pub source: kornia_bow::BowError,
+}
+
+/// Loads a DBoW2 `ORBvoc.txt` (by `.txt` extension) or a binary vocabulary
+/// from `convert_orbvoc`.
+pub fn load_vocabulary(path: &Path) -> Result<Vocabulary, VocabularyLoadError> {
+    let loaded = if path.extension().is_some_and(|ext| ext == "txt") {
+        load_orb_slam3_vocabulary(path)
+    } else {
+        // `Vocabulary::load` takes `&str`; a non-UTF-8 path cannot name the file.
+        path.to_str()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidFilename).into())
+            .and_then(Vocabulary::load)
+    };
+    loaded.map_err(|source| VocabularyLoadError {
+        path: path.to_path_buf(),
+        source,
+    })
+}
 
 /// Computes the bag-of-words vector for a set of ORB descriptors.
 ///
@@ -189,6 +216,15 @@ mod tests {
 
     fn bow(entries: &[(u32, f32)]) -> BoW {
         BoW(entries.to_vec())
+    }
+
+    #[test]
+    fn missing_vocabulary_reports_its_path() {
+        for path in ["/nonexistent/ORBvoc.txt", "/nonexistent/ORBvoc.bin"] {
+            let err = load_vocabulary(Path::new(path)).err().unwrap();
+            assert_eq!(err.path, Path::new(path));
+            assert!(matches!(err.source, kornia_bow::BowError::Io(_)));
+        }
     }
 
     #[test]
