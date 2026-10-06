@@ -136,6 +136,16 @@ fn correspondence_input_filters_unassociated_and_culled_points() {
 }
 
 #[test]
+fn default_verification_sampling_is_reproducible() {
+    assert!(
+        LoopVerificationConfig::default()
+            .pnp_ransac
+            .random_seed
+            .is_some()
+    );
+}
+
+#[test]
 fn verify_loop_recovers_metric_relative_pose() {
     let (map, expected_query_pose) = synthetic_loop_map();
     let config = LoopVerificationConfig {

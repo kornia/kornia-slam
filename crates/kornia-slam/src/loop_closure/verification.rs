@@ -38,7 +38,9 @@ impl Default for LoopVerificationConfig {
                 max_iterations: 500,
                 reproj_threshold_px: 3.0,
                 confidence: 0.999,
-                random_seed: None,
+                // Fixed so loop decisions, and the corrections they trigger,
+                // replay identically across runs.
+                random_seed: Some(0),
                 refine: true,
                 sprt: None,
             },
