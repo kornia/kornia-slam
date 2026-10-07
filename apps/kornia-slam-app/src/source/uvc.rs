@@ -4,7 +4,7 @@
 //! macOS, MSMF on Windows). Any UVC-class device works — built-in laptop
 //! webcams, USB cameras, CSI-to-UVC adapters on a Raspberry Pi, etc. Frames
 //! are decoded to grayscale `Image<u8, 1>` and fed through the same
-//! `process_frame` orchestrator as the EuRoC dataset.
+//! `SlamSystem::process` loop as the EuRoC dataset.
 //!
 //! Intrinsics are supplied by the caller (CLI flags). They must match the
 //! device's *resolution at capture time* — if you calibrated at 1280×720, ask

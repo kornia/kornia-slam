@@ -1,8 +1,8 @@
 //! Frame sources for SLAM examples.
 //!
 //! Both offline datasets (EuRoC) and live cameras (OAK-D) feed the same
-//! `process_frame` loop. This module exposes a single trait, [`FrameSource`],
-//! so the main binary can stay source-agnostic.
+//! `SlamSystem::process` loop. This module exposes a single trait,
+//! [`FrameSource`], so the main binary can stay source-agnostic.
 
 pub mod euroc;
 pub mod hilti;
@@ -13,11 +13,10 @@ pub mod oakd;
 pub mod uvc;
 
 use kornia_image::Image;
-use kornia_imgproc::features::OrbFeatures;
 use kornia_sensors::SensorRig;
+use kornia_sensors::imu::ImuMeasurement;
 
 use crate::datasets::StereoRectifier;
-use crate::datasets::euroc::ImuSample;
 
 pub use euroc::EurocSource;
 pub use hilti::HiltiSource;
@@ -32,15 +31,13 @@ pub struct FrameItem {
     /// Absolute frame index (source-defined; EuRoC counts samples, OAK-D counts received frames).
     pub idx: usize,
     /// Capture timestamp in seconds (host clock for live sources).
-    #[allow(dead_code)]
     pub timestamp_sec: f64,
     /// Grayscale image (rectified left view when the source is stereo).
     pub image: Image<u8, 1>,
     /// Rectified right view, when the source provides a stereo pair.
     pub right_image: Option<Image<u8, 1>>,
     /// IMU samples between the previous yielded camera frame and this one.
-    #[allow(dead_code)]
-    pub imu_samples: Vec<ImuSample>,
+    pub imu_samples: Vec<ImuMeasurement>,
 }
 
 /// Pull-based interface for monocular SLAM frame producers.
@@ -52,6 +49,8 @@ pub trait FrameSource {
     /// Calibration of the sensors behind this source. Must be valid before the
     /// first `next_frame` call. For a stereo source the camera is the rectified
     /// one shared by both views, and the IMU extrinsic (when present) refers to it.
+    /// A source of raw fisheye images declares their model with
+    /// [`SensorRig::with_fisheye`].
     fn rig(&self) -> SensorRig;
 
     /// Total frames the source will yield, if known.
@@ -62,18 +61,6 @@ pub trait FrameSource {
 
     /// Pull the next frame. `Ok(None)` ⇒ end of stream.
     fn next_frame(&mut self) -> Result<Option<FrameItem>, SourceError>;
-
-    /// Map keypoints from raw-image pixels into the coordinate frame implied by
-    /// [`Self::rig`]'s camera, filtering features the camera model cannot represent.
-    ///
-    /// Default is a no-op: sources that yield images already in `camera()`'s
-    /// frame (EuRoC, rectified stereo) leave features untouched. A fisheye
-    /// source extracts ORB on the raw fisheye image, then overrides this to
-    /// undistort each keypoint to its virtual-pinhole pixel and drop features
-    /// beyond the usable incidence angle. Called after extraction, before the
-    /// features are handed to the SLAM pipeline. All per-feature arrays
-    /// (keypoints, orientations, descriptors, octaves) stay aligned.
-    fn undistort_features(&self, _features: &mut OrbFeatures) {}
 }
 
 /// Errors returned from a [`FrameSource`].

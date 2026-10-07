@@ -29,14 +29,9 @@ mod tui;
 mod utils;
 use crate::datasets::euroc::GroundTruthPose;
 use evaluation::associate_gt;
-use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
-use kornia_image::{Image, ImageSize, InterpolationMode};
-use kornia_imgproc::resize::resize_fast_mono;
-use kornia_sensors::imu::ImuMeasurement;
 use kornia_slam::pipeline::{CameraSelection, PipelineConfig, PipelineDefinition};
-use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches};
-use kornia_slam::{Frame, LoopClosureEvent, SlamConfig, SlamSystem};
+use kornia_slam::{LoopClosureEvent, SensorFrame, SlamSystem};
 #[cfg(feature = "oakd")]
 use source::OakdSource;
 #[cfg(feature = "uvc")]
@@ -273,42 +268,6 @@ struct UvcCmd {
     p2: f64,
 }
 
-/// ORB pyramid scale factor (matches `OrbDetector` default `downscale`).
-const ORB_SCALE: f32 = 1.2;
-/// ORB pyramid level count (matches `OrbDetector` default `n_scales`).
-const ORB_LEVELS: usize = 8;
-
-// TODO: dedupe with kornia-imgproc — `OrbDetector::build_pyramid` (and helpers
-// `pyramid_size_at_level` / `pyramid_reduce_u8`) implement this same 1.2-scale,
-// 8-level pyramid, but they're private. Once those are exposed publicly (e.g. in
-// `kornia_imgproc::pyramid`), call them here instead. Note the semantic diff:
-// this builder resizes the original full-res image each level, whereas kornia
-// resizes the previous level (ORB-SLAM3 behavior) — reconcile before switching.
-/// Builds an ORB-consistent u8 image pyramid: level `o` is the full image
-/// downscaled by `ORB_SCALE^o`, so a full-resolution keypoint at octave `o`
-/// maps into level `o` by multiplying its coordinates by `ORB_SCALE^-o`.
-fn build_u8_pyramid(img: &Image<u8, 1>) -> Vec<Image<u8, 1>> {
-    let mut pyramid = Vec::with_capacity(ORB_LEVELS);
-    pyramid.push(img.clone());
-    let (w0, h0) = (img.width() as f32, img.height() as f32);
-    for level in 1..ORB_LEVELS {
-        let inv = 1.0 / ORB_SCALE.powi(level as i32);
-        let w = ((w0 * inv).round() as usize).max(1);
-        let h = ((h0 * inv).round() as usize).max(1);
-        let mut dst = Image::from_size_val(
-            ImageSize {
-                width: w,
-                height: h,
-            },
-            0u8,
-        )
-        .expect("pyramid level allocation");
-        resize_fast_mono(img, &mut dst, InterpolationMode::Bilinear).expect("pyramid resize");
-        pyramid.push(dst);
-    }
-    pyramid
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Args = argh::from_env();
 
@@ -324,7 +283,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => PipelineConfig::default(),
     };
     let stereo = pipeline.sensors.cameras == CameraSelection::Stereo;
-    let imu_enabled = pipeline.sensors.imu;
     if !tui_active {
         eprint!("{pipeline}");
     }
@@ -437,42 +395,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let rig = pipeline
-        .sensors
-        .select_rig(source.rig())
-        .map_err(|e| e.to_string())?;
-    let camera = rig.camera.clone();
     let n_frames_hint = source.n_frames_hint();
-    let slam_config = SlamConfig {
-        debug: args.debug,
-        ..pipeline.slam_config(&rig)
-    };
-
-    let stereo_config = rig
-        .stereo_baseline_m
-        .zip(slam_config.stereo_close_depth_m)
-        .map(|(baseline, close_depth)| {
-            let bf = baseline * camera.fx;
-            if !tui_active {
-                eprintln!(
-                    "Stereo: rectified fx={:.2} baseline={baseline:.4}m bf={bf:.2} close_depth={close_depth:.2}m",
-                    camera.fx,
-                );
-            }
-            StereoMatchConfig::new(baseline as f32, camera.fx as f32, ORB_SCALE, ORB_LEVELS)
-        });
-
-    let detector = pipeline.orb_detector();
-    let mut system = SlamSystem::with_rig(rig, slam_config);
-    if let Some(vocab) = pipeline.load_vocabulary().map_err(|e| e.to_string())? {
-        let PipelineDefinition::OrbSlam(orb) = &pipeline.pipeline;
-        if let Some(path) = orb.loop_closing.vocabulary() {
-            eprintln!(
-                "[place-recognition] loaded vocabulary from {}",
-                path.display()
-            );
-        }
-        system.set_vocabulary(vocab);
+    let mut system =
+        SlamSystem::build(pipeline.clone(), source.rig()).map_err(|e| e.to_string())?;
+    system.set_debug(args.debug);
+    let camera = system.rig().camera.clone();
+    let PipelineDefinition::OrbSlam(orb) = &pipeline.pipeline;
+    if let Some(path) = orb.loop_closing.vocabulary() {
+        eprintln!(
+            "[place-recognition] loaded vocabulary from {}",
+            path.display()
+        );
+    }
+    if !tui_active && let Some(baseline) = system.rig().stereo_baseline_m {
+        eprintln!(
+            "Stereo: rectified fx={:.2} baseline={baseline:.4}m bf={:.2}",
+            camera.fx,
+            baseline * camera.fx,
+        );
     }
 
     // ── Rerun ──────────────────────────────────────────────────────────────
@@ -500,7 +440,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Main loop ──────────────────────────────────────────────────────────
     let mut trajectory: Vec<[f32; 3]> = Vec::new();
     let mut processed: usize = 0;
-    let mut previous_image: Option<Image<u8, 1>> = None;
 
     while let Some(item) = source.next_frame()? {
         let now = Instant::now();
@@ -515,101 +454,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let FrameItem {
             idx,
             timestamp_sec,
-            image: gray_u8,
+            image,
             right_image,
             imu_samples,
         } = item;
-        let image_size = gray_u8.size();
         #[cfg(feature = "viz")]
         if let Some(ref rec) = rec {
             rec.set_time_sequence("frame", idx as i64);
             rec.set_duration_secs("timestamp", timestamp_sec);
         }
-        let imu_measurements: Vec<ImuMeasurement> = if imu_enabled {
-            imu_samples
-                .into_iter()
-                .map(|s| ImuMeasurement {
-                    timestamp: s.timestamp_sec,
-                    gyro: Vec3F64::new(s.gyro[0], s.gyro[1], s.gyro[2]),
-                    accel: Vec3F64::new(s.accel[0], s.accel[1], s.accel[2]),
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
 
-        // Extract ORB features (on the raw image — for a fisheye source this is
-        // the distorted frame; keypoints are undistorted below).
-        let mut features = detector.detect_and_extract_u8(&gray_u8)?;
-
-        // Stereo: match the rectified right view to fill per-keypoint depth.
-        let (u_right, depth) = match (&stereo_config, &right_image) {
-            (Some(cfg), Some(right_img)) => {
-                let right_features = detector.detect_and_extract_u8(right_img)?;
-                let left_pyr = build_u8_pyramid(&gray_u8);
-                let right_pyr = build_u8_pyramid(right_img);
-                let matches =
-                    compute_stereo_matches(&left_pyr, &right_pyr, &features, &right_features, cfg);
-                if args.debug && !tui_active {
-                    let n = matches.num_matched();
-                    let mut ds: Vec<f32> =
-                        matches.depth.iter().copied().filter(|&d| d > 0.0).collect();
-                    let med = if ds.is_empty() {
-                        0.0
-                    } else {
-                        ds.sort_by(|a, b| a.total_cmp(b));
-                        ds[ds.len() / 2]
-                    };
-                    eprintln!("[stereo] frame={idx} matched={n} median_depth={med:.3}m");
-                }
-                (matches.u_right, matches.depth)
-            }
-            _ => (Vec::new(), Vec::new()),
-        };
+        let t0 = Instant::now();
+        let result = system.process(SensorFrame {
+            idx,
+            timestamp_sec,
+            image: &image,
+            right_image: right_image.as_ref(),
+            imu_samples: &imu_samples,
+        })?;
+        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let frontend_ms = system.frontend_observation().duration.as_secs_f64() * 1000.0;
+        // Tracking time excludes feature extraction, as it did before the
+        // system owned the frontend.
+        let frame_ms = total_ms - frontend_ms;
         #[cfg(feature = "viz")]
         if let Some(ref rec) = rec {
-            log_frame_to_rerun(rec, &gray_u8, &features.keypoints_xy);
+            log_frame_to_rerun(rec, &image, &system.frontend_observation().keypoints_xy);
         }
-
-        // Undistort keypoints into the camera's coordinate frame. No-op for
-        // pinhole/rectified sources; for the fisheye source this remaps each
-        // keypoint to its virtual-pinhole pixel and drops over-wide rays, so it
-        // must run before colors/Frame so all per-feature arrays stay aligned.
-        source.undistort_features(&mut features);
-
-        // Sample pixel colors at each keypoint location.
-        let image_bytes = gray_u8.as_slice();
-        let keypoint_colors: Vec<[u8; 3]> = features
-            .keypoints_xy
-            .iter()
-            .map(|kp| {
-                let x = (kp[0] as usize).min(image_size.width.saturating_sub(1));
-                let y = (kp[1] as usize).min(image_size.height.saturating_sub(1));
-                let g = image_bytes[y * image_size.width + x];
-                [g, g, g]
-            })
-            .collect();
-
-        // Run SLAM.
-        let frame = Frame {
-            idx,
-            features,
-            pose_world_to_cam: Pose3d::IDENTITY,
-            image_size,
-            keypoint_colors,
-            u_right,
-            depth,
-            keypoints_undist: Vec::new(),
-        };
-        let t0 = std::time::Instant::now();
-        let result = system.process_frame(
-            frame,
-            previous_image.as_ref(),
-            &gray_u8,
-            timestamp_sec,
-            imu_measurements,
-        );
-        let frame_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let keyframe_idx = system.current_keyframe_idx().unwrap_or(idx);
         let map_point_count = system.num_active_map_points();
         let debug_msgs = system.drain_debug_messages();
@@ -638,7 +509,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("{line}");
             }
             let status_line = format!(
-                "[{idx:>5}] {:?}  kf={:<4} pts={:<5} {frame_ms:>6.1}ms",
+                "[{idx:>5}] {:?}  kf={:<4} pts={:<5} {frame_ms:>6.1}ms fe={frontend_ms:.1}ms",
                 result.status, keyframe_idx, map_point_count,
             );
             eprintln!("{status_line}");
@@ -665,7 +536,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "viz")]
         if let Some(ref rec) = rec {
             log_trajectory_to_rerun(rec, &trajectory);
-            log_camera_to_rerun(rec, &result.pose_world_to_cam, &camera, image_size);
+            log_camera_to_rerun(rec, &result.pose_world_to_cam, &camera, image.size());
             system.with_map_points(|map_points| log_map_points_to_rerun(rec, map_points));
         }
 
@@ -697,7 +568,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tui::TuiAction::None => {}
             }
         }
-        previous_image = Some(gray_u8);
     }
 
     // Restore terminal before printing the final summary.
@@ -783,5 +653,43 @@ mod cli_tests {
             }
         }
         assert!(loaded > 0, "no configs in {}", dir.display());
+    }
+
+    fn shipped(name: &str) -> PipelineConfig {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../configs")
+            .join(name);
+        PipelineConfig::from_ron_file(&path).unwrap()
+    }
+
+    /// `mono.ron` documents every default, so it must stay equal to them.
+    #[test]
+    fn mono_config_lists_the_defaults() {
+        let defaults = PipelineConfig::default().to_ron_string().unwrap();
+        let mono = shipped("mono.ron").to_ron_string().unwrap();
+        assert_eq!(
+            mono, defaults,
+            "configs/mono.ron no longer lists the defaults"
+        );
+    }
+
+    /// `stereo-imu-loop.ron` documents the loop-correction defaults.
+    #[test]
+    fn loop_config_lists_the_correction_defaults() {
+        let loop_config = shipped("stereo-imu-loop.ron");
+        let PipelineDefinition::OrbSlam(orb) = &loop_config.pipeline;
+        let mut expected = PipelineConfig {
+            sensors: loop_config.sensors,
+            ..PipelineConfig::default()
+        };
+        let PipelineDefinition::OrbSlam(expected_orb) = &mut expected.pipeline;
+        expected_orb.loop_closing = kornia_slam::pipeline::LoopClosingMode::DetectAndCorrect {
+            vocabulary: orb.loop_closing.vocabulary().unwrap().to_path_buf(),
+            correction: Box::default(),
+        };
+        assert_eq!(
+            loop_config.to_ron_string().unwrap(),
+            expected.to_ron_string().unwrap()
+        );
     }
 }

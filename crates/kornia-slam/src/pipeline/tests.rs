@@ -346,12 +346,11 @@ mod runtime_settings {
     #[test]
     fn default_maps_to_previous_runtime_defaults() {
         let config = PipelineConfig::default();
-        let slam = config.slam_config(&rig());
+        let slam = config.settings(&rig());
         assert_eq!(slam.keyframe_policy, KeyframePolicy::default());
         assert_eq!(slam.local_mapping, LocalMappingMode::Asynchronous);
         assert_eq!(slam.stereo_close_depth_m, None);
         assert!(slam.pgo.is_none());
-        assert!(!slam.debug);
         assert_eq!(config.orb_detector().n_keypoints, 1000);
 
         let triangulation = &slam.two_view_init.triangulation_config;
@@ -391,7 +390,7 @@ mod runtime_settings {
         orb.tracking.map_projection.pnp.min_inliers = 12;
         orb.tracking.loss_recovery.timeout_imu_sec = 2.0;
 
-        let slam = config.slam_config(&rig());
+        let slam = config.settings(&rig());
         assert_eq!(slam.keyframe_policy, orb_keyframes(&config));
         assert_eq!(slam.local_mapping, LocalMappingMode::Synchronous);
         assert_eq!(slam.two_view_init.acceptance_config.min_inliers, 40);
@@ -416,7 +415,7 @@ mod runtime_settings {
                 stereo_close_depth: depth,
                 ..OrbFrontendConfig::default()
             });
-            config.slam_config(&selected).stereo_close_depth_m
+            config.settings(&selected).stereo_close_depth_m
         };
         assert_eq!(close_depth(StereoCloseDepth::default()), Some(0.11 * 35.0));
         assert_eq!(close_depth(StereoCloseDepth::Metres(2.5)), Some(2.5));
@@ -432,7 +431,7 @@ mod runtime_settings {
         let stereo_rig = stereo.select_rig(stereo_imu_rig()).unwrap();
         assert!(
             with_loop_closing(detect_only, stereo)
-                .slam_config(&stereo_rig)
+                .settings(&stereo_rig)
                 .pgo
                 .is_none()
         );
@@ -446,7 +445,7 @@ mod runtime_settings {
             },
             stereo,
         );
-        let pgo = config.slam_config(&stereo_rig).pgo.unwrap();
+        let pgo = config.settings(&stereo_rig).pgo.unwrap();
         assert_eq!(pgo.optimizer.max_iterations, 7);
     }
 

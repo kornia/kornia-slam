@@ -4,9 +4,10 @@ use std::path::Path;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::Mat3F64;
+use kornia_algebra::{Mat3F64, Vec3F64};
 use kornia_io::png::read_image_png_mono8;
 use kornia_sensors::SensorRig;
+use kornia_sensors::imu::ImuMeasurement;
 
 use super::{FrameItem, FrameSource, SourceError, rectify_pair};
 use crate::datasets::EurocDataset;
@@ -195,7 +196,7 @@ impl EurocSource {
         }
     }
 
-    fn imu_samples_until(&mut self, timestamp_sec: f64) -> Vec<ImuSample> {
+    fn imu_samples_until(&mut self, timestamp_sec: f64) -> Vec<ImuMeasurement> {
         if !self.with_imu {
             return Vec::new();
         }
@@ -205,6 +206,17 @@ impl EurocSource {
             .partition_point(|sample| sample.timestamp_sec <= timestamp_sec);
         let end = start + rel_end;
         self.imu_cursor = end;
-        self.dataset.imu_samples[start..end].to_vec()
+        self.dataset.imu_samples[start..end]
+            .iter()
+            .map(imu_measurement)
+            .collect()
+    }
+}
+
+fn imu_measurement(sample: &ImuSample) -> ImuMeasurement {
+    ImuMeasurement {
+        timestamp: sample.timestamp_sec,
+        gyro: Vec3F64::new(sample.gyro[0], sample.gyro[1], sample.gyro[2]),
+        accel: Vec3F64::new(sample.accel[0], sample.accel[1], sample.accel[2]),
     }
 }

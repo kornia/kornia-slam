@@ -9,13 +9,12 @@ mod inertial;
 mod input;
 mod state;
 
-pub use config::SlamConfig;
 pub use frontend::FrontendObservation;
 pub use input::{ProcessError, SensorFrame};
-
-use frontend::OrbFrontend;
 pub use state::{TrackingResult, TrackingStatus};
 
+pub(crate) use config::SystemSettings;
+use frontend::OrbFrontend;
 use inertial::{AppliedInitialization, InertialState, viba0_accel_bias_prior};
 use state::{SystemMode, SystemState};
 
@@ -40,11 +39,10 @@ use crate::mapping::map::{Keyframe, Map, MapInsertion, MapMutationError, MapPoin
 use crate::mapping::{KeyframeJob, LocalMapping};
 use crate::pipeline::{BuildError, PipelineConfig};
 use crate::pose_conversion::apply_reference_pose_correction;
-use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
+use kornia_sensors::SensorRig;
 use kornia_sensors::imu::ImuMeasurement;
-use kornia_sensors::{ImuCalibration, SensorRig};
 
 /// Top-level ORB-SLAM system: orchestrates tracking, mapping, and state transitions.
 pub struct SlamSystem {
@@ -57,7 +55,7 @@ pub struct SlamSystem {
     stereo_close_depth: Option<f64>,
     // Emit per-frame diagnostic logs (skip/reject reasons, growth counters)
     debug: bool,
-    // Buffered debug messages produced during the most recent process_frame call;
+    // Buffered debug messages produced during the most recent process call;
     // drained by the caller (TUI panel or stderr).
     debug_messages: Vec<String>,
     map: Arc<Mutex<Map>>,
@@ -78,52 +76,39 @@ pub struct SlamSystem {
 impl SlamSystem {
     /// Builds the system `config` describes from the source's calibrated rig,
     /// restricted to the selected sensors. Resources such as the vocabulary
-    /// are loaded before any mapping worker starts. The world frame is the
-    /// first keyframe's camera frame.
+    /// are loaded before any mapping worker starts.
     pub fn build(config: PipelineConfig, rig: SensorRig) -> Result<Self, BuildError> {
         config.validate()?;
         let rig = config.sensors.select_rig(rig)?;
-        let settings = config.slam_config(&rig);
+        let settings = config.settings(&rig);
         let frontend = OrbFrontend::new(config.orb_detector(), &rig);
         let vocabulary = config.load_vocabulary()?;
         Ok(Self::assemble(rig, settings, frontend, vocabulary))
     }
 
-    /// Creates a new system with identity pose.
-    pub fn new(camera: PinholeCamera, config: SlamConfig) -> Self {
-        Self::with_rig(SensorRig::new(camera), config)
-    }
-
-    /// Builds a system from an explicit sensor rig, so IMU noise parameters and
-    /// extrinsics can be supplied for the actual sensor.
-    pub fn with_rig(rig: SensorRig, config: SlamConfig) -> Self {
-        let frontend = OrbFrontend::new(PipelineConfig::default().orb_detector(), &rig);
-        Self::assemble(rig, config, frontend, None)
-    }
-
     fn assemble(
         rig: SensorRig,
-        config: SlamConfig,
+        settings: SystemSettings,
         frontend: OrbFrontend,
         vocabulary: Option<Vocabulary>,
     ) -> Self {
         let camera = rig.camera.clone();
         let map = Arc::new(Mutex::new(Map::new()));
         let local_mapping =
-            LocalMapping::new(config.local_mapping, Arc::clone(&map), camera.clone());
+            LocalMapping::new(settings.local_mapping, Arc::clone(&map), camera.clone());
         let map_publication_gate = local_mapping.publication_gate();
-        let mut loop_closer = LoopCloser::new(config.pgo, rig.imu.is_some());
+        let mut loop_closer = LoopCloser::new(settings.pgo, rig.imu.is_some());
         if let Some(vocabulary) = vocabulary {
             loop_closer.set_vocabulary(vocabulary);
         }
         Self {
             rig,
-            tracker: Tracker::new(config.map_projection),
-            two_view_init_config: config.two_view_init,
-            keyframe_policy: config.keyframe_policy,
-            tracking_loss_recovery: config.tracking_loss_recovery,
-            stereo_close_depth: config.stereo_close_depth_m,
-            debug: config.debug,
+            tracker: Tracker::new(settings.map_projection),
+            two_view_init_config: settings.two_view_init,
+            keyframe_policy: settings.keyframe_policy,
+            tracking_loss_recovery: settings.tracking_loss_recovery,
+            stereo_close_depth: settings.stereo_close_depth_m,
+            debug: false,
             debug_messages: Vec::new(),
             map,
             map_publication_gate,
@@ -137,23 +122,11 @@ impl SlamSystem {
         }
     }
 
-    /// Enables appearance-based loop detection with a bag-of-words vocabulary.
-    /// Without it, keyframes are not indexed and no loop candidates are emitted.
-    pub fn set_vocabulary(&mut self, vocabulary: Vocabulary) {
-        self.loop_closer.set_vocabulary(vocabulary);
-    }
-
     pub fn drain_loop_closure_events(&mut self) -> Vec<LoopClosureEvent> {
         std::mem::take(&mut self.loop_closure_events)
     }
 
-    /// Enables the inertial path by providing the camera-to-body extrinsic
-    /// `T_BC` (`X_body = T_BC * X_cam`). Without it, IMU samples are ignored.
-    pub fn set_imu_extrinsics(&mut self, t_bc: Pose3d) {
-        self.rig.imu = Some(ImuCalibration::new(t_bc));
-    }
-
-    /// The system's fixed sensor calibration.
+    /// The system's sensor calibration, restricted to the selected sensors.
     pub fn rig(&self) -> &SensorRig {
         &self.rig
     }
@@ -175,7 +148,7 @@ impl SlamSystem {
         };
         // Taken out for the call so tracking can borrow it alongside `self`.
         let previous_image = self.previous_image.take();
-        let result = self.process_frame(
+        let result = self.process_prepared(
             frame,
             previous_image.as_ref(),
             input.image,
@@ -222,8 +195,8 @@ impl SlamSystem {
         ));
     }
 
-    /// Processes one frame (pre-extracted features) and returns the tracking result.
-    pub fn process_frame(
+    /// Tracks one frame of prepared features.
+    fn process_prepared(
         &mut self,
         mut frame: Frame,
         previous_image: Option<&Image<u8, 1>>,
@@ -282,7 +255,9 @@ impl SlamSystem {
         std::mem::take(&mut self.debug_messages)
     }
 
-    /// Toggle whether the pipeline buffers per-frame debug messages.
+    /// Toggles per-frame diagnostics: bootstrap skip and reject reasons,
+    /// tracking reject reasons, keyframe growth and fuse counters. Off after
+    /// [`SlamSystem::build`].
     pub fn set_debug(&mut self, on: bool) {
         self.debug = on;
         if !on {

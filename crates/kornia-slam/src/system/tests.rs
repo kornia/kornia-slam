@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use kornia_3d::camera::PinholeCamera;
 use kornia_algebra::Vec3F64;
 use kornia_image::ImageSize;
 
