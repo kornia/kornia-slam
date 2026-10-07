@@ -3,13 +3,14 @@
 //!
 //! With the `serde` feature, definitions load from versioned RON files.
 
+mod build;
 mod config;
 #[cfg(feature = "serde")]
 mod file;
-mod runtime;
 mod stages;
 mod validation;
 
+pub use build::BuildError;
 pub use config::{
     CameraSelection, FrontendConfig, LoopClosingMode, MappingConfig, OrbFrontendConfig,
     OrbSlamPipeline, PIPELINE_CONFIG_VERSION, PipelineConfig, PipelineDefinition, SensorSelection,

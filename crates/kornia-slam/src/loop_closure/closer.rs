@@ -163,6 +163,20 @@ impl LoopCloser {
 
 #[cfg(test)]
 impl LoopCloser {
+    pub(crate) fn has_vocabulary(&self) -> bool {
+        self.vocabulary.is_some()
+    }
+
+    pub(crate) fn corrects_loops(&self) -> bool {
+        self.acceptance.is_some()
+    }
+
+    pub(crate) fn correction_requires_imu(&self) -> Option<bool> {
+        self.acceptance
+            .as_ref()
+            .map(LoopAcceptance::requires_imu_initialized)
+    }
+
     pub(crate) fn indexed_keyframes(&self) -> usize {
         self.kf_database.len()
     }

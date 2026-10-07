@@ -9,6 +9,16 @@ use super::validation::ConfigError;
 use crate::loop_closure::place_recognition::{Vocabulary, VocabularyLoadError, load_vocabulary};
 use crate::system::SlamConfig;
 
+/// A [`SlamSystem`](crate::SlamSystem) that cannot be built from its
+/// configuration and rig.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildError {
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error(transparent)]
+    Vocabulary(#[from] VocabularyLoadError),
+}
+
 impl SensorSelection {
     /// The source's rig restricted to the selected sensors.
     pub fn select_rig(&self, mut rig: SensorRig) -> Result<SensorRig, ConfigError> {

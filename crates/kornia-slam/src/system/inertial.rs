@@ -48,6 +48,11 @@ impl InertialState {
         self.pending_samples.extend(samples);
     }
 
+    #[cfg(test)]
+    pub(super) fn pending_sample_count(&self) -> usize {
+        self.pending_samples.len()
+    }
+
     /// Integrates the inclusive window `[t0, t1]` without consuming the
     /// measurements: frame prediction and keyframe edges need overlapping
     /// windows. The returned sample copy is what the published `ImuFactor` keeps

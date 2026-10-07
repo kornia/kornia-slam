@@ -4,10 +4,16 @@
 //! in the same order frames move through the system.
 
 mod config;
+mod frontend;
 mod inertial;
+mod input;
 mod state;
 
 pub use config::SlamConfig;
+pub use frontend::FrontendObservation;
+pub use input::{ProcessError, SensorFrame};
+
+use frontend::OrbFrontend;
 pub use state::{TrackingResult, TrackingStatus};
 
 use inertial::{AppliedInitialization, InertialState, viba0_accel_bias_prior};
@@ -32,6 +38,7 @@ use crate::loop_closure::{LoopCloser, LoopClosingContext, LoopClosureEvent};
 use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
 use crate::mapping::map::{Keyframe, Map, MapInsertion, MapMutationError, MapPoint};
 use crate::mapping::{KeyframeJob, LocalMapping};
+use crate::pipeline::{BuildError, PipelineConfig};
 use crate::pose_conversion::apply_reference_pose_correction;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
@@ -63,9 +70,25 @@ pub struct SlamSystem {
     loop_closer: LoopCloser,
     loop_closure_events: Vec<LoopClosureEvent>,
     state: SystemState,
+    frontend: OrbFrontend,
+    // The last processed image, for optical-flow tracks into the next frame.
+    previous_image: Option<Image<u8, 1>>,
 }
 
 impl SlamSystem {
+    /// Builds the system `config` describes from the source's calibrated rig,
+    /// restricted to the selected sensors. Resources such as the vocabulary
+    /// are loaded before any mapping worker starts. The world frame is the
+    /// first keyframe's camera frame.
+    pub fn build(config: PipelineConfig, rig: SensorRig) -> Result<Self, BuildError> {
+        config.validate()?;
+        let rig = config.sensors.select_rig(rig)?;
+        let settings = config.slam_config(&rig);
+        let frontend = OrbFrontend::new(config.orb_detector(), &rig);
+        let vocabulary = config.load_vocabulary()?;
+        Ok(Self::assemble(rig, settings, frontend, vocabulary))
+    }
+
     /// Creates a new system with identity pose.
     pub fn new(camera: PinholeCamera, config: SlamConfig) -> Self {
         Self::with_rig(SensorRig::new(camera), config)
@@ -74,12 +97,25 @@ impl SlamSystem {
     /// Builds a system from an explicit sensor rig, so IMU noise parameters and
     /// extrinsics can be supplied for the actual sensor.
     pub fn with_rig(rig: SensorRig, config: SlamConfig) -> Self {
+        let frontend = OrbFrontend::new(PipelineConfig::default().orb_detector(), &rig);
+        Self::assemble(rig, config, frontend, None)
+    }
+
+    fn assemble(
+        rig: SensorRig,
+        config: SlamConfig,
+        frontend: OrbFrontend,
+        vocabulary: Option<Vocabulary>,
+    ) -> Self {
         let camera = rig.camera.clone();
         let map = Arc::new(Mutex::new(Map::new()));
         let local_mapping =
             LocalMapping::new(config.local_mapping, Arc::clone(&map), camera.clone());
         let map_publication_gate = local_mapping.publication_gate();
-        let loop_closer = LoopCloser::new(config.pgo, rig.imu.is_some());
+        let mut loop_closer = LoopCloser::new(config.pgo, rig.imu.is_some());
+        if let Some(vocabulary) = vocabulary {
+            loop_closer.set_vocabulary(vocabulary);
+        }
         Self {
             rig,
             tracker: Tracker::new(config.map_projection),
@@ -96,6 +132,8 @@ impl SlamSystem {
             inertial: InertialState::new(),
             loop_closer,
             loop_closure_events: Vec::new(),
+            frontend,
+            previous_image: None,
         }
     }
 
@@ -118,6 +156,70 @@ impl SlamSystem {
     /// The system's fixed sensor calibration.
     pub fn rig(&self) -> &SensorRig {
         &self.rig
+    }
+
+    /// Extracts features from one input frame and tracks it.
+    ///
+    /// # Errors
+    ///
+    /// Invalid input or a feature-extraction failure; the system state,
+    /// including buffered IMU samples and image history, is then unchanged.
+    pub fn process(&mut self, input: SensorFrame<'_>) -> Result<TrackingResult, ProcessError> {
+        input.validate(self.rig.stereo_baseline_m.is_some())?;
+        let frame = self.frontend.prepare(&input)?;
+        self.report_stereo(&frame);
+        let imu_samples = if self.rig.imu.is_some() {
+            input.imu_samples.to_vec()
+        } else {
+            Vec::new()
+        };
+        // Taken out for the call so tracking can borrow it alongside `self`.
+        let previous_image = self.previous_image.take();
+        let result = self.process_frame(
+            frame,
+            previous_image.as_ref(),
+            input.image,
+            input.timestamp_sec,
+            imu_samples,
+        );
+        self.retain_previous_image(input.image, previous_image);
+        Ok(result)
+    }
+
+    /// The frontend output of the latest successfully processed frame.
+    pub fn frontend_observation(&self) -> &FrontendObservation {
+        self.frontend.observation()
+    }
+
+    /// Copies `image` into the previous-image buffer, reusing its allocation.
+    fn retain_previous_image(&mut self, image: &Image<u8, 1>, buffer: Option<Image<u8, 1>>) {
+        self.previous_image = match buffer {
+            Some(mut buffer) if buffer.size() == image.size() => {
+                buffer.as_slice_mut().copy_from_slice(image.as_slice());
+                Some(buffer)
+            }
+            _ => Some(image.clone()),
+        };
+    }
+
+    fn report_stereo(&mut self, frame: &Frame) {
+        if !self.debug {
+            return;
+        }
+        let Some(matched) = self.frontend.observation().stereo_matched else {
+            return;
+        };
+        let mut depths: Vec<f32> = frame.depth.iter().copied().filter(|&d| d > 0.0).collect();
+        let median = if depths.is_empty() {
+            0.0
+        } else {
+            depths.sort_by(|a, b| a.total_cmp(b));
+            depths[depths.len() / 2]
+        };
+        self.dbg(format!(
+            "[stereo] frame={} matched={matched} median_depth={median:.3}m",
+            frame.idx
+        ));
     }
 
     /// Processes one frame (pre-extracted features) and returns the tracking result.
@@ -1038,14 +1140,4 @@ fn format_imu_init_gate(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::format_imu_init_gate;
-
-    #[test]
-    fn formats_compact_imu_init_gate() {
-        assert_eq!(
-            format_imu_init_gate(12, Some(12), Some(32), 7, 10, 1.05, 1.0),
-            "[imu_init_gate] start_idx=12 first_idx=Some(12) last_idx=Some(32) kfs=7/10 imu_time=1.05/1.0s"
-        );
-    }
-}
+mod tests;
