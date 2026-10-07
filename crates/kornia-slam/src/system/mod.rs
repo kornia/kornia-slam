@@ -79,7 +79,7 @@ impl SlamSystem {
         let local_mapping =
             LocalMapping::new(config.local_mapping, Arc::clone(&map), camera.clone());
         let map_publication_gate = local_mapping.publication_gate();
-        let loop_closer = LoopCloser::new(config.pgo);
+        let loop_closer = LoopCloser::new(config.pgo, rig.imu.is_some());
         Self {
             rig,
             tracker: Tracker::new(config.map_projection),

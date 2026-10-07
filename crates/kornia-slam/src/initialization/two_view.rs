@@ -21,8 +21,10 @@ use kornia_imgproc::features::{OrbFeatures, OrbMatchConfig, match_orb_descriptor
 
 use crate::tracking::pose_estimation::Estimate;
 
-/// Configuration for two-view initialization.
+/// Acceptance thresholds of two-view initialization.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct TwoViewAcceptanceConfig {
     /// Minimum descriptor matches required before two-view estimation.
     pub min_matches: usize,
@@ -34,10 +36,17 @@ pub struct TwoViewAcceptanceConfig {
 
 /// Configuration for two-view initialization.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct TwoViewInitConfig {
     /// ORB descriptor matcher settings.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_remote::orb_match"))]
     pub match_config: OrbMatchConfig,
     /// Triangulation thresholds applied during two-view estimation.
+    #[cfg_attr(
+        feature = "serde",
+        serde(with = "crate::serde_remote::two_view_triangulation")
+    )]
     pub triangulation_config: TriangulationConfig,
     /// Acceptance thresholds applied on top of the estimator result.
     pub acceptance_config: TwoViewAcceptanceConfig,
@@ -56,13 +65,21 @@ impl Default for TwoViewInitConfig {
             // ambiguity threshold (default in kornia-3d is 0.70).
             triangulation_config: TriangulationConfig {
                 cheirality_ambiguity_max: 0.75,
+                max_midpoint_gap: 0.25,
+                max_reprojection_error: 3.0,
                 ..TriangulationConfig::default()
             },
-            acceptance_config: TwoViewAcceptanceConfig {
-                min_matches: 100,
-                min_inliers: 30,
-                min_triangulated: 50,
-            },
+            acceptance_config: TwoViewAcceptanceConfig::default(),
+        }
+    }
+}
+
+impl Default for TwoViewAcceptanceConfig {
+    fn default() -> Self {
+        Self {
+            min_matches: 100,
+            min_inliers: 30,
+            min_triangulated: 50,
         }
     }
 }

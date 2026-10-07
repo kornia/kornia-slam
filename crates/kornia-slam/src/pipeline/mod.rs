@@ -11,13 +11,12 @@ mod stages;
 mod validation;
 
 pub use config::{
-    CameraSelection, FrontendConfig, KeyframeConfig, LoopClosingMode, MappingConfig,
-    MappingExecution, OrbFrontendConfig, OrbSlamPipeline, PIPELINE_CONFIG_VERSION, PipelineConfig,
-    PipelineDefinition, SensorSelection,
+    CameraSelection, FrontendConfig, LoopClosingMode, MappingConfig, OrbFrontendConfig,
+    OrbSlamPipeline, PIPELINE_CONFIG_VERSION, PipelineConfig, PipelineDefinition, SensorSelection,
+    StereoCloseDepth, TrackingConfig,
 };
 #[cfg(feature = "serde")]
 pub use file::LoadError;
-pub use stages::Stage;
 pub use validation::ConfigError;
 
 #[cfg(test)]

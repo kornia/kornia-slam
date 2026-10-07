@@ -3,6 +3,8 @@ use super::VerifiedLoopEdge;
 /// Temporal and map-neighbourhood consistency required before a verified loop
 /// becomes a pose-graph edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct LoopEpisodeConfig {
     pub min_consistent_edges: usize,
     pub max_query_gap: usize,

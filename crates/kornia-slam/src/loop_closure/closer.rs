@@ -23,11 +23,11 @@ use crate::loop_closure::{
 use crate::mapping::Map;
 use crate::pose_conversion::apply_reference_pose_correction;
 
+/// Verification, episode consistency, fusion and pose-graph settings of loop correction.
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct LoopClosingConfig {
-    /// Mono+IMU maps become metric only after inertial initialization. Stereo
-    /// maps are metric from bootstrap and leave this disabled.
-    pub require_imu_initialized: bool,
     pub episode: LoopEpisodeConfig,
     pub fusion: LoopFusionConfig,
     pub verification: LoopVerificationConfig,
@@ -83,12 +83,13 @@ pub(crate) struct LoopCloser {
 
 impl LoopCloser {
     /// `pgo` enables verification and correction; without it keyframes are
-    /// only indexed.
-    pub(crate) fn new(pgo: Option<LoopClosingConfig>) -> Self {
+    /// only indexed. `require_imu_initialized` holds correction back until
+    /// inertial initialization, which makes a mono+IMU map metric.
+    pub(crate) fn new(pgo: Option<LoopClosingConfig>, require_imu_initialized: bool) -> Self {
         Self {
             vocabulary: None,
             kf_database: KeyFrameDatabase::new(),
-            acceptance: pgo.map(LoopAcceptance::new),
+            acceptance: pgo.map(|config| LoopAcceptance::new(config, require_imu_initialized)),
         }
     }
 
@@ -185,16 +186,18 @@ impl LoopCloser {
 /// the history that makes acceptance consistent across keyframes.
 struct LoopAcceptance {
     config: LoopClosingConfig,
+    require_imu_initialized: bool,
     episode_tracker: LoopEpisodeTracker,
     verified_loops: Vec<VerifiedLoopEdge>,
     verified_loop_pairs: HashSet<(usize, usize)>,
 }
 
 impl LoopAcceptance {
-    fn new(config: LoopClosingConfig) -> Self {
+    fn new(config: LoopClosingConfig, require_imu_initialized: bool) -> Self {
         let episode_tracker = LoopEpisodeTracker::new(config.episode);
         Self {
             config,
+            require_imu_initialized,
             episode_tracker,
             verified_loops: Vec::new(),
             verified_loop_pairs: HashSet::new(),
@@ -204,7 +207,7 @@ impl LoopAcceptance {
     /// Mono+IMU maps are only metric once inertial initialization has run, so
     /// correcting them before that is not meaningful.
     fn requires_imu_initialized(&self) -> bool {
-        self.config.require_imu_initialized
+        self.require_imu_initialized
     }
 
     /// Verifies `candidates` against `kf_idx`, and on an accepted closure
@@ -516,7 +519,7 @@ mod tests {
     /// alone: no correction to apply, no PGO, nothing to report.
     #[test]
     fn outcome_is_inert_when_no_candidate_verifies() {
-        let mut closer = LoopAcceptance::new(LoopClosingConfig::default());
+        let mut closer = LoopAcceptance::new(LoopClosingConfig::default(), false);
         let mut map = Map::new();
         let candidates = [Candidate {
             kf_idx: 7,
@@ -534,7 +537,7 @@ mod tests {
     /// With no candidates at all the closer must not touch the map or report.
     #[test]
     fn outcome_is_inert_without_candidates() {
-        let mut closer = LoopAcceptance::new(LoopClosingConfig::default());
+        let mut closer = LoopAcceptance::new(LoopClosingConfig::default(), false);
         let mut map = Map::new();
 
         let outcome = closer.close(&mut map, &test_camera(), 0, &[], context());
@@ -549,13 +552,10 @@ mod tests {
     /// until inertial initialization has run.
     #[test]
     fn imu_requirement_is_reported_from_config() {
-        let closer = LoopAcceptance::new(LoopClosingConfig {
-            require_imu_initialized: true,
-            ..LoopClosingConfig::default()
-        });
+        let closer = LoopAcceptance::new(LoopClosingConfig::default(), true);
         assert!(closer.requires_imu_initialized());
 
-        let closer = LoopAcceptance::new(LoopClosingConfig::default());
+        let closer = LoopAcceptance::new(LoopClosingConfig::default(), false);
         assert!(!closer.requires_imu_initialized());
     }
 

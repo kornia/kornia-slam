@@ -9,8 +9,11 @@ use kornia_algebra::Vec3F64;
 use crate::mapping::map::{BaSnapshot, BaUpdate, BaUpdateError, LocalBaMergeResult, Map};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum LocalMappingMode {
+    /// On the tracking thread, before the frame result is returned.
     Synchronous,
+    /// On a background worker.
     #[default]
     Asynchronous,
 }

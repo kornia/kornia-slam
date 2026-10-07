@@ -15,6 +15,8 @@ use super::VerifiedLoopEdge;
 
 /// Configuration for pose-graph optimization.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct PgoConfig {
     pub loop_edge_weight: f32,
     pub max_iterations: usize,

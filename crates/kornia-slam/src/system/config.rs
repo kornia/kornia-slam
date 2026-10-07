@@ -25,12 +25,8 @@ pub struct SlamConfig {
 
 impl Default for SlamConfig {
     fn default() -> Self {
-        let mut two_view_init = TwoViewInitConfig::default();
-        two_view_init.triangulation_config.max_midpoint_gap = 0.25;
-        two_view_init.triangulation_config.max_reprojection_error = 3.0;
-
         Self {
-            two_view_init,
+            two_view_init: TwoViewInitConfig::default(),
             map_projection: MapProjectionConfig::default(),
             keyframe_policy: KeyframePolicy::default(),
             tracking_loss_recovery: TrackingLossRecoveryPolicy::default(),

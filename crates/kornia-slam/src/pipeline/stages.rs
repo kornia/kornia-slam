@@ -1,9 +1,10 @@
 use std::fmt;
 
 use super::config::{
-    CameraSelection, FrontendConfig, LoopClosingMode, MappingExecution, OrbSlamPipeline,
-    PipelineConfig, PipelineDefinition,
+    CameraSelection, FrontendConfig, LoopClosingMode, OrbSlamPipeline, PipelineConfig,
+    PipelineDefinition, StereoCloseDepth,
 };
+use crate::mapping::LocalMappingMode;
 
 /// A stage role in the resolved pipeline graph.
 ///
@@ -12,7 +13,7 @@ use super::config::{
 /// selection, keyframes feed local mapping and place recognition, and loop
 /// correction feeds back into the map and tracking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stage {
+pub(crate) enum Stage {
     OrbFrontend,
     StereoDepth,
     ImuIntegration,
@@ -25,7 +26,7 @@ pub enum Stage {
 
 impl PipelineConfig {
     /// Stages the definition enables, in data-flow order.
-    pub fn stages(&self) -> Vec<Stage> {
+    pub(crate) fn stages(&self) -> Vec<Stage> {
         match &self.pipeline {
             PipelineDefinition::OrbSlam(orb) => self.orb_stages(orb),
         }
@@ -77,7 +78,21 @@ fn write_orb_stage(f: &mut fmt::Formatter<'_>, stage: Stage, orb: &OrbSlamPipeli
             let FrontendConfig::Orb(frontend) = orb.frontend;
             write!(f, "frontend: ORB, {} keypoints", frontend.n_keypoints)
         }
-        Stage::StereoDepth => write!(f, "stereo depth: rectified pair"),
+        Stage::StereoDepth => {
+            let FrontendConfig::Orb(frontend) = orb.frontend;
+            match frontend.stereo_close_depth {
+                StereoCloseDepth::Baselines(n) => {
+                    write!(
+                        f,
+                        "stereo depth: rectified pair, close within {n} baselines"
+                    )
+                }
+                StereoCloseDepth::Metres(m) => {
+                    write!(f, "stereo depth: rectified pair, close within {m} m")
+                }
+                StereoCloseDepth::Disabled => write!(f, "stereo depth: rectified pair"),
+            }
+        }
         Stage::ImuIntegration => write!(f, "IMU integration"),
         Stage::Tracking => write!(f, "tracking"),
         Stage::KeyframeSelection => {
@@ -90,8 +105,8 @@ fn write_orb_stage(f: &mut fmt::Formatter<'_>, stage: Stage, orb: &OrbSlamPipeli
         }
         Stage::LocalMapping => {
             let execution = match orb.mapping.execution {
-                MappingExecution::Synchronous => "synchronous",
-                MappingExecution::Asynchronous => "asynchronous",
+                LocalMappingMode::Synchronous => "synchronous",
+                LocalMappingMode::Asynchronous => "asynchronous",
             };
             write!(f, "local mapping: {execution}")
         }

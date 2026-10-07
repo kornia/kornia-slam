@@ -4,7 +4,11 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_sensors::SensorRig;
 
+use super::stages::Stage;
 use super::*;
+use crate::loop_closure::LoopClosingConfig;
+use crate::mapping::LocalMappingMode;
+use crate::tracking::KeyframePolicy;
 
 fn orb_mut(config: &mut PipelineConfig) -> &mut OrbSlamPipeline {
     let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
@@ -23,6 +27,7 @@ fn with_loop_closing(mode: LoopClosingMode, sensors: SensorSelection) -> Pipelin
 fn detect_and_correct() -> LoopClosingMode {
     LoopClosingMode::DetectAndCorrect {
         vocabulary: PathBuf::from("ORBvoc.txt"),
+        correction: Box::default(),
     }
 }
 
@@ -84,7 +89,10 @@ fn keypoint_budget_is_bounded() {
         (*range.end() + 1, false),
     ] {
         let mut config = PipelineConfig::default();
-        orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig { n_keypoints });
+        orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
+            n_keypoints,
+            ..OrbFrontendConfig::default()
+        });
         assert_eq!(config.validate().is_ok(), ok, "n_keypoints {n_keypoints}");
     }
 }
@@ -114,6 +122,59 @@ fn keyframe_ratio_must_be_finite_unit_interval() {
         orb_mut(&mut config).keyframes.ref_ratio = ratio;
         assert_eq!(config.validate().is_ok(), ok, "ratio {ratio}");
     }
+}
+
+fn invalid_setting(config: &PipelineConfig) -> Option<String> {
+    match config.validate() {
+        Err(ConfigError::InvalidSetting { setting, .. }) => Some(setting),
+        _ => None,
+    }
+}
+
+#[test]
+fn stage_settings_are_range_checked() {
+    let mut config = PipelineConfig::default();
+    let orb = orb_mut(&mut config);
+    orb.frontend = FrontendConfig::Orb(OrbFrontendConfig {
+        stereo_close_depth: StereoCloseDepth::Metres(-1.0),
+        ..OrbFrontendConfig::default()
+    });
+    assert_eq!(
+        invalid_setting(&config).as_deref(),
+        Some("frontend.stereo_close_depth")
+    );
+
+    let mut config = PipelineConfig::default();
+    orb_mut(&mut config).initialization.match_config.nn_ratio = 0.0;
+    assert_eq!(
+        invalid_setting(&config).as_deref(),
+        Some("initialization.match_config.nn_ratio")
+    );
+
+    let mut config = PipelineConfig::default();
+    orb_mut(&mut config)
+        .tracking
+        .map_projection
+        .local_projection
+        .search_radius = f32::NAN;
+    assert_eq!(
+        invalid_setting(&config).as_deref(),
+        Some("tracking.map_projection.local_projection.search_radius")
+    );
+
+    let mut correction = LoopClosingConfig::default();
+    correction.verification.pnp_ransac.confidence = 1.0;
+    let config = with_loop_closing(
+        LoopClosingMode::DetectAndCorrect {
+            vocabulary: PathBuf::from("ORBvoc.txt"),
+            correction: Box::new(correction),
+        },
+        sensors(CameraSelection::Stereo, false),
+    );
+    assert_eq!(
+        invalid_setting(&config).as_deref(),
+        Some("loop_closing.correction.verification.pnp_ransac.confidence")
+    );
 }
 
 #[test]
@@ -191,7 +252,7 @@ fn display_lists_enabled_stages_with_settings() {
     let description = config.to_string();
     for line in [
         "frontend: ORB, 1000 keypoints",
-        "stereo depth",
+        "stereo depth: rectified pair, close within 35 baselines",
         "IMU integration",
         "keyframes: every 3..=8 frames, ref ratio 0.6",
         "local mapping: asynchronous",
@@ -254,8 +315,6 @@ fn stereo_rejects_raw_fisheye_images() {
 
 mod runtime_settings {
     use super::*;
-    use crate::mapping::LocalMappingMode;
-    use crate::tracking::KeyframePolicy;
 
     fn stereo_imu_rig() -> SensorRig {
         rig().with_stereo_baseline(0.11).with_imu(Pose3d::IDENTITY)
@@ -282,54 +341,86 @@ mod runtime_settings {
         );
     }
 
+    /// Version-1 files written before the advanced sections existed must keep
+    /// the runtime settings they had.
     #[test]
-    fn default_maps_to_current_runtime_defaults() {
+    fn default_maps_to_previous_runtime_defaults() {
         let config = PipelineConfig::default();
         let slam = config.slam_config(&rig());
-        let policy = KeyframePolicy::default();
-        assert_eq!(
-            slam.keyframe_policy.min_frames_between,
-            policy.min_frames_between
-        );
-        assert_eq!(
-            slam.keyframe_policy.max_frames_between,
-            policy.max_frames_between
-        );
-        assert_eq!(slam.keyframe_policy.ref_ratio, policy.ref_ratio);
+        assert_eq!(slam.keyframe_policy, KeyframePolicy::default());
         assert_eq!(slam.local_mapping, LocalMappingMode::Asynchronous);
         assert_eq!(slam.stereo_close_depth_m, None);
         assert!(slam.pgo.is_none());
         assert!(!slam.debug);
         assert_eq!(config.orb_detector().n_keypoints, 1000);
+
+        let triangulation = &slam.two_view_init.triangulation_config;
+        assert_eq!(triangulation.max_midpoint_gap, 0.25);
+        assert_eq!(triangulation.max_reprojection_error, 3.0);
+        assert_eq!(triangulation.cheirality_ambiguity_max, 0.75);
+        assert_eq!(triangulation.min_parallax_deg, 1.0);
+        let acceptance = &slam.two_view_init.acceptance_config;
+        assert_eq!(
+            (
+                acceptance.min_matches,
+                acceptance.min_inliers,
+                acceptance.min_triangulated
+            ),
+            (100, 30, 50)
+        );
+        assert_eq!(slam.map_projection.local_projection.search_radius, 30.0);
+        assert_eq!(slam.map_projection.local_projection.max_hamming, 60);
+        assert_eq!(slam.tracking_loss_recovery.timeout_visual_sec, 0.5);
     }
 
     #[test]
     fn stage_settings_reach_runtime() {
         let mut config = PipelineConfig::default();
         let orb = orb_mut(&mut config);
-        orb.frontend = FrontendConfig::Orb(OrbFrontendConfig { n_keypoints: 3000 });
-        orb.keyframes = KeyframeConfig {
+        orb.frontend = FrontendConfig::Orb(OrbFrontendConfig {
+            n_keypoints: 3000,
+            ..OrbFrontendConfig::default()
+        });
+        orb.keyframes = KeyframePolicy {
             min_frames_between: 2,
             max_frames_between: 5,
             ref_ratio: 0.8,
         };
-        orb.mapping.execution = MappingExecution::Synchronous;
+        orb.mapping.execution = LocalMappingMode::Synchronous;
+        orb.initialization.acceptance_config.min_inliers = 40;
+        orb.tracking.map_projection.pnp.min_inliers = 12;
+        orb.tracking.loss_recovery.timeout_imu_sec = 2.0;
 
         let slam = config.slam_config(&rig());
-        assert_eq!(slam.keyframe_policy.min_frames_between, 2);
-        assert_eq!(slam.keyframe_policy.max_frames_between, 5);
-        assert_eq!(slam.keyframe_policy.ref_ratio, 0.8);
+        assert_eq!(slam.keyframe_policy, orb_keyframes(&config));
         assert_eq!(slam.local_mapping, LocalMappingMode::Synchronous);
+        assert_eq!(slam.two_view_init.acceptance_config.min_inliers, 40);
+        assert_eq!(slam.map_projection.pnp.min_inliers, 12);
+        assert_eq!(slam.tracking_loss_recovery.timeout_imu_sec, 2.0);
         assert_eq!(config.orb_detector().n_keypoints, 3000);
     }
 
+    fn orb_keyframes(config: &PipelineConfig) -> KeyframePolicy {
+        let PipelineDefinition::OrbSlam(orb) = &config.pipeline;
+        orb.keyframes
+    }
+
     #[test]
-    fn stereo_close_depth_derives_from_baseline() {
+    fn stereo_close_depth_resolves_against_the_baseline() {
         let selected = sensors(CameraSelection::Stereo, false)
             .select_rig(stereo_imu_rig())
             .unwrap();
-        let slam = PipelineConfig::default().slam_config(&selected);
-        assert_eq!(slam.stereo_close_depth_m, Some(0.11 * 35.0));
+        let close_depth = |depth| {
+            let mut config = PipelineConfig::default();
+            orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
+                stereo_close_depth: depth,
+                ..OrbFrontendConfig::default()
+            });
+            config.slam_config(&selected).stereo_close_depth_m
+        };
+        assert_eq!(close_depth(StereoCloseDepth::default()), Some(0.11 * 35.0));
+        assert_eq!(close_depth(StereoCloseDepth::Metres(2.5)), Some(2.5));
+        assert_eq!(close_depth(StereoCloseDepth::Disabled), None);
     }
 
     #[test]
@@ -346,19 +437,17 @@ mod runtime_settings {
                 .is_none()
         );
 
-        let pgo = with_loop_closing(detect_and_correct(), stereo)
-            .slam_config(&stereo_rig)
-            .pgo
-            .unwrap();
-        assert!(!pgo.require_imu_initialized);
-
-        let mono_imu = sensors(CameraSelection::Mono, true);
-        let imu_rig = mono_imu.select_rig(stereo_imu_rig()).unwrap();
-        let pgo = with_loop_closing(detect_and_correct(), mono_imu)
-            .slam_config(&imu_rig)
-            .pgo
-            .unwrap();
-        assert!(pgo.require_imu_initialized);
+        let mut correction = LoopClosingConfig::default();
+        correction.optimizer.max_iterations = 7;
+        let config = with_loop_closing(
+            LoopClosingMode::DetectAndCorrect {
+                vocabulary: PathBuf::from("ORBvoc.txt"),
+                correction: Box::new(correction),
+            },
+            stereo,
+        );
+        let pgo = config.slam_config(&stereo_rig).pgo.unwrap();
+        assert_eq!(pgo.optimizer.max_iterations, 7);
     }
 
     #[test]
@@ -409,10 +498,17 @@ mod ron_files {
         PipelineConfig::from_ron_str(text, Path::new(""))
     }
 
+    /// Configurations hold upstream types without `PartialEq`, so they are
+    /// compared through their serialized form.
+    fn ron(config: &PipelineConfig) -> String {
+        config.to_ron_string().unwrap()
+    }
+
     #[test]
     fn explicit_defaults_equal_default() {
-        assert_eq!(parse(PLAN_EXAMPLE).unwrap(), PipelineConfig::default());
-        assert_eq!(parse("(version: 1)").unwrap(), PipelineConfig::default());
+        let default = ron(&PipelineConfig::default());
+        assert_eq!(ron(&parse(PLAN_EXAMPLE).unwrap()), default);
+        assert_eq!(ron(&parse("(version: 1)").unwrap()), default);
     }
 
     #[test]
@@ -420,9 +516,44 @@ mod ron_files {
         let config =
             parse("(version: 1, pipeline: OrbSlam((frontend: Orb((n_keypoints: 3000)))))").unwrap();
         let mut expected = PipelineConfig::default();
-        orb_mut(&mut expected).frontend =
-            FrontendConfig::Orb(OrbFrontendConfig { n_keypoints: 3000 });
-        assert_eq!(config, expected);
+        orb_mut(&mut expected).frontend = FrontendConfig::Orb(OrbFrontendConfig {
+            n_keypoints: 3000,
+            ..OrbFrontendConfig::default()
+        });
+        assert_eq!(ron(&config), ron(&expected));
+    }
+
+    /// A partially written section keeps the defaults of the setting it
+    /// configures, which can differ from the type's own defaults.
+    #[test]
+    fn partial_sections_keep_their_context_defaults() {
+        let config = parse(
+            "(version: 1, sensors: (cameras: Stereo), pipeline: OrbSlam((
+                initialization: (triangulation_config: (min_parallax_deg: 2.0)),
+                tracking: (map_projection: (local_projection: (search_radius: 20.0))),
+                loop_closing: DetectAndCorrect(
+                    vocabulary: \"v.txt\",
+                    correction: (verification: (pnp_ransac: (max_iterations: 100))),
+                ),
+            )))",
+        )
+        .unwrap();
+        let orb = orb(&config);
+        let triangulation = &orb.initialization.triangulation_config;
+        assert_eq!(triangulation.min_parallax_deg, 2.0);
+        assert_eq!(triangulation.max_midpoint_gap, 0.25);
+        assert_eq!(triangulation.cheirality_ambiguity_max, 0.75);
+        let local = &orb.tracking.map_projection.local_projection;
+        assert_eq!((local.search_radius, local.max_hamming), (20.0, 60));
+        let ransac = &orb
+            .loop_closing
+            .correction()
+            .unwrap()
+            .verification
+            .pnp_ransac;
+        assert_eq!(ransac.max_iterations, 100);
+        assert_eq!(ransac.random_seed, Some(0));
+        assert_eq!(ransac.confidence, 0.999);
     }
 
     #[test]
@@ -449,6 +580,10 @@ mod ron_files {
             "(version: 1, pipeline: OrbSlam((keyframes: (gap: 3))))",
             "(version: 1, pipeline: OrbSlam((mapping: (window: 3))))",
             "(version: 1, pipeline: OrbSlam((loop_closing: DetectOnly(vocabulary: \"v.txt\", pgo: true))))",
+            "(version: 1, pipeline: OrbSlam((initialization: (triangulation_config: (gap: 1.0)))))",
+            "(version: 1, pipeline: OrbSlam((tracking: (map_projection: (pnp: (kernel: Huber))))))",
+            "(version: 1, pipeline: OrbSlam((tracking: (loss_recovery: (timeout: 1.0)))))",
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((loop_closing: DetectAndCorrect(vocabulary: \"v.txt\", correction: (optimizer: (steps: 3))))))",
         ] {
             assert!(matches!(parse(text), Err(LoadError::Parse(_))), "{text}");
         }
@@ -520,18 +655,49 @@ mod ron_files {
 
     #[test]
     fn serialization_round_trips() {
+        let mut correction = LoopClosingConfig::default();
+        correction.verification.pnp_ransac.random_seed = None;
+        correction.verification.pnp_ransac.sprt =
+            Some(kornia_3d::ransac::SPRTConfig::new(0.4, 0.05));
+        correction.episode.min_consistent_edges = 2;
+        correction.optimizer.loop_edge_weight = 2.0;
         let mut config = with_loop_closing(
             LoopClosingMode::DetectAndCorrect {
                 vocabulary: PathBuf::from("/weights/ORBvoc.bin"),
+                correction: Box::new(correction),
             },
             sensors(CameraSelection::Stereo, true),
         );
-        let orb = orb_mut(&mut config);
-        orb.frontend = FrontendConfig::Orb(OrbFrontendConfig { n_keypoints: 2000 });
-        orb.keyframes.ref_ratio = 0.75;
-        orb.mapping.execution = MappingExecution::Synchronous;
+        let settings = orb_mut(&mut config);
+        settings.frontend = FrontendConfig::Orb(OrbFrontendConfig {
+            n_keypoints: 2000,
+            stereo_close_depth: StereoCloseDepth::Metres(4.0),
+        });
+        settings
+            .initialization
+            .triangulation_config
+            .min_parallax_deg = 1.5;
+        settings.initialization.match_config.check_orientation = false;
+        settings.tracking.map_projection.pnp.robust = kornia_3d::ransac::RobustKernelKind::Cauchy;
+        settings
+            .tracking
+            .map_projection
+            .local_projection
+            .max_hamming = 70;
+        settings.tracking.loss_recovery.min_keyframes_for_grace = 4;
+        settings.keyframes.ref_ratio = 0.75;
+        settings.mapping.execution = LocalMappingMode::Synchronous;
 
-        let text = config.to_ron_string().unwrap();
-        assert_eq!(parse(&text).unwrap(), config, "{text}");
+        let text = ron(&config);
+        let parsed = parse(&text).unwrap();
+        assert_eq!(ron(&parsed), text);
+        assert_ne!(text, ron(&PipelineConfig::default()));
+        let parsed = orb(&parsed);
+        assert_eq!(
+            parsed.tracking.map_projection.local_projection.max_hamming,
+            70
+        );
+        let correction = parsed.loop_closing.correction().unwrap();
+        assert!(correction.verification.pnp_ransac.sprt.is_some());
     }
 }

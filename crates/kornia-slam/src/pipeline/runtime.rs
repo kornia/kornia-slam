@@ -2,19 +2,12 @@ use kornia_imgproc::features::OrbDetector;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    CameraSelection, FrontendConfig, KeyframeConfig, LoopClosingMode, MappingExecution,
-    OrbSlamPipeline, PipelineConfig, PipelineDefinition, SensorSelection,
+    CameraSelection, FrontendConfig, OrbSlamPipeline, PipelineConfig, PipelineDefinition,
+    SensorSelection,
 };
 use super::validation::ConfigError;
-use crate::loop_closure::LoopClosingConfig;
 use crate::loop_closure::place_recognition::{Vocabulary, VocabularyLoadError, load_vocabulary};
-use crate::mapping::LocalMappingMode;
 use crate::system::SlamConfig;
-use crate::tracking::KeyframePolicy;
-
-/// Stereo points closer than this many baselines are back-projected directly
-/// at each keyframe (ORB-SLAM3's `ThDepth`, ~35 for EuRoC).
-const STEREO_CLOSE_DEPTH_BASELINES: f64 = 35.0;
 
 impl SensorSelection {
     /// The source's rig restricted to the selected sensors.
@@ -33,24 +26,21 @@ impl SensorSelection {
 impl PipelineConfig {
     /// Runtime settings for a rig returned by [`SensorSelection::select_rig`].
     ///
-    /// Stereo close depth and the loop-correction IMU gate are derived from
-    /// the rig rather than stored in the configuration.
+    /// Stereo close depth is resolved against the rig's baseline.
     pub fn slam_config(&self, rig: &SensorRig) -> SlamConfig {
         let orb = self.orb();
-        let pgo = matches!(orb.loop_closing, LoopClosingMode::DetectAndCorrect { .. }).then(|| {
-            LoopClosingConfig {
-                require_imu_initialized: rig.imu.is_some(),
-                ..LoopClosingConfig::default()
-            }
-        });
+        let FrontendConfig::Orb(frontend) = orb.frontend;
         SlamConfig {
-            keyframe_policy: orb.keyframes.into(),
-            local_mapping: orb.mapping.execution.into(),
+            two_view_init: orb.initialization.clone(),
+            map_projection: orb.tracking.map_projection.clone(),
+            keyframe_policy: orb.keyframes,
+            tracking_loss_recovery: orb.tracking.loss_recovery,
+            local_mapping: orb.mapping.execution,
             stereo_close_depth_m: rig
                 .stereo_baseline_m
-                .map(|baseline| baseline * STEREO_CLOSE_DEPTH_BASELINES),
-            pgo,
-            ..SlamConfig::default()
+                .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
+            debug: false,
+            pgo: orb.loop_closing.correction().cloned(),
         }
     }
 
@@ -75,24 +65,5 @@ impl PipelineConfig {
     fn orb(&self) -> &OrbSlamPipeline {
         let PipelineDefinition::OrbSlam(orb) = &self.pipeline;
         orb
-    }
-}
-
-impl From<KeyframeConfig> for KeyframePolicy {
-    fn from(config: KeyframeConfig) -> Self {
-        Self {
-            min_frames_between: config.min_frames_between,
-            max_frames_between: config.max_frames_between,
-            ref_ratio: config.ref_ratio,
-        }
-    }
-}
-
-impl From<MappingExecution> for LocalMappingMode {
-    fn from(execution: MappingExecution) -> Self {
-        match execution {
-            MappingExecution::Synchronous => Self::Synchronous,
-            MappingExecution::Asynchronous => Self::Asynchronous,
-        }
     }
 }
