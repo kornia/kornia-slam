@@ -3,16 +3,14 @@
 //! The runtime flow is kept in one file so it can be read from top to bottom
 //! in the same order frames move through the system.
 
-mod frontend;
 mod inertial;
 mod input;
 mod state;
 
-pub use frontend::FrontendObservation;
 pub use input::ProcessError;
 pub use state::{TrackingResult, TrackingStatus};
 
-use frontend::OrbFrontend;
+use crate::frontend::{FrontendObservation, OrbFrontend};
 use inertial::{AppliedInitialization, InertialState, viba0_accel_bias_prior};
 use state::{SystemMode, SystemState};
 

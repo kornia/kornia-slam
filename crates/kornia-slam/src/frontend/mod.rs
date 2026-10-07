@@ -13,9 +13,9 @@ use kornia_sensors::SensorRig;
 
 use kornia_sensors::SensorFrame;
 
-use super::input::ProcessError;
 use crate::Frame;
 use crate::stereo::{StereoMatchConfig, compute_stereo_matches};
+use crate::system::ProcessError;
 
 /// Fisheye keypoints beyond this incidence angle are dropped: a pinhole cannot
 /// represent rays at or past 90°, and precision degrades well before that.

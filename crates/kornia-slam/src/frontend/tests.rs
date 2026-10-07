@@ -2,8 +2,8 @@ use kornia_sensors::imu::ImuMeasurement;
 
 use super::*;
 
-const FRONTEND_FIXTURE: &str = include_str!("../../../tests/fixtures/frontend/frontend.txt");
-const HILTI_FIXTURE: &str = include_str!("../../../tests/fixtures/frontend/hilti.txt");
+const FRONTEND_FIXTURE: &str = include_str!("../../tests/fixtures/frontend/frontend.txt");
+const HILTI_FIXTURE: &str = include_str!("../../tests/fixtures/frontend/hilti.txt");
 
 /// Deterministic texture of 4x4 blocks of noise. The right view is the left
 /// view shifted by `disparity` pixels, so a point at `x` appears at `x - d`.

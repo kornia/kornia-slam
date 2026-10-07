@@ -5,6 +5,7 @@ use kornia_algebra::Vec3F64;
 use kornia_image::ImageSize;
 
 use super::*;
+use crate::frontend::OrbFrontend;
 use crate::loop_closure::place_recognition::VocabularyLoadError;
 use crate::mapping::LocalMappingMode;
 use crate::pipeline::{

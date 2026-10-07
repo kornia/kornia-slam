@@ -2,7 +2,7 @@
 
 FNV-1a 64-bit hashes of frontend outputs recorded from the app's frontend before
 it moved into `SlamSystem` (commit `7fd563c`, rustc 1.98.1, kornia-rs 0.2.0). The
-tests in `src/system/frontend/tests.rs` regenerate the same inputs and must
+tests in `src/frontend/tests.rs` regenerate the same inputs and must
 reproduce these values exactly.
 
 - `frontend.txt`: ORB features (1000-keypoint detector), stereo matches and

@@ -29,6 +29,7 @@
 //! ```
 
 pub mod frame;
+pub(crate) mod frontend;
 pub mod initialization;
 pub mod loop_closure;
 pub mod mapping;
@@ -39,9 +40,10 @@ pub mod system;
 pub mod tracking;
 
 pub use frame::Frame;
+pub use frontend::FrontendObservation;
 pub use kornia_imgproc::features::OrbFeatures;
 pub use kornia_sensors::{ImuCalibration, SensorFrame, SensorRig};
 pub use loop_closure::{LoopClosingConfig, LoopClosureEvent};
 pub use pipeline::{BuildError, PipelineConfig};
-pub use system::{FrontendObservation, ProcessError, SlamSystem, TrackingResult, TrackingStatus};
+pub use system::{ProcessError, SlamSystem, TrackingResult, TrackingStatus};
 pub use tracking::{KeyframePolicy, MapProjectionEstimator};
