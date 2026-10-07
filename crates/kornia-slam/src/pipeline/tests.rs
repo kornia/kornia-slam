@@ -232,6 +232,26 @@ fn rig_must_provide_selected_sensors() {
     );
 }
 
+#[test]
+fn stereo_rejects_raw_fisheye_images() {
+    let fisheye = kornia_3d::camera::FisheyeCamera {
+        fx: 460.0,
+        fy: 460.0,
+        cx: 367.0,
+        cy: 248.0,
+        k1: 0.03,
+        k2: -0.02,
+        k3: 0.003,
+        k4: -0.0005,
+    };
+    let rig = rig().with_stereo_baseline(0.11).with_fisheye(fisheye);
+    assert_eq!(
+        sensors(CameraSelection::Stereo, false).validate_rig(&rig),
+        Err(ConfigError::FisheyeStereo)
+    );
+    assert_eq!(SensorSelection::default().validate_rig(&rig), Ok(()));
+}
+
 mod runtime_settings {
     use super::*;
     use crate::mapping::LocalMappingMode;
