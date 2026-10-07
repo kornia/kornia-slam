@@ -6091,6 +6091,7 @@ dependencies = [
  "glam 0.33.2",
  "kornia-3d",
  "kornia-algebra",
+ "kornia-image",
 ]
 
 [[package]]

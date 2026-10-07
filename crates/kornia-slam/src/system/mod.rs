@@ -9,7 +9,7 @@ mod input;
 mod state;
 
 pub use frontend::FrontendObservation;
-pub use input::{ProcessError, SensorFrame};
+pub use input::ProcessError;
 pub use state::{TrackingResult, TrackingStatus};
 
 use frontend::OrbFrontend;
@@ -39,8 +39,8 @@ use crate::pipeline::{BuildError, PipelineConfig, SystemSettings};
 use crate::pose_conversion::apply_reference_pose_correction;
 use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
-use kornia_sensors::SensorRig;
 use kornia_sensors::imu::ImuMeasurement;
+use kornia_sensors::{SensorFrame, SensorRig};
 
 /// Top-level ORB-SLAM system: orchestrates tracking, mapping, and state transitions.
 pub struct SlamSystem {
@@ -136,7 +136,7 @@ impl SlamSystem {
     /// Invalid input or a feature-extraction failure; the system state,
     /// including buffered IMU samples and image history, is then unchanged.
     pub fn process(&mut self, input: SensorFrame<'_>) -> Result<TrackingResult, ProcessError> {
-        input.validate(self.rig.stereo_baseline_m.is_some())?;
+        input::validate(&input, self.rig.stereo_baseline_m.is_some())?;
         let frame = self.frontend.prepare(&input)?;
         self.report_stereo(&frame);
         let imu_samples = if self.rig.imu.is_some() {

@@ -31,8 +31,10 @@ keypoints and extraction time for overlays. Pipeline files gain
 former `SlamConfig` settings (two-view initialization, map projection, loss
 recovery, loop correction) are algorithm tuning, set from Rust through
 `OrbSlamPipeline::tuning` and kept out of the file format. Existing
-configuration files resolve to the same settings as before. `kornia-sensors`' `SensorRig` gains an
-optional fisheye model for sources that supply raw fisheye images.
+configuration files resolve to the same settings as before. `kornia-sensors` gains `SensorFrame`,
+so sources can produce input without depending on `kornia-slam` (which
+re-exports it), and `SensorRig` gains an optional fisheye model for sources
+that supply raw fisheye images.
 **Breaking (library):**
 
 | Removed | Replacement |

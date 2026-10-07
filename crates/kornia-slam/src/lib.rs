@@ -40,10 +40,8 @@ pub mod tracking;
 
 pub use frame::Frame;
 pub use kornia_imgproc::features::OrbFeatures;
-pub use kornia_sensors::{ImuCalibration, SensorRig};
+pub use kornia_sensors::{ImuCalibration, SensorFrame, SensorRig};
 pub use loop_closure::{LoopClosingConfig, LoopClosureEvent};
 pub use pipeline::{BuildError, PipelineConfig};
-pub use system::{
-    FrontendObservation, ProcessError, SensorFrame, SlamSystem, TrackingResult, TrackingStatus,
-};
+pub use system::{FrontendObservation, ProcessError, SlamSystem, TrackingResult, TrackingStatus};
 pub use tracking::{KeyframePolicy, MapProjectionEstimator};

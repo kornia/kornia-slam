@@ -11,7 +11,9 @@ use kornia_imgproc::features::{OrbDetector, OrbFeatures};
 use kornia_imgproc::resize::resize_fast_mono;
 use kornia_sensors::SensorRig;
 
-use super::input::{ProcessError, SensorFrame};
+use kornia_sensors::SensorFrame;
+
+use super::input::ProcessError;
 use crate::Frame;
 use crate::stereo::{StereoMatchConfig, compute_stereo_matches};
 
