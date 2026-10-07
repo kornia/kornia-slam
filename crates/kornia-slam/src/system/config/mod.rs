@@ -1,21 +1,8 @@
-//! Declarative SLAM pipeline definitions: the sensors a pipeline consumes and
+//! Declarative pipeline configuration: the sensors a pipeline consumes and
 //! the stages, optional branches and settings it runs.
-//!
-//! With the `serde` feature, definitions load from versioned RON files.
-
-mod build;
-#[cfg(feature = "serde")]
-mod file;
-mod validation;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-
-pub use build::BuildError;
-pub(crate) use build::SystemSettings;
-#[cfg(feature = "serde")]
-pub use file::LoadError;
-pub use validation::ConfigError;
 
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopClosingConfig;

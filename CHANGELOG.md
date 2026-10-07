@@ -15,7 +15,7 @@ versioned RON file that selects the sensors, ORB settings, keyframe policy,
 local-mapping execution and loop-closing branch; `configs/` has ready-made
 files for each sensor combination and for Hilti. Invalid settings, and sensors
 the source cannot provide, are rejected before any data is read. The library
-gains `kornia_slam::pipeline`, with RON loading behind the optional `serde`
+gains `PipelineConfig` (in `kornia_slam::system`, re-exported at the root), with RON loading behind the optional `serde`
 feature. **Breaking (CLI):** `--n-keypoints`, `--local-mapping`, `--vocab`,
 `--apply-pgo` and the sources' `--stereo`/`--imu` switches are removed; for
 example `euroc --stereo --imu` becomes `--config configs/stereo-imu.ron euroc`.
@@ -46,6 +46,7 @@ that supply raw fisheye images.
 | `SlamSystem::process_frame` (prepared features) | `SlamSystem::process(SensorFrame)` |
 | `LoopClosingConfig::require_imu_initialized` | derived from the rig |
 | `PipelineConfig::{slam_config, orb_detector, load_vocabulary}`, `SensorSelection::select_rig` | done by `SlamSystem::build` |
+| `kornia_slam::pipeline` | `kornia_slam::system`; common types are re-exported at the crate root |
 | `pipeline::{KeyframeConfig, MappingExecution, Stage}` | `KeyframePolicy`, `LocalMappingMode`; the stage list is gone, `Display` describes the pipeline |
 
 `SlamSystem` no longer accepts features computed outside it; such callers pass

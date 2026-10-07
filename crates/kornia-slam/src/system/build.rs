@@ -1,11 +1,11 @@
 use kornia_imgproc::features::OrbDetector;
 use kornia_sensors::SensorRig;
 
-use super::validation::ConfigError;
-use super::{
+use super::config::{
     CameraSelection, FrontendConfig, OrbSlamPipeline, PipelineConfig, PipelineDefinition,
     SensorSelection,
 };
+use super::validation::ConfigError;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopClosingConfig;
 use crate::loop_closure::place_recognition::{Vocabulary, VocabularyLoadError, load_vocabulary};

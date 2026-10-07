@@ -1,8 +1,10 @@
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_image::{Image, ImageSize};
-use kornia_slam::pipeline::{CameraSelection, PipelineConfig, SensorSelection};
-use kornia_slam::{SensorFrame, SensorRig, SlamSystem, TrackingStatus};
+use kornia_slam::{
+    CameraSelection, PipelineConfig, SensorFrame, SensorRig, SensorSelection, SlamSystem,
+    TrackingStatus,
+};
 
 fn test_camera() -> PinholeCamera {
     PinholeCamera {

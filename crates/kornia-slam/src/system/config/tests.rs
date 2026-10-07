@@ -6,6 +6,9 @@ use kornia_sensors::SensorRig;
 
 use super::*;
 use crate::mapping::LocalMappingMode;
+use crate::system::ConfigError;
+#[cfg(feature = "serde")]
+use crate::system::LoadError;
 use crate::tracking::KeyframePolicy;
 
 fn orb_mut(config: &mut PipelineConfig) -> &mut OrbSlamPipeline {

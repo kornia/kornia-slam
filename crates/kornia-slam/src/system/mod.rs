@@ -1,14 +1,29 @@
-//! SLAM runtime: orchestrates tracking, mapping, and state transitions.
+//! SLAM runtime: its configuration, construction and processing flow.
 //!
-//! The runtime flow is kept in one file so it can be read from top to bottom
-//! in the same order frames move through the system.
+//! The processing flow is kept in this file so it can be read from top to
+//! bottom in the same order frames move through the system. With the `serde`
+//! feature, configurations load from versioned RON files.
 
+mod build;
+mod config;
+#[cfg(feature = "serde")]
+mod file;
 mod inertial;
 mod input;
 mod state;
+mod validation;
 
+pub use build::BuildError;
+pub use config::{
+    CameraSelection, FrontendConfig, LoopClosingMode, MappingConfig, OrbFrontendConfig,
+    OrbSlamPipeline, OrbTuning, PIPELINE_CONFIG_VERSION, PipelineConfig, PipelineDefinition,
+    SensorSelection, StereoCloseDepth,
+};
+#[cfg(feature = "serde")]
+pub use file::LoadError;
 pub use input::ProcessError;
 pub use state::{TrackingResult, TrackingStatus};
+pub use validation::ConfigError;
 
 use crate::frontend::{FrontendObservation, OrbFrontend};
 use inertial::{AppliedInitialization, InertialState, viba0_accel_bias_prior};
@@ -33,8 +48,8 @@ use crate::loop_closure::{LoopCloser, LoopClosingContext, LoopClosureEvent};
 use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
 use crate::mapping::map::{Keyframe, Map, MapInsertion, MapMutationError, MapPoint};
 use crate::mapping::{KeyframeJob, LocalMapping};
-use crate::pipeline::{BuildError, PipelineConfig, SystemSettings};
 use crate::pose_conversion::apply_reference_pose_correction;
+use build::SystemSettings;
 use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
 use kornia_sensors::imu::ImuMeasurement;

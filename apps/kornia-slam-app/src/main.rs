@@ -30,7 +30,8 @@ mod utils;
 use crate::datasets::euroc::GroundTruthPose;
 use evaluation::associate_gt;
 use kornia_algebra::Vec3F64;
-use kornia_slam::pipeline::{CameraSelection, PipelineConfig, PipelineDefinition};
+use kornia_slam::system::PipelineDefinition;
+use kornia_slam::{CameraSelection, PipelineConfig};
 use kornia_slam::{LoopClosureEvent, SensorFrame, SlamSystem};
 #[cfg(feature = "oakd")]
 use source::OakdSource;

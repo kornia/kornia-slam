@@ -1,7 +1,7 @@
 use kornia_imgproc::features::OrbMatchConfig;
 use kornia_sensors::SensorRig;
 
-use super::{
+use super::config::{
     CameraSelection, FrontendConfig, LoopClosingMode, OrbFrontendConfig, OrbSlamPipeline,
     OrbTuning, PIPELINE_CONFIG_VERSION, PipelineConfig, PipelineDefinition, SensorSelection,
     StereoCloseDepth,

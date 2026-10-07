@@ -58,8 +58,7 @@ stereo matching and frame history are the system's; sources supply
 synchronized, calibrated (and, for stereo, rectified) images.
 
 ```rust,ignore
-use kornia_slam::pipeline::PipelineConfig;
-use kornia_slam::{SensorFrame, SlamSystem};
+use kornia_slam::{PipelineConfig, SensorFrame, SlamSystem};
 
 let config = PipelineConfig::from_ron_file("configs/stereo-imu.ron")?; // `serde` feature
 let mut system = SlamSystem::build(config, rig)?; // rig: kornia_slam::SensorRig

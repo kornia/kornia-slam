@@ -8,9 +8,6 @@ use super::*;
 use crate::frontend::OrbFrontend;
 use crate::loop_closure::place_recognition::VocabularyLoadError;
 use crate::mapping::LocalMappingMode;
-use crate::pipeline::{
-    CameraSelection, ConfigError, LoopClosingMode, PipelineDefinition, SensorSelection,
-};
 
 #[test]
 fn formats_compact_imu_init_gate() {
