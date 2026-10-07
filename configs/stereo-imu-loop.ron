@@ -1,10 +1,51 @@
 // Stereo visual-inertial with loop detection and pose-graph correction.
 // Expects the DBoW2 ORB vocabulary at weights/ORBvoc.txt in the repository
 // root (a .bin from convert_orbvoc also works); adjust the path otherwise.
+// The correction settings below are the defaults and may be omitted.
 (
     version: 1,
     sensors: ( cameras: Stereo, imu: true ),
     pipeline: OrbSlam((
-        loop_closing: DetectAndCorrect(vocabulary: "../weights/ORBvoc.txt"),
+        loop_closing: DetectAndCorrect(
+            vocabulary: "../weights/ORBvoc.txt",
+            correction: (
+                // A loop is accepted once this many consistent candidates agree.
+                episode: ( min_consistent_edges: 3, max_query_gap: 5, candidate_neighborhood_radius: 10 ),
+                fusion: (
+                    min_covisibility_weight: 15,
+                    max_neighbors_per_side: 5,
+                    search_radius_px: 7.0,
+                    max_hamming: 50,
+                    max_reprojection_error_px: 3.0,
+                ),
+                verification: (
+                    orb_match: ( nn_ratio: 0.6, th_low: 50, check_orientation: true, histo_length: 30 ),
+                    min_correspondences: 30,
+                    min_inliers: 30,
+                    min_inlier_ratio: 0.4,
+                    max_reprojection_rmse_px: 3.0,
+                    // Inliers must spread over this grid of image cells.
+                    coverage_rows: 4,
+                    coverage_cols: 4,
+                    min_occupied_cells: 6,
+                    // A fixed seed makes loop decisions replay identically.
+                    pnp_ransac: (
+                        max_iterations: 500,
+                        reproj_threshold_px: 3.0,
+                        confidence: 0.999,
+                        random_seed: Some(0),
+                        refine: true,
+                        sprt: None,
+                    ),
+                ),
+                optimizer: (
+                    loop_edge_weight: 0.5,
+                    max_iterations: 30,
+                    cost_tolerance: 0.000001,
+                    gradient_tolerance: 0.000001,
+                    initial_lambda: 0.001,
+                ),
+            ),
+        ),
     )),
 )

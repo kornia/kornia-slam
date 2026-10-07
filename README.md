@@ -50,6 +50,31 @@ cargo run --release -p kornia-slam-app -- --config configs/stereo-imu.ron \
 
 More sources and options: [apps/kornia-slam-app](apps/kornia-slam-app/README.md).
 
+## Library
+
+A pipeline configuration and the source's calibrated rig build a `SlamSystem`,
+which then takes images and IMU samples and returns poses. Feature extraction,
+stereo matching and frame history are the system's; sources supply
+synchronized, calibrated (and, for stereo, rectified) images.
+
+```rust,ignore
+use kornia_slam::pipeline::PipelineConfig;
+use kornia_slam::{SensorFrame, SlamSystem};
+
+let config = PipelineConfig::from_ron_file("configs/stereo-imu.ron")?; // `serde` feature
+let mut system = SlamSystem::build(config, rig)?; // rig: kornia_slam::SensorRig
+for (idx, frame) in frames.enumerate() {
+    let result = system.process(SensorFrame {
+        idx,
+        timestamp_sec: frame.timestamp_sec,
+        image: &frame.left,
+        right_image: Some(&frame.right),
+        imu_samples: &frame.imu,
+    })?;
+    println!("{idx}: {:?} {:?}", result.status, result.pose_world_to_cam);
+}
+```
+
 ## Integrations
 
 - **[Copper](https://github.com/copper-project/copper-rs):** stereo visual-inertial odometry as

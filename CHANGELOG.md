@@ -20,6 +20,37 @@ feature. **Breaking (CLI):** `--n-keypoints`, `--local-mapping`, `--vocab`,
 `--apply-pgo` and the sources' `--stereo`/`--imu` switches are removed; for
 example `euroc --stereo --imu` becomes `--config configs/stereo-imu.ron euroc`.
 
+**One configuration, one construction call, one processing call.**
+`SlamSystem::build(config, rig)` assembles the system from a `PipelineConfig`
+and the source's calibrated `SensorRig`, and `SlamSystem::process` takes a
+`SensorFrame` of images and IMU samples. The system now owns ORB extraction,
+stereo matching, fisheye keypoint mapping and frame history, so an embedding
+no longer reimplements them; `frontend_observation()` exposes the raw-image
+keypoints and extraction time for overlays. Every former `SlamConfig` setting
+is part of the pipeline definition: `initialization` (two-view matching,
+triangulation, acceptance), `tracking` (map projection, PnP, loss recovery),
+`frontend.stereo_close_depth` (baselines, metres or disabled), and the
+`correction` settings of `DetectAndCorrect`. Existing configuration files
+resolve to the same settings as before. `kornia-sensors`' `SensorRig` gains an
+optional fisheye model for sources that supply raw fisheye images.
+**Breaking (library):**
+
+| Removed | Replacement |
+| --- | --- |
+| `SlamConfig`, `SlamSystem::new`, `SlamSystem::with_rig` | `SlamSystem::build(PipelineConfig, SensorRig)` |
+| `SlamConfig::debug` | `SlamSystem::set_debug` |
+| `SlamSystem::set_vocabulary` | a `loop_closing` branch naming the vocabulary |
+| `SlamSystem::set_imu_extrinsics` | IMU calibration on the `SensorRig` |
+| `SlamSystem::process_frame` (prepared features) | `SlamSystem::process(SensorFrame)` |
+| `LoopClosingConfig::require_imu_initialized` | derived from the rig |
+| `PipelineConfig::{slam_config, orb_detector, load_vocabulary}`, `SensorSelection::select_rig` | done by `SlamSystem::build` |
+| `pipeline::{KeyframeConfig, MappingExecution, Stage}` | `KeyframePolicy`, `LocalMappingMode`; stages are internal |
+
+`SlamSystem` no longer accepts features computed outside it; such callers pass
+images, or compose the tracking and mapping building blocks directly, which
+remain public. `TwoViewInitConfig::default()` now carries the triangulation
+gates the runtime used (`max_midpoint_gap` 0.25, `max_reprojection_error` 3.0).
+
 **Loop correction replays identically.** Loop-verification RANSAC now uses a
 fixed seed, so runs with loop correction are reproducible.
 

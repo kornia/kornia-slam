@@ -1,20 +1,70 @@
 // Monocular ORB-SLAM with every setting at its default. Omitted fields take
-// these values, so the other configs only list what they change.
+// these values, so the other configs only list what they change; a partially
+// written section keeps the defaults of its other fields.
 (
     version: 1,
     // cameras: Mono | Stereo (a rectified pair; the right image adds depth).
     // imu: true needs a source with IMU data and camera-IMU calibration.
     sensors: ( cameras: Mono, imu: false ),
     pipeline: OrbSlam((
-        frontend: Orb(( n_keypoints: 1000 )),
+        frontend: Orb((
+            n_keypoints: 1000,
+            // Stereo keypoints closer than this are back-projected directly at
+            // each keyframe: Baselines(n) | Metres(m) | Disabled.
+            stereo_close_depth: Baselines(35.0),
+        )),
+        // Monocular two-view map initialization. Keyframe growth shares its
+        // matching and triangulation settings.
+        initialization: (
+            match_config: ( nn_ratio: 0.6, th_low: 50, check_orientation: true, histo_length: 30 ),
+            triangulation_config: (
+                min_parallax_deg: 1.0,
+                max_midpoint_gap: 0.25,
+                max_reprojection_error: 3.0,
+                min_cheirality_count: 1,
+                cheirality_ambiguity_max: 0.75,
+            ),
+            acceptance_config: ( min_matches: 100, min_inliers: 30, min_triangulated: 50 ),
+        ),
+        tracking: (
+            map_projection: (
+                match_config: ( nn_ratio: 0.6, th_low: 50, check_orientation: true, histo_length: 30 ),
+                pnp: (
+                    prior_reproj_threshold_px: 25.0,
+                    final_reproj_threshold_px: 3.0,
+                    min_correspondences: 4,
+                    min_inliers_early: 10,
+                    min_inliers: 30,
+                    // Identity | Huber | Cauchy | Tukey
+                    robust: Huber,
+                    robust_scale_sq: 25.0,
+                    outlier_rounds: 4,
+                    lm_max_iterations: 50,
+                ),
+                projection: ( min_depth: 0.0, search_radius: 15.0, max_hamming: 50 ),
+                local_projection: ( min_depth: 0.0, search_radius: 30.0, max_hamming: 60 ),
+                // Search gates widen while tracking is lost, up to max_search_scale.
+                search_widen_per_sec: 1.0,
+                max_search_scale: 4.0,
+                geometric_filter_threshold_px: 1.0,
+            ),
+            // Seconds a lost map may keep predicting before it is reset.
+            loss_recovery: (
+                min_keyframes_for_grace: 10,
+                timeout_imu_sec: 1.0,
+                timeout_visual_sec: 0.5,
+                min_imu_confidence_sec: 2.0,
+            ),
+        ),
         // Frames since the last keyframe; ref_ratio in [0, 1].
         keyframes: ( min_frames_between: 3, max_frames_between: 8, ref_ratio: 0.6 ),
         // Synchronous runs local mapping before each frame returns, which
         // makes runs replay identically; Asynchronous uses a background worker.
         mapping: ( execution: Asynchronous ),
         // Disabled | DetectOnly(vocabulary: "…") | DetectAndCorrect(vocabulary: "…").
-        // DetectAndCorrect needs stereo or IMU input. Relative vocabulary paths
-        // are resolved against this file's directory.
+        // DetectAndCorrect needs stereo or IMU input; stereo-imu-loop.ron lists
+        // its correction settings. Relative vocabulary paths are resolved
+        // against this file's directory.
         loop_closing: Disabled,
     )),
 )

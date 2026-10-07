@@ -1,15 +1,15 @@
 # kornia-slam-app
 
 This package is the composition root for the `kornia-slam` executable. It wires the
-`kornia_slam::SlamSystem` runtime to four interchangeable frame sources — offline EuRoC MAV image sequences, offline MCAP recordings (e.g. bubbaloop captures), a live OAK-D camera, and any UVC-class camera (laptop webcams, USB cams, CSI-to-UVC adapters on a Pi…). All feed the same `process_frame` orchestrator, and the TUI / Rerun visualizers work for any of them. EuRoC, MCAP, and OAK-D additionally support a **stereo mode** (see below) that yields metric depth; UVC is monocular only.
+`kornia_slam::SlamSystem` runtime to four interchangeable frame sources — offline EuRoC MAV image sequences, offline MCAP recordings (e.g. bubbaloop captures), a live OAK-D camera, and any UVC-class camera (laptop webcams, USB cams, CSI-to-UVC adapters on a Pi…). All feed the same `SlamSystem::process` loop, and the TUI / Rerun visualizers work for any of them. Sources supply calibrated, synchronized images and IMU samples (rectified for stereo); feature extraction, stereo matching and fisheye keypoint mapping happen in the library. EuRoC, MCAP, and OAK-D additionally support a **stereo mode** (see below) that yields metric depth; UVC is monocular only.
 
 ## Pipeline configuration
 
-What the pipeline runs is set by a RON file passed with `--config`: which sensors it uses, the ORB settings, keyframe policy, local-mapping execution and loop closing. Without `--config` it runs monocular ORB with loop closing disabled. [`configs/`](../../configs) has ready-made files:
+What the pipeline runs is set by a RON file passed with `--config`: which sensors it uses, the ORB settings, map initialization, tracking, keyframe policy, local-mapping execution and loop closing. Without `--config` it runs monocular ORB with loop closing disabled. [`configs/`](../../configs) has ready-made files:
 
 | File | Pipeline |
 | --- | --- |
-| `mono.ron` | Monocular; lists every setting with its default |
+| `mono.ron` | Monocular; lists every setting with its default, including the advanced initialization, tracking and loop-correction sections |
 | `mono-imu.ron` | Monocular + IMU |
 | `stereo.ron` | Rectified stereo |
 | `stereo-imu.ron` | Stereo + IMU |
