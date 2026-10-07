@@ -17,9 +17,9 @@
         // Synchronous runs local mapping before each frame returns, which
         // makes runs replay identically; Asynchronous uses a background worker.
         mapping: ( execution: Asynchronous ),
-        // Disabled | DetectOnly(vocabulary: "…") | DetectAndCorrect(vocabulary: "…").
-        // DetectAndCorrect needs stereo or IMU input. Relative vocabulary paths
-        // are resolved against this file's directory.
+        // Disabled | Enabled(vocabulary: "…"): detection with pose-graph
+        // correction; needs stereo or IMU input. Relative vocabulary paths are
+        // resolved against this file's directory.
         loop_closing: Disabled,
     )),
 )

@@ -12,13 +12,16 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 **Pipelines are defined by a configuration file.** The CLI's `--config` takes a
 versioned RON file that selects the sensors, ORB settings, keyframe policy,
-local-mapping execution and loop-closing branch; `configs/` has ready-made
+local-mapping execution and loop closing; `configs/` has ready-made
 files for each sensor combination and for Hilti. Invalid settings, and sensors
 the source cannot provide, are rejected before any data is read. The library
 gains `PipelineConfig` (in `kornia_slam::system`, re-exported at the root), with RON loading behind the optional `serde`
 feature. **Breaking (CLI):** `--n-keypoints`, `--local-mapping`, `--vocab`,
 `--apply-pgo` and the sources' `--stereo`/`--imu` switches are removed; for
 example `euroc --stereo --imu` becomes `--config configs/stereo-imu.ron euroc`.
+Loop closing is one setting, `Enabled(vocabulary: …)`, which always applies
+pose-graph correction to accepted loops and needs stereo or IMU input; there
+is no detection-only mode.
 
 **One configuration, one construction call, one processing call.**
 `SlamSystem::build(config, rig)` assembles the system from a `PipelineConfig`

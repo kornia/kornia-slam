@@ -144,9 +144,9 @@ fn build_restricts_the_rig_to_selected_sensors() {
 fn build_reports_a_missing_vocabulary() {
     let missing = PathBuf::from("/nonexistent/ORBvoc.bin");
     let detect = config(
-        CameraSelection::Mono,
+        CameraSelection::Stereo,
         false,
-        LoopClosingMode::DetectOnly {
+        LoopClosingMode::Enabled {
             vocabulary: missing.clone(),
         },
     );
@@ -159,28 +159,17 @@ fn build_reports_a_missing_vocabulary() {
 }
 
 #[test]
-fn loop_branches_construct_only_what_they_enable() {
+fn loop_closing_constructs_only_when_enabled() {
     let disabled = SlamSystem::build(mono(), stereo_imu_rig()).unwrap();
     assert!(!disabled.loop_closer.has_vocabulary());
     assert!(!disabled.loop_closer.corrects_loops());
 
     let vocabulary = saved_vocabulary("branches");
-    let detect = config(
-        CameraSelection::Stereo,
-        false,
-        LoopClosingMode::DetectOnly {
-            vocabulary: vocabulary.clone(),
-        },
-    );
-    let detect = SlamSystem::build(detect, stereo_imu_rig()).unwrap();
-    assert!(detect.loop_closer.has_vocabulary());
-    assert!(!detect.loop_closer.corrects_loops());
-
     let correct = |imu| {
         let config = config(
             CameraSelection::Stereo,
             imu,
-            LoopClosingMode::DetectAndCorrect {
+            LoopClosingMode::Enabled {
                 vocabulary: vocabulary.clone(),
             },
         );
@@ -188,6 +177,7 @@ fn loop_branches_construct_only_what_they_enable() {
     };
     let stereo = correct(false);
     assert!(stereo.loop_closer.has_vocabulary());
+    assert!(stereo.loop_closer.corrects_loops());
     assert_eq!(stereo.loop_closer.correction_requires_imu(), Some(false));
     assert_eq!(
         correct(true).loop_closer.correction_requires_imu(),

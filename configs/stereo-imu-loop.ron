@@ -5,6 +5,6 @@
     version: 1,
     sensors: ( cameras: Stereo, imu: true ),
     pipeline: OrbSlam((
-        loop_closing: DetectAndCorrect(vocabulary: "../weights/ORBvoc.txt"),
+        loop_closing: Enabled(vocabulary: "../weights/ORBvoc.txt"),
     )),
 )

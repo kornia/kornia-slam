@@ -25,8 +25,8 @@ fn with_loop_closing(mode: LoopClosingMode, sensors: SensorSelection) -> Pipelin
     config
 }
 
-fn detect_and_correct() -> LoopClosingMode {
-    LoopClosingMode::DetectAndCorrect {
+fn loop_closing() -> LoopClosingMode {
+    LoopClosingMode::Enabled {
         vocabulary: PathBuf::from("ORBvoc.txt"),
     }
 }
@@ -166,12 +166,9 @@ fn settings_are_range_checked() {
         Some("tuning.map_projection.local_projection.search_radius")
     );
 
-    // Loop-correction tuning only matters, and is only checked, with the
-    // correction branch.
-    let mut config = with_loop_closing(
-        detect_and_correct(),
-        sensors(CameraSelection::Stereo, false),
-    );
+    // Loop-correction tuning only matters, and is only checked, with loop
+    // closing enabled.
+    let mut config = with_loop_closing(loop_closing(), sensors(CameraSelection::Stereo, false));
     orb_mut(&mut config)
         .tuning
         .loop_correction
@@ -189,7 +186,7 @@ fn settings_are_range_checked() {
 #[test]
 fn vocabulary_path_must_not_be_empty() {
     let config = with_loop_closing(
-        LoopClosingMode::DetectOnly {
+        LoopClosingMode::Enabled {
             vocabulary: PathBuf::new(),
         },
         SensorSelection::default(),
@@ -198,36 +195,26 @@ fn vocabulary_path_must_not_be_empty() {
 }
 
 #[test]
-fn correction_requires_metric_input() {
-    let mono = with_loop_closing(detect_and_correct(), sensors(CameraSelection::Mono, false));
+fn loop_closing_requires_metric_input() {
+    let mono = with_loop_closing(loop_closing(), sensors(CameraSelection::Mono, false));
     assert_eq!(
         mono.validate(),
-        Err(ConfigError::CorrectionWithoutMetricScale)
+        Err(ConfigError::LoopClosingWithoutMetricScale)
     );
     for metric in [
         sensors(CameraSelection::Stereo, false),
         sensors(CameraSelection::Mono, true),
     ] {
-        assert_eq!(
-            with_loop_closing(detect_and_correct(), metric).validate(),
-            Ok(())
-        );
+        assert_eq!(with_loop_closing(loop_closing(), metric).validate(), Ok(()));
     }
-    let detect_only = LoopClosingMode::DetectOnly {
-        vocabulary: PathBuf::from("ORBvoc.txt"),
-    };
-    assert_eq!(
-        with_loop_closing(detect_only, sensors(CameraSelection::Mono, false)).validate(),
-        Ok(())
-    );
 }
 
 #[test]
 fn display_lists_sensors_and_branches() {
-    let detect_only = LoopClosingMode::DetectOnly {
-        vocabulary: PathBuf::from("ORBvoc.txt"),
+    let config = PipelineConfig {
+        sensors: sensors(CameraSelection::Stereo, false),
+        ..PipelineConfig::default()
     };
-    let config = with_loop_closing(detect_only, sensors(CameraSelection::Stereo, false));
     assert_eq!(
         config.to_string(),
         "OrbSlam pipeline (config version 1)
@@ -236,11 +223,10 @@ fn display_lists_sensors_and_branches() {
   tracking
   keyframes: every 3..=8 frames, ref ratio 0.6
   local mapping: asynchronous
-  place recognition: ORBvoc.txt
 "
     );
 
-    let mut config = with_loop_closing(detect_and_correct(), sensors(CameraSelection::Mono, true));
+    let mut config = with_loop_closing(loop_closing(), sensors(CameraSelection::Mono, true));
     orb_mut(&mut config).mapping.execution = LocalMappingMode::Synchronous;
     assert_eq!(
         config.to_string(),
@@ -250,8 +236,7 @@ fn display_lists_sensors_and_branches() {
   tracking
   keyframes: every 3..=8 frames, ref ratio 0.6
   local mapping: synchronous
-  place recognition: ORBvoc.txt
-  loop correction: verification and pose graph
+  loop closing: ORBvoc.txt, pose-graph correction
 "
     );
 }
@@ -408,20 +393,17 @@ mod runtime_settings {
     }
 
     #[test]
-    fn only_correction_branch_configures_pgo() {
-        let detect_only = LoopClosingMode::DetectOnly {
-            vocabulary: PathBuf::from("ORBvoc.txt"),
-        };
+    fn enabled_loop_closing_configures_pgo() {
         let stereo = sensors(CameraSelection::Stereo, false);
         let stereo_rig = stereo.select_rig(stereo_imu_rig()).unwrap();
         assert!(
-            with_loop_closing(detect_only, stereo)
+            with_loop_closing(LoopClosingMode::Disabled, stereo)
                 .settings(&stereo_rig)
                 .pgo
                 .is_none()
         );
 
-        let mut config = with_loop_closing(detect_and_correct(), stereo);
+        let mut config = with_loop_closing(loop_closing(), stereo);
         orb_mut(&mut config)
             .tuning
             .loop_correction
@@ -442,7 +424,7 @@ mod runtime_settings {
 
         let missing = PathBuf::from("/nonexistent/ORBvoc.txt");
         let config = with_loop_closing(
-            LoopClosingMode::DetectOnly {
+            LoopClosingMode::Enabled {
                 vocabulary: missing.clone(),
             },
             SensorSelection::default(),
@@ -540,9 +522,9 @@ mod ron_files {
             "(version: 1, pipeline: OrbSlam((frontend: Orb((n_levels: 8)))))",
             "(version: 1, pipeline: OrbSlam((keyframes: (gap: 3))))",
             "(version: 1, pipeline: OrbSlam((mapping: (window: 3))))",
-            "(version: 1, pipeline: OrbSlam((loop_closing: DetectOnly(vocabulary: \"v.txt\", pgo: true))))",
+            "(version: 1, pipeline: OrbSlam((loop_closing: Enabled(vocabulary: \"v.txt\", pgo: true))))",
             "(version: 1, pipeline: OrbSlam((initialization: ())))",
-            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((loop_closing: DetectAndCorrect(vocabulary: \"v.txt\", correction: ()))))",
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((loop_closing: Enabled(vocabulary: \"v.txt\", correction: ()))))",
         ] {
             assert!(matches!(parse(text), Err(LoadError::Parse(_))), "{text}");
         }
@@ -557,12 +539,12 @@ mod ron_files {
             LoadError::Invalid(ConfigError::KeypointsOutOfRange { value: 0, .. })
         ));
         let err = parse(
-            "(version: 1, pipeline: OrbSlam((loop_closing: DetectAndCorrect(vocabulary: \"v.txt\"))))",
+            "(version: 1, pipeline: OrbSlam((loop_closing: Enabled(vocabulary: \"v.txt\"))))",
         )
         .unwrap_err();
         assert!(matches!(
             err,
-            LoadError::Invalid(ConfigError::CorrectionWithoutMetricScale)
+            LoadError::Invalid(ConfigError::LoopClosingWithoutMetricScale)
         ));
     }
 
@@ -570,7 +552,7 @@ mod ron_files {
     fn vocabulary_resolves_against_base_dir() {
         let text = |path: &str| {
             format!(
-                "(version: 1, pipeline: OrbSlam((loop_closing: DetectOnly(vocabulary: {path:?}))))"
+                "(version: 1, sensors: (cameras: Stereo), pipeline: OrbSlam((loop_closing: Enabled(vocabulary: {path:?}))))"
             )
         };
         let base = Path::new("/configs");
@@ -593,7 +575,7 @@ mod ron_files {
         let path = dir.join("orb.ron");
         std::fs::write(
             &path,
-            "(version: 1, pipeline: OrbSlam((loop_closing: DetectOnly(vocabulary: \"ORBvoc.txt\"))))",
+            "(version: 1, sensors: (cameras: Stereo), pipeline: OrbSlam((loop_closing: Enabled(vocabulary: \"ORBvoc.txt\"))))",
         )
         .unwrap();
         let loaded = PipelineConfig::from_ron_file(&path);
@@ -615,7 +597,7 @@ mod ron_files {
     #[test]
     fn serialization_round_trips() {
         let mut config = with_loop_closing(
-            LoopClosingMode::DetectAndCorrect {
+            LoopClosingMode::Enabled {
                 vocabulary: PathBuf::from("/weights/ORBvoc.bin"),
             },
             sensors(CameraSelection::Stereo, true),

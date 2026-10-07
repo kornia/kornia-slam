@@ -162,7 +162,8 @@ pub struct MappingConfig {
     pub execution: LocalMappingMode,
 }
 
-/// Optional loop-closing branches.
+/// Loop closing: place recognition over every keyframe, and verification,
+/// fusion and pose-graph correction of accepted loops.
 ///
 /// `vocabulary` is a `.bin` from `convert_orbvoc` or a DBoW2 `ORBvoc.txt`,
 /// selected by extension. A relative path in a file is resolved against that
@@ -174,33 +175,28 @@ pub enum LoopClosingMode {
     /// No vocabulary is loaded and no recognition or correction work runs.
     #[default]
     Disabled,
-    /// Place recognition only; no correction path is constructed.
-    DetectOnly { vocabulary: PathBuf },
-    /// Recognition plus verification, fusion and pose-graph correction.
-    DetectAndCorrect { vocabulary: PathBuf },
+    /// Needs metric input: stereo cameras or the IMU. With a monocular IMU
+    /// pipeline, corrections wait for inertial initialization.
+    Enabled { vocabulary: PathBuf },
 }
 
 impl LoopClosingMode {
     pub fn vocabulary(&self) -> Option<&Path> {
         match self {
             Self::Disabled => None,
-            Self::DetectOnly { vocabulary } | Self::DetectAndCorrect { vocabulary } => {
-                Some(vocabulary)
-            }
+            Self::Enabled { vocabulary } => Some(vocabulary),
         }
     }
 
-    pub fn corrects(&self) -> bool {
-        matches!(self, Self::DetectAndCorrect { .. })
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled { .. })
     }
 
     #[cfg(feature = "serde")]
     pub(crate) fn vocabulary_mut(&mut self) -> Option<&mut PathBuf> {
         match self {
             Self::Disabled => None,
-            Self::DetectOnly { vocabulary } | Self::DetectAndCorrect { vocabulary } => {
-                Some(vocabulary)
-            }
+            Self::Enabled { vocabulary } => Some(vocabulary),
         }
     }
 }
@@ -213,7 +209,7 @@ pub struct OrbTuning {
     pub initialization: TwoViewInitConfig,
     pub map_projection: MapProjectionConfig,
     pub loss_recovery: TrackingLossRecoveryPolicy,
-    /// Used by the `DetectAndCorrect` branch.
+    /// Used when loop closing is enabled.
     pub loop_correction: LoopClosingConfig,
 }
 
@@ -252,10 +248,11 @@ impl fmt::Display for PipelineConfig {
         };
         writeln!(f, "  local mapping: {execution}")?;
         if let Some(vocabulary) = orb.loop_closing.vocabulary() {
-            writeln!(f, "  place recognition: {}", vocabulary.display())?;
-        }
-        if orb.loop_closing.corrects() {
-            writeln!(f, "  loop correction: verification and pose graph")?;
+            writeln!(
+                f,
+                "  loop closing: {}, pose-graph correction",
+                vocabulary.display()
+            )?;
         }
         Ok(())
     }

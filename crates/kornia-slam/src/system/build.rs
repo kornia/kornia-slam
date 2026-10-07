@@ -72,7 +72,7 @@ impl PipelineConfig {
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
             pgo: orb
                 .loop_closing
-                .corrects()
+                .is_enabled()
                 .then(|| tuning.loop_correction.clone()),
         }
     }
@@ -86,7 +86,7 @@ impl PipelineConfig {
         }
     }
 
-    /// Loads the vocabulary when a loop-closing branch is enabled; `None` when disabled.
+    /// Loads the vocabulary when loop closing is enabled; `None` when disabled.
     pub(crate) fn load_vocabulary(&self) -> Result<Option<Vocabulary>, VocabularyLoadError> {
         self.orb()
             .loop_closing

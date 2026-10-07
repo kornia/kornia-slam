@@ -36,8 +36,8 @@ pub enum ConfigError {
     },
     #[error("loop closing vocabulary path is empty")]
     EmptyVocabularyPath,
-    #[error("DetectAndCorrect needs metric input: enable stereo cameras or the IMU")]
-    CorrectionWithoutMetricScale,
+    #[error("loop closing needs metric input: enable stereo cameras or the IMU")]
+    LoopClosingWithoutMetricScale,
     #[error("configuration requests {0}, but the source does not provide it")]
     MissingSensor(&'static str),
     #[error("stereo cameras need rectified images; the source supplies raw fisheye images")]
@@ -66,14 +66,14 @@ impl OrbSlamPipeline {
         }
         validate_keyframes(&self.keyframes)?;
         validate_loop_closing(&self.loop_closing, sensors)?;
-        validate_tuning(&self.tuning, self.loop_closing.corrects())
+        validate_tuning(&self.tuning, self.loop_closing.is_enabled())
     }
 }
 
-fn validate_tuning(tuning: &OrbTuning, corrects: bool) -> Result<(), ConfigError> {
+fn validate_tuning(tuning: &OrbTuning, loop_closing: bool) -> Result<(), ConfigError> {
     validate_initialization(&tuning.initialization)?;
     validate_tracking(tuning)?;
-    if corrects {
+    if loop_closing {
         validate_correction(&tuning.loop_correction)?;
     }
     Ok(())
@@ -225,8 +225,8 @@ fn validate_loop_closing(
     // Correcting a visual-only monocular map would apply scale-ambiguous
     // corrections.
     let metric = sensors.cameras == CameraSelection::Stereo || sensors.imu;
-    if mode.corrects() && !metric {
-        return Err(ConfigError::CorrectionWithoutMetricScale);
+    if mode.is_enabled() && !metric {
+        return Err(ConfigError::LoopClosingWithoutMetricScale);
     }
     Ok(())
 }
