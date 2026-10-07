@@ -1,13 +1,17 @@
 use kornia_imgproc::features::OrbDetector;
 use kornia_sensors::SensorRig;
 
-use super::config::{
+use super::validation::ConfigError;
+use super::{
     CameraSelection, FrontendConfig, OrbSlamPipeline, PipelineConfig, PipelineDefinition,
     SensorSelection,
 };
-use super::validation::ConfigError;
+use crate::initialization::two_view::TwoViewInitConfig;
+use crate::loop_closure::LoopClosingConfig;
 use crate::loop_closure::place_recognition::{Vocabulary, VocabularyLoadError, load_vocabulary};
-use crate::system::SystemSettings;
+use crate::mapping::LocalMappingMode;
+use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
+use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
 /// A [`SlamSystem`](crate::SlamSystem) that cannot be built from its
 /// configuration and rig.
@@ -17,6 +21,22 @@ pub enum BuildError {
     Config(#[from] ConfigError),
     #[error(transparent)]
     Vocabulary(#[from] VocabularyLoadError),
+}
+
+/// Settings a [`SlamSystem`](crate::SlamSystem) is assembled from, resolved
+/// from a pipeline configuration against the selected rig.
+pub(crate) struct SystemSettings {
+    pub two_view_init: TwoViewInitConfig,
+    pub map_projection: MapProjectionConfig,
+    pub keyframe_policy: KeyframePolicy,
+    pub tracking_loss_recovery: TrackingLossRecoveryPolicy,
+    pub local_mapping: LocalMappingMode,
+    /// Near/far depth threshold `mThDepth` (metres). When `Some`, each new
+    /// keyframe back-projects its unassociated "close" (`z < threshold`) stereo
+    /// keypoints directly into metric map points.
+    pub stereo_close_depth_m: Option<f64>,
+    /// Verified loop closure and live pose-graph correction.
+    pub pgo: Option<LoopClosingConfig>,
 }
 
 impl SensorSelection {
@@ -40,16 +60,20 @@ impl PipelineConfig {
     pub(crate) fn settings(&self, rig: &SensorRig) -> SystemSettings {
         let orb = self.orb();
         let FrontendConfig::Orb(frontend) = orb.frontend;
+        let tuning = &orb.tuning;
         SystemSettings {
-            two_view_init: orb.initialization.clone(),
-            map_projection: orb.tracking.map_projection.clone(),
+            two_view_init: tuning.initialization.clone(),
+            map_projection: tuning.map_projection.clone(),
             keyframe_policy: orb.keyframes,
-            tracking_loss_recovery: orb.tracking.loss_recovery,
+            tracking_loss_recovery: tuning.loss_recovery,
             local_mapping: orb.mapping.execution,
             stereo_close_depth_m: rig
                 .stereo_baseline_m
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
-            pgo: orb.loop_closing.correction().cloned(),
+            pgo: orb
+                .loop_closing
+                .corrects()
+                .then(|| tuning.loop_correction.clone()),
         }
     }
 

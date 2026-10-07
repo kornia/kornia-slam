@@ -11,10 +11,7 @@ use crate::pose_conversion::{mat3_to_f64, vec3_to_f32, vec3_to_f64};
 
 /// Acceptance thresholds for geometric loop verification.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct LoopVerificationConfig {
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_remote::orb_match"))]
     pub orb_match: OrbMatchConfig,
     pub min_correspondences: usize,
     pub min_inliers: usize,
@@ -23,10 +20,6 @@ pub struct LoopVerificationConfig {
     pub coverage_rows: usize,
     pub coverage_cols: usize,
     pub min_occupied_cells: usize,
-    #[cfg_attr(
-        feature = "serde",
-        serde(with = "crate::serde_remote::loop_pnp_ransac")
-    )]
     pub pnp_ransac: RansacParams,
 }
 

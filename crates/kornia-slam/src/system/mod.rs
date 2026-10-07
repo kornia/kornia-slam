@@ -3,7 +3,6 @@
 //! The runtime flow is kept in one file so it can be read from top to bottom
 //! in the same order frames move through the system.
 
-mod config;
 mod frontend;
 mod inertial;
 mod input;
@@ -13,7 +12,6 @@ pub use frontend::FrontendObservation;
 pub use input::{ProcessError, SensorFrame};
 pub use state::{TrackingResult, TrackingStatus};
 
-pub(crate) use config::SystemSettings;
 use frontend::OrbFrontend;
 use inertial::{AppliedInitialization, InertialState, viba0_accel_bias_prior};
 use state::{SystemMode, SystemState};
@@ -37,7 +35,7 @@ use crate::loop_closure::{LoopCloser, LoopClosingContext, LoopClosureEvent};
 use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
 use crate::mapping::map::{Keyframe, Map, MapInsertion, MapMutationError, MapPoint};
 use crate::mapping::{KeyframeJob, LocalMapping};
-use crate::pipeline::{BuildError, PipelineConfig};
+use crate::pipeline::{BuildError, PipelineConfig, SystemSettings};
 use crate::pose_conversion::apply_reference_pose_correction;
 use kornia_3d::pose::Pose3d;
 use kornia_image::Image;

@@ -5,7 +5,6 @@ use kornia_algebra::Vec3F64;
 use kornia_image::ImageSize;
 
 use super::*;
-use crate::loop_closure::LoopClosingConfig;
 use crate::loop_closure::place_recognition::VocabularyLoadError;
 use crate::mapping::LocalMappingMode;
 use crate::pipeline::{
@@ -185,7 +184,6 @@ fn loop_branches_construct_only_what_they_enable() {
             imu,
             LoopClosingMode::DetectAndCorrect {
                 vocabulary: vocabulary.clone(),
-                correction: Box::new(LoopClosingConfig::default()),
             },
         );
         SlamSystem::build(config, stereo_imu_rig()).unwrap()

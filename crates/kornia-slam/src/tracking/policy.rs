@@ -67,8 +67,6 @@ impl KeyframePolicy {
 /// tracking resume early). A map that's too young, or an inertial state that
 /// hasn't settled yet, gets no grace at all.
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct TrackingLossRecoveryPolicy {
     /// Minimum keyframe count before any grace period is granted.
     pub min_keyframes_for_grace: usize,

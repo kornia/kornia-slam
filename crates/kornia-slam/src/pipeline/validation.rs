@@ -1,10 +1,10 @@
 use kornia_imgproc::features::OrbMatchConfig;
 use kornia_sensors::SensorRig;
 
-use super::config::{
+use super::{
     CameraSelection, FrontendConfig, LoopClosingMode, OrbFrontendConfig, OrbSlamPipeline,
-    PIPELINE_CONFIG_VERSION, PipelineConfig, PipelineDefinition, SensorSelection, StereoCloseDepth,
-    TrackingConfig,
+    OrbTuning, PIPELINE_CONFIG_VERSION, PipelineConfig, PipelineDefinition, SensorSelection,
+    StereoCloseDepth,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopClosingConfig;
@@ -64,11 +64,19 @@ impl OrbSlamPipeline {
         match &self.frontend {
             FrontendConfig::Orb(orb) => orb.validate()?,
         }
-        validate_initialization(&self.initialization)?;
-        validate_tracking(&self.tracking)?;
         validate_keyframes(&self.keyframes)?;
-        validate_loop_closing(&self.loop_closing, sensors)
+        validate_loop_closing(&self.loop_closing, sensors)?;
+        validate_tuning(&self.tuning, self.loop_closing.corrects())
     }
+}
+
+fn validate_tuning(tuning: &OrbTuning, corrects: bool) -> Result<(), ConfigError> {
+    validate_initialization(&tuning.initialization)?;
+    validate_tracking(tuning)?;
+    if corrects {
+        validate_correction(&tuning.loop_correction)?;
+    }
+    Ok(())
 }
 
 impl OrbFrontendConfig {
@@ -102,7 +110,7 @@ fn validate_keyframes(policy: &KeyframePolicy) -> Result<(), ConfigError> {
 }
 
 fn validate_initialization(config: &TwoViewInitConfig) -> Result<(), ConfigError> {
-    let section = "initialization";
+    let section = "tuning.initialization";
     validate_orb_match(section, "match_config", &config.match_config)?;
     let t = &config.triangulation_config;
     let at = |field| format!("{section}.triangulation_config.{field}");
@@ -120,10 +128,10 @@ fn validate_initialization(config: &TwoViewInitConfig) -> Result<(), ConfigError
     )
 }
 
-fn validate_tracking(config: &TrackingConfig) -> Result<(), ConfigError> {
-    let section = "tracking.map_projection";
+fn validate_tracking(tuning: &OrbTuning) -> Result<(), ConfigError> {
+    let section = "tuning.map_projection";
     let at = |field| format!("{section}.{field}");
-    let projection = &config.map_projection;
+    let projection = &tuning.map_projection;
     validate_orb_match(section, "match_config", &projection.match_config)?;
     let pnp = &projection.pnp;
     check(
@@ -159,8 +167,8 @@ fn validate_tracking(config: &TrackingConfig) -> Result<(), ConfigError> {
         POSITIVE,
     )?;
 
-    let recovery = &config.loss_recovery;
-    let at = |field| format!("tracking.loss_recovery.{field}");
+    let recovery = &tuning.loss_recovery;
+    let at = |field| format!("tuning.loss_recovery.{field}");
     check(
         at("timeout_imu_sec"),
         recovery.timeout_imu_sec,
@@ -214,20 +222,17 @@ fn validate_loop_closing(
     {
         return Err(ConfigError::EmptyVocabularyPath);
     }
-    let Some(correction) = mode.correction() else {
-        return Ok(());
-    };
     // Correcting a visual-only monocular map would apply scale-ambiguous
     // corrections.
     let metric = sensors.cameras == CameraSelection::Stereo || sensors.imu;
-    if !metric {
+    if mode.corrects() && !metric {
         return Err(ConfigError::CorrectionWithoutMetricScale);
     }
-    validate_correction(correction)
+    Ok(())
 }
 
 fn validate_correction(config: &LoopClosingConfig) -> Result<(), ConfigError> {
-    let section = "loop_closing.correction";
+    let section = "tuning.loop_correction";
     let at = |field| format!("{section}.{field}");
     let v = &config.verification;
     validate_orb_match(section, "verification.orb_match", &v.orb_match)?;

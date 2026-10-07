@@ -9,8 +9,6 @@ use super::VerifiedLoopEdge;
 
 /// Bounded landmark search performed after an accepted loop correction.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct LoopFusionConfig {
     pub min_covisibility_weight: usize,
     pub max_neighbors_per_side: usize,

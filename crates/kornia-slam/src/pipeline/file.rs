@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use super::config::{PIPELINE_CONFIG_VERSION, PipelineConfig, PipelineDefinition};
 use super::validation::ConfigError;
+use super::{PIPELINE_CONFIG_VERSION, PipelineConfig, PipelineDefinition};
 
 /// Failure to read, parse or serialize a RON pipeline configuration.
 #[derive(Debug, thiserror::Error)]

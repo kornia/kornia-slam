@@ -47,8 +47,6 @@ const OCTAVE_WINDOW_HALF_WIDTH: usize = 2;
 
 /// Tunable parameters for projection-guided matching.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct ProjectionMatchConfig {
     /// Reject projected points with depth `<= min_depth`.
     pub min_depth: f64,
@@ -70,21 +68,14 @@ impl Default for ProjectionMatchConfig {
 
 /// Map-projection tracking thresholds.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct MapProjectionConfig {
     /// ORB descriptor matcher settings for tracking against reference observations.
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_remote::orb_match"))]
     pub match_config: OrbMatchConfig,
     /// PnP pose-estimation thresholds.
     pub pnp: PnpConfig,
     /// Projection matching config for initial tracking.
     pub projection: ProjectionMatchConfig,
     /// Projection matching config for local-map refinement (wider search).
-    #[cfg_attr(
-        feature = "serde",
-        serde(with = "crate::serde_remote::local_projection")
-    )]
     pub local_projection: ProjectionMatchConfig,
     /// Growth in `search_scale` per second spent failing to track (see
     /// `search_scale_for`).

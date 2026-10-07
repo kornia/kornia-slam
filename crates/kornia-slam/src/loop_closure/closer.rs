@@ -25,8 +25,6 @@ use crate::pose_conversion::apply_reference_pose_correction;
 
 /// Verification, episode consistency, fusion and pose-graph settings of loop correction.
 #[derive(Debug, Clone, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct LoopClosingConfig {
     pub episode: LoopEpisodeConfig,
     pub fusion: LoopFusionConfig,

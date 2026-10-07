@@ -10,8 +10,6 @@ use crate::pose_conversion::{mat3_to_f32, mat3_to_f64, vec3_to_f32, vec3_to_f64}
 
 /// PnP pose-estimation thresholds.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct PnpConfig {
     /// Reprojection threshold (px) for filtering correspondences against the prior pose.
     pub prior_reproj_threshold_px: f64,
@@ -24,7 +22,6 @@ pub struct PnpConfig {
     /// Minimum inliers to accept a PnP solution.
     pub min_inliers: usize,
     /// M-estimator kernel applied per residual during LM refinement.
-    #[cfg_attr(feature = "serde", serde(with = "crate::serde_remote::robust_kernel"))]
     pub robust: RobustKernelKind,
     /// Squared robust-loss scale passed to the LM solver.
     pub robust_scale_sq: f32,

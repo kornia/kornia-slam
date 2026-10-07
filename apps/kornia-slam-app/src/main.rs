@@ -672,24 +672,4 @@ mod cli_tests {
             "configs/mono.ron no longer lists the defaults"
         );
     }
-
-    /// `stereo-imu-loop.ron` documents the loop-correction defaults.
-    #[test]
-    fn loop_config_lists_the_correction_defaults() {
-        let loop_config = shipped("stereo-imu-loop.ron");
-        let PipelineDefinition::OrbSlam(orb) = &loop_config.pipeline;
-        let mut expected = PipelineConfig {
-            sensors: loop_config.sensors,
-            ..PipelineConfig::default()
-        };
-        let PipelineDefinition::OrbSlam(expected_orb) = &mut expected.pipeline;
-        expected_orb.loop_closing = kornia_slam::pipeline::LoopClosingMode::DetectAndCorrect {
-            vocabulary: orb.loop_closing.vocabulary().unwrap().to_path_buf(),
-            correction: Box::default(),
-        };
-        assert_eq!(
-            loop_config.to_ron_string().unwrap(),
-            expected.to_ron_string().unwrap()
-        );
-    }
 }

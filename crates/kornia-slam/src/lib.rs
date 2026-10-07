@@ -34,8 +34,6 @@ pub mod loop_closure;
 pub mod mapping;
 pub mod pipeline;
 mod pose_conversion;
-#[cfg(feature = "serde")]
-mod serde_remote;
 pub mod stereo;
 pub mod system;
 pub mod tracking;

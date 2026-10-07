@@ -5,11 +5,11 @@ This package is the composition root for the `kornia-slam` executable. It wires 
 
 ## Pipeline configuration
 
-What the pipeline runs is set by a RON file passed with `--config`: which sensors it uses, the ORB settings, map initialization, tracking, keyframe policy, local-mapping execution and loop closing. Without `--config` it runs monocular ORB with loop closing disabled. [`configs/`](../../configs) has ready-made files:
+What the pipeline runs is set by a RON file passed with `--config`: which sensors it uses, the ORB settings, keyframe policy, local-mapping execution and loop closing. Lower-level algorithm thresholds are not part of the file; library users set them in Rust. Without `--config` it runs monocular ORB with loop closing disabled. [`configs/`](../../configs) has ready-made files:
 
 | File | Pipeline |
 | --- | --- |
-| `mono.ron` | Monocular; lists every setting with its default, including the advanced initialization, tracking and loop-correction sections |
+| `mono.ron` | Monocular; lists every setting with its default |
 | `mono-imu.ron` | Monocular + IMU |
 | `stereo.ron` | Rectified stereo |
 | `stereo-imu.ron` | Stereo + IMU |
