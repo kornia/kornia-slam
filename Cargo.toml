@@ -28,6 +28,19 @@ kornia-imgproc = "0.2.0"
 kornia-io = "0.2.0"
 kornia-tensor = "0.2.0"
 
+# TEMP: Use kornia-rs git with StereoMatcher until a 0.2.x release ships it.
+# TODO: switch back to crates.io 0.2.x once a release including
+# https://github.com/kornia/kornia-rs/commit/d0a6502ab673fbbac6a2edb70e68fcbbfed0f8c4
+# is published.
+[patch.crates-io]
+kornia-3d = { git = "https://github.com/kornia/kornia-rs.git", rev = "d0a6502ab673fbbac6a2edb70e68fcbbfed0f8c4" }
+kornia-algebra = { git = "https://github.com/kornia/kornia-rs.git", rev = "d0a6502ab673fbbac6a2edb70e68fcbbfed0f8c4" }
+kornia-bow = { git = "https://github.com/kornia/kornia-rs.git", rev = "d0a6502ab673fbbac6a2edb70e68fcbbfed0f8c4" }
+kornia-image = { git = "https://github.com/kornia/kornia-rs.git", rev = "d0a6502ab673fbbac6a2edb70e68fcbbfed0f8c4" }
+kornia-imgproc = { git = "https://github.com/kornia/kornia-rs.git", rev = "d0a6502ab673fbbac6a2edb70e68fcbbfed0f8c4" }
+kornia-io = { git = "https://github.com/kornia/kornia-rs.git", rev = "d0a6502ab673fbbac6a2edb70e68fcbbfed0f8c4" }
+kornia-tensor = { git = "https://github.com/kornia/kornia-rs.git", rev = "d0a6502ab673fbbac6a2edb70e68fcbbfed0f8c4" }
+
 # Release binaries only (binary_release.yml). Kept out of `release` so local
 # benchmark builds stay fast and comparable with earlier runs.
 [profile.dist]
