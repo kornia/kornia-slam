@@ -10,15 +10,22 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
-**Pipelines are defined by a configuration file.** The CLI's `--config` takes a
-versioned RON file that selects the sensors, ORB settings, keyframe policy,
-local-mapping execution and loop closing; `configs/` has ready-made
-files for each sensor combination and for Hilti. Invalid settings, and sensors
+**Runs are defined by a configuration file.** The CLI takes one RON run file,
+`kornia-slam --config run.ron`, naming the `source` (EuRoC, Hilti, MCAP, OAK-D
+or UVC, with its paths, frame range and calibration) and the `system`: the
+sensors, ORB settings, keyframe policy, local-mapping execution and loop
+closing. `configs/` has an example per source. Relative paths resolve against
+the run file. Invalid settings, and sensors
 the source cannot provide, are rejected before any data is read. The library
 gains `PipelineConfig` (in `kornia_slam::system`, re-exported at the root), with RON loading behind the optional `serde`
-feature. **Breaking (CLI):** `--n-keypoints`, `--local-mapping`, `--vocab`,
-`--apply-pgo` and the sources' `--stereo`/`--imu` switches are removed; for
-example `euroc --stereo --imu` becomes `--config configs/stereo-imu.ron euroc`.
+feature; the CLI's run files embed it as `system`. **Breaking (CLI):** the
+source subcommands (`euroc`, `hilti`, `mcap`, `oakd`, `uvc`) and their flags,
+and `--n-keypoints`, `--local-mapping`, `--vocab`, `--apply-pgo`, `--stereo`
+and `--imu`, are removed; `euroc --data D --stereo --imu` becomes a run file
+with `source: Euroc((data: "D"))` and
+`system: (version: 1, sensors: (cameras: Stereo, imu: true))`. `--evaluate` and
+`--eval-out` are now global options. `PipelineConfig::resolve_paths` and
+`PipelineConfig::check_version` let other file formats embed a configuration.
 Loop closing is one setting, `Enabled(vocabulary: …)`, which always applies
 pose-graph correction to accepted loops and needs stereo or IMU input; there
 is no detection-only mode.

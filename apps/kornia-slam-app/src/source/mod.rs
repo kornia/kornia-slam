@@ -16,7 +16,10 @@ use kornia_image::Image;
 use kornia_sensors::SensorRig;
 use kornia_sensors::imu::ImuMeasurement;
 
+use crate::config::SourceConfig;
 use crate::datasets::StereoRectifier;
+use crate::datasets::euroc::GroundTruthPose;
+use kornia_slam::{CameraSelection, SensorSelection};
 
 pub use euroc::EurocSource;
 pub use hilti::HiltiSource;
@@ -82,6 +85,125 @@ impl SourceError {
     {
         Self::Other(err.into())
     }
+}
+
+/// A source opened from its run configuration.
+pub struct OpenedSource {
+    pub source: Box<dyn FrameSource>,
+    /// Ground truth for evaluation, when the dataset has it.
+    pub ground_truth: Option<Vec<GroundTruthPose>>,
+    /// One line describing what will be read, for the startup log.
+    pub summary: Option<String>,
+}
+
+/// Opens the configured source in the mode the selected sensors need.
+pub fn open(
+    config: &SourceConfig,
+    sensors: SensorSelection,
+) -> Result<OpenedSource, Box<dyn std::error::Error>> {
+    let stereo = sensors.cameras == CameraSelection::Stereo;
+    let window = |total: usize, start: usize, n: Option<usize>| {
+        format!(
+            "Dataset: {total} frames (processing {start}..{})",
+            start + n.unwrap_or(0)
+        )
+    };
+    let opened = match config {
+        SourceConfig::Euroc(e) => {
+            let src = if stereo {
+                EurocSource::open_stereo(&e.data, e.start_frame, e.max_frames)?
+            } else {
+                EurocSource::open(&e.data, e.start_frame, e.max_frames)?
+            };
+            OpenedSource {
+                summary: Some(window(
+                    src.dataset_len(),
+                    e.start_frame,
+                    src.n_frames_hint(),
+                )),
+                ground_truth: Some(src.ground_truth_poses_cloned()),
+                source: Box::new(src),
+            }
+        }
+        SourceConfig::Hilti(h) => {
+            let src =
+                HiltiSource::open(&h.data, &h.calib, h.start_frame, h.max_frames, h.rotate_180)?;
+            OpenedSource {
+                summary: Some(window(
+                    src.dataset_len(),
+                    h.start_frame,
+                    src.n_frames_hint(),
+                )),
+                ground_truth: Some(src.ground_truth_poses_cloned()),
+                source: Box::new(src),
+            }
+        }
+        SourceConfig::Mcap(m) => {
+            let src = match (&m.calib, stereo) {
+                (Some(calib), true) => McapSource::open_stereo(
+                    &m.path,
+                    &m.channel,
+                    &m.right_channel,
+                    calib,
+                    m.start_frame,
+                    m.max_frames,
+                )?,
+                _ => McapSource::open(&m.path, &m.channel, m.start_frame, m.max_frames)?,
+            };
+            OpenedSource {
+                summary: src
+                    .n_frames_hint()
+                    .map(|n| format!("MCAP: {n} frames from /{}", m.channel)),
+                ground_truth: None,
+                source: Box::new(src),
+            }
+        }
+        #[cfg(feature = "oakd")]
+        SourceConfig::Oakd(o) => {
+            let src = match (&o.calib, stereo) {
+                (Some(calib), true) => OakdSource::open_stereo(o.fps, calib, o.max_frames)?,
+                _ => OakdSource::open(o.width, o.height, o.fps, o.max_frames)?,
+            };
+            OpenedSource {
+                summary: None,
+                ground_truth: None,
+                source: Box::new(src),
+            }
+        }
+        #[cfg(feature = "uvc")]
+        SourceConfig::Uvc(u) => {
+            let camera = kornia_3d::camera::PinholeCamera {
+                fx: u.fx,
+                fy: u.fy,
+                cx: u.cx,
+                cy: u.cy,
+                k1: u.k1,
+                k2: u.k2,
+                p1: u.p1,
+                p2: u.p2,
+            };
+            OpenedSource {
+                summary: None,
+                ground_truth: None,
+                source: Box::new(UvcSource::open(
+                    u.index,
+                    u.width,
+                    u.height,
+                    camera,
+                    u.max_frames,
+                )?),
+            }
+        }
+        #[cfg(not(feature = "oakd"))]
+        SourceConfig::Oakd(_) => {
+            return Err("this build has no OAK-D support; rebuild with `--features oakd`".into());
+        }
+        #[cfg(not(feature = "uvc"))]
+        SourceConfig::Uvc(_) => {
+            return Err("this build has no UVC support; rebuild with `--features uvc`".into());
+        }
+    };
+    Ok(opened)
 }
 
 /// Rectify a raw stereo pair into freshly allocated `(left, right)` images.

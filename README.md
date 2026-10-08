@@ -37,16 +37,19 @@ See [ROADMAP.md](ROADMAP.md) for what's next.
 ## Quick start
 
 Download a [EuRoC](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets)
-sequence (ASL format), then:
+sequence (ASL format) to `data/euroc/MH_01_easy`, or edit the `data` path in
+the run file, then:
 
 ```bash
 # monocular
-cargo run --release -p kornia-slam-app -- euroc --data /path/to/MH_01_easy
+cargo run --release -p kornia-slam-app -- --config configs/euroc.ron
 
-# stereo + IMU, with evaluation against ground truth
-cargo run --release -p kornia-slam-app -- --config configs/stereo-imu.ron \
-    euroc --data /path/to/MH_01_easy --evaluate
+# stereo + IMU with loop closing, with evaluation against ground truth
+cargo run --release -p kornia-slam-app -- --config configs/euroc-stereo-imu-loop.ron --evaluate
 ```
+
+A run file names the source and the system to run on it; see
+[apps/kornia-slam-app](apps/kornia-slam-app/README.md#run-files).
 
 More sources and options: [apps/kornia-slam-app](apps/kornia-slam-app/README.md).
 
@@ -60,7 +63,7 @@ synchronized, calibrated (and, for stereo, rectified) images.
 ```rust,ignore
 use kornia_slam::{PipelineConfig, SensorFrame, SlamSystem};
 
-let config = PipelineConfig::from_ron_file("configs/stereo-imu.ron")?; // `serde` feature
+let config = PipelineConfig::from_ron_file("stereo-imu.ron")?; // a system file; `serde` feature
 let mut system = SlamSystem::build(config, rig)?; // rig: kornia_slam::SensorRig
 for (idx, frame) in frames.enumerate() {
     let result = system.process(SensorFrame {

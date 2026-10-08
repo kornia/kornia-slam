@@ -191,12 +191,18 @@ impl LoopClosingMode {
     pub fn is_enabled(&self) -> bool {
         matches!(self, Self::Enabled { .. })
     }
+}
 
-    #[cfg(feature = "serde")]
-    pub(crate) fn vocabulary_mut(&mut self) -> Option<&mut PathBuf> {
-        match self {
-            Self::Disabled => None,
-            Self::Enabled { vocabulary } => Some(vocabulary),
+impl PipelineConfig {
+    /// Resolves relative resource paths, such as the vocabulary, against
+    /// `base_dir`, usually the directory of the file the configuration came
+    /// from. Absolute paths are kept.
+    pub fn resolve_paths(&mut self, base_dir: &Path) {
+        let PipelineDefinition::OrbSlam(orb) = &mut self.pipeline;
+        if let LoopClosingMode::Enabled { vocabulary } = &mut orb.loop_closing
+            && vocabulary.is_relative()
+        {
+            *vocabulary = base_dir.join(&*vocabulary);
         }
     }
 }

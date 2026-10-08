@@ -3,43 +3,51 @@
 This package is the composition root for the `kornia-slam` executable. It wires the
 `kornia_slam::SlamSystem` runtime to four interchangeable frame sources — offline EuRoC MAV image sequences, offline MCAP recordings (e.g. bubbaloop captures), a live OAK-D camera, and any UVC-class camera (laptop webcams, USB cams, CSI-to-UVC adapters on a Pi…). All feed the same `SlamSystem::process` loop, and the TUI / Rerun visualizers work for any of them. Sources supply calibrated, synchronized images and IMU samples (rectified for stereo); feature extraction, stereo matching and fisheye keypoint mapping happen in the library. EuRoC, MCAP, and OAK-D additionally support a **stereo mode** (see below) that yields metric depth; UVC is monocular only.
 
-## Pipeline configuration
+## Run files
 
-What the pipeline runs is set by a RON file passed with `--config`: which sensors it uses, the ORB settings, keyframe policy, local-mapping execution and loop closing. Lower-level algorithm thresholds are not part of the file; library users set them in Rust. Without `--config` it runs monocular ORB with loop closing disabled. [`configs/`](../../configs) has ready-made files:
+A run is described by one RON file passed with `--config`: the `source` to read and the `system` to run on it.
 
-| File | Pipeline |
+```ron
+(
+    source: Euroc((data: "../data/euroc/MH_01_easy", max_frames: 500)),
+    system: (version: 1, sensors: (cameras: Stereo, imu: true)),
+)
+```
+
+```bash
+cargo run --release -p kornia-slam-app -- --config run.ron
+```
+
+- **`source`** is one of `Euroc`, `Hilti`, `Mcap`, `Oakd` or `Uvc`, with the dataset path or device settings, frame range (`start_frame`, `max_frames`; 0 = all) and, where needed, a calibration file. Its options are documented in [`src/config.rs`](src/config.rs).
+- **`system`** selects the sensors, ORB settings, keyframe policy, local-mapping execution and loop closing. Omitted, the default monocular pipeline runs. Lower-level algorithm thresholds are not part of the file; library users set them in Rust.
+- Omitted fields keep their defaults. Unknown fields and invalid values are rejected before any data is read, and selecting a sensor the source cannot provide fails with an explicit error.
+- Relative paths (datasets, recordings, calibration, vocabulary) resolve against the run file's directory.
+- Loop closing needs an ORB vocabulary (DBoW2 `ORBvoc.txt`, or a `.bin` from `convert_orbvoc`) and stereo or IMU input.
+
+[`configs/`](../../configs) has one example per source; the data paths are placeholders:
+
+| File | Run |
 | --- | --- |
-| `mono.ron` | Monocular; lists every setting with its default |
-| `mono-imu.ron` | Monocular + IMU |
-| `stereo.ron` | Rectified stereo |
-| `stereo-imu.ron` | Stereo + IMU |
-| `stereo-imu-loop.ron` | Stereo + IMU with loop detection and pose-graph correction |
-| `hilti.ron` | Monocular with 3000 keypoints for the Hilti fisheye frames |
-
-Omitted fields keep their defaults, so a file only lists what it changes. Unknown fields and invalid values are rejected before any data is read, and a configuration that selects a sensor the source cannot provide fails with an explicit error. Loop closing needs an ORB vocabulary (DBoW2 `ORBvoc.txt`, or a `.bin` from `convert_orbvoc`); relative vocabulary paths resolve against the config file's directory.
+| `euroc.ron` | EuRoC, monocular; lists every system setting with its default |
+| `euroc-stereo-imu-loop.ron` | EuRoC, stereo + IMU with loop closing |
+| `hilti.ron` | Hilti fisheye sequence, 3000 keypoints |
+| `mcap-stereo.ron` | MCAP recording, rectified stereo |
+| `oakd-stereo.ron` | Live OAK-D stereo (`--features oakd`) |
+| `uvc.ron` | Live UVC camera (`--features uvc`) |
 
 Sensors each source can provide:
 
 | Source | Stereo | IMU |
 | --- | --- | --- |
-| `euroc` | yes | yes |
-| `mcap` | yes, with `--calib` | no |
-| `oakd` | yes, with `--calib` | no |
-| `hilti` | no | no |
-| `uvc` | no | no |
+| `Euroc` | yes | yes |
+| `Mcap` | yes, with `calib` | no |
+| `Oakd` | yes, with `calib` | no |
+| `Hilti` | no | no |
+| `Uvc` | no | no |
 
-## Frame sources
+`Oakd` requires `--features oakd` and `Uvc` requires `--features uvc`; a run file naming them in a build without the feature fails with a message saying which. The default build needs no extra system dependencies.
 
-Selectable via subcommand, after the global options (`--config`, visualizer flags):
-
-```text
-kornia-slam [--config FILE.ron] euroc --data /path/to/V1_01_easy [--start-frame N] [--max-frames N] [--evaluate] [--eval-out DIR]
-kornia-slam [--config FILE.ron] mcap  --path FILE.mcap [--channel mono_left] [--max-frames N] [--calib calib.yaml --right-channel mono_right]
-kornia-slam [--config FILE.ron] oakd  [--width 640 --height 400 --fps 30] [--max-frames N] [--calib calib.yaml]
-kornia-slam [--config FILE.ron] uvc   --fx F --fy F --cx C --cy C [--index 0] [--width 640 --height 480] [--max-frames N]
-```
-
-`oakd` requires `--features oakd`; `uvc` requires `--features uvc`. The default build needs no extra system dependencies.
+Command-line options are only about evaluation and display: `--evaluate` and `--eval-out DIR` (sources with ground truth: EuRoC, Hilti), and the visualizer flags below.
 
 ## EuRoC dataset
 
@@ -66,7 +74,7 @@ V1_01_easy/
 [Machine Hall sequences](https://www.research-collection.ethz.ch/entities/researchdata/bcaf173e-5dac-484b-bc37-faf97a594f1f) (MH_01–MH_05) are recommended for initial testing.
 
 ```bash
-cargo run --release -p kornia-slam-app -- euroc --data /path/to/MH_01_easy
+cargo run --release -p kornia-slam-app -- --config configs/euroc.ron
 ```
 
 ## OAK-D camera
@@ -96,13 +104,15 @@ at cargo invocation time when building with both `viz` and `oakd`.
 ```bash
 # Live, with Rerun visualization:
 RUSTFLAGS="-C link-arg=-Wl,--allow-multiple-definition" \
-  cargo run --release -p kornia-slam-app --features oakd -- --rerun-stream oakd
+  cargo run --release -p kornia-slam-app --features oakd -- \
+  --config configs/oakd-stereo.ron --rerun-stream
 
 # Live, TUI only (no Rerun, no lz4 clash):
-cargo run --release -p kornia-slam-app --no-default-features --features oakd -- oakd
+cargo run --release -p kornia-slam-app --no-default-features --features oakd -- \
+  --config configs/oakd-stereo.ron
 ```
 
-In **mono** mode intrinsics are placeholder (rough scale of the OAK-D Pro factory fx/fy at 1280×800); reading the on-device factory calibration is a TODO. In **stereo** mode (a stereo config plus `--calib …`) the intrinsics come from the calibration YAML and online rectification produces metric pairs — see [Stereo mode](#stereo-mode).
+In **mono** mode intrinsics are placeholder (rough scale of the OAK-D Pro factory fx/fy at 1280×800); reading the on-device factory calibration is a TODO. In **stereo** mode (stereo cameras plus `calib`) the intrinsics come from the calibration YAML and online rectification produces metric pairs — see [Stereo mode](#stereo-mode).
 
 ## Stereo mode
 
@@ -144,31 +154,28 @@ For an OAK-D this is the device's factory calibration (readable once via the dep
 ### Examples
 
 ```bash
-# EuRoC stereo (metric), first 500 frames, with evaluation CSVs:
-cargo run --release -p kornia-slam-app -- --config configs/stereo.ron \
-    euroc --data /path/to/MH_01_easy --max-frames 500 --evaluate
+# EuRoC stereo + IMU with loop closing, and evaluation CSVs:
+cargo run --release -p kornia-slam-app -- \
+    --config configs/euroc-stereo-imu-loop.ron --evaluate
 
 # Offline MCAP stereo (raw OAK-D recording + calibration):
-cargo run --release -p kornia-slam-app -- --config configs/stereo.ron \
-    mcap --path recording.mcap --calib calib.yaml \
-    --channel mono_left --right-channel mono_right
+cargo run --release -p kornia-slam-app -- --config configs/mcap-stereo.ron
 
 # Live OAK-D stereo (free the device first if a daemon holds it, e.g.
 # `bubbaloop node stop oak-camera`):
 cargo run --release -p kornia-slam-app --no-default-features --features oakd -- \
-    --config configs/stereo.ron oakd --calib calib.yaml --fps 30
+    --config configs/oakd-stereo.ron
 ```
 
-For the live OAK-D case, stereo uses the `width`/`height` from the YAML; `--width`/`--height` apply to mono only. CamB/CamC are hardware-synced, so consecutive items from each queue are paired directly.
+For the live OAK-D case, stereo uses the `width`/`height` from the YAML; the run file's `width`/`height` apply to mono only. CamB/CamC are hardware-synced, so consecutive items from each queue are paired directly.
 
 ## UVC camera
 
-Any UVC-class device works (built-in laptop webcam, USB camera, CSI-to-UVC adapter on a Raspberry Pi). Unlike EuRoC and OAK-D, there's no on-device calibration, so you must pass intrinsics on the command line — they have to match the resolution the device actually streams at (nokhwa picks the closest supported mode if the exact one is missing).
+Any UVC-class device works (built-in laptop webcam, USB camera, CSI-to-UVC adapter on a Raspberry Pi). Unlike EuRoC and OAK-D, there's no on-device calibration, so the run file gives the intrinsics (`fx`, `fy`, `cx`, `cy` and optional distortion) — they have to match the resolution the device actually streams at (nokhwa picks the closest supported mode if the exact one is missing).
 
 ```bash
-# /dev/video0 at 640x480, rough pinhole calibration:
-cargo run --release -p kornia-slam-app --features uvc -- \
-    uvc --index 0 --fx 600 --fy 600 --cx 320 --cy 240
+# /dev/video0 at 640x480, rough pinhole calibration (see configs/uvc.ron):
+cargo run --release -p kornia-slam-app --features uvc -- --config configs/uvc.ron
 ```
 
 ## Visualizers

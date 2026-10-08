@@ -47,14 +47,24 @@ pub enum ConfigError {
 impl PipelineConfig {
     /// Checks the definition on its own, before any source or resource is opened.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.version != PIPELINE_CONFIG_VERSION {
-            return Err(ConfigError::UnsupportedVersion {
-                found: self.version,
-                supported: PIPELINE_CONFIG_VERSION,
-            });
-        }
+        Self::check_version(self.version)?;
         match &self.pipeline {
             PipelineDefinition::OrbSlam(orb) => orb.validate(&self.sensors),
+        }
+    }
+}
+
+impl PipelineConfig {
+    /// Checks a schema version on its own, so a file written for another
+    /// version can be reported as such before its fields are parsed.
+    pub fn check_version(version: u32) -> Result<(), ConfigError> {
+        if version == PIPELINE_CONFIG_VERSION {
+            Ok(())
+        } else {
+            Err(ConfigError::UnsupportedVersion {
+                found: version,
+                supported: PIPELINE_CONFIG_VERSION,
+            })
         }
     }
 }

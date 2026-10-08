@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use super::config::{PIPELINE_CONFIG_VERSION, PipelineConfig, PipelineDefinition};
+use super::config::PipelineConfig;
 use super::validation::ConfigError;
 
 /// Failure to read, parse or serialize a RON pipeline configuration.
@@ -43,13 +43,7 @@ impl PipelineConfig {
     /// relative resource paths are resolved against `base_dir`.
     pub fn from_ron_str(text: &str, base_dir: &Path) -> Result<Self, LoadError> {
         let VersionProbe { version } = ron::from_str(text)?;
-        if version != PIPELINE_CONFIG_VERSION {
-            return Err(ConfigError::UnsupportedVersion {
-                found: version,
-                supported: PIPELINE_CONFIG_VERSION,
-            }
-            .into());
-        }
+        PipelineConfig::check_version(version)?;
         let mut config: Self = ron::from_str(text)?;
         config.validate()?;
         config.resolve_paths(base_dir);
@@ -62,14 +56,5 @@ impl PipelineConfig {
             self,
             ron::ser::PrettyConfig::default(),
         )?)
-    }
-
-    fn resolve_paths(&mut self, base_dir: &Path) {
-        let PipelineDefinition::OrbSlam(orb) = &mut self.pipeline;
-        if let Some(vocabulary) = orb.loop_closing.vocabulary_mut()
-            && vocabulary.is_relative()
-        {
-            *vocabulary = base_dir.join(&*vocabulary);
-        }
     }
 }

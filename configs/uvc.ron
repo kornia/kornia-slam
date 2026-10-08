@@ -1,0 +1,13 @@
+// Live UVC camera (webcam, USB camera); requires `--features uvc`. The
+// intrinsics must match the resolution the device actually streams at.
+(
+    source: Uvc((
+        index: 0,
+        width: 640,
+        height: 480,
+        fx: 600.0,
+        fy: 600.0,
+        cx: 320.0,
+        cy: 240.0,
+    )),
+)

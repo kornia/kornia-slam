@@ -1,8 +1,15 @@
-// Hilti-Trimble SLAM Challenge sequences: the 2 MP fisheye frames need about
-// 3000 keypoints to bootstrap.
+// Hilti-Trimble SLAM Challenge sequence, extracted to the EuRoC-style layout by
+// the challenge's ros2bag_to_euroc.py. Monocular on the raw fisheye cam0; the
+// 2 MP frames need about 3000 keypoints to bootstrap.
 (
-    version: 1,
-    pipeline: OrbSlam((
-        frontend: Orb(( n_keypoints: 3000 )),
+    source: Hilti((
+        data: "../data/hilti/floor_2",
+        calib: "../data/hilti/camera_calibration/kalibr_imucam_chain.yaml",
+        // Set false when the extraction already rotated the inverted images.
+        rotate_180: true,
     )),
+    system: (
+        version: 1,
+        pipeline: OrbSlam(( frontend: Orb(( n_keypoints: 3000 )) )),
+    ),
 )

@@ -35,6 +35,7 @@ depthai = { version = "0.1", optional = true }
 nokhwa = { version = "0.10", optional = true, default-features = false, features = ["input-native", "decoding"] }
 mcap = "0.21"
 ciborium = "0.2"
+ron = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "2"

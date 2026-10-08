@@ -1,5 +1,0 @@
-// Stereo visual-inertial.
-(
-    version: 1,
-    sensors: ( cameras: Stereo, imu: true ),
-)

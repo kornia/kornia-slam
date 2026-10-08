@@ -1,5 +1,0 @@
-// Rectified stereo: metric depth from the right image.
-(
-    version: 1,
-    sensors: ( cameras: Stereo, imu: false ),
-)

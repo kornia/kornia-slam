@@ -1,43 +1,25 @@
-//! `kornia-slam` command-line application: runs the SLAM runtime over a selectable frame source.
+//! `kornia-slam` command-line application: runs the SLAM runtime over the
+//! source a run file describes.
 //!
-//! Run on an offline EuRoC dataset:
 //! ```text
-//! cargo run --release -p kornia-slam-app -- euroc --data /path/to/V1_01_easy
+//! cargo run --release -p kornia-slam-app -- --config configs/euroc.ron
 //! ```
 //!
-//! Run on a bubbaloop MCAP recording (defaults to the mono_left channel):
-//! ```text
-//! cargo run --release -p kornia-slam-app -- mcap --path /path/to/recording.mcap
-//! ```
-//!
-//! Run live on an OAK-D camera (requires `--features oakd`):
-//! ```text
-//! cargo run --release -p kornia-slam-app --features oakd -- oakd
-//! ```
-//!
-//! Run live on a UVC camera (built-in webcam, USB cam, etc.; requires
-//! `--features uvc`):
-//! ```text
-//! cargo run --release -p kornia-slam-app --features uvc -- uvc \
-//!     --fx 600 --fy 600 --cx 320 --cy 240
-//! ```
+//! A run file names the source (EuRoC, Hilti, MCAP, or a live OAK-D or UVC
+//! camera) and the system to run on it; see `configs/` and [`config`].
 
+mod config;
 mod datasets;
 mod evaluation;
 mod source;
 mod tui;
 mod utils;
-use crate::datasets::euroc::GroundTruthPose;
+use config::RunConfig;
 use evaluation::associate_gt;
 use kornia_algebra::Vec3F64;
 use kornia_slam::system::PipelineDefinition;
-use kornia_slam::{CameraSelection, PipelineConfig};
 use kornia_slam::{LoopClosureEvent, SensorFrame, SlamSystem};
-#[cfg(feature = "oakd")]
-use source::OakdSource;
-#[cfg(feature = "uvc")]
-use source::UvcSource;
-use source::{EurocSource, FrameItem, FrameSource, HiltiSource, McapSource};
+use source::{FrameItem, OpenedSource};
 use std::time::{Duration, Instant};
 use utils::trajectory_point_from_pose;
 
@@ -47,10 +29,21 @@ use utils::{
 };
 /// CLI arguments.
 #[derive(argh::FromArgs)]
-#[argh(description = "Visual and visual-inertial ORB-SLAM over a selectable frame source")]
+#[argh(description = "Visual and visual-inertial ORB-SLAM over the source a run file describes")]
 struct Args {
-    #[argh(subcommand)]
-    source: SourceCmd,
+    /// run file (RON): the source to read and the system to run on it; see configs/
+    #[argh(option)]
+    config: String,
+
+    /// after the run, align the trajectory to ground truth and report
+    /// ATE/RPE/drift (writes kornia_slam_raw.csv and kornia_slam_aligned.csv);
+    /// needs a source with ground truth (EuRoC, Hilti)
+    #[argh(switch)]
+    evaluate: bool,
+
+    /// directory for the evaluation CSVs (created if missing; default: current dir)
+    #[argh(option, default = "String::from(\".\")")]
+    eval_out: String,
 
     /// spawn a Rerun viewer and stream to it (requires `--features viz`)
     #[argh(switch)]
@@ -65,208 +58,6 @@ struct Args {
     /// map-projection reject reasons, keyframe growth and fuse counters
     #[argh(switch)]
     debug: bool,
-
-    /// pipeline configuration (RON): sensors, ORB settings and loop closing.
-    /// Defaults to monocular ORB without loop closing; see configs/
-    #[argh(option)]
-    config: Option<String>,
-}
-
-#[derive(argh::FromArgs)]
-#[argh(subcommand)]
-enum SourceCmd {
-    Euroc(EurocCmd),
-    Hilti(HiltiCmd),
-    Mcap(McapCmd),
-    #[cfg(feature = "oakd")]
-    Oakd(OakdCmd),
-    #[cfg(feature = "uvc")]
-    Uvc(UvcCmd),
-}
-
-/// Run on an EuRoC MAV dataset.
-#[derive(argh::FromArgs)]
-#[argh(subcommand, name = "euroc")]
-struct EurocCmd {
-    /// path to EuRoC dataset root (e.g. V1_01_easy/)
-    #[argh(option)]
-    data: String,
-
-    /// maximum number of frames to process (0 = all)
-    #[argh(option, default = "0")]
-    max_frames: usize,
-
-    /// skip this many initial frames
-    #[argh(option, default = "0")]
-    start_frame: usize,
-
-    /// after the run, align the trajectory to ground truth and report
-    /// ATE/RPE/drift (writes kornia_slam_raw.csv and kornia_slam_aligned.csv)
-    #[argh(switch)]
-    evaluate: bool,
-
-    /// directory for the evaluation CSVs (created if missing; default: current dir)
-    #[argh(option, default = "String::from(\".\")")]
-    eval_out: String,
-}
-
-/// Run on a Hilti-Trimble SLAM Challenge 2026 sequence extracted to the
-/// EuRoC-style layout by the challenge `ros2bag_to_euroc.py` tool.
-///
-/// ORB runs on the raw fisheye `cam0` image; keypoints (not pixels) are
-/// undistorted into a virtual pinhole, preserving the full field of view. Images
-/// are rotated 180° by default (inverted sensor mount); pass `--no-rotate` if the
-/// extraction already rotated them. These 2 MP frames need about 3000 keypoints
-/// to bootstrap (`configs/hilti.ron`).
-#[derive(argh::FromArgs)]
-#[argh(subcommand, name = "hilti")]
-struct HiltiCmd {
-    /// path to the extracted sequence root (the dir containing cam0/, imu0/)
-    #[argh(option)]
-    data: String,
-
-    /// path to the Kalibr camera-IMU chain YAML
-    #[argh(option)]
-    calib: String,
-
-    /// maximum number of frames to process (0 = all)
-    #[argh(option, default = "0")]
-    max_frames: usize,
-
-    /// skip this many initial frames
-    #[argh(option, default = "0")]
-    start_frame: usize,
-
-    /// do not rotate frames 180° (use when the extraction already rotated them)
-    #[argh(switch)]
-    no_rotate: bool,
-
-    /// after the run, align the trajectory to ground truth and report
-    /// ATE/RPE/drift (writes kornia_slam_raw.csv and kornia_slam_aligned.csv)
-    #[argh(switch)]
-    evaluate: bool,
-
-    /// directory for the evaluation CSVs (created if missing; default: current dir)
-    #[argh(option, default = "String::from(\".\")")]
-    eval_out: String,
-}
-
-/// Run on a bubbaloop MCAP recording.
-///
-/// Defaults to the `mono_left` channel — 640×400 grayscale JPEGs, ready for
-/// the SLAM pipeline without color conversion. Pass `--channel mono_right`
-/// or `--channel compressed` to switch sources within the same file.
-#[derive(argh::FromArgs)]
-#[argh(subcommand, name = "mcap")]
-struct McapCmd {
-    /// path to an MCAP file recorded by the bubbaloop mcap-recorder
-    #[argh(option)]
-    path: String,
-
-    /// channel suffix to read (e.g. mono_left, mono_right, compressed).
-    /// In stereo mode this is the left channel.
-    #[argh(option, default = "String::from(\"mono_left\")")]
-    channel: String,
-
-    /// right stereo channel suffix (stereo mode)
-    #[argh(option, default = "String::from(\"mono_right\")")]
-    right_channel: String,
-
-    /// path to a stereo calibration YAML (required for stereo cameras)
-    #[argh(option)]
-    calib: Option<String>,
-
-    /// maximum number of frames to process (0 = all)
-    #[argh(option, default = "0")]
-    max_frames: usize,
-
-    /// skip this many initial frames
-    #[argh(option, default = "0")]
-    start_frame: usize,
-}
-
-/// Run live on an OAK-D camera (CamB mono, or CamB+CamC stereo).
-#[cfg(feature = "oakd")]
-#[derive(argh::FromArgs)]
-#[argh(subcommand, name = "oakd")]
-struct OakdCmd {
-    /// maximum number of frames to process (0 = run forever, Ctrl-C to stop)
-    #[argh(option, default = "0")]
-    max_frames: usize,
-
-    /// frame width in pixels (mono only; stereo uses the calibration's width)
-    #[argh(option, default = "640")]
-    width: u32,
-
-    /// frame height in pixels (mono only; stereo uses the calibration's height)
-    #[argh(option, default = "400")]
-    height: u32,
-
-    /// camera FPS
-    #[argh(option, default = "30.0")]
-    fps: f32,
-
-    /// path to a stereo calibration YAML (required for stereo cameras)
-    #[argh(option)]
-    calib: Option<String>,
-}
-
-/// Run live on a UVC camera (laptop webcam, USB cam, CSI-to-UVC adapter…),
-/// using V4L2 / AVFoundation / MSMF via nokhwa.
-///
-/// Intrinsics flags must match the resolution the device actually streams at
-/// — nokhwa may pick the closest supported mode if the exact one is missing.
-#[cfg(feature = "uvc")]
-#[derive(argh::FromArgs)]
-#[argh(subcommand, name = "uvc")]
-struct UvcCmd {
-    /// camera device index (0 = first camera)
-    #[argh(option, default = "0")]
-    index: u32,
-
-    /// frame width in pixels
-    #[argh(option, default = "640")]
-    width: u32,
-
-    /// frame height in pixels
-    #[argh(option, default = "480")]
-    height: u32,
-
-    /// maximum number of frames to process (0 = run forever, Ctrl-C to stop)
-    #[argh(option, default = "0")]
-    max_frames: usize,
-
-    /// focal length x (pixels)
-    #[argh(option)]
-    fx: f64,
-
-    /// focal length y (pixels)
-    #[argh(option)]
-    fy: f64,
-
-    /// principal point x (pixels)
-    #[argh(option)]
-    cx: f64,
-
-    /// principal point y (pixels)
-    #[argh(option)]
-    cy: f64,
-
-    /// radial distortion k1
-    #[argh(option, default = "0.0")]
-    k1: f64,
-
-    /// radial distortion k2
-    #[argh(option, default = "0.0")]
-    k2: f64,
-
-    /// tangential distortion p1
-    #[argh(option, default = "0.0")]
-    p1: f64,
-
-    /// tangential distortion p2
-    #[argh(option, default = "0.0")]
-    p2: f64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -278,125 +69,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "viz"))]
     let tui_active = !args.no_tui;
 
-    // ── Pipeline ───────────────────────────────────────────────────────────
-    let pipeline = match args.config.as_deref() {
-        Some(path) => PipelineConfig::from_ron_file(path).map_err(|e| format!("{path}: {e}"))?,
-        None => PipelineConfig::default(),
-    };
-    let stereo = pipeline.sensors.cameras == CameraSelection::Stereo;
+    // ── Run file ───────────────────────────────────────────────────────────
+    let run = RunConfig::from_ron_file(&args.config)?;
     if !tui_active {
-        eprint!("{pipeline}");
+        eprint!("{}", run.system);
     }
 
     // ── Source ─────────────────────────────────────────────────────────────
-    let mut evaluate = false;
-    let mut eval_out = String::from(".");
+    let OpenedSource {
+        mut source,
+        ground_truth,
+        summary,
+    } = source::open(&run.source, run.system.sensors)?;
+    if args.evaluate && ground_truth.is_none() {
+        return Err("--evaluate needs a source with ground truth (EuRoC or Hilti)".into());
+    }
+    if !tui_active && let Some(summary) = summary {
+        eprintln!("{summary}");
+    }
+    let (evaluate, eval_out) = (args.evaluate, args.eval_out.clone());
     let target_dt = Duration::from_secs_f64(1.0 / 30.0);
     let mut last_frame_walltime = Instant::now();
-    let (mut source, euroc_gt): (Box<dyn FrameSource>, Option<Vec<GroundTruthPose>>) = match args
-        .source
-    {
-        SourceCmd::Euroc(e) => {
-            evaluate = e.evaluate;
-            eval_out = e.eval_out.clone();
-            let src = if stereo {
-                EurocSource::open_stereo(&e.data, e.start_frame, e.max_frames)?
-            } else {
-                EurocSource::open(&e.data, e.start_frame, e.max_frames)?
-            };
-            if !tui_active {
-                let total = src.dataset_len();
-                let n = src.n_frames_hint().unwrap_or(0);
-                eprintln!(
-                    "Dataset: {total} frames (processing {}..{})",
-                    e.start_frame,
-                    e.start_frame + n,
-                );
-            }
-            // Clone the GT poses before the source is moved into the box.
-            let gt = src.ground_truth_poses_cloned();
-            (Box::new(src), Some(gt))
-        }
-        SourceCmd::Hilti(h) => {
-            evaluate = h.evaluate;
-            eval_out = h.eval_out.clone();
-            let src =
-                HiltiSource::open(&h.data, &h.calib, h.start_frame, h.max_frames, !h.no_rotate)?;
-            if !tui_active {
-                let total = src.dataset_len();
-                let n = src.n_frames_hint().unwrap_or(0);
-                eprintln!(
-                    "Dataset: {total} frames (processing {}..{})",
-                    h.start_frame,
-                    h.start_frame + n,
-                );
-            }
-            // Clone the GT poses before the source is moved into the box.
-            let gt = src.ground_truth_poses_cloned();
-            (Box::new(src), Some(gt))
-        }
-        SourceCmd::Mcap(m) => {
-            let path = std::path::Path::new(&m.path);
-            let src = if stereo {
-                let calib = m
-                    .calib
-                    .as_deref()
-                    .ok_or("mcap stereo cameras require --calib <stereo calibration YAML>")?;
-                McapSource::open_stereo(
-                    path,
-                    &m.channel,
-                    &m.right_channel,
-                    std::path::Path::new(calib),
-                    m.start_frame,
-                    m.max_frames,
-                )?
-            } else {
-                McapSource::open(path, &m.channel, m.start_frame, m.max_frames)?
-            };
-            if !tui_active && let Some(n) = src.n_frames_hint() {
-                eprintln!("MCAP: {n} frames from /{}", m.channel);
-            }
-            (Box::new(src), None)
-        }
-        #[cfg(feature = "oakd")]
-        SourceCmd::Oakd(o) => {
-            let src = if stereo {
-                let calib = o
-                    .calib
-                    .as_deref()
-                    .ok_or("oakd stereo cameras require --calib <stereo calibration YAML>")?;
-                OakdSource::open_stereo(o.fps, std::path::Path::new(calib), o.max_frames)?
-            } else {
-                OakdSource::open(o.width, o.height, o.fps, o.max_frames)?
-            };
-            (Box::new(src), None)
-        }
-        #[cfg(feature = "uvc")]
-        SourceCmd::Uvc(w) => {
-            let camera = kornia_3d::camera::PinholeCamera {
-                fx: w.fx,
-                fy: w.fy,
-                cx: w.cx,
-                cy: w.cy,
-                k1: w.k1,
-                k2: w.k2,
-                p1: w.p1,
-                p2: w.p2,
-            };
-            (
-                Box::new(UvcSource::open(
-                    w.index,
-                    w.width,
-                    w.height,
-                    camera,
-                    w.max_frames,
-                )?),
-                None,
-            )
-        }
-    };
 
     let n_frames_hint = source.n_frames_hint();
+    let pipeline = run.system;
     let mut system =
         SlamSystem::build(pipeline.clone(), source.rig()).map_err(|e| e.to_string())?;
     system.set_debug(args.debug);
@@ -526,7 +222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             est_positions.push(est_pos);
 
             // Associate nearest ground-truth pose by timestamp.
-            let gt_pos = euroc_gt
+            let gt_pos = ground_truth
                 .as_deref()
                 .and_then(|gt| associate_gt(timestamp_sec, gt))
                 .map(|gt| Vec3F64::new(gt.tx, gt.ty, gt.tz))
@@ -612,6 +308,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod cli_tests {
     use argh::FromArgs;
+    use kornia_slam::PipelineConfig;
 
     use super::*;
 
@@ -620,57 +317,60 @@ mod cli_tests {
     }
 
     #[test]
-    fn config_selects_the_pipeline() {
-        let args = parse(&["--config", "configs/stereo-imu.ron", "euroc", "--data", "d"]).unwrap();
-        assert_eq!(args.config.as_deref(), Some("configs/stereo-imu.ron"));
-        assert!(parse(&["euroc", "--data", "d"]).unwrap().config.is_none());
+    fn a_run_file_is_required() {
+        assert!(parse(&[]).is_err());
+        let args = parse(&["--config", "configs/euroc.ron"]).unwrap();
+        assert_eq!(args.config, "configs/euroc.ron");
+        assert!(!args.evaluate);
+        assert_eq!(args.eval_out, ".");
     }
 
     #[test]
-    fn algorithm_and_sensor_flags_are_rejected() {
+    fn evaluation_is_a_global_option() {
+        let args = parse(&["--config", "r.ron", "--evaluate", "--eval-out", "out"]).unwrap();
+        assert!(args.evaluate);
+        assert_eq!(args.eval_out, "out");
+    }
+
+    #[test]
+    fn source_subcommands_and_algorithm_flags_are_gone() {
         for removed in [
-            &["--n-keypoints", "3000", "euroc", "--data", "d"][..],
-            &["--local-mapping", "sync", "euroc", "--data", "d"],
-            &["--vocab", "ORBvoc.txt", "euroc", "--data", "d"],
-            &["--apply-pgo", "euroc", "--data", "d"],
-            &["euroc", "--data", "d", "--stereo"],
-            &["euroc", "--data", "d", "--imu"],
-            &["mcap", "--path", "r.mcap", "--stereo"],
+            &["--config", "r.ron", "euroc", "--data", "d"][..],
+            &["--config", "r.ron", "mcap", "--path", "r.mcap"],
+            &["--config", "r.ron", "--data", "d"],
+            &["--config", "r.ron", "--n-keypoints", "3000"],
+            &["--config", "r.ron", "--stereo"],
         ] {
             assert!(parse(removed).is_err(), "{removed:?}");
         }
     }
 
+    fn configs_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs")
+    }
+
     #[test]
-    fn shipped_configs_load() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    fn shipped_run_files_load() {
         let mut loaded = 0;
-        for entry in std::fs::read_dir(&dir).unwrap() {
+        for entry in std::fs::read_dir(configs_dir()).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|ext| ext == "ron") {
-                PipelineConfig::from_ron_file(&path)
+                RunConfig::from_ron_file(&path)
                     .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
                 loaded += 1;
             }
         }
-        assert!(loaded > 0, "no configs in {}", dir.display());
+        assert!(loaded > 0, "no run files in {}", configs_dir().display());
     }
 
-    fn shipped(name: &str) -> PipelineConfig {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../configs")
-            .join(name);
-        PipelineConfig::from_ron_file(&path).unwrap()
-    }
-
-    /// `mono.ron` documents every default, so it must stay equal to them.
+    /// `euroc.ron` documents every system default, so it must stay equal to them.
     #[test]
-    fn mono_config_lists_the_defaults() {
-        let defaults = PipelineConfig::default().to_ron_string().unwrap();
-        let mono = shipped("mono.ron").to_ron_string().unwrap();
+    fn euroc_run_file_lists_the_system_defaults() {
+        let run = RunConfig::from_ron_file(configs_dir().join("euroc.ron")).unwrap();
         assert_eq!(
-            mono, defaults,
-            "configs/mono.ron no longer lists the defaults"
+            run.system.to_ron_string().unwrap(),
+            PipelineConfig::default().to_ron_string().unwrap(),
+            "configs/euroc.ron no longer lists the system defaults"
         );
     }
 }
