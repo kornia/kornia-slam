@@ -6,6 +6,7 @@
 use crate::mapping::map::{
     BaSnapshot, BaUpdate, BaUpdateError, BaWindow, Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR,
 };
+use crate::mapping::wheel_odom::WheelOdomFactor;
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
 use kornia_3d::camera::PinholeCamera;
@@ -272,11 +273,16 @@ pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
 
 /// Solves the same local window with velocity, bias and active IMU edges.
 /// Repropagated preintegrations remain in the returned update even if solving fails.
+///
+/// `wheel_factors` index keyframes by `Frame::idx`, like the map's IMU
+/// factors; those with an endpoint outside the window, or with both endpoints
+/// fixed, are dropped.
 pub fn run_local_inertial_ba(
     snapshot: BaSnapshot,
     camera: &PinholeCamera,
     imu_t_bc: Option<Pose3d>,
     gravity_world: Vec3F64,
+    wheel_factors: &[WheelOdomFactor],
 ) -> BaUpdate {
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
@@ -387,6 +393,22 @@ pub fn run_local_inertial_ba(
         })
         .collect();
 
+    let wheel_edges: Vec<WheelOdomFactor> = wheel_factors
+        .iter()
+        .filter_map(|f| {
+            let from = *frame_idx_to_slot.get(&f.from_idx)?;
+            let to = *frame_idx_to_slot.get(&f.to_idx)?;
+            if from < active_start && to < active_start {
+                return None;
+            }
+            Some(WheelOdomFactor {
+                from_idx: from,
+                to_idx: to,
+                ..*f
+            })
+        })
+        .collect();
+
     // 15-DOF-per-keyframe state (pose+velocity+bias) with information
     // entries spanning many more orders of magnitude than the pure
     // visual 6-DOF problem (see the Marquardt-damping note in
@@ -400,6 +422,7 @@ pub fn run_local_inertial_ba(
         &window.positions,
         &observations,
         &imu_edges,
+        &wheel_edges,
         camera,
         &ViBaParams {
             imu_t_bc,

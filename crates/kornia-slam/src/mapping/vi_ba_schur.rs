@@ -35,15 +35,17 @@
 //!   * Point parameters are the 3-dim world coordinates.
 //!   * z is clamped to `MIN_Z` to handle mid-iteration cheirality flips.
 //!
-//! Supports Huber-robustified reprojection, stereo depth and IMU residuals,
-//! an accel-bias prior, fixed keyframes and fixed points. A damped step is
-//! kept only if it lowers the cost; otherwise λ grows and the step is retried.
+//! Supports Huber-robustified reprojection, stereo depth, IMU and wheel
+//! odometry residuals, an accel-bias prior, fixed keyframes and fixed points.
+//! A damped step is kept only if it lowers the cost; otherwise λ grows and the
+//! step is retried.
 
 use faer::Mat;
 use faer::prelude::Solve;
 use kornia_algebra::{Mat3F64, SE3F32, SO3F64, Vec3F64};
 use thiserror::Error;
 
+use crate::mapping::wheel_odom::{self, Mat6, WheelOdomFactor};
 use crate::pose_conversion::{pose_to_se3, se3_to_pose, vec3_to_f32};
 
 use kornia_3d::ba::{BaError, BaObservation};
@@ -63,6 +65,10 @@ pub enum ViBaError {
     NoFreeVariables,
     #[error("IMU edge keyframe indices out of range: {0} → {1}")]
     ImuFactorOutOfRange(usize, usize),
+    #[error("Wheel odometry edge keyframe indices out of range: {0} → {1}")]
+    WheelFactorOutOfRange(usize, usize),
+    #[error("Wheel odometry edge {0} has a non-invertible covariance")]
+    InvalidWheelCovariance(usize),
     #[error(transparent)]
     Ba(#[from] BaError),
 }
@@ -722,11 +728,113 @@ fn mat3_scalar_f64(m: &Mat3F64, s: f64) -> Mat3F64 {
     Mat3F64(m.mul_scalar(s))
 }
 
+/// Validates the wheel edges and returns each one's information matrix.
+fn wheel_information(edges: &[WheelOdomFactor], n_kf: usize) -> Result<Vec<Mat6>, ViBaError> {
+    edges
+        .iter()
+        .enumerate()
+        .map(|(k, edge)| {
+            if edge.from_idx >= n_kf || edge.to_idx >= n_kf {
+                return Err(ViBaError::WheelFactorOutOfRange(edge.from_idx, edge.to_idx));
+            }
+            edge.measurement
+                .information()
+                .ok_or(ViBaError::InvalidWheelCovariance(k))
+        })
+        .collect()
+}
+
+/// Wheel edges touch only the pose DOF (0..6) of each 15-DOF slot. With
+/// `J_j = −J_i` every block is `±JᵀΩJ` and the gradients are `∓JᵀΩr`.
+/// Returns the robustified cost.
+fn accumulate_wheel_edges(
+    m_mat: &mut Mat<f64>,
+    m_vec: &mut [f64],
+    kfs: &[ViBaKeyframe],
+    kf_local: &[i64],
+    edges: &[WheelOdomFactor],
+    infos: &[Mat6],
+) -> f64 {
+    const KF_DOF: usize = 15;
+    let mut cost = 0.0;
+    for (edge, info) in edges.iter().zip(infos) {
+        let (li, lj) = (kf_local[edge.from_idx], kf_local[edge.to_idx]);
+        if li < 0 && lj < 0 {
+            continue;
+        }
+        let (r, j) = wheel_odom::residual_and_jacobian(
+            &kfs[edge.from_idx].pose,
+            &kfs[edge.to_idx].pose,
+            edge,
+        );
+        let (w, c) = wheel_odom::robust_weight_and_cost(&r, info, edge.huber_chi2);
+        cost += c;
+
+        // JᵀΩ, with the robust weight folded in.
+        let mut jt_omega = [[0.0f64; 6]; 6];
+        for (a, row) in jt_omega.iter_mut().enumerate() {
+            for (b, x) in row.iter_mut().enumerate() {
+                *x = w * (0..6).map(|k| j[k][a] * info[k][b]).sum::<f64>();
+            }
+        }
+        let h: Mat6 = std::array::from_fn(|a| {
+            std::array::from_fn(|b| (0..6).map(|k| jt_omega[a][k] * j[k][b]).sum())
+        });
+        let g: [f64; 6] = std::array::from_fn(|a| (0..6).map(|k| jt_omega[a][k] * r[k]).sum());
+
+        let slots = [(li, 1.0), (lj, -1.0)];
+        for &(l_row, s_row) in &slots {
+            if l_row < 0 {
+                continue;
+            }
+            let row0 = l_row as usize * KF_DOF;
+            for a in 0..6 {
+                m_vec[row0 + a] -= s_row * g[a];
+            }
+            for &(l_col, s_col) in &slots {
+                if l_col < 0 {
+                    continue;
+                }
+                let col0 = l_col as usize * KF_DOF;
+                for a in 0..6 {
+                    for b in 0..6 {
+                        m_mat[(row0 + a, col0 + b)] += s_row * s_col * h[a][b];
+                    }
+                }
+            }
+        }
+    }
+    cost
+}
+
+/// Robustified wheel cost at a trial state, matching [`accumulate_wheel_edges`].
+fn wheel_cost(
+    kfs: &[ViBaKeyframe],
+    kf_local: &[i64],
+    edges: &[WheelOdomFactor],
+    infos: &[Mat6],
+) -> f64 {
+    edges
+        .iter()
+        .zip(infos)
+        .filter(|(edge, _)| kf_local[edge.from_idx] >= 0 || kf_local[edge.to_idx] >= 0)
+        .map(|(edge, info)| {
+            let (r, _) = wheel_odom::residual_and_jacobian(
+                &kfs[edge.from_idx].pose,
+                &kfs[edge.to_idx].pose,
+                edge,
+            );
+            wheel_odom::robust_weight_and_cost(&r, info, edge.huber_chi2).1
+        })
+        .sum()
+}
+
 /// Visual-inertial bundle adjustment via dense Schur-complement reduction.
 ///
 /// Jointly optimises keyframe poses, velocities, and IMU biases (15 DOF each)
-/// together with 3D landmark positions, connected by both reprojection factors
-/// and IMU preintegration factors.
+/// together with 3D landmark positions, connected by reprojection factors,
+/// IMU preintegration factors and optional wheel-odometry factors (pass `&[]`
+/// for none).
 ///
 /// The Schur trick marginalises points exactly as in pure BA. After point
 /// elimination, IMU edge normal equations are added directly to the reduced
@@ -741,6 +849,7 @@ pub fn visual_inertial_bundle_adjust(
     points: &[Vec3F64],
     observations: &[BaObservation],
     imu_edges: &[ImuFactor],
+    wheel_edges: &[WheelOdomFactor],
     camera: &PinholeCamera,
     params: &ViBaParams,
 ) -> Result<ViBaResult, ViBaError> {
@@ -751,7 +860,7 @@ pub fn visual_inertial_bundle_adjust(
 
     // ── Index maps: free keyframes and free points ────────────────────────
     // A keyframe is free if it is not marked fixed AND appears in at least
-    // one observation or IMU edge (otherwise it has no gradient, and we
+    // one observation, IMU or wheel edge (otherwise it has no gradient, and we
     // skip it to avoid rank deficiency).
 
     let mut kf_touched = vec![false; n_kf];
@@ -767,6 +876,13 @@ pub fn visual_inertial_bundle_adjust(
         }
         if edge.to_idx < n_kf {
             kf_touched[edge.to_idx] = true;
+        }
+    }
+    for edge in wheel_edges {
+        for idx in [edge.from_idx, edge.to_idx] {
+            if idx < n_kf {
+                kf_touched[idx] = true;
+            }
         }
     }
 
@@ -797,6 +913,7 @@ pub fn visual_inertial_bundle_adjust(
     let n_free_kf = kf_local.iter().filter(|&&x| x >= 0).count();
     let n_free_pts = point_local.iter().filter(|&&x| x >= 0).count();
 
+    let wheel_info = wheel_information(wheel_edges, n_kf)?;
     if n_free_kf == 0 {
         return Err(ViBaError::NoFreeVariables);
     }
@@ -1157,7 +1274,16 @@ pub fn visual_inertial_bundle_adjust(
             }
         }
 
-        let cost = (cost_vis + cost_imu + cost_bias_prior) as f32;
+        let cost_wheel = accumulate_wheel_edges(
+            &mut m_mat,
+            &mut m_vec,
+            &kfs,
+            &kf_local,
+            wheel_edges,
+            &wheel_info,
+        );
+
+        let cost = (cost_vis + cost_imu + cost_bias_prior + cost_wheel) as f32;
 
         // ── 4. LM damping on full 15P system, then Cholesky ──────────────
         // Damping goes on AFTER IMU terms so every diagonal entry sees it.
@@ -1363,7 +1489,8 @@ pub fn visual_inertial_bundle_adjust(
                 new_cost_bias_prior += 0.5 * w * (ba.x * ba.x + ba.y * ba.y + ba.z * ba.z);
             }
         }
-        let new_cost = (new_cost_vis + new_cost_imu + new_cost_bias_prior) as f32;
+        let new_cost_wheel = wheel_cost(&kfs_trial, &kf_local, wheel_edges, &wheel_info);
+        let new_cost = (new_cost_vis + new_cost_imu + new_cost_bias_prior + new_cost_wheel) as f32;
 
         // ── 8. LM accept / reject ─────────────────────────────────────────
         if new_cost < cost {
@@ -1460,3 +1587,7 @@ mod tests {
         assert_eq!(visual_huber_weight(100.0, 25.0), 0.5);
     }
 }
+
+#[cfg(test)]
+#[path = "vi_ba_wheel_tests.rs"]
+mod wheel_tests;

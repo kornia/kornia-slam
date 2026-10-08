@@ -70,6 +70,18 @@ cost, and the stall it caused tracking, grew with the map. It now captures only
 the local window. **Breaking:** `Map::ba_snapshot` takes a `BaWindow`; use
 `mapping::bundle_adjustment::local_window` for the standard selection.
 
+**Wheel odometry in visual-inertial BA.** A ground robot can now constrain
+local VI-BA with the planar base motion its wheels measure between keyframes.
+`mapping::wheel_odom::WheelOdomFactor` carries the `(dx, dy, dθ)` delta and its
+covariance, holds z, roll and pitch stiff, takes the base-to-camera extrinsic
+at each end (a moving head makes it time-varying), and has an optional Huber
+kernel. Its Jacobians are analytic. With no factors the solve is unchanged,
+bit for bit. **Breaking:** `run_local_inertial_ba` takes a `wheel_factors`
+slice (indexed by `Frame::idx`) and `visual_inertial_bundle_adjust` a
+`wheel_edges` slice (indexed by keyframe slot); pass `&[]` to keep the old
+behaviour. `ViBaError` gains two variants. The workspace version moves to
+0.2.0.
+
 ## [0.1.0] — 2026-09-27
 
 First public release. The API will change between minor versions through the 0.x

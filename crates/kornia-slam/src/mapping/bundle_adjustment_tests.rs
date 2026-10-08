@@ -173,7 +173,7 @@ fn local_window_solves_match_a_full_map_capture() {
         )),
         merged(run_local_ba(map.full_ba_snapshot(), &camera())),
     );
-    let inertial = |snapshot| run_local_inertial_ba(snapshot, &camera(), None, Vec3F64::ZERO);
+    let inertial = |snapshot| run_local_inertial_ba(snapshot, &camera(), None, Vec3F64::ZERO, &[]);
     assert_eq!(
         merged(inertial(map.ba_snapshot(&local_window(&map)))),
         merged(inertial(map.full_ba_snapshot())),
@@ -225,6 +225,7 @@ fn skipped_visual_and_inertial_solves_leave_the_map_unchanged() {
         &camera(),
         None,
         Vec3F64::ZERO,
+        &[],
     );
     assert_eq!(map.apply_ba_update(inertial).unwrap().map_points_updated, 0);
     assert_eq!(map.state_fingerprint_for_test(), before);
@@ -305,6 +306,7 @@ fn inertial_ba_repropagates_active_edges_and_preserves_new_live_edges() {
         &camera(),
         None,
         Vec3F64::ZERO,
+        &[],
     );
     assert_eq!(map.state_fingerprint_for_test(), before);
     // A boundary edge has one fixed endpoint and must still be repropagated.
@@ -341,6 +343,7 @@ fn failed_inertial_solve_still_returns_repropagated_measurements() {
         &invalid_camera,
         None,
         Vec3F64::ZERO,
+        &[],
     );
     assert_eq!(update.imu_preintegrations[0].bias.accel.x, 0.05);
     let result = map.apply_ba_update(update).unwrap();
@@ -377,4 +380,56 @@ fn stereo_depth_obs_uses_proportional_sigma_with_floor() {
     let kf_near = Keyframe::from_frame(near);
     let (_, s2) = stereo_depth_obs(&kf_near, 0);
     assert!((s2 - STEREO_DEPTH_MIN_SIGMA).abs() < 1e-9);
+}
+
+#[test]
+fn inertial_ba_maps_wheel_factors_by_frame_id_and_drops_inactive_ones() {
+    use crate::mapping::wheel_odom::{self, WheelOdomFactor, WheelOdomMeasurement};
+    let map = fixture();
+    let solve = |wheel: &[WheelOdomFactor]| {
+        let update = run_local_inertial_ba(
+            map.ba_snapshot(&local_window(&map)),
+            &camera(),
+            None,
+            Vec3F64::ZERO,
+            wheel,
+        );
+        let mut map = map.clone();
+        map.apply_ba_update(update).unwrap();
+        map
+    };
+    let pose = |map: &Map, id| map.get_keyframe(id).unwrap().frame.pose_world_to_cam;
+    // Identity extrinsic: the camera is the base. The fixture moves 0.2 m
+    // per keyframe along camera -x; the wheels claim 0.1 m more.
+    let factor = |from_idx, to_idx| WheelOdomFactor {
+        from_idx,
+        to_idx,
+        measurement: WheelOdomMeasurement::new(
+            [-0.3, 0.0, 0.0],
+            [[1e-4, 0.0, 0.0], [0.0, 1e-4, 0.0], [0.0, 0.0, 1e-4]],
+        ),
+        t_cb_from: Pose3d::IDENTITY,
+        t_cb_to: Pose3d::IDENTITY,
+        huber_chi2: None,
+    };
+    let baseline = solve(&[]).state_fingerprint_for_test();
+    assert_eq!(
+        solve(&[factor(999, KF_IDS[4]), factor(KF_IDS[0], KF_IDS[1])]).state_fingerprint_for_test(),
+        baseline
+    );
+
+    let edge = factor(KF_IDS[3], KF_IDS[4]);
+    let residual = |map: &Map| {
+        let (r, _) =
+            wheel_odom::residual_and_jacobian(&pose(map, KF_IDS[3]), &pose(map, KF_IDS[4]), &edge);
+        r.iter().map(|x| x * x).sum::<f64>().sqrt()
+    };
+    let fused = solve(&[edge]);
+    let visual = solve(&[]);
+    assert!(
+        residual(&fused) < 0.5 * residual(&visual),
+        "{} vs {}",
+        residual(&fused),
+        residual(&visual)
+    );
 }

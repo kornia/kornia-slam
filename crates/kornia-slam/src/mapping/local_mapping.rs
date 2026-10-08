@@ -49,6 +49,7 @@ fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJo
             camera,
             job.imu_t_bc,
             job.gravity_world,
+            &[],
         )
     } else {
         super::bundle_adjustment::run_local_ba(snapshot, camera)
