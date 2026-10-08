@@ -67,7 +67,7 @@ pub enum ViBaError {
     ImuFactorOutOfRange(usize, usize),
     #[error("Wheel odometry edge keyframe indices out of range: {0} → {1}")]
     WheelFactorOutOfRange(usize, usize),
-    #[error("Wheel odometry edge {0} has a non-invertible covariance")]
+    #[error("Wheel odometry edge {0} covariance is not positive definite")]
     InvalidWheelCovariance(usize),
     #[error(transparent)]
     Ba(#[from] BaError),

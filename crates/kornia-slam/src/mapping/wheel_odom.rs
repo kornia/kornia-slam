@@ -71,12 +71,26 @@ impl WheelOdomMeasurement {
 
     /// Information over the residual tangent `[x, y, z, roll, pitch, yaw]`.
     ///
-    /// `None` if the covariance is not invertible or a sigma is not positive.
+    /// `None` if the covariance is not symmetric positive definite or a sigma
+    /// is not positive.
     pub fn information(&self) -> Option<Mat6> {
         if !(self.z_sigma > 0.0 && self.tilt_sigma > 0.0) {
             return None;
         }
         let c = &self.covariance;
+        // det > 0 alone passes diag(-a, -a, a), whose negative information
+        // makes LM grow the residual. Sylvester needs symmetry, so check it.
+        for i in 0..3 {
+            for j in (i + 1)..3 {
+                let tol = 1e-9 * (c[i][i] * c[j][j]).abs().sqrt();
+                if (c[i][j] - c[j][i]).abs() > tol {
+                    return None;
+                }
+            }
+        }
+        if !(c[0][0] > 0.0 && c[0][0] * c[1][1] - c[0][1] * c[1][0] > 0.0) {
+            return None;
+        }
         let cov = Mat3F64::from_cols_array(&[
             c[0][0], c[1][0], c[2][0], c[0][1], c[1][1], c[2][1], c[0][2], c[1][2], c[2][2],
         ]);
@@ -404,6 +418,14 @@ mod tests {
         m.covariance[2][2] = 0.0;
         assert!(m.information().is_none());
         m.covariance[2][2] = 1e-2;
+        // Indefinite with a positive determinant.
+        let good = m.covariance;
+        m.covariance = [[-1e-4, 0.0, 0.0], [0.0, -1e-4, 0.0], [0.0, 0.0, 1e-4]];
+        assert!(m.information().is_none());
+        m.covariance = good;
+        m.covariance[0][1] = 2e-4;
+        assert!(m.information().is_none());
+        m.covariance = good;
         m.tilt_sigma = 0.0;
         assert!(m.information().is_none());
     }
