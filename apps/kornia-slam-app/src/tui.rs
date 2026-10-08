@@ -224,8 +224,8 @@ fn getrusage_total_us() -> i64 {
     unsafe {
         let mut ru: libc::rusage = std::mem::zeroed();
         if libc::getrusage(libc::RUSAGE_SELF, &mut ru) == 0 {
-            let u = ru.ru_utime.tv_sec as i64 * 1_000_000 + ru.ru_utime.tv_usec as i64;
-            let s = ru.ru_stime.tv_sec as i64 * 1_000_000 + ru.ru_stime.tv_usec as i64;
+            let u = ru.ru_utime.tv_sec * 1_000_000 + ru.ru_utime.tv_usec;
+            let s = ru.ru_stime.tv_sec * 1_000_000 + ru.ru_stime.tv_usec;
             u + s
         } else {
             0
