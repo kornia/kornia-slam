@@ -492,7 +492,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // back-projection at each keyframe (ORB-SLAM3's ThDepth ~ 35 for EuRoC).
     const TH_DEPTH: f64 = 35.0;
     let stereo_close_depth_m = rig.stereo_baseline_m.map(|baseline| baseline * TH_DEPTH);
-    let stereo_config = rig.stereo_baseline_m.map(|baseline| {
+    let mut stereo_matcher: Option<StereoMatcher> = rig.stereo_baseline_m.map(|baseline| {
         let bf = baseline * camera.fx;
         if !tui_active {
             eprintln!(
@@ -503,13 +503,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 baseline * TH_DEPTH,
             );
         }
-        StereoMatchConfig::new(baseline as f32, camera.fx as f32, ORB_SCALE, ORB_LEVELS)
+        // Map local config to upstream StereoMatchConfig.
+        let mut cfg = StereoMatchConfig::new(camera.fx as f32, baseline as f32);
+        cfg.scale_factor = ORB_SCALE;
+        cfg.n_levels = ORB_LEVELS;
+        // Keep parity with previous behaviour: SAD with parabola fit.
+        cfg.sad = Some(SadRefine {
+            fit: SubPixelFit::Parabola,
+            ..SadRefine::default()
+        });
+        StereoMatcher::new(cfg)
+            .expect("internal: stereo match config should be valid for rectified EuRoC pairs")
     });
+    // Reusable output buffer for stereo results.
+    let mut stereo_out = StereoMatches::default();
 
     if let Err(error) = validate_pgo_mode(
         args.apply_pgo,
         args.vocab.is_some(),
-        stereo_config.is_some(),
+        stereo_matcher.is_some(),
         imu_enabled,
     ) {
         return Err(error.into());
@@ -614,17 +626,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut features = detector.detect_and_extract_u8(&gray_u8)?;
 
         // Stereo: match the rectified right view to fill per-keypoint depth.
-        let (u_right, depth) = match (&stereo_config, &right_image) {
-            (Some(cfg), Some(right_img)) => {
+        let (u_right, depth) = match (&mut stereo_matcher, &right_image) {
+            (Some(matcher), Some(right_img)) => {
                 let right_features = detector.detect_and_extract_u8(right_img)?;
                 let left_pyr = build_u8_pyramid(&gray_u8);
                 let right_pyr = build_u8_pyramid(right_img);
-                let matches =
-                    compute_stereo_matches(&left_pyr, &right_pyr, &features, &right_features, cfg);
+                // Flatten ORB descriptors into row-major bytes and wrap keypoints.
+                let mut left_desc: Vec<u8> = Vec::with_capacity(features.descriptors.len() * 32);
+                for d in &features.descriptors {
+                    left_desc.extend_from_slice(d);
+                }
+                let mut right_desc: Vec<u8> =
+                    Vec::with_capacity(right_features.descriptors.len() * 32);
+                for d in &right_features.descriptors {
+                    right_desc.extend_from_slice(d);
+                }
+                let left_kp = StereoKeypoints {
+                    xy: &features.keypoints_xy,
+                    octaves: Some(&features.octaves),
+                    descriptors: StereoDescriptors::Binary {
+                        data: &left_desc,
+                        bytes: 32,
+                    },
+                };
+                let right_kp = StereoKeypoints {
+                    xy: &right_features.keypoints_xy,
+                    octaves: Some(&right_features.octaves),
+                    descriptors: StereoDescriptors::Binary {
+                        data: &right_desc,
+                        bytes: 32,
+                    },
+                };
+                matcher.match_into(&left_pyr, &right_pyr, &left_kp, &right_kp, &mut stereo_out)?;
                 if args.debug && !tui_active {
-                    let n = matches.num_matched();
-                    let mut ds: Vec<f32> =
-                        matches.depth.iter().copied().filter(|&d| d > 0.0).collect();
+                    let n = stereo_out.num_matched();
+                    let mut ds: Vec<f32> = stereo_out
+                        .depth
+                        .iter()
+                        .copied()
+                        .filter(|&d| d > 0.0)
+                        .collect();
                     let med = if ds.is_empty() {
                         0.0
                     } else {
@@ -633,7 +674,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     eprintln!("[stereo] frame={idx} matched={n} median_depth={med:.3}m");
                 }
-                (matches.u_right, matches.depth)
+                (
+                    std::mem::take(&mut stereo_out.u_right),
+                    std::mem::take(&mut stereo_out.depth),
+                )
             }
             _ => (Vec::new(), Vec::new()),
         };
