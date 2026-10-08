@@ -30,12 +30,15 @@ mod utils;
 use crate::datasets::euroc::GroundTruthPose;
 use evaluation::associate_gt;
 use kornia_3d::pose::Pose3d;
+use kornia_3d::stereo::{
+    SadRefine, StereoDescriptors, StereoKeypoints, StereoMatchConfig, StereoMatcher, StereoMatches,
+    SubPixelFit,
+};
 use kornia_algebra::Vec3F64;
 use kornia_image::{Image, ImageSize, InterpolationMode};
 use kornia_imgproc::resize::resize_fast_mono;
 use kornia_sensors::imu::ImuMeasurement;
 use kornia_slam::mapping::LocalMappingMode;
-use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches};
 use kornia_slam::{Frame, LoopClosingConfig, LoopClosureEvent, SlamConfig, SlamSystem};
 #[cfg(feature = "oakd")]
 use source::OakdSource;
