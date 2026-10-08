@@ -81,7 +81,7 @@ In **mono** mode intrinsics are placeholder (rough scale of the OAK-D Pro factor
 
 ## Stereo mode
 
-`--stereo` opens a left/right pair instead of a single image. Each rectified pair is matched along its rows (`compute_stereo_matches`) to recover per-keypoint disparity, and `depth = bf / disparity` (with `bf = fx · baseline`) gives **metric** depth. This makes initialization metric (no scale ambiguity) and feeds depth into bundle adjustment.
+`--stereo` opens a left/right pair instead of a single image. Each rectified pair is matched along its rows (via `kornia_3d::stereo::StereoMatcher`) to recover per-keypoint disparity, and `depth = bf / disparity` (with `bf = fx · baseline`) gives **metric** depth. This makes initialization metric (no scale ambiguity) and feeds depth into bundle adjustment.
 
 | Source  | How rectification is obtained                                            | Extra flags                                  |
 | ------- | ------------------------------------------------------------------------ | -------------------------------------------- |
