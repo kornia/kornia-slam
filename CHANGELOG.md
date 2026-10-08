@@ -26,6 +26,9 @@ with `source: Euroc((data: "D"))` and
 `system: (version: 1, sensors: (cameras: Stereo, imu: true))`. `--evaluate` and
 `--eval-out` are now global options. `PipelineConfig::resolve_paths` and
 `PipelineConfig::check_version` let other file formats embed a configuration.
+`--evaluate` refuses a dataset without ground truth instead of scoring the
+trajectory against itself. `SlamSystem::tracking_duration` reports the time a
+frame spent in tracking and mapping, separately from feature extraction.
 Loop closing is one setting, `Enabled(vocabulary: …)`, which always applies
 pose-graph correction to accepted loops and needs stereo or IMU input; there
 is no detection-only mode.

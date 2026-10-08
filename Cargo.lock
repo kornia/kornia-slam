@@ -6131,6 +6131,7 @@ dependencies = [
  "nokhwa",
  "ratatui",
  "rerun",
+ "ron 0.12.2",
  "serde",
  "serde_yaml",
  "thiserror 2.0.19",

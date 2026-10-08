@@ -136,6 +136,42 @@ fn stereo_recordings_and_cameras_need_calibration() {
 }
 
 #[test]
+fn sensors_the_source_cannot_provide_are_rejected_before_opening() {
+    for (source, sensors, message) in [
+        (
+            r#"Hilti((data: "d", calib: "c"))"#,
+            "(cameras: Stereo)",
+            "monocular images only",
+        ),
+        (
+            "Uvc((fx: 600, fy: 600, cx: 320, cy: 240))",
+            "(cameras: Stereo)",
+            "monocular images only",
+        ),
+        (
+            r#"Hilti((data: "d", calib: "c"))"#,
+            "(imu: true)",
+            "no IMU data",
+        ),
+        (r#"Mcap((path: "r.mcap"))"#, "(imu: true)", "no IMU data"),
+        ("Oakd(())", "(imu: true)", "no IMU data"),
+        (
+            "Uvc((fx: 600, fy: 600, cx: 320, cy: 240))",
+            "(imu: true)",
+            "no IMU data",
+        ),
+    ] {
+        let text = format!("(source: {source}, system: (version: 1, sensors: {sensors}))");
+        match parse(&text) {
+            Err(Invalid::Source(error)) => assert!(error.contains(message), "{text}: {error}"),
+            other => panic!("{text}: expected a source error, got {:?}", other.err()),
+        }
+    }
+    let euroc = r#"(source: Euroc((data: "d")), system: (version: 1, sensors: (cameras: Stereo, imu: true)))"#;
+    assert!(parse(euroc).is_ok());
+}
+
+#[test]
 fn camera_settings_are_range_checked() {
     for text in [
         "(source: Oakd((fps: 0)))",
@@ -174,21 +210,33 @@ impl Drop for TempRun {
 fn relative_paths_resolve_against_the_run_file() {
     let (temp, path) = TempRun::new(
         "relative",
-        r#"(source: Hilti((data: "../data/floor_2", calib: "/calib/chain.yaml")),
-            system: (version: 1, sensors: (imu: true),
-                pipeline: OrbSlam((loop_closing: Enabled(vocabulary: "../weights/ORBvoc.txt")))))"#,
+        r#"(source: Hilti((data: "../data/floor_2", calib: "/calib/chain.yaml")))"#,
     );
     let run = RunConfig::from_ron_file(&path).unwrap();
-    let configs = temp.dir.join("configs");
     let SourceConfig::Hilti(hilti) = &run.source else {
         panic!()
     };
-    assert_eq!(hilti.data, configs.join("../data/floor_2"));
+    assert_eq!(hilti.data, temp.dir.join("configs/../data/floor_2"));
     assert_eq!(hilti.calib, Path::new("/calib/chain.yaml"));
+}
+
+#[test]
+fn the_vocabulary_resolves_against_the_run_file() {
+    let (temp, path) = TempRun::new(
+        "vocabulary",
+        r#"(source: Euroc((data: "/data/MH_01_easy")),
+            system: (version: 1, sensors: (cameras: Stereo, imu: true),
+                pipeline: OrbSlam((loop_closing: Enabled(vocabulary: "../weights/ORBvoc.txt")))))"#,
+    );
+    let run = RunConfig::from_ron_file(&path).unwrap();
     assert_eq!(
         vocabulary(&run),
-        Some(configs.join("../weights/ORBvoc.txt").as_path())
+        Some(temp.dir.join("configs/../weights/ORBvoc.txt").as_path())
     );
+    let SourceConfig::Euroc(euroc) = &run.source else {
+        panic!()
+    };
+    assert_eq!(euroc.data, Path::new("/data/MH_01_easy"));
 }
 
 #[test]

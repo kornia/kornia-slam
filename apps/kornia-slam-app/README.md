@@ -118,13 +118,13 @@ In **mono** mode intrinsics are placeholder (rough scale of the OAK-D Pro factor
 
 Selecting `cameras: Stereo` in the configuration opens a left/right pair instead of a single image. Each rectified pair is matched along its rows (`compute_stereo_matches`) to recover per-keypoint disparity, and `depth = bf / disparity` (with `bf = fx · baseline`) gives **metric** depth. This makes initialization metric (no scale ambiguity) and feeds depth into bundle adjustment.
 
-| Source  | How rectification is obtained                                            | Extra flags                          |
+| Source  | How rectification is obtained                                            | Run-file settings                    |
 | ------- | ------------------------------------------------------------------------ | ------------------------------------ |
-| `euroc` | From `cam0`/`cam1` `sensor.yaml` (intrinsics + `T_BS`), computed in-proc | none                                 |
-| `mcap`  | From a calibration YAML; left/right channels paired by timestamp         | `--calib c.yaml [--right-channel …]` |
-| `oakd`  | From a calibration YAML; CamB+CamC streamed and rectified online         | `--calib c.yaml`                     |
+| `Euroc` | From `cam0`/`cam1` `sensor.yaml` (intrinsics + `T_BS`), computed in-proc | none                                 |
+| `Mcap`  | From a calibration YAML; left/right channels paired by timestamp         | `calib`, optionally `right_channel`  |
+| `Oakd`  | From a calibration YAML; CamB+CamC streamed and rectified online         | `calib`                              |
 
-EuRoC is already rectifiable from its `sensor.yaml`, so it needs no `--calib`. MCAP and OAK-D record **raw** (unrectified) frames, so they need a calibration YAML.
+EuRoC is already rectifiable from its `sensor.yaml`, so it needs no `calib`. MCAP and OAK-D record **raw** (unrectified) frames, so they need a calibration YAML.
 
 ### Calibration YAML
 

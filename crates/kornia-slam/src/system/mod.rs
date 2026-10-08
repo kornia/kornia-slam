@@ -36,6 +36,7 @@ use crate::tracking::motion::{InertialPrediction, predict_pose};
 use crate::tracking::tracker::{FrameInput, Tracker};
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::Frame;
 use crate::initialization::bootstrap::{
@@ -82,6 +83,7 @@ pub struct SlamSystem {
     frontend: OrbFrontend,
     // The last processed image, for optical-flow tracks into the next frame.
     previous_image: Option<Image<u8, 1>>,
+    tracking_duration: Duration,
 }
 
 impl SlamSystem {
@@ -130,6 +132,7 @@ impl SlamSystem {
             loop_closure_events: Vec::new(),
             frontend,
             previous_image: None,
+            tracking_duration: Duration::ZERO,
         }
     }
 
@@ -159,6 +162,7 @@ impl SlamSystem {
         };
         // Taken out for the call so tracking can borrow it alongside `self`.
         let previous_image = self.previous_image.take();
+        let tracking_start = Instant::now();
         let result = self.process_prepared(
             frame,
             previous_image.as_ref(),
@@ -166,8 +170,15 @@ impl SlamSystem {
             input.timestamp_sec,
             imu_samples,
         );
+        self.tracking_duration = tracking_start.elapsed();
         self.retain_previous_image(input.image, previous_image);
         Ok(result)
+    }
+
+    /// Time the latest successfully processed frame spent in tracking and
+    /// mapping, excluding feature extraction (see [`Self::frontend_observation`]).
+    pub fn tracking_duration(&self) -> Duration {
+        self.tracking_duration
     }
 
     /// The frontend output of the latest successfully processed frame.

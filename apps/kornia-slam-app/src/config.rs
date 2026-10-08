@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use kornia_slam::system::ConfigError;
-use kornia_slam::{CameraSelection, PipelineConfig};
+use kornia_slam::{CameraSelection, PipelineConfig, SensorSelection};
 use serde::Deserialize;
 
 /// One run: where the data comes from and how it is processed.
@@ -231,7 +231,7 @@ impl RunConfig {
         let run: Self = ron.from_str(text).map_err(parse_error)?;
         run.system.validate().map_err(Invalid::System)?;
         run.source
-            .validate(run.system.sensors.cameras)
+            .validate(run.system.sensors)
             .map_err(Invalid::Source)?;
         Ok(run)
     }
@@ -279,21 +279,14 @@ impl Invalid {
 }
 
 impl SourceConfig {
-    /// Checks settings the source needs before it can be opened. Whether the
-    /// opened source provides the selected sensors is checked when the system
-    /// is built.
-    fn validate(&self, cameras: CameraSelection) -> Result<(), String> {
-        let stereo = cameras == CameraSelection::Stereo;
+    /// Checks, before anything is opened, that the source can provide the
+    /// selected sensors and has the settings it needs. `SlamSystem::build`
+    /// checks the opened source's calibration again.
+    fn validate(&self, sensors: SensorSelection) -> Result<(), String> {
+        self.check_sensors(sensors)?;
         match self {
-            Self::Euroc(_) | Self::Hilti(_) => Ok(()),
-            Self::Mcap(mcap) if stereo && mcap.calib.is_none() => {
-                Err("Mcap with stereo cameras needs `calib`".into())
-            }
-            Self::Mcap(_) => Ok(()),
+            Self::Euroc(_) | Self::Hilti(_) | Self::Mcap(_) => Ok(()),
             Self::Oakd(oakd) => {
-                if stereo && oakd.calib.is_none() {
-                    return Err("Oakd with stereo cameras needs `calib`".into());
-                }
                 positive("fps", oakd.fps.into())?;
                 positive("width", oakd.width.into())?;
                 positive("height", oakd.height.into())
@@ -316,6 +309,41 @@ impl SourceConfig {
                 Ok(())
             }
         }
+    }
+}
+
+impl SourceConfig {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Euroc(_) => "Euroc",
+            Self::Hilti(_) => "Hilti",
+            Self::Mcap(_) => "Mcap",
+            Self::Oakd(_) => "Oakd",
+            Self::Uvc(_) => "Uvc",
+        }
+    }
+
+    /// Stereo needs a rectifiable pair: EuRoC's own calibration, or a
+    /// calibration file for MCAP and OAK-D. Only EuRoC supplies IMU data.
+    fn check_sensors(&self, sensors: SensorSelection) -> Result<(), String> {
+        let name = self.name();
+        if sensors.cameras == CameraSelection::Stereo {
+            match self {
+                Self::Euroc(_) => {}
+                Self::Mcap(McapConfig { calib: None, .. })
+                | Self::Oakd(OakdConfig { calib: None, .. }) => {
+                    return Err(format!("{name} with stereo cameras needs `calib`"));
+                }
+                Self::Mcap(_) | Self::Oakd(_) => {}
+                Self::Hilti(_) | Self::Uvc(_) => {
+                    return Err(format!("{name} provides monocular images only"));
+                }
+            }
+        }
+        if sensors.imu && !matches!(self, Self::Euroc(_)) {
+            return Err(format!("{name} provides no IMU data"));
+        }
+        Ok(())
     }
 }
 

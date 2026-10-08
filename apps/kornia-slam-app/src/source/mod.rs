@@ -90,7 +90,7 @@ impl SourceError {
 /// A source opened from its run configuration.
 pub struct OpenedSource {
     pub source: Box<dyn FrameSource>,
-    /// Ground truth for evaluation, when the dataset has it.
+    /// Ground truth for evaluation; `None` when the dataset has none.
     pub ground_truth: Option<Vec<GroundTruthPose>>,
     /// One line describing what will be read, for the startup log.
     pub summary: Option<String>,
@@ -121,7 +121,7 @@ pub fn open(
                     e.start_frame,
                     src.n_frames_hint(),
                 )),
-                ground_truth: Some(src.ground_truth_poses_cloned()),
+                ground_truth: non_empty(src.ground_truth_poses_cloned()),
                 source: Box::new(src),
             }
         }
@@ -134,7 +134,7 @@ pub fn open(
                     h.start_frame,
                     src.n_frames_hint(),
                 )),
-                ground_truth: Some(src.ground_truth_poses_cloned()),
+                ground_truth: non_empty(src.ground_truth_poses_cloned()),
                 source: Box::new(src),
             }
         }
@@ -204,6 +204,11 @@ pub fn open(
         }
     };
     Ok(opened)
+}
+
+/// Datasets report missing ground truth as an empty list.
+fn non_empty(poses: Vec<GroundTruthPose>) -> Option<Vec<GroundTruthPose>> {
+    (!poses.is_empty()).then_some(poses)
 }
 
 /// Rectify a raw stereo pair into freshly allocated `(left, right)` images.

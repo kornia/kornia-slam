@@ -82,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         summary,
     } = source::open(&run.source, run.system.sensors)?;
     if args.evaluate && ground_truth.is_none() {
-        return Err("--evaluate needs a source with ground truth (EuRoC or Hilti)".into());
+        return Err("--evaluate needs ground truth, and this source has none".into());
     }
     if !tui_active && let Some(summary) = summary {
         eprintln!("{summary}");
@@ -161,7 +161,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rec.set_duration_secs("timestamp", timestamp_sec);
         }
 
-        let t0 = Instant::now();
         let result = system.process(SensorFrame {
             idx,
             timestamp_sec,
@@ -169,11 +168,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             right_image: right_image.as_ref(),
             imu_samples: &imu_samples,
         })?;
-        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let frame_ms = system.tracking_duration().as_secs_f64() * 1000.0;
         let frontend_ms = system.frontend_observation().duration.as_secs_f64() * 1000.0;
-        // Tracking time excludes feature extraction, as it did before the
-        // system owned the frontend.
-        let frame_ms = total_ms - frontend_ms;
         #[cfg(feature = "viz")]
         if let Some(ref rec) = rec {
             log_frame_to_rerun(rec, &image, &system.frontend_observation().keypoints_xy);
@@ -216,18 +212,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let traj_pt = trajectory_point_from_pose(&result.pose_world_to_cam);
         trajectory.push(traj_pt);
 
-        // Evaluation collection (EuRoC, --evaluate only).
-        if evaluate {
-            let est_pos = Vec3F64::new(traj_pt[0] as f64, traj_pt[1] as f64, traj_pt[2] as f64);
-            est_positions.push(est_pos);
-
-            // Associate nearest ground-truth pose by timestamp.
-            let gt_pos = ground_truth
+        // Evaluation pairs each estimate with the nearest ground-truth pose.
+        if evaluate
+            && let Some(gt) = ground_truth
                 .as_deref()
                 .and_then(|gt| associate_gt(timestamp_sec, gt))
-                .map(|gt| Vec3F64::new(gt.tx, gt.ty, gt.tz))
-                .unwrap_or_else(|| *est_positions.last().unwrap());
-            gt_positions.push(gt_pos);
+        {
+            est_positions.push(Vec3F64::new(
+                traj_pt[0] as f64,
+                traj_pt[1] as f64,
+                traj_pt[2] as f64,
+            ));
+            gt_positions.push(Vec3F64::new(gt.tx, gt.ty, gt.tz));
         }
         // Rerun logging.
         #[cfg(feature = "viz")]
