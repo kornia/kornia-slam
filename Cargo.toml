@@ -3,7 +3,7 @@ members = ["crates/*", "apps/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 authors = [
@@ -17,8 +17,8 @@ categories = ["computer-vision", "science::robotics"]
 
 [workspace.dependencies]
 # Cargo cannot inherit workspace.package.version here: bump these with it.
-kornia-sensors = { path = "crates/kornia-sensors", version = "0.1.0" }
-kornia-slam = { path = "crates/kornia-slam", version = "0.1.0" }
+kornia-sensors = { path = "crates/kornia-sensors", version = "0.2.0" }
+kornia-slam = { path = "crates/kornia-slam", version = "0.2.0" }
 
 kornia-3d = "0.2.0"
 kornia-algebra = "0.2.0"

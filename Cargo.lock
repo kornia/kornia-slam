@@ -6086,7 +6086,7 @@ dependencies = [
 
 [[package]]
 name = "kornia-sensors"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glam 0.33.2",
  "kornia-3d",
@@ -6096,7 +6096,7 @@ dependencies = [
 
 [[package]]
 name = "kornia-slam"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "faer 0.22.6",
  "kornia-3d",
@@ -6112,7 +6112,7 @@ dependencies = [
 
 [[package]]
 name = "kornia-slam-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argh",
  "ciborium",
