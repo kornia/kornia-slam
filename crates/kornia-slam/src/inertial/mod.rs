@@ -7,7 +7,10 @@
 pub mod initialization;
 mod schedule;
 
-pub use initialization::{AlignedTrackingState, ImuInitConfig, ImuInitResult, ImuInitializer};
+pub use initialization::{
+    AlignedTrackingState, ImuInitConfig, ImuInitResult, ImuInitializer, ImuWindowStats,
+    StationaryInitError,
+};
 pub(crate) use schedule::{InertialInitSchedule, viba0_accel_bias_prior};
 
 use crate::mapping::Map;

@@ -82,6 +82,19 @@ slice (indexed by `Frame::idx`) and `visual_inertial_bundle_adjust` a
 behaviour. `ViBaError` gains two variants. The workspace version moves to
 0.2.0.
 
+**Inertial initialization while stationary.** A stereo-inertial rig no
+longer has to move before the IMU joins the estimate: the motion-based
+initializer needs displacement to see gravity, but a stereo map is already
+metric, so a still window is enough. `ImuInitializer::initialize_stationary`
+takes the window's `ImuWindowStats` (mean and vector spread of the raw
+samples) and returns an ordinary `ImuInitResult` for `apply_initialization`:
+gravity from the mean specific force through the newest keyframe's attitude
+and `T_BC`, gyro bias from the mean rate, zero velocities, the accelerometer
+bias held at the prior (unobservable at rest). Deciding that the window was
+still is left to the caller. Monocular windows and a mean specific force far
+from standard gravity are refused (`StationaryInitError`). Additive; no
+existing signature changes.
+
 ## [0.1.0] — 2026-09-27
 
 First public release. The API will change between minor versions through the 0.x

@@ -6,6 +6,9 @@
 
 pub mod factor;
 mod solve;
+mod stationary;
+
+pub use stationary::{ImuWindowStats, StationaryInitError};
 
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{QuatF64, SO3F64, Vec3F64};
