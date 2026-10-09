@@ -53,6 +53,19 @@ pub struct BaUpdate {
     pub(crate) snapshot: BaSnapshot,
 }
 
+impl BaUpdate {
+    /// The IMU bias this update would write on each captured keyframe, in capture order
+    /// (fixed context keyframes included, unchanged).
+    ///
+    /// Read-only, so a caller can refuse an update whose bias left the physically plausible
+    /// range before [`Map::apply_ba_update`] writes it: the solver has no absolute prior on
+    /// the gyro bias, only random-walk edges between keyframes, so a window can return a bias
+    /// no sensor of the class could have.
+    pub fn keyframe_biases(&self) -> impl Iterator<Item = ImuBias> + '_ {
+        self.keyframes.iter().map(|kf| kf.imu_bias)
+    }
+}
+
 impl BaSnapshot {
     pub fn keyframes(&self) -> &[Keyframe] {
         &self.keyframes

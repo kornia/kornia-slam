@@ -1039,3 +1039,28 @@ fn two_landmarks_naming_one_feature_refuse_the_whole_batch() {
     assert_eq!(result.landmark_ids.len(), 2);
     assert_map_consistent(&map);
 }
+
+/// `BaUpdate::keyframe_biases` reports, in capture order, the bias the update would write: a
+/// caller refusing an implausible bias must read the estimate, not the map it was captured from.
+#[test]
+fn ba_update_reports_the_bias_it_would_write() {
+    use crate::mapping::map::ops::BaWindow;
+    use kornia_sensors::imu::ImuBias;
+    let mut map = Map::new();
+    for (idx, gz) in [(0usize, 0.001), (1, 0.002)] {
+        let mut kf = detached(idx, 2);
+        kf.imu_bias = ImuBias {
+            gyro: Vec3F64::new(0.0, 0.0, gz),
+            accel: Vec3F64::ZERO,
+        };
+        map.insert_keyframe(kf).unwrap();
+    }
+    let window = BaWindow {
+        keyframe_slots: vec![0, 1],
+        landmark_ids: Vec::new(),
+    };
+    let mut update = map.ba_snapshot(&window).into_update();
+    update.keyframes[1].imu_bias.gyro.z = 0.3;
+    let gz: Vec<f64> = update.keyframe_biases().map(|b| b.gyro.z).collect();
+    assert_eq!(gz, vec![0.001, 0.3]);
+}
