@@ -8,7 +8,6 @@ mod build;
 mod config;
 #[cfg(feature = "serde")]
 mod file;
-mod inertial;
 mod input;
 mod state;
 mod validation;
@@ -26,7 +25,6 @@ pub use state::{TrackingResult, TrackingStatus};
 pub use validation::ConfigError;
 
 use crate::frontend::{FrontendObservation, OrbFrontend};
-use inertial::{AppliedInitialization, InertialState, viba0_accel_bias_prior};
 use state::{SystemMode, SystemState};
 
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
@@ -39,6 +37,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::Frame;
+use crate::inertial::{
+    AppliedInitialization, ImuInitResult, InertialState, viba0_accel_bias_prior,
+};
 use crate::initialization::bootstrap::{
     self, BootstrapDecision, MIN_KEYPOINTS_FOR_BOOTSTRAP, MIN_STEREO_POINTS, MIN_VALID_POINTS,
     TooFewStereoPoints, evaluate_bootstrap,
@@ -47,7 +48,9 @@ use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::place_recognition::Vocabulary;
 use crate::loop_closure::{LoopCloser, LoopClosingContext, LoopClosureEvent};
 use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
-use crate::mapping::map::{Keyframe, Map, MapInsertion, MapMutationError, MapPoint};
+use crate::mapping::map::{
+    InertialAlignmentError, Keyframe, Map, MapInsertion, MapMutationError, MapPoint,
+};
 use crate::mapping::{KeyframeJob, LocalMapping};
 use crate::pose_conversion::apply_reference_pose_correction;
 use build::SystemSettings;
@@ -638,12 +641,7 @@ impl SlamSystem {
             );
             match init_result {
                 Some(init) => {
-                    let applied = self.inertial.apply_initialization(
-                        &mut self.map.lock().unwrap(),
-                        &mut self.state,
-                        init,
-                        start_idx,
-                    );
+                    let applied = self.apply_inertial_initialization(init, start_idx);
                     match applied {
                         Ok(applied) => self.resume_tracking_after_viba0(timestamp_sec, applied),
                         // Staying in ImuInit lets the retry throttle re-solve later.
@@ -659,6 +657,22 @@ impl SlamSystem {
         }
 
         result
+    }
+
+    /// Applies an inertial initialization to the map and resumes tracking from
+    /// the aligned state; a refused alignment changes nothing.
+    fn apply_inertial_initialization(
+        &mut self,
+        init: ImuInitResult,
+        start_kf_idx: usize,
+    ) -> Result<AppliedInitialization, InertialAlignmentError> {
+        let applied = self.inertial.apply_initialization(
+            &mut self.map.lock().unwrap(),
+            init,
+            start_kf_idx,
+        )?;
+        self.state.adopt_inertial_initialization(applied.aligned);
+        Ok(applied)
     }
 
     fn resume_tracking_after_viba0(&mut self, timestamp_sec: f64, applied: AppliedInitialization) {
@@ -680,6 +694,7 @@ impl SlamSystem {
             scale,
             gravity_world: gravity,
             gyro_bias: bg,
+            ..
         } = applied;
         self.dbg(format!(
             "[imu_init] VIBA0 accepted: scale={scale:.4} gravity=({:.3},{:.3},{:.3}) \
@@ -1053,12 +1068,7 @@ impl SlamSystem {
         );
         match init_result {
             Some(init) => {
-                let applied = self.inertial.apply_initialization(
-                    &mut self.map.lock().unwrap(),
-                    &mut self.state,
-                    init,
-                    start_idx,
-                );
+                let applied = self.apply_inertial_initialization(init, start_idx);
                 match applied {
                     Ok(AppliedInitialization {
                         scale,

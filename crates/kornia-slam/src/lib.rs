@@ -30,6 +30,7 @@
 
 pub mod frame;
 pub(crate) mod frontend;
+pub mod inertial;
 pub mod initialization;
 pub mod loop_closure;
 pub mod mapping;

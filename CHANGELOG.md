@@ -59,6 +59,7 @@ that supply raw fisheye images.
 | `SlamSystem::process_frame` (prepared features) | `SlamSystem::process(SensorFrame)` |
 | `LoopClosingConfig::require_imu_initialized` | derived from the rig |
 | `kornia_slam::pipeline` | `kornia_slam::system`; common types are re-exported at the crate root |
+| `kornia_slam::initialization::inertial` and its re-exports (`ImuInitializer`, `ImuInitConfig`, `ImuInitResult`, `AlignedTrackingState`) | `kornia_slam::inertial`, a subsystem that also owns the runtime IMU state |
 | `pipeline::{KeyframeConfig, MappingExecution, Stage}` | `KeyframePolicy`, `LocalMappingMode`; the stage list is gone, `Display` describes the pipeline |
 
 `SlamSystem` no longer accepts features computed outside it; such callers pass

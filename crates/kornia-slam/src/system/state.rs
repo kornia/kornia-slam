@@ -3,7 +3,7 @@
 use kornia_3d::pose::Pose3d;
 
 use crate::frame::Frame;
-use crate::initialization::AlignedTrackingState;
+use crate::inertial::AlignedTrackingState;
 use kornia_algebra::Vec3F64;
 
 /// Status of processing one frame.
@@ -119,7 +119,7 @@ impl Default for SystemState {
 #[cfg(test)]
 mod tests {
     use super::SystemState;
-    use crate::initialization::AlignedTrackingState;
+    use crate::inertial::AlignedTrackingState;
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::Vec3F64;
 
