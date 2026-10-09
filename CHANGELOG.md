@@ -40,6 +40,17 @@ largest frame-to-frame jump against ground truth drops from 1.30 m to 0.04 m on
 V2_01 and from 1.01 m to 0.51 m on V2_03; jumps above 30 cm on V2_03 go from 15
 to 5.
 
+**Monocular initialization no longer waits forever on a stale reference.** A
+bootstrap reference that fails to match more than ten frames in a row is
+replaced by the current frame. EuRoC MH_02 and MH_05 previously never
+initialized in mono or mono+IMU (0% of frames tracked); they now track 95–99%
+of frames, and V1_03 mono goes from 10% to 83%.
+
+**TUM-VI sequences.** The app reads TUM-VI's `dataset-*_512_16` exports
+(`source: TumVi((data: …))`), monocular on the raw fisheye with the IMU, and
+evaluates against motion capture. 16-bit images are reduced to 8 bits, and the
+Hilti reader gains the IMU when its images are not rotated.
+
 **EuRoC stereo pairs are matched by timestamp.** The source paired left and
 right images by position, which is off by one frame for all of MH_04 and
 drifts through V2_03's dropped left frames; stereo results on those two

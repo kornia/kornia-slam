@@ -44,7 +44,7 @@ use crate::initialization::bootstrap::{
     self, BootstrapDecision, MIN_KEYPOINTS_FOR_BOOTSTRAP, MIN_STEREO_POINTS, MIN_VALID_POINTS,
     TooFewStereoPoints, evaluate_bootstrap,
 };
-use crate::initialization::two_view::TwoViewInitConfig;
+use crate::initialization::two_view::{TwoViewInitConfig, TwoViewRejectReason};
 use crate::loop_closure::{LoopCloser, LoopClosingContext, LoopClosureEvent};
 use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
 use crate::mapping::map::{
@@ -403,10 +403,7 @@ impl SlamSystem {
                     "[bootstrap] frame={} stored as reference (awaiting second frame)",
                     curr_frame.idx,
                 ));
-                self.state.bootstrap_frame = Some(curr_frame);
-                self.inertial.bootstrap_timestamp_sec = Some(timestamp_sec);
-                // Samples before the reference frame can never enter an edge.
-                self.prune_imu_before(timestamp_sec);
+                self.store_bootstrap_reference(curr_frame, timestamp_sec);
                 return self.frame_result(TrackingStatus::Skipped);
             }
             // The reference is kept: only the second frame was unsuitable.
@@ -418,6 +415,19 @@ impl SlamSystem {
                     "[bootstrap] frame={} (ref={}) reject: {:?}",
                     curr_frame.idx, reference_idx, reason,
                 ));
+                // A reference that keeps failing to match has lost the scene
+                // (ORB-SLAM3 replaces it on the first such frame; waiting a
+                // little keeps the better-conditioned early pairs).
+                if matches!(reason, TwoViewRejectReason::LowMatches) {
+                    self.state.bootstrap_low_match_rejections += 1;
+                    if self.state.bootstrap_low_match_rejections > MAX_LOW_MATCH_REJECTIONS {
+                        self.dbg(format!(
+                            "[bootstrap] frame={} replaces reference {reference_idx}",
+                            curr_frame.idx
+                        ));
+                        self.store_bootstrap_reference(curr_frame, timestamp_sec);
+                    }
+                }
                 return self.frame_result(TrackingStatus::Skipped);
             }
             BootstrapDecision::Initialized(estimate) => *estimate,
@@ -509,6 +519,14 @@ impl SlamSystem {
         self.finish_bootstrap(curr_idx, timestamp_sec);
 
         self.frame_result(TrackingStatus::KeyframeAccepted)
+    }
+
+    fn store_bootstrap_reference(&mut self, frame: Frame, timestamp_sec: f64) {
+        self.state.bootstrap_frame = Some(frame);
+        self.state.bootstrap_low_match_rejections = 0;
+        self.inertial.bootstrap_timestamp_sec = Some(timestamp_sec);
+        // Samples before the reference frame can never enter an edge.
+        self.prune_imu_before(timestamp_sec);
     }
 
     /// Publishes the two-view map, refines it with initial BA, and offers both
@@ -1220,6 +1238,9 @@ impl SlamSystem {
 /// Largest distance, in metres, between the motion-model pose and a
 /// relocalized one that is adopted.
 const RELOCALIZATION_MAX_JUMP_M: f64 = 0.5;
+
+/// Low-match two-view rejections a monocular bootstrap reference survives.
+const MAX_LOW_MATCH_REJECTIONS: usize = 10;
 
 fn format_imu_init_gate(
     start_idx: usize,
