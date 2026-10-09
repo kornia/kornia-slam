@@ -17,15 +17,15 @@ sensors, ORB settings, keyframe policy, local-mapping execution and loop
 closing. `configs/` has an example per source. Relative paths resolve against
 the run file. Invalid settings, and sensors
 the source cannot provide, are rejected before any data is read. The library
-gains `PipelineConfig` (in `kornia_slam::system`, re-exported at the root), with RON loading behind the optional `serde`
+gains `SystemConfig` (in `kornia_slam::system`, re-exported at the root), with RON loading behind the optional `serde`
 feature; the CLI's run files embed it as `system`. **Breaking (CLI):** the
 source subcommands (`euroc`, `hilti`, `mcap`, `oakd`, `uvc`) and their flags,
 and `--n-keypoints`, `--local-mapping`, `--vocab`, `--apply-pgo`, `--stereo`
 and `--imu`, are removed; `euroc --data D --stereo --imu` becomes a run file
 with `source: Euroc((data: "D"))` and
 `system: (version: 1, sensors: (cameras: Stereo, imu: true))`. `--evaluate` and
-`--eval-out` are now global options. `PipelineConfig::resolve_paths` and
-`PipelineConfig::check_version` let other file formats embed a configuration.
+`--eval-out` are now global options. `SystemConfig::resolve_paths` and
+`SystemConfig::check_version` let other file formats embed a configuration.
 `--evaluate` refuses a dataset without ground truth instead of scoring the
 trajectory against itself. `SlamSystem::tracking_duration` reports the time a
 frame spent in tracking and mapping, separately from feature extraction.
@@ -34,12 +34,12 @@ pose-graph correction to accepted loops and needs stereo or IMU input; there
 is no detection-only mode.
 
 **One configuration, one construction call, one processing call.**
-`SlamSystem::build(config, rig)` assembles the system from a `PipelineConfig`
+`SlamSystem::build(config, rig)` assembles the system from a `SystemConfig`
 and the source's calibrated `SensorRig`, and `SlamSystem::process` takes a
 `SensorFrame` of images and IMU samples. The system now owns ORB extraction,
 stereo matching, fisheye keypoint mapping and frame history, so an embedding
 no longer reimplements them; `frontend_observation()` exposes the raw-image
-keypoints and extraction time for overlays. Pipeline files gain
+keypoints and extraction time for overlays. System configurations gain
 `frontend.stereo_close_depth` (baselines, metres or disabled); the remaining
 former `SlamConfig` settings (two-view initialization, map projection, loss
 recovery, loop correction) are algorithm tuning, set from Rust through
@@ -52,13 +52,12 @@ that supply raw fisheye images.
 
 | Removed | Replacement |
 | --- | --- |
-| `SlamConfig`, `SlamSystem::new`, `SlamSystem::with_rig` | `SlamSystem::build(PipelineConfig, SensorRig)`, with tuning in `OrbSlamPipeline::tuning` |
+| `SlamConfig`, `SlamSystem::new`, `SlamSystem::with_rig` | `SlamSystem::build(SystemConfig, SensorRig)`, with tuning in `OrbSlamPipeline::tuning` |
 | `SlamConfig::debug` | `SlamSystem::set_debug` |
 | `SlamSystem::set_vocabulary` | a `loop_closing` branch naming the vocabulary |
 | `SlamSystem::set_imu_extrinsics` | IMU calibration on the `SensorRig` |
 | `SlamSystem::process_frame` (prepared features) | `SlamSystem::process(SensorFrame)` |
 | `LoopClosingConfig::require_imu_initialized` | derived from the rig |
-| `PipelineConfig::{slam_config, orb_detector, load_vocabulary}`, `SensorSelection::select_rig` | done by `SlamSystem::build` |
 | `kornia_slam::pipeline` | `kornia_slam::system`; common types are re-exported at the crate root |
 | `pipeline::{KeyframeConfig, MappingExecution, Stage}` | `KeyframePolicy`, `LocalMappingMode`; the stage list is gone, `Display` describes the pipeline |
 

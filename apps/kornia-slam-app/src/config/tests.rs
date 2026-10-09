@@ -37,7 +37,7 @@ fn an_omitted_system_runs_the_default_pipeline() {
     let run = parse(r#"(source: Euroc((data: "d")))"#).unwrap();
     assert_eq!(
         run.system.to_ron_string().unwrap(),
-        PipelineConfig::default().to_ron_string().unwrap()
+        SystemConfig::default().to_ron_string().unwrap()
     );
 }
 

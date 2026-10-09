@@ -304,7 +304,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod cli_tests {
     use argh::FromArgs;
-    use kornia_slam::PipelineConfig;
+    use kornia_slam::SystemConfig;
 
     use super::*;
 
@@ -365,7 +365,7 @@ mod cli_tests {
         let run = RunConfig::from_ron_file(configs_dir().join("euroc.ron")).unwrap();
         assert_eq!(
             run.system.to_ron_string().unwrap(),
-            PipelineConfig::default().to_ron_string().unwrap(),
+            SystemConfig::default().to_ron_string().unwrap(),
             "configs/euroc.ron no longer lists the system defaults"
         );
     }

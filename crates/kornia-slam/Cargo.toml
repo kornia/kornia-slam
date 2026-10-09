@@ -27,5 +27,5 @@ ron = { version = "0.12", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 
 [features]
-# Serialization of the pipeline configuration and its RON file loading.
+# Serialization of the system configuration and its RON file loading.
 serde = ["dep:serde", "dep:ron"]

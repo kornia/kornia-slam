@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use kornia_slam::PipelineConfig;
+use kornia_slam::SystemConfig;
 use kornia_slam::system::ConfigError;
 use serde::Deserialize;
 
@@ -25,7 +25,7 @@ pub struct RunConfig {
     pub source: SourceConfig,
     /// Omitted, the default monocular pipeline runs.
     #[serde(default)]
-    pub system: PipelineConfig,
+    pub system: SystemConfig,
 }
 
 /// A run file that cannot be read or does not describe a valid run.
@@ -71,7 +71,7 @@ impl Default for SystemVersion {
 }
 
 fn current_version() -> u32 {
-    kornia_slam::system::PIPELINE_CONFIG_VERSION
+    kornia_slam::system::SYSTEM_CONFIG_VERSION
 }
 
 impl RunConfig {
@@ -94,7 +94,7 @@ impl RunConfig {
             .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME);
         let parse_error = |error| Invalid::Parse(Box::new(error));
         let probe: VersionProbe = ron.from_str(text).map_err(parse_error)?;
-        PipelineConfig::check_version(probe.system.version).map_err(Invalid::System)?;
+        SystemConfig::check_version(probe.system.version).map_err(Invalid::System)?;
         let run: Self = ron.from_str(text).map_err(parse_error)?;
         run.system.validate().map_err(Invalid::System)?;
         run.source

@@ -1,5 +1,5 @@
-//! Declarative pipeline configuration: the sensors a pipeline consumes and
-//! the stages, optional branches and settings it runs.
+//! Declarative system configuration: the sensors the system consumes and the
+//! pipeline it runs on them.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -10,11 +10,11 @@ use crate::mapping::LocalMappingMode;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
-/// Schema version of [`PipelineConfig`] this crate reads and writes.
-pub const PIPELINE_CONFIG_VERSION: u32 = 1;
+/// Schema version of [`SystemConfig`] this crate reads and writes.
+pub const SYSTEM_CONFIG_VERSION: u32 = 1;
 
-/// Declarative definition of a SLAM pipeline: the sensors it consumes and the
-/// stages, optional branches and settings it runs.
+/// Declarative definition of a SLAM system: the sensors it consumes and the
+/// pipeline stages, optional branches and settings it runs.
 ///
 /// This is the complete configuration of a [`SlamSystem`](crate::SlamSystem).
 /// Settings that follow from the sensor rig, such as the loop-correction IMU
@@ -22,7 +22,7 @@ pub const PIPELINE_CONFIG_VERSION: u32 = 1;
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
-pub struct PipelineConfig {
+pub struct SystemConfig {
     pub version: u32,
     #[cfg_attr(feature = "serde", serde(default))]
     pub sensors: SensorSelection,
@@ -30,10 +30,10 @@ pub struct PipelineConfig {
     pub pipeline: PipelineDefinition,
 }
 
-impl Default for PipelineConfig {
+impl Default for SystemConfig {
     fn default() -> Self {
         Self {
-            version: PIPELINE_CONFIG_VERSION,
+            version: SYSTEM_CONFIG_VERSION,
             sensors: SensorSelection::default(),
             pipeline: PipelineDefinition::default(),
         }
@@ -81,7 +81,7 @@ pub struct OrbSlamPipeline {
     pub keyframes: KeyframePolicy,
     pub mapping: MappingConfig,
     pub loop_closing: LoopClosingMode,
-    /// Algorithm tuning, set from Rust only: pipeline files always use the
+    /// Algorithm tuning, set from Rust only: configuration files always use the
     /// defaults.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub tuning: OrbTuning,
@@ -193,7 +193,7 @@ impl LoopClosingMode {
     }
 }
 
-impl PipelineConfig {
+impl SystemConfig {
     /// Resolves relative resource paths, such as the vocabulary, against
     /// `base_dir`, usually the directory of the file the configuration came
     /// from. Absolute paths are kept.
@@ -207,7 +207,7 @@ impl PipelineConfig {
     }
 }
 
-/// Algorithm thresholds of the ORB pipeline that pipeline files do not expose.
+/// Algorithm thresholds of the ORB pipeline that configuration files do not expose.
 #[derive(Debug, Clone, Default)]
 pub struct OrbTuning {
     /// Monocular two-view map initialization, and the matching and
@@ -220,7 +220,7 @@ pub struct OrbTuning {
 }
 
 /// One line per enabled stage with its resolved settings.
-impl fmt::Display for PipelineConfig {
+impl fmt::Display for SystemConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let PipelineDefinition::OrbSlam(orb) = &self.pipeline;
         let FrontendConfig::Orb(frontend) = orb.frontend;

@@ -3,18 +3,18 @@ use kornia_sensors::SensorRig;
 
 use super::config::{
     CameraSelection, FrontendConfig, LoopClosingMode, OrbFrontendConfig, OrbSlamPipeline,
-    OrbTuning, PIPELINE_CONFIG_VERSION, PipelineConfig, PipelineDefinition, SensorSelection,
-    StereoCloseDepth,
+    OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth,
+    SystemConfig,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopClosingConfig;
 use crate::tracking::KeyframePolicy;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
 
-/// A pipeline configuration that cannot be built or does not fit its source.
+/// A system configuration that cannot be built or does not fit its source.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ConfigError {
-    #[error("unsupported pipeline config version {found}; this build reads version {supported}")]
+    #[error("unsupported system config version {found}; this build reads version {supported}")]
     UnsupportedVersion { found: u32, supported: u32 },
     #[error("ORB n_keypoints {value} is outside the supported range {min}..={max}")]
     KeypointsOutOfRange {
@@ -44,7 +44,7 @@ pub enum ConfigError {
     FisheyeStereo,
 }
 
-impl PipelineConfig {
+impl SystemConfig {
     /// Checks the definition on its own, before any source or resource is opened.
     pub fn validate(&self) -> Result<(), ConfigError> {
         Self::check_version(self.version)?;
@@ -54,16 +54,16 @@ impl PipelineConfig {
     }
 }
 
-impl PipelineConfig {
+impl SystemConfig {
     /// Checks a schema version on its own, so a file written for another
     /// version can be reported as such before its fields are parsed.
     pub fn check_version(version: u32) -> Result<(), ConfigError> {
-        if version == PIPELINE_CONFIG_VERSION {
+        if version == SYSTEM_CONFIG_VERSION {
             Ok(())
         } else {
             Err(ConfigError::UnsupportedVersion {
                 found: version,
-                supported: PIPELINE_CONFIG_VERSION,
+                supported: SYSTEM_CONFIG_VERSION,
             })
         }
     }

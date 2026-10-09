@@ -36,10 +36,10 @@ fn stereo_imu_rig() -> SensorRig {
         .with_imu(Pose3d::IDENTITY)
 }
 
-fn config(cameras: CameraSelection, imu: bool, loop_closing: LoopClosingMode) -> PipelineConfig {
-    let mut config = PipelineConfig {
+fn config(cameras: CameraSelection, imu: bool, loop_closing: LoopClosingMode) -> SystemConfig {
+    let mut config = SystemConfig {
         sensors: SensorSelection { cameras, imu },
-        ..PipelineConfig::default()
+        ..SystemConfig::default()
     };
     let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
     orb.mapping.execution = LocalMappingMode::Synchronous;
@@ -47,7 +47,7 @@ fn config(cameras: CameraSelection, imu: bool, loop_closing: LoopClosingMode) ->
     config
 }
 
-fn mono() -> PipelineConfig {
+fn mono() -> SystemConfig {
     config(CameraSelection::Mono, false, LoopClosingMode::Disabled)
 }
 
@@ -112,7 +112,7 @@ fn saved_vocabulary(name: &str) -> PathBuf {
 
 #[test]
 fn build_validates_programmatic_configs() {
-    let config = PipelineConfig {
+    let config = SystemConfig {
         version: 2,
         ..mono()
     };

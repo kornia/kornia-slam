@@ -55,15 +55,15 @@ More sources and options: [apps/kornia-slam-app](apps/kornia-slam-app/README.md)
 
 ## Library
 
-A pipeline configuration and the source's calibrated rig build a `SlamSystem`,
+A system configuration and the source's calibrated rig build a `SlamSystem`,
 which then takes images and IMU samples and returns poses. Feature extraction,
 stereo matching and frame history are the system's; sources supply
 synchronized, calibrated (and, for stereo, rectified) images.
 
 ```rust,ignore
-use kornia_slam::{PipelineConfig, SensorFrame, SlamSystem};
+use kornia_slam::{SystemConfig, SensorFrame, SlamSystem};
 
-let config = PipelineConfig::from_ron_file("stereo-imu.ron")?; // a system file; `serde` feature
+let config = SystemConfig::from_ron_file("stereo-imu.ron")?; // a system file; `serde` feature
 let mut system = SlamSystem::build(config, rig)?; // rig: kornia_slam::SensorRig
 for (idx, frame) in frames.enumerate() {
     let result = system.process(SensorFrame {

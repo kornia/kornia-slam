@@ -1,7 +1,7 @@
 //! Visual odometry and SLAM building blocks for kornia-rs.
 //!
 //! [`SlamSystem`] is the runtime: [`SlamSystem::build`] assembles it from a
-//! [`PipelineConfig`] and the source's calibrated [`SensorRig`], and
+//! [`SystemConfig`] and the source's calibrated [`SensorRig`], and
 //! [`SlamSystem::process`] tracks one [`SensorFrame`] of images and IMU samples.
 //! Images are in the coordinates of the rig's camera, rectified for stereo,
 //! except for a rig with [`SensorRig::fisheye`], whose raw fisheye images
@@ -10,10 +10,10 @@
 //! ```no_run
 //! # use kornia_3d::camera::PinholeCamera;
 //! # use kornia_image::Image;
-//! use kornia_slam::{PipelineConfig, SensorFrame, SensorRig, SlamSystem};
+//! use kornia_slam::{SystemConfig, SensorFrame, SensorRig, SlamSystem};
 //!
 //! # fn run(camera: PinholeCamera, images: Vec<Image<u8, 1>>) -> Result<(), Box<dyn std::error::Error>> {
-//! let mut system = SlamSystem::build(PipelineConfig::default(), SensorRig::new(camera))?;
+//! let mut system = SlamSystem::build(SystemConfig::default(), SensorRig::new(camera))?;
 //! for (idx, image) in images.iter().enumerate() {
 //!     let result = system.process(SensorFrame {
 //!         idx,
@@ -46,7 +46,7 @@ pub use loop_closure::{LoopClosingConfig, LoopClosureEvent};
 #[cfg(feature = "serde")]
 pub use system::LoadError;
 pub use system::{
-    BuildError, CameraSelection, ConfigError, LoopClosingMode, PipelineConfig, ProcessError,
-    SensorSelection, SlamSystem, TrackingResult, TrackingStatus,
+    BuildError, CameraSelection, ConfigError, LoopClosingMode, ProcessError, SensorSelection,
+    SlamSystem, SystemConfig, TrackingResult, TrackingStatus,
 };
 pub use tracking::{KeyframePolicy, MapProjectionEstimator};

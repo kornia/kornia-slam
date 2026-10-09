@@ -2,8 +2,8 @@ use kornia_imgproc::features::OrbDetector;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    CameraSelection, FrontendConfig, OrbSlamPipeline, PipelineConfig, PipelineDefinition,
-    SensorSelection,
+    CameraSelection, FrontendConfig, OrbSlamPipeline, PipelineDefinition, SensorSelection,
+    SystemConfig,
 };
 use super::validation::ConfigError;
 use crate::initialization::two_view::TwoViewInitConfig;
@@ -24,7 +24,7 @@ pub enum BuildError {
 }
 
 /// Settings a [`SlamSystem`](crate::SlamSystem) is assembled from, resolved
-/// from a pipeline configuration against the selected rig.
+/// from a system configuration against the selected rig.
 pub(crate) struct SystemSettings {
     pub two_view_init: TwoViewInitConfig,
     pub map_projection: MapProjectionConfig,
@@ -53,7 +53,7 @@ impl SensorSelection {
     }
 }
 
-impl PipelineConfig {
+impl SystemConfig {
     /// System settings for a rig returned by [`SensorSelection::select_rig`].
     ///
     /// Stereo close depth is resolved against the rig's baseline.

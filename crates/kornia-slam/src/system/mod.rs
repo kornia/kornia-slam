@@ -16,8 +16,8 @@ mod validation;
 pub use build::BuildError;
 pub use config::{
     CameraSelection, FrontendConfig, LoopClosingMode, MappingConfig, OrbFrontendConfig,
-    OrbSlamPipeline, OrbTuning, PIPELINE_CONFIG_VERSION, PipelineConfig, PipelineDefinition,
-    SensorSelection, StereoCloseDepth,
+    OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection,
+    StereoCloseDepth, SystemConfig,
 };
 #[cfg(feature = "serde")]
 pub use file::LoadError;
@@ -90,7 +90,7 @@ impl SlamSystem {
     /// Builds the system `config` describes from the source's calibrated rig,
     /// restricted to the selected sensors. Resources such as the vocabulary
     /// are loaded before any mapping worker starts.
-    pub fn build(config: PipelineConfig, rig: SensorRig) -> Result<Self, BuildError> {
+    pub fn build(config: SystemConfig, rig: SensorRig) -> Result<Self, BuildError> {
         config.validate()?;
         let rig = config.sensors.select_rig(rig)?;
         let settings = config.settings(&rig);

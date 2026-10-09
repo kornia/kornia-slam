@@ -11,15 +11,15 @@ use crate::system::ConfigError;
 use crate::system::LoadError;
 use crate::tracking::KeyframePolicy;
 
-fn orb_mut(config: &mut PipelineConfig) -> &mut OrbSlamPipeline {
+fn orb_mut(config: &mut SystemConfig) -> &mut OrbSlamPipeline {
     let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
     orb
 }
 
-fn with_loop_closing(mode: LoopClosingMode, sensors: SensorSelection) -> PipelineConfig {
-    let mut config = PipelineConfig {
+fn with_loop_closing(mode: LoopClosingMode, sensors: SensorSelection) -> SystemConfig {
+    let mut config = SystemConfig {
         sensors,
-        ..PipelineConfig::default()
+        ..SystemConfig::default()
     };
     orb_mut(&mut config).loop_closing = mode;
     config
@@ -50,7 +50,7 @@ fn rig() -> SensorRig {
 
 #[test]
 fn default_is_valid_orb_without_branches() {
-    let config = PipelineConfig::default();
+    let config = SystemConfig::default();
     assert_eq!(config.validate(), Ok(()));
     assert_eq!(
         config.to_string(),
@@ -65,15 +65,15 @@ fn default_is_valid_orb_without_branches() {
 
 #[test]
 fn rejects_unsupported_version() {
-    let config = PipelineConfig {
+    let config = SystemConfig {
         version: 2,
-        ..PipelineConfig::default()
+        ..SystemConfig::default()
     };
     assert_eq!(
         config.validate(),
         Err(ConfigError::UnsupportedVersion {
             found: 2,
-            supported: PIPELINE_CONFIG_VERSION,
+            supported: SYSTEM_CONFIG_VERSION,
         })
     );
 }
@@ -88,7 +88,7 @@ fn keypoint_budget_is_bounded() {
         (*range.end(), true),
         (*range.end() + 1, false),
     ] {
-        let mut config = PipelineConfig::default();
+        let mut config = SystemConfig::default();
         orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
             n_keypoints,
             ..OrbFrontendConfig::default()
@@ -100,7 +100,7 @@ fn keypoint_budget_is_bounded() {
 #[test]
 fn keyframe_gaps_must_be_positive_and_ordered() {
     for (min, max, ok) in [(0, 8, false), (9, 8, false), (8, 8, true), (1, 2, true)] {
-        let mut config = PipelineConfig::default();
+        let mut config = SystemConfig::default();
         let keyframes = &mut orb_mut(&mut config).keyframes;
         keyframes.min_frames_between = min;
         keyframes.max_frames_between = max;
@@ -118,13 +118,13 @@ fn keyframe_ratio_must_be_finite_unit_interval() {
         (f64::NAN, false),
         (f64::INFINITY, false),
     ] {
-        let mut config = PipelineConfig::default();
+        let mut config = SystemConfig::default();
         orb_mut(&mut config).keyframes.ref_ratio = ratio;
         assert_eq!(config.validate().is_ok(), ok, "ratio {ratio}");
     }
 }
 
-fn invalid_setting(config: &PipelineConfig) -> Option<String> {
+fn invalid_setting(config: &SystemConfig) -> Option<String> {
     match config.validate() {
         Err(ConfigError::InvalidSetting { setting, .. }) => Some(setting),
         _ => None,
@@ -133,7 +133,7 @@ fn invalid_setting(config: &PipelineConfig) -> Option<String> {
 
 #[test]
 fn settings_are_range_checked() {
-    let mut config = PipelineConfig::default();
+    let mut config = SystemConfig::default();
     let orb = orb_mut(&mut config);
     orb.frontend = FrontendConfig::Orb(OrbFrontendConfig {
         stereo_close_depth: StereoCloseDepth::Metres(-1.0),
@@ -144,7 +144,7 @@ fn settings_are_range_checked() {
         Some("frontend.stereo_close_depth")
     );
 
-    let mut config = PipelineConfig::default();
+    let mut config = SystemConfig::default();
     orb_mut(&mut config)
         .tuning
         .initialization
@@ -155,7 +155,7 @@ fn settings_are_range_checked() {
         Some("tuning.initialization.match_config.nn_ratio")
     );
 
-    let mut config = PipelineConfig::default();
+    let mut config = SystemConfig::default();
     orb_mut(&mut config)
         .tuning
         .map_projection
@@ -211,9 +211,9 @@ fn loop_closing_requires_metric_input() {
 
 #[test]
 fn display_lists_sensors_and_branches() {
-    let config = PipelineConfig {
+    let config = SystemConfig {
         sensors: sensors(CameraSelection::Stereo, false),
-        ..PipelineConfig::default()
+        ..SystemConfig::default()
     };
     assert_eq!(
         config.to_string(),
@@ -312,10 +312,10 @@ mod runtime_settings {
     }
 
     /// The defaults must keep the runtime settings the system had before the
-    /// pipeline configuration owned them.
+    /// system configuration owned them.
     #[test]
     fn default_maps_to_previous_runtime_defaults() {
-        let config = PipelineConfig::default();
+        let config = SystemConfig::default();
         let slam = config.settings(&rig());
         assert_eq!(slam.keyframe_policy, KeyframePolicy::default());
         assert_eq!(slam.local_mapping, LocalMappingMode::Asynchronous);
@@ -344,7 +344,7 @@ mod runtime_settings {
 
     #[test]
     fn stage_settings_reach_runtime() {
-        let mut config = PipelineConfig::default();
+        let mut config = SystemConfig::default();
         let orb = orb_mut(&mut config);
         orb.frontend = FrontendConfig::Orb(OrbFrontendConfig {
             n_keypoints: 3000,
@@ -369,7 +369,7 @@ mod runtime_settings {
         assert_eq!(config.orb_detector().n_keypoints, 3000);
     }
 
-    fn orb_keyframes(config: &PipelineConfig) -> KeyframePolicy {
+    fn orb_keyframes(config: &SystemConfig) -> KeyframePolicy {
         let PipelineDefinition::OrbSlam(orb) = &config.pipeline;
         orb.keyframes
     }
@@ -380,7 +380,7 @@ mod runtime_settings {
             .select_rig(stereo_imu_rig())
             .unwrap();
         let close_depth = |depth| {
-            let mut config = PipelineConfig::default();
+            let mut config = SystemConfig::default();
             orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
                 stereo_close_depth: depth,
                 ..OrbFrontendConfig::default()
@@ -415,12 +415,7 @@ mod runtime_settings {
 
     #[test]
     fn vocabulary_loads_only_for_enabled_branches() {
-        assert!(
-            PipelineConfig::default()
-                .load_vocabulary()
-                .unwrap()
-                .is_none()
-        );
+        assert!(SystemConfig::default().load_vocabulary().unwrap().is_none());
 
         let missing = PathBuf::from("/nonexistent/ORBvoc.txt");
         let config = with_loop_closing(
@@ -452,24 +447,24 @@ mod ron_files {
         )
     "#;
 
-    fn orb(config: &PipelineConfig) -> &OrbSlamPipeline {
+    fn orb(config: &SystemConfig) -> &OrbSlamPipeline {
         let PipelineDefinition::OrbSlam(orb) = &config.pipeline;
         orb
     }
 
-    fn parse(text: &str) -> Result<PipelineConfig, LoadError> {
-        PipelineConfig::from_ron_str(text, Path::new(""))
+    fn parse(text: &str) -> Result<SystemConfig, LoadError> {
+        SystemConfig::from_ron_str(text, Path::new(""))
     }
 
     /// Tuning has no `PartialEq` and no file representation, so configurations
     /// are compared through their serialized form.
-    fn ron(config: &PipelineConfig) -> String {
+    fn ron(config: &SystemConfig) -> String {
         config.to_ron_string().unwrap()
     }
 
     #[test]
     fn explicit_defaults_equal_default() {
-        let default = ron(&PipelineConfig::default());
+        let default = ron(&SystemConfig::default());
         assert_eq!(ron(&parse(PLAN_EXAMPLE).unwrap()), default);
         assert_eq!(ron(&parse("(version: 1)").unwrap()), default);
     }
@@ -478,7 +473,7 @@ mod ron_files {
     fn partial_file_keeps_other_defaults() {
         let config =
             parse("(version: 1, pipeline: OrbSlam((frontend: Orb((n_keypoints: 3000)))))").unwrap();
-        let mut expected = PipelineConfig::default();
+        let mut expected = SystemConfig::default();
         orb_mut(&mut expected).frontend = FrontendConfig::Orb(OrbFrontendConfig {
             n_keypoints: 3000,
             ..OrbFrontendConfig::default()
@@ -493,7 +488,7 @@ mod ron_files {
             parse("(version: 1, pipeline: OrbSlam((tuning: ())))"),
             Err(LoadError::Parse(_))
         ));
-        let mut config = PipelineConfig::default();
+        let mut config = SystemConfig::default();
         orb_mut(&mut config).tuning.loss_recovery.timeout_imu_sec = 9.0;
         let reloaded = parse(&ron(&config)).unwrap();
         assert_eq!(orb(&reloaded).tuning.loss_recovery.timeout_imu_sec, 1.0);
@@ -556,12 +551,12 @@ mod ron_files {
             )
         };
         let base = Path::new("/configs");
-        let relative = PipelineConfig::from_ron_str(&text("../weights/ORBvoc.txt"), base).unwrap();
+        let relative = SystemConfig::from_ron_str(&text("../weights/ORBvoc.txt"), base).unwrap();
         assert_eq!(
             orb(&relative).loop_closing.vocabulary(),
             Some(Path::new("/configs/../weights/ORBvoc.txt"))
         );
-        let absolute = PipelineConfig::from_ron_str(&text("/weights/ORBvoc.bin"), base).unwrap();
+        let absolute = SystemConfig::from_ron_str(&text("/weights/ORBvoc.bin"), base).unwrap();
         assert_eq!(
             orb(&absolute).loop_closing.vocabulary(),
             Some(Path::new("/weights/ORBvoc.bin"))
@@ -578,7 +573,7 @@ mod ron_files {
             "(version: 1, sensors: (cameras: Stereo), pipeline: OrbSlam((loop_closing: Enabled(vocabulary: \"ORBvoc.txt\"))))",
         )
         .unwrap();
-        let loaded = PipelineConfig::from_ron_file(&path);
+        let loaded = SystemConfig::from_ron_file(&path);
         std::fs::remove_dir_all(&dir).unwrap();
 
         let config = loaded.unwrap();
@@ -590,7 +585,7 @@ mod ron_files {
 
     #[test]
     fn missing_file_is_an_io_error() {
-        let err = PipelineConfig::from_ron_file("/nonexistent/orb.ron").unwrap_err();
+        let err = SystemConfig::from_ron_file("/nonexistent/orb.ron").unwrap_err();
         assert!(matches!(err, LoadError::Io { .. }));
     }
 
@@ -613,7 +608,7 @@ mod ron_files {
         let text = ron(&config);
         let parsed = parse(&text).unwrap();
         assert_eq!(ron(&parsed), text);
-        assert_ne!(text, ron(&PipelineConfig::default()));
+        assert_ne!(text, ron(&SystemConfig::default()));
         assert_eq!(
             orb(&parsed).frontend,
             FrontendConfig::Orb(OrbFrontendConfig {

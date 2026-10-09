@@ -2,7 +2,7 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_image::{Image, ImageSize};
 use kornia_slam::{
-    CameraSelection, PipelineConfig, SensorFrame, SensorRig, SensorSelection, SlamSystem,
+    CameraSelection, SensorFrame, SensorRig, SensorSelection, SlamSystem, SystemConfig,
     TrackingStatus,
 };
 
@@ -21,12 +21,12 @@ fn test_camera() -> PinholeCamera {
 
 #[test]
 fn slam_system_builds_and_processes_through_the_public_api() {
-    let config = PipelineConfig {
+    let config = SystemConfig {
         sensors: SensorSelection {
             cameras: CameraSelection::Mono,
             imu: true,
         },
-        ..PipelineConfig::default()
+        ..SystemConfig::default()
     };
     let rig = SensorRig::new(test_camera()).with_imu(Pose3d::IDENTITY);
     let mut system = SlamSystem::build(config, rig).unwrap();
