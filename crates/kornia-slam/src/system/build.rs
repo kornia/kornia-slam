@@ -7,8 +7,8 @@ use super::config::{
 };
 use super::validation::ConfigError;
 use crate::initialization::two_view::TwoViewInitConfig;
-use crate::loop_closure::LoopClosingConfig;
-use crate::loop_closure::place_recognition::{Vocabulary, VocabularyLoadError, load_vocabulary};
+use crate::loop_closure::LoopCloser;
+use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabulary};
 use crate::mapping::LocalMappingMode;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
@@ -35,8 +35,6 @@ pub(crate) struct SystemSettings {
     /// keyframe back-projects its unassociated "close" (`z < threshold`) stereo
     /// keypoints directly into metric map points.
     pub stereo_close_depth_m: Option<f64>,
-    /// Verified loop closure and live pose-graph correction.
-    pub pgo: Option<LoopClosingConfig>,
 }
 
 impl SensorSelection {
@@ -70,10 +68,6 @@ impl SystemConfig {
             stereo_close_depth_m: rig
                 .stereo_baseline_m
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
-            pgo: orb
-                .loop_closing
-                .is_enabled()
-                .then(|| tuning.loop_correction.clone()),
         }
     }
 
@@ -86,12 +80,23 @@ impl SystemConfig {
         }
     }
 
-    /// Loads the vocabulary when loop closing is enabled; `None` when disabled.
-    pub(crate) fn load_vocabulary(&self) -> Result<Option<Vocabulary>, VocabularyLoadError> {
-        self.orb()
-            .loop_closing
+    /// The loop closer, with its vocabulary loaded, when loop closing is
+    /// enabled. With the IMU selected, correction waits for inertial
+    /// initialization.
+    pub(crate) fn loop_closer(
+        &self,
+        rig: &SensorRig,
+    ) -> Result<Option<LoopCloser>, VocabularyLoadError> {
+        let orb = self.orb();
+        orb.loop_closing
             .vocabulary()
-            .map(load_vocabulary)
+            .map(|path| {
+                Ok(LoopCloser::new(
+                    load_vocabulary(path)?,
+                    orb.tuning.loop_correction.clone(),
+                    rig.imu.is_some(),
+                ))
+            })
             .transpose()
     }
 

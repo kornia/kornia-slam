@@ -6,7 +6,7 @@ use kornia_image::ImageSize;
 
 use super::*;
 use crate::frontend::OrbFrontend;
-use crate::loop_closure::place_recognition::VocabularyLoadError;
+use crate::loop_closure::place_recognition::{Vocabulary, VocabularyLoadError};
 use crate::mapping::LocalMappingMode;
 
 #[test]
@@ -87,8 +87,8 @@ fn imu_samples() -> Vec<ImuMeasurement> {
         .collect()
 }
 
-/// A vocabulary trained on the texture's descriptors, saved where a pipeline
-/// file can name it.
+/// A vocabulary trained on the texture's descriptors, saved where a
+/// configuration can name it.
 fn saved_vocabulary(name: &str) -> PathBuf {
     let features = OrbFrontend::new(mono().orb_detector(), &SensorRig::new(camera()))
         .prepare(&input(0, &textured(0), &[]))
@@ -143,14 +143,14 @@ fn build_restricts_the_rig_to_selected_sensors() {
 #[test]
 fn build_reports_a_missing_vocabulary() {
     let missing = PathBuf::from("/nonexistent/ORBvoc.bin");
-    let detect = config(
+    let enabled = config(
         CameraSelection::Stereo,
         false,
         LoopClosingMode::Enabled {
             vocabulary: missing.clone(),
         },
     );
-    match SlamSystem::build(detect, stereo_imu_rig()) {
+    match SlamSystem::build(enabled, stereo_imu_rig()) {
         Err(BuildError::Vocabulary(VocabularyLoadError { path, .. })) => {
             assert_eq!(path, missing)
         }
@@ -161,11 +161,10 @@ fn build_reports_a_missing_vocabulary() {
 #[test]
 fn loop_closing_constructs_only_when_enabled() {
     let disabled = SlamSystem::build(mono(), stereo_imu_rig()).unwrap();
-    assert!(!disabled.loop_closer.has_vocabulary());
-    assert!(!disabled.loop_closer.corrects_loops());
+    assert!(disabled.loop_closer.is_none());
 
-    let vocabulary = saved_vocabulary("branches");
-    let correct = |imu| {
+    let vocabulary = saved_vocabulary("loop-closing");
+    let enabled = |imu| {
         let config = config(
             CameraSelection::Stereo,
             imu,
@@ -175,14 +174,9 @@ fn loop_closing_constructs_only_when_enabled() {
         );
         SlamSystem::build(config, stereo_imu_rig()).unwrap()
     };
-    let stereo = correct(false);
-    assert!(stereo.loop_closer.has_vocabulary());
-    assert!(stereo.loop_closer.corrects_loops());
-    assert_eq!(stereo.loop_closer.correction_requires_imu(), Some(false));
-    assert_eq!(
-        correct(true).loop_closer.correction_requires_imu(),
-        Some(true)
-    );
+    let stereo = enabled(false).loop_closer.unwrap();
+    assert!(!stereo.correction_requires_imu());
+    assert!(enabled(true).loop_closer.unwrap().correction_requires_imu());
     std::fs::remove_file(vocabulary).unwrap();
 }
 

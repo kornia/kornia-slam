@@ -236,7 +236,7 @@ fn display_lists_sensors_and_branches() {
   tracking
   keyframes: every 3..=8 frames, ref ratio 0.6
   local mapping: synchronous
-  loop closing: ORBvoc.txt, pose-graph correction
+  loop closing: ORBvoc.txt
 "
     );
 }
@@ -320,7 +320,6 @@ mod runtime_settings {
         assert_eq!(slam.keyframe_policy, KeyframePolicy::default());
         assert_eq!(slam.local_mapping, LocalMappingMode::Asynchronous);
         assert_eq!(slam.stereo_close_depth_m, None);
-        assert!(slam.pgo.is_none());
         assert_eq!(config.orb_detector().n_keypoints, 1000);
 
         let triangulation = &slam.two_view_init.triangulation_config;
@@ -390,41 +389,6 @@ mod runtime_settings {
         assert_eq!(close_depth(StereoCloseDepth::default()), Some(0.11 * 35.0));
         assert_eq!(close_depth(StereoCloseDepth::Metres(2.5)), Some(2.5));
         assert_eq!(close_depth(StereoCloseDepth::Disabled), None);
-    }
-
-    #[test]
-    fn enabled_loop_closing_configures_pgo() {
-        let stereo = sensors(CameraSelection::Stereo, false);
-        let stereo_rig = stereo.select_rig(stereo_imu_rig()).unwrap();
-        assert!(
-            with_loop_closing(LoopClosingMode::Disabled, stereo)
-                .settings(&stereo_rig)
-                .pgo
-                .is_none()
-        );
-
-        let mut config = with_loop_closing(loop_closing(), stereo);
-        orb_mut(&mut config)
-            .tuning
-            .loop_correction
-            .optimizer
-            .max_iterations = 7;
-        let pgo = config.settings(&stereo_rig).pgo.unwrap();
-        assert_eq!(pgo.optimizer.max_iterations, 7);
-    }
-
-    #[test]
-    fn vocabulary_loads_only_for_enabled_branches() {
-        assert!(SystemConfig::default().load_vocabulary().unwrap().is_none());
-
-        let missing = PathBuf::from("/nonexistent/ORBvoc.txt");
-        let config = with_loop_closing(
-            LoopClosingMode::Enabled {
-                vocabulary: missing.clone(),
-            },
-            SensorSelection::default(),
-        );
-        assert_eq!(config.load_vocabulary().err().unwrap().path, missing);
     }
 }
 

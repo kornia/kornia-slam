@@ -72,7 +72,7 @@ impl Default for PipelineDefinition {
 }
 
 /// Feature-based ORB path over a persistent map. Tracking and local mapping
-/// are always present; loop closing adds optional branches.
+/// are always present; loop closing is optional.
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
@@ -175,8 +175,8 @@ pub enum LoopClosingMode {
     /// No vocabulary is loaded and no recognition or correction work runs.
     #[default]
     Disabled,
-    /// Needs metric input: stereo cameras or the IMU. With a monocular IMU
-    /// pipeline, corrections wait for inertial initialization.
+    /// Needs metric input: stereo cameras or the IMU. With the IMU selected,
+    /// corrections wait for inertial initialization.
     Enabled { vocabulary: PathBuf },
 }
 
@@ -254,11 +254,7 @@ impl fmt::Display for SystemConfig {
         };
         writeln!(f, "  local mapping: {execution}")?;
         if let Some(vocabulary) = orb.loop_closing.vocabulary() {
-            writeln!(
-                f,
-                "  loop closing: {}, pose-graph correction",
-                vocabulary.display()
-            )?;
+            writeln!(f, "  loop closing: {}", vocabulary.display())?;
         }
         Ok(())
     }

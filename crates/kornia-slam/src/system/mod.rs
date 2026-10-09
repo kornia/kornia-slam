@@ -45,7 +45,6 @@ use crate::initialization::bootstrap::{
     TooFewStereoPoints, evaluate_bootstrap,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
-use crate::loop_closure::place_recognition::Vocabulary;
 use crate::loop_closure::{LoopCloser, LoopClosingContext, LoopClosureEvent};
 use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
 use crate::mapping::map::{
@@ -80,7 +79,7 @@ pub struct SlamSystem {
     inertial: InertialState,
     local_mapping: LocalMapping,
     // Place recognition for every keyframe, and loop closing when configured.
-    loop_closer: LoopCloser,
+    loop_closer: Option<LoopCloser>,
     loop_closure_events: Vec<LoopClosureEvent>,
     state: SystemState,
     frontend: OrbFrontend,
@@ -98,25 +97,21 @@ impl SlamSystem {
         let rig = config.sensors.select_rig(rig)?;
         let settings = config.settings(&rig);
         let frontend = OrbFrontend::new(config.orb_detector(), &rig);
-        let vocabulary = config.load_vocabulary()?;
-        Ok(Self::assemble(rig, settings, frontend, vocabulary))
+        let loop_closer = config.loop_closer(&rig)?;
+        Ok(Self::assemble(rig, settings, frontend, loop_closer))
     }
 
     fn assemble(
         rig: SensorRig,
         settings: SystemSettings,
         frontend: OrbFrontend,
-        vocabulary: Option<Vocabulary>,
+        loop_closer: Option<LoopCloser>,
     ) -> Self {
         let camera = rig.camera.clone();
         let map = Arc::new(Mutex::new(Map::new()));
         let local_mapping =
             LocalMapping::new(settings.local_mapping, Arc::clone(&map), camera.clone());
         let map_publication_gate = local_mapping.publication_gate();
-        let mut loop_closer = LoopCloser::new(settings.pgo, rig.imu.is_some());
-        if let Some(vocabulary) = vocabulary {
-            loop_closer.set_vocabulary(vocabulary);
-        }
         Self {
             rig,
             tracker: Tracker::new(settings.map_projection),
@@ -1013,8 +1008,6 @@ impl SlamSystem {
         // asynchronous mode will deliver it at a later frame boundary.
         self.apply_local_mapping_results();
 
-        // Index this keyframe for appearance-based place recognition and surface
-        // any loop candidates (no-op unless a vocabulary was provided).
         self.register_place_recognition(frame.idx);
 
         true
@@ -1093,9 +1086,12 @@ impl SlamSystem {
         self.inertial.schedule.complete(refinement);
     }
 
-    /// Offers a freshly inserted keyframe to place recognition and, when
-    /// configured, loop closing; applies whatever the closer reports back.
+    /// Offers a freshly inserted keyframe to loop closing, when enabled, and
+    /// applies whatever the closer reports back.
     fn register_place_recognition(&mut self, kf_idx: usize) {
+        let Some(loop_closer) = self.loop_closer.as_mut() else {
+            return;
+        };
         let context = LoopClosingContext {
             pose_world_to_cam: self.state.pose_world_to_cam,
             velocity_world: self.state.velocity_world,
@@ -1105,8 +1101,7 @@ impl SlamSystem {
         };
         let outcome = {
             let mut map = self.map.lock().unwrap();
-            self.loop_closer
-                .on_keyframe(&mut map, &self.rig.camera, kf_idx, context)
+            loop_closer.on_keyframe(&mut map, &self.rig.camera, kf_idx, context)
         };
         if let Some(message) = outcome.debug_message {
             self.dbg(message);
