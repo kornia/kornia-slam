@@ -6,4 +6,7 @@ docs/
 
 # Pixi
 .pixi/
-weights/
+
+# Datasets and the ORB vocabulary the example run files point at
+/data/
+/weights/

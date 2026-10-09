@@ -29,3 +29,6 @@ serde = { version = "1", features = ["derive"], optional = true }
 [features]
 # Serialization of the system configuration and its RON file loading.
 serde = ["dep:serde", "dep:ron"]
+
+[package.metadata.docs.rs]
+features = ["serde"]

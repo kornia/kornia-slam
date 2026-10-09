@@ -1,7 +1,7 @@
 # kornia-slam-app
 
 This package is the composition root for the `kornia-slam` executable. It wires the
-`kornia_slam::SlamSystem` runtime to four interchangeable frame sources — offline EuRoC MAV image sequences, offline MCAP recordings (e.g. bubbaloop captures), a live OAK-D camera, and any UVC-class camera (laptop webcams, USB cams, CSI-to-UVC adapters on a Pi…). All feed the same `SlamSystem::process` loop, and the TUI / Rerun visualizers work for any of them. Sources supply calibrated, synchronized images and IMU samples (rectified for stereo); feature extraction, stereo matching and fisheye keypoint mapping happen in the library. EuRoC, MCAP, and OAK-D additionally support a **stereo mode** (see below) that yields metric depth; UVC is monocular only.
+`kornia_slam::SlamSystem` runtime to five interchangeable frame sources — offline EuRoC MAV image sequences, extracted Hilti-Trimble challenge sequences (raw fisheye), offline MCAP recordings (e.g. bubbaloop captures), a live OAK-D camera, and any UVC-class camera (laptop webcams, USB cams, CSI-to-UVC adapters on a Pi…). All feed the same `SlamSystem::process` loop, and the TUI / Rerun visualizers work for any of them. Sources supply calibrated, synchronized images and IMU samples (rectified for stereo); feature extraction, stereo matching and fisheye keypoint mapping happen in the library. EuRoC, MCAP, and OAK-D additionally support a **stereo mode** (see below) that yields metric depth; Hilti and UVC are monocular only.
 
 ## Run files
 
@@ -18,9 +18,9 @@ A run is described by one RON file passed with `--config`: the `source` to read 
 cargo run --release -p kornia-slam-app -- --config run.ron
 ```
 
-- **`source`** is one of `Euroc`, `Hilti`, `Mcap`, `Oakd` or `Uvc`, with the dataset path or device settings, frame range (`start_frame`, `max_frames`; 0 = all) and, where needed, a calibration file. Its options are documented in [`src/config.rs`](src/config.rs).
+- **`source`** is one of `Euroc`, `Hilti`, `Mcap`, `Oakd` or `Uvc`, with the dataset path or device settings, frame range (`start_frame`, `max_frames`; 0 = all) and, where needed, a calibration file. Each source's options are documented in its module under [`src/source/`](src/source).
 - **`system`** selects the sensors, ORB settings, keyframe policy, local-mapping execution and loop closing. Omitted, the default monocular pipeline runs. Lower-level algorithm thresholds are not part of the file; library users set them in Rust.
-- Omitted fields keep their defaults. Unknown fields and invalid values are rejected before any data is read, and selecting a sensor the source cannot provide fails with an explicit error.
+- `system.version` is required; other omitted fields keep their defaults. Unknown fields and invalid values are rejected before any data is read, and selecting a sensor the source cannot provide fails with an explicit error.
 - Relative paths (datasets, recordings, calibration, vocabulary) resolve against the run file's directory.
 - Loop closing needs an ORB vocabulary (DBoW2 `ORBvoc.txt`, or a `.bin` from `convert_orbvoc`) and stereo or IMU input.
 
@@ -65,11 +65,13 @@ V1_01_easy/
     │   └── data/
     │       ├── 1403636579763555584.png
     │       └── ...
-    └── state_groundtruth_estimate0/
+    ├── cam1/                          (stereo)
+    ├── imu0/                          (IMU)
+    └── state_groundtruth_estimate0/   (--evaluate)
         └── data.csv
 ```
 
-`mav0/cam0/{data.csv,sensor.yaml}` and the PNGs under `data/` are required. Ground truth is optional and only parsed by the dataset reader.
+`mav0/cam0/{data.csv,sensor.yaml}` and the PNGs under `data/` are always required; `cam1/` with stereo cameras, `imu0/` with the IMU, and ground truth with `--evaluate`.
 
 [Machine Hall sequences](https://www.research-collection.ethz.ch/entities/researchdata/bcaf173e-5dac-484b-bc37-faf97a594f1f) (MH_01–MH_05) are recommended for initial testing.
 

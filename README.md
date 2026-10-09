@@ -48,6 +48,9 @@ cargo run --release -p kornia-slam-app -- --config configs/euroc.ron
 cargo run --release -p kornia-slam-app -- --config configs/euroc-stereo-imu-loop.ron --evaluate
 ```
 
+Loop closing needs ORB-SLAM3's vocabulary: extract `Vocabulary/ORBvoc.txt.tar.gz`
+from [ORB-SLAM3](https://github.com/UZ-SLAMLab/ORB_SLAM3) to `weights/ORBvoc.txt`.
+
 A run file names the source and the system to run on it; see
 [apps/kornia-slam-app](apps/kornia-slam-app/README.md#run-files).
 
@@ -61,9 +64,12 @@ stereo matching and frame history are the system's; sources supply
 synchronized, calibrated (and, for stereo, rectified) images.
 
 ```rust,ignore
-use kornia_slam::{SystemConfig, SensorFrame, SlamSystem};
+use kornia_slam::{CameraSelection, SensorFrame, SensorSelection, SlamSystem, SystemConfig};
 
-let config = SystemConfig::from_ron_file("stereo-imu.ron")?; // a system file; `serde` feature
+let config = SystemConfig {
+    sensors: SensorSelection { cameras: CameraSelection::Stereo, imu: true },
+    ..SystemConfig::default()
+};
 let mut system = SlamSystem::build(config, rig)?; // rig: kornia_slam::SensorRig
 for (idx, frame) in frames.enumerate() {
     let result = system.process(SensorFrame {
@@ -76,6 +82,9 @@ for (idx, frame) in frames.enumerate() {
     println!("{idx}: {:?} {:?}", result.status, result.pose_world_to_cam);
 }
 ```
+
+With the `serde` feature, `SystemConfig::from_ron_file` reads the same settings
+from a RON file, the `system` section of a run file.
 
 ## Integrations
 
