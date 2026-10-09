@@ -22,6 +22,15 @@ mapping); the other ten sequences are unchanged. `MapProjectionConfig`'s
 `lost_search_scale`, and `TrackingLossRecoveryPolicy` gains
 `keyframe_interval_while_lost_sec`.
 
+**Visual tracking relocalizes against the map.** When tracking fails without a
+settled IMU (stereo or mono only, or before inertial initialization), each lost
+frame is scored against the keyframe database, matched against the best
+candidates, solved with PnP RANSAC and refined against the candidate's local
+map; 50 inliers resume tracking where the map already was instead of starting
+a new one. It uses the loop closer's vocabulary, so it runs when loop closing
+is enabled. On EuRoC V2_03 stereo-only, resets drop from 22 to 18 (ATE
+1.72 m → 1.27 m).
+
 **EuRoC stereo pairs are matched by timestamp.** The source paired left and
 right images by position, which is off by one frame for all of MH_04 and
 drifts through V2_03's dropped left frames; stereo results on those two

@@ -843,17 +843,22 @@ impl SlamSystem {
             }
         }
 
+        // With a settled IMU the system coasts instead (below): a relocalized
+        // pose taken from an older part of a drifted map would jump away from
+        // the inertial state, which ORB-SLAM3 also avoids in inertial mode.
+        if status == TrackingStatus::Skipped
+            && !self.imu_confident(timestamp_sec)
+            && self.relocalize(&frame)
+        {
+            status = TrackingStatus::Tracked;
+        }
         if status == TrackingStatus::Skipped {
             let policy = &self.tracking_loss_recovery;
 
             let lost_since = *self.state.lost_since_sec.get_or_insert(timestamp_sec);
             let recently_lost_for = timestamp_sec - lost_since;
 
-            let imu_confident = self.state.imu_initialized
-                && self
-                    .state
-                    .imu_init_timestamp_sec
-                    .is_some_and(|t0| timestamp_sec - t0 >= policy.min_imu_confidence_sec);
+            let imu_confident = self.imu_confident(timestamp_sec);
             let grace_period_sec = policy.grace_period_sec(imu_confident);
             let map_established =
                 self.map.lock().unwrap().keyframes().len() > policy.min_keyframes_for_grace;
@@ -886,6 +891,44 @@ impl SlamSystem {
             self.prune_imu_before(kf_ts.min(timestamp_sec));
         }
         self.frame_result(status)
+    }
+
+    /// Whether the IMU has been initialized long enough to coast on.
+    fn imu_confident(&self, timestamp_sec: f64) -> bool {
+        let min_confidence_sec = self.tracking_loss_recovery.min_imu_confidence_sec;
+        self.state.imu_initialized
+            && self
+                .state
+                .imu_init_timestamp_sec
+                .is_some_and(|t0| timestamp_sec - t0 >= min_confidence_sec)
+    }
+
+    /// Recovers the pose against the map from place-recognition candidates
+    /// and resumes tracking from it. Needs the loop closer's vocabulary and
+    /// keyframe database.
+    fn relocalize(&mut self, frame: &Frame) -> bool {
+        const MAX_CANDIDATES: usize = 5;
+        let Some(loop_closer) = self.loop_closer.as_ref() else {
+            return false;
+        };
+        let candidates =
+            loop_closer.relocalization_candidates(&frame.features.descriptors, MAX_CANDIDATES);
+        let found = {
+            let map = self.map.lock().unwrap();
+            self.tracker
+                .relocalize(frame, &candidates, &map, &self.rig.camera)
+        };
+        let Some(found) = found else {
+            return false;
+        };
+        self.dbg(format!(
+            "[reloc] frame={} against kf={} inliers={}",
+            frame.idx, found.keyframe_idx, found.estimate.inliers
+        ));
+        self.state.pose_world_to_cam = found.estimate.pose;
+        self.state.current_keyframe_idx = Some(found.keyframe_idx);
+        self.state.velocity = None;
+        true
     }
 
     /// Whether to extend the map from this frame while coasting on the IMU:
