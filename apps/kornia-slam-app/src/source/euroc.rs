@@ -157,10 +157,9 @@ impl FrameSource for EurocSource {
     }
 
     fn next_frame(&mut self) -> Result<Option<FrameItem>, SourceError> {
-        if self.cursor >= self.end {
+        let Some(idx) = self.advance() else {
             return Ok(None);
-        }
-        let idx = self.cursor;
+        };
         let sample = &self.dataset.left_samples[idx];
         let timestamp_sec = sample.timestamp_sec;
         let left_raw = read_image_png_mono8(&sample.image_path)
@@ -169,7 +168,11 @@ impl FrameSource for EurocSource {
 
         let (image, right_image) = match &self.rectifier {
             Some(rect) => {
-                let right_path = &self.dataset.right_samples[idx].image_path;
+                let right_path = &self
+                    .dataset
+                    .right_sample_for(idx)
+                    .ok_or_else(|| SourceError::other("left frame has no right partner"))?
+                    .image_path;
                 let right_raw = read_image_png_mono8(right_path)
                     .map_err(SourceError::other)?
                     .into_inner();
@@ -180,7 +183,6 @@ impl FrameSource for EurocSource {
         };
         let imu_samples = self.imu_samples_until(timestamp_sec);
 
-        self.cursor += 1;
         Ok(Some(FrameItem {
             idx,
             timestamp_sec,
@@ -215,6 +217,20 @@ impl EurocSource {
             }
             None => Some(Pose3d::from_rt(rotation, translation)),
         }
+    }
+
+    /// Next left frame to yield: any frame in mono mode, and in stereo mode
+    /// only frames with a synchronised right image. IMU samples of a skipped
+    /// frame are delivered with the next yielded one.
+    fn advance(&mut self) -> Option<usize> {
+        while self.cursor < self.end {
+            let idx = self.cursor;
+            self.cursor += 1;
+            if self.rectifier.is_none() || self.dataset.right_sample_for(idx).is_some() {
+                return Some(idx);
+            }
+        }
+        None
     }
 
     fn imu_samples_until(&mut self, timestamp_sec: f64) -> Vec<ImuMeasurement> {
