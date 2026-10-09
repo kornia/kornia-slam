@@ -1,4 +1,4 @@
-//! Frame sources: offline datasets (EuRoC, Hilti, MCAP recordings) and live
+//! Frame sources: offline datasets (EuRoC, Hilti, TUM-VI, MCAP recordings) and live
 //! cameras (OAK-D, UVC) behind one [`FrameSource`] trait. Each source module
 //! also owns the run-file settings it is opened from.
 
@@ -6,6 +6,7 @@ pub mod euroc;
 pub mod hilti;
 pub mod mcap;
 pub mod oakd;
+pub mod tumvi;
 pub mod uvc;
 
 use std::path::{Path, PathBuf};
@@ -23,6 +24,7 @@ use euroc::EurocConfig;
 use hilti::HiltiConfig;
 use mcap::McapConfig;
 use oakd::OakdConfig;
+use tumvi::TumViConfig;
 use uvc::UvcConfig;
 
 /// One frame yielded by a source.
@@ -99,6 +101,7 @@ pub enum SourceConfig {
     Hilti(HiltiConfig),
     Mcap(McapConfig),
     Oakd(OakdConfig),
+    TumVi(TumViConfig),
     Uvc(UvcConfig),
 }
 
@@ -112,6 +115,7 @@ impl SourceConfig {
             Self::Hilti(hilti) => hilti.validate(sensors),
             Self::Mcap(mcap) => mcap.validate(sensors),
             Self::Oakd(oakd) => oakd.validate(sensors),
+            Self::TumVi(tumvi) => tumvi.validate(sensors),
             Self::Uvc(uvc) => uvc.validate(sensors),
         }
     }
@@ -123,6 +127,7 @@ impl SourceConfig {
             Self::Hilti(hilti) => hilti.resolve_paths(base_dir),
             Self::Mcap(mcap) => mcap.resolve_paths(base_dir),
             Self::Oakd(oakd) => oakd.resolve_paths(base_dir),
+            Self::TumVi(tumvi) => tumvi.resolve_paths(base_dir),
             Self::Uvc(_) => {}
         }
     }
@@ -132,9 +137,10 @@ impl SourceConfig {
         let stereo = sensors.cameras == CameraSelection::Stereo;
         match self {
             Self::Euroc(euroc) => euroc.open(stereo),
-            Self::Hilti(hilti) => hilti.open(),
+            Self::Hilti(hilti) => hilti.open(sensors.imu),
             Self::Mcap(mcap) => mcap.open(stereo),
             Self::Oakd(oakd) => oakd.open(stereo),
+            Self::TumVi(tumvi) => tumvi.open(sensors.imu),
             Self::Uvc(uvc) => uvc.open(),
         }
     }

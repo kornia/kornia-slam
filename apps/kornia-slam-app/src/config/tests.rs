@@ -158,7 +158,8 @@ fn sources_are_checked_before_opening() {
         ("Oakd(())", stereo, "needs `calib`"),
         (hilti, stereo, "monocular images only"),
         (uvc, stereo, "monocular images only"),
-        (hilti, imu, "no IMU data"),
+        (hilti, imu, "needs `rotate_180: false`"),
+        (r#"TumVi((data: "d"))"#, stereo, "monocular images only"),
         (mcap, imu, "no IMU data"),
         ("Oakd(())", imu, "no IMU data"),
         (uvc, imu, "no IMU data"),
@@ -177,6 +178,8 @@ fn sources_are_checked_before_opening() {
     }
     for (source, sensors) in [
         (r#"Mcap((path: "r.mcap", calib: "c.yaml"))"#, stereo),
+        (r#"TumVi((data: "d"))"#, imu),
+        (r#"Hilti((data: "d", calib: "c", rotate_180: false))"#, imu),
         (r#"Euroc((data: "d"))"#, "(cameras: Stereo, imu: true)"),
     ] {
         assert!(parse(&run(source, sensors)).is_ok(), "{source} {sensors}");

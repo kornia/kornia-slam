@@ -1,7 +1,7 @@
 # kornia-slam-app
 
 This package is the composition root for the `kornia-slam` executable. It wires the
-`kornia_slam::SlamSystem` runtime to five interchangeable frame sources — offline EuRoC MAV image sequences, extracted Hilti-Trimble challenge sequences (raw fisheye), offline MCAP recordings (e.g. bubbaloop captures), a live OAK-D camera, and any UVC-class camera (laptop webcams, USB cams, CSI-to-UVC adapters on a Pi…). All feed the same `SlamSystem::process` loop, and the TUI / Rerun visualizers work for any of them. Sources supply calibrated, synchronized images and IMU samples (rectified for stereo); feature extraction, stereo matching and fisheye keypoint mapping happen in the library. EuRoC, MCAP, and OAK-D additionally support a **stereo mode** (see below) that yields metric depth; Hilti and UVC are monocular only.
+`kornia_slam::SlamSystem` runtime to six interchangeable frame sources — offline EuRoC MAV image sequences, extracted Hilti-Trimble challenge sequences (raw fisheye), TUM-VI sequences (raw fisheye), offline MCAP recordings (e.g. bubbaloop captures), a live OAK-D camera, and any UVC-class camera (laptop webcams, USB cams, CSI-to-UVC adapters on a Pi…). All feed the same `SlamSystem::process` loop, and the TUI / Rerun visualizers work for any of them. Sources supply calibrated, synchronized images and IMU samples (rectified for stereo); feature extraction, stereo matching and fisheye keypoint mapping happen in the library. EuRoC, MCAP, and OAK-D additionally support a **stereo mode** (see below) that yields metric depth; Hilti, TUM-VI and UVC are monocular only.
 
 ## Run files
 
@@ -18,7 +18,7 @@ A run is described by one RON file passed with `--config`: the `source` to read 
 cargo run --release -p kornia-slam-app -- --config run.ron
 ```
 
-- **`source`** is one of `Euroc`, `Hilti`, `Mcap`, `Oakd` or `Uvc`, with the dataset path or device settings, frame range (`start_frame`, `max_frames`; 0 = all) and, where needed, a calibration file. Each source's options are documented in its module under [`src/source/`](src/source).
+- **`source`** is one of `Euroc`, `Hilti`, `TumVi`, `Mcap`, `Oakd` or `Uvc`, with the dataset path or device settings, frame range (`start_frame`, `max_frames`; 0 = all) and, where needed, a calibration file. Each source's options are documented in its module under [`src/source/`](src/source).
 - **`system`** selects the sensors, ORB settings, keyframe policy, local-mapping execution and loop closing. Omitted, the default monocular pipeline runs. Lower-level algorithm thresholds are not part of the file; library users set them in Rust.
 - `system.version` is required; other omitted fields keep their defaults. Unknown fields and invalid values are rejected before any data is read, and selecting a sensor the source cannot provide fails with an explicit error.
 - Relative paths (datasets, recordings, calibration, vocabulary) resolve against the run file's directory.
@@ -31,6 +31,7 @@ cargo run --release -p kornia-slam-app -- --config run.ron
 | `euroc.ron` | EuRoC, monocular; lists every system setting with its default |
 | `euroc-stereo-imu-loop.ron` | EuRoC, stereo + IMU with loop closing |
 | `hilti.ron` | Hilti fisheye sequence, 3000 keypoints |
+| `tumvi-imu.ron` | TUM-VI fisheye sequence with the IMU |
 | `mcap-stereo.ron` | MCAP recording, rectified stereo |
 | `oakd-stereo.ron` | Live OAK-D stereo (`--features oakd`) |
 | `uvc.ron` | Live UVC camera (`--features uvc`) |
@@ -42,12 +43,13 @@ Sensors each source can provide:
 | `Euroc` | yes | yes |
 | `Mcap` | yes, with `calib` | no |
 | `Oakd` | yes, with `calib` | no |
-| `Hilti` | no | no |
+| `Hilti` | no | with `rotate_180: false` |
+| `TumVi` | no | yes |
 | `Uvc` | no | no |
 
 `Oakd` requires `--features oakd` and `Uvc` requires `--features uvc`; a run file naming them in a build without the feature fails with a message saying which. The default build needs no extra system dependencies.
 
-Command-line options are only about evaluation and display: `--evaluate` and `--eval-out DIR` (sources with ground truth: EuRoC, Hilti), and the visualizer flags below.
+Command-line options are only about evaluation and display: `--evaluate` and `--eval-out DIR` (sources with ground truth: EuRoC, Hilti, TUM-VI), and the visualizer flags below.
 
 ## EuRoC dataset
 
