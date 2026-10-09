@@ -160,13 +160,8 @@ fn validate_tracking(tuning: &OrbTuning) -> Result<(), ConfigError> {
     validate_projection(at("projection"), &projection.projection)?;
     validate_projection(at("local_projection"), &projection.local_projection)?;
     check(
-        at("search_widen_per_sec"),
-        projection.search_widen_per_sec.into(),
-        NON_NEGATIVE,
-    )?;
-    check(
-        at("max_search_scale"),
-        projection.max_search_scale.into(),
+        at("lost_search_scale"),
+        projection.lost_search_scale.into(),
         AT_LEAST_ONE,
     )?;
     check(
@@ -191,6 +186,11 @@ fn validate_tracking(tuning: &OrbTuning) -> Result<(), ConfigError> {
         at("min_imu_confidence_sec"),
         recovery.min_imu_confidence_sec,
         NON_NEGATIVE,
+    )?;
+    check(
+        at("keyframe_interval_while_lost_sec"),
+        recovery.keyframe_interval_while_lost_sec,
+        POSITIVE,
     )
 }
 

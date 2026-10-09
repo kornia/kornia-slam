@@ -54,18 +54,16 @@ impl KeyframePolicy {
 }
 
 /// Recently-lost grace period policy (mirrors ORB-SLAM3's RECENTLY_LOST vs
-/// LOST distinction), bridging brief interruptions (motion blur, a few
-/// dropped/occluded frames) without throwing the map away.
+/// LOST distinction), bridging interruptions (fast rotation, motion blur,
+/// dropped frames) without throwing the map away.
 ///
-/// Deliberately short, unlike ORB-SLAM3's ~5s: our PnP has no RANSAC/robust
-/// loss, so the projection search and the PnP prior-reprojection gate both
-/// key off the same predicted pose. Once genuinely lost (not a brief blip),
-/// that pose keeps compounding IMU/constant-velocity drift every extra frame
-/// we wait, which does not improve recovery odds (verified against EuRoC
-/// V101 frames ~600-770, a sustained-loss segment: granting several seconds
-/// of patience there only delayed the same eventual reset, it never let
-/// tracking resume early). A map that's too young, or an inertial state that
-/// hasn't settled yet, gets no grace at all.
+/// With a settled IMU, tracking coasts on the inertial prediction for up to
+/// `timeout_imu_sec` (ORB-SLAM3's `time_recently_lost`), and stereo keyframes
+/// keep extending the map at the predicted pose every
+/// `keyframe_interval_while_lost_sec`: after a fast turn the camera faces
+/// space the map does not cover, and only new landmarks there let tracking
+/// resume. A map that's too young, or an inertial state that hasn't settled
+/// yet, gets the short visual grace period.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TrackingLossRecoveryPolicy {
     /// Minimum keyframe count before any grace period is granted.
@@ -78,20 +76,30 @@ pub struct TrackingLossRecoveryPolicy {
     /// How long the IMU must have been initialized before `timeout_imu_sec`
     /// applies instead of `timeout_visual_sec`.
     pub min_imu_confidence_sec: f64,
+    /// Seconds between stereo keyframes inserted at the IMU-predicted pose
+    /// while coasting.
+    pub keyframe_interval_while_lost_sec: f64,
 }
 
 impl Default for TrackingLossRecoveryPolicy {
     fn default() -> Self {
         Self {
             min_keyframes_for_grace: 10,
-            timeout_imu_sec: 1.0,
+            timeout_imu_sec: 5.0,
             timeout_visual_sec: 0.5,
             min_imu_confidence_sec: 2.0,
+            keyframe_interval_while_lost_sec: 0.2,
         }
     }
 }
 
 impl TrackingLossRecoveryPolicy {
+    /// Whether a lost frame should become a keyframe, given the seconds since
+    /// the last one.
+    pub fn keyframe_due(&self, since_last_keyframe_sec: f64) -> bool {
+        since_last_keyframe_sec >= self.keyframe_interval_while_lost_sec
+    }
+
     /// Grace period, in seconds, to allow before giving up and resetting.
     pub fn grace_period_sec(&self, imu_confident: bool) -> f64 {
         if imu_confident {
@@ -99,5 +107,24 @@ impl TrackingLossRecoveryPolicy {
         } else {
             self.timeout_visual_sec
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TrackingLossRecoveryPolicy;
+
+    #[test]
+    fn keyframes_while_lost_follow_the_interval() {
+        let policy = TrackingLossRecoveryPolicy::default();
+        let interval = policy.keyframe_interval_while_lost_sec;
+        assert!(!policy.keyframe_due(interval * 0.5));
+        assert!(policy.keyframe_due(interval));
+    }
+
+    #[test]
+    fn a_settled_imu_coasts_longer_than_vision_alone() {
+        let policy = TrackingLossRecoveryPolicy::default();
+        assert!(policy.grace_period_sec(true) > policy.grace_period_sec(false));
     }
 }

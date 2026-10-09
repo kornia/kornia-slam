@@ -10,6 +10,23 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**Stereo-inertial tracking rides through fast motion instead of resetting.**
+Once the IMU has settled, a tracking failure now coasts on the inertial
+prediction for up to 5 s (was 1 s, ORB-SLAM3's `time_recently_lost`), keeps
+inserting stereo keyframes at the predicted pose every 0.2 s so the map covers
+the view the camera turned to, and widens the projection search at once
+rather than over several seconds. On EuRoC V2_03 stereo+IMU the system no
+longer resets (21 resets before, ATE 1.66 m → 0.88 m with synchronous
+mapping); the other ten sequences are unchanged. `MapProjectionConfig`'s
+`search_widen_per_sec` and `max_search_scale` are replaced by
+`lost_search_scale`, and `TrackingLossRecoveryPolicy` gains
+`keyframe_interval_while_lost_sec`.
+
+**EuRoC stereo pairs are matched by timestamp.** The source paired left and
+right images by position, which is off by one frame for all of MH_04 and
+drifts through V2_03's dropped left frames; stereo results on those two
+sequences were invalid.
+
 **Runs are defined by a configuration file.** The CLI takes one RON run file,
 `kornia-slam --config run.ron`, with a `source` (EuRoC, Hilti, MCAP, OAK-D or
 UVC: paths, frame range, calibration) and a `system` (sensors, ORB settings,
