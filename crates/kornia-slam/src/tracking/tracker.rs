@@ -19,6 +19,7 @@ use crate::tracking::pose_estimation::map_projection::{
     MapProjectionConfig, MapProjectionRejectReason,
 };
 use crate::tracking::pose_estimation::{Estimate, MapProjectionEstimator};
+use crate::tracking::relocalization::{Relocalization, RelocalizationConfig, relocalize};
 
 /// Everything the tracker needs about the current frame that it does not own.
 pub(crate) struct FrameInput<'a> {
@@ -47,6 +48,29 @@ impl Tracker {
             klt_tracker: KltTracker::default(),
             track_set: TrackSet::new(),
         }
+    }
+
+    /// Recovers the pose against one of the candidate keyframes; on success
+    /// the optical-flow tracks, which belonged to the lost pose, are dropped.
+    pub(crate) fn relocalize(
+        &mut self,
+        frame: &Frame,
+        candidates: &[usize],
+        map: &Map,
+        camera: &PinholeCamera,
+    ) -> Option<Relocalization> {
+        let found = relocalize(
+            frame,
+            candidates,
+            map,
+            camera,
+            &self.estimator,
+            &RelocalizationConfig::default(),
+        );
+        if found.is_some() {
+            self.reset_tracks();
+        }
+        found
     }
 
     /// Drops optical-flow continuity. Used when the map's world frame changes

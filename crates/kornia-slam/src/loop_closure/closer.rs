@@ -102,6 +102,22 @@ impl LoopCloser {
     /// the lowest BoW similarity to a covisible neighbour, and the covisibility
     /// set is excluded so only a revisited place can match. The query runs before
     /// this keyframe is added, so it never matches itself.
+    /// Keyframes that look like the given descriptors, best first, for
+    /// relocalization.
+    pub(crate) fn relocalization_candidates(
+        &self,
+        descriptors: &[[u8; 32]],
+        max_candidates: usize,
+    ) -> Vec<usize> {
+        let query = compute_bow(&self.vocabulary, descriptors);
+        self.kf_database
+            .detect_candidates(&query, &HashSet::new(), 0.0)
+            .into_iter()
+            .take(max_candidates)
+            .map(|candidate| candidate.kf_idx)
+            .collect()
+    }
+
     pub(crate) fn on_keyframe(
         &mut self,
         map: &mut Map,
