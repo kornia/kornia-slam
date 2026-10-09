@@ -13,10 +13,17 @@
 //! * at rest the gyroscope measures `w = 0 + b_g`, so `b_g = mean(w)`;
 //! * velocity is zero.
 //!
-//! The accelerometer bias is NOT observable at rest: any `b_a` trades one for
-//! one against a tilt of the gravity direction. It is held at the caller's
-//! prior, and the refinements and visual-inertial BA that follow estimate it
-//! once the platform moves. This is the textbook zero-velocity
+//! The accelerometer bias is only HALF observable at rest. Its component
+//! across gravity trades one for one against a tilt of the gravity direction,
+//! so it is held at the caller's prior, and the refinements and
+//! visual-inertial BA that follow estimate it once the platform moves. Its
+//! component ALONG gravity is fixed by the known magnitude of g: a still IMU
+//! reading `|f| = 9.66` has 0.15 m/s^2 of vertical bias (or scale error, which
+//! at rest is the same thing), and is corrected by exactly that along the
+//! measured direction. Leaving it unmodelled would put it into the velocities
+//! of the first visual-inertial BA, ~0.2 m/s per 1.4 s edge on a parked rig,
+//! while the tight bias random walk moves it into the bias only slowly.
+//! This is the textbook zero-velocity
 //! initialization; see e.g. Qin et al., VINS-Mono (IEEE T-RO 2018), and the
 //! static initializer of Geneva et al., OpenVINS (ICRA 2020).
 //!
@@ -37,7 +44,26 @@ use super::{ImuInitResult, ImuInitializer, window_is_mono};
 use crate::mapping::map::{Keyframe, Map};
 
 /// Mean and spread of a window of raw IMU samples, in the IMU (body) frame.
+///
+/// Built with [`ImuWindowStats::from_samples`]; `#[non_exhaustive]` so a
+/// figure can be added later without breaking callers.
+///
+/// ```compile_fail
+/// // `#[non_exhaustive]`: built by `from_samples` only, so a figure can be
+/// // added without a semver break.
+/// use kornia_algebra::Vec3F64;
+/// use kornia_slam::initialization::ImuWindowStats;
+/// let _ = ImuWindowStats {
+///     samples: 2,
+///     duration_sec: 1.0,
+///     mean_accel: Vec3F64::ZERO,
+///     mean_gyro: Vec3F64::ZERO,
+///     accel_rms_dev: 0.0,
+///     gyro_rms_dev: 0.0,
+/// };
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct ImuWindowStats {
     /// Samples in the window.
     pub samples: usize,
@@ -103,6 +129,7 @@ fn finite(v: Vec3F64) -> bool {
 
 /// Why a stationary initialization was refused.
 #[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum StationaryInitError {
     /// The window's first keyframe carries no stereo data. Without stereo the
     /// map has no metric scale, and a stationary window cannot supply one.
@@ -143,9 +170,15 @@ impl ImuInitializer {
     /// `start_idx`: scale 1 (the map is already metric), gravity in the
     /// CURRENT world frame at standard magnitude, a zero velocity for every
     /// keyframe at or after `start_idx`, gyro bias `mean(w)` and accelerometer
-    /// bias `prior_bias.accel` (unobservable at rest; see the module docs).
+    /// bias `prior_bias.accel` corrected ALONG the measured specific force by
+    /// `|mean(f) - prior_bias.accel| - g`: the across-gravity part is
+    /// unobservable at rest and stays at the prior, the along-gravity part is
+    /// what the known magnitude of g pins (see the module docs). The corrected
+    /// specific force then has magnitude g exactly, so gravity needs no
+    /// rescale.
     ///
-    /// `max_gravity_norm_error` bounds `| |mean(f) - b_a| - g |` in m/s^2.
+    /// `max_gravity_norm_error` bounds `| |mean(f) - prior_bias.accel| - g |`
+    /// in m/s^2: the largest vertical bias (or scale error) believed.
     ///
     /// # Errors
     ///
@@ -188,7 +221,9 @@ impl ImuInitializer {
         let r_wc = newest.frame.pose_world_to_cam.inverse().rotation;
         let r_cb = imu_t_bc.inverse().rotation;
         let r_wb = r_wc * r_cb;
-        let gravity_world = -(r_wb * f_body) * (GRAVITY_MAGNITUDE / norm);
+        // The along-gravity bias: whatever |f| has over g, along f.
+        let accel_bias = prior_bias.accel + f_body * ((norm - GRAVITY_MAGNITUDE) / norm);
+        let gravity_world = -(r_wb * (stats.mean_accel - accel_bias));
 
         Ok(ImuInitResult {
             scale: 1.0,
@@ -196,7 +231,7 @@ impl ImuInitializer {
             velocities_world: vec![Vec3F64::ZERO; keyframes.len()],
             bias: ImuBias {
                 gyro: stats.mean_gyro,
-                accel: prior_bias.accel,
+                accel: accel_bias,
             },
         })
     }
@@ -436,7 +471,8 @@ mod tests {
         );
         assert!((init.gravity_world.length() - GRAVITY_MAGNITUDE).abs() < 1e-9);
         assert!((init.bias.gyro - bias().gyro).length() < 1e-9);
-        assert_eq!(init.bias.accel, prior.accel);
+        // |f - prior| is g exactly here, so the along-gravity correction is nil.
+        assert!((init.bias.accel - prior.accel).length() < 1e-9);
         assert_eq!(init.scale, 1.0);
         assert_eq!(init.velocities_world, vec![Vec3F64::ZERO; 4]);
 
@@ -581,5 +617,48 @@ mod tests {
                 "specific force in the aligned world: {up:?}"
             );
         }
+    }
+    /// The along-gravity accelerometer bias IS observable at rest: an IMU at
+    /// XLeRobot's measured `|a| = 9.66` with a zero prior recovers the 0.15
+    /// m/s^2 along the measured direction, keeps the across-gravity part at the
+    /// prior, and its corrected specific force has magnitude g, so gravity is
+    /// unchanged in direction and exact in size.
+    ///
+    /// Mutation: keeping `accel` at the prior (the original behaviour) turned
+    /// this red.
+    #[test]
+    fn stationary_init_recovers_the_along_gravity_accel_bias() {
+        let r_vis = SO3F64::exp(Vec3F64::new(0.1, -0.3, 0.2)).matrix();
+        let map = still_map(4, 0.6, r_vis, Vec3F64::ZERO);
+        // A vertical bias of -0.15 m/s^2 along the specific force: |f| = 9.66.
+        let f_true = tilted_r_wb().transpose() * (-gravity_true());
+        let along = f_true.normalize() * -0.15;
+        let samples: Vec<ImuMeasurement> = still_samples(
+            0.0,
+            241,
+            tilted_r_wb(),
+            gravity_true(),
+            ImuBias {
+                gyro: bias().gyro,
+                accel: along,
+            },
+            (0.0, 0.0),
+        );
+        let stats = ImuWindowStats::from_samples(&samples).unwrap();
+        assert!((stats.mean_accel.length() - 9.66).abs() < 0.001);
+
+        let init = initializer()
+            .initialize_stationary(&map, extrinsic(), ImuBias::default(), 0, &stats, 0.3)
+            .expect("9.66 is within tolerance");
+        assert!(
+            (init.bias.accel - along).length() < 1e-9,
+            "bias {:?} vs {:?}",
+            init.bias.accel,
+            along
+        );
+        assert!((init.gravity_world.length() - GRAVITY_MAGNITUDE).abs() < 1e-9);
+        let want_g = r_vis * gravity_true();
+        assert!(angle_deg(init.gravity_world, want_g) < 0.05);
+        assert!(((stats.mean_accel - init.bias.accel).length() - GRAVITY_MAGNITUDE).abs() < 1e-9);
     }
 }
