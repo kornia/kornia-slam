@@ -67,10 +67,7 @@ pub struct SlamSystem {
     tracking_loss_recovery: TrackingLossRecoveryPolicy,
     // mThDepth (metres): back-project close stereo points at each keyframe when set
     stereo_close_depth: Option<f64>,
-    // Emit per-frame diagnostic logs (skip/reject reasons, growth counters)
     debug: bool,
-    // Buffered debug messages produced during the most recent process call;
-    // drained by the caller (TUI panel or stderr).
     debug_messages: Vec<String>,
     map: Arc<Mutex<Map>>,
     // Serializes compound map publication and short local-BA snapshot/merge phases.
@@ -151,7 +148,13 @@ impl SlamSystem {
     /// including buffered IMU samples and image history, is then unchanged.
     pub fn process(&mut self, input: SensorFrame<'_>) -> Result<TrackingResult, ProcessError> {
         input::validate(&input, self.rig.stereo_baseline_m.is_some())?;
-        let frame = self.frontend.prepare(&input)?;
+        let frame = self
+            .frontend
+            .prepare(&input)
+            .map_err(|source| ProcessError::Frontend {
+                idx: input.idx,
+                source,
+            })?;
         self.report_stereo(&frame);
         let imu_samples = if self.rig.imu.is_some() {
             input.imu_samples.to_vec()

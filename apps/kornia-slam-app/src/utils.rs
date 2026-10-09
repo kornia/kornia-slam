@@ -1,4 +1,4 @@
-//! Minimal Rerun visualization helpers for the ORB-SLAM example.
+//! Rerun logging and trajectory helpers.
 
 #[cfg(feature = "viz")]
 use kornia_3d::camera::PinholeCamera;

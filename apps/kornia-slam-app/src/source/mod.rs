@@ -1,9 +1,6 @@
-//! Frame sources for SLAM examples.
-//!
-//! Both offline datasets (EuRoC) and live cameras (OAK-D) feed the same
-//! `SlamSystem::process` loop. This module exposes a single trait,
-//! [`FrameSource`], so the main binary can stay source-agnostic. Each source
-//! module also owns the run-file settings it is opened from.
+//! Frame sources: offline datasets (EuRoC, Hilti, MCAP recordings) and live
+//! cameras (OAK-D, UVC) behind one [`FrameSource`] trait. Each source module
+//! also owns the run-file settings it is opened from.
 
 pub mod euroc;
 pub mod hilti;
@@ -42,11 +39,11 @@ pub struct FrameItem {
     pub imu_samples: Vec<ImuMeasurement>,
 }
 
-/// Pull-based interface for monocular SLAM frame producers.
+/// Pull-based interface for frame producers.
 ///
 /// `next_frame` returns `Ok(None)` when the stream is exhausted. Offline
 /// datasets exhaust after their last sample; live sources may exhaust when
-/// a CLI-imposed cap is reached.
+/// their `max_frames` is reached.
 pub trait FrameSource {
     /// Calibration of the sensors behind this source. Must be valid before the
     /// first `next_frame` call. For a stereo source the camera is the rectified

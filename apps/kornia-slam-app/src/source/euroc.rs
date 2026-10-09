@@ -37,11 +37,7 @@ impl EurocConfig {
     }
 
     pub(super) fn open(&self, stereo: bool) -> Result<OpenedSource, SourceError> {
-        let source = if stereo {
-            EurocSource::open_stereo(&self.data, self.start_frame, self.max_frames)?
-        } else {
-            EurocSource::open(&self.data, self.start_frame, self.max_frames)?
-        };
+        let source = EurocSource::open(&self.data, self.start_frame, self.max_frames, stereo)?;
         Ok(OpenedSource {
             summary: Some(dataset_summary(
                 source.dataset_len(),
@@ -72,26 +68,10 @@ impl EurocSource {
     ///
     /// `max_frames == 0` means "until the dataset is exhausted". `start_frame`
     /// is the index into the left-camera samples of the first sample to yield; later
-    /// samples retain their absolute index in `FrameItem::idx`.
+    /// samples retain their absolute index in `FrameItem::idx`. With `stereo`,
+    /// the left+right pair is rectified and yielded together; the dataset must
+    /// then have a usable right camera.
     pub fn open(
-        root: impl AsRef<Path>,
-        start_frame: usize,
-        max_frames: usize,
-    ) -> Result<Self, SourceError> {
-        Self::open_inner(root, start_frame, max_frames, false)
-    }
-
-    /// Like [`Self::open`], but rectifies the left+right pair and yields stereo
-    /// pairs. Errors if the dataset has no usable right camera.
-    pub fn open_stereo(
-        root: impl AsRef<Path>,
-        start_frame: usize,
-        max_frames: usize,
-    ) -> Result<Self, SourceError> {
-        Self::open_inner(root, start_frame, max_frames, true)
-    }
-
-    fn open_inner(
         root: impl AsRef<Path>,
         start_frame: usize,
         max_frames: usize,

@@ -6,10 +6,8 @@
 //! order `[k1, k2, p1, p2, k3, k4, k5, k6]`; the rotation is row-major 3×3 and
 //! the translation is in metres.
 //!
-//! TODO: this is a generic stereo-calibration container + loader, not specific
-//! to this example. Move it into `kornia-imgproc::calibration` upstream
-//! alongside the generalized rectifier (see the matching TODO in `rectify.rs`),
-//! so any kornia consumer can load a stereo calib and build a rectifier.
+//! TODO: this is a generic stereo-calibration loader; move it upstream next to
+//! `kornia_3d::stereo::StereoRectifier`.
 
 use kornia_algebra::{Mat3F64, Vec3F64};
 use kornia_imgproc::calibration::distortion::PolynomialDistortion;

@@ -1,15 +1,13 @@
 //! Hilti-Trimble SLAM Challenge 2026 dataset as a [`FrameSource`].
 //!
-//! The challenge cameras are Kannala-Brandt (equidistant) fisheye. Rather than
-//! resampling the whole image into a pinhole view (which crops the wide field of
-//! view and stretches the edges), the source yields raw fisheye images and
-//! declares the fisheye model in its rig; following ORB-SLAM3, the SLAM
-//! frontend extracts ORB on the raw image and maps only the keypoints into the
-//! rig's virtual pinhole. The existing pinhole geometry then works unchanged.
+//! The challenge cameras are Kannala-Brandt (equidistant) fisheye. The source
+//! yields the raw fisheye images and declares their model in its rig rather
+//! than resampling them into a pinhole view, which would crop the wide field of
+//! view.
 //!
 //! The sensors are mounted inverted, so the extracted PNGs are upside-down. The
 //! source rotates each frame 180° (a flat-array reverse, not a remap) so the
-//! image matches the upright calibration; pass `rotate_180 = false` if the
+//! image matches the upright calibration; set `rotate_180: false` if the
 //! extraction already rotated them.
 //!
 //! Monocular only for now: it reads `cam0`. Stereo (`cam0`+`cam1`) is a
@@ -148,7 +146,7 @@ impl HiltiSource {
     }
 }
 
-/// Rotates a single-channel image 180° in place. For one channel this is just a
+/// Rotates a single-channel image 180°. For one channel this is just a
 /// reverse of the row-major pixel buffer: `out[i] = in[N-1-i]`.
 fn rotate_180_mono(img: &Image<u8, 1>) -> Image<u8, 1> {
     let mut buf = img.as_slice().to_vec();

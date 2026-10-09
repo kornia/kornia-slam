@@ -52,9 +52,7 @@ impl SystemConfig {
             PipelineDefinition::OrbSlam(orb) => orb.validate(&self.sensors),
         }
     }
-}
 
-impl SystemConfig {
     /// Checks a schema version on its own, so a file written for another
     /// version can be reported as such before its fields are parsed.
     pub fn check_version(version: u32) -> Result<(), ConfigError> {

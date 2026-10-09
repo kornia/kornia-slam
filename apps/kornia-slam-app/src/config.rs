@@ -2,7 +2,7 @@
 //!
 //! ```ron
 //! (
-//!     source: Euroc((data: "../data/MH_01_easy", max_frames: 500)),
+//!     source: Euroc((data: "../data/euroc/MH_01_easy", max_frames: 500)),
 //!     system: (version: 1, sensors: (cameras: Stereo, imu: true)),
 //! )
 //! ```

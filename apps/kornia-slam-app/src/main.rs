@@ -27,7 +27,7 @@ use utils::trajectory_point_from_pose;
 use utils::{
     log_camera_to_rerun, log_frame_to_rerun, log_map_points_to_rerun, log_trajectory_to_rerun,
 };
-/// CLI arguments.
+
 #[derive(argh::FromArgs)]
 #[argh(description = "Visual and visual-inertial ORB-SLAM over the source a run file describes")]
 struct Args {
@@ -63,19 +63,16 @@ struct Args {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Args = argh::from_env();
 
-    // TUI is the default; --rerun-stream or --no-tui falls back to plain stderr.
     #[cfg(feature = "viz")]
     let tui_active = !args.no_tui && !args.rerun_stream;
     #[cfg(not(feature = "viz"))]
     let tui_active = !args.no_tui;
 
-    // ── Run file ───────────────────────────────────────────────────────────
     let run = RunConfig::from_ron_file(&args.config)?;
     if !tui_active {
         eprint!("{}", run.system);
     }
 
-    // ── Source ─────────────────────────────────────────────────────────────
     let OpenedSource {
         mut source,
         ground_truth,
@@ -87,18 +84,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !tui_active && let Some(summary) = summary {
         eprintln!("{summary}");
     }
-    let (evaluate, eval_out) = (args.evaluate, args.eval_out.clone());
     let target_dt = Duration::from_secs_f64(1.0 / 30.0);
     let mut last_frame_walltime = Instant::now();
 
     let n_frames_hint = source.n_frames_hint();
-    let pipeline = run.system;
-    let mut system =
-        SlamSystem::build(pipeline.clone(), source.rig()).map_err(|e| e.to_string())?;
+    let PipelineDefinition::OrbSlam(orb) = &run.system.pipeline;
+    let vocabulary = orb
+        .loop_closing
+        .vocabulary()
+        .map(std::path::Path::to_path_buf);
+    let mut system = SlamSystem::build(run.system, source.rig()).map_err(|e| e.to_string())?;
     system.set_debug(args.debug);
     let camera = system.rig().camera.clone();
-    let PipelineDefinition::OrbSlam(orb) = &pipeline.pipeline;
-    if let Some(path) = orb.loop_closing.vocabulary() {
+    if let Some(path) = vocabulary {
         eprintln!(
             "[place-recognition] loaded vocabulary from {}",
             path.display()
@@ -112,7 +110,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // ── Rerun ──────────────────────────────────────────────────────────────
     #[cfg(feature = "viz")]
     let rec = if args.rerun_stream {
         let r = rerun::RecordingStreamBuilder::new("kornia-slam").spawn()?;
@@ -123,7 +120,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // ── TUI ────────────────────────────────────────────────────────────────
     let mut tui_state = if tui_active {
         let (term, guard) = tui::setup_terminal(std::path::Path::new("tui_stderr.log"))?;
         let mut app = tui::TuiApp::new(n_frames_hint.unwrap_or(0));
@@ -134,7 +130,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let (mut est_positions, mut gt_positions): (Vec<Vec3F64>, Vec<Vec3F64>) =
         (Vec::new(), Vec::new());
-    // ── Main loop ──────────────────────────────────────────────────────────
     let mut trajectory: Vec<[f32; 3]> = Vec::new();
     let mut processed: usize = 0;
 
@@ -196,7 +191,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Status line.
         if !tui_active {
             for line in &debug_msgs {
                 eprintln!("{line}");
@@ -208,12 +202,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("{status_line}");
         }
 
-        // Trajectory.
         let traj_pt = trajectory_point_from_pose(&result.pose_world_to_cam);
         trajectory.push(traj_pt);
 
         // Evaluation pairs each estimate with the nearest ground-truth pose.
-        if evaluate
+        if args.evaluate
             && let Some(gt) = ground_truth
                 .as_deref()
                 .and_then(|gt| associate_gt(timestamp_sec, gt))
@@ -225,7 +218,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
             gt_positions.push(Vec3F64::new(gt.tx, gt.ty, gt.tz));
         }
-        // Rerun logging.
         #[cfg(feature = "viz")]
         if let Some(ref rec) = rec {
             log_trajectory_to_rerun(rec, &trajectory);
@@ -233,7 +225,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             system.with_map_points(|map_points| log_map_points_to_rerun(rec, map_points));
         }
 
-        // TUI render.
         if let Some((term, app, _guard)) = tui_state.as_mut() {
             for line in debug_msgs {
                 app.push_debug_line(line);
@@ -290,12 +281,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
     );
-    // ── Trajectory evaluation (EuRoC, --evaluate only) ─────────────────────
-    if evaluate {
+    if args.evaluate {
         evaluation::report(
             &est_positions,
             &gt_positions,
-            std::path::Path::new(&eval_out),
+            std::path::Path::new(&args.eval_out),
         )?;
     }
     Ok(())

@@ -1,8 +1,7 @@
-//! When inertial initialization runs: VIBA0 and its retries, then the VIBA1
-//! and VIBA2 refinements.
+//! Scheduling of inertial initialization (ORB-SLAM3 LocalMapping.cc:183-228).
 
-/// When inertial initialization runs: the keyframe window it solves over, the
-/// throttle on VIBA0 retries, and the one-shot VIBA1/VIBA2 refinements.
+/// The keyframe window inertial initialization solves over, the throttle on
+/// VIBA0 retries, and the one-shot VIBA1/VIBA2 refinements.
 #[derive(Debug, Default)]
 pub(crate) struct InertialInitSchedule {
     start_kf_idx: Option<usize>,

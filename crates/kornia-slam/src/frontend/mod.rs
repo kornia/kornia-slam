@@ -9,13 +9,10 @@ use kornia_algebra::Vec2F64;
 use kornia_image::{Image, ImageError, ImageSize, InterpolationMode};
 use kornia_imgproc::features::{OrbDetector, OrbFeatures};
 use kornia_imgproc::resize::resize_fast_mono;
-use kornia_sensors::SensorRig;
-
-use kornia_sensors::SensorFrame;
+use kornia_sensors::{SensorFrame, SensorRig};
 
 use crate::Frame;
 use crate::stereo::{StereoMatchConfig, compute_stereo_matches};
-use crate::system::ProcessError;
 
 /// Fisheye keypoints beyond this incidence angle are dropped: a pinhole cannot
 /// represent rays at or past 90°, and precision degrades well before that.
@@ -72,26 +69,16 @@ impl OrbFrontend {
 
     /// Extracts and prepares the features of a validated input. The
     /// observation is updated only when preparation succeeds.
-    pub(crate) fn prepare(&mut self, input: &SensorFrame<'_>) -> Result<Frame, ProcessError> {
+    pub(crate) fn prepare(&mut self, input: &SensorFrame<'_>) -> Result<Frame, ImageError> {
         let start = Instant::now();
-        let to_error = |source| ProcessError::Frontend {
-            idx: input.idx,
-            source,
-        };
         let image = input.image;
-        let mut features = self
-            .detector
-            .detect_and_extract_u8(image)
-            .map_err(to_error)?;
+        let mut features = self.detector.detect_and_extract_u8(image)?;
 
         let (u_right, depth, stereo_matched) = match (&self.stereo, input.right_image) {
             (Some(config), Some(right)) => {
-                let right_features = self
-                    .detector
-                    .detect_and_extract_u8(right)
-                    .map_err(to_error)?;
-                let left_pyramid = self.build_pyramid(image).map_err(to_error)?;
-                let right_pyramid = self.build_pyramid(right).map_err(to_error)?;
+                let right_features = self.detector.detect_and_extract_u8(right)?;
+                let left_pyramid = self.build_pyramid(image)?;
+                let right_pyramid = self.build_pyramid(right)?;
                 let matches = compute_stereo_matches(
                     &left_pyramid,
                     &right_pyramid,

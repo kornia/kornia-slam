@@ -35,9 +35,7 @@ impl InertialState {
             last_keyframe_timestamp_sec: None,
             // Matches ORB-SLAM3's LocalMapping::InitializeIMU VIBA0 gate
             // (nMinKF=10; minTime=1.0s stereo/2.0s mono — `ready()` doubles
-            // this for mono). The previous min_keyframes=30/min_time_sec=15.0
-            // was effectively skipping VIBA0/VIBA1 and attempting a
-            // VIBA2-strength window on the very first try.
+            // this for mono).
             initializer: ImuInitializer::new(ImuInitConfig {
                 min_keyframes: 10,
                 min_time_sec: 1.0,

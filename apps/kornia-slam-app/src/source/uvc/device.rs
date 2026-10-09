@@ -14,22 +14,12 @@ use std::time::Instant;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_image::{Image, ImageSize};
+use kornia_sensors::SensorRig;
 use nokhwa::Camera;
 use nokhwa::pixel_format::LumaFormat;
 use nokhwa::utils::{
     ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
 };
-
-/// Open the device at `index` with a closest-resolution request for the given
-/// frame format. Returns the camera ready to stream (caller must `open_stream`).
-fn try_open(index: u32, width: u32, height: u32, fmt: FrameFormat) -> Result<Camera, SourceError> {
-    let target = CameraFormat::new_from(width, height, fmt, 30);
-    let requested = RequestedFormat::new::<LumaFormat>(RequestedFormatType::Closest(target));
-    Camera::with_backend(CameraIndex::Index(index), requested, ApiBackend::Auto)
-        .map_err(SourceError::other)
-}
-
-use kornia_sensors::SensorRig;
 
 use crate::source::{FrameItem, FrameSource, SourceError};
 
@@ -146,4 +136,13 @@ impl FrameSource for UvcSource {
             imu_samples: Vec::new(),
         }))
     }
+}
+
+/// Open the device at `index` with a closest-resolution request for the given
+/// frame format. Returns the camera ready to stream (caller must `open_stream`).
+fn try_open(index: u32, width: u32, height: u32, fmt: FrameFormat) -> Result<Camera, SourceError> {
+    let target = CameraFormat::new_from(width, height, fmt, 30);
+    let requested = RequestedFormat::new::<LumaFormat>(RequestedFormatType::Closest(target));
+    Camera::with_backend(CameraIndex::Index(index), requested, ApiBackend::Auto)
+        .map_err(SourceError::other)
 }
