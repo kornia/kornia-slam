@@ -31,6 +31,15 @@ a new one. It uses the loop closer's vocabulary, so it runs when loop closing
 is enabled. On EuRoC V2_03 stereo-only, resets drop from 22 to 18 (ATE
 1.72 m → 1.27 m).
 
+**Weak pose estimates no longer teleport the trajectory.** With a settled IMU,
+a frame now needs 15 inliers (ORB-SLAM3's inertial threshold) instead of 10
+before its visual pose replaces the inertial prediction
+(`MapProjectionConfig::min_inliers_with_prediction`), and a relocalized pose
+more than 0.5 m from the motion model is refused. On EuRoC stereo+IMU the
+largest frame-to-frame jump against ground truth drops from 1.30 m to 0.04 m on
+V2_01 and from 1.01 m to 0.51 m on V2_03; jumps above 30 cm on V2_03 go from 15
+to 5.
+
 **EuRoC stereo pairs are matched by timestamp.** The source paired left and
 right images by position, which is off by one frame for all of MH_04 and
 drifts through V2_03's dropped left frames; stereo results on those two

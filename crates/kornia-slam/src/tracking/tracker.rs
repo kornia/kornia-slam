@@ -33,6 +33,9 @@ pub(crate) struct FrameInput<'a> {
     pub current_keyframe_idx: Option<usize>,
     /// How long tracking has been failing, which widens the search.
     pub lost_for_sec: f64,
+    /// Whether `candidate_pose` is an inertial prediction trustworthy enough
+    /// to veto a weakly supported visual estimate.
+    pub trusted_prediction: bool,
 }
 
 pub(crate) struct Tracker {
@@ -130,6 +133,18 @@ impl Tracker {
             search_scale,
             pre_seeded,
         );
+
+        // With a trusted inertial prediction the threshold drops to
+        // ORB-SLAM3's inertial value; a solution below it is too weakly
+        // supported to override the prediction and would teleport the pose.
+        let min_inliers = self.estimator.config().min_inliers_with_prediction;
+        let result = result.and_then(|estimate| {
+            if input.trusted_prediction && estimate.inliers < min_inliers {
+                Err(MapProjectionRejectReason::LowPnpInliers)
+            } else {
+                Ok(estimate)
+            }
+        });
 
         match result {
             Ok(estimate) => {

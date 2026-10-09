@@ -758,6 +758,7 @@ impl SlamSystem {
                     pose_before,
                     current_keyframe_idx: self.state.current_keyframe_idx,
                     lost_for_sec: currently_lost_for,
+                    trusted_prediction: self.imu_confident(timestamp_sec),
                 },
                 &map,
                 &self.rig.camera,
@@ -921,6 +922,19 @@ impl SlamSystem {
         let Some(found) = found else {
             return false;
         };
+        // A pose far from where the motion model put the camera belongs to a
+        // part of the map that has drifted from here; adopting it would
+        // teleport the trajectory.
+        let jump = (found.estimate.pose.inverse().translation
+            - self.state.pose_world_to_cam.inverse().translation)
+            .length();
+        if jump > RELOCALIZATION_MAX_JUMP_M {
+            self.dbg(format!(
+                "[reloc] frame={} refused kf={} jump={jump:.2}m",
+                frame.idx, found.keyframe_idx
+            ));
+            return false;
+        }
         self.dbg(format!(
             "[reloc] frame={} against kf={} inliers={}",
             frame.idx, found.keyframe_idx, found.estimate.inliers
@@ -1202,6 +1216,10 @@ impl SlamSystem {
         self.loop_closure_events.extend(outcome.events);
     }
 }
+
+/// Largest distance, in metres, between the motion-model pose and a
+/// relocalized one that is adopted.
+const RELOCALIZATION_MAX_JUMP_M: f64 = 0.5;
 
 fn format_imu_init_gate(
     start_idx: usize,

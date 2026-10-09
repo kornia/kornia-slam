@@ -79,6 +79,9 @@ pub struct MapProjectionConfig {
     pub local_projection: ProjectionMatchConfig,
     /// `search_scale` once tracking has failed (see `search_scale_for`).
     pub lost_search_scale: f32,
+    /// Inliers an estimate needs when a trusted inertial prediction is
+    /// available (ORB-SLAM3's 15 for inertial tracking).
+    pub min_inliers_with_prediction: usize,
     /// Fundamental-matrix RANSAC inlier threshold in pixels.
     pub geometric_filter_threshold_px: f64,
 }
@@ -100,6 +103,7 @@ impl Default for MapProjectionConfig {
                 ..ProjectionMatchConfig::default()
             },
             lost_search_scale: 4.0,
+            min_inliers_with_prediction: 15,
             geometric_filter_threshold_px: 1.0,
         }
     }
