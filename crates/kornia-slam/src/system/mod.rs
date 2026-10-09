@@ -876,6 +876,15 @@ impl SlamSystem {
                 self.state.reset();
                 return self.bootstrap_step(frame, timestamp_sec);
             }
+            if imu_confident
+                && self.keyframe_due_while_lost(&frame, timestamp_sec)
+                && self.insert_keyframe(&frame, timestamp_sec, &[])
+            {
+                self.dbg(format!(
+                    "[lost] frame={} keyframe inserted at the inertial prediction",
+                    frame.idx
+                ));
+            }
         } else {
             self.state.lost_since_sec = None;
         }
@@ -943,6 +952,17 @@ impl SlamSystem {
         interval_elapsed || self.keyframe_policy.should_insert_with(evidence)
     }
 
+    /// Whether to extend the map from this frame while coasting on the IMU:
+    /// it has stereo depth to create landmarks from, and the policy says the
+    /// last keyframe is old enough.
+    fn keyframe_due_while_lost(&self, frame: &Frame, timestamp_sec: f64) -> bool {
+        frame.is_stereo()
+            && self
+                .inertial
+                .last_keyframe_timestamp_sec
+                .is_some_and(|t| self.tracking_loss_recovery.keyframe_due(timestamp_sec - t))
+    }
+
     fn try_insert_keyframe(
         &mut self,
         frame: &Frame,
@@ -954,7 +974,17 @@ impl SlamSystem {
         if !self.keyframe_due(&evidence, timestamp_sec) {
             return false;
         }
+        self.insert_keyframe(frame, timestamp_sec, matches)
+    }
 
+    /// Publishes `frame` as a keyframe at the current tracking pose and runs
+    /// the mapping work it earns.
+    fn insert_keyframe(
+        &mut self,
+        frame: &Frame,
+        timestamp_sec: f64,
+        matches: &[(usize, usize)],
+    ) -> bool {
         // Guard: reference KF must exist before we can triangulate.
         if let Some(ki) = self.state.current_keyframe_idx {
             let map = self.map.lock().unwrap();
