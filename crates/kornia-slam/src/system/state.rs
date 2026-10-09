@@ -53,6 +53,9 @@ pub(crate) struct SystemState {
     /// failures, or `None` while tracking is healthy. Drives the
     /// recently-lost grace period (mirrors ORB-SLAM3's `mTimeStampLost`).
     pub lost_since_sec: Option<f64>,
+    /// Consecutive descriptor-starved two-view attempts against the stored
+    /// bootstrap reference.
+    pub bootstrap_low_match_rejections: usize,
     pub bootstrap_frame: Option<Frame>,
     pub mode: SystemMode,
 }
@@ -77,6 +80,7 @@ impl SystemState {
             current_keyframe_idx: None,
             last_keyframe_idx: None,
             lost_since_sec: None,
+            bootstrap_low_match_rejections: 0,
             bootstrap_frame: None,
             imu_initialized: false,
             imu_init_timestamp_sec: None,
@@ -91,6 +95,7 @@ impl SystemState {
         self.last_keyframe_idx = None;
         self.velocity = None;
         self.lost_since_sec = None;
+        self.bootstrap_low_match_rejections = 0;
         self.bootstrap_frame = None;
         // The new map starts at an unknown monocular scale, so the metric
         // IMU state no longer applies until inertial init runs again.
