@@ -1,0 +1,12 @@
+// Live OAK-D (CamB + CamC), rectified online; requires `--features oakd`.
+// For mono (CamB), drop calib and the sensors line and set width/height/fps.
+(
+    source: Oakd((
+        fps: 30.0,
+        calib: "../data/oakd_calib.yaml",
+    )),
+    system: (
+        version: 1,
+        sensors: ( cameras: Stereo ),
+    ),
+)

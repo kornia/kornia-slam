@@ -1,4 +1,4 @@
-//! EuRoC trajectory evaluation: ground-truth association, Sim3 alignment,
+//! Trajectory evaluation: ground-truth association, Sim3 alignment,
 //! ATE/RPE/drift metrics, and CSV reporting.
 
 use std::io::Write;

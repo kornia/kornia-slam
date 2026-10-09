@@ -1,6 +1,10 @@
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-use kornia_slam::{LoopClosingConfig, SensorRig, SlamConfig, SlamSystem};
+use kornia_image::{Image, ImageSize};
+use kornia_slam::{
+    CameraSelection, SensorFrame, SensorRig, SensorSelection, SlamSystem, SystemConfig,
+    TrackingStatus,
+};
 
 fn test_camera() -> PinholeCamera {
     PinholeCamera {
@@ -16,20 +20,35 @@ fn test_camera() -> PinholeCamera {
 }
 
 #[test]
-fn slam_system_is_constructible_from_the_public_api() {
-    let camera = test_camera();
-    let config = SlamConfig {
-        pgo: Some(LoopClosingConfig::default()),
-        ..SlamConfig::default()
+fn slam_system_builds_and_processes_through_the_public_api() {
+    let config = SystemConfig {
+        sensors: SensorSelection {
+            cameras: CameraSelection::Mono,
+            imu: true,
+        },
+        ..SystemConfig::default()
     };
-
-    let _system = SlamSystem::new(camera, config);
-}
-
-#[test]
-fn system_accepts_an_explicit_sensor_rig() {
     let rig = SensorRig::new(test_camera()).with_imu(Pose3d::IDENTITY);
-    assert_eq!(rig.camera_to_body(), Some(Pose3d::IDENTITY));
+    let mut system = SlamSystem::build(config, rig).unwrap();
+    assert_eq!(system.rig().camera_to_body(), Some(Pose3d::IDENTITY));
 
-    let _system = SlamSystem::with_rig(rig, SlamConfig::default());
+    let image = Image::from_size_val(
+        ImageSize {
+            width: 640,
+            height: 480,
+        },
+        0u8,
+    )
+    .unwrap();
+    let result = system
+        .process(SensorFrame {
+            idx: 0,
+            timestamp_sec: 0.0,
+            image: &image,
+            right_image: None,
+            imu_samples: &[],
+        })
+        .unwrap();
+    assert_eq!(result.status, TrackingStatus::Skipped);
+    assert!(system.frontend_observation().keypoints_xy.is_empty());
 }

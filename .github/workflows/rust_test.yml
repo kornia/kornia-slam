@@ -48,6 +48,13 @@ jobs:
             test_cmd: cargo test --workspace
             build_cmd: cargo run -p kornia-slam-app -- --help
 
+          # Library on its own: the workspace build enables `serde` through
+          # the app, so this covers the default feature set.
+          - name: slam-default-features
+            apt: ""
+            test_cmd: cargo test -p kornia-slam
+            build_cmd: cargo build -p kornia-slam
+
           # App with no default features — just confirms the non-viz build
           # links and the CLI parses.
           - name: app-no-default

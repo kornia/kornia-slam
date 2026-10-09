@@ -37,17 +37,54 @@ See [ROADMAP.md](ROADMAP.md) for what's next.
 ## Quick start
 
 Download a [EuRoC](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets)
-sequence (ASL format), then:
+sequence (ASL format) to `data/euroc/MH_01_easy`, or edit the `data` path in
+the run file, then:
 
 ```bash
 # monocular
-cargo run --release -p kornia-slam-app -- euroc --data /path/to/MH_01_easy
+cargo run --release -p kornia-slam-app -- --config configs/euroc.ron
 
-# stereo + IMU, with evaluation against ground truth
-cargo run --release -p kornia-slam-app -- euroc --data /path/to/MH_01_easy --stereo --imu --evaluate
+# stereo + IMU with loop closing, with evaluation against ground truth
+cargo run --release -p kornia-slam-app -- --config configs/euroc-stereo-imu-loop.ron --evaluate
 ```
 
+Loop closing needs ORB-SLAM3's vocabulary: extract `Vocabulary/ORBvoc.txt.tar.gz`
+from [ORB-SLAM3](https://github.com/UZ-SLAMLab/ORB_SLAM3) to `weights/ORBvoc.txt`.
+
+A run file names the source and the system to run on it; see
+[apps/kornia-slam-app](apps/kornia-slam-app/README.md#run-files).
+
 More sources and options: [apps/kornia-slam-app](apps/kornia-slam-app/README.md).
+
+## Library
+
+A system configuration and the source's calibrated rig build a `SlamSystem`,
+which then takes images and IMU samples and returns poses. Feature extraction,
+stereo matching and frame history are the system's; sources supply
+synchronized, calibrated (and, for stereo, rectified) images.
+
+```rust,ignore
+use kornia_slam::{CameraSelection, SensorFrame, SensorSelection, SlamSystem, SystemConfig};
+
+let config = SystemConfig {
+    sensors: SensorSelection { cameras: CameraSelection::Stereo, imu: true },
+    ..SystemConfig::default()
+};
+let mut system = SlamSystem::build(config, rig)?; // rig: kornia_slam::SensorRig
+for (idx, frame) in frames.enumerate() {
+    let result = system.process(SensorFrame {
+        idx,
+        timestamp_sec: frame.timestamp_sec,
+        image: &frame.left,
+        right_image: Some(&frame.right),
+        imu_samples: &frame.imu,
+    })?;
+    println!("{idx}: {:?} {:?}", result.status, result.pose_world_to_cam);
+}
+```
+
+With the `serde` feature, `SystemConfig::from_ron_file` reads the same settings
+from a RON file, the `system` section of a run file.
 
 ## Integrations
 

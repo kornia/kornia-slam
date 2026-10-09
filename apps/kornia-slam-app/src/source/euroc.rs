@@ -1,17 +1,55 @@
 //! EuRoC MAV dataset as a [`FrameSource`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::Mat3F64;
+use kornia_algebra::{Mat3F64, Vec3F64};
 use kornia_io::png::read_image_png_mono8;
 use kornia_sensors::SensorRig;
+use kornia_sensors::imu::ImuMeasurement;
+use serde::Deserialize;
 
-use super::{FrameItem, FrameSource, SourceError, rectify_pair};
+use super::{
+    FrameItem, FrameSource, OpenedSource, SourceError, dataset_summary, non_empty, rectify_pair,
+    resolve,
+};
 use crate::datasets::EurocDataset;
 use crate::datasets::euroc::{GroundTruthPose, ImuSample};
 use crate::datasets::{StereoRectifier, rectifier_from_euroc};
+
+/// An EuRoC MAV sequence; stereo and IMU calibration come from its `sensor.yaml` files.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EurocConfig {
+    /// Sequence root, e.g. `MH_01_easy/`.
+    pub data: PathBuf,
+    #[serde(default)]
+    pub start_frame: usize,
+    /// 0 processes the whole sequence.
+    #[serde(default)]
+    pub max_frames: usize,
+}
+
+impl EurocConfig {
+    pub(super) fn resolve_paths(&mut self, base_dir: &Path) {
+        resolve(&mut self.data, base_dir);
+    }
+
+    pub(super) fn open(&self, stereo: bool) -> Result<OpenedSource, SourceError> {
+        let source = EurocSource::open(&self.data, self.start_frame, self.max_frames, stereo)?;
+        Ok(OpenedSource {
+            summary: Some(dataset_summary(
+                source.dataset_len(),
+                self.start_frame,
+                source.n_frames_hint(),
+            )),
+            ground_truth: non_empty(source.ground_truth_poses_cloned()),
+            source: Box::new(source),
+        })
+    }
+}
+
 /// Reads left-camera (and optionally rectified left+right) PNG frames from an
 /// EuRoC dataset in order.
 pub struct EurocSource {
@@ -30,26 +68,10 @@ impl EurocSource {
     ///
     /// `max_frames == 0` means "until the dataset is exhausted". `start_frame`
     /// is the index into the left-camera samples of the first sample to yield; later
-    /// samples retain their absolute index in `FrameItem::idx`.
+    /// samples retain their absolute index in `FrameItem::idx`. With `stereo`,
+    /// the left+right pair is rectified and yielded together; the dataset must
+    /// then have a usable right camera.
     pub fn open(
-        root: impl AsRef<Path>,
-        start_frame: usize,
-        max_frames: usize,
-    ) -> Result<Self, SourceError> {
-        Self::open_inner(root, start_frame, max_frames, false)
-    }
-
-    /// Like [`Self::open`], but rectifies the left+right pair and yields stereo
-    /// pairs. Errors if the dataset has no usable right camera.
-    pub fn open_stereo(
-        root: impl AsRef<Path>,
-        start_frame: usize,
-        max_frames: usize,
-    ) -> Result<Self, SourceError> {
-        Self::open_inner(root, start_frame, max_frames, true)
-    }
-
-    fn open_inner(
         root: impl AsRef<Path>,
         start_frame: usize,
         max_frames: usize,
@@ -195,7 +217,7 @@ impl EurocSource {
         }
     }
 
-    fn imu_samples_until(&mut self, timestamp_sec: f64) -> Vec<ImuSample> {
+    fn imu_samples_until(&mut self, timestamp_sec: f64) -> Vec<ImuMeasurement> {
         if !self.with_imu {
             return Vec::new();
         }
@@ -205,6 +227,17 @@ impl EurocSource {
             .partition_point(|sample| sample.timestamp_sec <= timestamp_sec);
         let end = start + rel_end;
         self.imu_cursor = end;
-        self.dataset.imu_samples[start..end].to_vec()
+        self.dataset.imu_samples[start..end]
+            .iter()
+            .map(imu_measurement)
+            .collect()
+    }
+}
+
+fn imu_measurement(sample: &ImuSample) -> ImuMeasurement {
+    ImuMeasurement {
+        timestamp: sample.timestamp_sec,
+        gyro: Vec3F64::new(sample.gyro[0], sample.gyro[1], sample.gyro[2]),
+        accel: Vec3F64::new(sample.accel[0], sample.accel[1], sample.accel[2]),
     }
 }

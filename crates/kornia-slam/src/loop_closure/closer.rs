@@ -23,11 +23,9 @@ use crate::loop_closure::{
 use crate::mapping::Map;
 use crate::pose_conversion::apply_reference_pose_correction;
 
+/// Verification, episode consistency, fusion and pose-graph settings of loop correction.
 #[derive(Debug, Clone, Default)]
 pub struct LoopClosingConfig {
-    /// Mono+IMU maps become metric only after inertial initialization. Stereo
-    /// maps are metric from bootstrap and leave this disabled.
-    pub require_imu_initialized: bool,
     pub episode: LoopEpisodeConfig,
     pub fusion: LoopFusionConfig,
     pub verification: LoopVerificationConfig,
@@ -70,36 +68,35 @@ pub(crate) struct LoopClosingOutcome {
     pub pgo_applied: bool,
 }
 
-/// Place recognition for every keyframe, and loop closing when configured.
+/// Place recognition and loop closing for every keyframe.
 ///
-/// Keyframes are indexed whenever a vocabulary is set, even with closing
-/// disabled or held back until inertial initialization, so the database is
-/// complete by the time a closure is allowed.
+/// Keyframes are indexed even while correction is held back until inertial
+/// initialization, so the database is complete by the time a closure is
+/// allowed.
 pub(crate) struct LoopCloser {
-    vocabulary: Option<Vocabulary>,
+    vocabulary: Vocabulary,
     kf_database: KeyFrameDatabase,
-    acceptance: Option<LoopAcceptance>,
+    acceptance: LoopAcceptance,
 }
 
 impl LoopCloser {
-    /// `pgo` enables verification and correction; without it keyframes are
-    /// only indexed.
-    pub(crate) fn new(pgo: Option<LoopClosingConfig>) -> Self {
+    /// `require_imu_initialized` holds correction back until inertial
+    /// initialization.
+    pub(crate) fn new(
+        vocabulary: Vocabulary,
+        config: LoopClosingConfig,
+        require_imu_initialized: bool,
+    ) -> Self {
         Self {
-            vocabulary: None,
+            vocabulary,
             kf_database: KeyFrameDatabase::new(),
-            acceptance: pgo.map(LoopAcceptance::new),
+            acceptance: LoopAcceptance::new(config, require_imu_initialized),
         }
-    }
-
-    /// Enables appearance-based loop detection with a bag-of-words vocabulary.
-    pub(crate) fn set_vocabulary(&mut self, vocabulary: Vocabulary) {
-        self.vocabulary = Some(vocabulary);
     }
 
     /// Indexes a freshly inserted keyframe for place recognition, queries the
     /// database for appearance-based loop candidates, and closes a verified
-    /// loop when closing is configured and allowed.
+    /// loop when correction is allowed.
     ///
     /// Mirrors ORB-SLAM3's `LoopClosing::DetectLoop`: the acceptance threshold is
     /// the lowest BoW similarity to a covisible neighbour, and the covisibility
@@ -112,14 +109,11 @@ impl LoopCloser {
         kf_idx: usize,
         context: LoopClosingContext,
     ) -> LoopClosingOutcome {
-        let Some(vocabulary) = self.vocabulary.as_ref() else {
-            return LoopClosingOutcome::default();
-        };
         const MIN_COVIS_WEIGHT: usize = 15;
         let Some(kf) = map.get_keyframe(kf_idx) else {
             return LoopClosingOutcome::default();
         };
-        let bow = compute_bow(vocabulary, &kf.frame.features.descriptors);
+        let bow = compute_bow(&self.vocabulary, &kf.frame.features.descriptors);
         if bow.0.is_empty() {
             return LoopClosingOutcome::default();
         }
@@ -141,13 +135,7 @@ impl LoopCloser {
             )
         });
 
-        let Some(acceptance) = self.acceptance.as_mut() else {
-            return LoopClosingOutcome {
-                debug_message,
-                ..Default::default()
-            };
-        };
-        if acceptance.requires_imu_initialized() && !context.imu_initialized {
+        if self.acceptance.require_imu_initialized && !context.imu_initialized {
             return LoopClosingOutcome {
                 debug_message,
                 ..Default::default()
@@ -155,29 +143,31 @@ impl LoopCloser {
         }
         LoopClosingOutcome {
             debug_message,
-            ..acceptance.close(map, camera, kf_idx, &candidates, context)
+            ..self
+                .acceptance
+                .close(map, camera, kf_idx, &candidates, context)
         }
     }
 }
 
 #[cfg(test)]
 impl LoopCloser {
+    pub(crate) fn correction_requires_imu(&self) -> bool {
+        self.acceptance.require_imu_initialized
+    }
+
     pub(crate) fn indexed_keyframes(&self) -> usize {
         self.kf_database.len()
     }
 
     pub(crate) fn verified_loop_count(&self) -> usize {
-        self.acceptance
-            .as_ref()
-            .map_or(0, |acceptance| acceptance.verified_loops.len())
+        self.acceptance.verified_loops.len()
     }
 
     pub(crate) fn mark_verified_for_test(&mut self, a: usize, b: usize) {
-        if let Some(acceptance) = self.acceptance.as_mut() {
-            acceptance
-                .verified_loop_pairs
-                .insert(normalized_loop_pair(a, b));
-        }
+        self.acceptance
+            .verified_loop_pairs
+            .insert(normalized_loop_pair(a, b));
     }
 }
 
@@ -185,26 +175,22 @@ impl LoopCloser {
 /// the history that makes acceptance consistent across keyframes.
 struct LoopAcceptance {
     config: LoopClosingConfig,
+    require_imu_initialized: bool,
     episode_tracker: LoopEpisodeTracker,
     verified_loops: Vec<VerifiedLoopEdge>,
     verified_loop_pairs: HashSet<(usize, usize)>,
 }
 
 impl LoopAcceptance {
-    fn new(config: LoopClosingConfig) -> Self {
+    fn new(config: LoopClosingConfig, require_imu_initialized: bool) -> Self {
         let episode_tracker = LoopEpisodeTracker::new(config.episode);
         Self {
             config,
+            require_imu_initialized,
             episode_tracker,
             verified_loops: Vec::new(),
             verified_loop_pairs: HashSet::new(),
         }
-    }
-
-    /// Mono+IMU maps are only metric once inertial initialization has run, so
-    /// correcting them before that is not meaningful.
-    fn requires_imu_initialized(&self) -> bool {
-        self.config.require_imu_initialized
     }
 
     /// Verifies `candidates` against `kf_idx`, and on an accepted closure
@@ -516,7 +502,7 @@ mod tests {
     /// alone: no correction to apply, no PGO, nothing to report.
     #[test]
     fn outcome_is_inert_when_no_candidate_verifies() {
-        let mut closer = LoopAcceptance::new(LoopClosingConfig::default());
+        let mut closer = LoopAcceptance::new(LoopClosingConfig::default(), false);
         let mut map = Map::new();
         let candidates = [Candidate {
             kf_idx: 7,
@@ -534,7 +520,7 @@ mod tests {
     /// With no candidates at all the closer must not touch the map or report.
     #[test]
     fn outcome_is_inert_without_candidates() {
-        let mut closer = LoopAcceptance::new(LoopClosingConfig::default());
+        let mut closer = LoopAcceptance::new(LoopClosingConfig::default(), false);
         let mut map = Map::new();
 
         let outcome = closer.close(&mut map, &test_camera(), 0, &[], context());
@@ -543,20 +529,6 @@ mod tests {
         assert!(!outcome.pgo_applied);
         assert!(outcome.events.is_empty());
         assert_eq!(map.keyframes().len(), 0);
-    }
-
-    /// The runtime asks before building a context; mono+IMU maps are not metric
-    /// until inertial initialization has run.
-    #[test]
-    fn imu_requirement_is_reported_from_config() {
-        let closer = LoopAcceptance::new(LoopClosingConfig {
-            require_imu_initialized: true,
-            ..LoopClosingConfig::default()
-        });
-        assert!(closer.requires_imu_initialized());
-
-        let closer = LoopAcceptance::new(LoopClosingConfig::default());
-        assert!(!closer.requires_imu_initialized());
     }
 
     /// A correction the runtime applies must move the pose and rotate the world

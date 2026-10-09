@@ -172,10 +172,9 @@ impl ImuInitializer {
     }
 
     /// Mirrors ORB-SLAM3's `LocalMapping::InitializeIMU(priorG, priorA, bFIBA)`:
-    /// a *single* joint LM solve per call. The pipeline is responsible for the
-    /// progressive VIBA0 (immediate) / VIBA1 (mTinit>5s) / VIBA2 (mTinit>15s)
-    /// re-triggering schedule with progressively relaxed priors — this
-    /// function does not chain multiple passes internally.
+    /// a *single* joint LM solve per call. The progressive VIBA0 / VIBA1 /
+    /// VIBA2 re-solves with relaxed priors are scheduled by the caller (see
+    /// `InertialInitSchedule`).
     ///
     /// `already_initialized` selects the same branch ORB-SLAM3 does at
     /// LocalMapping.cc:1226 (`!isImuInitialized()`): on the first (VIBA0)

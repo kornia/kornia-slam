@@ -1,0 +1,34 @@
+// EuRoC MAV sequence with every system setting at its default (monocular).
+// Omitted fields take these values, so the other run files only list what
+// they change. Relative paths are resolved against this file's directory.
+(
+    source: Euroc((
+        data: "../data/euroc/MH_01_easy",
+        start_frame: 0,
+        // 0 processes the whole sequence.
+        max_frames: 0,
+    )),
+    system: (
+        version: 1,
+        // cameras: Mono | Stereo (a rectified pair; the right image adds depth).
+        // imu: true needs a source with IMU data; EuRoC provides both, e.g.
+        // ( cameras: Stereo, imu: true ).
+        sensors: ( cameras: Mono, imu: false ),
+        pipeline: OrbSlam((
+            frontend: Orb((
+                n_keypoints: 1000,
+                // Stereo keypoints closer than this are back-projected directly
+                // at each keyframe: Baselines(n) | Metres(m) | Disabled.
+                stereo_close_depth: Baselines(35.0),
+            )),
+            // Frames since the last keyframe; ref_ratio in [0, 1].
+            keyframes: ( min_frames_between: 3, max_frames_between: 8, ref_ratio: 0.6 ),
+            // Synchronous runs local mapping before each frame returns, which
+            // makes runs replay identically; Asynchronous uses a background worker.
+            mapping: ( execution: Asynchronous ),
+            // Disabled | Enabled(vocabulary: "…"): detection with pose-graph
+            // correction; needs stereo or IMU input.
+            loop_closing: Disabled,
+        )),
+    ),
+)

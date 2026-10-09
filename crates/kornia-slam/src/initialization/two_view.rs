@@ -21,7 +21,7 @@ use kornia_imgproc::features::{OrbFeatures, OrbMatchConfig, match_orb_descriptor
 
 use crate::tracking::pose_estimation::Estimate;
 
-/// Configuration for two-view initialization.
+/// Acceptance thresholds of two-view initialization.
 #[derive(Debug, Clone)]
 pub struct TwoViewAcceptanceConfig {
     /// Minimum descriptor matches required before two-view estimation.
@@ -56,13 +56,21 @@ impl Default for TwoViewInitConfig {
             // ambiguity threshold (default in kornia-3d is 0.70).
             triangulation_config: TriangulationConfig {
                 cheirality_ambiguity_max: 0.75,
+                max_midpoint_gap: 0.25,
+                max_reprojection_error: 3.0,
                 ..TriangulationConfig::default()
             },
-            acceptance_config: TwoViewAcceptanceConfig {
-                min_matches: 100,
-                min_inliers: 30,
-                min_triangulated: 50,
-            },
+            acceptance_config: TwoViewAcceptanceConfig::default(),
+        }
+    }
+}
+
+impl Default for TwoViewAcceptanceConfig {
+    fn default() -> Self {
+        Self {
+            min_matches: 100,
+            min_inliers: 30,
+            min_triangulated: 50,
         }
     }
 }

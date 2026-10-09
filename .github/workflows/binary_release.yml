@@ -67,6 +67,7 @@ jobs:
           name="kornia-slam-v${{ steps.version.outputs.version }}-${{ matrix.target }}"
           mkdir "$name"
           cp target/dist/kornia-slam LICENSE README.md CHANGELOG.md "$name/"
+          cp -r configs "$name/"
           tar -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
 

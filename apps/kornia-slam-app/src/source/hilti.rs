@@ -1,54 +1,98 @@
 //! Hilti-Trimble SLAM Challenge 2026 dataset as a [`FrameSource`].
 //!
-//! The challenge cameras are Kannala-Brandt (equidistant) fisheye. Rather than
-//! resampling the whole image into a pinhole view (which crops the wide field of
-//! view and stretches the edges), this source follows ORB-SLAM3: ORB is
-//! extracted on the raw fisheye image, and only the *keypoints* are undistorted
-//! — each is unprojected through the KB model to a bearing and reprojected
-//! through a virtual pinhole (see [`HiltiSource::undistort_features`]). The
-//! existing pinhole geometry then works unchanged.
+//! The challenge cameras are Kannala-Brandt (equidistant) fisheye. The source
+//! yields the raw fisheye images and declares their model in its rig rather
+//! than resampling them into a pinhole view, which would crop the wide field of
+//! view.
 //!
 //! The sensors are mounted inverted, so the extracted PNGs are upside-down. The
 //! source rotates each frame 180° (a flat-array reverse, not a remap) so the
-//! image matches the upright calibration; pass `rotate_180 = false` if the
+//! image matches the upright calibration; set `rotate_180: false` if the
 //! extraction already rotated them.
-//!
-//! Features whose incidence angle exceeds [`MAX_INCIDENCE_DEG`] are dropped: a
-//! pinhole cannot represent rays at/beyond 90°, and precision degrades long
-//! before that.
 //!
 //! Monocular only for now: it reads `cam0`. Stereo (`cam0`+`cam1`) is a
 //! follow-up.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use kornia_3d::camera::{FisheyeCamera, PinholeCamera};
-use kornia_algebra::Vec2F64;
 use kornia_image::Image;
-use kornia_imgproc::features::OrbFeatures;
 use kornia_io::png::read_image_png_mono8;
 
 use kornia_sensors::SensorRig;
+use kornia_slam::SensorSelection;
+use serde::Deserialize;
 
-use super::{FrameItem, FrameSource, SourceError};
+use super::{
+    FrameItem, FrameSource, OpenedSource, SourceError, dataset_summary, mono_only, no_imu,
+    non_empty, resolve,
+};
 use crate::datasets::euroc::GroundTruthPose;
 use crate::datasets::hilti::HiltiDataset;
 
-/// Maximum incidence angle (degrees) kept when undistorting keypoints. Beyond
-/// this the bearing's `z` is tiny and the pinhole reprojection is ill-posed.
-const MAX_INCIDENCE_DEG: f64 = 88.0;
+/// A Hilti-Trimble SLAM Challenge 2026 sequence extracted to the EuRoC-style
+/// layout by the challenge's `ros2bag_to_euroc.py`. Monocular raw fisheye.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HiltiConfig {
+    /// Extracted sequence root, containing `cam0/` and `imu0/`.
+    pub data: PathBuf,
+    /// Kalibr camera-IMU chain YAML.
+    pub calib: PathBuf,
+    #[serde(default)]
+    pub start_frame: usize,
+    #[serde(default)]
+    pub max_frames: usize,
+    /// The sensors are mounted inverted; disable when the extraction already
+    /// rotated the images.
+    #[serde(default = "enabled")]
+    pub rotate_180: bool,
+}
 
-/// Reads upright fisheye `cam0` frames from an extracted Hilti sequence in
-/// order, undistorting keypoints (not pixels) to a virtual pinhole.
+fn enabled() -> bool {
+    true
+}
+
+impl HiltiConfig {
+    pub(super) fn validate(&self, sensors: SensorSelection) -> Result<(), String> {
+        mono_only("Hilti", sensors)?;
+        no_imu("Hilti", sensors)
+    }
+
+    pub(super) fn resolve_paths(&mut self, base_dir: &Path) {
+        resolve(&mut self.data, base_dir);
+        resolve(&mut self.calib, base_dir);
+    }
+
+    pub(super) fn open(&self) -> Result<OpenedSource, SourceError> {
+        let source = HiltiSource::open(
+            &self.data,
+            &self.calib,
+            self.start_frame,
+            self.max_frames,
+            self.rotate_180,
+        )?;
+        Ok(OpenedSource {
+            summary: Some(dataset_summary(
+                source.dataset_len(),
+                self.start_frame,
+                source.n_frames_hint(),
+            )),
+            ground_truth: non_empty(source.ground_truth_poses_cloned()),
+            source: Box::new(source),
+        })
+    }
+}
+
+/// Reads upright raw fisheye `cam0` frames from an extracted Hilti sequence in
+/// order.
 pub struct HiltiSource {
     dataset: HiltiDataset,
-    /// Virtual pinhole that keypoints are undistorted into; reported by `camera()`.
+    /// Virtual pinhole that keypoints are mapped into.
     camera: PinholeCamera,
-    /// Source Kannala-Brandt fisheye (upright image) for unprojecting keypoints.
+    /// Kannala-Brandt model of the upright raw image.
     fisheye: FisheyeCamera,
     rotate_180: bool,
-    /// `cosθ` floor for the incidence-angle cap.
-    min_bearing_z: f64,
     cursor: usize,
     start: usize,
     end: usize,
@@ -86,7 +130,6 @@ impl HiltiSource {
             camera,
             fisheye,
             rotate_180,
-            min_bearing_z: MAX_INCIDENCE_DEG.to_radians().cos(),
             cursor: start,
             start,
             end,
@@ -103,7 +146,7 @@ impl HiltiSource {
     }
 }
 
-/// Rotates a single-channel image 180° in place. For one channel this is just a
+/// Rotates a single-channel image 180°. For one channel this is just a
 /// reverse of the row-major pixel buffer: `out[i] = in[N-1-i]`.
 fn rotate_180_mono(img: &Image<u8, 1>) -> Image<u8, 1> {
     let mut buf = img.as_slice().to_vec();
@@ -113,7 +156,7 @@ fn rotate_180_mono(img: &Image<u8, 1>) -> Image<u8, 1> {
 
 impl FrameSource for HiltiSource {
     fn rig(&self) -> SensorRig {
-        SensorRig::new(self.camera.clone())
+        SensorRig::new(self.camera.clone()).with_fisheye(self.fisheye.clone())
     }
 
     fn n_frames_hint(&self) -> Option<usize> {
@@ -145,123 +188,12 @@ impl FrameSource for HiltiSource {
             imu_samples: Vec::new(),
         }))
     }
-
-    fn undistort_features(&self, features: &mut OrbFeatures) {
-        let n = features.keypoints_xy.len();
-        let mut keypoints_xy = Vec::with_capacity(n);
-        let mut orientations = Vec::with_capacity(n);
-        let mut descriptors = Vec::with_capacity(n);
-        let mut octaves = Vec::with_capacity(n);
-
-        for i in 0..n {
-            let [u, v] = features.keypoints_xy[i];
-            let b = self.fisheye.unproject(&Vec2F64::new(u as f64, v as f64));
-            // b is a unit bearing; b.z = cosθ. Drop rays too close to / past 90°.
-            if b.z <= self.min_bearing_z {
-                continue;
-            }
-            let xn = b.x / b.z;
-            let yn = b.y / b.z;
-            let pu = self.camera.fx * xn + self.camera.cx;
-            let pv = self.camera.fy * yn + self.camera.cy;
-
-            keypoints_xy.push([pu as f32, pv as f32]);
-            orientations.push(features.orientations[i]);
-            descriptors.push(features.descriptors[i]);
-            octaves.push(features.octaves[i]);
-        }
-
-        features.keypoints_xy = keypoints_xy;
-        features.orientations = orientations;
-        features.descriptors = descriptors;
-        features.octaves = octaves;
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datasets::hilti::KannalaBrandtCalibration;
     use kornia_image::ImageSize;
-
-    fn test_calib() -> KannalaBrandtCalibration {
-        KannalaBrandtCalibration {
-            fx: 461.64,
-            fy: 459.72,
-            cx: 732.95,
-            cy: 720.54,
-            k1: 0.0344,
-            k2: -0.0216,
-            k3: 0.0031,
-            k4: -0.0005,
-            width: 1472,
-            height: 1440,
-        }
-    }
-
-    /// Build a `HiltiSource` without touching the filesystem.
-    fn source(calib: &KannalaBrandtCalibration) -> HiltiSource {
-        HiltiSource {
-            // dataset is unused by the methods under test; build a minimal stub
-            // via the public open path is overkill, so we only exercise the
-            // pure-math pieces through a hand-built source.
-            dataset: HiltiDataset {
-                root: std::path::PathBuf::new(),
-                cam0_samples: Vec::new(),
-                cam1_samples: Vec::new(),
-                imu_samples: Vec::new(),
-                cam0_calibration: *calib,
-                cam1_calibration: *calib,
-                t_cam0_imu: [[0.0; 4]; 4],
-                t_cam1_imu: [[0.0; 4]; 4],
-                ground_truth: Vec::new(),
-            },
-            camera: calib.to_undistorted_pinhole(),
-            fisheye: calib.to_fisheye_camera(),
-            rotate_180: true,
-            min_bearing_z: MAX_INCIDENCE_DEG.to_radians().cos(),
-            cursor: 0,
-            start: 0,
-            end: 0,
-        }
-    }
-
-    fn features_at(pts: &[[f32; 2]]) -> OrbFeatures {
-        OrbFeatures {
-            keypoints_xy: pts.to_vec(),
-            orientations: vec![0.0; pts.len()],
-            descriptors: vec![[0u8; 32]; pts.len()],
-            octaves: vec![0u8; pts.len()],
-        }
-    }
-
-    #[test]
-    fn principal_point_is_a_fixed_point() {
-        let calib = test_calib();
-        let src = source(&calib);
-        let mut f = features_at(&[[calib.cx as f32, calib.cy as f32]]);
-        src.undistort_features(&mut f);
-        assert_eq!(f.keypoints_xy.len(), 1);
-        let [u, v] = f.keypoints_xy[0];
-        assert!((u as f64 - calib.cx).abs() < 1e-2);
-        assert!((v as f64 - calib.cy).abs() < 1e-2);
-    }
-
-    #[test]
-    fn keeps_arrays_aligned_when_filtering() {
-        let calib = test_calib();
-        let src = source(&calib);
-        // One central point (kept) and one extreme-corner point (likely dropped).
-        let mut f = features_at(&[[calib.cx as f32, calib.cy as f32], [1.0, 1.0]]);
-        f.orientations = vec![0.5, 1.5];
-        f.octaves = vec![1, 2];
-        src.undistort_features(&mut f);
-        let m = f.keypoints_xy.len();
-        assert_eq!(f.orientations.len(), m);
-        assert_eq!(f.descriptors.len(), m);
-        assert_eq!(f.octaves.len(), m);
-        assert!(m >= 1);
-    }
 
     #[test]
     fn rotate_180_reverses_pixels() {

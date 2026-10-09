@@ -1,0 +1,9 @@
+keypoints 1991
+keypoints_xy 2cb34df93a1b8171
+orientations 54aea5c22b8465f9
+descriptors 0dd35a886975eec1
+octaves 89cb8df6c48eac94
+stereo_matched 1243
+u_right f0dcfdf6e5a874a4
+depth 67a85c1f9e623003
+colors a0c9af4ae3c380e9

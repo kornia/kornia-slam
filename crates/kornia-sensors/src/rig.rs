@@ -2,13 +2,16 @@
 //! of any estimated state.
 
 use crate::imu::ImuCalib;
-use kornia_3d::{camera::PinholeCamera, pose::Pose3d};
+use kornia_3d::camera::{FisheyeCamera, PinholeCamera};
+use kornia_3d::pose::Pose3d;
 
 /// Camera calibration plus optional stereo and IMU calibration.
 ///
-/// The camera model describes the images the rig supplies. For rectified
-/// images, its intrinsics, the stereo baseline and the IMU extrinsics must all
-/// refer to that camera.
+/// `camera` is the geometry camera: keypoint coordinates, the stereo baseline
+/// and the IMU extrinsics all refer to it. For rectified or pinhole images it
+/// also describes the supplied images. With [`SensorRig::fisheye`] the images
+/// are raw fisheye instead, and `camera` is a virtual pinhole that keypoints
+/// are mapped into.
 /// Estimated bias, gravity and poses are runtime state of the consumer.
 #[derive(Debug, Clone)]
 pub struct SensorRig {
@@ -18,6 +21,9 @@ pub struct SensorRig {
     pub stereo_baseline_m: Option<f64>,
     /// `None` selects visual-only operation.
     pub imu: Option<ImuCalibration>,
+    /// Kannala-Brandt model of raw fisheye images, in image pixels. `None`
+    /// when the images are already in `camera`'s coordinates.
+    pub fisheye: Option<FisheyeCamera>,
 }
 
 impl SensorRig {
@@ -27,6 +33,7 @@ impl SensorRig {
             camera,
             stereo_baseline_m: None,
             imu: None,
+            fisheye: None,
         }
     }
 
@@ -40,6 +47,13 @@ impl SensorRig {
     /// noise parameters (see [`ImuCalibration::new`]).
     pub fn with_imu(mut self, camera_to_body: Pose3d) -> Self {
         self.imu = Some(ImuCalibration::new(camera_to_body));
+        self
+    }
+
+    /// Declares the images as raw fisheye: features are extracted on them and
+    /// their keypoints mapped through `fisheye` into the virtual pinhole `camera`.
+    pub fn with_fisheye(mut self, fisheye: FisheyeCamera) -> Self {
+        self.fisheye = Some(fisheye);
         self
     }
 

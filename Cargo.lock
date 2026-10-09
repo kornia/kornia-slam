@@ -3439,7 +3439,7 @@ dependencies = [
  "pollster",
  "profiling",
  "raw-window-handle",
- "ron",
+ "ron 0.11.0",
  "serde",
  "static_assertions",
  "wasm-bindgen",
@@ -3466,7 +3466,7 @@ dependencies = [
  "log",
  "nohash-hasher",
  "profiling",
- "ron",
+ "ron 0.11.0",
  "serde",
  "smallvec",
  "unicode-segmentation",
@@ -6091,6 +6091,7 @@ dependencies = [
  "glam 0.33.2",
  "kornia-3d",
  "kornia-algebra",
+ "kornia-image",
 ]
 
 [[package]]
@@ -6104,6 +6105,8 @@ dependencies = [
  "kornia-image",
  "kornia-imgproc",
  "kornia-sensors",
+ "ron 0.12.2",
+ "serde",
  "thiserror 1.0.69",
 ]
 
@@ -6128,6 +6131,7 @@ dependencies = [
  "nokhwa",
  "ratatui",
  "rerun",
+ "ron 0.12.2",
  "serde",
  "serde_yaml",
  "thiserror 2.0.19",
@@ -10520,7 +10524,7 @@ dependencies = [
  "re_log",
  "re_log_types",
  "re_tracing",
- "ron",
+ "ron 0.11.0",
  "serde",
  "smallvec",
  "strum",
@@ -10921,7 +10925,7 @@ dependencies = [
  "re_viewport",
  "re_viewport_blueprint",
  "rfd",
- "ron",
+ "ron 0.11.0",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
@@ -11473,6 +11477,20 @@ dependencies = [
  "bitflags 2.13.1",
  "serde",
  "serde_derive",
+ "unicode-ident",
+]
+
+[[package]]
+name = "ron"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81116b9531d61eabc41aeb228e4b6b2435bcca3233b98cf3b3077d4e6e9debb3"
+dependencies = [
+ "bitflags 2.13.1",
+ "once_cell",
+ "serde",
+ "serde_derive",
+ "typeid",
  "unicode-ident",
 ]
 
@@ -13037,6 +13055,12 @@ name = "typed-path"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+
+[[package]]
+name = "typeid"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc7d623258602320d5c55d1bc22793b57daff0ec7efc270ea7d55ce1d5f5471c"
 
 [[package]]
 name = "typenum"

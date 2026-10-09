@@ -1,0 +1,14 @@
+// Bubbaloop MCAP recording, rectified stereo. For mono, drop calib and the
+// sensors line; channel then names the single camera channel.
+(
+    source: Mcap((
+        path: "../data/recording.mcap",
+        channel: "mono_left",
+        right_channel: "mono_right",
+        calib: "../data/stereo_calib.yaml",
+    )),
+    system: (
+        version: 1,
+        sensors: ( cameras: Stereo ),
+    ),
+)

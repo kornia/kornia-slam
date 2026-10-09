@@ -23,3 +23,12 @@ kornia-sensors.workspace = true
 # camera system in visual-inertial Schur-complement BA.
 faer = "0.22"
 thiserror = "1"
+ron = { version = "0.12", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+# Serialization of the system configuration and its RON file loading.
+serde = ["dep:serde", "dep:ron"]
+
+[package.metadata.docs.rs]
+features = ["serde"]

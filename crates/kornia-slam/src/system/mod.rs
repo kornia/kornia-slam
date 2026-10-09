@@ -1,16 +1,30 @@
-//! SLAM runtime: orchestrates tracking, mapping, and state transitions.
+//! SLAM runtime: its configuration, construction and processing flow.
 //!
-//! The runtime flow is kept in one file so it can be read from top to bottom
-//! in the same order frames move through the system.
+//! The processing flow is kept in this file so it can be read from top to
+//! bottom in the same order frames move through the system. With the `serde`
+//! feature, configurations load from versioned RON files.
 
+mod build;
 mod config;
-mod inertial;
+#[cfg(feature = "serde")]
+mod file;
+mod input;
 mod state;
+mod validation;
 
-pub use config::SlamConfig;
+pub use build::BuildError;
+pub use config::{
+    CameraSelection, FrontendConfig, LoopClosingMode, MappingConfig, OrbFrontendConfig,
+    OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection,
+    StereoCloseDepth, SystemConfig,
+};
+#[cfg(feature = "serde")]
+pub use file::LoadError;
+pub use input::ProcessError;
 pub use state::{TrackingResult, TrackingStatus};
+pub use validation::ConfigError;
 
-use inertial::{AppliedInitialization, InertialState, viba0_accel_bias_prior};
+use crate::frontend::{FrontendObservation, OrbFrontend};
 use state::{SystemMode, SystemState};
 
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
@@ -20,24 +34,29 @@ use crate::tracking::motion::{InertialPrediction, predict_pose};
 use crate::tracking::tracker::{FrameInput, Tracker};
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::Frame;
+use crate::inertial::{
+    AppliedInitialization, ImuInitResult, InertialState, viba0_accel_bias_prior,
+};
 use crate::initialization::bootstrap::{
     self, BootstrapDecision, MIN_KEYPOINTS_FOR_BOOTSTRAP, MIN_STEREO_POINTS, MIN_VALID_POINTS,
     TooFewStereoPoints, evaluate_bootstrap,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
-use crate::loop_closure::place_recognition::Vocabulary;
 use crate::loop_closure::{LoopCloser, LoopClosingContext, LoopClosureEvent};
 use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
-use crate::mapping::map::{Keyframe, Map, MapInsertion, MapMutationError, MapPoint};
+use crate::mapping::map::{
+    InertialAlignmentError, Keyframe, Map, MapInsertion, MapMutationError, MapPoint,
+};
 use crate::mapping::{KeyframeJob, LocalMapping};
 use crate::pose_conversion::apply_reference_pose_correction;
-use kornia_3d::camera::PinholeCamera;
+use build::SystemSettings;
 use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
 use kornia_sensors::imu::ImuMeasurement;
-use kornia_sensors::{ImuCalibration, SensorRig};
+use kornia_sensors::{SensorFrame, SensorRig};
 
 /// Top-level ORB-SLAM system: orchestrates tracking, mapping, and state transitions.
 pub struct SlamSystem {
@@ -48,10 +67,7 @@ pub struct SlamSystem {
     tracking_loss_recovery: TrackingLossRecoveryPolicy,
     // mThDepth (metres): back-project close stereo points at each keyframe when set
     stereo_close_depth: Option<f64>,
-    // Emit per-frame diagnostic logs (skip/reject reasons, growth counters)
     debug: bool,
-    // Buffered debug messages produced during the most recent process_frame call;
-    // drained by the caller (TUI panel or stderr).
     debug_messages: Vec<String>,
     map: Arc<Mutex<Map>>,
     // Serializes compound map publication and short local-BA snapshot/merge phases.
@@ -60,34 +76,47 @@ pub struct SlamSystem {
     inertial: InertialState,
     local_mapping: LocalMapping,
     // Place recognition for every keyframe, and loop closing when configured.
-    loop_closer: LoopCloser,
+    loop_closer: Option<LoopCloser>,
     loop_closure_events: Vec<LoopClosureEvent>,
     state: SystemState,
+    frontend: OrbFrontend,
+    // The last processed image, for optical-flow tracks into the next frame.
+    previous_image: Option<Image<u8, 1>>,
+    tracking_duration: Duration,
 }
 
 impl SlamSystem {
-    /// Creates a new system with identity pose.
-    pub fn new(camera: PinholeCamera, config: SlamConfig) -> Self {
-        Self::with_rig(SensorRig::new(camera), config)
+    /// Builds the system `config` describes from the source's calibrated rig,
+    /// restricted to the selected sensors. Resources such as the vocabulary
+    /// are loaded before any mapping worker starts.
+    pub fn build(config: SystemConfig, rig: SensorRig) -> Result<Self, BuildError> {
+        config.validate()?;
+        let rig = config.sensors.select_rig(rig)?;
+        let settings = config.settings(&rig);
+        let frontend = OrbFrontend::new(config.orb_detector(), &rig);
+        let loop_closer = config.loop_closer(&rig)?;
+        Ok(Self::assemble(rig, settings, frontend, loop_closer))
     }
 
-    /// Builds a system from an explicit sensor rig, so IMU noise parameters and
-    /// extrinsics can be supplied for the actual sensor.
-    pub fn with_rig(rig: SensorRig, config: SlamConfig) -> Self {
+    fn assemble(
+        rig: SensorRig,
+        settings: SystemSettings,
+        frontend: OrbFrontend,
+        loop_closer: Option<LoopCloser>,
+    ) -> Self {
         let camera = rig.camera.clone();
         let map = Arc::new(Mutex::new(Map::new()));
         let local_mapping =
-            LocalMapping::new(config.local_mapping, Arc::clone(&map), camera.clone());
+            LocalMapping::new(settings.local_mapping, Arc::clone(&map), camera.clone());
         let map_publication_gate = local_mapping.publication_gate();
-        let loop_closer = LoopCloser::new(config.pgo);
         Self {
             rig,
-            tracker: Tracker::new(config.map_projection),
-            two_view_init_config: config.two_view_init,
-            keyframe_policy: config.keyframe_policy,
-            tracking_loss_recovery: config.tracking_loss_recovery,
-            stereo_close_depth: config.stereo_close_depth_m,
-            debug: config.debug,
+            tracker: Tracker::new(settings.map_projection),
+            two_view_init_config: settings.two_view_init,
+            keyframe_policy: settings.keyframe_policy,
+            tracking_loss_recovery: settings.tracking_loss_recovery,
+            stereo_close_depth: settings.stereo_close_depth_m,
+            debug: false,
             debug_messages: Vec::new(),
             map,
             map_publication_gate,
@@ -96,32 +125,101 @@ impl SlamSystem {
             inertial: InertialState::new(),
             loop_closer,
             loop_closure_events: Vec::new(),
+            frontend,
+            previous_image: None,
+            tracking_duration: Duration::ZERO,
         }
-    }
-
-    /// Enables appearance-based loop detection with a bag-of-words vocabulary.
-    /// Without it, keyframes are not indexed and no loop candidates are emitted.
-    pub fn set_vocabulary(&mut self, vocabulary: Vocabulary) {
-        self.loop_closer.set_vocabulary(vocabulary);
     }
 
     pub fn drain_loop_closure_events(&mut self) -> Vec<LoopClosureEvent> {
         std::mem::take(&mut self.loop_closure_events)
     }
 
-    /// Enables the inertial path by providing the camera-to-body extrinsic
-    /// `T_BC` (`X_body = T_BC * X_cam`). Without it, IMU samples are ignored.
-    pub fn set_imu_extrinsics(&mut self, t_bc: Pose3d) {
-        self.rig.imu = Some(ImuCalibration::new(t_bc));
-    }
-
-    /// The system's fixed sensor calibration.
+    /// The system's sensor calibration, restricted to the selected sensors.
     pub fn rig(&self) -> &SensorRig {
         &self.rig
     }
 
-    /// Processes one frame (pre-extracted features) and returns the tracking result.
-    pub fn process_frame(
+    /// Extracts features from one input frame and tracks it.
+    ///
+    /// # Errors
+    ///
+    /// Invalid input or a feature-extraction failure; the system state,
+    /// including buffered IMU samples and image history, is then unchanged.
+    pub fn process(&mut self, input: SensorFrame<'_>) -> Result<TrackingResult, ProcessError> {
+        input::validate(&input, self.rig.stereo_baseline_m.is_some())?;
+        let frame = self
+            .frontend
+            .prepare(&input)
+            .map_err(|source| ProcessError::Frontend {
+                idx: input.idx,
+                source,
+            })?;
+        self.report_stereo(&frame);
+        let imu_samples = if self.rig.imu.is_some() {
+            input.imu_samples.to_vec()
+        } else {
+            Vec::new()
+        };
+        // Taken out for the call so tracking can borrow it alongside `self`.
+        let previous_image = self.previous_image.take();
+        let tracking_start = Instant::now();
+        let result = self.process_prepared(
+            frame,
+            previous_image.as_ref(),
+            input.image,
+            input.timestamp_sec,
+            imu_samples,
+        );
+        self.tracking_duration = tracking_start.elapsed();
+        self.retain_previous_image(input.image, previous_image);
+        Ok(result)
+    }
+
+    /// Time the latest successfully processed frame spent in tracking and
+    /// mapping, excluding feature extraction (see [`Self::frontend_observation`]).
+    pub fn tracking_duration(&self) -> Duration {
+        self.tracking_duration
+    }
+
+    /// The frontend output of the latest successfully processed frame.
+    pub fn frontend_observation(&self) -> &FrontendObservation {
+        self.frontend.observation()
+    }
+
+    /// Copies `image` into the previous-image buffer, reusing its allocation.
+    fn retain_previous_image(&mut self, image: &Image<u8, 1>, buffer: Option<Image<u8, 1>>) {
+        self.previous_image = match buffer {
+            Some(mut buffer) if buffer.size() == image.size() => {
+                buffer.as_slice_mut().copy_from_slice(image.as_slice());
+                Some(buffer)
+            }
+            _ => Some(image.clone()),
+        };
+    }
+
+    fn report_stereo(&mut self, frame: &Frame) {
+        if !self.debug {
+            return;
+        }
+        let Some(matched) = self.frontend.observation().stereo_matched else {
+            return;
+        };
+        let mut depths: Vec<f32> = frame.depth.iter().copied().filter(|&d| d > 0.0).collect();
+        let median = if depths.is_empty() {
+            0.0
+        } else {
+            depths.sort_by(|a, b| a.total_cmp(b));
+            depths[depths.len() / 2]
+        };
+        self.dbg(format!(
+            "[stereo] frame={} matched={matched} median_depth={median:.3}m",
+            frame.idx
+        ));
+    }
+
+    /// Tracks one frame of prepared features.
+    fn process_prepared(
         &mut self,
         mut frame: Frame,
         previous_image: Option<&Image<u8, 1>>,
@@ -180,7 +278,9 @@ impl SlamSystem {
         std::mem::take(&mut self.debug_messages)
     }
 
-    /// Toggle whether the pipeline buffers per-frame debug messages.
+    /// Toggles per-frame diagnostics: bootstrap skip and reject reasons,
+    /// tracking reject reasons, keyframe growth and fuse counters. Off after
+    /// [`SlamSystem::build`].
     pub fn set_debug(&mut self, on: bool) {
         self.debug = on;
         if !on {
@@ -539,12 +639,7 @@ impl SlamSystem {
             );
             match init_result {
                 Some(init) => {
-                    let applied = self.inertial.apply_initialization(
-                        &mut self.map.lock().unwrap(),
-                        &mut self.state,
-                        init,
-                        start_idx,
-                    );
+                    let applied = self.apply_inertial_initialization(init, start_idx);
                     match applied {
                         Ok(applied) => self.resume_tracking_after_viba0(timestamp_sec, applied),
                         // Staying in ImuInit lets the retry throttle re-solve later.
@@ -560,6 +655,22 @@ impl SlamSystem {
         }
 
         result
+    }
+
+    /// Applies an inertial initialization to the map and resumes tracking from
+    /// the aligned state; a refused alignment changes nothing.
+    fn apply_inertial_initialization(
+        &mut self,
+        init: ImuInitResult,
+        start_kf_idx: usize,
+    ) -> Result<AppliedInitialization, InertialAlignmentError> {
+        let applied = self.inertial.apply_initialization(
+            &mut self.map.lock().unwrap(),
+            init,
+            start_kf_idx,
+        )?;
+        self.state.adopt_inertial_initialization(applied.aligned);
+        Ok(applied)
     }
 
     fn resume_tracking_after_viba0(&mut self, timestamp_sec: f64, applied: AppliedInitialization) {
@@ -581,6 +692,7 @@ impl SlamSystem {
             scale,
             gravity_world: gravity,
             gyro_bias: bg,
+            ..
         } = applied;
         self.dbg(format!(
             "[imu_init] VIBA0 accepted: scale={scale:.4} gravity=({:.3},{:.3},{:.3}) \
@@ -899,8 +1011,6 @@ impl SlamSystem {
         // asynchronous mode will deliver it at a later frame boundary.
         self.apply_local_mapping_results();
 
-        // Index this keyframe for appearance-based place recognition and surface
-        // any loop candidates (no-op unless a vocabulary was provided).
         self.register_place_recognition(frame.idx);
 
         true
@@ -954,12 +1064,7 @@ impl SlamSystem {
         );
         match init_result {
             Some(init) => {
-                let applied = self.inertial.apply_initialization(
-                    &mut self.map.lock().unwrap(),
-                    &mut self.state,
-                    init,
-                    start_idx,
-                );
+                let applied = self.apply_inertial_initialization(init, start_idx);
                 match applied {
                     Ok(AppliedInitialization {
                         scale,
@@ -984,9 +1089,12 @@ impl SlamSystem {
         self.inertial.schedule.complete(refinement);
     }
 
-    /// Offers a freshly inserted keyframe to place recognition and, when
-    /// configured, loop closing; applies whatever the closer reports back.
+    /// Offers a freshly inserted keyframe to loop closing, when enabled, and
+    /// applies whatever the closer reports back.
     fn register_place_recognition(&mut self, kf_idx: usize) {
+        let Some(loop_closer) = self.loop_closer.as_mut() else {
+            return;
+        };
         let context = LoopClosingContext {
             pose_world_to_cam: self.state.pose_world_to_cam,
             velocity_world: self.state.velocity_world,
@@ -996,8 +1104,7 @@ impl SlamSystem {
         };
         let outcome = {
             let mut map = self.map.lock().unwrap();
-            self.loop_closer
-                .on_keyframe(&mut map, &self.rig.camera, kf_idx, context)
+            loop_closer.on_keyframe(&mut map, &self.rig.camera, kf_idx, context)
         };
         if let Some(message) = outcome.debug_message {
             self.dbg(message);
@@ -1038,14 +1145,4 @@ fn format_imu_init_gate(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::format_imu_init_gate;
-
-    #[test]
-    fn formats_compact_imu_init_gate() {
-        assert_eq!(
-            format_imu_init_gate(12, Some(12), Some(32), 7, 10, 1.05, 1.0),
-            "[imu_init_gate] start_idx=12 first_idx=Some(12) last_idx=Some(32) kfs=7/10 imu_time=1.05/1.0s"
-        );
-    }
-}
+mod tests;
