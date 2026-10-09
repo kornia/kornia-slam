@@ -105,6 +105,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_images() {
+        let empty = image(0, 6);
+        assert!(matches!(
+            validate(&frame(&empty, None), false),
+            Err(ProcessError::EmptyImage { idx: 7 })
+        ));
+    }
+
+    #[test]
     fn rejects_non_finite_timestamps() {
         let left = image(8, 6);
         for timestamp_sec in [f64::NAN, f64::INFINITY] {

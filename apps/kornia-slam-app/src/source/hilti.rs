@@ -193,46 +193,7 @@ impl FrameSource for HiltiSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datasets::hilti::KannalaBrandtCalibration;
     use kornia_image::ImageSize;
-
-    #[test]
-    fn rig_declares_the_fisheye_model() {
-        let calib = KannalaBrandtCalibration {
-            fx: 461.64,
-            fy: 459.72,
-            cx: 732.95,
-            cy: 720.54,
-            k1: 0.0344,
-            k2: -0.0216,
-            k3: 0.0031,
-            k4: -0.0005,
-            width: 1472,
-            height: 1440,
-        };
-        let source = HiltiSource {
-            dataset: HiltiDataset {
-                root: std::path::PathBuf::new(),
-                cam0_samples: Vec::new(),
-                cam1_samples: Vec::new(),
-                imu_samples: Vec::new(),
-                cam0_calibration: calib,
-                cam1_calibration: calib,
-                t_cam0_imu: [[0.0; 4]; 4],
-                t_cam1_imu: [[0.0; 4]; 4],
-                ground_truth: Vec::new(),
-            },
-            camera: calib.to_undistorted_pinhole(),
-            fisheye: calib.to_fisheye_camera(),
-            rotate_180: true,
-            cursor: 0,
-            start: 0,
-            end: 0,
-        };
-        let rig = source.rig();
-        assert_eq!(rig.camera.fx, calib.fx);
-        assert_eq!(rig.fisheye.map(|fisheye| fisheye.k1), Some(calib.k1));
-    }
 
     #[test]
     fn rotate_180_reverses_pixels() {

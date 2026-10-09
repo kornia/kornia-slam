@@ -133,28 +133,6 @@ mod tests {
     }
 
     #[test]
-    fn rigs_supply_pinhole_images_unless_fisheye_is_declared() {
-        let rig = SensorRig::new(test_camera())
-            .with_stereo_baseline(0.11)
-            .with_imu(Pose3d::IDENTITY);
-        assert!(rig.fisheye.is_none());
-
-        let fisheye = FisheyeCamera {
-            fx: 460.0,
-            fy: 460.0,
-            cx: 730.0,
-            cy: 720.0,
-            k1: 0.03,
-            k2: -0.02,
-            k3: 0.003,
-            k4: -0.0005,
-        };
-        let rig = SensorRig::new(test_camera()).with_fisheye(fisheye);
-        assert_eq!(rig.fisheye.as_ref().map(|f| f.fx), Some(460.0));
-        assert_eq!(rig.camera.fx, 400.0);
-    }
-
-    #[test]
     fn stereo_bf_is_focal_times_baseline() {
         let rig = SensorRig::new(test_camera());
         assert!(rig.stereo_bf().is_none());

@@ -145,7 +145,6 @@ mod tests {
 
         assert_eq!(mono, 1e10);
         assert_eq!(stereo, 1e5);
-        assert!(mono > stereo);
     }
 
     /// VIBA1 waits for 5 s of window and VIBA2 for 15 s after VIBA1; each

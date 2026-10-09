@@ -7,7 +7,11 @@ const HILTI_FIXTURE: &str = include_str!("../../tests/fixtures/frontend/hilti.tx
 
 /// Deterministic texture of 4x4 blocks of noise. The right view is the left
 /// view shifted by `disparity` pixels, so a point at `x` appears at `x - d`.
-fn synthetic_pair(width: usize, height: usize, disparity: usize) -> (Image<u8, 1>, Image<u8, 1>) {
+pub(crate) fn synthetic_pair(
+    width: usize,
+    height: usize,
+    disparity: usize,
+) -> (Image<u8, 1>, Image<u8, 1>) {
     let value = |x: usize, y: usize| -> u8 {
         let mut s = ((x / 4) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ ((y / 4) as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
@@ -122,7 +126,7 @@ fn stereo_frontend() -> OrbFrontend {
 }
 
 #[test]
-fn stereo_preparation_matches_the_app_baseline() {
+fn stereo_preparation_matches_the_recorded_baseline() {
     let (left, right) = synthetic_pair(376, 240, 8);
     let mut frontend = stereo_frontend();
     let frame = frontend.prepare(&input(&left, Some(&right))).unwrap();
@@ -168,7 +172,7 @@ fn stereo_preparation_matches_the_app_baseline() {
 }
 
 #[test]
-fn fisheye_mapping_matches_the_app_baseline() {
+fn fisheye_mapping_matches_the_recorded_baseline() {
     let grid: Vec<[f32; 2]> = (0..40)
         .flat_map(|j| (0..40).map(move |i| [i as f32 * 1471.0 / 39.0, j as f32 * 1439.0 / 39.0]))
         .collect();

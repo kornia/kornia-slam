@@ -2,10 +2,10 @@ use std::path::PathBuf;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_algebra::Vec3F64;
-use kornia_image::ImageSize;
 
 use super::*;
 use crate::frontend::OrbFrontend;
+use crate::frontend::tests::synthetic_pair;
 use crate::loop_closure::place_recognition::{Vocabulary, VocabularyLoadError};
 use crate::mapping::LocalMappingMode;
 
@@ -51,20 +51,9 @@ fn mono() -> SystemConfig {
     config(CameraSelection::Mono, false, LoopClosingMode::Disabled)
 }
 
-/// Deterministic texture of 4x4 blocks of noise, shifted right by `shift` pixels.
+/// Deterministic texture of 4x4 blocks of noise, shifted left by `shift` pixels.
 fn textured(shift: usize) -> Image<u8, 1> {
-    let (width, height) = (376, 240);
-    let value = |x: usize, y: usize| -> u8 {
-        let mut s = ((x / 4) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            ^ ((y / 4) as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-        s ^= s >> 29;
-        s = s.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        (s ^ (s >> 32)) as u8
-    };
-    let pixels: Vec<u8> = (0..height)
-        .flat_map(|y| (0..width).map(move |x| value(x + shift, y)))
-        .collect();
-    Image::from_size_slice(ImageSize { width, height }, &pixels).unwrap()
+    synthetic_pair(376, 240, shift).1
 }
 
 fn input<'a>(idx: usize, image: &'a Image<u8, 1>, imu: &'a [ImuMeasurement]) -> SensorFrame<'a> {
@@ -87,9 +76,18 @@ fn imu_samples() -> Vec<ImuMeasurement> {
         .collect()
 }
 
+/// A vocabulary file, removed on drop.
+struct SavedVocabulary(PathBuf);
+
+impl Drop for SavedVocabulary {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// A vocabulary trained on the texture's descriptors, saved where a
 /// configuration can name it.
-fn saved_vocabulary(name: &str) -> PathBuf {
+fn saved_vocabulary(name: &str) -> SavedVocabulary {
     let features = OrbFrontend::new(mono().orb_detector(), &SensorRig::new(camera()))
         .prepare(&input(0, &textured(0), &[]))
         .unwrap()
@@ -107,7 +105,7 @@ fn saved_vocabulary(name: &str) -> PathBuf {
         .unwrap()
         .save(path.to_str().unwrap())
         .unwrap();
-    path
+    SavedVocabulary(path)
 }
 
 #[test]
@@ -169,7 +167,7 @@ fn loop_closing_constructs_only_when_enabled() {
             CameraSelection::Stereo,
             imu,
             LoopClosingMode::Enabled {
-                vocabulary: vocabulary.clone(),
+                vocabulary: vocabulary.0.clone(),
             },
         );
         SlamSystem::build(config, stereo_imu_rig()).unwrap()
@@ -177,7 +175,6 @@ fn loop_closing_constructs_only_when_enabled() {
     let stereo = enabled(false).loop_closer.unwrap();
     assert!(!stereo.correction_requires_imu());
     assert!(enabled(true).loop_closer.unwrap().correction_requires_imu());
-    std::fs::remove_file(vocabulary).unwrap();
 }
 
 #[test]

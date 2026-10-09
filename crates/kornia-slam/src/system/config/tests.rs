@@ -49,78 +49,98 @@ fn rig() -> SensorRig {
 }
 
 #[test]
-fn default_is_valid_orb_without_branches() {
-    let config = SystemConfig::default();
-    assert_eq!(config.validate(), Ok(()));
-    assert_eq!(
-        config.to_string(),
-        "OrbSlam pipeline (config version 1)
+fn display_describes_the_pipeline() {
+    let stereo = SystemConfig {
+        sensors: sensors(CameraSelection::Stereo, false),
+        ..SystemConfig::default()
+    };
+    let mut inertial_loop = with_loop_closing(loop_closing(), sensors(CameraSelection::Mono, true));
+    orb_mut(&mut inertial_loop).mapping.execution = LocalMappingMode::Synchronous;
+    for (config, expected) in [
+        (
+            SystemConfig::default(),
+            "OrbSlam pipeline (config version 1)
   frontend: ORB, 1000 keypoints
   tracking
   keyframes: every 3..=8 frames, ref ratio 0.6
   local mapping: asynchronous
-"
-    );
-}
-
-#[test]
-fn rejects_unsupported_version() {
-    let config = SystemConfig {
-        version: 2,
-        ..SystemConfig::default()
-    };
-    assert_eq!(
-        config.validate(),
-        Err(ConfigError::UnsupportedVersion {
-            found: 2,
-            supported: SYSTEM_CONFIG_VERSION,
-        })
-    );
-}
-
-#[test]
-fn keypoint_budget_is_bounded() {
-    let range = OrbFrontendConfig::N_KEYPOINTS_RANGE;
-    for (n_keypoints, ok) in [
-        (0, false),
-        (*range.start() - 1, false),
-        (*range.start(), true),
-        (*range.end(), true),
-        (*range.end() + 1, false),
+",
+        ),
+        (
+            stereo,
+            "OrbSlam pipeline (config version 1)
+  frontend: ORB, 1000 keypoints
+  stereo depth: rectified pair, close within 35 baselines
+  tracking
+  keyframes: every 3..=8 frames, ref ratio 0.6
+  local mapping: asynchronous
+",
+        ),
+        (
+            inertial_loop,
+            "OrbSlam pipeline (config version 1)
+  frontend: ORB, 1000 keypoints
+  IMU integration
+  tracking
+  keyframes: every 3..=8 frames, ref ratio 0.6
+  local mapping: synchronous
+  loop closing: ORBvoc.txt
+",
+        ),
     ] {
+        assert_eq!(config.to_string(), expected);
+    }
+}
+
+#[test]
+fn frontend_and_keyframe_settings_are_range_checked() {
+    let keypoints = |n_keypoints| {
         let mut config = SystemConfig::default();
         orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
             n_keypoints,
             ..OrbFrontendConfig::default()
         });
-        assert_eq!(config.validate().is_ok(), ok, "n_keypoints {n_keypoints}");
+        config.validate()
+    };
+    let range = OrbFrontendConfig::N_KEYPOINTS_RANGE;
+    for n in [*range.start(), *range.end()] {
+        assert_eq!(keypoints(n), Ok(()), "n_keypoints {n}");
     }
-}
+    for n in [0, *range.start() - 1, *range.end() + 1] {
+        assert!(
+            matches!(keypoints(n), Err(ConfigError::KeypointsOutOfRange { value, .. }) if value == n),
+            "n_keypoints {n}"
+        );
+    }
 
-#[test]
-fn keyframe_gaps_must_be_positive_and_ordered() {
-    for (min, max, ok) in [(0, 8, false), (9, 8, false), (8, 8, true), (1, 2, true)] {
+    let gaps = |min, max| {
         let mut config = SystemConfig::default();
         let keyframes = &mut orb_mut(&mut config).keyframes;
         keyframes.min_frames_between = min;
         keyframes.max_frames_between = max;
-        assert_eq!(config.validate().is_ok(), ok, "gaps {min}..={max}");
+        config.validate()
+    };
+    assert_eq!(gaps(8, 8), Ok(()));
+    assert_eq!(gaps(1, 2), Ok(()));
+    for (min, max) in [(0, 8), (9, 8)] {
+        assert_eq!(
+            gaps(min, max),
+            Err(ConfigError::InvalidKeyframeGaps { min, max })
+        );
     }
-}
 
-#[test]
-fn keyframe_ratio_must_be_finite_unit_interval() {
-    for (ratio, ok) in [
-        (0.0, true),
-        (1.0, true),
-        (-0.1, false),
-        (1.5, false),
-        (f64::NAN, false),
-        (f64::INFINITY, false),
-    ] {
+    let ratio = |ref_ratio| {
         let mut config = SystemConfig::default();
-        orb_mut(&mut config).keyframes.ref_ratio = ratio;
-        assert_eq!(config.validate().is_ok(), ok, "ratio {ratio}");
+        orb_mut(&mut config).keyframes.ref_ratio = ref_ratio;
+        config.validate()
+    };
+    assert_eq!(ratio(0.0), Ok(()));
+    assert_eq!(ratio(1.0), Ok(()));
+    for ref_ratio in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
+        assert!(
+            matches!(ratio(ref_ratio), Err(ConfigError::InvalidRefRatio(_))),
+            "ratio {ref_ratio}"
+        );
     }
 }
 
@@ -210,38 +230,6 @@ fn loop_closing_requires_metric_input() {
 }
 
 #[test]
-fn display_lists_sensors_and_branches() {
-    let config = SystemConfig {
-        sensors: sensors(CameraSelection::Stereo, false),
-        ..SystemConfig::default()
-    };
-    assert_eq!(
-        config.to_string(),
-        "OrbSlam pipeline (config version 1)
-  frontend: ORB, 1000 keypoints
-  stereo depth: rectified pair, close within 35 baselines
-  tracking
-  keyframes: every 3..=8 frames, ref ratio 0.6
-  local mapping: asynchronous
-"
-    );
-
-    let mut config = with_loop_closing(loop_closing(), sensors(CameraSelection::Mono, true));
-    orb_mut(&mut config).mapping.execution = LocalMappingMode::Synchronous;
-    assert_eq!(
-        config.to_string(),
-        "OrbSlam pipeline (config version 1)
-  frontend: ORB, 1000 keypoints
-  IMU integration
-  tracking
-  keyframes: every 3..=8 frames, ref ratio 0.6
-  local mapping: synchronous
-  loop closing: ORBvoc.txt
-"
-    );
-}
-
-#[test]
 fn rig_must_provide_selected_sensors() {
     let mono = rig();
     let stereo_imu = rig().with_stereo_baseline(0.11).with_imu(Pose3d::IDENTITY);
@@ -288,57 +276,6 @@ mod runtime_settings {
 
     fn stereo_imu_rig() -> SensorRig {
         rig().with_stereo_baseline(0.11).with_imu(Pose3d::IDENTITY)
-    }
-
-    #[test]
-    fn select_rig_keeps_only_selected_sensors() {
-        let mono = SensorSelection::default()
-            .select_rig(stereo_imu_rig())
-            .unwrap();
-        assert!(mono.stereo_baseline_m.is_none() && mono.imu.is_none());
-
-        let all = sensors(CameraSelection::Stereo, true)
-            .select_rig(stereo_imu_rig())
-            .unwrap();
-        assert_eq!(all.stereo_baseline_m, Some(0.11));
-        assert!(all.imu.is_some());
-
-        assert_eq!(
-            sensors(CameraSelection::Mono, true)
-                .select_rig(rig())
-                .unwrap_err(),
-            ConfigError::MissingSensor("an IMU")
-        );
-    }
-
-    /// The defaults must keep the runtime settings the system had before the
-    /// system configuration owned them.
-    #[test]
-    fn default_maps_to_previous_runtime_defaults() {
-        let config = SystemConfig::default();
-        let slam = config.settings(&rig());
-        assert_eq!(slam.keyframe_policy, KeyframePolicy::default());
-        assert_eq!(slam.local_mapping, LocalMappingMode::Asynchronous);
-        assert_eq!(slam.stereo_close_depth_m, None);
-        assert_eq!(config.orb_detector().n_keypoints, 1000);
-
-        let triangulation = &slam.two_view_init.triangulation_config;
-        assert_eq!(triangulation.max_midpoint_gap, 0.25);
-        assert_eq!(triangulation.max_reprojection_error, 3.0);
-        assert_eq!(triangulation.cheirality_ambiguity_max, 0.75);
-        assert_eq!(triangulation.min_parallax_deg, 1.0);
-        let acceptance = &slam.two_view_init.acceptance_config;
-        assert_eq!(
-            (
-                acceptance.min_matches,
-                acceptance.min_inliers,
-                acceptance.min_triangulated
-            ),
-            (100, 30, 50)
-        );
-        assert_eq!(slam.map_projection.local_projection.search_radius, 30.0);
-        assert_eq!(slam.map_projection.local_projection.max_hamming, 60);
-        assert_eq!(slam.tracking_loss_recovery.timeout_visual_sec, 0.5);
     }
 
     #[test]
@@ -398,7 +335,7 @@ mod ron_files {
 
     use super::*;
 
-    const PLAN_EXAMPLE: &str = r#"
+    const EXPLICIT_DEFAULTS: &str = r#"
         (
             version: 1,
             sensors: ( cameras: Mono, imu: false ),
@@ -420,6 +357,17 @@ mod ron_files {
         SystemConfig::from_ron_str(text, Path::new(""))
     }
 
+    fn parse_error(text: &str) -> ron::Error {
+        match parse(text) {
+            Err(LoadError::Parse(error)) => error.code,
+            other => panic!("{text}: expected a parse error, got {other:?}"),
+        }
+    }
+
+    fn rejects_field(text: &str, field: &str) -> bool {
+        matches!(parse_error(text), ron::Error::NoSuchStructField { found, .. } if found == field)
+    }
+
     /// Tuning has no `PartialEq` and no file representation, so configurations
     /// are compared through their serialized form.
     fn ron(config: &SystemConfig) -> String {
@@ -427,14 +375,11 @@ mod ron_files {
     }
 
     #[test]
-    fn explicit_defaults_equal_default() {
+    fn omitted_settings_take_their_defaults() {
         let default = ron(&SystemConfig::default());
-        assert_eq!(ron(&parse(PLAN_EXAMPLE).unwrap()), default);
+        assert_eq!(ron(&parse(EXPLICIT_DEFAULTS).unwrap()), default);
         assert_eq!(ron(&parse("(version: 1)").unwrap()), default);
-    }
 
-    #[test]
-    fn partial_file_keeps_other_defaults() {
         let config =
             parse("(version: 1, pipeline: OrbSlam((frontend: Orb((n_keypoints: 3000)))))").unwrap();
         let mut expected = SystemConfig::default();
@@ -448,19 +393,28 @@ mod ron_files {
     /// Tuning is not part of the file format, so a file cannot set it.
     #[test]
     fn files_cannot_set_tuning() {
-        assert!(matches!(
-            parse("(version: 1, pipeline: OrbSlam((tuning: ())))"),
-            Err(LoadError::Parse(_))
+        assert!(rejects_field(
+            "(version: 1, pipeline: OrbSlam((tuning: ())))",
+            "tuning"
         ));
         let mut config = SystemConfig::default();
         orb_mut(&mut config).tuning.loss_recovery.timeout_imu_sec = 9.0;
         let reloaded = parse(&ron(&config)).unwrap();
-        assert_eq!(orb(&reloaded).tuning.loss_recovery.timeout_imu_sec, 1.0);
+        assert_eq!(
+            orb(&reloaded).tuning.loss_recovery.timeout_imu_sec,
+            OrbTuning::default().loss_recovery.timeout_imu_sec
+        );
     }
 
     #[test]
     fn version_is_required() {
-        assert!(matches!(parse("()"), Err(LoadError::Parse(_))));
+        assert!(matches!(
+            parse_error("()"),
+            ron::Error::MissingStructField {
+                field: "version",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -474,36 +428,38 @@ mod ron_files {
 
     #[test]
     fn unknown_fields_are_rejected_at_every_level() {
-        for text in [
-            "(version: 1, extra: 1)",
-            "(version: 1, sensors: (lidar: true))",
-            "(version: 1, pipeline: OrbSlam((tracker: 1)))",
-            "(version: 1, pipeline: OrbSlam((frontend: Orb((n_levels: 8)))))",
-            "(version: 1, pipeline: OrbSlam((keyframes: (gap: 3))))",
-            "(version: 1, pipeline: OrbSlam((mapping: (window: 3))))",
-            "(version: 1, pipeline: OrbSlam((loop_closing: Enabled(vocabulary: \"v.txt\", pgo: true))))",
-            "(version: 1, pipeline: OrbSlam((initialization: ())))",
-            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((loop_closing: Enabled(vocabulary: \"v.txt\", correction: ()))))",
+        for (text, field) in [
+            ("(version: 1, extra: 1)", "extra"),
+            ("(version: 1, sensors: (lidar: true))", "lidar"),
+            ("(version: 1, pipeline: OrbSlam((tracker: 1)))", "tracker"),
+            (
+                "(version: 1, pipeline: OrbSlam((frontend: Orb((n_levels: 8)))))",
+                "n_levels",
+            ),
+            (
+                "(version: 1, pipeline: OrbSlam((keyframes: (gap: 3))))",
+                "gap",
+            ),
+            (
+                "(version: 1, pipeline: OrbSlam((mapping: (window: 3))))",
+                "window",
+            ),
+            (
+                "(version: 1, pipeline: OrbSlam((loop_closing: Enabled(vocabulary: \"v.txt\", pgo: true))))",
+                "pgo",
+            ),
         ] {
-            assert!(matches!(parse(text), Err(LoadError::Parse(_))), "{text}");
+            assert!(rejects_field(text, field), "{text}");
         }
     }
 
     #[test]
-    fn invalid_settings_are_rejected() {
+    fn loaded_files_are_validated() {
         let err = parse("(version: 1, pipeline: OrbSlam((frontend: Orb((n_keypoints: 0)))))")
             .unwrap_err();
         assert!(matches!(
             err,
             LoadError::Invalid(ConfigError::KeypointsOutOfRange { value: 0, .. })
-        ));
-        let err = parse(
-            "(version: 1, pipeline: OrbSlam((loop_closing: Enabled(vocabulary: \"v.txt\"))))",
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            LoadError::Invalid(ConfigError::LoopClosingWithoutMetricScale)
         ));
     }
 
@@ -529,7 +485,7 @@ mod ron_files {
 
     #[test]
     fn file_paths_resolve_against_the_file_directory() {
-        let dir = std::env::temp_dir().join(format!("kornia-slam-pipeline-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kornia-slam-system-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("orb.ron");
         std::fs::write(

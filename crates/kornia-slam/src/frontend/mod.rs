@@ -202,4 +202,4 @@ fn sample_colors(image: &Image<u8, 1>, keypoints_xy: &[[f32; 2]]) -> Vec<[u8; 3]
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

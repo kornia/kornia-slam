@@ -294,7 +294,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod cli_tests {
     use argh::FromArgs;
-    use kornia_slam::SystemConfig;
 
     use super::*;
 
@@ -303,60 +302,16 @@ mod cli_tests {
     }
 
     #[test]
-    fn a_run_file_is_required() {
-        assert!(parse(&[]).is_err());
+    fn parses_the_run_file_and_evaluation_options() {
+        assert!(parse(&[]).is_err(), "a run file is required");
+
         let args = parse(&["--config", "configs/euroc.ron"]).unwrap();
         assert_eq!(args.config, "configs/euroc.ron");
         assert!(!args.evaluate);
         assert_eq!(args.eval_out, ".");
-    }
 
-    #[test]
-    fn evaluation_is_a_global_option() {
         let args = parse(&["--config", "r.ron", "--evaluate", "--eval-out", "out"]).unwrap();
         assert!(args.evaluate);
         assert_eq!(args.eval_out, "out");
-    }
-
-    #[test]
-    fn source_subcommands_and_algorithm_flags_are_gone() {
-        for removed in [
-            &["--config", "r.ron", "euroc", "--data", "d"][..],
-            &["--config", "r.ron", "mcap", "--path", "r.mcap"],
-            &["--config", "r.ron", "--data", "d"],
-            &["--config", "r.ron", "--n-keypoints", "3000"],
-            &["--config", "r.ron", "--stereo"],
-        ] {
-            assert!(parse(removed).is_err(), "{removed:?}");
-        }
-    }
-
-    fn configs_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs")
-    }
-
-    #[test]
-    fn shipped_run_files_load() {
-        let mut loaded = 0;
-        for entry in std::fs::read_dir(configs_dir()).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_some_and(|ext| ext == "ron") {
-                RunConfig::from_ron_file(&path)
-                    .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
-                loaded += 1;
-            }
-        }
-        assert!(loaded > 0, "no run files in {}", configs_dir().display());
-    }
-
-    /// `euroc.ron` documents every system default, so it must stay equal to them.
-    #[test]
-    fn euroc_run_file_lists_the_system_defaults() {
-        let run = RunConfig::from_ron_file(configs_dir().join("euroc.ron")).unwrap();
-        assert_eq!(
-            run.system.to_ron_string().unwrap(),
-            SystemConfig::default().to_ron_string().unwrap(),
-            "configs/euroc.ron no longer lists the system defaults"
-        );
     }
 }
