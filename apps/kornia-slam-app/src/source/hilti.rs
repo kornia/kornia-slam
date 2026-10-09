@@ -15,17 +15,76 @@
 //! Monocular only for now: it reads `cam0`. Stereo (`cam0`+`cam1`) is a
 //! follow-up.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use kornia_3d::camera::{FisheyeCamera, PinholeCamera};
 use kornia_image::Image;
 use kornia_io::png::read_image_png_mono8;
 
 use kornia_sensors::SensorRig;
+use kornia_slam::SensorSelection;
+use serde::Deserialize;
 
-use super::{FrameItem, FrameSource, SourceError};
+use super::{
+    FrameItem, FrameSource, OpenedSource, SourceError, dataset_summary, mono_only, no_imu,
+    non_empty, resolve,
+};
 use crate::datasets::euroc::GroundTruthPose;
 use crate::datasets::hilti::HiltiDataset;
+
+/// A Hilti-Trimble SLAM Challenge 2026 sequence extracted to the EuRoC-style
+/// layout by the challenge's `ros2bag_to_euroc.py`. Monocular raw fisheye.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HiltiConfig {
+    /// Extracted sequence root, containing `cam0/` and `imu0/`.
+    pub data: PathBuf,
+    /// Kalibr camera-IMU chain YAML.
+    pub calib: PathBuf,
+    #[serde(default)]
+    pub start_frame: usize,
+    #[serde(default)]
+    pub max_frames: usize,
+    /// The sensors are mounted inverted; disable when the extraction already
+    /// rotated the images.
+    #[serde(default = "enabled")]
+    pub rotate_180: bool,
+}
+
+fn enabled() -> bool {
+    true
+}
+
+impl HiltiConfig {
+    pub(super) fn validate(&self, sensors: SensorSelection) -> Result<(), String> {
+        mono_only("Hilti", sensors)?;
+        no_imu("Hilti", sensors)
+    }
+
+    pub(super) fn resolve_paths(&mut self, base_dir: &Path) {
+        resolve(&mut self.data, base_dir);
+        resolve(&mut self.calib, base_dir);
+    }
+
+    pub(super) fn open(&self) -> Result<OpenedSource, SourceError> {
+        let source = HiltiSource::open(
+            &self.data,
+            &self.calib,
+            self.start_frame,
+            self.max_frames,
+            self.rotate_180,
+        )?;
+        Ok(OpenedSource {
+            summary: Some(dataset_summary(
+                source.dataset_len(),
+                self.start_frame,
+                source.n_frames_hint(),
+            )),
+            ground_truth: non_empty(source.ground_truth_poses_cloned()),
+            source: Box::new(source),
+        })
+    }
+}
 
 /// Reads upright raw fisheye `cam0` frames from an extracted Hilti sequence in
 /// order.

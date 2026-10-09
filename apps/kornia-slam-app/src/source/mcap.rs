@@ -13,7 +13,7 @@
 //! distortion + extrinsics) before yielding the pair.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ciborium::value::Value as CborValue;
 use kornia_3d::camera::PinholeCamera;
@@ -23,9 +23,76 @@ use kornia_io::jpeg::{decode_image_jpeg_layout, decode_image_jpeg_mono8, decode_
 use mcap::McapError;
 
 use kornia_sensors::SensorRig;
+use kornia_slam::SensorSelection;
+use serde::Deserialize;
 
-use super::{FrameItem, FrameSource, SourceError, rectify_pair};
+use super::{
+    FrameItem, FrameSource, OpenedSource, SourceError, no_imu, rectify_pair, resolve,
+    stereo_needs_calib,
+};
 use crate::datasets::StereoCalib;
+
+/// A bubbaloop MCAP recording.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McapConfig {
+    pub path: PathBuf,
+    /// Channel suffix to read; the left channel with stereo cameras.
+    #[serde(default = "mono_left")]
+    pub channel: String,
+    #[serde(default = "mono_right")]
+    pub right_channel: String,
+    /// Stereo calibration YAML; required with stereo cameras.
+    #[serde(default)]
+    pub calib: Option<PathBuf>,
+    #[serde(default)]
+    pub start_frame: usize,
+    #[serde(default)]
+    pub max_frames: usize,
+}
+
+fn mono_left() -> String {
+    "mono_left".into()
+}
+
+fn mono_right() -> String {
+    "mono_right".into()
+}
+
+impl McapConfig {
+    pub(super) fn validate(&self, sensors: SensorSelection) -> Result<(), String> {
+        stereo_needs_calib("Mcap", sensors, self.calib.as_deref())?;
+        no_imu("Mcap", sensors)
+    }
+
+    pub(super) fn resolve_paths(&mut self, base_dir: &Path) {
+        resolve(&mut self.path, base_dir);
+        if let Some(calib) = &mut self.calib {
+            resolve(calib, base_dir);
+        }
+    }
+
+    pub(super) fn open(&self, stereo: bool) -> Result<OpenedSource, SourceError> {
+        let source = match (&self.calib, stereo) {
+            (Some(calib), true) => McapSource::open_stereo(
+                &self.path,
+                &self.channel,
+                &self.right_channel,
+                calib,
+                self.start_frame,
+                self.max_frames,
+            )?,
+            _ => McapSource::open(&self.path, &self.channel, self.start_frame, self.max_frames)?,
+        };
+        Ok(OpenedSource {
+            summary: source
+                .n_frames_hint()
+                .map(|n| format!("MCAP: {n} frames from /{}", self.channel)),
+            ground_truth: None,
+            source: Box::new(source),
+        })
+    }
+}
 
 /// A timestamped grayscale frame, `(log_time_sec, image)`.
 type TimedImage = (f64, Image<u8, 1>);

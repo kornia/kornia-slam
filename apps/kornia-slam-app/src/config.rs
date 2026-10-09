@@ -12,9 +12,11 @@
 
 use std::path::{Path, PathBuf};
 
+use kornia_slam::PipelineConfig;
 use kornia_slam::system::ConfigError;
-use kornia_slam::{CameraSelection, PipelineConfig, SensorSelection};
 use serde::Deserialize;
+
+use crate::source::SourceConfig;
 
 /// One run: where the data comes from and how it is processed.
 #[derive(Debug, Clone, Deserialize)]
@@ -24,141 +26,6 @@ pub struct RunConfig {
     /// Omitted, the default monocular pipeline runs.
     #[serde(default)]
     pub system: PipelineConfig,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub enum SourceConfig {
-    Euroc(EurocConfig),
-    Hilti(HiltiConfig),
-    Mcap(McapConfig),
-    Oakd(OakdConfig),
-    Uvc(UvcConfig),
-}
-
-/// An EuRoC MAV sequence; stereo and IMU calibration come from its `sensor.yaml` files.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EurocConfig {
-    /// Sequence root, e.g. `MH_01_easy/`.
-    pub data: PathBuf,
-    #[serde(default)]
-    pub start_frame: usize,
-    /// 0 processes the whole sequence.
-    #[serde(default)]
-    pub max_frames: usize,
-}
-
-/// A Hilti-Trimble SLAM Challenge 2026 sequence extracted to the EuRoC-style
-/// layout by the challenge's `ros2bag_to_euroc.py`. Monocular raw fisheye.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HiltiConfig {
-    /// Extracted sequence root, containing `cam0/` and `imu0/`.
-    pub data: PathBuf,
-    /// Kalibr camera-IMU chain YAML.
-    pub calib: PathBuf,
-    #[serde(default)]
-    pub start_frame: usize,
-    #[serde(default)]
-    pub max_frames: usize,
-    /// The sensors are mounted inverted; disable when the extraction already
-    /// rotated the images.
-    #[serde(default = "enabled")]
-    pub rotate_180: bool,
-}
-
-/// A bubbaloop MCAP recording.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct McapConfig {
-    pub path: PathBuf,
-    /// Channel suffix to read; the left channel with stereo cameras.
-    #[serde(default = "mono_left")]
-    pub channel: String,
-    #[serde(default = "mono_right")]
-    pub right_channel: String,
-    /// Stereo calibration YAML; required with stereo cameras.
-    #[serde(default)]
-    pub calib: Option<PathBuf>,
-    #[serde(default)]
-    pub start_frame: usize,
-    #[serde(default)]
-    pub max_frames: usize,
-}
-
-/// A live OAK-D camera: CamB mono, or CamB+CamC stereo.
-#[derive(Debug, Clone, Deserialize)]
-#[cfg_attr(not(feature = "oakd"), expect(dead_code))]
-#[serde(deny_unknown_fields)]
-pub struct OakdConfig {
-    /// 0 runs until stopped.
-    #[serde(default)]
-    pub max_frames: usize,
-    /// Mono resolution; stereo uses the calibration's.
-    #[serde(default = "oakd_width")]
-    pub width: u32,
-    #[serde(default = "oakd_height")]
-    pub height: u32,
-    #[serde(default = "thirty")]
-    pub fps: f32,
-    /// Stereo calibration YAML; required with stereo cameras.
-    #[serde(default)]
-    pub calib: Option<PathBuf>,
-}
-
-/// A live UVC camera (webcam, USB camera, CSI-to-UVC adapter). The intrinsics
-/// must match the resolution the device actually streams at.
-#[derive(Debug, Clone, Deserialize)]
-#[cfg_attr(not(feature = "uvc"), expect(dead_code))]
-#[serde(deny_unknown_fields)]
-pub struct UvcConfig {
-    #[serde(default)]
-    pub index: u32,
-    #[serde(default = "uvc_width")]
-    pub width: u32,
-    #[serde(default = "uvc_height")]
-    pub height: u32,
-    #[serde(default)]
-    pub max_frames: usize,
-    /// Focal lengths and principal point, in pixels.
-    pub fx: f64,
-    pub fy: f64,
-    pub cx: f64,
-    pub cy: f64,
-    /// Radial and tangential distortion.
-    #[serde(default)]
-    pub k1: f64,
-    #[serde(default)]
-    pub k2: f64,
-    #[serde(default)]
-    pub p1: f64,
-    #[serde(default)]
-    pub p2: f64,
-}
-
-fn enabled() -> bool {
-    true
-}
-fn mono_left() -> String {
-    "mono_left".into()
-}
-fn mono_right() -> String {
-    "mono_right".into()
-}
-fn oakd_width() -> u32 {
-    640
-}
-fn oakd_height() -> u32 {
-    400
-}
-fn uvc_width() -> u32 {
-    640
-}
-fn uvc_height() -> u32 {
-    480
-}
-fn thirty() -> f32 {
-    30.0
 }
 
 /// A run file that cannot be read or does not describe a valid run.
@@ -237,24 +104,7 @@ impl RunConfig {
     }
 
     fn resolve_paths(&mut self, base_dir: &Path) {
-        let resolve = |path: &mut PathBuf| {
-            if path.is_relative() {
-                *path = base_dir.join(&*path);
-            }
-        };
-        match &mut self.source {
-            SourceConfig::Euroc(euroc) => resolve(&mut euroc.data),
-            SourceConfig::Hilti(hilti) => {
-                resolve(&mut hilti.data);
-                resolve(&mut hilti.calib);
-            }
-            SourceConfig::Mcap(mcap) => {
-                resolve(&mut mcap.path);
-                mcap.calib.iter_mut().for_each(resolve);
-            }
-            SourceConfig::Oakd(oakd) => oakd.calib.iter_mut().for_each(resolve),
-            SourceConfig::Uvc(_) => {}
-        }
+        self.source.resolve_paths(base_dir);
         self.system.resolve_paths(base_dir);
     }
 }
@@ -275,91 +125,6 @@ impl Invalid {
             Self::System(source) => RunConfigError::System { path, source },
             Self::Source(message) => RunConfigError::Source { path, message },
         }
-    }
-}
-
-impl SourceConfig {
-    /// Checks, before anything is opened, that the source can provide the
-    /// selected sensors and has the settings it needs. `SlamSystem::build`
-    /// checks the opened source's calibration again.
-    fn validate(&self, sensors: SensorSelection) -> Result<(), String> {
-        self.check_sensors(sensors)?;
-        match self {
-            Self::Euroc(_) | Self::Hilti(_) | Self::Mcap(_) => Ok(()),
-            Self::Oakd(oakd) => {
-                positive("fps", oakd.fps.into())?;
-                positive("width", oakd.width.into())?;
-                positive("height", oakd.height.into())
-            }
-            Self::Uvc(uvc) => {
-                positive("width", uvc.width.into())?;
-                positive("height", uvc.height.into())?;
-                positive("fx", uvc.fx)?;
-                positive("fy", uvc.fy)?;
-                finite("cx", uvc.cx)?;
-                finite("cy", uvc.cy)?;
-                for (name, value) in [
-                    ("k1", uvc.k1),
-                    ("k2", uvc.k2),
-                    ("p1", uvc.p1),
-                    ("p2", uvc.p2),
-                ] {
-                    finite(name, value)?;
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-impl SourceConfig {
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Euroc(_) => "Euroc",
-            Self::Hilti(_) => "Hilti",
-            Self::Mcap(_) => "Mcap",
-            Self::Oakd(_) => "Oakd",
-            Self::Uvc(_) => "Uvc",
-        }
-    }
-
-    /// Stereo needs a rectifiable pair: EuRoC's own calibration, or a
-    /// calibration file for MCAP and OAK-D. Only EuRoC supplies IMU data.
-    fn check_sensors(&self, sensors: SensorSelection) -> Result<(), String> {
-        let name = self.name();
-        if sensors.cameras == CameraSelection::Stereo {
-            match self {
-                Self::Euroc(_) => {}
-                Self::Mcap(McapConfig { calib: None, .. })
-                | Self::Oakd(OakdConfig { calib: None, .. }) => {
-                    return Err(format!("{name} with stereo cameras needs `calib`"));
-                }
-                Self::Mcap(_) | Self::Oakd(_) => {}
-                Self::Hilti(_) | Self::Uvc(_) => {
-                    return Err(format!("{name} provides monocular images only"));
-                }
-            }
-        }
-        if sensors.imu && !matches!(self, Self::Euroc(_)) {
-            return Err(format!("{name} provides no IMU data"));
-        }
-        Ok(())
-    }
-}
-
-fn positive(name: &str, value: f64) -> Result<(), String> {
-    if value.is_finite() && value > 0.0 {
-        Ok(())
-    } else {
-        Err(format!("{name} is {value}, but must be finite and > 0"))
-    }
-}
-
-fn finite(name: &str, value: f64) -> Result<(), String> {
-    if value.is_finite() {
-        Ok(())
-    } else {
-        Err(format!("{name} must be finite"))
     }
 }
 

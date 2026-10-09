@@ -2,32 +2,31 @@
 //!
 //! Both offline datasets (EuRoC) and live cameras (OAK-D) feed the same
 //! `SlamSystem::process` loop. This module exposes a single trait,
-//! [`FrameSource`], so the main binary can stay source-agnostic.
+//! [`FrameSource`], so the main binary can stay source-agnostic. Each source
+//! module also owns the run-file settings it is opened from.
 
 pub mod euroc;
 pub mod hilti;
 pub mod mcap;
-#[cfg(feature = "oakd")]
 pub mod oakd;
-#[cfg(feature = "uvc")]
 pub mod uvc;
+
+use std::path::{Path, PathBuf};
 
 use kornia_image::Image;
 use kornia_sensors::SensorRig;
 use kornia_sensors::imu::ImuMeasurement;
+use serde::Deserialize;
 
-use crate::config::SourceConfig;
 use crate::datasets::StereoRectifier;
 use crate::datasets::euroc::GroundTruthPose;
 use kornia_slam::{CameraSelection, SensorSelection};
 
-pub use euroc::EurocSource;
-pub use hilti::HiltiSource;
-pub use mcap::McapSource;
-#[cfg(feature = "oakd")]
-pub use oakd::OakdSource;
-#[cfg(feature = "uvc")]
-pub use uvc::UvcSource;
+use euroc::EurocConfig;
+use hilti::HiltiConfig;
+use mcap::McapConfig;
+use oakd::OakdConfig;
+use uvc::UvcConfig;
 
 /// One frame yielded by a source.
 pub struct FrameItem {
@@ -96,114 +95,108 @@ pub struct OpenedSource {
     pub summary: Option<String>,
 }
 
-/// Opens the configured source in the mode the selected sensors need.
-pub fn open(
-    config: &SourceConfig,
+/// Where a run's frames come from.
+#[derive(Debug, Clone, Deserialize)]
+pub enum SourceConfig {
+    Euroc(EurocConfig),
+    Hilti(HiltiConfig),
+    Mcap(McapConfig),
+    Oakd(OakdConfig),
+    Uvc(UvcConfig),
+}
+
+impl SourceConfig {
+    /// Checks, before anything is opened, that the source can provide the
+    /// selected sensors and has the settings it needs. `SlamSystem::build`
+    /// checks the opened source's calibration again.
+    pub fn validate(&self, sensors: SensorSelection) -> Result<(), String> {
+        match self {
+            Self::Euroc(_) => Ok(()),
+            Self::Hilti(hilti) => hilti.validate(sensors),
+            Self::Mcap(mcap) => mcap.validate(sensors),
+            Self::Oakd(oakd) => oakd.validate(sensors),
+            Self::Uvc(uvc) => uvc.validate(sensors),
+        }
+    }
+
+    /// Resolves relative paths against `base_dir`.
+    pub fn resolve_paths(&mut self, base_dir: &Path) {
+        match self {
+            Self::Euroc(euroc) => euroc.resolve_paths(base_dir),
+            Self::Hilti(hilti) => hilti.resolve_paths(base_dir),
+            Self::Mcap(mcap) => mcap.resolve_paths(base_dir),
+            Self::Oakd(oakd) => oakd.resolve_paths(base_dir),
+            Self::Uvc(_) => {}
+        }
+    }
+
+    /// Opens the source in the mode the selected sensors need.
+    pub fn open(&self, sensors: SensorSelection) -> Result<OpenedSource, SourceError> {
+        let stereo = sensors.cameras == CameraSelection::Stereo;
+        match self {
+            Self::Euroc(euroc) => euroc.open(stereo),
+            Self::Hilti(hilti) => hilti.open(),
+            Self::Mcap(mcap) => mcap.open(stereo),
+            Self::Oakd(oakd) => oakd.open(stereo),
+            Self::Uvc(uvc) => uvc.open(),
+        }
+    }
+}
+
+fn resolve(path: &mut PathBuf, base_dir: &Path) {
+    if path.is_relative() {
+        *path = base_dir.join(&*path);
+    }
+}
+
+fn mono_only(source: &str, sensors: SensorSelection) -> Result<(), String> {
+    if sensors.cameras == CameraSelection::Stereo {
+        return Err(format!("{source} provides monocular images only"));
+    }
+    Ok(())
+}
+
+fn no_imu(source: &str, sensors: SensorSelection) -> Result<(), String> {
+    if sensors.imu {
+        return Err(format!("{source} provides no IMU data"));
+    }
+    Ok(())
+}
+
+/// Stereo from a raw camera pair needs a calibration to rectify it with.
+fn stereo_needs_calib(
+    source: &str,
     sensors: SensorSelection,
-) -> Result<OpenedSource, Box<dyn std::error::Error>> {
-    let stereo = sensors.cameras == CameraSelection::Stereo;
-    let window = |total: usize, start: usize, n: Option<usize>| {
-        format!(
-            "Dataset: {total} frames (processing {start}..{})",
-            start + n.unwrap_or(0)
-        )
-    };
-    let opened = match config {
-        SourceConfig::Euroc(e) => {
-            let src = if stereo {
-                EurocSource::open_stereo(&e.data, e.start_frame, e.max_frames)?
-            } else {
-                EurocSource::open(&e.data, e.start_frame, e.max_frames)?
-            };
-            OpenedSource {
-                summary: Some(window(
-                    src.dataset_len(),
-                    e.start_frame,
-                    src.n_frames_hint(),
-                )),
-                ground_truth: non_empty(src.ground_truth_poses_cloned()),
-                source: Box::new(src),
-            }
-        }
-        SourceConfig::Hilti(h) => {
-            let src =
-                HiltiSource::open(&h.data, &h.calib, h.start_frame, h.max_frames, h.rotate_180)?;
-            OpenedSource {
-                summary: Some(window(
-                    src.dataset_len(),
-                    h.start_frame,
-                    src.n_frames_hint(),
-                )),
-                ground_truth: non_empty(src.ground_truth_poses_cloned()),
-                source: Box::new(src),
-            }
-        }
-        SourceConfig::Mcap(m) => {
-            let src = match (&m.calib, stereo) {
-                (Some(calib), true) => McapSource::open_stereo(
-                    &m.path,
-                    &m.channel,
-                    &m.right_channel,
-                    calib,
-                    m.start_frame,
-                    m.max_frames,
-                )?,
-                _ => McapSource::open(&m.path, &m.channel, m.start_frame, m.max_frames)?,
-            };
-            OpenedSource {
-                summary: src
-                    .n_frames_hint()
-                    .map(|n| format!("MCAP: {n} frames from /{}", m.channel)),
-                ground_truth: None,
-                source: Box::new(src),
-            }
-        }
-        #[cfg(feature = "oakd")]
-        SourceConfig::Oakd(o) => {
-            let src = match (&o.calib, stereo) {
-                (Some(calib), true) => OakdSource::open_stereo(o.fps, calib, o.max_frames)?,
-                _ => OakdSource::open(o.width, o.height, o.fps, o.max_frames)?,
-            };
-            OpenedSource {
-                summary: None,
-                ground_truth: None,
-                source: Box::new(src),
-            }
-        }
-        #[cfg(feature = "uvc")]
-        SourceConfig::Uvc(u) => {
-            let camera = kornia_3d::camera::PinholeCamera {
-                fx: u.fx,
-                fy: u.fy,
-                cx: u.cx,
-                cy: u.cy,
-                k1: u.k1,
-                k2: u.k2,
-                p1: u.p1,
-                p2: u.p2,
-            };
-            OpenedSource {
-                summary: None,
-                ground_truth: None,
-                source: Box::new(UvcSource::open(
-                    u.index,
-                    u.width,
-                    u.height,
-                    camera,
-                    u.max_frames,
-                )?),
-            }
-        }
-        #[cfg(not(feature = "oakd"))]
-        SourceConfig::Oakd(_) => {
-            return Err("this build has no OAK-D support; rebuild with `--features oakd`".into());
-        }
-        #[cfg(not(feature = "uvc"))]
-        SourceConfig::Uvc(_) => {
-            return Err("this build has no UVC support; rebuild with `--features uvc`".into());
-        }
-    };
-    Ok(opened)
+    calib: Option<&Path>,
+) -> Result<(), String> {
+    if sensors.cameras == CameraSelection::Stereo && calib.is_none() {
+        return Err(format!("{source} with stereo cameras needs `calib`"));
+    }
+    Ok(())
+}
+
+fn positive(name: &str, value: f64) -> Result<(), String> {
+    if value.is_finite() && value > 0.0 {
+        Ok(())
+    } else {
+        Err(format!("{name} is {value}, but must be finite and > 0"))
+    }
+}
+
+fn finite(name: &str, value: f64) -> Result<(), String> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(format!("{name} must be finite"))
+    }
+}
+
+/// Startup line for a dataset read through a frame window.
+fn dataset_summary(total: usize, start: usize, n_frames: Option<usize>) -> String {
+    format!(
+        "Dataset: {total} frames (processing {start}..{})",
+        start + n_frames.unwrap_or(0)
+    )
 }
 
 /// Datasets report missing ground truth as an empty list.

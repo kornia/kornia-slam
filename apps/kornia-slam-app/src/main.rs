@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mut source,
         ground_truth,
         summary,
-    } = source::open(&run.source, run.system.sensors)?;
+    } = run.source.open(run.system.sensors)?;
     if args.evaluate && ground_truth.is_none() {
         return Err("--evaluate needs ground truth, and this source has none".into());
     }

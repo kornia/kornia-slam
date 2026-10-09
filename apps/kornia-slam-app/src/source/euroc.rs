@@ -1,6 +1,6 @@
 //! EuRoC MAV dataset as a [`FrameSource`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
@@ -8,11 +8,52 @@ use kornia_algebra::{Mat3F64, Vec3F64};
 use kornia_io::png::read_image_png_mono8;
 use kornia_sensors::SensorRig;
 use kornia_sensors::imu::ImuMeasurement;
+use serde::Deserialize;
 
-use super::{FrameItem, FrameSource, SourceError, rectify_pair};
+use super::{
+    FrameItem, FrameSource, OpenedSource, SourceError, dataset_summary, non_empty, rectify_pair,
+    resolve,
+};
 use crate::datasets::EurocDataset;
 use crate::datasets::euroc::{GroundTruthPose, ImuSample};
 use crate::datasets::{StereoRectifier, rectifier_from_euroc};
+
+/// An EuRoC MAV sequence; stereo and IMU calibration come from its `sensor.yaml` files.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EurocConfig {
+    /// Sequence root, e.g. `MH_01_easy/`.
+    pub data: PathBuf,
+    #[serde(default)]
+    pub start_frame: usize,
+    /// 0 processes the whole sequence.
+    #[serde(default)]
+    pub max_frames: usize,
+}
+
+impl EurocConfig {
+    pub(super) fn resolve_paths(&mut self, base_dir: &Path) {
+        resolve(&mut self.data, base_dir);
+    }
+
+    pub(super) fn open(&self, stereo: bool) -> Result<OpenedSource, SourceError> {
+        let source = if stereo {
+            EurocSource::open_stereo(&self.data, self.start_frame, self.max_frames)?
+        } else {
+            EurocSource::open(&self.data, self.start_frame, self.max_frames)?
+        };
+        Ok(OpenedSource {
+            summary: Some(dataset_summary(
+                source.dataset_len(),
+                self.start_frame,
+                source.n_frames_hint(),
+            )),
+            ground_truth: non_empty(source.ground_truth_poses_cloned()),
+            source: Box::new(source),
+        })
+    }
+}
+
 /// Reads left-camera (and optionally rectified left+right) PNG frames from an
 /// EuRoC dataset in order.
 pub struct EurocSource {
