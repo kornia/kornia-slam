@@ -52,6 +52,13 @@ of frames, and V1_03 mono goes from 10% to 83%.
 evaluates against motion capture. 16-bit images are reduced to 8 bits, and the
 Hilti reader gains the IMU when its images are not rotated.
 
+**Mono+IMU keeps mapping while it coasts too.** Keyframes inserted at the
+inertial prediction while lost now include monocular ones, which local mapping
+triangulates against their neighbours. On EuRoC mono+IMU, ATE drops from
+0.96 m to 0.33 m on V1_02, 1.51 m to 0.62 m on V1_03 and 1.72 m to 0.79 m on
+V2_01, with fewer resets; jumps above 30 cm rise on V1_03 and V2_01, where the
+coasted pose snaps back as vision returns.
+
 **EuRoC stereo pairs are matched by timestamp.** The source paired left and
 right images by position, which is off by one frame for all of MH_04 and
 drifts through V2_03's dropped left frames; stereo results on those two
