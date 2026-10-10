@@ -1,0 +1,9 @@
+// TUM-VI sequence (the 512x512 "dataset-*_512_16" export): monocular on the raw
+// equidistant fisheye cam0 with the IMU; mocap0 is the ground truth.
+(
+    source: TumVi(( data: "../data/tumvi/dataset-room1_512_16" )),
+    system: (
+        version: 1,
+        sensors: ( cameras: Mono, imu: true ),
+    ),
+)

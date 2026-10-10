@@ -10,6 +10,60 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**Stereo-inertial tracking rides through fast motion instead of resetting.**
+Once the IMU has settled, a tracking failure now coasts on the inertial
+prediction for up to 5 s (was 1 s, ORB-SLAM3's `time_recently_lost`), keeps
+inserting stereo keyframes at the predicted pose every 0.2 s so the map covers
+the view the camera turned to, and widens the projection search at once
+rather than over several seconds (without a settled IMU it still widens
+gradually: a wide search around a constant-velocity guess accepts wrong
+matches). On EuRoC V2_03 stereo+IMU the system no
+longer resets (21 resets before, ATE 1.66 m → 0.88 m with synchronous
+mapping); the other ten sequences are unchanged. `MapProjectionConfig::max_search_scale` is renamed
+`lost_search_scale`, and `TrackingLossRecoveryPolicy` gains
+`keyframe_interval_while_lost_sec`.
+
+**Visual tracking relocalizes against the map.** When tracking fails without a
+settled IMU (stereo or mono only, or before inertial initialization), each lost
+frame is scored against the keyframe database, matched against the best
+candidates, solved with PnP RANSAC and refined against the candidate's local
+map; 50 inliers resume tracking where the map already was instead of starting
+a new one. It uses the loop closer's vocabulary, so it runs when loop closing
+is enabled. On EuRoC V2_03 stereo-only, resets drop from 22 to 18 (ATE
+1.72 m → 1.27 m).
+
+**Weak pose estimates no longer teleport the trajectory.** With a settled IMU,
+a frame now needs 15 inliers (ORB-SLAM3's inertial threshold) instead of 10
+before its visual pose replaces the inertial prediction
+(`MapProjectionConfig::min_inliers_with_prediction`), and a relocalized pose
+more than 0.5 m from the motion model is refused. On EuRoC stereo+IMU the
+largest frame-to-frame jump against ground truth drops from 1.30 m to 0.04 m on
+V2_01 and from 1.01 m to 0.51 m on V2_03; jumps above 30 cm on V2_03 go from 15
+to 5.
+
+**Monocular initialization no longer waits forever on a stale reference.** A
+bootstrap reference that fails to match more than ten frames in a row is
+replaced by the current frame. EuRoC MH_02 and MH_05 previously never
+initialized in mono or mono+IMU (0% of frames tracked); they now track 95–99%
+of frames, and V1_03 mono goes from 10% to 83%.
+
+**TUM-VI sequences.** The app reads TUM-VI's `dataset-*_512_16` exports
+(`source: TumVi((data: …))`), monocular on the raw fisheye with the IMU, and
+evaluates against motion capture. 16-bit images are reduced to 8 bits, and the
+Hilti reader gains the IMU when its images are not rotated.
+
+**Mono+IMU keeps mapping while it coasts too.** Keyframes inserted at the
+inertial prediction while lost now include monocular ones, which local mapping
+triangulates against their neighbours. On EuRoC mono+IMU, ATE drops from
+0.96 m to 0.33 m on V1_02, 1.51 m to 0.62 m on V1_03 and 1.72 m to 0.79 m on
+V2_01, with fewer resets; jumps above 30 cm rise on V1_03 and V2_01, where the
+coasted pose snaps back as vision returns.
+
+**EuRoC stereo pairs are matched by timestamp.** The source paired left and
+right images by position, which is off by one frame for all of MH_04 and
+drifts through V2_03's dropped left frames; stereo results on those two
+sequences were invalid.
+
 **Runs are defined by a configuration file.** The CLI takes one RON run file,
 `kornia-slam --config run.ron`, with a `source` (EuRoC, Hilti, MCAP, OAK-D or
 UVC: paths, frame range, calibration) and a `system` (sensors, ORB settings,

@@ -19,6 +19,7 @@ use crate::tracking::pose_estimation::map_projection::{
     MapProjectionConfig, MapProjectionRejectReason,
 };
 use crate::tracking::pose_estimation::{Estimate, MapProjectionEstimator};
+use crate::tracking::relocalization::{Relocalization, RelocalizationConfig, relocalize};
 
 /// Everything the tracker needs about the current frame that it does not own.
 pub(crate) struct FrameInput<'a> {
@@ -32,6 +33,9 @@ pub(crate) struct FrameInput<'a> {
     pub current_keyframe_idx: Option<usize>,
     /// How long tracking has been failing, which widens the search.
     pub lost_for_sec: f64,
+    /// Whether `candidate_pose` is an inertial prediction trustworthy enough
+    /// to veto a weakly supported visual estimate.
+    pub trusted_prediction: bool,
 }
 
 pub(crate) struct Tracker {
@@ -47,6 +51,29 @@ impl Tracker {
             klt_tracker: KltTracker::default(),
             track_set: TrackSet::new(),
         }
+    }
+
+    /// Recovers the pose against one of the candidate keyframes; on success
+    /// the optical-flow tracks, which belonged to the lost pose, are dropped.
+    pub(crate) fn relocalize(
+        &mut self,
+        frame: &Frame,
+        candidates: &[usize],
+        map: &Map,
+        camera: &PinholeCamera,
+    ) -> Option<Relocalization> {
+        let found = relocalize(
+            frame,
+            candidates,
+            map,
+            camera,
+            &self.estimator,
+            &RelocalizationConfig::default(),
+        );
+        if found.is_some() {
+            self.reset_tracks();
+        }
+        found
     }
 
     /// Drops optical-flow continuity. Used when the map's world frame changes
@@ -67,7 +94,10 @@ impl Tracker {
         map: &Map,
         camera: &PinholeCamera,
     ) -> Result<Estimate, MapProjectionRejectReason> {
-        let search_scale = self.estimator.config().search_scale_for(input.lost_for_sec);
+        let search_scale = self
+            .estimator
+            .config()
+            .search_scale_for(input.lost_for_sec, input.trusted_prediction);
 
         let klt_survivors = if self.track_set.is_empty() {
             None
@@ -106,6 +136,18 @@ impl Tracker {
             search_scale,
             pre_seeded,
         );
+
+        // With a trusted inertial prediction the threshold drops to
+        // ORB-SLAM3's inertial value; a solution below it is too weakly
+        // supported to override the prediction and would teleport the pose.
+        let min_inliers = self.estimator.config().min_inliers_with_prediction;
+        let result = result.and_then(|estimate| {
+            if input.trusted_prediction && estimate.inliers < min_inliers {
+                Err(MapProjectionRejectReason::LowPnpInliers)
+            } else {
+                Ok(estimate)
+            }
+        });
 
         match result {
             Ok(estimate) => {

@@ -9,9 +9,11 @@
 //!   cam1/data.csv          # optional
 //!   cam1/data/<timestamp>.png
 //!   imu0/data.csv          # optional
+//!   state_groundtruth_estimate0/data.csv   # optional, or mocap0/data.csv
 //! ```
 //!
-//! Camera calibration is loaded from a separate Kalibr YAML file.
+//! Camera calibration is loaded from a separate Kalibr YAML file. TUM-VI's
+//! `mav0/` directory has the same layout, with its Kalibr chain in `dso/`.
 
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::ImuMeasurement;
@@ -401,13 +403,17 @@ fn read_optional_imu_samples(root: &Path) -> Result<Vec<ImuMeasurement>, Dataset
     Ok(samples)
 }
 
-/// Reads `state_groundtruth_estimate0/data.csv` (EuRoC ground-truth format)
-/// when present. Returns an empty Vec when the directory or file is absent.
+/// Reads `state_groundtruth_estimate0/data.csv`, or TUM-VI's `mocap0/data.csv`
+/// (both EuRoC ground-truth columns), when present. Returns an empty Vec when
+/// neither exists.
 fn read_optional_ground_truth(root: &Path) -> Result<Vec<GroundTruthPose>, DatasetError> {
-    let csv = root.join("state_groundtruth_estimate0").join("data.csv");
-    if !csv.exists() {
+    let Some(csv) = ["state_groundtruth_estimate0", "mocap0"]
+        .iter()
+        .map(|dir| root.join(dir).join("data.csv"))
+        .find(|csv| csv.exists())
+    else {
         return Ok(Vec::new());
-    }
+    };
 
     let file = File::open(&csv)?;
     let reader = BufReader::new(file);
@@ -687,6 +693,30 @@ cam1:
             DatasetError::Parse(message) => assert!(message.contains("distortion_model")),
             other => panic!("expected Parse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn open_reads_mocap_ground_truth_when_there_is_no_state_estimate() {
+        let dir = TestDir::new("hilti-mocap-ground-truth");
+        let calibration = write_calibration(dir.path());
+        write_camera(
+            dir.path(),
+            "cam0",
+            "#timestamp [ns],filename\n1000,1000.png\n",
+        );
+        let mocap = dir.path().join("mocap0");
+        fs::create_dir_all(&mocap).unwrap();
+        fs::write(
+            mocap.join("data.csv"),
+            "#timestamp [ns], p_RS_R_x [m], p_RS_R_y [m], p_RS_R_z [m], q_RS_w [], q_RS_x [], q_RS_y [], q_RS_z []\n\
+             2000000000,1.0,2.0,3.0,1.0,0.0,0.0,0.0\n",
+        )
+        .unwrap();
+
+        let dataset = HiltiDataset::open(dir.path(), &calibration).unwrap();
+
+        assert_eq!(dataset.ground_truth().len(), 1);
+        assert_eq!(dataset.ground_truth()[0].tz, 3.0);
     }
 
     #[test]

@@ -44,7 +44,7 @@ use crate::initialization::bootstrap::{
     self, BootstrapDecision, MIN_KEYPOINTS_FOR_BOOTSTRAP, MIN_STEREO_POINTS, MIN_VALID_POINTS,
     TooFewStereoPoints, evaluate_bootstrap,
 };
-use crate::initialization::two_view::TwoViewInitConfig;
+use crate::initialization::two_view::{TwoViewInitConfig, TwoViewRejectReason};
 use crate::loop_closure::{LoopCloser, LoopClosingContext, LoopClosureEvent};
 use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
 use crate::mapping::map::{
@@ -403,10 +403,7 @@ impl SlamSystem {
                     "[bootstrap] frame={} stored as reference (awaiting second frame)",
                     curr_frame.idx,
                 ));
-                self.state.bootstrap_frame = Some(curr_frame);
-                self.inertial.bootstrap_timestamp_sec = Some(timestamp_sec);
-                // Samples before the reference frame can never enter an edge.
-                self.prune_imu_before(timestamp_sec);
+                self.store_bootstrap_reference(curr_frame, timestamp_sec);
                 return self.frame_result(TrackingStatus::Skipped);
             }
             // The reference is kept: only the second frame was unsuitable.
@@ -418,6 +415,19 @@ impl SlamSystem {
                     "[bootstrap] frame={} (ref={}) reject: {:?}",
                     curr_frame.idx, reference_idx, reason,
                 ));
+                // A reference that keeps failing to match has lost the scene
+                // (ORB-SLAM3 replaces it on the first such frame; waiting a
+                // little keeps the better-conditioned early pairs).
+                if matches!(reason, TwoViewRejectReason::LowMatches) {
+                    self.state.bootstrap_low_match_rejections += 1;
+                    if self.state.bootstrap_low_match_rejections > MAX_LOW_MATCH_REJECTIONS {
+                        self.dbg(format!(
+                            "[bootstrap] frame={} replaces reference {reference_idx}",
+                            curr_frame.idx
+                        ));
+                        self.store_bootstrap_reference(curr_frame, timestamp_sec);
+                    }
+                }
                 return self.frame_result(TrackingStatus::Skipped);
             }
             BootstrapDecision::Initialized(estimate) => *estimate,
@@ -509,6 +519,14 @@ impl SlamSystem {
         self.finish_bootstrap(curr_idx, timestamp_sec);
 
         self.frame_result(TrackingStatus::KeyframeAccepted)
+    }
+
+    fn store_bootstrap_reference(&mut self, frame: Frame, timestamp_sec: f64) {
+        self.state.bootstrap_frame = Some(frame);
+        self.state.bootstrap_low_match_rejections = 0;
+        self.inertial.bootstrap_timestamp_sec = Some(timestamp_sec);
+        // Samples before the reference frame can never enter an edge.
+        self.prune_imu_before(timestamp_sec);
     }
 
     /// Publishes the two-view map, refines it with initial BA, and offers both
@@ -758,6 +776,7 @@ impl SlamSystem {
                     pose_before,
                     current_keyframe_idx: self.state.current_keyframe_idx,
                     lost_for_sec: currently_lost_for,
+                    trusted_prediction: self.imu_confident(timestamp_sec),
                 },
                 &map,
                 &self.rig.camera,
@@ -843,17 +862,22 @@ impl SlamSystem {
             }
         }
 
+        // With a settled IMU the system coasts instead (below): a relocalized
+        // pose taken from an older part of a drifted map would jump away from
+        // the inertial state, which ORB-SLAM3 also avoids in inertial mode.
+        if status == TrackingStatus::Skipped
+            && !self.imu_confident(timestamp_sec)
+            && self.relocalize(&frame)
+        {
+            status = TrackingStatus::Tracked;
+        }
         if status == TrackingStatus::Skipped {
             let policy = &self.tracking_loss_recovery;
 
             let lost_since = *self.state.lost_since_sec.get_or_insert(timestamp_sec);
             let recently_lost_for = timestamp_sec - lost_since;
 
-            let imu_confident = self.state.imu_initialized
-                && self
-                    .state
-                    .imu_init_timestamp_sec
-                    .is_some_and(|t0| timestamp_sec - t0 >= policy.min_imu_confidence_sec);
+            let imu_confident = self.imu_confident(timestamp_sec);
             let grace_period_sec = policy.grace_period_sec(imu_confident);
             let map_established =
                 self.map.lock().unwrap().keyframes().len() > policy.min_keyframes_for_grace;
@@ -867,6 +891,15 @@ impl SlamSystem {
                 self.state.reset();
                 return self.bootstrap_step(frame, timestamp_sec);
             }
+            if imu_confident
+                && self.keyframe_due_while_lost(timestamp_sec)
+                && self.insert_keyframe(&frame, timestamp_sec, &[])
+            {
+                self.dbg(format!(
+                    "[lost] frame={} keyframe inserted at the inertial prediction",
+                    frame.idx
+                ));
+            }
         } else {
             self.state.lost_since_sec = None;
         }
@@ -877,6 +910,67 @@ impl SlamSystem {
             self.prune_imu_before(kf_ts.min(timestamp_sec));
         }
         self.frame_result(status)
+    }
+
+    /// Whether the IMU has been initialized long enough to coast on.
+    fn imu_confident(&self, timestamp_sec: f64) -> bool {
+        let min_confidence_sec = self.tracking_loss_recovery.min_imu_confidence_sec;
+        self.state.imu_initialized
+            && self
+                .state
+                .imu_init_timestamp_sec
+                .is_some_and(|t0| timestamp_sec - t0 >= min_confidence_sec)
+    }
+
+    /// Recovers the pose against the map from place-recognition candidates
+    /// and resumes tracking from it. Needs the loop closer's vocabulary and
+    /// keyframe database.
+    fn relocalize(&mut self, frame: &Frame) -> bool {
+        const MAX_CANDIDATES: usize = 5;
+        let Some(loop_closer) = self.loop_closer.as_ref() else {
+            return false;
+        };
+        let candidates =
+            loop_closer.relocalization_candidates(&frame.features.descriptors, MAX_CANDIDATES);
+        let found = {
+            let map = self.map.lock().unwrap();
+            self.tracker
+                .relocalize(frame, &candidates, &map, &self.rig.camera)
+        };
+        let Some(found) = found else {
+            return false;
+        };
+        // A pose far from where the motion model put the camera belongs to a
+        // part of the map that has drifted from here; adopting it would
+        // teleport the trajectory.
+        let jump = (found.estimate.pose.inverse().translation
+            - self.state.pose_world_to_cam.inverse().translation)
+            .length();
+        if jump > RELOCALIZATION_MAX_JUMP_M {
+            self.dbg(format!(
+                "[reloc] frame={} refused kf={} jump={jump:.2}m",
+                frame.idx, found.keyframe_idx
+            ));
+            return false;
+        }
+        self.dbg(format!(
+            "[reloc] frame={} against kf={} inliers={}",
+            frame.idx, found.keyframe_idx, found.estimate.inliers
+        ));
+        self.state.pose_world_to_cam = found.estimate.pose;
+        self.state.current_keyframe_idx = Some(found.keyframe_idx);
+        self.state.velocity = None;
+        true
+    }
+
+    /// Whether to extend the map from this frame while coasting on the IMU:
+    /// the policy says the last keyframe is old enough. A stereo keyframe
+    /// creates landmarks from its depth; a monocular one through triangulation
+    /// against its neighbours at the inertial poses.
+    fn keyframe_due_while_lost(&self, timestamp_sec: f64) -> bool {
+        self.inertial
+            .last_keyframe_timestamp_sec
+            .is_some_and(|t| self.tracking_loss_recovery.keyframe_due(timestamp_sec - t))
     }
 
     fn try_insert_keyframe(
@@ -903,7 +997,17 @@ impl SlamSystem {
         ) {
             return false;
         }
+        self.insert_keyframe(frame, timestamp_sec, matches)
+    }
 
+    /// Publishes `frame` as a keyframe at the current tracking pose and runs
+    /// the mapping work it earns.
+    fn insert_keyframe(
+        &mut self,
+        frame: &Frame,
+        timestamp_sec: f64,
+        matches: &[(usize, usize)],
+    ) -> bool {
         // Guard: reference KF must exist before we can triangulate.
         if let Some(ki) = self.state.current_keyframe_idx {
             let map = self.map.lock().unwrap();
@@ -1129,6 +1233,13 @@ impl SlamSystem {
         self.loop_closure_events.extend(outcome.events);
     }
 }
+
+/// Largest distance, in metres, between the motion-model pose and a
+/// relocalized one that is adopted.
+const RELOCALIZATION_MAX_JUMP_M: f64 = 0.5;
+
+/// Low-match two-view rejections a monocular bootstrap reference survives.
+const MAX_LOW_MATCH_REJECTIONS: usize = 10;
 
 fn format_imu_init_gate(
     start_idx: usize,

@@ -77,11 +77,15 @@ pub struct MapProjectionConfig {
     pub projection: ProjectionMatchConfig,
     /// Projection matching config for local-map refinement (wider search).
     pub local_projection: ProjectionMatchConfig,
-    /// Growth in `search_scale` per second spent failing to track (see
-    /// `search_scale_for`).
+    /// Upper bound on `search_scale`, reached at once when the prediction is
+    /// inertial (see `search_scale_for`).
+    pub lost_search_scale: f32,
+    /// Growth in `search_scale` per second spent lost without a trusted
+    /// inertial prediction.
     pub search_widen_per_sec: f32,
-    /// Upper bound on `search_scale` (see `search_scale_for`).
-    pub max_search_scale: f32,
+    /// Inliers an estimate needs when a trusted inertial prediction is
+    /// available (ORB-SLAM3's 15 for inertial tracking).
+    pub min_inliers_with_prediction: usize,
     /// Fundamental-matrix RANSAC inlier threshold in pixels.
     pub geometric_filter_threshold_px: f64,
 }
@@ -102,8 +106,9 @@ impl Default for MapProjectionConfig {
                 max_hamming: 60,
                 ..ProjectionMatchConfig::default()
             },
+            lost_search_scale: 4.0,
             search_widen_per_sec: 1.0,
-            max_search_scale: 4.0,
+            min_inliers_with_prediction: 15,
             geometric_filter_threshold_px: 1.0,
         }
     }
@@ -113,15 +118,21 @@ impl MapProjectionConfig {
     /// `search_scale` to pass to `MapProjectionEstimator::estimate_pose` given
     /// how long tracking has been failing.
     ///
-    /// Widens the search/PnP-prior gates in proportion to how long we've
-    /// already been failing to track: a pose predicted by compounding
-    /// IMU/constant-velocity integration over several seconds of loss carries
-    /// far more uncertainty than a single-frame prediction, and the narrow
-    /// gates sized for the latter would otherwise starve PnP of
-    /// correspondences for the entire recently-lost grace period, making a
-    /// longer grace period actively counterproductive.
-    pub fn search_scale_for(&self, currently_lost_for_sec: f64) -> f32 {
-        (1.0 + currently_lost_for_sec as f32 * self.search_widen_per_sec).min(self.max_search_scale)
+    /// Once lost, the predicted pose has been compounding error and the camera
+    /// may have turned well past the last tracked view. An inertial prediction
+    /// stays close enough that the search widens at once, as ORB-SLAM3 widens
+    /// its local-map search in RECENTLY_LOST; a constant-velocity prediction
+    /// does not, and a wide search around it accepts wrong matches, so it
+    /// widens gradually.
+    pub fn search_scale_for(&self, currently_lost_for_sec: f64, inertial_prediction: bool) -> f32 {
+        if currently_lost_for_sec <= 0.0 {
+            1.0
+        } else if inertial_prediction {
+            self.lost_search_scale
+        } else {
+            (1.0 + currently_lost_for_sec as f32 * self.search_widen_per_sec)
+                .min(self.lost_search_scale)
+        }
     }
 }
 
@@ -622,7 +633,23 @@ impl MapProjectionEstimator {
 
 #[cfg(test)]
 mod estimator_tests {
+    use super::MapProjectionConfig;
     use crate::tracking::KeyframePolicy;
+
+    #[test]
+    fn the_search_widens_once_tracking_has_failed() {
+        let config = MapProjectionConfig::default();
+        assert_eq!(config.search_scale_for(0.0, true), 1.0);
+        assert_eq!(
+            config.search_scale_for(0.05, true),
+            config.lost_search_scale
+        );
+        assert!(config.search_scale_for(0.05, false) < config.lost_search_scale);
+        assert_eq!(
+            config.search_scale_for(60.0, false),
+            config.lost_search_scale
+        );
+    }
 
     #[test]
     fn test_need_new_keyframe_forced_by_gap() {
