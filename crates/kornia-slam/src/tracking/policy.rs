@@ -58,7 +58,7 @@ impl KeyframePolicy {
 /// dropped frames) without throwing the map away.
 ///
 /// With a settled IMU, tracking coasts on the inertial prediction for up to
-/// `timeout_imu_sec` (ORB-SLAM3's `time_recently_lost`), and stereo keyframes
+/// `timeout_imu_sec` (ORB-SLAM3's `time_recently_lost`), and keyframes
 /// keep extending the map at the predicted pose every
 /// `keyframe_interval_while_lost_sec`: after a fast turn the camera faces
 /// space the map does not cover, and only new landmarks there let tracking
@@ -76,7 +76,7 @@ pub struct TrackingLossRecoveryPolicy {
     /// How long the IMU must have been initialized before `timeout_imu_sec`
     /// applies instead of `timeout_visual_sec`.
     pub min_imu_confidence_sec: f64,
-    /// Seconds between stereo keyframes inserted at the IMU-predicted pose
+    /// Seconds between keyframes inserted at the IMU-predicted pose
     /// while coasting.
     pub keyframe_interval_while_lost_sec: f64,
 }

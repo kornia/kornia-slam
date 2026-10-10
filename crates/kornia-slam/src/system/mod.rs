@@ -892,7 +892,7 @@ impl SlamSystem {
                 return self.bootstrap_step(frame, timestamp_sec);
             }
             if imu_confident
-                && self.keyframe_due_while_lost(&frame, timestamp_sec)
+                && self.keyframe_due_while_lost(timestamp_sec)
                 && self.insert_keyframe(&frame, timestamp_sec, &[])
             {
                 self.dbg(format!(
@@ -964,14 +964,13 @@ impl SlamSystem {
     }
 
     /// Whether to extend the map from this frame while coasting on the IMU:
-    /// it has stereo depth to create landmarks from, and the policy says the
-    /// last keyframe is old enough.
-    fn keyframe_due_while_lost(&self, frame: &Frame, timestamp_sec: f64) -> bool {
-        frame.is_stereo()
-            && self
-                .inertial
-                .last_keyframe_timestamp_sec
-                .is_some_and(|t| self.tracking_loss_recovery.keyframe_due(timestamp_sec - t))
+    /// the policy says the last keyframe is old enough. A stereo keyframe
+    /// creates landmarks from its depth; a monocular one through triangulation
+    /// against its neighbours at the inertial poses.
+    fn keyframe_due_while_lost(&self, timestamp_sec: f64) -> bool {
+        self.inertial
+            .last_keyframe_timestamp_sec
+            .is_some_and(|t| self.tracking_loss_recovery.keyframe_due(timestamp_sec - t))
     }
 
     fn try_insert_keyframe(
