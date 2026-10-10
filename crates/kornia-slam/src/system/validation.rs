@@ -165,6 +165,11 @@ fn validate_tracking(tuning: &OrbTuning) -> Result<(), ConfigError> {
         AT_LEAST_ONE,
     )?;
     check(
+        at("search_widen_per_sec"),
+        projection.search_widen_per_sec.into(),
+        NON_NEGATIVE,
+    )?;
+    check(
         at("min_inliers_with_prediction"),
         projection.min_inliers_with_prediction as f64,
         AT_LEAST_ONE,

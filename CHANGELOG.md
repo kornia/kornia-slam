@@ -15,10 +15,11 @@ Once the IMU has settled, a tracking failure now coasts on the inertial
 prediction for up to 5 s (was 1 s, ORB-SLAM3's `time_recently_lost`), keeps
 inserting stereo keyframes at the predicted pose every 0.2 s so the map covers
 the view the camera turned to, and widens the projection search at once
-rather than over several seconds. On EuRoC V2_03 stereo+IMU the system no
+rather than over several seconds (without a settled IMU it still widens
+gradually: a wide search around a constant-velocity guess accepts wrong
+matches). On EuRoC V2_03 stereo+IMU the system no
 longer resets (21 resets before, ATE 1.66 m → 0.88 m with synchronous
-mapping); the other ten sequences are unchanged. `MapProjectionConfig`'s
-`search_widen_per_sec` and `max_search_scale` are replaced by
+mapping); the other ten sequences are unchanged. `MapProjectionConfig::max_search_scale` is renamed
 `lost_search_scale`, and `TrackingLossRecoveryPolicy` gains
 `keyframe_interval_while_lost_sec`.
 
