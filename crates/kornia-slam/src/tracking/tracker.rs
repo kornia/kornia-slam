@@ -94,7 +94,10 @@ impl Tracker {
         map: &Map,
         camera: &PinholeCamera,
     ) -> Result<Estimate, MapProjectionRejectReason> {
-        let search_scale = self.estimator.config().search_scale_for(input.lost_for_sec);
+        let search_scale = self
+            .estimator
+            .config()
+            .search_scale_for(input.lost_for_sec, input.trusted_prediction);
 
         let klt_survivors = if self.track_set.is_empty() {
             None
