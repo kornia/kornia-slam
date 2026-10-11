@@ -34,6 +34,37 @@ keypoints, and a follow view.</sub>
 
 See [ROADMAP.md](ROADMAP.md) for what's next.
 
+## Install
+
+- **Prebuilt binaries (v0.1.0)**
+  - Linux x86_64 (glibc 2.35+):
+    ```bash
+    cd /tmp
+    curl -LO https://github.com/kornia/kornia-slam/releases/download/v0.1.0/kornia-slam-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+    tar -xzf kornia-slam-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+    cd kornia-slam-v0.1.0-x86_64-unknown-linux-gnu
+    ./kornia-slam euroc --data ./data/euroc/MH_01_easy
+    ```
+  - Linux aarch64 (Jetson / JetPack 6):
+    ```bash
+    cd /tmp
+    curl -LO https://github.com/kornia/kornia-slam/releases/download/v0.1.0/kornia-slam-v0.1.0-aarch64-unknown-linux-gnu.tar.gz
+    tar -xzf kornia-slam-v0.1.0-aarch64-unknown-linux-gnu.tar.gz
+    cd kornia-slam-v0.1.0-aarch64-unknown-linux-gnu
+    ./kornia-slam euroc --data ./data/euroc/MH_01_easy
+    ```
+  - What’s included: the v0.1.0 archives contain the `kornia-slam` CLI, `README.md`, `CHANGELOG.md` and `LICENSE`. They do not include `configs/` (the run-file CLI landed after v0.1.0).
+  - Features in the release binaries: built with the app’s default features (includes visualization; excludes live cameras). Live OAK-D/UVC support is not in these binaries. To use live cameras, build from source with features:
+    - OAK-D: `cargo run --release -p kornia-slam-app --features oakd -- --config configs/oakd-stereo.ron`
+    - UVC: `cargo run --release -p kornia-slam-app --features uvc -- --config configs/uvc.ron`
+  - CLI note: the v0.1.0 binary predates configurable run files (PR #149). It uses subcommands and flags, e.g.:
+    - v0.1.0 release binary: `./kornia-slam euroc --data ./data/euroc/MH_01_easy`
+    - main / build from source: `kornia-slam --config configs/euroc.ron`
+
+- **Build from source**
+  - With Cargo (Rust 1.91+ for the CLI): see `apps/kornia-slam-app/README.md` for build and run instructions.
+  - With Pixi: the workspace includes tasks for lint/test and a ready toolchain; see `apps/kornia-slam-app/README.md`.
+
 ## Quick start
 
 Download a [EuRoC](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets)
