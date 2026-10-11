@@ -28,6 +28,23 @@
 //! # }
 //! ```
 
+/// `eprintln!` only when `KORNIA_SLAM_DEBUG` is set. The solvers' diagnostic lines run per solve
+/// (~100 unbuffered writes a keyframe); on an embedded host whose stderr is a file on eMMC they
+/// blocked the caller's solve thread on journal commits for seconds (2026-10-11, XLeRobot).
+macro_rules! debug_eprintln {
+    ($($arg:tt)*) => {
+        if $crate::debug_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+/// Whether [`debug_eprintln!`] prints: `KORNIA_SLAM_DEBUG` set to anything, read once.
+pub(crate) fn debug_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KORNIA_SLAM_DEBUG").is_some())
+}
+
 pub mod frame;
 pub(crate) mod frontend;
 pub mod inertial;

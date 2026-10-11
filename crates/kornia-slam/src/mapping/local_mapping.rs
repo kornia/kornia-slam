@@ -299,7 +299,7 @@ impl Drop for LocalMappingHandle {
         if let Some(handle) = self.join_handle.take()
             && handle.join().is_err()
         {
-            eprintln!("local-mapping worker panicked");
+            debug_eprintln!("local-mapping worker panicked");
         }
     }
 }

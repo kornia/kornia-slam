@@ -174,14 +174,14 @@ pub fn run_initial_ba(
     let (sq_err_after, depth_after, kf1_t_after) =
         initial_ba_diagnostics(&ba_result.poses, &ba_result.points, &observations, camera);
 
-    eprintln!(
+    debug_eprintln!(
         "[init_ba] before: reproj_rms={:.3}px median_depth={:.3} kf1_t_norm={:.3} obs={}",
         sq_err_before.sqrt(),
         depth_before,
         kf1_t_before,
         observations.len()
     );
-    eprintln!(
+    debug_eprintln!(
         "[init_ba] after:  reproj_rms={:.3}px median_depth={:.3} kf1_t_norm={:.3} iters={} converged={}",
         sq_err_after.sqrt(),
         depth_after,
@@ -200,9 +200,11 @@ pub fn run_initial_ba(
     {
         let normal_len = mp.mean_viewing_direction.length();
         let predicted = mp.predict_scale(depth_after.max(1e-6), ORB_SCALE_FACTOR, ORB_N_LEVELS);
-        eprintln!(
+        debug_eprintln!(
             "[init_ba] scale_state[mp{sample}]: min_dist={:.3} max_dist={:.3} normal_len={:.3} predict_scale@median={predicted}",
-            mp.min_distance, mp.max_distance, normal_len,
+            mp.min_distance,
+            mp.max_distance,
+            normal_len,
         );
     }
 

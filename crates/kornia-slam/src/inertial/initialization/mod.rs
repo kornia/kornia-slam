@@ -163,9 +163,12 @@ impl ImuInitializer {
         init: ImuInitResult,
         start_idx: usize,
     ) -> Result<Option<AlignedTrackingState>, InertialAlignmentError> {
-        eprintln!(
+        debug_eprintln!(
             "[imu_init] applying: scale={:.4}  g=({:.3},{:.3},{:.3})",
-            init.scale, init.gravity_world.x, init.gravity_world.y, init.gravity_world.z
+            init.scale,
+            init.gravity_world.x,
+            init.gravity_world.y,
+            init.gravity_world.z
         );
 
         // 1–3. Scale to metric, rotate gravity onto +Y, and write each
@@ -190,7 +193,7 @@ impl ImuInitializer {
             keyframe_velocities,
             bias: init.bias,
         }) {
-            eprintln!("[imu_init] alignment refused, map left unchanged: {error}");
+            debug_eprintln!("[imu_init] alignment refused, map left unchanged: {error}");
             return Err(error);
         }
 

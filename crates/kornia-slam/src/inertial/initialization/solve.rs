@@ -142,9 +142,11 @@ impl ImuInitializer {
         };
 
         let result = lm.optimize(&mut problem).ok()?;
-        eprintln!(
+        debug_eprintln!(
             "[inertial_optimizer] {:?} after {} iters, final_cost={:.6}",
-            result.termination_reason, result.iterations, result.final_cost
+            result.termination_reason,
+            result.iterations,
+            result.final_cost
         );
         let vars = problem.get_variables(); // &HashMap<String, Variable>
 
@@ -294,17 +296,17 @@ impl ImuInitializer {
         // broke real-data initialization — it rejected results ORB-SLAM3
         // would have accepted and simply refined at VIBA1/VIBA2.
         if !scale_out.is_finite() || scale_out < 0.1 {
-            eprintln!("[imu_init] rejected: bad scale {:.4}", scale_out);
+            debug_eprintln!("[imu_init] rejected: bad scale {:.4}", scale_out);
             return None;
         }
         if !bg_out.length().is_finite() || !ba_out.length().is_finite() {
-            eprintln!("[imu_init] rejected: non-finite bias");
+            debug_eprintln!("[imu_init] rejected: non-finite bias");
             return None;
         }
         // Reject a diverged refinement instead of replacing the last valid bias.
         const MAX_PLAUSIBLE_ACCEL_BIAS: f64 = 1.0; // m/s^2
         if ba_out.length() > MAX_PLAUSIBLE_ACCEL_BIAS {
-            eprintln!(
+            debug_eprintln!(
                 "[imu_init] rejected: implausible accel bias |ba|={:.3} > {MAX_PLAUSIBLE_ACCEL_BIAS} m/s^2 ({:.3},{:.3},{:.3})",
                 ba_out.length(),
                 ba_out.x,
@@ -328,7 +330,7 @@ impl ImuInitializer {
         // VIBA0's roughness — confirmed on the same V101 sequence pre-gate:
         // VIBA0 23.0° → VIBA1 1.13° → VIBA2 0.78°, all within the first 15s of
         // IMU time. Trust that chain; don't gate its entry point.
-        eprintln!(
+        debug_eprintln!(
             "[imu_init] accepted  scale={:.4}  gravity=({:.3},{:.3},{:.3})  bg=({:.5},{:.5},{:.5})  ba=({:.6},{:.6},{:.6})",
             scale_out,
             gravity_world.x,

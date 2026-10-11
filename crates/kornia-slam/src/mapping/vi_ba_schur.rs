@@ -594,7 +594,7 @@ fn imu_information_matrix(pim: &PreintegratedImu, weight: f64) -> [f64; 225] {
         }
     } else {
         // Degenerate covariance — fall back to diagonal with a log warning.
-        eprintln!("[vi_ba] WARNING: 9×9 IMU covariance singular, using diagonal fallback");
+        debug_eprintln!("[vi_ba] WARNING: 9×9 IMU covariance singular, using diagonal fallback");
         for i in 0..9 {
             let var = pim.covariance[i * 10]; // diagonal: col-major index i*9+i
             omega[i * 15 + i] = weight * if var > 1e-20 { 1.0 / var } else { 1e6 };
@@ -1206,7 +1206,7 @@ pub fn visual_inertial_bundle_adjust(
                     .filter(|&x| x > 0.0)
                     .fold(f64::MAX, f64::min);
                 let om_max = omega_raw.iter().cloned().fold(f64::MIN, f64::max);
-                eprintln!(
+                debug_eprintln!(
                     "[vi_ba] edge {i}→{j}  dt={:.3}s  |r_R|={nr:.4e}  |r_v|={nv:.4e}  \
                         |r_p|={np:.4e}  |r_bg|={nbg:.4e}  |r_ba|={nba:.4e}  \
                         Ω∈[{om_min:.2e},{om_max:.2e}]  hw={hw:.4}",
@@ -1535,7 +1535,7 @@ pub fn visual_inertial_bundle_adjust(
         let np = (res[6] * res[6] + res[7] * res[7] + res[8] * res[8]).sqrt();
         let nbg = (res[9] * res[9] + res[10] * res[10] + res[11] * res[11]).sqrt();
         let nba = (res[12] * res[12] + res[13] * res[13] + res[14] * res[14]).sqrt();
-        eprintln!(
+        debug_eprintln!(
             "[vi_ba] FINAL edge {i}→{j}  dt={:.3}s  |r_R|={nr:.4e}  |r_v|={nv:.4e}  \
                 |r_p|={np:.4e}  |r_bg|={nbg:.4e}  |r_ba|={nba:.4e}  \
                 (iters={iters_done} conv={converged})",
