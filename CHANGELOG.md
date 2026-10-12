@@ -66,9 +66,10 @@ reproduce exactly.
 
 **Keyframe culling.** The keyframe count no longer has to grow without bound.
 `mapping::culling::cull_redundant_keyframes` removes keyframes whose live
-landmarks are, by at least 90 %, each seen by three other keyframes at the same
-or a finer scale (ORB-SLAM's local-mapping rule), never the first keyframe nor
-the newest few. Removal is a canonical map operation, `Map::remove_keyframe`:
+landmarks are, by at least 90 %, each seen by three other keyframes at most one
+pyramid level coarser (ORB-SLAM3's local-mapping code; set
+`scale_level_tolerance = 0` for its paper's "same or finer scale"), never the
+first keyframe nor the newest few. Removal is a canonical map operation, `Map::remove_keyframe`:
 every landmark record, reference and derived geometry is repaired, and the IMU
 edges on each side are merged into one, re-preintegrated from their raw samples
 (ORB-SLAM3's `MergePrevious`); a keyframe at an end of the IMU chain is refused.

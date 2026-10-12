@@ -132,8 +132,10 @@ pub struct KeyframeCullReport {
 }
 
 /// Removes redundant keyframes: those whose live landmarks are, by at least
-/// `redundant_ratio`, each seen by `min_other_observers` other keyframes at the
-/// same or a finer scale.
+/// `redundant_ratio`, each seen by `min_other_observers` other keyframes at
+/// most `scale_level_tolerance` pyramid levels coarser than its own. The
+/// default 1 is ORB-SLAM3's code rule and also counts a view one level
+/// coarser; 0 gives its paper's "same or finer scale".
 ///
 /// The first keyframe (the gauge anchor) and the `protect_newest` newest are
 /// never removed. Candidates are judged oldest first against the live map, so

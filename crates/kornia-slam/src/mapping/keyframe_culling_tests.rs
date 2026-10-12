@@ -189,6 +189,28 @@ fn observers_at_a_coarser_scale_do_not_count() {
     );
 }
 
+#[test]
+fn default_tolerance_counts_observers_one_level_coarser() {
+    let mut map = culling_fixture();
+    // Every keyframe but 7 sees the shared points one octave coarser.
+    map.edit_keyframes_for_test(|slot, kf| {
+        if slot != 1 {
+            kf.frame.features.octaves.iter_mut().for_each(|o| *o = 1);
+        }
+    });
+    let default = cull_redundant_keyframes(&mut map.clone(), &enabled(), None);
+    assert!(default.removed.contains(&7), "{:?}", default.removed);
+    let paper = KeyframeCullingConfig {
+        scale_level_tolerance: 0,
+        ..enabled()
+    };
+    assert!(
+        !cull_redundant_keyframes(&mut map, &paper, None)
+            .removed
+            .contains(&7)
+    );
+}
+
 fn calib() -> ImuCalib {
     ImuCalib {
         gyro_noise: 1e-4,
