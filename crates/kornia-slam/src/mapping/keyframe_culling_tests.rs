@@ -42,6 +42,12 @@ fn point(i: usize) -> Vec3F64 {
 /// points at octave 0, `LONER` also sees its own. Landmarks start a few cm
 /// off the truth so BA has something to do.
 fn culling_fixture() -> Map {
+    culling_fixture_with_depth(|_, _| None)
+}
+
+/// [`culling_fixture`] with stereo depth: keyframe `id` is stereo when
+/// `depth(id, feature)` gives `Some` for any feature (`-1` elsewhere).
+fn culling_fixture_with_depth(depth: impl Fn(usize, usize) -> Option<f32>) -> Map {
     let mut map = Map::new();
     for (slot, id) in IDS.into_iter().enumerate() {
         let pose = Pose3d::new(
@@ -54,6 +60,11 @@ fn culling_fixture() -> Map {
                 .project_to_pixel(&pose.transform_point(&point(i)), 1e-6)
                 .unwrap();
             frame.features.keypoints_xy[i] = [p.x as f32, p.y as f32];
+        }
+        if (0..SHARED + OWN).any(|i| depth(id, i).is_some()) {
+            frame.depth = (0..SHARED + OWN)
+                .map(|i| depth(id, i).unwrap_or(-1.0))
+                .collect();
         }
         map.insert_keyframe(Keyframe::from_frame(frame)).unwrap();
     }
@@ -83,6 +94,50 @@ fn enabled() -> KeyframeCullingConfig {
         min_keyframes: 0,
         ..KeyframeCullingConfig::default()
     }
+}
+
+/// ORB-SLAM3's stereo rule counts only close stereo points: `LONER`'s 30
+/// shared and 6 own landmarks score 30/36 under the plain count, but with the
+/// close depth set its far or mono-only points drop out of the count.
+#[test]
+fn the_stereo_close_depth_rule_counts_only_close_stereo_points() {
+    let config = |ratio, close| KeyframeCullingConfig {
+        redundant_ratio: ratio,
+        stereo_close_depth_m: close,
+        ..enabled()
+    };
+    // Shared points close, own points mono-only: 30/30 redundant.
+    let shared_close = |id, i| (id == LONER).then_some(if i < SHARED { 2.0 } else { -1.0 });
+    let mut map = culling_fixture_with_depth(shared_close);
+    assert!(
+        !cull_redundant_keyframes(&mut map, &config(0.9, None), None)
+            .removed
+            .contains(&LONER)
+    );
+    let mut map = culling_fixture_with_depth(shared_close);
+    assert!(
+        cull_redundant_keyframes(&mut map, &config(0.9, Some(10.0)), None)
+            .removed
+            .contains(&LONER)
+    );
+
+    // The review's case: shared points far (only 3+ others see them), the
+    // own points close and seen by nobody else. 30/36 clears a 0.8 ratio,
+    // 0/6 does not.
+    let shared_far = |id, i| (id == LONER).then_some(if i < SHARED { 50.0 } else { 2.0 });
+    let mut map = culling_fixture_with_depth(shared_far);
+    assert!(
+        cull_redundant_keyframes(&mut map, &config(0.8, None), None)
+            .removed
+            .contains(&LONER)
+    );
+    let mut map = culling_fixture_with_depth(shared_far);
+    assert!(
+        !cull_redundant_keyframes(&mut map, &config(0.8, Some(10.0)), None)
+            .removed
+            .contains(&LONER)
+    );
+    assert_map_consistent(&map);
 }
 
 fn ids(map: &Map) -> Vec<usize> {
@@ -355,7 +410,25 @@ fn wheel_factors_are_composed_across_removed_keyframes() {
         .unwrap();
     assert_eq!(factors[0].measurement, expected);
 
-    // The composed factor still enters (and moves) inertial BA.
+    // A composed factor still enters inertial BA. (3, 15) joins two fixed
+    // context keyframes and is dropped by design; (15, 23), composed across
+    // 19, reaches the active window, and dropping it alone moves the
+    // solution (its 0.04 rad of turn disagrees with the straight visual track).
+    let with = solved_poses(&map, &factors);
+    assert_ne!(with, unsolved_poses(&map), "the solve must run");
+    assert_eq!((factors[1].from_idx, factors[1].to_idx), (15, 23));
+    let without_composed: Vec<WheelOdomFactor> = factors
+        .iter()
+        .enumerate()
+        .filter(|&(k, _)| k != 1)
+        .map(|(_, f)| *f)
+        .collect();
+    let gap = max_pose_gap(&with, &solved_poses(&map, &without_composed));
+    assert!(
+        gap > 1e-6,
+        "the composed factor did not reach the solver: {gap}"
+    );
+
     let update = run_local_inertial_ba(
         map.ba_snapshot(&local_window(&map)),
         &camera(),
@@ -365,6 +438,66 @@ fn wheel_factors_are_composed_across_removed_keyframes() {
     );
     map.apply_ba_update(update).unwrap();
     assert_map_consistent(&map);
+}
+
+/// Window poses after one local inertial BA with `factors`.
+fn solved_poses(map: &Map, factors: &[WheelOdomFactor]) -> Vec<Pose3d> {
+    let update = run_local_inertial_ba(
+        map.ba_snapshot(&local_window(map)),
+        &camera(),
+        None,
+        Vec3F64::new(0.0, 9.81, 0.0),
+        factors,
+    );
+    update
+        .keyframes
+        .iter()
+        .map(|kf| kf.pose_world_to_cam)
+        .collect()
+}
+
+/// Window poses as captured, what a failed solve returns.
+fn unsolved_poses(map: &Map) -> Vec<Pose3d> {
+    map.ba_snapshot(&local_window(map))
+        .into_update()
+        .keyframes
+        .iter()
+        .map(|kf| kf.pose_world_to_cam)
+        .collect()
+}
+
+/// Largest translation difference between two pose lists, metres.
+fn max_pose_gap(a: &[Pose3d], b: &[Pose3d]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b)
+        .map(|(p, q)| {
+            let d = p.translation - q.translation;
+            d.dot(d).sqrt()
+        })
+        .fold(0.0, f64::max)
+}
+
+#[test]
+fn an_invalid_wheel_factor_is_skipped_not_fatal_to_inertial_ba() {
+    let map = inertial_fixture();
+    let valid: Vec<WheelOdomFactor> = (0..IDS.len() - 1).map(wheel).collect();
+    let reference = solved_poses(&map, &valid);
+    assert_ne!(reference, unsolved_poses(&map), "the solve must run");
+
+    // A parked driver's all-zero covariance, a NaN delta from a zero-length
+    // tick interval, and a NaN extrinsic from an unread joint.
+    let mut zero_cov = wheel(2);
+    zero_cov.measurement.covariance = [[0.0; 3]; 3];
+    let mut nan_delta = wheel(3);
+    nan_delta.measurement.delta[0] = f64::NAN;
+    let mut nan_extrinsic = wheel(4);
+    nan_extrinsic.t_cb_to.translation.z = f64::NAN;
+    let mut with_bad = valid.clone();
+    with_bad.extend([zero_cov, nan_delta, nan_extrinsic]);
+
+    // Each is dropped; the rest solve exactly as without them.
+    assert_eq!(solved_poses(&map, &with_bad), reference);
 }
 
 #[test]

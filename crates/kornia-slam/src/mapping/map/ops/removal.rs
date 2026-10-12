@@ -18,8 +18,10 @@ use kornia_sensors::imu::{ImuMeasurement, PreintegratedImu};
 /// of keyframe `k`, so anything but rounding is a different interval.
 const IMU_JOIN_TOLERANCE_SEC: f64 = 1e-9;
 
-/// What [`Map::remove_keyframe`] changed.
+/// What [`Map::remove_keyframe`] changed. `#[non_exhaustive]`, so a count
+/// can be added without a semver break.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KeyframeRemoval {
     pub keyframe_idx: usize,
     /// Landmark observation records dropped, live and retired.

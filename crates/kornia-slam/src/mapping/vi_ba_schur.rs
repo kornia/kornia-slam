@@ -69,6 +69,8 @@ pub enum ViBaError {
     WheelFactorOutOfRange(usize, usize),
     #[error("Wheel odometry edge {0} covariance is not positive definite")]
     InvalidWheelCovariance(usize),
+    #[error("Wheel odometry edge {0} has a non-finite delta or extrinsic")]
+    NonFiniteWheelFactor(usize),
     #[error(transparent)]
     Ba(#[from] BaError),
 }
@@ -593,8 +595,20 @@ fn imu_information_matrix(pim: &PreintegratedImu, weight: f64) -> [f64; 225] {
             }
         }
     } else {
-        // Degenerate covariance — fall back to diagonal with a log warning.
-        debug_eprintln!("[vi_ba] WARNING: 9×9 IMU covariance singular, using diagonal fallback");
+        // Degenerate covariance — fall back to diagonal with a log warning:
+        // the first one always (it is a fault in the IMU input, not chatter),
+        // the rest only under KORNIA_SLAM_DEBUG, as it can recur every solve.
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "kornia-slam: [vi_ba] WARNING: 9×9 IMU covariance singular, using diagonal \
+                 fallback (further occurrences only with KORNIA_SLAM_DEBUG)"
+            );
+        } else {
+            debug_eprintln!(
+                "[vi_ba] WARNING: 9×9 IMU covariance singular, using diagonal fallback"
+            );
+        }
         for i in 0..9 {
             let var = pim.covariance[i * 10]; // diagonal: col-major index i*9+i
             omega[i * 15 + i] = weight * if var > 1e-20 { 1.0 / var } else { 1e6 };
@@ -736,6 +750,11 @@ fn wheel_information(edges: &[WheelOdomFactor], n_kf: usize) -> Result<Vec<Mat6>
         .map(|(k, edge)| {
             if edge.from_idx >= n_kf || edge.to_idx >= n_kf {
                 return Err(ViBaError::WheelFactorOutOfRange(edge.from_idx, edge.to_idx));
+            }
+            // A NaN delta or extrinsic makes every cost NaN, so LM could
+            // never accept a step; refuse it by name instead.
+            if !(edge.extrinsics_finite() && edge.measurement.delta.iter().all(|v| v.is_finite())) {
+                return Err(ViBaError::NonFiniteWheelFactor(k));
             }
             edge.measurement
                 .information()

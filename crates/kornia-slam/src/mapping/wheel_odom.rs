@@ -71,10 +71,19 @@ impl WheelOdomMeasurement {
 
     /// Information over the residual tangent `[x, y, z, roll, pitch, yaw]`.
     ///
-    /// `None` if the covariance is not symmetric positive definite or a sigma
-    /// is not positive.
+    /// `covariance` is over `delta`, whose translation is in base-i axes, but
+    /// the residual `Log(ΔT⁻¹ · T_ij)` carries the translation error in the
+    /// predicted base-j axes: `r ≈ J δz` with `J = blockdiag(R(dθ)ᵀ, 1)`. The
+    /// planar block is therefore `J⁻ᵀ Σ⁻¹ J⁻¹`, so that `rᵀ Ω r` is the
+    /// Mahalanobis distance of `δz` under `covariance` whatever the turn.
+    ///
+    /// `None` if `delta` is not finite, the covariance is not symmetric
+    /// positive definite, or a sigma is not positive.
     pub fn information(&self) -> Option<Mat6> {
         if !(self.z_sigma > 0.0 && self.tilt_sigma > 0.0) {
+            return None;
+        }
+        if !self.delta.iter().all(|v| v.is_finite()) {
             return None;
         }
         let c = &self.covariance;
@@ -98,7 +107,11 @@ impl WheelOdomMeasurement {
         if !(det.is_finite() && det > 0.0) {
             return None;
         }
-        let planar = cov.inverse().to_cols_array();
+        // J⁻¹ = blockdiag(R(dθ), 1) rotates a base-j residual back into the
+        // base-i axes the covariance is written in.
+        let (sin, cos) = self.delta[2].sin_cos();
+        let j_inv = Mat3F64::from_cols_array(&[cos, sin, 0.0, -sin, cos, 0.0, 0.0, 0.0, 1.0]);
+        let planar = (j_inv.transpose() * cov.inverse() * j_inv).to_cols_array();
         // delta rows (x, y, θ) sit at tangent indices (0, 1, 5).
         const AXES: [usize; 3] = [0, 1, 5];
         let mut info = [[0.0; 6]; 6];
@@ -184,6 +197,23 @@ pub struct WheelOdomFactor {
 }
 
 impl WheelOdomFactor {
+    /// Whether the factor can enter a solve: the measurement has an
+    /// information matrix ([`WheelOdomMeasurement::information`]) and both
+    /// extrinsics are finite. [`super::bundle_adjustment::run_local_inertial_ba`]
+    /// skips a factor that is not; `visual_inertial_bundle_adjust` refuses it.
+    pub fn is_valid(&self) -> bool {
+        self.extrinsics_finite() && self.measurement.information().is_some()
+    }
+
+    pub(crate) fn extrinsics_finite(&self) -> bool {
+        [&self.t_cb_from, &self.t_cb_to].iter().all(|t| {
+            t.rotation.to_cols_array().iter().all(|v| v.is_finite())
+                && [t.translation.x, t.translation.y, t.translation.z]
+                    .iter()
+                    .all(|v| v.is_finite())
+        })
+    }
+
     /// The factor from `self.from_idx` to `next.to_idx`, replacing the two
     /// when the keyframe between them is removed; `None` unless `next` starts
     /// where `self` ends.
@@ -507,6 +537,90 @@ mod tests {
         m.covariance = good;
         m.tilt_sigma = 0.0;
         assert!(m.information().is_none());
+    }
+
+    /// `rᵀΩr` must be the Mahalanobis distance of the planar error `δz`
+    /// under `covariance` (written in base-i axes) even after a turn, where
+    /// the residual's translation sits in base-j axes. The covariance is
+    /// tight forward, loose sideways, with the y–θ correlation `compose`
+    /// creates; at 90° an unrotated information swaps the two axes.
+    #[test]
+    fn chi2_is_the_planar_mahalanobis_distance_after_a_turn() {
+        let covariance = [[1e-6, 0.0, 0.0], [0.0, 1e-2, 2e-4], [0.0, 2e-4, 1e-4]];
+        let sigma_inv = Mat3F64::from_cols_array(&[
+            covariance[0][0],
+            covariance[1][0],
+            covariance[2][0],
+            covariance[0][1],
+            covariance[1][1],
+            covariance[2][1],
+            covariance[0][2],
+            covariance[1][2],
+            covariance[2][2],
+        ])
+        .inverse();
+        for dtheta in [std::f64::consts::FRAC_PI_2, 0.7, -2.5, 0.0] {
+            let delta = [0.3, 0.1, dtheta];
+            let factor = WheelOdomFactor {
+                from_idx: 0,
+                to_idx: 1,
+                measurement: WheelOdomMeasurement::new(delta, covariance),
+                t_cb_from: Pose3d::IDENTITY,
+                t_cb_to: Pose3d::IDENTITY,
+                huber_chi2: None,
+            };
+            let info = factor.measurement.information().unwrap();
+            for dz in [
+                [1e-4, 0.0, 0.0],
+                [0.0, 1e-4, 0.0],
+                [0.0, 0.0, 1e-4],
+                [3e-5, -7e-5, 2e-5],
+            ] {
+                // Base j in base i is the measurement moved by δz.
+                let truth = WheelOdomMeasurement::new(
+                    [delta[0] + dz[0], delta[1] + dz[1], delta[2] + dz[2]],
+                    covariance,
+                )
+                .delta_pose();
+                let (r, _) = residual_and_jacobian(&Pose3d::IDENTITY, &truth.inverse(), &factor);
+                let chi2 = quadratic_form(&info, &r);
+                let dz_v = Vec3F64::new(dz[0], dz[1], dz[2]);
+                let expected = dz_v.dot(sigma_inv * dz_v);
+                assert!(
+                    (chi2 - expected).abs() <= 1e-3 * expected,
+                    "dθ={dtheta} δz={dz:?}: chi2 {chi2} vs Mahalanobis {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_finite_factor_is_invalid() {
+        let good = WheelOdomFactor {
+            from_idx: 0,
+            to_idx: 1,
+            measurement: WheelOdomMeasurement::new(
+                [0.1, 0.0, 0.1],
+                [[1e-4, 0.0, 0.0], [0.0, 1e-4, 0.0], [0.0, 0.0, 1e-4]],
+            ),
+            t_cb_from: Pose3d::IDENTITY,
+            t_cb_to: Pose3d::IDENTITY,
+            huber_chi2: None,
+        };
+        assert!(good.is_valid());
+        let mut f = good;
+        f.measurement.delta[0] = f64::NAN;
+        assert!(f.measurement.information().is_none());
+        assert!(!f.is_valid());
+        let mut f = good;
+        f.t_cb_from.translation.y = f64::NAN;
+        assert!(!f.is_valid());
+        let mut f = good;
+        f.t_cb_to.rotation = Mat3F64::from_cols_array(&[f64::INFINITY; 9]);
+        assert!(!f.is_valid());
+        let mut f = good;
+        f.measurement.covariance = [[0.0; 3]; 3];
+        assert!(!f.is_valid());
     }
 
     #[test]

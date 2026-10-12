@@ -170,6 +170,19 @@ fn wheel_edge_errors_are_reported() {
         run(singular),
         Err(ViBaError::InvalidWheelCovariance(0))
     ));
+    // A NaN delta or extrinsic is named, not left to stall LM on a NaN cost.
+    let mut nan_delta = edge;
+    nan_delta.measurement.delta[2] = f64::NAN;
+    assert!(matches!(
+        run(nan_delta),
+        Err(ViBaError::NonFiniteWheelFactor(0))
+    ));
+    let mut nan_extrinsic = edge;
+    nan_extrinsic.t_cb_to.translation.x = f64::INFINITY;
+    assert!(matches!(
+        run(nan_extrinsic),
+        Err(ViBaError::NonFiniteWheelFactor(0))
+    ));
 }
 
 /// Deterministic N(0, 1) samples.

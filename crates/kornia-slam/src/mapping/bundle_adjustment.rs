@@ -278,7 +278,8 @@ pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
 ///
 /// `wheel_factors` index keyframes by `Frame::idx`, like the map's IMU
 /// factors; those with an endpoint outside the window, or with both endpoints
-/// fixed, are dropped.
+/// fixed, are dropped, and so is any that fails [`WheelOdomFactor::is_valid`]
+/// (one such factor would otherwise fail the whole solve).
 pub fn run_local_inertial_ba(
     snapshot: BaSnapshot,
     camera: &PinholeCamera,
@@ -403,6 +404,16 @@ pub fn run_local_inertial_ba(
             if from < active_start && to < active_start {
                 return None;
             }
+            // One bad factor would fail the whole solve, losing every
+            // window update for as long as it stays in the window: drop it.
+            if !f.is_valid() {
+                debug_eprintln!(
+                    "[vi_ba] skipping wheel factor {} -> {}: non-finite or not positive definite",
+                    f.from_idx,
+                    f.to_idx
+                );
+                return None;
+            }
             Some(WheelOdomFactor {
                 from_idx: from,
                 to_idx: to,
@@ -434,7 +445,10 @@ pub fn run_local_inertial_ba(
         },
     ) {
         Ok(r) => r,
-        Err(_) => return update,
+        Err(error) => {
+            debug_eprintln!("[vi_ba] local inertial BA failed, window unchanged: {error}");
+            return update;
+        }
     };
 
     // Write back optimised poses, velocities, and biases for active keyframes.

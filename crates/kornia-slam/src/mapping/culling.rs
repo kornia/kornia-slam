@@ -97,6 +97,14 @@ pub struct KeyframeCullingConfig {
     pub max_merged_imu_span_sec: f64,
     /// Most keyframes one call removes.
     pub max_removals: usize,
+    /// ORB-SLAM3's stereo rule: in a stereo keyframe, count only landmarks
+    /// whose feature has a stereo depth in `(0, d]` (its `mThDepth`, the
+    /// close-depth threshold), so far and mono-only points cannot make a
+    /// keyframe that holds the only close metric points look redundant.
+    /// `None` (the default) counts every live landmark, in stereo keyframes
+    /// too; set it to the frontend's stereo close depth for ORB-SLAM3's
+    /// behaviour. Monocular keyframes are unaffected.
+    pub stereo_close_depth_m: Option<f64>,
 }
 
 impl Default for KeyframeCullingConfig {
@@ -110,6 +118,7 @@ impl Default for KeyframeCullingConfig {
             merge_imu_edges: true,
             max_merged_imu_span_sec: 3.0,
             max_removals: usize::MAX,
+            stereo_close_depth_m: None,
         }
     }
 }
@@ -135,7 +144,9 @@ pub struct KeyframeCullReport {
 /// `redundant_ratio`, each seen by `min_other_observers` other keyframes at
 /// most `scale_level_tolerance` pyramid levels coarser than its own. The
 /// default 1 is ORB-SLAM3's code rule and also counts a view one level
-/// coarser; 0 gives its paper's "same or finer scale".
+/// coarser; 0 gives its paper's "same or finer scale". In a stereo keyframe
+/// only close stereo points count when `stereo_close_depth_m` is set, as in
+/// ORB-SLAM3; by default every live landmark does.
 ///
 /// The first keyframe (the gauge anchor) and the `protect_newest` newest are
 /// never removed. Candidates are judged oldest first against the live map, so
@@ -216,6 +227,20 @@ fn is_redundant(map: &Map, kf_idx: usize, config: &KeyframeCullingConfig) -> boo
             .map(|&s| feature_octave(&map.keyframes()[s], feature))
     };
 
+    // ORB-SLAM3 skips `mvDepth[i] > mThDepth || mvDepth[i] < 0` in stereo.
+    let close_depth = config
+        .stereo_close_depth_m
+        .filter(|_| keyframe.frame.is_stereo());
+    let counts = |feature: usize| {
+        close_depth.is_none_or(|max| {
+            keyframe
+                .frame
+                .depth
+                .get(feature)
+                .is_some_and(|&d| d > 0.0 && f64::from(d) <= max)
+        })
+    };
+
     let mut live = 0usize;
     let mut redundant = 0usize;
     for (feature, slot) in keyframe.map_point_by_desc_idx.iter().enumerate() {
@@ -225,6 +250,9 @@ fn is_redundant(map: &Map, kf_idx: usize, config: &KeyframeCullingConfig) -> boo
         else {
             continue;
         };
+        if !counts(feature) {
+            continue;
+        }
         live += 1;
         let coarsest =
             feature_octave(keyframe, feature).saturating_add(config.scale_level_tolerance);
