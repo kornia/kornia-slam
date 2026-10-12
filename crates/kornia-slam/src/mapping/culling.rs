@@ -89,8 +89,11 @@ pub struct KeyframeCullingConfig {
     /// Cull keyframes inside the IMU chain by merging their two edges. `false`
     /// restricts culling to keyframes no IMU edge touches.
     pub merge_imu_edges: bool,
-    /// Longest IMU edge a merge may produce, seconds. ORB-SLAM3 allows 3 s once
-    /// the IMU is initialized and 0.5 s before.
+    /// Longest IMU edge a merge may produce, seconds. One value whatever the
+    /// IMU state: the culler is not told whether inertial initialization has
+    /// run. ORB-SLAM3 allows 3 s once the IMU is initialized and 0.5 s before,
+    /// so a caller that culls before initialization should set 0.5 (or not
+    /// cull then); the 3.0 default is the initialized limit.
     pub max_merged_imu_span_sec: f64,
     /// Most keyframes one call removes.
     pub max_removals: usize,

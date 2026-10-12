@@ -64,7 +64,7 @@ gates the runtime used (`max_midpoint_gap` 0.25, `max_reprojection_error` 3.0).
 fixed seed, so runs with loop correction and synchronous local mapping
 reproduce exactly.
 
-**Keyframe culling.** The map no longer has to grow without bound.
+**Keyframe culling.** The keyframe count no longer has to grow without bound.
 `mapping::culling::cull_redundant_keyframes` removes keyframes whose live
 landmarks are, by at least 90 %, each seen by three other keyframes at the same
 or a finer scale (ORB-SLAM's local-mapping rule), never the first keyframe nor
@@ -75,7 +75,14 @@ edges on each side are merged into one, re-preintegrated from their raw samples
 Wheel-odometry factors, which the caller holds, are composed across a removed
 keyframe (`WheelOdomFactor::compose`, with first-order covariance
 propagation), or the keyframe is kept. Opt-in: nothing calls it by default.
-Additive, apart from the new `KeyframePolicy` field below.
+Landmarks are not bounded by it: a retired landmark keeps its slot in
+`Map::map_points` (ids are never compacted or reused) and `remove_keyframe`
+walks every slot, so a map that only ever culls still grows by one slot per
+landmark created, and each removal costs time in that count. A long-running
+caller still needs a whole-map reset (`clear_active`) on some bound, such as
+`map_points().len()`. The `max_merged_imu_span_sec` default (3 s) is
+ORB-SLAM3's limit for an initialized IMU; cull before initialization only with
+0.5 s. Additive, apart from the new `KeyframePolicy` field below.
 
 **Parallax-based keyframe insertion.** `KeyframePolicy::min_parallax_px`
 inserts a keyframe once the median rotation-compensated parallax since the last

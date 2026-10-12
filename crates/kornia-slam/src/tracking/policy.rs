@@ -197,14 +197,38 @@ mod tests {
     }
 
     #[test]
-    fn the_default_ignores_parallax_and_matches_should_insert() {
+    fn the_default_keeps_the_frame_count_and_ratio_decision_and_ignores_parallax() {
         let policy = KeyframePolicy::default();
+        // (inliers, n_ref, first frame gap that inserts). The ratio rule
+        // inserts from min_frames_between (3) when 15 <= inliers <
+        // 0.6 * n_ref, an empty reference always does, anything else waits
+        // for max_frames_between (8).
+        let cases = [
+            (80, 100, 8),
+            (60, 100, 8), // exactly at the ratio: not below it
+            (59, 100, 3),
+            (50, 100, 3),
+            (15, 30, 3), // fewest inliers the ratio rule keeps
+            (14, 30, 8),
+            (10, 100, 8),
+            (50, 0, 3),
+        ];
         for frames in 0..12 {
-            for (inliers, n_ref) in [(80, 100), (50, 100), (10, 100), (50, 0)] {
+            for (inliers, n_ref, inserts_from) in cases {
                 let e = evidence(frames, inliers, n_ref);
-                let plain = policy.should_insert(e.curr_idx, e.last_keyframe_idx, inliers, n_ref);
-                assert_eq!(policy.should_insert_with(&e), plain);
-                assert_eq!(policy.should_insert_with(&with_parallax(e, 1e6)), plain);
+                let expected = frames >= inserts_from;
+                let case = format!("frames={frames} inliers={inliers} n_ref={n_ref}");
+                assert_eq!(policy.should_insert_with(&e), expected, "{case}");
+                assert_eq!(
+                    policy.should_insert(e.curr_idx, e.last_keyframe_idx, inliers, n_ref),
+                    expected,
+                    "{case}"
+                );
+                assert_eq!(
+                    policy.should_insert_with(&with_parallax(e, 1e6)),
+                    expected,
+                    "{case}: parallax is ignored without min_parallax_px"
+                );
             }
         }
     }

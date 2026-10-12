@@ -243,3 +243,68 @@ fn image_history_follows_successful_frames_only() {
         third.as_slice()
     );
 }
+
+mod keyframe_evidence {
+    use super::*;
+    use crate::tracking::parallax::tests::{
+        all_matches, camera, frame_seeing_points, map_with_keyframe_at,
+    };
+    use kornia_algebra::{Mat3F64, SO3F64};
+
+    /// A system whose map holds keyframe 0 at the identity and keyframe 1, the
+    /// tracking reference, at `ref_pose` observing nothing, with the camera
+    /// tracked at `tracked` after the last keyframe 0.
+    fn system_tracked_at(min_parallax_px: Option<f64>, tracked: Pose3d) -> SlamSystem {
+        let mut config = mono();
+        let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+        orb.keyframes.min_parallax_px = min_parallax_px;
+        let mut system = SlamSystem::build(config, SensorRig::new(camera())).unwrap();
+        let mut map = map_with_keyframe_at(Pose3d::IDENTITY);
+        let ref_pose = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.5, 0.0, 0.0));
+        map.insert_keyframe(Keyframe::from_frame(frame_seeing_points(1, ref_pose, &[])))
+            .unwrap();
+        *system.map.lock().unwrap() = map;
+        system.state.last_keyframe_idx = Some(0);
+        system.state.current_keyframe_idx = Some(1);
+        system.state.pose_world_to_cam = tracked;
+        system
+    }
+
+    #[test]
+    fn measures_parallax_against_the_last_keyframe_at_the_tracked_pose() {
+        // The head yawed 0.08 rad without moving: about 32 px of raw pixel
+        // motion, zero parallax once the rotation is compensated.
+        let yaw = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.0, 0.08, 0.0)).matrix(),
+            Vec3F64::ZERO,
+        );
+        let points = map_with_keyframe_at(Pose3d::IDENTITY)
+            .map_points()
+            .iter()
+            .map(|mp| mp.position)
+            .collect::<Vec<_>>();
+        // The frame's own pose is the pre-tracking one, still at the keyframe;
+        // the keypoints are where the tracked (yawed) camera sees the points.
+        let mut frame = frame_seeing_points(7, yaw, &points);
+        frame.pose_world_to_cam = Pose3d::IDENTITY;
+
+        let system = system_tracked_at(Some(10.0), yaw);
+        let evidence = system.keyframe_evidence(&frame, 9, &all_matches());
+        assert_eq!(evidence.curr_idx, 7);
+        assert_eq!(evidence.last_keyframe_idx, Some(0));
+        assert_eq!(evidence.tracked_inliers, 9);
+        assert_eq!(evidence.n_ref_map_points, 0, "the reference is keyframe 1");
+        let parallax = evidence
+            .median_parallax_px
+            .expect("measured against keyframe 0, which observes the matches");
+        assert!(parallax < 1e-3, "{parallax}");
+
+        let off = system_tracked_at(None, yaw);
+        assert_eq!(
+            off.keyframe_evidence(&frame, 9, &all_matches())
+                .median_parallax_px,
+            None,
+            "not measured unless the policy reads it"
+        );
+    }
+}

@@ -5,7 +5,7 @@
 pub mod local_map;
 pub(crate) mod motion;
 pub mod optical_flow;
-mod parallax;
+pub(crate) mod parallax;
 mod policy;
 pub mod pose_estimation;
 pub(crate) mod tracker;

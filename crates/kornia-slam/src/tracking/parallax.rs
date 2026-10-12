@@ -78,13 +78,13 @@ pub fn median_compensated_parallax_px(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::mapping::map::tests::test_frame_with_pose;
     use crate::mapping::map::{Keyframe, LandmarkSeed, ObservationKey};
     use kornia_algebra::SO3F64;
 
-    fn camera() -> PinholeCamera {
+    pub(crate) fn camera() -> PinholeCamera {
         PinholeCamera {
             fx: 400.0,
             fy: 400.0,
@@ -97,15 +97,23 @@ mod tests {
         }
     }
 
-    fn points() -> Vec<Vec3F64> {
+    /// Landmarks 4 m in front of the camera at `kf_pose` (world to camera).
+    fn points_before(kf_pose: &Pose3d) -> Vec<Vec3F64> {
         (0..9)
-            .map(|i| Vec3F64::new((i % 3) as f64 * 0.5 - 0.5, (i / 3) as f64 * 0.4 - 0.4, 4.0))
+            .map(|i| {
+                let in_cam =
+                    Vec3F64::new((i % 3) as f64 * 0.5 - 0.5, (i / 3) as f64 * 0.4 - 0.4, 4.0);
+                kf_pose.inverse().transform_point(&in_cam)
+            })
             .collect()
     }
 
-    /// A frame at `pose` whose keypoints are the exact projections of `points()`.
-    fn frame_seeing(idx: usize, pose: Pose3d) -> Frame {
-        let pts = points();
+    fn points() -> Vec<Vec3F64> {
+        points_before(&Pose3d::IDENTITY)
+    }
+
+    /// A frame at `pose` whose keypoints are the exact projections of `pts`.
+    pub(crate) fn frame_seeing_points(idx: usize, pose: Pose3d, pts: &[Vec3F64]) -> Frame {
         let mut frame = test_frame_with_pose(idx, vec![[0; 32]; pts.len()], pose);
         for (i, p) in pts.iter().enumerate() {
             let px = camera()
@@ -116,11 +124,23 @@ mod tests {
         frame
     }
 
+    /// A frame at `pose` whose keypoints are the exact projections of `points()`.
+    fn frame_seeing(idx: usize, pose: Pose3d) -> Frame {
+        frame_seeing_points(idx, pose, &points())
+    }
+
     fn map_with_keyframe() -> Map {
+        map_with_keyframe_at(Pose3d::IDENTITY)
+    }
+
+    /// A map whose keyframe 0 sits at `kf_pose` and observes
+    /// `points_before(kf_pose)` as landmarks `0..9`, feature `i` = landmark `i`.
+    pub(crate) fn map_with_keyframe_at(kf_pose: Pose3d) -> Map {
+        let pts = points_before(&kf_pose);
         let mut map = Map::new();
-        map.insert_keyframe(Keyframe::from_frame(frame_seeing(0, Pose3d::IDENTITY)))
+        map.insert_keyframe(Keyframe::from_frame(frame_seeing_points(0, kf_pose, &pts)))
             .unwrap();
-        for (i, p) in points().into_iter().enumerate() {
+        for (i, p) in pts.into_iter().enumerate() {
             map.insert_landmark(LandmarkSeed {
                 position: p,
                 color: [0; 3],
@@ -134,7 +154,7 @@ mod tests {
         map
     }
 
-    fn all_matches() -> Vec<(usize, usize)> {
+    pub(crate) fn all_matches() -> Vec<(usize, usize)> {
         (0..points().len()).map(|i| (i, i)).collect()
     }
 
@@ -147,6 +167,28 @@ mod tests {
         let parallax =
             median_parallax_px(&map, 0, &current, &pose, &all_matches(), &camera()).unwrap();
         // Uncompensated, a 0.08 rad yaw moves every pixel by about 32 px.
+        assert!(parallax < 1e-3, "{parallax}");
+    }
+
+    #[test]
+    fn a_pure_rotation_from_a_rotated_keyframe_reads_zero_parallax() {
+        // The relative rotation is R_cur * R_kf^T. With the keyframe at
+        // identity the reversed order R_kf^T * R_cur is the same matrix, so
+        // the keyframe here is pitched, and the head then yaws on top of it:
+        // the two orders differ by tens of pixels.
+        let kf_pose = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.4, 0.0, 0.0)).matrix(),
+            Vec3F64::new(0.3, -0.2, 0.1),
+        );
+        let map = map_with_keyframe_at(kf_pose);
+        let yaw = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.0, 0.15, 0.0)).matrix(),
+            Vec3F64::ZERO,
+        );
+        let pose = yaw.compose(&kf_pose);
+        let current = frame_seeing_points(5, pose, &points_before(&kf_pose));
+        let parallax =
+            median_parallax_px(&map, 0, &current, &pose, &all_matches(), &camera()).unwrap();
         assert!(parallax < 1e-3, "{parallax}");
     }
 
