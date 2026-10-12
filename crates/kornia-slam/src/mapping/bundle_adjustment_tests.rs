@@ -1,7 +1,7 @@
 use super::*;
 use crate::mapping::map::tests::test_frame;
 use crate::mapping::map::{ImuFactor, LandmarkSeed, MapInsertion, ObservationKey};
-use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement};
+use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 
 const KF_IDS: [usize; 5] = [80, 10, 90, 30, 120];
 
@@ -287,6 +287,7 @@ fn imu_edge(prev: usize, curr: usize) -> ImuFactor {
         raw_samples: samples,
         t0: 0.0,
         t1: 0.1,
+        bias_walk_extra_s: 0.0,
     }
 }
 
@@ -471,4 +472,41 @@ fn caller_held_links_pull_their_neighbour_into_the_window() {
     let linked = local_window_with_neighbors(&map, [(40, 30), (50, 40)]);
     assert_eq!(linked.keyframe_slots, vec![1, 2, 3, 4]);
     assert_eq!(linked.landmark_ids, plain.landmark_ids);
+}
+
+/// Repropagating an edge whose bias link also spans elided still time keeps
+/// that walk: the samples alone would give back the walk over 0.1 s.
+///
+/// Mutation: rebuilding with `from_measurements` instead of `repreintegrate`
+/// turned the widened-covariance assert red.
+#[test]
+fn inertial_ba_repropagation_keeps_the_elided_bias_walk() {
+    let mut map = fixture();
+    map.edit_keyframes_for_test(|_, kf| kf.imu_bias.accel.x = 0.05);
+    let mut edge = imu_edge(KF_IDS[1], KF_IDS[2]);
+    edge.bias_walk_extra_s = 3600.0;
+    edge.preintegrated.widen_bias_walk(3600.0);
+    map.apply_insertion(MapInsertion {
+        imu_factors: vec![edge],
+        ..Default::default()
+    })
+    .unwrap();
+    let update = run_local_inertial_ba(
+        map.ba_snapshot(&local_window(&map)),
+        &camera(),
+        None,
+        Vec3F64::ZERO,
+        &[],
+        &[],
+    );
+    let repropagated = &update.imu_preintegrations[0];
+    assert_eq!(repropagated.bias.accel.x, 0.05, "repropagated at all");
+    let walk = |density: f64| density * density * (3600.0 + 0.1);
+    let calib = repropagated.calib;
+    for i in 0..3 {
+        let g = repropagated.bias_covariance[i * 7];
+        let a = repropagated.bias_covariance[(i + 3) * 7];
+        assert!((g - walk(calib.gyro_bias_noise)).abs() < 1e-3 * g, "{g}");
+        assert!((a - walk(calib.accel_bias_noise)).abs() < 1e-3 * a, "{a}");
+    }
 }

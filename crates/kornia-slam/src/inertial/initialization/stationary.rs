@@ -371,6 +371,7 @@ mod tests {
                         raw_samples: raw,
                         t0,
                         t1,
+                        bias_walk_extra_s: 0.0,
                     }],
                     ..Default::default()
                 })

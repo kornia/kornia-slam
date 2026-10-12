@@ -105,6 +105,22 @@ impl PreintegratedImu {
         }
     }
 
+    /// Widens the bias random walk by `seconds` beyond the integrated span:
+    /// for an edge whose bias link also covers time outside its samples (a
+    /// still stretch elided before it), so `bias_covariance` is the walk over
+    /// `dt + seconds`. Non-positive or non-finite `seconds` change nothing.
+    pub fn widen_bias_walk(&mut self, seconds: f64) {
+        if !(seconds.is_finite() && seconds > 0.0) {
+            return;
+        }
+        let bg_var = self.calib.gyro_bias_noise * self.calib.gyro_bias_noise * seconds;
+        let ba_var = self.calib.accel_bias_noise * self.calib.accel_bias_noise * seconds;
+        for i in 0..3 {
+            self.bias_covariance[i + i * 6] += bg_var;
+            self.bias_covariance[(i + 3) * 7] += ba_var;
+        }
+    }
+
     /// Builds a preintegrated factor from raw measurements covering `[t0, t1]`,
     /// linearized fresh at `bias` — i.e. full re-integration rather than the
     /// first-order `delta_*_with_bias` correction.
@@ -511,6 +527,30 @@ mod tests {
             gyro_bias_noise: 1.9393e-5,
             accel_bias_noise: 3.0e-3,
         }
+    }
+
+    #[test]
+    fn widen_bias_walk_adds_the_walk_over_the_extra_time() {
+        let calib = default_calib();
+        let mut pre = PreintegratedImu::new(ImuBias::default(), calib);
+        pre.widen_bias_walk(10.0);
+        for i in 0..3 {
+            let g = calib.gyro_bias_noise * calib.gyro_bias_noise * 10.0;
+            let a = calib.accel_bias_noise * calib.accel_bias_noise * 10.0;
+            assert!((pre.bias_covariance[i * 7] - g).abs() <= g * 1e-12);
+            assert!((pre.bias_covariance[(i + 3) * 7] - a).abs() <= a * 1e-12);
+        }
+        let off_diagonal = (0..36).filter(|k| k % 7 != 0);
+        assert!(
+            off_diagonal
+                .into_iter()
+                .all(|k| pre.bias_covariance[k] == 0.0)
+        );
+        let before = pre.bias_covariance;
+        for s in [0.0, -1.0, f64::NAN] {
+            pre.widen_bias_walk(s);
+        }
+        assert_eq!(pre.bias_covariance, before);
     }
 
     #[test]

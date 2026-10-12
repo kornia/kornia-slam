@@ -1342,6 +1342,7 @@ mod validation_tests {
             raw_samples: Vec::new(),
             t0: 0.0,
             t1: 0.1,
+            bias_walk_extra_s: 0.0,
         }
     }
 

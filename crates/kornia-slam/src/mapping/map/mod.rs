@@ -69,7 +69,7 @@ pub use ops::{
 pub use ops::{
     InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError, ObservationLink,
 };
-pub use ops::{KeyframeRemoval, KeyframeRemovalError};
+pub use ops::{KeyframeRemoval, KeyframeRemovalError, StillNeighbour, StillSide};
 
 /// ORB pyramid scale factor between adjacent levels (matches the kornia-imgproc
 /// ORB extractor default `downscale = 1.2`, which equals ORB-SLAM3's default).

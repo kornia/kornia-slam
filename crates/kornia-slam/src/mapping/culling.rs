@@ -5,7 +5,7 @@
 //! the map's canonical operation, so this selects ids and delegates — there is
 //! no second cleanup loop, and the map never calls back into mapping.
 
-use crate::mapping::map::{Keyframe, Map};
+use crate::mapping::map::{Keyframe, Map, StillNeighbour, StillSide};
 use crate::mapping::stationary::StationaryFactor;
 use crate::mapping::wheel_odom::WheelOdomFactor;
 use std::collections::{HashMap, HashSet};
@@ -136,6 +136,9 @@ pub struct KeyframeCullReport {
     pub wheel_edges_merged: usize,
     /// Stationary factors composed across a removed keyframe.
     pub stationary_edges_merged: usize,
+    /// Keyframes removed at an end of a stationary chain, their stationary
+    /// factor dropped and their IMU edge moved onto the still neighbour.
+    pub stationary_boundaries_removed: usize,
     /// Redundant keyframes kept because their IMU, wheel or stationary edges
     /// could not be merged, or the merged IMU edge would have been too long.
     pub kept_for_edges: usize,
@@ -163,9 +166,13 @@ pub struct KeyframeCullReport {
 /// keyframe with no span limit ([`StationaryFactor::compose`]):
 /// `max_merged_imu_span_sec` caps IMU merges only. A keyframe linked by one
 /// stationary factor in and one out, and by no IMU edge, is removable however
-/// long the parked span; one at an end of the stationary chain (including the
-/// boundary between IMU and stationary edges) is kept. `None` culls exactly as
-/// before.
+/// long the parked span. One at the boundary between a stationary and an IMU
+/// edge is removable too: its stationary factor is dropped and the IMU edge
+/// moves onto the still neighbour ([`Map::remove_keyframe_beside_still`]), so
+/// the boundaries a stop leaves never pin keyframes. Boundaries are judged
+/// after every other candidate, each at most once per call. A bare chain end
+/// (a stationary factor and nothing on the other side) is kept. `None` culls
+/// exactly as before.
 pub fn cull_redundant_keyframes(
     map: &mut Map,
     config: &KeyframeCullingConfig,
@@ -182,67 +189,133 @@ pub fn cull_redundant_keyframes(
         .map(|kf| kf.frame.idx)
         .collect();
 
+    // Boundaries go last, each once per call: removing one drops a stationary factor (its gyro
+    // mean with it), so the chain behind it is composed first, and the keyframe that becomes the
+    // next boundary waits for the next call instead of the IMU edge eating the whole stop now.
+    let mut boundaries = Vec::new();
     for kf_idx in candidates {
-        if report.removed.len() >= config.max_removals
-            || map.keyframes().len() <= config.min_keyframes
-        {
+        let step = cull_one(
+            map,
+            config,
+            kf_idx,
+            false,
+            wheel_factors.as_deref_mut(),
+            stationary_factors.as_deref_mut(),
+            &mut report,
+        );
+        match step {
+            Step::Done => {}
+            Step::Boundary => boundaries.push(kf_idx),
+            Step::Stop => return report,
+        }
+    }
+    for kf_idx in boundaries {
+        let step = cull_one(
+            map,
+            config,
+            kf_idx,
+            true,
+            wheel_factors.as_deref_mut(),
+            stationary_factors.as_deref_mut(),
+            &mut report,
+        );
+        if step == Step::Stop {
             break;
         }
-        if !is_redundant(map, kf_idx, config) {
-            continue;
+    }
+    report
+}
+
+/// What [`cull_one`] did with a candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// Removed, kept, or not redundant.
+    Done,
+    /// A stationary boundary, left for the boundary pass.
+    Boundary,
+    /// A bound was reached; nothing more is removed.
+    Stop,
+}
+
+/// Judges and, if allowed, removes one candidate, repairing the factor chains and the report.
+/// A stationary boundary is removed only when `boundaries` is set.
+#[allow(clippy::too_many_arguments)]
+fn cull_one(
+    map: &mut Map,
+    config: &KeyframeCullingConfig,
+    kf_idx: usize,
+    boundaries: bool,
+    wheel_factors: Option<&mut Vec<WheelOdomFactor>>,
+    stationary_factors: Option<&mut Vec<StationaryFactor>>,
+    report: &mut KeyframeCullReport,
+) -> Step {
+    if report.removed.len() >= config.max_removals || map.keyframes().len() <= config.min_keyframes
+    {
+        return Step::Stop;
+    }
+    if map.get_keyframe(kf_idx).is_none() || !is_redundant(map, kf_idx, config) {
+        return Step::Done;
+    }
+    let wheel_merge = match wheel_factors.as_deref() {
+        Some(factors) => match wheel_merge_through(factors, kf_idx) {
+            Ok(merge) => merge,
+            Err(()) => {
+                report.kept_for_edges += 1;
+                return Step::Done;
+            }
+        },
+        None => None,
+    };
+    let stationary = match stationary_factors.as_deref() {
+        Some(factors) => match stationary_plan(factors, kf_idx) {
+            Ok(plan) => plan,
+            Err(()) => {
+                report.kept_for_edges += 1;
+                return Step::Done;
+            }
+        },
+        None => StationaryPlan::None,
+    };
+    let removal = match &stationary {
+        StationaryPlan::Boundary { .. } if !boundaries => return Step::Boundary,
+        // Stationary on both sides: no span cap, but no IMU edge either
+        // (the map would refuse a one-sided IMU chain anyway).
+        StationaryPlan::Compose(_) if touches_imu_edge(map, kf_idx) => None,
+        StationaryPlan::Compose(_) => map.remove_keyframe(kf_idx).ok(),
+        // The IMU edge keeps its span, so the cap does not apply.
+        StationaryPlan::Boundary { still, .. } => {
+            map.remove_keyframe_beside_still(kf_idx, *still).ok()
         }
-        let wheel_merge = match wheel_factors.as_deref() {
-            Some(factors) => match wheel_merge_through(factors, kf_idx) {
-                Ok(merge) => merge,
-                Err(()) => {
-                    report.kept_for_edges += 1;
-                    continue;
-                }
-            },
-            None => None,
-        };
-        // A chain end (not one in and one out) is refused here: the map
-        // sees no IMU edge on it and would remove it, cutting the chain.
-        let stationary_merge = match stationary_factors.as_deref() {
-            Some(factors) => match stationary_merge_through(factors, kf_idx) {
-                Ok(merge) => merge,
-                Err(()) => {
-                    report.kept_for_edges += 1;
-                    continue;
-                }
-            },
-            None => None,
-        };
-        let allowed = match stationary_merge {
-            // Stationary on both sides: no span cap, but no IMU edge either
-            // (the map would refuse a one-sided IMU chain anyway).
-            Some(_) => !touches_imu_edge(map, kf_idx),
-            None => imu_allows_removal(map, kf_idx, config),
-        };
-        if !allowed {
-            report.kept_for_edges += 1;
-            continue;
+        StationaryPlan::None if imu_allows_removal(map, kf_idx, config) => {
+            map.remove_keyframe(kf_idx).ok()
         }
-        let Ok(removal) = map.remove_keyframe(kf_idx) else {
-            report.kept_for_edges += 1;
-            continue;
-        };
-        report.removed.push(kf_idx);
-        report.landmarks_retired += removal.landmarks_retired;
-        report.imu_edges_merged += usize::from(removal.merged_imu_edge.is_some());
-        if let (Some(factors), Some(merge)) = (wheel_factors.as_deref_mut(), wheel_merge) {
-            factors[merge.incoming] = merge.factor;
-            factors.remove(merge.outgoing);
-            report.wheel_edges_merged += 1;
-        }
-        if let (Some(factors), Some(merge)) = (stationary_factors.as_deref_mut(), stationary_merge)
-        {
+        StationaryPlan::None => None,
+    };
+    let Some(removal) = removal else {
+        report.kept_for_edges += 1;
+        return Step::Done;
+    };
+    report.removed.push(kf_idx);
+    report.landmarks_retired += removal.landmarks_retired;
+    if let (Some(factors), Some(merge)) = (wheel_factors, wheel_merge) {
+        factors[merge.incoming] = merge.factor;
+        factors.remove(merge.outgoing);
+        report.wheel_edges_merged += 1;
+    }
+    match (stationary_factors, stationary) {
+        (Some(factors), StationaryPlan::Compose(merge)) => {
             factors[merge.incoming] = merge.factor;
             factors.remove(merge.outgoing);
             report.stationary_edges_merged += 1;
         }
+        // The IMU edge was moved, not merged.
+        (Some(factors), StationaryPlan::Boundary { position, .. }) => {
+            factors.remove(position);
+            report.stationary_boundaries_removed += 1;
+        }
+        _ => report.imu_edges_merged += usize::from(removal.merged_imu_edge.is_some()),
     }
-    report
+    Step::Done
 }
 
 /// ORB-SLAM's redundancy test for keyframe `kf_idx` against the live map.
@@ -351,12 +424,24 @@ struct EdgeMerge<F> {
 
 type WheelMerge = EdgeMerge<WheelOdomFactor>;
 
-/// `Ok(None)` when no stationary factor touches `kf_idx`; `Err` when the
-/// ones that do are not exactly one in and one out, or do not compose.
-fn stationary_merge_through(
-    factors: &[StationaryFactor],
-    kf_idx: usize,
-) -> Result<Option<EdgeMerge<StationaryFactor>>, ()> {
+/// What culling does with the stationary factors at a keyframe.
+enum StationaryPlan {
+    /// None touches it.
+    None,
+    /// One in and one out, composed into one.
+    Compose(EdgeMerge<StationaryFactor>),
+    /// One on one side only, at `position`: the keyframe ends the stationary
+    /// chain, and [`Map::remove_keyframe_beside_still`] moves its IMU edge
+    /// onto `still`.
+    Boundary {
+        position: usize,
+        still: StillNeighbour,
+    },
+}
+
+/// `Err` when the stationary factors at `kf_idx` are more than one on a side,
+/// or do not compose.
+fn stationary_plan(factors: &[StationaryFactor], kf_idx: usize) -> Result<StationaryPlan, ()> {
     let positions = |pick: fn(&StationaryFactor) -> usize| -> Vec<usize> {
         factors
             .iter()
@@ -369,17 +454,33 @@ fn stationary_merge_through(
         positions(|f| f.to_idx).as_slice(),
         positions(|f| f.from_idx).as_slice(),
     ) {
-        ([], []) => Ok(None),
+        ([], []) => Ok(StationaryPlan::None),
         (&[incoming], &[outgoing]) => factors[incoming]
             .compose(&factors[outgoing])
             .map(|factor| {
-                Some(EdgeMerge {
+                StationaryPlan::Compose(EdgeMerge {
                     incoming,
                     outgoing,
                     factor,
                 })
             })
             .ok_or(()),
+        (&[position], []) => Ok(StationaryPlan::Boundary {
+            position,
+            still: StillNeighbour {
+                keyframe_idx: factors[position].from_idx,
+                side: StillSide::Before,
+                span_s: factors[position].span_s,
+            },
+        }),
+        ([], &[position]) => Ok(StationaryPlan::Boundary {
+            position,
+            still: StillNeighbour {
+                keyframe_idx: factors[position].to_idx,
+                side: StillSide::After,
+                span_s: factors[position].span_s,
+            },
+        }),
         _ => Err(()),
     }
 }

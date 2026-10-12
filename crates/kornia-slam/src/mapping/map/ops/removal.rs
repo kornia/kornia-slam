@@ -11,7 +11,7 @@
 
 use super::correction::valid_preintegration;
 use crate::mapping::map::{ImuFactor, Map};
-use kornia_sensors::imu::{ImuMeasurement, PreintegratedImu};
+use kornia_sensors::imu::ImuMeasurement;
 
 /// Largest gap, seconds, between the end of `(p, k)` and the start of
 /// `(k, n)` that still counts as one contiguous interval. Both are the stamp
@@ -59,13 +59,51 @@ pub enum KeyframeRemovalError {
     DuplicateImuFactor { prev: usize, next: usize },
     #[error("re-preintegrating the imu edges through keyframe {0} gave an invalid result")]
     InvalidMergedImu(usize),
+    #[error("still neighbour {neighbour} of keyframe {keyframe_idx} cannot take over its imu edge")]
+    InvalidStillNeighbour {
+        keyframe_idx: usize,
+        neighbour: usize,
+    },
 }
 
-/// The merged edge and the positions, in `Map::imu_factors`, of the two it replaces.
-struct ImuMerge {
-    incoming: usize,
-    outgoing: usize,
-    factor: ImuFactor,
+/// Which side of a keyframe its still neighbour is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StillSide {
+    /// The neighbour is the earlier keyframe.
+    Before,
+    /// The neighbour is the later keyframe.
+    After,
+}
+
+/// A keyframe linked to the one being removed by a stationary constraint held
+/// outside the map: neither moved over the `span_s` seconds between them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StillNeighbour {
+    pub keyframe_idx: usize,
+    pub side: StillSide,
+    pub span_s: f64,
+}
+
+/// How the IMU chain through a removed keyframe is repaired, validated but
+/// not yet written.
+enum ImuRepair {
+    /// `incoming` and `outgoing` (positions in `Map::imu_factors`) become
+    /// `factor`.
+    Merge {
+        incoming: usize,
+        outgoing: usize,
+        factor: ImuFactor,
+    },
+    /// The edge at `position` is replaced by `factor`, its endpoint moved to
+    /// the still neighbour.
+    Move { position: usize, factor: ImuFactor },
+}
+
+impl ImuRepair {
+    fn edge(&self) -> (usize, usize) {
+        let (Self::Merge { factor, .. } | Self::Move { factor, .. }) = self;
+        (factor.prev_kf_idx, factor.curr_kf_idx)
+    }
 }
 
 impl Map {
@@ -88,21 +126,66 @@ impl Map {
         &mut self,
         keyframe_idx: usize,
     ) -> Result<KeyframeRemoval, KeyframeRemovalError> {
-        let slot = self
-            .keyframes
+        let slot = self.keyframe_slot(keyframe_idx)?;
+        let repair = self
+            .imu_merge_through(keyframe_idx)?
+            .map(|(incoming, outgoing, factor)| ImuRepair::Merge {
+                incoming,
+                outgoing,
+                factor,
+            });
+        Ok(self.remove_validated(slot, keyframe_idx, repair))
+    }
+
+    /// Removes keyframe `keyframe_idx`, which sits at the end of a stationary
+    /// chain: linked to `still` by a stationary constraint the caller holds
+    /// (and drops), and to the rest of the IMU chain by exactly one edge on the
+    /// other side. That edge moves to the still neighbour, keeping its
+    /// `[t0, t1]` and samples, its bias walk widened by `still.span_s`
+    /// ([`ImuFactor::bias_walk_extra_s`]): the neighbour has the removed
+    /// keyframe's pose and zero velocity, so it is the edge the map would hold
+    /// had the removed keyframe never been inserted. Landmarks are repaired as
+    /// in [`Self::remove_keyframe`].
+    ///
+    /// Refused, with the map untouched, unless the keyframe has no IMU edge
+    /// towards `still` and one away from it, and the neighbour is another
+    /// keyframe in the map holding no IMU edge on that side, with a positive
+    /// finite span.
+    pub fn remove_keyframe_beside_still(
+        &mut self,
+        keyframe_idx: usize,
+        still: StillNeighbour,
+    ) -> Result<KeyframeRemoval, KeyframeRemovalError> {
+        let slot = self.keyframe_slot(keyframe_idx)?;
+        let (position, factor) = self.imu_move_to_still(keyframe_idx, still)?;
+        Ok(self.remove_validated(
+            slot,
+            keyframe_idx,
+            Some(ImuRepair::Move { position, factor }),
+        ))
+    }
+
+    fn keyframe_slot(&self, keyframe_idx: usize) -> Result<usize, KeyframeRemovalError> {
+        self.keyframes
             .iter()
             .position(|kf| kf.frame.idx == keyframe_idx)
-            .ok_or(KeyframeRemovalError::UnknownKeyframe(keyframe_idx))?;
-        let merge = self.imu_merge_through(keyframe_idx)?;
+            .ok_or(KeyframeRemovalError::UnknownKeyframe(keyframe_idx))
+    }
 
-        // ── no error exit past this point ──
+    /// The writes of a removal whose IMU repair was validated; cannot fail.
+    fn remove_validated(
+        &mut self,
+        slot: usize,
+        keyframe_idx: usize,
+        repair: Option<ImuRepair>,
+    ) -> KeyframeRemoval {
         self.keyframes.remove(slot);
 
         let mut removal = KeyframeRemoval {
             keyframe_idx,
             observations_removed: 0,
             landmarks_retired: 0,
-            merged_imu_edge: None,
+            merged_imu_edge: repair.as_ref().map(ImuRepair::edge),
         };
         let mut dirty = Vec::new();
         for mp_idx in 0..self.map_points.len() {
@@ -128,25 +211,90 @@ impl Map {
             self.refresh_landmark(mp_idx);
         }
 
-        if let Some(ImuMerge {
-            incoming,
-            outgoing,
-            factor,
-        }) = merge
-        {
-            removal.merged_imu_edge = Some((factor.prev_kf_idx, factor.curr_kf_idx));
-            self.imu_factors[incoming] = factor;
-            self.imu_factors.remove(outgoing);
+        match repair {
+            Some(ImuRepair::Merge {
+                incoming,
+                outgoing,
+                factor,
+            }) => {
+                self.imu_factors[incoming] = factor;
+                self.imu_factors.remove(outgoing);
+            }
+            Some(ImuRepair::Move { position, factor }) => self.imu_factors[position] = factor,
+            None => {}
         }
-        Ok(removal)
+        removal
+    }
+
+    /// The edge through `keyframe_idx` moved onto its still neighbour, and
+    /// its position; validated but not yet written.
+    fn imu_move_to_still(
+        &self,
+        keyframe_idx: usize,
+        still: StillNeighbour,
+    ) -> Result<(usize, ImuFactor), KeyframeRemovalError> {
+        let invalid = KeyframeRemovalError::InvalidStillNeighbour {
+            keyframe_idx,
+            neighbour: still.keyframe_idx,
+        };
+        let neighbour = still.keyframe_idx;
+        if neighbour == keyframe_idx
+            || self.get_keyframe(neighbour).is_none()
+            || !(still.span_s.is_finite() && still.span_s > 0.0)
+        {
+            return Err(invalid);
+        }
+        let positions = |pick: fn(&ImuFactor) -> usize, kf: usize| -> Vec<usize> {
+            self.imu_factors
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| pick(f) == kf)
+                .map(|(pos, _)| pos)
+                .collect()
+        };
+        let incoming = positions(|f| f.curr_kf_idx, keyframe_idx);
+        let outgoing = positions(|f| f.prev_kf_idx, keyframe_idx);
+        // The still side holds no edge; the other exactly one.
+        let (towards, away) = match still.side {
+            StillSide::Before => (&incoming, &outgoing),
+            StillSide::After => (&outgoing, &incoming),
+        };
+        let position = match (towards.as_slice(), away.as_slice()) {
+            ([], &[position]) => position,
+            _ => {
+                return Err(KeyframeRemovalError::UnmergeableImuChain {
+                    keyframe_idx,
+                    incoming: incoming.len(),
+                    outgoing: outgoing.len(),
+                });
+            }
+        };
+        let mut factor = self.imu_factors[position].clone();
+        let neighbour_side = match still.side {
+            StillSide::Before => {
+                factor.prev_kf_idx = neighbour;
+                positions(|f| f.prev_kf_idx, neighbour)
+            }
+            StillSide::After => {
+                factor.curr_kf_idx = neighbour;
+                positions(|f| f.curr_kf_idx, neighbour)
+            }
+        };
+        if factor.prev_kf_idx == factor.curr_kf_idx || !neighbour_side.is_empty() {
+            return Err(invalid);
+        }
+        factor.preintegrated.widen_bias_walk(still.span_s);
+        factor.bias_walk_extra_s += still.span_s;
+        Ok((position, factor))
     }
 
     /// The edge replacing the IMU edges through `keyframe_idx`, validated but
     /// not yet written; `None` when no edge touches it.
+    #[allow(clippy::type_complexity)]
     fn imu_merge_through(
         &self,
         keyframe_idx: usize,
-    ) -> Result<Option<ImuMerge>, KeyframeRemovalError> {
+    ) -> Result<Option<(usize, usize, ImuFactor)>, KeyframeRemovalError> {
         let positions = |pick: fn(&ImuFactor) -> usize| -> Vec<usize> {
             self.imu_factors
                 .iter()
@@ -209,28 +357,29 @@ impl Map {
         let bias = self
             .get_keyframe(prev)
             .map_or(before.preintegrated.bias, |kf| kf.imu_bias);
-        let preintegrated = PreintegratedImu::from_measurements(
-            bias,
-            before.preintegrated.calib,
-            &raw_samples,
-            before.t0,
-            after.t1,
-        );
+        // Both edges' still time stays outside the merged span, so its walk
+        // carries over ([`ImuFactor::bias_walk_extra_s`]).
+        let factor = ImuFactor {
+            prev_kf_idx: prev,
+            curr_kf_idx: next,
+            preintegrated: before.preintegrated.clone(),
+            raw_samples,
+            t0: before.t0,
+            t1: after.t1,
+            bias_walk_extra_s: before.bias_walk_extra_s + after.bias_walk_extra_s,
+        };
+        let preintegrated = factor.repreintegrate(bias);
         if !(preintegrated.dt > 0.0 && valid_preintegration(&preintegrated)) {
             return Err(KeyframeRemovalError::InvalidMergedImu(keyframe_idx));
         }
-        Ok(Some(ImuMerge {
+        Ok(Some((
             incoming,
             outgoing,
-            factor: ImuFactor {
-                prev_kf_idx: prev,
-                curr_kf_idx: next,
+            ImuFactor {
                 preintegrated,
-                raw_samples,
-                t0: before.t0,
-                t1: after.t1,
+                ..factor
             },
-        }))
+        )))
     }
 }
 

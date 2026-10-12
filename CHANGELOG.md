@@ -153,9 +153,21 @@ and checked numerically. It has no span limit:
 keyframe (`StationaryFactor::compose`) however long the parked span, while
 `max_merged_imu_span_sec` keeps capping IMU merges only, so a parked map no
 longer fills with keyframes whose ~10 s IMU edges cannot merge. A keyframe at
-an end of the stationary chain, including the boundary between IMU and
-stationary edges, is kept; `KeyframeCullReport::stationary_edges_merged`
-counts the merges. Like wheel factors, stationary factors are held by the
+the boundary between a stationary factor and an IMU edge is removable too: the
+stationary factor is dropped and the IMU edge moves onto the still neighbour
+(`Map::remove_keyframe_beside_still`, with `StillNeighbour` / `StillSide`),
+keeping its interval and samples, so the boundaries every stop leaves no longer
+pin keyframes until the map is dropped. Boundaries are judged after every other
+candidate, each once per call, so a stop's chain is composed before an IMU edge
+takes it over; only a bare chain end is kept.
+`KeyframeCullReport::stationary_edges_merged` and
+`stationary_boundaries_removed` count both. An IMU edge whose bias link spans
+still time outside its samples (a tail edge after a stop, or one moved across
+a boundary) records it in `ImuFactor::bias_walk_extra_s`; keyframe merges and
+VI-BA repropagation re-preintegrate through `ImuFactor::repreintegrate`, which
+adds that walk back (`PreintegratedImu::widen_bias_walk`), instead of
+rebuilding a bias link from the samples alone that was orders of magnitude too
+stiff. Like wheel factors, stationary factors are held by the
 caller, keyed by `Frame::idx`; `bundle_adjustment::local_window_with_neighbors`
 captures a window in which a stationary neighbour of the active keyframes is
 fixed context, and `run_local_inertial_ba` drops an invalid factor
@@ -165,7 +177,9 @@ stationary factors every solve and every cull is unchanged.
 (after `wheel_edges`), `run_local_inertial_ba` a `stationary_factors` slice
 and `cull_redundant_keyframes` an `Option<&mut Vec<StationaryFactor>>` (pass
 `&[]` / `None` for the old behaviour); `ViBaError` gains
-`StationaryFactorOutOfRange` and `InvalidStationaryFactor`. Additive:
+`StationaryFactorOutOfRange` and `InvalidStationaryFactor`; `map::ImuFactor`
+gains the public field `bias_walk_extra_s` (set it to `0.0` for an ordinary
+edge) and `KeyframeRemovalError` the variant `InvalidStillNeighbour`. Additive:
 `local_window_with_neighbors`, `KeyframeCullReport::stationary_edges_merged`
 (the report is `#[non_exhaustive]`), and `kornia_sensors::imu::ImuCalib`
 derives `PartialEq`. All of this rides on the already-breaking 0.2.0; none of

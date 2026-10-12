@@ -14,7 +14,6 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::ransac::RobustKernelKind;
 use kornia_algebra::Vec3F64;
-use kornia_sensors::imu::PreintegratedImu;
 use std::collections::{HashMap, HashSet};
 
 /// Relative standard deviation of a stereo depth measurement, as a fraction of
@@ -392,13 +391,9 @@ pub fn run_local_inertial_ba(
         let d_accel = (current_bias.accel - preintegrated.bias.accel).length();
         let d_gyro = (current_bias.gyro - preintegrated.bias.gyro).length();
         if d_accel > REPROPAGATE_BIAS_THRESHOLD || d_gyro > REPROPAGATE_BIAS_THRESHOLD {
-            *preintegrated = PreintegratedImu::from_measurements(
-                current_bias,
-                preintegrated.calib,
-                &factor.raw_samples,
-                factor.t0,
-                factor.t1,
-            );
+            // Keeps the walk over the edge's still time, which the samples
+            // alone do not cover.
+            *preintegrated = factor.repreintegrate(current_bias);
         }
     }
 

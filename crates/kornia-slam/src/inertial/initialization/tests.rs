@@ -156,6 +156,7 @@ fn synth_map_with_calib(s_true: f64, r_arb: Mat3F64, calib: ImuCalib, omega: f64
                     raw_samples: Vec::new(),
                     t0: t - kf_dt,
                     t1: t,
+                    bias_walk_extra_s: 0.0,
                 }],
                 ..Default::default()
             })
@@ -352,6 +353,7 @@ fn recovers_scale_bias_gravity_from_synthetic_trajectory() {
                     raw_samples: Vec::new(),
                     t0: t - kf_dt,
                     t1: t,
+                    bias_walk_extra_s: 0.0,
                 }],
                 ..Default::default()
             })

@@ -1,4 +1,4 @@
-use kornia_sensors::imu::{ImuMeasurement, PreintegratedImu};
+use kornia_sensors::imu::{ImuBias, ImuMeasurement, PreintegratedImu};
 
 /// Preintegrated IMU measurements connecting two consecutive keyframes.
 #[derive(Debug, Clone)]
@@ -16,4 +16,27 @@ pub struct ImuFactor {
     pub raw_samples: Vec<ImuMeasurement>,
     pub t0: f64,
     pub t1: f64,
+    /// Seconds outside `[t0, t1]` that the bias link between the two
+    /// keyframes also spans: still stretches with no motion, elided from the
+    /// samples (an edge over the tail of a stop) or absorbed when a keyframe
+    /// at the end of a stationary chain was removed. `preintegrated`'s bias
+    /// covariance includes the walk over them, and every re-preintegration
+    /// ([`Self::repreintegrate`]) adds it back. Zero for an ordinary edge.
+    pub bias_walk_extra_s: f64,
+}
+
+impl ImuFactor {
+    /// The edge's raw samples re-preintegrated over `[t0, t1]` at `bias`,
+    /// with the bias walk widened by [`Self::bias_walk_extra_s`].
+    pub fn repreintegrate(&self, bias: ImuBias) -> PreintegratedImu {
+        let mut preintegrated = PreintegratedImu::from_measurements(
+            bias,
+            self.preintegrated.calib,
+            &self.raw_samples,
+            self.t0,
+            self.t1,
+        );
+        preintegrated.widen_bias_walk(self.bias_walk_extra_s);
+        preintegrated
+    }
 }

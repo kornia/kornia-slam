@@ -510,6 +510,7 @@ fn an_invalid_imu_edge_rejects_the_batch() {
         raw_samples: Vec::new(),
         t0,
         t1,
+        bias_walk_extra_s: 0.0,
     };
     let mut request = MapInsertion {
         keyframes: vec![detached(1, 1)],
@@ -693,6 +694,7 @@ fn a_duplicate_imu_edge_within_one_batch_is_refused() {
         raw_samples: Vec::new(),
         t0: 0.0,
         t1: 1.0,
+        bias_walk_extra_s: 0.0,
     };
     let before = map.state_fingerprint_for_test();
 

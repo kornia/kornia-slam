@@ -302,6 +302,7 @@ fn imu_edge(slot: usize) -> ImuFactor {
         raw_samples: raw,
         t0,
         t1,
+        bias_walk_extra_s: 0.0,
     }
 }
 
@@ -596,6 +597,7 @@ fn imu_edge_between(from: usize, to: usize, t0: f64, span_s: f64) -> ImuFactor {
         raw_samples: raw,
         t0,
         t1,
+        bias_walk_extra_s: 0.0,
     }
 }
 
@@ -669,15 +671,22 @@ fn the_imu_span_cap_still_applies_without_stationary_factors() {
     assert_map_consistent(&map);
 }
 
-/// IMU edges for the first keyframes, stationary factors after: the
-/// boundary keyframe (IMU in, stationary out) is kept, the IMU part still
-/// obeys the cap, and the stationary part merges freely.
+/// A burst of quality keyframes inside a stop: stationary factors, then IMU
+/// edges under the minimum span, then stationary factors again
+/// (`K0 -stat- K5 -imu- K8 -stat- K19`). Both boundary keyframes go, after the
+/// stationary chains are composed: each hands its IMU edge to its still
+/// neighbour, widened by the still span, so a stop leaves no keyframe culling
+/// can never remove. The IMU part still obeys the cap.
+///
+/// Mutations (each turned this red): refusing the boundary plan (the old
+/// `Err` for a one-sided stationary keyframe) kept both boundaries; removing
+/// boundaries inline instead of in the second pass let the IMU edge eat the
+/// chain one factor at a time.
 #[test]
-fn the_boundary_between_imu_and_stationary_edges_is_kept() {
+fn the_boundaries_between_imu_and_stationary_edges_are_removable() {
     let (mut map, ids) = parked_fixture(20);
-    let boundary = ids[6];
     map.apply_insertion(MapInsertion {
-        imu_factors: ids[..7]
+        imu_factors: ids[5..9]
             .windows(2)
             .enumerate()
             .map(|(k, w)| imu_edge_between(w[0], w[1], 0.25 * k as f64, 0.25))
@@ -685,34 +694,45 @@ fn the_boundary_between_imu_and_stationary_edges_is_kept() {
         ..Default::default()
     })
     .unwrap();
-    let mut factors = stationary_chain(&ids[6..], 30.0);
+    let mut factors = stationary_chain(&ids[..6], 30.0);
+    factors.extend(stationary_chain(&ids[8..], 30.0));
     let config = KeyframeCullingConfig {
         min_keyframes: 0,
         max_merged_imu_span_sec: 0.6,
         ..KeyframeCullingConfig::default()
     };
     let report = cull_redundant_keyframes(&mut map, &config, None, Some(&mut factors));
-    assert!(
-        map.get_keyframe(boundary).is_some(),
-        "the boundary keyframe stays"
+    // ids[7] is the only keyframe kept for its edges: merging through it
+    // would make a 0.75 s IMU edge.
+    assert_eq!(
+        ids_of(&map),
+        vec![ids[0], ids[7], ids[17], ids[18], ids[19]]
+    );
+    assert_eq!(report.kept_for_edges, 1);
+    // The stationary chains are composed first (ids[1..5] and ids[9..17]), then each boundary
+    // goes once, so the IMU edges take over two composed factors, not nine single ones.
+    assert_eq!(report.stationary_edges_merged, 12);
+    assert_eq!(report.stationary_boundaries_removed, 2);
+    assert_eq!(report.imu_edges_merged, 1);
+    let edges: Vec<(usize, usize, f64)> = map
+        .imu_factors()
+        .iter()
+        .map(|f| (f.prev_kf_idx, f.curr_kf_idx, f.bias_walk_extra_s))
+        .collect();
+    assert_eq!(
+        edges,
+        vec![(ids[0], ids[7], 150.0), (ids[7], ids[17], 270.0)]
     );
     assert!(map.imu_factors().iter().all(|f| f.t1 - f.t0 <= 0.6 + 1e-9));
-    assert!(map.imu_factors().len() > 1, "IMU merges stop at the cap");
-    // Of the stationary part only the boundary and the protected newest three remain.
-    let kept = ids_of(&map);
-    let stationary_kept: Vec<usize> = kept.iter().copied().filter(|&id| id >= boundary).collect();
-    assert_eq!(stationary_kept, vec![boundary, ids[17], ids[18], ids[19]]);
-    assert_eq!(report.stationary_edges_merged, 10);
     let chain: Vec<(usize, usize)> = factors.iter().map(|f| (f.from_idx, f.to_idx)).collect();
-    let expected: Vec<(usize, usize)> = stationary_kept.windows(2).map(|w| (w[0], w[1])).collect();
-    assert_eq!(chain, expected);
+    assert_eq!(chain, vec![(ids[17], ids[18]), (ids[18], ids[19])]);
     assert_endpoints_in_map(&map, &factors);
     assert_map_consistent(&map);
 }
 
-/// A keyframe at an end of the stationary chain (its outgoing factor not
-/// yet inserted, or dropped) is never removed: the map sees no IMU edge on
-/// it and would remove it, cutting the chain.
+/// A keyframe at a bare end of the stationary chain (its outgoing factor not
+/// yet inserted, or dropped, and no IMU edge either) is never removed: the
+/// map sees no IMU edge on it and would remove it, cutting the chain.
 #[test]
 fn a_stationary_chain_end_is_never_removed() {
     let (mut map, ids) = parked_fixture(10);

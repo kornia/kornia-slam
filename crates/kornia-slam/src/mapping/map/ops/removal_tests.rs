@@ -46,6 +46,7 @@ fn edge(prev: usize, curr: usize, t0: f64, t1: f64) -> ImuFactor {
         raw_samples: raw,
         t0,
         t1,
+        bias_walk_extra_s: 0.0,
     }
 }
 
@@ -286,4 +287,179 @@ fn a_snapshot_captured_before_the_removal_still_merges_without_resurrecting_it()
     );
     assert!((map.imu_factors()[1].preintegrated.dt - 1.2).abs() < 1e-9);
     assert_map_consistent(&map);
+}
+
+fn gyro_walk(preintegrated: &PreintegratedImu) -> f64 {
+    preintegrated.bias_covariance[0]
+}
+
+/// A merge re-preintegrates from the samples, which alone give back only the
+/// walk over `[t0, t1]`; the still time either edge spans outside them
+/// carries over.
+///
+/// Mutation: dropping `bias_walk_extra_s` from the merged edge turned it red.
+#[test]
+fn a_merge_keeps_the_bias_walk_over_elided_still_time() {
+    let mut map = landmark_map();
+    let mut tail = edge(10, 20, 0.0, 0.2);
+    tail.bias_walk_extra_s = 3600.0;
+    tail.preintegrated.widen_bias_walk(3600.0);
+    map.apply_insertion(MapInsertion {
+        imu_factors: vec![tail, edge(20, 30, 0.2, 0.4)],
+        ..Default::default()
+    })
+    .unwrap();
+    map.remove_keyframe(20).unwrap();
+    let merged = &map.imu_factors()[0];
+    assert_eq!(merged.bias_walk_extra_s, 3600.0);
+    let expected = calib().gyro_bias_noise.powi(2) * (3600.0 + 0.4);
+    let got = gyro_walk(&merged.preintegrated);
+    assert!(
+        (got - expected).abs() < 1e-6 * expected,
+        "{got} vs {expected}"
+    );
+}
+
+/// A keyframe at the end of a stationary chain hands its one IMU edge to the
+/// still neighbour, on either side: same interval, samples and deltas, the
+/// bias walk widened by the still span. Landmarks are repaired as in any
+/// removal.
+///
+/// Mutation: not widening the moved edge turned the covariance asserts red.
+#[test]
+fn a_still_boundary_keyframe_moves_its_imu_edge_onto_the_still_neighbour() {
+    use super::{StillNeighbour, StillSide};
+    for (side, removed, neighbour, edges, moved_pair) in [
+        (
+            StillSide::Before,
+            20,
+            10,
+            vec![edge(20, 30, 0.2, 0.4), edge(30, 40, 0.4, 0.6)],
+            (10, 30),
+        ),
+        (
+            StillSide::After,
+            30,
+            40,
+            vec![edge(10, 20, 0.0, 0.2), edge(20, 30, 0.2, 0.4)],
+            (20, 40),
+        ),
+    ] {
+        let mut map = landmark_map();
+        map.apply_insertion(MapInsertion {
+            imu_factors: edges,
+            ..Default::default()
+        })
+        .unwrap();
+        let position = map
+            .imu_factors()
+            .iter()
+            .position(|f| f.prev_kf_idx == removed || f.curr_kf_idx == removed)
+            .unwrap();
+        let original = map.imu_factors()[position].clone();
+        let removal = map
+            .remove_keyframe_beside_still(
+                removed,
+                StillNeighbour {
+                    keyframe_idx: neighbour,
+                    side,
+                    span_s: 50.0,
+                },
+            )
+            .unwrap();
+        assert_eq!(removal.merged_imu_edge, Some(moved_pair), "{side:?}");
+        assert!(map.get_keyframe(removed).is_none());
+        assert_map_consistent(&map);
+        let moved = &map.imu_factors()[position];
+        assert_eq!((moved.prev_kf_idx, moved.curr_kf_idx), moved_pair);
+        assert_eq!((moved.t0, moved.t1), (original.t0, original.t1));
+        assert_eq!(moved.raw_samples.len(), original.raw_samples.len());
+        assert_eq!(moved.bias_walk_extra_s, 50.0);
+        let (a, b) = (&moved.preintegrated, &original.preintegrated);
+        assert_eq!(a.delta_position, b.delta_position);
+        let widened = calib().gyro_bias_noise.powi(2) * 50.0;
+        assert!((gyro_walk(a) - gyro_walk(b) - widened).abs() < 1e-6 * widened);
+        let accel = calib().accel_bias_noise.powi(2) * 50.0;
+        assert!((a.bias_covariance[35] - b.bias_covariance[35] - accel).abs() < 1e-6 * accel);
+    }
+}
+
+/// The move is refused, with the map untouched, when the keyframe has an IMU
+/// edge towards the still neighbour, none away from it, or the neighbour is
+/// unknown, already holds an edge on that side, or the span is not positive.
+#[test]
+fn a_still_boundary_move_that_would_break_the_chain_is_refused_without_a_write() {
+    use super::{StillNeighbour, StillSide};
+    let still = |keyframe_idx, side, span_s| StillNeighbour {
+        keyframe_idx,
+        side,
+        span_s,
+    };
+    let cases: Vec<(Vec<ImuFactor>, StillNeighbour, KeyframeRemovalError)> = vec![
+        (
+            vec![edge(10, 20, 0.0, 0.2), edge(20, 30, 0.2, 0.4)],
+            still(10, StillSide::Before, 5.0),
+            KeyframeRemovalError::UnmergeableImuChain {
+                keyframe_idx: 20,
+                incoming: 1,
+                outgoing: 1,
+            },
+        ),
+        (
+            vec![edge(30, 40, 0.4, 0.6)],
+            still(10, StillSide::Before, 5.0),
+            KeyframeRemovalError::UnmergeableImuChain {
+                keyframe_idx: 20,
+                incoming: 0,
+                outgoing: 0,
+            },
+        ),
+        (
+            vec![edge(20, 30, 0.2, 0.4), edge(10, 40, 0.0, 0.6)],
+            still(10, StillSide::Before, 5.0),
+            KeyframeRemovalError::InvalidStillNeighbour {
+                keyframe_idx: 20,
+                neighbour: 10,
+            },
+        ),
+        (
+            vec![edge(20, 30, 0.2, 0.4)],
+            still(99, StillSide::Before, 5.0),
+            KeyframeRemovalError::InvalidStillNeighbour {
+                keyframe_idx: 20,
+                neighbour: 99,
+            },
+        ),
+        (
+            vec![edge(20, 30, 0.2, 0.4)],
+            still(10, StillSide::Before, 0.0),
+            KeyframeRemovalError::InvalidStillNeighbour {
+                keyframe_idx: 20,
+                neighbour: 10,
+            },
+        ),
+        (
+            vec![edge(20, 30, 0.2, 0.4)],
+            still(30, StillSide::After, 5.0),
+            KeyframeRemovalError::UnmergeableImuChain {
+                keyframe_idx: 20,
+                incoming: 0,
+                outgoing: 1,
+            },
+        ),
+    ];
+    for (edges, still, expected) in cases {
+        let mut map = landmark_map();
+        map.apply_insertion(MapInsertion {
+            imu_factors: edges,
+            ..Default::default()
+        })
+        .unwrap();
+        let before = map.state_fingerprint_for_test();
+        assert_eq!(
+            map.remove_keyframe_beside_still(20, still).unwrap_err(),
+            expected
+        );
+        assert_eq!(map.state_fingerprint_for_test(), before);
+    }
 }

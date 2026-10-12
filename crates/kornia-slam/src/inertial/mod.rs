@@ -97,6 +97,7 @@ impl InertialState {
             raw_samples,
             t0,
             t1,
+            bias_walk_extra_s: 0.0,
         })
     }
 
