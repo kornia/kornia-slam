@@ -79,8 +79,8 @@ pub struct ViBaKeyframe {
     pub velocity: Vec3F64,
     /// IMU bias estimate at this keyframe.
     pub bias: ImuBias,
-    /// If true, pose+velocity+bias are held fixed (used for the first keyframe
-    /// as the gauge anchor, or for marginalised frames).
+    /// If true, pose+velocity+bias are held fixed (gauge anchor; older keyframes
+    /// are held fixed ORB-SLAM3‑style — not marginalised).
     pub fixed: bool,
 }
 
@@ -1058,7 +1058,6 @@ pub fn visual_inertial_bundle_adjust(
             // Huber robustification: down-weight edges whose nav-block Mahalanobis
             // chi2 exceeds the threshold. This handles large residuals from rough
             // post-init velocity estimates without a fixed weight compromise.
-            //
             // Only the nav 9×9 sub-block (rows/cols 0-8) is scaled by `hw` — the
             // bias-random-walk 6×6 sub-block (rows/cols 9-14) is a separate,
             // uncorrelated measurement (see `imu_information_matrix`) that ORB-SLAM3
