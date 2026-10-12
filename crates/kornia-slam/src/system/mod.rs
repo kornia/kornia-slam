@@ -334,6 +334,11 @@ impl SlamSystem {
 
     /// Single-frame metric initialization from stereo depth.
     fn bootstrap_stereo(&mut self, mut curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
+        // The map will start at this frame or a later one, so older samples
+        // can never enter an edge; a failed attempt (too few stereo points,
+        // as in the dark) must not keep them, or the buffer grows for as
+        // long as bootstrap keeps failing.
+        self.prune_imu_before(timestamp_sec);
         // Build the new map in the current odometry frame (identity at start,
         // or the recovery pose after a tracking loss).
         curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
@@ -398,6 +403,8 @@ impl SlamSystem {
                     curr_frame.idx, keypoints, MIN_KEYPOINTS_FOR_BOOTSTRAP,
                 ));
                 self.state.bootstrap_frame = None;
+                // No reference is held: the next one is a later frame.
+                self.prune_imu_before(timestamp_sec);
                 return self.frame_result(TrackingStatus::Skipped);
             }
             BootstrapDecision::StoreAsReference => {

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_algebra::Vec3F64;
+use kornia_image::ImageSize;
 
 use super::*;
 use crate::frontend::OrbFrontend;
@@ -211,6 +212,53 @@ fn stereo_input_without_a_right_image_changes_nothing() {
     };
     assert!(system.process(pair).is_ok());
     assert!(system.frontend_observation().stereo_matched.unwrap() > 0);
+}
+
+/// A rig that never bootstraps (a dark room) inserts no keyframe, yet must
+/// not buffer IMU samples for as long as that lasts.
+#[test]
+fn imu_buffer_stays_bounded_while_bootstrap_keeps_failing() {
+    let dark = Image::from_size_val(
+        ImageSize {
+            width: 376,
+            height: 240,
+        },
+        0u8,
+    )
+    .unwrap();
+    let frame_samples = |idx: usize| -> Vec<ImuMeasurement> {
+        // 10 samples at 200 Hz ending at the frame's stamp.
+        (0..10)
+            .map(|k| ImuMeasurement {
+                timestamp: idx as f64 * 0.05 - 0.045 + k as f64 * 0.005,
+                gyro: Vec3F64::ZERO,
+                accel: Vec3F64::new(0.0, 0.0, 9.81),
+            })
+            .collect()
+    };
+    // Stereo: keypoints on the left, none matched on the right, so the
+    // single-frame stereo bootstrap fails on too few stereo points. Mono:
+    // no keypoints at all, so no bootstrap reference is ever held.
+    let left = textured(0);
+    for cameras in [CameraSelection::Stereo, CameraSelection::Mono] {
+        let stereo = matches!(cameras, CameraSelection::Stereo);
+        let config = config(cameras, true, LoopClosingMode::Disabled);
+        let mut system = SlamSystem::build(config, stereo_imu_rig()).unwrap();
+        for idx in 0..400 {
+            let samples = frame_samples(idx);
+            let frame = SensorFrame {
+                right_image: stereo.then_some(&dark),
+                ..input(idx, if stereo { &left } else { &dark }, &samples)
+            };
+            let result = system.process(frame).unwrap();
+            assert_eq!(result.status, TrackingStatus::Skipped);
+            assert!(
+                system.inertial.pending_sample_count() <= 10,
+                "{cameras:?} frame {idx}: {} samples buffered",
+                system.inertial.pending_sample_count()
+            );
+        }
+    }
 }
 
 #[test]

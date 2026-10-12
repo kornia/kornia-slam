@@ -171,6 +171,15 @@ and `cull_redundant_keyframes` an `Option<&mut Vec<StationaryFactor>>` (pass
 derives `PartialEq`. All of this rides on the already-breaking 0.2.0; none of
 it belongs in a 0.1.x.
 
+**The IMU buffer stays bounded while bootstrap fails.** `SlamSystem` dropped
+buffered IMU samples only once a map existed or a monocular bootstrap
+reference was stored, so a rig that could not bootstrap (a dark room: too few
+stereo points, or no keypoints at all) buffered every sample for as long as
+that lasted. Samples older than the current frame are now dropped on every
+failed stereo bootstrap and whenever no monocular reference is held. While a
+monocular reference is held the samples since it are still kept, as the first
+edge needs them.
+
 **Inertial initialization while stationary.** A stereo-inertial rig no
 longer has to move before the IMU joins the estimate: the motion-based
 initializer needs displacement to see gravity, but a stereo map is already
