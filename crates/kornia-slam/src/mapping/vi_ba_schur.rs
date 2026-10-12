@@ -35,8 +35,9 @@
 //!   * Point parameters are the 3-dim world coordinates.
 //!   * z is clamped to `MIN_Z` to handle mid-iteration cheirality flips.
 //!
-//! Supports Huber-robustified reprojection, stereo depth, IMU and wheel
-//! odometry residuals, an accel-bias prior, fixed keyframes and fixed points.
+//! Supports Huber-robustified reprojection, stereo depth, IMU, wheel
+//! odometry and stationary residuals, an accel-bias prior, fixed keyframes
+//! and fixed points.
 //! A damped step is kept only if it lowers the cost; otherwise λ grows and the
 //! step is retried.
 
@@ -45,6 +46,9 @@ use faer::prelude::Solve;
 use kornia_algebra::{Mat3F64, SE3F32, SO3F64, Vec3F64};
 use thiserror::Error;
 
+use crate::mapping::stationary::{
+    self, StationaryFactor, StationaryInfo, StationaryResidual, StationaryState,
+};
 use crate::mapping::wheel_odom::{self, Mat6, WheelOdomFactor};
 use crate::pose_conversion::{pose_to_se3, se3_to_pose, vec3_to_f32};
 
@@ -71,6 +75,10 @@ pub enum ViBaError {
     InvalidWheelCovariance(usize),
     #[error("Wheel odometry edge {0} has a non-finite delta or extrinsic")]
     NonFiniteWheelFactor(usize),
+    #[error("Stationary edge keyframe indices out of range: {0} → {1}")]
+    StationaryFactorOutOfRange(usize, usize),
+    #[error("Stationary edge {0} is invalid (see StationaryFactor::is_valid)")]
+    InvalidStationaryFactor(usize),
     #[error(transparent)]
     Ba(#[from] BaError),
 }
@@ -774,7 +782,6 @@ fn accumulate_wheel_edges(
     edges: &[WheelOdomFactor],
     infos: &[Mat6],
 ) -> f64 {
-    const KF_DOF: usize = 15;
     let mut cost = 0.0;
     for (edge, info) in edges.iter().zip(infos) {
         let (li, lj) = (kf_local[edge.from_idx], kf_local[edge.to_idx]);
@@ -788,42 +795,59 @@ fn accumulate_wheel_edges(
         );
         let (w, c) = wheel_odom::robust_weight_and_cost(&r, info, edge.huber_chi2);
         cost += c;
+        accumulate_pose_pair(m_mat, m_vec, li, lj, &r, &j, info, w);
+    }
+    cost
+}
 
-        // JᵀΩ, with the robust weight folded in.
-        let mut jt_omega = [[0.0f64; 6]; 6];
-        for (a, row) in jt_omega.iter_mut().enumerate() {
-            for (b, x) in row.iter_mut().enumerate() {
-                *x = w * (0..6).map(|k| j[k][a] * info[k][b]).sum::<f64>();
-            }
+/// Normal equations of a 6-row pose-pair residual with `J_j = −J_i`: every
+/// block is `±w JᵀΩJ` and the gradients are `∓w JᵀΩr`, scattered over the
+/// pose DOF (0..6) of each free slot (`l < 0` is a fixed keyframe).
+#[allow(clippy::too_many_arguments)]
+fn accumulate_pose_pair(
+    m_mat: &mut Mat<f64>,
+    m_vec: &mut [f64],
+    li: i64,
+    lj: i64,
+    r: &[f64; 6],
+    j: &Mat6,
+    info: &Mat6,
+    w: f64,
+) {
+    const KF_DOF: usize = 15;
+    // JᵀΩ, with the robust weight folded in.
+    let mut jt_omega = [[0.0f64; 6]; 6];
+    for (a, row) in jt_omega.iter_mut().enumerate() {
+        for (b, x) in row.iter_mut().enumerate() {
+            *x = w * (0..6).map(|k| j[k][a] * info[k][b]).sum::<f64>();
         }
-        let h: Mat6 = std::array::from_fn(|a| {
-            std::array::from_fn(|b| (0..6).map(|k| jt_omega[a][k] * j[k][b]).sum())
-        });
-        let g: [f64; 6] = std::array::from_fn(|a| (0..6).map(|k| jt_omega[a][k] * r[k]).sum());
+    }
+    let h: Mat6 = std::array::from_fn(|a| {
+        std::array::from_fn(|b| (0..6).map(|k| jt_omega[a][k] * j[k][b]).sum())
+    });
+    let g: [f64; 6] = std::array::from_fn(|a| (0..6).map(|k| jt_omega[a][k] * r[k]).sum());
 
-        let slots = [(li, 1.0), (lj, -1.0)];
-        for &(l_row, s_row) in &slots {
-            if l_row < 0 {
+    let slots = [(li, 1.0), (lj, -1.0)];
+    for &(l_row, s_row) in &slots {
+        if l_row < 0 {
+            continue;
+        }
+        let row0 = l_row as usize * KF_DOF;
+        for a in 0..6 {
+            m_vec[row0 + a] -= s_row * g[a];
+        }
+        for &(l_col, s_col) in &slots {
+            if l_col < 0 {
                 continue;
             }
-            let row0 = l_row as usize * KF_DOF;
+            let col0 = l_col as usize * KF_DOF;
             for a in 0..6 {
-                m_vec[row0 + a] -= s_row * g[a];
-            }
-            for &(l_col, s_col) in &slots {
-                if l_col < 0 {
-                    continue;
-                }
-                let col0 = l_col as usize * KF_DOF;
-                for a in 0..6 {
-                    for b in 0..6 {
-                        m_mat[(row0 + a, col0 + b)] += s_row * s_col * h[a][b];
-                    }
+                for b in 0..6 {
+                    m_mat[(row0 + a, col0 + b)] += s_row * s_col * h[a][b];
                 }
             }
         }
     }
-    cost
 }
 
 /// Robustified wheel cost at a trial state, matching [`accumulate_wheel_edges`].
@@ -848,12 +872,153 @@ fn wheel_cost(
         .sum()
 }
 
+/// Validates the stationary edges and returns each one's information.
+fn stationary_information(
+    edges: &[StationaryFactor],
+    n_kf: usize,
+) -> Result<Vec<StationaryInfo>, ViBaError> {
+    edges
+        .iter()
+        .enumerate()
+        .map(|(k, edge)| {
+            if edge.from_idx >= n_kf || edge.to_idx >= n_kf {
+                return Err(ViBaError::StationaryFactorOutOfRange(
+                    edge.from_idx,
+                    edge.to_idx,
+                ));
+            }
+            if !edge.is_valid() {
+                return Err(ViBaError::InvalidStationaryFactor(k));
+            }
+            Ok(edge.information())
+        })
+        .collect()
+}
+
+/// One stationary edge's residual at the keyframe states `i` and `j`.
+fn stationary_eval(
+    edge: &StationaryFactor,
+    info: &StationaryInfo,
+    i: &ViBaKeyframe,
+    j: &ViBaKeyframe,
+) -> StationaryResidual {
+    fn state(kf: &ViBaKeyframe) -> StationaryState<'_> {
+        StationaryState {
+            pose_cw: &kf.pose,
+            velocity: kf.velocity,
+            bias: kf.bias,
+        }
+    }
+    stationary::residual(edge, info, state(i), state(j))
+}
+
+/// Stationary edges ([`crate::mapping::stationary`]). The pose rows go
+/// through [`accumulate_pose_pair`]; the rest are linear with constant
+/// Jacobians and are written directly (`m_vec −= JᵀΩr`, `m_mat += JᵀΩJ`):
+///
+/// * `v_i`, `v_j` (`J = I`, weight `w`): `H_vv += wΩ_v`, `m_v −= wΩ_v v`.
+/// * bias walk `r = b_j − b_i` (`J_i = −I`, `J_j = I`): `H_ii = H_jj += W`,
+///   `H_ij = H_ji −= W`, `m_i += W r`, `m_j −= W r`.
+/// * mean gyro `r = ω̄ − (b_gi + b_gj)/2` (`J_i = J_j = −I/2`): every block
+///   `+= G/4`, `m_i = m_j += G r / 2`.
+///
+/// A fixed endpoint's rows and columns are skipped, an edge with both ends
+/// fixed entirely. Returns the robustified cost.
+fn accumulate_stationary_edges(
+    m_mat: &mut Mat<f64>,
+    m_vec: &mut [f64],
+    kfs: &[ViBaKeyframe],
+    kf_local: &[i64],
+    edges: &[StationaryFactor],
+    infos: &[StationaryInfo],
+) -> f64 {
+    const KF_DOF: usize = 15;
+    let mut cost = 0.0;
+    for (edge, info) in edges.iter().zip(infos) {
+        let (li, lj) = (kf_local[edge.from_idx], kf_local[edge.to_idx]);
+        if li < 0 && lj < 0 {
+            continue;
+        }
+        let e = stationary_eval(edge, info, &kfs[edge.from_idx], &kfs[edge.to_idx]);
+        cost += e.cost;
+        accumulate_pose_pair(
+            m_mat,
+            m_vec,
+            li,
+            lj,
+            &e.pose,
+            &e.pose_jacobian_i,
+            &info.pose,
+            e.weight,
+        );
+        let base = |l: i64| (l >= 0).then(|| l as usize * KF_DOF);
+        let (bi, bj) = (base(li), base(lj));
+        let wv = e.weight * info.velocity;
+        for (b, v) in [(bi, e.velocity_i), (bj, e.velocity_j)] {
+            let Some(b) = b else { continue };
+            for (d, x) in [v.x, v.y, v.z].into_iter().enumerate() {
+                m_mat[(b + 6 + d, b + 6 + d)] += wv;
+                m_vec[b + 6 + d] -= wv * x;
+            }
+        }
+        for (offset, weight, r) in [
+            (9, info.gyro_bias, e.gyro_bias),
+            (12, info.accel_bias, e.accel_bias),
+        ] {
+            for (d, x) in [r.x, r.y, r.z].into_iter().enumerate() {
+                if let Some(bi) = bi {
+                    m_mat[(bi + offset + d, bi + offset + d)] += weight;
+                    m_vec[bi + offset + d] += weight * x;
+                }
+                if let Some(bj) = bj {
+                    m_mat[(bj + offset + d, bj + offset + d)] += weight;
+                    m_vec[bj + offset + d] -= weight * x;
+                }
+                if let (Some(bi), Some(bj)) = (bi, bj) {
+                    m_mat[(bi + offset + d, bj + offset + d)] -= weight;
+                    m_mat[(bj + offset + d, bi + offset + d)] -= weight;
+                }
+            }
+        }
+        if let (Some((_, g)), Some(r)) = (info.gyro_mean, e.gyro_mean) {
+            for (d, x) in [r.x, r.y, r.z].into_iter().enumerate() {
+                for row in [bi, bj].into_iter().flatten() {
+                    m_vec[row + 9 + d] += 0.5 * g * x;
+                    for col in [bi, bj].into_iter().flatten() {
+                        m_mat[(row + 9 + d, col + 9 + d)] += 0.25 * g;
+                    }
+                }
+            }
+        }
+    }
+    cost
+}
+
+/// Robustified stationary cost at a trial state, matching
+/// [`accumulate_stationary_edges`].
+fn stationary_cost(
+    kfs: &[ViBaKeyframe],
+    kf_local: &[i64],
+    edges: &[StationaryFactor],
+    infos: &[StationaryInfo],
+) -> f64 {
+    edges
+        .iter()
+        .zip(infos)
+        .filter(|(edge, _)| kf_local[edge.from_idx] >= 0 || kf_local[edge.to_idx] >= 0)
+        .map(|(edge, info)| {
+            stationary_eval(edge, info, &kfs[edge.from_idx], &kfs[edge.to_idx]).cost
+        })
+        .sum()
+}
+
 /// Visual-inertial bundle adjustment via dense Schur-complement reduction.
 ///
 /// Jointly optimises keyframe poses, velocities, and IMU biases (15 DOF each)
 /// together with 3D landmark positions, connected by reprojection factors,
-/// IMU preintegration factors and optional wheel-odometry factors (pass `&[]`
-/// for none).
+/// IMU preintegration factors, optional wheel-odometry factors and optional
+/// stationary factors ([`StationaryFactor`], indexed by keyframe slot; pass
+/// `&[]` for none — the solve is then unchanged, bit for bit).
 ///
 /// The Schur trick marginalises points exactly as in pure BA. After point
 /// elimination, IMU edge normal equations are added directly to the reduced
@@ -863,12 +1028,14 @@ fn wheel_cost(
 /// # Gauge freedom
 /// Fix at least one keyframe (`fixed = true`) to anchor the metric scale and
 /// world frame. The first keyframe is the natural choice.
+#[allow(clippy::too_many_arguments)]
 pub fn visual_inertial_bundle_adjust(
     keyframes: &[ViBaKeyframe],
     points: &[Vec3F64],
     observations: &[BaObservation],
     imu_edges: &[ImuFactor],
     wheel_edges: &[WheelOdomFactor],
+    stationary_edges: &[StationaryFactor],
     camera: &PinholeCamera,
     params: &ViBaParams,
 ) -> Result<ViBaResult, ViBaError> {
@@ -897,8 +1064,12 @@ pub fn visual_inertial_bundle_adjust(
             kf_touched[edge.to_idx] = true;
         }
     }
-    for edge in wheel_edges {
-        for idx in [edge.from_idx, edge.to_idx] {
+    for (from, to) in wheel_edges
+        .iter()
+        .map(|e| (e.from_idx, e.to_idx))
+        .chain(stationary_edges.iter().map(|e| (e.from_idx, e.to_idx)))
+    {
+        for idx in [from, to] {
             if idx < n_kf {
                 kf_touched[idx] = true;
             }
@@ -933,6 +1104,7 @@ pub fn visual_inertial_bundle_adjust(
     let n_free_pts = point_local.iter().filter(|&&x| x >= 0).count();
 
     let wheel_info = wheel_information(wheel_edges, n_kf)?;
+    let stationary_info = stationary_information(stationary_edges, n_kf)?;
     if n_free_kf == 0 {
         return Err(ViBaError::NoFreeVariables);
     }
@@ -1302,7 +1474,16 @@ pub fn visual_inertial_bundle_adjust(
             &wheel_info,
         );
 
-        let cost = (cost_vis + cost_imu + cost_bias_prior + cost_wheel) as f32;
+        let cost_stationary = accumulate_stationary_edges(
+            &mut m_mat,
+            &mut m_vec,
+            &kfs,
+            &kf_local,
+            stationary_edges,
+            &stationary_info,
+        );
+
+        let cost = (cost_vis + cost_imu + cost_bias_prior + cost_wheel + cost_stationary) as f32;
 
         // ── 4. LM damping on full 15P system, then Cholesky ──────────────
         // Damping goes on AFTER IMU terms so every diagonal entry sees it.
@@ -1509,7 +1690,13 @@ pub fn visual_inertial_bundle_adjust(
             }
         }
         let new_cost_wheel = wheel_cost(&kfs_trial, &kf_local, wheel_edges, &wheel_info);
-        let new_cost = (new_cost_vis + new_cost_imu + new_cost_bias_prior + new_cost_wheel) as f32;
+        let new_cost_stationary =
+            stationary_cost(&kfs_trial, &kf_local, stationary_edges, &stationary_info);
+        let new_cost = (new_cost_vis
+            + new_cost_imu
+            + new_cost_bias_prior
+            + new_cost_wheel
+            + new_cost_stationary) as f32;
 
         // ── 8. LM accept / reject ─────────────────────────────────────────
         if new_cost < cost {
@@ -1610,3 +1797,7 @@ mod tests {
 #[cfg(test)]
 #[path = "vi_ba_wheel_tests.rs"]
 mod wheel_tests;
+
+#[cfg(test)]
+#[path = "vi_ba_stationary_tests.rs"]
+mod stationary_tests;

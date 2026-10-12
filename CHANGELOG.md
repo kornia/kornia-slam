@@ -140,6 +140,37 @@ by `Frame::idx`) and `visual_inertial_bundle_adjust` a `wheel_edges` slice
 (indexed by keyframe slot); pass `&[]` to keep the old behaviour. `ViBaError`
 gains three variants. The workspace version moves to 0.2.0.
 
+**Stationary edges for parked robots.** Two keyframes of one stop can now be
+linked without IMU preintegration. `mapping::stationary::StationaryFactor`
+(with `StationaryGyro`) constrains zero relative pose, zero velocity at both
+ends, bias continuity with a random walk scaled by the span, and, when the
+caller supplies the mean raw gyro rate of the still span, the gyro bias to that
+mean (variance `σ_g²/T + σ_bg²·span/12`); there is deliberately no
+accelerometer row, as tilt and accelerometer bias are not separable at rest.
+Its pose Jacobians are analytic (the wheel factor's with identity extrinsics)
+and checked numerically. It has no span limit:
+`cull_redundant_keyframes` composes two stationary factors through a removed
+keyframe (`StationaryFactor::compose`) however long the parked span, while
+`max_merged_imu_span_sec` keeps capping IMU merges only, so a parked map no
+longer fills with keyframes whose ~10 s IMU edges cannot merge. A keyframe at
+an end of the stationary chain, including the boundary between IMU and
+stationary edges, is kept; `KeyframeCullReport::stationary_edges_merged`
+counts the merges. Like wheel factors, stationary factors are held by the
+caller, keyed by `Frame::idx`; `bundle_adjustment::local_window_with_neighbors`
+captures a window in which a stationary neighbour of the active keyframes is
+fixed context, and `run_local_inertial_ba` drops an invalid factor
+(`StationaryFactor::is_valid`) instead of losing the window update. With no
+stationary factors every solve and every cull is unchanged.
+**Breaking:** `visual_inertial_bundle_adjust` takes a `stationary_edges` slice
+(after `wheel_edges`), `run_local_inertial_ba` a `stationary_factors` slice
+and `cull_redundant_keyframes` an `Option<&mut Vec<StationaryFactor>>` (pass
+`&[]` / `None` for the old behaviour); `ViBaError` gains
+`StationaryFactorOutOfRange` and `InvalidStationaryFactor`. Additive:
+`local_window_with_neighbors`, `KeyframeCullReport::stationary_edges_merged`
+(the report is `#[non_exhaustive]`), and `kornia_sensors::imu::ImuCalib`
+derives `PartialEq`. All of this rides on the already-breaking 0.2.0; none of
+it belongs in a 0.1.x.
+
 **Inertial initialization while stationary.** A stereo-inertial rig no
 longer has to move before the IMU joins the estimate: the motion-based
 initializer needs displacement to see gravity, but a stereo map is already

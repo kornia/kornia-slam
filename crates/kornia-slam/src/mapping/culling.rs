@@ -6,6 +6,7 @@
 //! no second cleanup loop, and the map never calls back into mapping.
 
 use crate::mapping::map::{Keyframe, Map};
+use crate::mapping::stationary::StationaryFactor;
 use crate::mapping::wheel_odom::WheelOdomFactor;
 use std::collections::{HashMap, HashSet};
 
@@ -133,8 +134,10 @@ pub struct KeyframeCullReport {
     pub removed: Vec<usize>,
     pub imu_edges_merged: usize,
     pub wheel_edges_merged: usize,
-    /// Redundant keyframes kept because their IMU or wheel edges could not be
-    /// merged, or the merged IMU edge would have been too long.
+    /// Stationary factors composed across a removed keyframe.
+    pub stationary_edges_merged: usize,
+    /// Redundant keyframes kept because their IMU, wheel or stationary edges
+    /// could not be merged, or the merged IMU edge would have been too long.
     pub kept_for_edges: usize,
     /// Landmarks retired because a removed keyframe was their last observer.
     pub landmarks_retired: usize,
@@ -155,10 +158,19 @@ pub struct KeyframeCullReport {
 /// `Frame::idx` as [`super::bundle_adjustment::run_local_inertial_ba`] takes
 /// them, have the pair through it composed into one. A keyframe either chain
 /// cannot be merged across is kept, so no edge is ever cut.
+///
+/// `stationary_factors`, held the same way, are composed across a removed
+/// keyframe with no span limit ([`StationaryFactor::compose`]):
+/// `max_merged_imu_span_sec` caps IMU merges only. A keyframe linked by one
+/// stationary factor in and one out, and by no IMU edge, is removable however
+/// long the parked span; one at an end of the stationary chain (including the
+/// boundary between IMU and stationary edges) is kept. `None` culls exactly as
+/// before.
 pub fn cull_redundant_keyframes(
     map: &mut Map,
     config: &KeyframeCullingConfig,
     mut wheel_factors: Option<&mut Vec<WheelOdomFactor>>,
+    mut stationary_factors: Option<&mut Vec<StationaryFactor>>,
 ) -> KeyframeCullReport {
     let mut report = KeyframeCullReport::default();
     let keyframes = map.keyframes();
@@ -189,7 +201,25 @@ pub fn cull_redundant_keyframes(
             },
             None => None,
         };
-        if !imu_allows_removal(map, kf_idx, config) {
+        // A chain end (not one in and one out) is refused here: the map
+        // sees no IMU edge on it and would remove it, cutting the chain.
+        let stationary_merge = match stationary_factors.as_deref() {
+            Some(factors) => match stationary_merge_through(factors, kf_idx) {
+                Ok(merge) => merge,
+                Err(()) => {
+                    report.kept_for_edges += 1;
+                    continue;
+                }
+            },
+            None => None,
+        };
+        let allowed = match stationary_merge {
+            // Stationary on both sides: no span cap, but no IMU edge either
+            // (the map would refuse a one-sided IMU chain anyway).
+            Some(_) => !touches_imu_edge(map, kf_idx),
+            None => imu_allows_removal(map, kf_idx, config),
+        };
+        if !allowed {
             report.kept_for_edges += 1;
             continue;
         }
@@ -204,6 +234,12 @@ pub fn cull_redundant_keyframes(
             factors[merge.incoming] = merge.factor;
             factors.remove(merge.outgoing);
             report.wheel_edges_merged += 1;
+        }
+        if let (Some(factors), Some(merge)) = (stationary_factors.as_deref_mut(), stationary_merge)
+        {
+            factors[merge.incoming] = merge.factor;
+            factors.remove(merge.outgoing);
+            report.stationary_edges_merged += 1;
         }
     }
     report
@@ -299,12 +335,53 @@ fn imu_allows_removal(map: &Map, kf_idx: usize, config: &KeyframeCullingConfig) 
     config.merge_imu_edges && end - start <= config.max_merged_imu_span_sec
 }
 
-/// The composite replacing the wheel factors into and out of a keyframe, and
-/// the positions of the two it replaces.
-struct WheelMerge {
+fn touches_imu_edge(map: &Map, kf_idx: usize) -> bool {
+    map.imu_factors()
+        .iter()
+        .any(|f| f.prev_kf_idx == kf_idx || f.curr_kf_idx == kf_idx)
+}
+
+/// The composite replacing the factors into and out of a keyframe, and the
+/// positions of the two it replaces.
+struct EdgeMerge<F> {
     incoming: usize,
     outgoing: usize,
-    factor: WheelOdomFactor,
+    factor: F,
+}
+
+type WheelMerge = EdgeMerge<WheelOdomFactor>;
+
+/// `Ok(None)` when no stationary factor touches `kf_idx`; `Err` when the
+/// ones that do are not exactly one in and one out, or do not compose.
+fn stationary_merge_through(
+    factors: &[StationaryFactor],
+    kf_idx: usize,
+) -> Result<Option<EdgeMerge<StationaryFactor>>, ()> {
+    let positions = |pick: fn(&StationaryFactor) -> usize| -> Vec<usize> {
+        factors
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| pick(f) == kf_idx)
+            .map(|(pos, _)| pos)
+            .collect()
+    };
+    match (
+        positions(|f| f.to_idx).as_slice(),
+        positions(|f| f.from_idx).as_slice(),
+    ) {
+        ([], []) => Ok(None),
+        (&[incoming], &[outgoing]) => factors[incoming]
+            .compose(&factors[outgoing])
+            .map(|factor| {
+                Some(EdgeMerge {
+                    incoming,
+                    outgoing,
+                    factor,
+                })
+            })
+            .ok_or(()),
+        _ => Err(()),
+    }
 }
 
 /// `Ok(None)` when no wheel factor touches `kf_idx`; `Err` when the ones that
@@ -331,7 +408,7 @@ fn wheel_merge_through(
             .compose(&factors[outgoing])
             .filter(|f| f.from_idx != f.to_idx)
             .map(|factor| {
-                Some(WheelMerge {
+                Some(EdgeMerge {
                     incoming,
                     outgoing,
                     factor,

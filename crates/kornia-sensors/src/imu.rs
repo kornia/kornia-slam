@@ -31,7 +31,7 @@ impl Default for ImuBias {
 }
 
 /// IMU noise parameters from the sensor datasheet.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ImuCalib {
     /// Gyroscope white noise density (rad/s/√Hz).
     pub gyro_noise: f64,

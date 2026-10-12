@@ -173,7 +173,8 @@ fn local_window_solves_match_a_full_map_capture() {
         )),
         merged(run_local_ba(map.full_ba_snapshot(), &camera())),
     );
-    let inertial = |snapshot| run_local_inertial_ba(snapshot, &camera(), None, Vec3F64::ZERO, &[]);
+    let inertial =
+        |snapshot| run_local_inertial_ba(snapshot, &camera(), None, Vec3F64::ZERO, &[], &[]);
     assert_eq!(
         merged(inertial(map.ba_snapshot(&local_window(&map)))),
         merged(inertial(map.full_ba_snapshot())),
@@ -225,6 +226,7 @@ fn skipped_visual_and_inertial_solves_leave_the_map_unchanged() {
         &camera(),
         None,
         Vec3F64::ZERO,
+        &[],
         &[],
     );
     assert_eq!(map.apply_ba_update(inertial).unwrap().map_points_updated, 0);
@@ -307,6 +309,7 @@ fn inertial_ba_repropagates_active_edges_and_preserves_new_live_edges() {
         None,
         Vec3F64::ZERO,
         &[],
+        &[],
     );
     assert_eq!(map.state_fingerprint_for_test(), before);
     // A boundary edge has one fixed endpoint and must still be repropagated.
@@ -343,6 +346,7 @@ fn failed_inertial_solve_still_returns_repropagated_measurements() {
         &invalid_camera,
         None,
         Vec3F64::ZERO,
+        &[],
         &[],
     );
     assert_eq!(update.imu_preintegrations[0].bias.accel.x, 0.05);
@@ -393,6 +397,7 @@ fn inertial_ba_maps_wheel_factors_by_frame_id_and_drops_inactive_ones() {
             None,
             Vec3F64::ZERO,
             wheel,
+            &[],
         );
         let mut map = map.clone();
         map.apply_ba_update(update).unwrap();
@@ -432,4 +437,38 @@ fn inertial_ba_maps_wheel_factors_by_frame_id_and_drops_inactive_ones() {
         residual(&fused),
         residual(&visual)
     );
+}
+
+/// A keyframe linked to the active window only by a caller-held factor
+/// (a stationary edge) and seeing none of its landmarks enters as fixed
+/// context through `local_window_with_neighbors`; `local_window` is unchanged.
+#[test]
+fn caller_held_links_pull_their_neighbour_into_the_window() {
+    let mut map = Map::new();
+    for id in [50, 40, 30, 20, 10] {
+        map.insert_keyframe(Keyframe::from_frame(test_frame(id, vec![[0; 32]; 2])))
+            .unwrap();
+    }
+    let active = map
+        .insert_landmark(LandmarkSeed {
+            position: Vec3F64::new(0.0, 0.0, 5.0),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 30,
+                feature_idx: 0,
+            },
+        })
+        .unwrap();
+    map.link_observation(10, 1, active).unwrap();
+    let plain = local_window(&map);
+    assert_eq!(plain.keyframe_slots, vec![2, 3, 4]);
+    assert_eq!(
+        local_window_with_neighbors(&map, []).keyframe_slots,
+        plain.keyframe_slots
+    );
+    // 40 → 30 links the oldest active keyframe back; 50 → 40 has no
+    // active endpoint and pulls nothing.
+    let linked = local_window_with_neighbors(&map, [(40, 30), (50, 40)]);
+    assert_eq!(linked.keyframe_slots, vec![1, 2, 3, 4]);
+    assert_eq!(linked.landmark_ids, plain.landmark_ids);
 }

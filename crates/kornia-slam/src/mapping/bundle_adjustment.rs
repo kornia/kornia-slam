@@ -6,6 +6,7 @@
 use crate::mapping::map::{
     BaSnapshot, BaUpdate, BaUpdateError, BaWindow, Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR,
 };
+use crate::mapping::stationary::StationaryFactor;
 use crate::mapping::wheel_odom::WheelOdomFactor;
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
@@ -35,6 +36,20 @@ const MAX_ACTIVE_KFS: usize = 3;
 /// always precede the active ones in slot order, because the active keyframes
 /// are the newest.
 pub fn local_window(map: &Map) -> BaWindow {
+    local_window_with_neighbors(map, [])
+}
+
+/// [`local_window`], with the caller's own keyframe links (`(from, to)` by
+/// `Frame::idx`, such as the stationary factors it holds) treated like IMU
+/// edges: an endpoint in the active set pulls the other in as fixed context.
+///
+/// Without it a keyframe linked to the active window only by a caller-held
+/// factor, and observing none of its landmarks, would be left out, and the
+/// factor dropped with it.
+pub fn local_window_with_neighbors(
+    map: &Map,
+    neighbors: impl IntoIterator<Item = (usize, usize)>,
+) -> BaWindow {
     let keyframes = map.keyframes();
     let active_start = keyframes.len().saturating_sub(MAX_ACTIVE_KFS);
     let active = &keyframes[active_start..];
@@ -45,10 +60,14 @@ pub fn local_window(map: &Map) -> BaWindow {
         .iter()
         .flat_map(|&id| map.map_points()[id].observer_keyframes())
         .collect();
-    for factor in map.imu_factors() {
-        if active_ids.contains(&factor.prev_kf_idx) || active_ids.contains(&factor.curr_kf_idx) {
-            context.insert(factor.prev_kf_idx);
-            context.insert(factor.curr_kf_idx);
+    let imu_links = map
+        .imu_factors()
+        .iter()
+        .map(|f| (f.prev_kf_idx, f.curr_kf_idx));
+    for (from, to) in imu_links.chain(neighbors) {
+        if active_ids.contains(&from) || active_ids.contains(&to) {
+            context.insert(from);
+            context.insert(to);
         }
     }
 
@@ -280,12 +299,18 @@ pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
 /// factors; those with an endpoint outside the window, or with both endpoints
 /// fixed, are dropped, and so is any that fails [`WheelOdomFactor::is_valid`]
 /// (one such factor would otherwise fail the whole solve).
+///
+/// `stationary_factors` are filtered the same way (by
+/// [`StationaryFactor::is_valid`]). Capture the window with
+/// [`local_window_with_neighbors`] so a stationary neighbour of the active
+/// keyframes is in it.
 pub fn run_local_inertial_ba(
     snapshot: BaSnapshot,
     camera: &PinholeCamera,
     imu_t_bc: Option<Pose3d>,
     gravity_world: Vec3F64,
     wheel_factors: &[WheelOdomFactor],
+    stationary_factors: &[StationaryFactor],
 ) -> BaUpdate {
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
@@ -422,6 +447,30 @@ pub fn run_local_inertial_ba(
         })
         .collect();
 
+    let stationary_edges: Vec<StationaryFactor> = stationary_factors
+        .iter()
+        .filter_map(|f| {
+            let from = *frame_idx_to_slot.get(&f.from_idx)?;
+            let to = *frame_idx_to_slot.get(&f.to_idx)?;
+            if from < active_start && to < active_start {
+                return None;
+            }
+            if !f.is_valid() {
+                debug_eprintln!(
+                    "[vi_ba] skipping stationary factor {} -> {}: invalid",
+                    f.from_idx,
+                    f.to_idx
+                );
+                return None;
+            }
+            Some(StationaryFactor {
+                from_idx: from,
+                to_idx: to,
+                ..*f
+            })
+        })
+        .collect();
+
     // 15-DOF-per-keyframe state (pose+velocity+bias) with information
     // entries spanning many more orders of magnitude than the pure
     // visual 6-DOF problem (see the Marquardt-damping note in
@@ -436,6 +485,7 @@ pub fn run_local_inertial_ba(
         &observations,
         &imu_edges,
         &wheel_edges,
+        &stationary_edges,
         camera,
         &ViBaParams {
             imu_t_bc,

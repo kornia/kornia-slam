@@ -80,6 +80,7 @@ fn solve(
         obs,
         &[],
         wheel,
+        &[],
         &camera(),
         &ViBaParams {
             max_iterations: 50,
@@ -155,6 +156,7 @@ fn wheel_edge_errors_are_reported() {
             &[],
             &[],
             &[edge],
+            &[],
             &camera(),
             &ViBaParams::default(),
         )

@@ -1,8 +1,11 @@
 use super::*;
-use crate::mapping::bundle_adjustment::{local_window, run_local_ba, run_local_inertial_ba};
+use crate::mapping::bundle_adjustment::{
+    local_window, local_window_with_neighbors, run_local_ba, run_local_inertial_ba,
+};
 use crate::mapping::map::tests::{assert_map_consistent, test_frame_with_pose};
 use crate::mapping::map::{ImuFactor, MapInsertion};
 use crate::mapping::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
+use crate::mapping::stationary::StationaryFactor;
 use crate::mapping::wheel_odom::WheelOdomMeasurement;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
@@ -110,13 +113,13 @@ fn the_stereo_close_depth_rule_counts_only_close_stereo_points() {
     let shared_close = |id, i| (id == LONER).then_some(if i < SHARED { 2.0 } else { -1.0 });
     let mut map = culling_fixture_with_depth(shared_close);
     assert!(
-        !cull_redundant_keyframes(&mut map, &config(0.9, None), None)
+        !cull_redundant_keyframes(&mut map, &config(0.9, None), None, None)
             .removed
             .contains(&LONER)
     );
     let mut map = culling_fixture_with_depth(shared_close);
     assert!(
-        cull_redundant_keyframes(&mut map, &config(0.9, Some(10.0)), None)
+        cull_redundant_keyframes(&mut map, &config(0.9, Some(10.0)), None, None)
             .removed
             .contains(&LONER)
     );
@@ -127,13 +130,13 @@ fn the_stereo_close_depth_rule_counts_only_close_stereo_points() {
     let shared_far = |id, i| (id == LONER).then_some(if i < SHARED { 50.0 } else { 2.0 });
     let mut map = culling_fixture_with_depth(shared_far);
     assert!(
-        cull_redundant_keyframes(&mut map, &config(0.8, None), None)
+        cull_redundant_keyframes(&mut map, &config(0.8, None), None, None)
             .removed
             .contains(&LONER)
     );
     let mut map = culling_fixture_with_depth(shared_far);
     assert!(
-        !cull_redundant_keyframes(&mut map, &config(0.8, Some(10.0)), None)
+        !cull_redundant_keyframes(&mut map, &config(0.8, Some(10.0)), None, None)
             .removed
             .contains(&LONER)
     );
@@ -147,7 +150,7 @@ fn ids(map: &Map) -> Vec<usize> {
 #[test]
 fn redundant_keyframes_go_and_the_anchor_newest_and_informative_stay() {
     let mut map = culling_fixture();
-    let report = cull_redundant_keyframes(&mut map, &enabled(), None);
+    let report = cull_redundant_keyframes(&mut map, &enabled(), None, None);
 
     // Candidates are 7..=19 (23, 27 and 31 are the protected newest), judged
     // oldest first. 15 holds points nobody else sees, so it stays.
@@ -161,14 +164,14 @@ fn redundant_keyframes_go_and_the_anchor_newest_and_informative_stay() {
         assert!(map.get_keyframe(mp.keyframe_idx).is_some());
     }
     // A second pass has only 15 to judge, and it still holds its own points.
-    let again = cull_redundant_keyframes(&mut map, &enabled(), None);
+    let again = cull_redundant_keyframes(&mut map, &enabled(), None, None);
     assert!(again.removed.is_empty());
 }
 
 #[test]
 fn visual_ba_runs_on_the_culled_map() {
     let mut map = culling_fixture();
-    cull_redundant_keyframes(&mut map, &enabled(), None);
+    cull_redundant_keyframes(&mut map, &enabled(), None, None);
     let window = local_window(&map);
     assert_eq!(window.keyframe_slots, vec![0, 1, 2, 3, 4]);
     let update = run_local_ba(map.ba_snapshot(&window), &camera());
@@ -182,7 +185,7 @@ fn visual_ba_runs_on_the_culled_map() {
 fn the_defaults_leave_a_small_map_alone() {
     let mut map = culling_fixture();
     let before = map.state_fingerprint_for_test();
-    let report = cull_redundant_keyframes(&mut map, &KeyframeCullingConfig::default(), None);
+    let report = cull_redundant_keyframes(&mut map, &KeyframeCullingConfig::default(), None, None);
     assert!(report.removed.is_empty());
     assert_eq!(map.state_fingerprint_for_test(), before);
 }
@@ -195,7 +198,7 @@ fn bounds_cap_the_removals() {
         ..enabled()
     };
     assert_eq!(
-        cull_redundant_keyframes(&mut map, &capped, None).removed,
+        cull_redundant_keyframes(&mut map, &capped, None, None).removed,
         vec![7, 11]
     );
 
@@ -205,7 +208,7 @@ fn bounds_cap_the_removals() {
         ..enabled()
     };
     assert_eq!(
-        cull_redundant_keyframes(&mut map, &floor, None).removed,
+        cull_redundant_keyframes(&mut map, &floor, None, None).removed,
         vec![7, 11]
     );
     assert_eq!(map.keyframes().len(), 6);
@@ -218,7 +221,7 @@ fn bounds_cap_the_removals() {
         min_other_observers: 0,
         ..enabled()
     };
-    cull_redundant_keyframes(&mut map, &unprotected, None);
+    cull_redundant_keyframes(&mut map, &unprotected, None, None);
     assert_eq!(ids(&map), vec![3, 31]);
 }
 
@@ -231,14 +234,14 @@ fn observers_at_a_coarser_scale_do_not_count() {
             kf.frame.features.octaves.iter_mut().for_each(|o| *o = 2);
         }
     });
-    let strict = cull_redundant_keyframes(&mut map.clone(), &enabled(), None);
+    let strict = cull_redundant_keyframes(&mut map.clone(), &enabled(), None, None);
     assert!(!strict.removed.contains(&7), "{:?}", strict.removed);
     let loose = KeyframeCullingConfig {
         scale_level_tolerance: 2,
         ..enabled()
     };
     assert!(
-        cull_redundant_keyframes(&mut map, &loose, None)
+        cull_redundant_keyframes(&mut map, &loose, None, None)
             .removed
             .contains(&7)
     );
@@ -253,14 +256,14 @@ fn default_tolerance_counts_observers_one_level_coarser() {
             kf.frame.features.octaves.iter_mut().for_each(|o| *o = 1);
         }
     });
-    let default = cull_redundant_keyframes(&mut map.clone(), &enabled(), None);
+    let default = cull_redundant_keyframes(&mut map.clone(), &enabled(), None, None);
     assert!(default.removed.contains(&7), "{:?}", default.removed);
     let paper = KeyframeCullingConfig {
         scale_level_tolerance: 0,
         ..enabled()
     };
     assert!(
-        !cull_redundant_keyframes(&mut map, &paper, None)
+        !cull_redundant_keyframes(&mut map, &paper, None, None)
             .removed
             .contains(&7)
     );
@@ -322,7 +325,7 @@ fn imu_chain(map: &Map) -> Vec<(usize, usize)> {
 #[test]
 fn the_imu_chain_is_merged_and_inertial_ba_still_runs() {
     let mut map = inertial_fixture();
-    let report = cull_redundant_keyframes(&mut map, &enabled(), None);
+    let report = cull_redundant_keyframes(&mut map, &enabled(), None, None);
     assert_eq!(report.removed, vec![7, 11, 19]);
     assert_eq!(report.imu_edges_merged, 3);
     assert_eq!(imu_chain(&map), vec![(3, 15), (15, 23), (23, 27), (27, 31)]);
@@ -336,6 +339,7 @@ fn the_imu_chain_is_merged_and_inertial_ba_still_runs() {
         &camera(),
         None,
         Vec3F64::new(0.0, 9.81, 0.0),
+        &[],
         &[],
     );
     assert_eq!(update.snapshot.imu_factors().len(), 4);
@@ -351,7 +355,7 @@ fn inertial_keyframes_stay_when_merging_is_off_or_too_long() {
         merge_imu_edges: false,
         ..enabled()
     };
-    let report = cull_redundant_keyframes(&mut map, &off, None);
+    let report = cull_redundant_keyframes(&mut map, &off, None, None);
     assert!(report.removed.is_empty());
     assert_eq!(report.kept_for_edges, 3);
     assert_eq!(map.state_fingerprint_for_test(), before);
@@ -361,7 +365,7 @@ fn inertial_keyframes_stay_when_merging_is_off_or_too_long() {
         max_merged_imu_span_sec: 0.6,
         ..enabled()
     };
-    let report = cull_redundant_keyframes(&mut map, &short, None);
+    let report = cull_redundant_keyframes(&mut map, &short, None, None);
     assert_eq!(report.removed, vec![7, 19]);
     assert_eq!(report.kept_for_edges, 1);
     assert_eq!(imu_chain(&map)[..2], [(3, 11), (11, 15)]);
@@ -376,7 +380,7 @@ fn a_keyframe_without_imu_edges_is_culled_even_with_merging_off() {
         ..enabled()
     };
     assert_eq!(
-        cull_redundant_keyframes(&mut map, &off, None).removed,
+        cull_redundant_keyframes(&mut map, &off, None, None).removed,
         vec![7, 11, 19]
     );
 }
@@ -399,7 +403,7 @@ fn wheel(slot: usize) -> WheelOdomFactor {
 fn wheel_factors_are_composed_across_removed_keyframes() {
     let mut map = inertial_fixture();
     let mut factors: Vec<WheelOdomFactor> = (0..IDS.len() - 1).map(wheel).collect();
-    let report = cull_redundant_keyframes(&mut map, &enabled(), Some(&mut factors));
+    let report = cull_redundant_keyframes(&mut map, &enabled(), Some(&mut factors), None);
     assert_eq!(report.removed, vec![7, 11, 19]);
     assert_eq!(report.wheel_edges_merged, 3);
     let chain: Vec<_> = factors.iter().map(|f| (f.from_idx, f.to_idx)).collect();
@@ -435,6 +439,7 @@ fn wheel_factors_are_composed_across_removed_keyframes() {
         None,
         Vec3F64::new(0.0, 9.81, 0.0),
         &factors,
+        &[],
     );
     map.apply_ba_update(update).unwrap();
     assert_map_consistent(&map);
@@ -448,6 +453,7 @@ fn solved_poses(map: &Map, factors: &[WheelOdomFactor]) -> Vec<Pose3d> {
         None,
         Vec3F64::new(0.0, 9.81, 0.0),
         factors,
+        &[],
     );
     update
         .keyframes
@@ -506,7 +512,7 @@ fn a_keyframe_whose_wheel_chain_is_cut_is_kept() {
     // The factor out of 11 was dropped for slip: 11 has one side only.
     let mut factors: Vec<WheelOdomFactor> =
         (0..IDS.len() - 1).filter(|&s| s != 2).map(wheel).collect();
-    let report = cull_redundant_keyframes(&mut map, &enabled(), Some(&mut factors));
+    let report = cull_redundant_keyframes(&mut map, &enabled(), Some(&mut factors), None);
     assert_eq!(report.removed, vec![7, 19]);
     assert_eq!(report.kept_for_edges, 1);
     assert!(map.get_keyframe(11).is_some());
@@ -514,5 +520,275 @@ fn a_keyframe_whose_wheel_chain_is_cut_is_kept() {
         assert!(map.get_keyframe(f.from_idx).is_some(), "{f:?}");
         assert!(map.get_keyframe(f.to_idx).is_some(), "{f:?}");
     }
+    assert_map_consistent(&map);
+}
+
+// ── Stationary factors ────────────────────────────────────────────────────
+
+/// `n` keyframes (ids 100, 102, ...) of a parked camera, all at one pose and
+/// all seeing the same landmarks: every keyframe but the anchor and the
+/// protected newest is redundant.
+fn parked_fixture(n: usize) -> (Map, Vec<usize>) {
+    let ids: Vec<usize> = (0..n).map(|k| 100 + 2 * k).collect();
+    let mut map = Map::new();
+    let pose = Pose3d::IDENTITY;
+    for &id in &ids {
+        let mut frame = test_frame_with_pose(id, vec![[id as u8; 32]; SHARED], pose);
+        for i in 0..SHARED {
+            let p = camera()
+                .project_to_pixel(&pose.transform_point(&point(i)), 1e-6)
+                .unwrap();
+            frame.features.keypoints_xy[i] = [p.x as f32, p.y as f32];
+        }
+        // Stereo depth: one view point gives no parallax.
+        frame.depth = (0..SHARED).map(|i| point(i).z as f32).collect();
+        map.insert_keyframe(Keyframe::from_frame(frame)).unwrap();
+    }
+    for i in 0..SHARED {
+        let id = map
+            .insert_landmark(LandmarkSeed {
+                position: point(i),
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: ids[0],
+                    feature_idx: i,
+                },
+            })
+            .unwrap();
+        for kf in &ids[1..] {
+            map.link_observation(*kf, i, id).unwrap();
+        }
+    }
+    (map, ids)
+}
+
+fn stationary(from: usize, to: usize, span_s: f64) -> StationaryFactor {
+    StationaryFactor::new(from, to, span_s, calib())
+}
+
+fn stationary_chain(ids: &[usize], span_s: f64) -> Vec<StationaryFactor> {
+    ids.windows(2)
+        .map(|w| stationary(w[0], w[1], span_s))
+        .collect()
+}
+
+/// IMU edge of `span_s` seconds starting at `t0`, at rest under gravity.
+fn imu_edge_between(from: usize, to: usize, t0: f64, span_s: f64) -> ImuFactor {
+    let n = (span_s / 0.005).round() as usize;
+    let t1 = t0 + span_s;
+    let raw: Vec<ImuMeasurement> = (0..=n)
+        .map(|i| ImuMeasurement {
+            timestamp: t0 + i as f64 * 0.005,
+            gyro: Vec3F64::ZERO,
+            accel: Vec3F64::new(0.0, -9.81, 0.0),
+        })
+        .collect();
+    ImuFactor {
+        prev_kf_idx: from,
+        curr_kf_idx: to,
+        preintegrated: PreintegratedImu::from_measurements(
+            ImuBias::default(),
+            calib(),
+            &raw,
+            t0,
+            t1,
+        ),
+        raw_samples: raw,
+        t0,
+        t1,
+    }
+}
+
+fn assert_endpoints_in_map(map: &Map, factors: &[StationaryFactor]) {
+    for f in factors {
+        assert!(map.get_keyframe(f.from_idx).is_some(), "{f:?}");
+        assert!(map.get_keyframe(f.to_idx).is_some(), "{f:?}");
+    }
+}
+
+/// Sixty parked keyframes a minute apart, linked only by stationary
+/// factors: culling merges them with no span limit (the IMU cap is 3 s),
+/// down to `min_keyframes`, and the factors stay one chain over the kept
+/// keyframes.
+#[test]
+fn stationary_factors_merge_without_a_span_limit() {
+    let (mut map, ids) = parked_fixture(60);
+    let mut factors = stationary_chain(&ids, 60.0);
+    let config = KeyframeCullingConfig {
+        min_keyframes: 5,
+        ..KeyframeCullingConfig::default()
+    };
+    assert_eq!(config.max_merged_imu_span_sec, 3.0);
+    let report = cull_redundant_keyframes(&mut map, &config, None, Some(&mut factors));
+    assert_eq!(map.keyframes().len(), 5);
+    assert_eq!(report.removed.len(), 55);
+    assert_eq!(report.kept_for_edges, 0);
+    assert_eq!(report.stationary_edges_merged, report.removed.len());
+    let kept = ids_of(&map);
+    let chain: Vec<(usize, usize)> = factors.iter().map(|f| (f.from_idx, f.to_idx)).collect();
+    let expected: Vec<(usize, usize)> = kept.windows(2).map(|w| (w[0], w[1])).collect();
+    assert_eq!(chain, expected);
+    let total: f64 = factors.iter().map(|f| f.span_s).sum();
+    assert_eq!(total, 59.0 * 60.0);
+    assert!(factors.iter().all(StationaryFactor::is_valid));
+    assert_endpoints_in_map(&map, &factors);
+    assert_map_consistent(&map);
+}
+
+fn ids_of(map: &Map) -> Vec<usize> {
+    map.keyframes().iter().map(|kf| kf.frame.idx).collect()
+}
+
+/// The same parked keyframes linked by IMU edges instead: the span cap
+/// still refuses the merges, as before.
+#[test]
+fn the_imu_span_cap_still_applies_without_stationary_factors() {
+    let (mut map, ids) = parked_fixture(12);
+    map.apply_insertion(MapInsertion {
+        imu_factors: ids
+            .windows(2)
+            .enumerate()
+            .map(|(k, w)| imu_edge_between(w[0], w[1], 5.0 * k as f64, 5.0))
+            .collect(),
+        ..Default::default()
+    })
+    .unwrap();
+    let config = KeyframeCullingConfig {
+        min_keyframes: 0,
+        max_merged_imu_span_sec: 11.0,
+        ..KeyframeCullingConfig::default()
+    };
+    let mut factors = Vec::new();
+    let report = cull_redundant_keyframes(&mut map, &config, None, Some(&mut factors));
+    // Every other keyframe goes (two 5 s edges make 10 s), then nothing
+    // more can merge under 11 s: the measured live failure.
+    assert_eq!(report.removed.len(), 4);
+    assert_eq!(report.stationary_edges_merged, 0);
+    assert!(report.kept_for_edges > 0);
+    assert!(map.imu_factors().iter().all(|f| f.t1 - f.t0 <= 11.0));
+    assert_map_consistent(&map);
+}
+
+/// IMU edges for the first keyframes, stationary factors after: the
+/// boundary keyframe (IMU in, stationary out) is kept, the IMU part still
+/// obeys the cap, and the stationary part merges freely.
+#[test]
+fn the_boundary_between_imu_and_stationary_edges_is_kept() {
+    let (mut map, ids) = parked_fixture(20);
+    let boundary = ids[6];
+    map.apply_insertion(MapInsertion {
+        imu_factors: ids[..7]
+            .windows(2)
+            .enumerate()
+            .map(|(k, w)| imu_edge_between(w[0], w[1], 0.25 * k as f64, 0.25))
+            .collect(),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut factors = stationary_chain(&ids[6..], 30.0);
+    let config = KeyframeCullingConfig {
+        min_keyframes: 0,
+        max_merged_imu_span_sec: 0.6,
+        ..KeyframeCullingConfig::default()
+    };
+    let report = cull_redundant_keyframes(&mut map, &config, None, Some(&mut factors));
+    assert!(
+        map.get_keyframe(boundary).is_some(),
+        "the boundary keyframe stays"
+    );
+    assert!(map.imu_factors().iter().all(|f| f.t1 - f.t0 <= 0.6 + 1e-9));
+    assert!(map.imu_factors().len() > 1, "IMU merges stop at the cap");
+    // Of the stationary part only the boundary and the protected newest three remain.
+    let kept = ids_of(&map);
+    let stationary_kept: Vec<usize> = kept.iter().copied().filter(|&id| id >= boundary).collect();
+    assert_eq!(stationary_kept, vec![boundary, ids[17], ids[18], ids[19]]);
+    assert_eq!(report.stationary_edges_merged, 10);
+    let chain: Vec<(usize, usize)> = factors.iter().map(|f| (f.from_idx, f.to_idx)).collect();
+    let expected: Vec<(usize, usize)> = stationary_kept.windows(2).map(|w| (w[0], w[1])).collect();
+    assert_eq!(chain, expected);
+    assert_endpoints_in_map(&map, &factors);
+    assert_map_consistent(&map);
+}
+
+/// A keyframe at an end of the stationary chain (its outgoing factor not
+/// yet inserted, or dropped) is never removed: the map sees no IMU edge on
+/// it and would remove it, cutting the chain.
+#[test]
+fn a_stationary_chain_end_is_never_removed() {
+    let (mut map, ids) = parked_fixture(10);
+    // The factor out of ids[4] is missing: 4 has one in, 0 out; 5 one out.
+    let mut factors: Vec<StationaryFactor> = stationary_chain(&ids, 10.0)
+        .into_iter()
+        .filter(|f| f.from_idx != ids[4])
+        .collect();
+    let report = cull_redundant_keyframes(&mut map, &enabled(), None, Some(&mut factors));
+    assert!(map.get_keyframe(ids[4]).is_some());
+    assert!(map.get_keyframe(ids[5]).is_some());
+    assert_eq!(report.kept_for_edges, 2);
+    assert_endpoints_in_map(&map, &factors);
+    assert_map_consistent(&map);
+}
+
+/// `None` leaves culling as it was, whatever factors the caller holds.
+#[test]
+fn no_stationary_factors_cull_as_before() {
+    let mut a = inertial_fixture();
+    let mut b = inertial_fixture();
+    let ra = cull_redundant_keyframes(&mut a, &enabled(), None, None);
+    let rb = cull_redundant_keyframes(&mut b, &enabled(), None, Some(&mut Vec::new()));
+    assert_eq!(ra, rb);
+    assert_eq!(
+        a.state_fingerprint_for_test(),
+        b.state_fingerprint_for_test()
+    );
+}
+
+/// A parked window solved with stationary factors keeps its keyframes on
+/// the anchor; an invalid factor is skipped, not fatal.
+#[test]
+fn inertial_ba_holds_parked_keyframes_with_stationary_factors() {
+    let (mut map, ids) = parked_fixture(6);
+    // Drift the three newest (the active window) off the parked pose.
+    map.edit_keyframes_for_test(|slot, kf| {
+        if slot >= 3 {
+            kf.frame.pose_world_to_cam.translation.x += 0.004 * (slot - 2) as f64;
+            kf.velocity_world = Vec3F64::new(0.03, 0.0, 0.0);
+        }
+    });
+    let factors = stationary_chain(&ids, 20.0);
+    let window = local_window_with_neighbors(&map, factors.iter().map(|f| (f.from_idx, f.to_idx)));
+    let solve = |factors: &[StationaryFactor]| {
+        run_local_inertial_ba(
+            map.ba_snapshot(&window),
+            &camera(),
+            None,
+            Vec3F64::new(0.0, 9.81, 0.0),
+            &[],
+            factors,
+        )
+    };
+    let update = solve(&factors);
+    for (slot, kf) in update.keyframes.iter().enumerate() {
+        let c = kf.pose_world_to_cam.translation;
+        assert!(c.length() < 2e-4, "slot {slot} at {c:?}");
+        assert!(kf.velocity_world.length() < 1e-3, "slot {slot}");
+    }
+    let mut bad = factors.clone();
+    bad.push(StationaryFactor {
+        span_s: f64::NAN,
+        ..stationary(ids[4], ids[5], 1.0)
+    });
+    let reference: Vec<Pose3d> = update
+        .keyframes
+        .iter()
+        .map(|k| k.pose_world_to_cam)
+        .collect();
+    let skipped: Vec<Pose3d> = solve(&bad)
+        .keyframes
+        .iter()
+        .map(|k| k.pose_world_to_cam)
+        .collect();
+    assert_eq!(skipped, reference);
+    map.apply_ba_update(update).unwrap();
     assert_map_consistent(&map);
 }
