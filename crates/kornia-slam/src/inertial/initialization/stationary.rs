@@ -52,7 +52,7 @@ use crate::mapping::map::{Keyframe, Map};
 /// // `#[non_exhaustive]`: built by `from_samples` only, so a figure can be
 /// // added without a semver break.
 /// use kornia_algebra::Vec3F64;
-/// use kornia_slam::initialization::ImuWindowStats;
+/// use kornia_slam::inertial::ImuWindowStats;
 /// let _ = ImuWindowStats {
 ///     samples: 2,
 ///     duration_sec: 1.0,

@@ -299,7 +299,9 @@ impl Drop for LocalMappingHandle {
         if let Some(handle) = self.join_handle.take()
             && handle.join().is_err()
         {
-            debug_eprintln!("local-mapping worker panicked");
+            // A fault, not solver chatter: always reported, since a host's
+            // panic hook may not write the panic itself to stderr.
+            eprintln!("kornia-slam: local-mapping worker panicked; mapping had stopped");
         }
     }
 }
