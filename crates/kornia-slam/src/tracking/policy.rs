@@ -7,6 +7,12 @@
 /// and `min_parallax_px` to a threshold gives ORB-SLAM3 / VINS-Mono style
 /// insertion instead, where a keyframe is earned by motion (parallax) or by
 /// losing the reference keyframe's landmarks, and a parked camera adds none.
+/// With inertial input that mode also needs `max_interval_sec`, as ORB-SLAM3
+/// forces a keyframe every 0.5 s in its inertial modes: IMU samples are
+/// buffered until the next keyframe, so without a time bound a parked rig
+/// buffers (and rescans) every sample of the stop and then bridges it with
+/// one IMU edge. [`SlamSystem::build`](crate::system::SlamSystem::build)
+/// refuses an inertial system with neither bound.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
@@ -23,6 +29,11 @@ pub struct KeyframePolicy {
     /// `None` (the default) ignores parallax. VINS-Mono uses 10 px at a
     /// 460 px focal length.
     pub min_parallax_px: Option<f64>,
+    /// Force a keyframe once this many seconds have passed since the last
+    /// one (outside `min_frames_between`). `None` (the default) sets no time
+    /// bound. `SlamSystem` applies it from the frame timestamps;
+    /// [`Self::should_insert_with`] does not see time.
+    pub max_interval_sec: Option<f64>,
 }
 
 impl Default for KeyframePolicy {
@@ -32,6 +43,7 @@ impl Default for KeyframePolicy {
             max_frames_between: 8,
             ref_ratio: 0.6,
             min_parallax_px: None,
+            max_interval_sec: None,
         }
     }
 }
@@ -114,6 +126,21 @@ impl KeyframePolicy {
             (self.min_parallax_px, evidence.median_parallax_px),
             (Some(threshold), Some(parallax)) if parallax >= threshold
         )
+    }
+}
+
+impl KeyframePolicy {
+    /// Whether `max_interval_sec` forces a keyframe `secs_since_last_kf`
+    /// seconds and `frames_since_last_kf` frames after the last one.
+    pub(crate) fn interval_elapsed(
+        &self,
+        frames_since_last_kf: usize,
+        secs_since_last_kf: f64,
+    ) -> bool {
+        frames_since_last_kf >= self.min_frames_between
+            && self
+                .max_interval_sec
+                .is_some_and(|max| secs_since_last_kf >= max)
     }
 }
 
@@ -258,6 +285,24 @@ mod tests {
         };
         assert!(!bounded.should_insert_with(&with_parallax(evidence(29, 80, 100), 0.3)));
         assert!(bounded.should_insert_with(&with_parallax(evidence(30, 80, 100), 0.3)));
+    }
+
+    #[test]
+    fn the_time_bound_forces_a_keyframe_outside_min_frames_between() {
+        let policy = KeyframePolicy {
+            max_interval_sec: Some(0.5),
+            ..parallax_policy()
+        };
+        assert!(!policy.interval_elapsed(1000, 0.49));
+        assert!(policy.interval_elapsed(1000, 0.5));
+        assert!(
+            !policy.interval_elapsed(2, 10.0),
+            "min_frames_between still applies"
+        );
+        assert!(
+            !parallax_policy().interval_elapsed(1000, 1e9),
+            "no bound by default"
+        );
     }
 
     #[test]

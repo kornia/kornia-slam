@@ -307,4 +307,29 @@ mod keyframe_evidence {
             "not measured unless the policy reads it"
         );
     }
+    /// A parked camera earns no keyframe from the motion policy; the time
+    /// bound still forces one, measured from the last keyframe's timestamp.
+    #[test]
+    fn the_time_bound_forces_a_keyframe_on_a_parked_camera() {
+        let mut config = mono();
+        let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+        orb.keyframes.max_frames_between = usize::MAX;
+        orb.keyframes.min_parallax_px = Some(10.0);
+        orb.keyframes.max_interval_sec = Some(0.5);
+        let mut system = SlamSystem::build(config, SensorRig::new(camera())).unwrap();
+        system.state.last_keyframe_idx = Some(100);
+        system.inertial.last_keyframe_timestamp_sec = Some(10.0);
+        let parked = KeyframeEvidence {
+            curr_idx: 1100,
+            last_keyframe_idx: Some(100),
+            tracked_inliers: 80,
+            n_ref_map_points: 100,
+            median_parallax_px: Some(0.3),
+        };
+        assert!(!system.keyframe_policy.should_insert_with(&parked));
+        assert!(!system.keyframe_due(&parked, 10.49));
+        assert!(system.keyframe_due(&parked, 10.5));
+        system.keyframe_policy.max_interval_sec = None;
+        assert!(!system.keyframe_due(&parked, 1e6), "no bound unless set");
+    }
 }

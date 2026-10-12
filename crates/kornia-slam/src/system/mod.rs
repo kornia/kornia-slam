@@ -921,6 +921,21 @@ impl SlamSystem {
         }
     }
 
+    /// The policy's decision, or `max_interval_sec` elapsed since the last
+    /// keyframe's timestamp.
+    fn keyframe_due(&self, evidence: &KeyframeEvidence, timestamp_sec: f64) -> bool {
+        let interval_elapsed = evidence
+            .last_keyframe_idx
+            .zip(self.inertial.last_keyframe_timestamp_sec)
+            .is_some_and(|(last_idx, last_ts)| {
+                self.keyframe_policy.interval_elapsed(
+                    evidence.curr_idx.saturating_sub(last_idx),
+                    timestamp_sec - last_ts,
+                )
+            });
+        interval_elapsed || self.keyframe_policy.should_insert_with(evidence)
+    }
+
     fn try_insert_keyframe(
         &mut self,
         frame: &Frame,
@@ -929,7 +944,7 @@ impl SlamSystem {
         matches: &[(usize, usize)],
     ) -> bool {
         let evidence = self.keyframe_evidence(frame, tracked_inliers, matches);
-        if !self.keyframe_policy.should_insert_with(&evidence) {
+        if !self.keyframe_due(&evidence, timestamp_sec) {
             return false;
         }
 

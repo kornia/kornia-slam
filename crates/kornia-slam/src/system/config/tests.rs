@@ -170,6 +170,44 @@ fn frontend_and_keyframe_settings_are_range_checked() {
             "parallax {px}"
         );
     }
+
+    let interval = |max_interval_sec| {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).keyframes.max_interval_sec = max_interval_sec;
+        invalid_setting(&config)
+    };
+    assert_eq!(interval(Some(0.5)), None);
+    for secs in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert_eq!(
+            interval(Some(secs)).as_deref(),
+            Some("keyframes.max_interval_sec"),
+            "interval {secs}"
+        );
+    }
+}
+
+/// A parked inertial rig with no keyframe bound would buffer IMU samples, and
+/// grow the next IMU edge, for the whole stop.
+#[test]
+fn an_inertial_system_needs_a_keyframe_bound() {
+    let parked = |imu, max_frames_between, max_interval_sec| {
+        let mut config = SystemConfig {
+            sensors: sensors(CameraSelection::Stereo, imu),
+            ..SystemConfig::default()
+        };
+        let keyframes = &mut orb_mut(&mut config).keyframes;
+        keyframes.max_frames_between = max_frames_between;
+        keyframes.min_parallax_px = Some(10.0);
+        keyframes.max_interval_sec = max_interval_sec;
+        config.validate()
+    };
+    assert_eq!(
+        parked(true, usize::MAX, None),
+        Err(ConfigError::UnboundedInertialKeyframes)
+    );
+    assert_eq!(parked(true, usize::MAX, Some(0.5)), Ok(()));
+    assert_eq!(parked(true, 30, None), Ok(()));
+    assert_eq!(parked(false, usize::MAX, None), Ok(()));
 }
 
 fn invalid_setting(config: &SystemConfig) -> Option<String> {
@@ -319,6 +357,7 @@ mod runtime_settings {
             max_frames_between: 5,
             ref_ratio: 0.8,
             min_parallax_px: Some(12.0),
+            max_interval_sec: Some(0.5),
         };
         orb.mapping.execution = LocalMappingMode::Synchronous;
         orb.tuning.initialization.acceptance_config.min_inliers = 40;
@@ -419,11 +458,12 @@ mod ron_files {
         assert_eq!(ron(&config), ron(&expected));
 
         let config = parse(
-            "(version: 1, pipeline: OrbSlam((keyframes: (max_frames_between: 18446744073709551615, min_parallax_px: Some(10.0)))))",
+            "(version: 1, pipeline: OrbSlam((keyframes: (max_frames_between: 18446744073709551615, min_parallax_px: Some(10.0), max_interval_sec: Some(0.5)))))",
         )
         .unwrap();
         assert_eq!(orb(&config).keyframes.max_frames_between, usize::MAX);
         assert_eq!(orb(&config).keyframes.min_parallax_px, Some(10.0));
+        assert_eq!(orb(&config).keyframes.max_interval_sec, Some(0.5));
     }
 
     /// Tuning is not part of the file format, so a file cannot set it.

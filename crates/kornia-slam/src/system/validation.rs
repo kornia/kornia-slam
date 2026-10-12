@@ -34,6 +34,11 @@ pub enum ConfigError {
         value: f64,
         requirement: &'static str,
     },
+    #[error(
+        "an inertial system needs a keyframe bound: keyframes.max_frames_between is unbounded, \
+         so set keyframes.max_interval_sec (ORB-SLAM3 forces one every 0.5 s)"
+    )]
+    UnboundedInertialKeyframes,
     #[error("loop closing vocabulary path is empty")]
     EmptyVocabularyPath,
     #[error("loop closing needs metric input: enable stereo cameras or the IMU")]
@@ -72,7 +77,7 @@ impl OrbSlamPipeline {
         match &self.frontend {
             FrontendConfig::Orb(orb) => orb.validate()?,
         }
-        validate_keyframes(&self.keyframes)?;
+        validate_keyframes(&self.keyframes, sensors.imu)?;
         validate_loop_closing(&self.loop_closing, sensors)?;
         validate_tuning(&self.tuning, self.loop_closing.is_enabled())
     }
@@ -106,7 +111,7 @@ impl OrbFrontendConfig {
     }
 }
 
-fn validate_keyframes(policy: &KeyframePolicy) -> Result<(), ConfigError> {
+fn validate_keyframes(policy: &KeyframePolicy, imu: bool) -> Result<(), ConfigError> {
     let (min, max) = (policy.min_frames_between, policy.max_frames_between);
     if min == 0 || min > max {
         return Err(ConfigError::InvalidKeyframeGaps { min, max });
@@ -116,6 +121,14 @@ fn validate_keyframes(policy: &KeyframePolicy) -> Result<(), ConfigError> {
     }
     if let Some(px) = policy.min_parallax_px {
         check("keyframes.min_parallax_px", px, POSITIVE)?;
+    }
+    if let Some(secs) = policy.max_interval_sec {
+        check("keyframes.max_interval_sec", secs, POSITIVE)?;
+    }
+    // IMU samples are kept until the next keyframe: a parked rig with no
+    // bound would buffer them, and grow the next IMU edge, without limit.
+    if imu && max == usize::MAX && policy.max_interval_sec.is_none() {
+        return Err(ConfigError::UnboundedInertialKeyframes);
     }
     Ok(())
 }

@@ -250,8 +250,11 @@ impl fmt::Display for SystemConfig {
             write!(f, "{}", k.max_frames_between)?;
         }
         write!(f, " frames, ref ratio {}", k.ref_ratio)?;
-        match k.min_parallax_px {
-            Some(px) => writeln!(f, ", parallax {px} px")?,
+        if let Some(px) = k.min_parallax_px {
+            write!(f, ", parallax {px} px")?;
+        }
+        match k.max_interval_sec {
+            Some(secs) => writeln!(f, ", at most {secs} s apart")?,
             None => writeln!(f)?,
         }
         let execution = match orb.mapping.execution {
