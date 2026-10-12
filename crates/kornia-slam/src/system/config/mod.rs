@@ -243,11 +243,17 @@ impl fmt::Display for SystemConfig {
         }
         writeln!(f, "  tracking")?;
         let k = &orb.keyframes;
-        writeln!(
-            f,
-            "  keyframes: every {}..={} frames, ref ratio {}",
-            k.min_frames_between, k.max_frames_between, k.ref_ratio
-        )?;
+        write!(f, "  keyframes: every {}..=", k.min_frames_between)?;
+        if k.max_frames_between == usize::MAX {
+            write!(f, "unbounded")?;
+        } else {
+            write!(f, "{}", k.max_frames_between)?;
+        }
+        write!(f, " frames, ref ratio {}", k.ref_ratio)?;
+        match k.min_parallax_px {
+            Some(px) => writeln!(f, ", parallax {px} px")?,
+            None => writeln!(f)?,
+        }
         let execution = match orb.mapping.execution {
             LocalMappingMode::Synchronous => "synchronous",
             LocalMappingMode::Asynchronous => "asynchronous",

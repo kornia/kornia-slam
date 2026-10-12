@@ -27,7 +27,9 @@ pub use validation::ConfigError;
 use crate::frontend::{FrontendObservation, OrbFrontend};
 use state::{SystemMode, SystemState};
 
-use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
+use crate::tracking::{
+    KeyframeEvidence, KeyframePolicy, TrackingLossRecoveryPolicy, median_parallax_px,
+};
 
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 use crate::tracking::motion::{InertialPrediction, predict_pose};
@@ -886,21 +888,39 @@ impl SlamSystem {
         tracked_inliers: usize,
         matches: &[(usize, usize)],
     ) -> bool {
-        let n_ref_map_points = if let Some(ki) = self.state.current_keyframe_idx {
+        let (n_ref_map_points, median_parallax_px) = {
             let map = self.map.lock().unwrap();
-            map.get_keyframe(ki)
+            let n_ref = self
+                .state
+                .current_keyframe_idx
+                .and_then(|ki| map.get_keyframe(ki))
                 .map(|kf| kf.num_associated_points())
-                .unwrap_or(0)
-        } else {
-            0
+                .unwrap_or(0);
+            // Measured only when the policy reads it: it walks every match.
+            let parallax = self
+                .keyframe_policy
+                .min_parallax_px
+                .zip(self.state.last_keyframe_idx)
+                .and_then(|(_, last)| {
+                    median_parallax_px(
+                        &map,
+                        last,
+                        frame,
+                        &self.state.pose_world_to_cam,
+                        matches,
+                        &self.rig.camera,
+                    )
+                });
+            (n_ref, parallax)
         };
 
-        if !self.keyframe_policy.should_insert(
-            frame.idx,
-            self.state.last_keyframe_idx,
+        if !self.keyframe_policy.should_insert_with(&KeyframeEvidence {
+            curr_idx: frame.idx,
+            last_keyframe_idx: self.state.last_keyframe_idx,
             tracked_inliers,
             n_ref_map_points,
-        ) {
+            median_parallax_px,
+        }) {
             return false;
         }
 

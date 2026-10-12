@@ -114,6 +114,9 @@ fn validate_keyframes(policy: &KeyframePolicy) -> Result<(), ConfigError> {
     if !(0.0..=1.0).contains(&policy.ref_ratio) {
         return Err(ConfigError::InvalidRefRatio(policy.ref_ratio));
     }
+    if let Some(px) = policy.min_parallax_px {
+        check("keyframes.min_parallax_px", px, POSITIVE)?;
+    }
     Ok(())
 }
 

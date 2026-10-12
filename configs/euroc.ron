@@ -21,8 +21,15 @@
                 // at each keyframe: Baselines(n) | Metres(m) | Disabled.
                 stereo_close_depth: Baselines(35.0),
             )),
-            // Frames since the last keyframe; ref_ratio in [0, 1].
-            keyframes: ( min_frames_between: 3, max_frames_between: 8, ref_ratio: 0.6 ),
+            // Frames since the last keyframe; ref_ratio in [0, 1]. min_parallax_px
+            // (pixels, None = ignored) also inserts on rotation-compensated
+            // parallax since the last keyframe.
+            keyframes: (
+                min_frames_between: 3,
+                max_frames_between: 8,
+                ref_ratio: 0.6,
+                min_parallax_px: None,
+            ),
             // Synchronous runs local mapping before each frame returns, which
             // makes runs replay identically; Asynchronous uses a background worker.
             mapping: ( execution: Asynchronous ),

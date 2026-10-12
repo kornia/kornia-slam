@@ -56,6 +56,10 @@ fn display_describes_the_pipeline() {
     };
     let mut inertial_loop = with_loop_closing(loop_closing(), sensors(CameraSelection::Mono, true));
     orb_mut(&mut inertial_loop).mapping.execution = LocalMappingMode::Synchronous;
+    let mut parallax = SystemConfig::default();
+    let keyframes = &mut orb_mut(&mut parallax).keyframes;
+    keyframes.max_frames_between = usize::MAX;
+    keyframes.min_parallax_px = Some(10.0);
     for (config, expected) in [
         (
             SystemConfig::default(),
@@ -85,6 +89,15 @@ fn display_describes_the_pipeline() {
   keyframes: every 3..=8 frames, ref ratio 0.6
   local mapping: synchronous
   loop closing: ORBvoc.txt
+",
+        ),
+        (
+            parallax,
+            "OrbSlam pipeline (config version 1)
+  frontend: ORB, 1000 keypoints
+  tracking
+  keyframes: every 3..=unbounded frames, ref ratio 0.6, parallax 10 px
+  local mapping: asynchronous
 ",
         ),
     ] {
@@ -140,6 +153,21 @@ fn frontend_and_keyframe_settings_are_range_checked() {
         assert!(
             matches!(ratio(ref_ratio), Err(ConfigError::InvalidRefRatio(_))),
             "ratio {ref_ratio}"
+        );
+    }
+
+    let parallax = |min_parallax_px| {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).keyframes.min_parallax_px = min_parallax_px;
+        invalid_setting(&config)
+    };
+    assert_eq!(parallax(None), None);
+    assert_eq!(parallax(Some(10.0)), None);
+    for px in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert_eq!(
+            parallax(Some(px)).as_deref(),
+            Some("keyframes.min_parallax_px"),
+            "parallax {px}"
         );
     }
 }
@@ -290,6 +318,7 @@ mod runtime_settings {
             min_frames_between: 2,
             max_frames_between: 5,
             ref_ratio: 0.8,
+            min_parallax_px: Some(12.0),
         };
         orb.mapping.execution = LocalMappingMode::Synchronous;
         orb.tuning.initialization.acceptance_config.min_inliers = 40;
