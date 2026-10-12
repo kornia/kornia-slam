@@ -417,6 +417,13 @@ mod ron_files {
             ..OrbFrontendConfig::default()
         });
         assert_eq!(ron(&config), ron(&expected));
+
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((keyframes: (max_frames_between: 18446744073709551615, min_parallax_px: Some(10.0)))))",
+        )
+        .unwrap();
+        assert_eq!(orb(&config).keyframes.max_frames_between, usize::MAX);
+        assert_eq!(orb(&config).keyframes.min_parallax_px, Some(10.0));
     }
 
     /// Tuning is not part of the file format, so a file cannot set it.
