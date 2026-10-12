@@ -1,0 +1,289 @@
+use super::KeyframeRemovalError;
+use crate::mapping::map::tests::{assert_map_consistent, test_frame};
+use crate::mapping::map::{
+    ImuFactor, Keyframe, LandmarkSeed, Map, MapInsertion, ObservationKey, ops::BaWindow,
+};
+use kornia_algebra::{Mat3F64, Vec3F64};
+use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
+
+fn calib() -> ImuCalib {
+    ImuCalib {
+        gyro_noise: 1e-4,
+        accel_noise: 1e-3,
+        gyro_bias_noise: 1e-5,
+        accel_bias_noise: 1e-3,
+    }
+}
+
+/// 200 Hz of a turning, accelerating body over `[t0, t1]`, both ends
+/// included, drawn from one stream so adjacent windows share stamps exactly.
+fn samples(t0: f64, t1: f64) -> Vec<ImuMeasurement> {
+    let tick = |t: f64| (t * 200.0).round() as usize;
+    (tick(t0)..=tick(t1))
+        .map(|i| {
+            let t = i as f64 * 0.005;
+            ImuMeasurement {
+                timestamp: t,
+                gyro: Vec3F64::new(0.1, -0.3 + t, 0.2),
+                accel: Vec3F64::new(0.5 * t, 0.2, 9.81),
+            }
+        })
+        .collect()
+}
+
+fn edge(prev: usize, curr: usize, t0: f64, t1: f64) -> ImuFactor {
+    let raw = samples(t0, t1);
+    ImuFactor {
+        prev_kf_idx: prev,
+        curr_kf_idx: curr,
+        preintegrated: PreintegratedImu::from_measurements(
+            ImuBias::default(),
+            calib(),
+            &raw,
+            t0,
+            t1,
+        ),
+        raw_samples: raw,
+        t0,
+        t1,
+    }
+}
+
+fn seed(kf: usize, feature: usize) -> LandmarkSeed {
+    LandmarkSeed {
+        position: Vec3F64::new(0.1 * feature as f64, 0.0, 4.0),
+        color: [0; 3],
+        reference: ObservationKey {
+            keyframe_idx: kf,
+            feature_idx: feature,
+        },
+    }
+}
+
+/// Keyframes 10, 20, 30, 40. Landmark 0 is seen only by 20; landmark 1 is
+/// anchored by 20 and seen by 30 and 40; landmark 2 is anchored by 10 and seen
+/// by 20; landmark 3 was seen by 20 and 30 and then retired.
+fn landmark_map() -> Map {
+    let mut map = Map::new();
+    for id in [10, 20, 30, 40] {
+        let descriptors = (0..4).map(|f| [(id + f) as u8; 32]).collect();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(id, descriptors)))
+            .unwrap();
+    }
+    map.insert_landmark(seed(20, 0)).unwrap();
+    let anchored = map.insert_landmark(seed(20, 1)).unwrap();
+    map.link_observation(30, 1, anchored).unwrap();
+    map.link_observation(40, 1, anchored).unwrap();
+    let older = map.insert_landmark(seed(10, 2)).unwrap();
+    map.link_observation(20, 2, older).unwrap();
+    let retired = map.insert_landmark(seed(20, 3)).unwrap();
+    map.link_observation(30, 3, retired).unwrap();
+    map.remove_landmark(retired).unwrap();
+    map
+}
+
+#[test]
+fn removal_unlinks_retires_and_promotes_references() {
+    let mut map = landmark_map();
+    let removal = map.remove_keyframe(20).unwrap();
+
+    assert!(map.get_keyframe(20).is_none());
+    assert_eq!(
+        map.keyframes()
+            .iter()
+            .map(|kf| kf.frame.idx)
+            .collect::<Vec<_>>(),
+        vec![10, 30, 40]
+    );
+    assert_eq!(removal.observations_removed, 4);
+    assert_eq!(removal.landmarks_retired, 1);
+    assert_eq!(removal.merged_imu_edge, None);
+    assert!(map.map_points()[0].culled, "its only observer went");
+    let promoted = &map.map_points()[1];
+    assert!(!promoted.culled);
+    assert_eq!(promoted.keyframe_idx, 30, "smallest remaining observer");
+    assert!(!map.map_points()[2].is_observed_by(20));
+    assert_eq!(map.map_points()[2].keyframe_idx, 10);
+    assert!(
+        !map.map_points()[3].is_observed_by(20),
+        "a retired landmark's stale record goes too"
+    );
+    assert!(map.map_points()[3].is_observed_by(30));
+    assert_map_consistent(&map);
+}
+
+#[test]
+fn an_unknown_keyframe_is_refused_without_a_write() {
+    let mut map = landmark_map();
+    let before = map.state_fingerprint_for_test();
+    assert_eq!(
+        map.remove_keyframe(99).unwrap_err(),
+        KeyframeRemovalError::UnknownKeyframe(99)
+    );
+    assert_eq!(map.state_fingerprint_for_test(), before);
+}
+
+fn inertial_map() -> Map {
+    let mut map = landmark_map();
+    map.edit_keyframes_for_test(|slot, kf| kf.imu_bias.gyro.x = 0.01 * (slot + 1) as f64);
+    map.apply_insertion(MapInsertion {
+        imu_factors: vec![
+            edge(10, 20, 0.0, 0.2),
+            edge(20, 30, 0.2, 0.4),
+            edge(30, 40, 0.4, 0.6),
+        ],
+        ..Default::default()
+    })
+    .unwrap();
+    map
+}
+
+#[test]
+fn the_imu_chain_is_merged_into_the_edge_that_skipping_the_keyframe_would_give() {
+    let mut map = inertial_map();
+    let (first, second) = (map.imu_factors()[0].clone(), map.imu_factors()[1].clone());
+    let removal = map.remove_keyframe(20).unwrap();
+    assert_eq!(removal.merged_imu_edge, Some((10, 30)));
+    assert_map_consistent(&map);
+
+    let edges: Vec<_> = map
+        .imu_factors()
+        .iter()
+        .map(|f| (f.prev_kf_idx, f.curr_kf_idx))
+        .collect();
+    assert_eq!(
+        edges,
+        vec![(10, 30), (30, 40)],
+        "position of the earlier edge"
+    );
+    let merged = &map.imu_factors()[0];
+    assert_eq!((merged.t0, merged.t1), (0.0, 0.4));
+    assert_eq!(merged.raw_samples.len(), samples(0.0, 0.4).len());
+
+    // Re-preintegrated over the whole interval at keyframe 10's bias.
+    let bias = map.get_keyframe(10).unwrap().imu_bias;
+    let direct = PreintegratedImu::from_measurements(bias, calib(), &samples(0.0, 0.4), 0.0, 0.4);
+    assert_eq!(format!("{:?}", merged.preintegrated), format!("{direct:?}"));
+
+    // And it composes the two deltas it replaced (both were linearized at zero
+    // bias, so compare against a zero-bias merge).
+    let at_zero = PreintegratedImu::from_measurements(
+        ImuBias::default(),
+        calib(),
+        &samples(0.0, 0.4),
+        0.0,
+        0.4,
+    );
+    let (a, b) = (&first.preintegrated, &second.preintegrated);
+    let rotation = Mat3F64(a.delta_rotation.mul_mat3(&b.delta_rotation));
+    let velocity = a.delta_velocity + a.delta_rotation * b.delta_velocity;
+    let position = a.delta_position + a.delta_velocity * b.dt + a.delta_rotation * b.delta_position;
+    let close = |x: &[f64], y: &[f64]| x.iter().zip(y).all(|(p, q)| (p - q).abs() < 1e-9);
+    assert!(close(
+        &rotation.to_cols_array(),
+        &at_zero.delta_rotation.to_cols_array()
+    ));
+    assert!(close(
+        &velocity.to_array(),
+        &at_zero.delta_velocity.to_array()
+    ));
+    assert!(close(
+        &position.to_array(),
+        &at_zero.delta_position.to_array()
+    ));
+    assert!((at_zero.dt - (a.dt + b.dt)).abs() < 1e-12);
+}
+
+#[test]
+fn an_end_of_the_imu_chain_is_refused_without_a_write() {
+    let mut map = inertial_map();
+    let before = map.state_fingerprint_for_test();
+    for (kf, incoming, outgoing) in [(10, 0, 1), (40, 1, 0)] {
+        assert_eq!(
+            map.remove_keyframe(kf).unwrap_err(),
+            KeyframeRemovalError::UnmergeableImuChain {
+                keyframe_idx: kf,
+                incoming,
+                outgoing,
+            }
+        );
+    }
+    assert_eq!(map.state_fingerprint_for_test(), before);
+}
+
+/// Removes keyframe 20 from a map holding `edges`, which must be refused
+/// with the map untouched; returns the refusal.
+fn refusal_with(edges: Vec<ImuFactor>) -> KeyframeRemovalError {
+    let mut map = landmark_map();
+    map.apply_insertion(MapInsertion {
+        imu_factors: edges,
+        ..Default::default()
+    })
+    .unwrap();
+    let before = map.state_fingerprint_for_test();
+    let error = map.remove_keyframe(20).unwrap_err();
+    assert_eq!(map.state_fingerprint_for_test(), before);
+    error
+}
+
+#[test]
+fn unmergeable_edges_are_refused_without_a_write() {
+    assert_eq!(
+        refusal_with(vec![edge(10, 20, 0.0, 0.2), edge(20, 30, 0.25, 0.4)]),
+        KeyframeRemovalError::ImuIntervalGap {
+            keyframe_idx: 20,
+            t1: 0.2,
+            t0: 0.25,
+        }
+    );
+    let mut bare = edge(20, 30, 0.2, 0.4);
+    bare.raw_samples.clear();
+    assert_eq!(
+        refusal_with(vec![edge(10, 20, 0.0, 0.2), bare]),
+        KeyframeRemovalError::MissingImuSamples(20)
+    );
+    assert_eq!(
+        refusal_with(vec![
+            edge(10, 20, 0.0, 0.2),
+            edge(20, 30, 0.2, 0.4),
+            edge(10, 30, 0.0, 0.4),
+        ]),
+        KeyframeRemovalError::DuplicateImuFactor { prev: 10, next: 30 }
+    );
+}
+
+#[test]
+fn a_snapshot_captured_before_the_removal_still_merges_without_resurrecting_it() {
+    let mut map = inertial_map();
+    let snapshot = map.ba_snapshot(&BaWindow {
+        keyframe_slots: (0..4).collect(),
+        landmark_ids: (0..4).collect(),
+    });
+    let mut update = snapshot.into_update();
+    for kf in &mut update.keyframes {
+        kf.pose_world_to_cam.translation.z += 0.01;
+    }
+    for preintegrated in &mut update.imu_preintegrations {
+        preintegrated.dt += 1.0;
+    }
+    map.remove_keyframe(20).unwrap();
+    let merged = format!("{:?}", map.imu_factors()[0]);
+
+    let result = map.apply_ba_update(update).unwrap();
+    assert!(map.get_keyframe(20).is_none());
+    assert_eq!(
+        result
+            .keyframe_corrections
+            .iter()
+            .map(|c| c.kf_idx)
+            .collect::<Vec<_>>(),
+        vec![10, 30, 40]
+    );
+    assert_eq!(
+        format!("{:?}", map.imu_factors()[0]),
+        merged,
+        "the merged edge is not overwritten by a replaced edge's result"
+    );
+    assert!((map.imu_factors()[1].preintegrated.dt - 1.2).abs() < 1e-9);
+    assert_map_consistent(&map);
+}

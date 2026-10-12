@@ -64,6 +64,31 @@ gates the runtime used (`max_midpoint_gap` 0.25, `max_reprojection_error` 3.0).
 fixed seed, so runs with loop correction and synchronous local mapping
 reproduce exactly.
 
+**Keyframe culling.** The map no longer has to grow without bound.
+`mapping::culling::cull_redundant_keyframes` removes keyframes whose live
+landmarks are, by at least 90 %, each seen by three other keyframes at the same
+or a finer scale (ORB-SLAM's local-mapping rule), never the first keyframe nor
+the newest few. Removal is a canonical map operation, `Map::remove_keyframe`:
+every landmark record, reference and derived geometry is repaired, and the IMU
+edges on each side are merged into one, re-preintegrated from their raw samples
+(ORB-SLAM3's `MergePrevious`); a keyframe at an end of the IMU chain is refused.
+Wheel-odometry factors, which the caller holds, are composed across a removed
+keyframe (`WheelOdomFactor::compose`, with first-order covariance
+propagation), or the keyframe is kept. Opt-in: nothing calls it by default.
+Additive, apart from the new `KeyframePolicy` field below.
+
+**Parallax-based keyframe insertion.** `KeyframePolicy::min_parallax_px`
+inserts a keyframe once the median rotation-compensated parallax since the last
+one reaches a threshold (`tracking::median_parallax_px` measures it), so with
+`max_frames_between = usize::MAX` a parked camera stops adding keyframes. The
+reference-ratio and weak-tracking rules still apply. Off by default, so
+insertion is unchanged; `SlamSystem` measures parallax only when it is set.
+In a system file it is `keyframes.min_parallax_px` (`None` by default, checked
+finite and positive when set).
+**Breaking:** `KeyframePolicy` gains a public field, so a struct literal
+needs `..KeyframePolicy::default()`. `should_insert_with` takes the new
+`KeyframeEvidence`; `should_insert` is unchanged.
+
 **Local BA no longer copies the whole map.** Each local bundle adjustment
 captured every keyframe, landmark and IMU factor under the map lock, so its
 cost, and the stall it caused tracking, grew with the map. It now captures only

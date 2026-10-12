@@ -4,6 +4,7 @@ mod correction;
 mod geometry;
 mod mutation;
 mod queries;
+mod removal;
 mod snapshot;
 
 pub use correction::{
@@ -14,4 +15,5 @@ pub use mutation::{
     InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError,
     MapPointMergeResult, ObservationLink,
 };
+pub use removal::{KeyframeRemoval, KeyframeRemovalError};
 pub use snapshot::{BaSnapshot, BaUpdate, BaWindow};

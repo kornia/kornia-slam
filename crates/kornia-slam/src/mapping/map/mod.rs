@@ -10,6 +10,7 @@
 //! | `mutation` | `insert_keyframe`, `insert_landmark`, `link_observation`, `apply_insertion`, `merge_map_points` |
 //! | `correction` | `apply_pose_graph_correction`, `apply_inertial_alignment`, `apply_ba_update` |
 //! | `geometry` | derived landmark geometry and the refresh set each correction owes |
+//! | `removal` | `remove_keyframe` — the IMU chain through it is merged, never cut |
 //! | `queries` | `covisible_keyframes`, `covisible_keyframes_min_weight` — thresholds belong to consumers |
 //! | `snapshot` | `ba_snapshot` — owned, immutable copies of a BA window |
 //!
@@ -22,7 +23,7 @@
 //! with a typed error; re-stating a link that already exists is a no-op, not an
 //! error.
 //!
-//! Deletion is logical. `remove_landmark` clears every referencing feature and
+//! Landmark deletion is logical. `remove_landmark` clears every referencing feature and
 //! marks the landmark culled; its slot, observation records and derived
 //! geometry stay in place, so readers must check `culled`. Landmark ids are
 //! stable indices held inside keyframes, so the vector is never compacted and a
@@ -30,6 +31,10 @@
 //! Unlinking the last observation retires the landmark; unlinking the reference
 //! observation promotes the smallest remaining `(keyframe, feature)` in its
 //! place.
+//!
+//! Keyframes, unlike landmarks, are removed physically by `remove_keyframe`.
+//! Their ids are frame indices, so the remaining ids keep their meaning; only
+//! slot positions shift, and slots are never held across a lock release.
 //!
 //! Ids are valid for the current map lifetime only. `clear_active` is a whole-
 //! map reset that invalidates every previous id and advances the world epoch;
@@ -64,6 +69,7 @@ pub use ops::{
 pub use ops::{
     InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError, ObservationLink,
 };
+pub use ops::{KeyframeRemoval, KeyframeRemovalError};
 
 /// ORB pyramid scale factor between adjacent levels (matches the kornia-imgproc
 /// ORB extractor default `downscale = 1.2`, which equals ORB-SLAM3's default).

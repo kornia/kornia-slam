@@ -635,7 +635,7 @@ impl Map {
     }
 
     /// Smallest `(keyframe_idx, feature_idx)` becomes the reference.
-    fn adopt_reference(&mut self, landmark_idx: usize) {
+    pub(super) fn adopt_reference(&mut self, landmark_idx: usize) {
         let Some(mp) = self.map_points.get(landmark_idx) else {
             return;
         };
@@ -667,7 +667,7 @@ impl Map {
     /// full EuRoC sequences, makes stereo worse (MH_01_easy ATE 0.152 -> 0.182 m,
     /// V2_01_easy 0.999 -> 1.323 m). That belongs in a separate change, once it
     /// is understood why tracked matches reach culled landmarks at all.
-    fn retire_landmark(&mut self, landmark_idx: usize) {
+    pub(super) fn retire_landmark(&mut self, landmark_idx: usize) {
         if let Some(mp) = self.map_points.get_mut(landmark_idx) {
             mp.mark_culled();
         }
@@ -677,7 +677,7 @@ impl Map {
     /// representative descriptor, then the geometry derived from its
     /// observers. Batches call this once per dirty landmark rather than per
     /// link, so the O(n^2) descriptor selection does not repeat.
-    fn refresh_landmark(&mut self, landmark_idx: usize) {
+    pub(super) fn refresh_landmark(&mut self, landmark_idx: usize) {
         if let Some(mp) = self.map_points.get_mut(landmark_idx) {
             mp.finalize_descriptor();
         }
