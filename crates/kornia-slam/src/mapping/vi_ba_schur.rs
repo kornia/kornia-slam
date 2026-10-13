@@ -297,6 +297,9 @@ fn depth_gate_bound(d: f32, factor: f64) -> f64 {
     factor * d as f64 + DEPTH_GATE_MARGIN_M
 }
 
+/// A gated stereo depth row: (observation index, measured depth, sigma), metres.
+type GatedDepthRow = (usize, f32, f64);
+
 /// Moves each free landmark whose stereo depth rows all lie beyond the depth
 /// gate (in front of their cameras, but farther than
 /// [`ViBaParams::depth_gate_factor`] allows) along the ray of one of those
@@ -331,7 +334,7 @@ fn reseed_walked_landmarks(
     factor: f64,
 ) -> usize {
     // Per landmark: (any depth row in the gate or behind, gated rows).
-    let mut rows: Vec<(bool, Vec<usize>)> = vec![(false, Vec::new()); points.len()];
+    let mut rows: Vec<(bool, Vec<GatedDepthRow>)> = vec![(false, Vec::new()); points.len()];
     for (o, obs) in observations.iter().enumerate() {
         let Some(d) = obs.depth_meas else {
             continue;
@@ -344,56 +347,53 @@ fn reseed_walked_landmarks(
         if z <= 0.0 || z < depth_gate_bound(d, factor) {
             row.0 = true;
         } else {
-            row.1.push(o);
+            row.1.push((o, d, obs.depth_sigma as f64));
         }
     }
-    let depth_of = |o: usize| {
-        let obs = &observations[o];
-        (obs.depth_meas.unwrap_or_default(), obs.depth_sigma as f64)
-    };
     let mut moved = 0;
     for (j, (blocked, mut gated)) in rows.into_iter().enumerate() {
         if blocked || !point_free[j] || gated.is_empty() {
             continue;
         }
         // Best measured first; ties keep observation order.
-        gated.sort_by(|&a, &b| depth_of(a).1.total_cmp(&depth_of(b).1));
-        // The landmark moved along `o`'s ray to `o`'s measured depth.
-        let candidate_of = |o: usize| {
+        gated.sort_by(|a, b| a.2.total_cmp(&b.2));
+        // The landmark moved along `o`'s ray to its measured depth `d`.
+        let candidate_of = |(o, d, _): GatedDepthRow| {
             let pose = &keyframes[observations[o].pose_idx].pose;
             let p_cam = pose.transform_point(&points[j]);
-            let d = depth_of(o).0 as f64;
             (
-                pose.inverse().transform_point(&(p_cam * (d / p_cam.z))),
+                pose.inverse()
+                    .transform_point(&(p_cam * (d as f64 / p_cam.z))),
                 p_cam.z,
             )
         };
-        let corroborated = |c: usize, candidate: &Vec3F64| {
-            let sigma = depth_of(c).1;
-            gated.iter().filter(|&&o| o != c).any(|&o| {
-                let (d_o, sigma_o) = depth_of(o);
-                let z_o = keyframes[observations[o].pose_idx]
-                    .pose
-                    .transform_point(candidate)
-                    .z;
-                let tolerance =
-                    RESEED_AGREEMENT_SIGMAS * (sigma * sigma + sigma_o * sigma_o).sqrt();
-                (z_o - d_o as f64).abs() <= tolerance
-            })
+        let corroborated = |(c, _, sigma): GatedDepthRow, candidate: &Vec3F64| {
+            gated
+                .iter()
+                .filter(|row| row.0 != c)
+                .any(|&(o, d_o, sigma_o)| {
+                    let z_o = keyframes[observations[o].pose_idx]
+                        .pose
+                        .transform_point(candidate)
+                        .z;
+                    let tolerance =
+                        RESEED_AGREEMENT_SIGMAS * (sigma * sigma + sigma_o * sigma_o).sqrt();
+                    (z_o - d_o as f64).abs() <= tolerance
+                })
         };
         // Each gated row in turn, so one bad best row cannot veto two rows
         // that agree with each other; failing that, the best row alone if
         // the landmark's depth is implausible.
         let reseed = gated
             .iter()
-            .find_map(|&c| {
-                let (candidate, _) = candidate_of(c);
-                corroborated(c, &candidate).then_some(candidate)
+            .find_map(|&row| {
+                let (candidate, _) = candidate_of(row);
+                corroborated(row, &candidate).then_some(candidate)
             })
             .or_else(|| {
                 let best = gated[0];
                 let (candidate, z) = candidate_of(best);
-                let bound = depth_gate_bound(depth_of(best).0, factor);
+                let bound = depth_gate_bound(best.1, factor);
                 (z > RESEED_UNCORROBORATED_FACTOR * bound).then_some(candidate)
             });
         if let Some(candidate) = reseed {
