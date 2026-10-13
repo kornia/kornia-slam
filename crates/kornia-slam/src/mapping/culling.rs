@@ -296,6 +296,9 @@ fn cull_one(
         None => StationaryPlan::None,
     };
     let removal = match &stationary {
+        // Removing a boundary moves its IMU edge onto the still neighbour,
+        // which `merge_imu_edges = false` rules out like any IMU change.
+        StationaryPlan::Boundary { .. } if !config.merge_imu_edges => None,
         StationaryPlan::Boundary { .. } if !boundaries => return Step::Boundary,
         // Stationary on both sides: no span cap, but no IMU edge either
         // (the map would refuse a one-sided IMU chain anyway).

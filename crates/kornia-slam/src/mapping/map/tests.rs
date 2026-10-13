@@ -75,11 +75,12 @@ impl Map {
         for factor in &self.imu_factors {
             let _ = writeln!(
                 out,
-                "imu {} -> {} [{}, {}] pre {:?} raw {:?}",
+                "imu {} -> {} [{}, {}] walk+{} pre {:?} raw {:?}",
                 factor.prev_kf_idx,
                 factor.curr_kf_idx,
                 factor.t0,
                 factor.t1,
+                factor.bias_walk_extra_s,
                 factor.preintegrated,
                 factor.raw_samples,
             );
