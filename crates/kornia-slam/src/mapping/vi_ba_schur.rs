@@ -99,7 +99,8 @@ const DEPTH_GATE_MARGIN_M: f64 = 1.0;
 /// and a re-seed needs a second row that agrees.
 const RESEED_UNCORROBORATED_FACTOR: f64 = 100.0;
 
-/// Sigmas within which a second depth row must agree with a re-seed.
+/// Sigmas within which a second depth row must agree with a re-seed. The
+/// row may come from the same viewpoint (see [`reseed_walked_landmarks`]).
 const RESEED_AGREEMENT_SIGMAS: f64 = 3.0;
 
 /// Errors specific to VI-BA.
@@ -224,8 +225,11 @@ pub struct ViBaParams {
     /// its rows then enter the solve: gated, nothing else would ever restore
     /// its depth. That move needs corroboration: a second gated depth row
     /// that agrees with the re-seeded position, or a starting depth beyond
-    /// 100 times the gate bound; otherwise the rows are only gated, so one
-    /// bad stereo match cannot pull a correct landmark onto itself. Default
+    /// 100 times the gate bound; otherwise the rows are only gated, so a
+    /// one-off bad stereo match cannot pull a correct landmark onto itself.
+    /// The second row need not come from another viewpoint: a mismatch
+    /// repeated in every frame of a parked window corroborates itself and
+    /// the landmark still moves. Default
     /// 10; `f64::INFINITY` gates only landmarks behind the camera. Must be
     /// positive: NaN, zero or a negative value is refused
     /// ([`ViBaError::InvalidDepthGateFactor`]).
@@ -303,12 +307,19 @@ fn depth_gate_bound(d: f32, factor: f64) -> f64 {
 /// window. A landmark any depth row agrees with, or one behind a camera, is
 /// left alone.
 ///
-/// One erroneous stereo depth must not pull a correct far landmark onto
-/// itself, so the move needs corroboration: another gated depth row whose
-/// predicted depth at the re-seeded position is within
+/// A one-off erroneous stereo depth must not pull a correct far landmark
+/// onto itself, so the move needs corroboration: another gated depth row
+/// whose predicted depth at the re-seeded position is within
 /// [`RESEED_AGREEMENT_SIGMAS`] of its measurement, or a starting depth past
 /// [`RESEED_UNCORROBORATED_FACTOR`] times the gate bound. Without it the
 /// landmark stays put and its rows are only gated.
+///
+/// The second row is not checked for geometric independence. In a parked
+/// window every keyframe sees the same image from the same pose, so a
+/// mismatch from repetitive texture or a reflection gives the same wrong
+/// depth in each of them and corroborates itself. Requiring a baseline
+/// would close that, but would also stop a parked window from ever
+/// restoring the landmarks it walked, which is the case this re-seed is for.
 fn reseed_walked_landmarks(
     keyframes: &[ViBaKeyframe],
     points: &mut [Vec3F64],

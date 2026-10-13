@@ -886,6 +886,10 @@ fn a_parked_chain_s_walked_landmarks_are_restored_when_stereo_measures_them() {
 /// with the 2 m re-seed corroborates it and the landmark moves; a second row
 /// that disagrees (2.6 m, beyond three combined sigmas) does not.
 ///
+/// Both keyframes here are parked at the same pose, so this pins agreement,
+/// not independence: a bad depth repeated in both rows corroborates itself
+/// (the agreeing case below), as [`reseed_walked_landmarks`] documents.
+///
 /// Red before corroboration was required (2026-10-13): the single row
 /// re-seeded the landmark to 2 m.
 #[test]

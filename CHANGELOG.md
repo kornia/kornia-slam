@@ -215,10 +215,14 @@ keyframe by 137° with them reverted):
   enter the solve: reprojection rows constrain only its bearing, so a gated
   landmark would otherwise stay wrong (and gated) in every later window,
   including the moving ones after the robot drives off. The move needs
-  corroboration, so one bad stereo match cannot pull a correct landmark onto
-  itself: a second gated depth row that agrees with the moved position within
-  three combined sigmas, or a starting depth more than 100 times the gate's
-  bound (the ~1e7 m flings). Otherwise the rows are only gated;
+  corroboration, so a one-off bad stereo match cannot pull a correct landmark
+  onto itself: a second gated depth row that agrees with the moved position
+  within three combined sigmas, or a starting depth more than 100 times the
+  gate's bound (the ~1e7 m flings). Otherwise the rows are only gated. The
+  second row is not required to come from a different viewpoint, so a
+  mismatch that repeats in every frame of a parked window (repetitive
+  texture, a reflection) corroborates itself and still moves the landmark,
+  as it did before corroboration was required;
 - a step may not move a landmark from in front of an observing camera to
   behind it: a free landmark whose own step does that keeps its old position
   for that step, and a step whose camera motion does it is refused (λ grows)
