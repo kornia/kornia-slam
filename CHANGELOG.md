@@ -203,8 +203,11 @@ keyframe by 137° with them reverted):
 - a stereo depth row is left out of the solve when, at the start, the
   landmark's depth in that camera is outside `(0, 10·d + 1 m)` for measured
   depth `d` (`ViBaParams::depth_gate_factor`, default 10);
-- a step that moves an observed landmark from in front of an observing camera
-  to behind it is refused (λ grows), as a cost increase;
+- a step may not move a landmark from in front of an observing camera to
+  behind it: a free landmark whose own step does that keeps its old position
+  for that step, and a step whose camera motion does it is refused (λ grows)
+  unless every observation that flips is a Huber outlier, so one mismatched
+  near-plane association cannot stall a moving window;
 - `run_local_inertial_ba` does not write back a landmark the solve left behind
   any observer, or whose distance from its nearest observer grew more than
   tenfold and beyond 50 m; it keeps its old position. `cull_landmarks` also
@@ -212,7 +215,8 @@ keyframe by 137° with them reverted):
   already retired one behind an observer).
 
 The solve now reports what it did: `ViBaResult` gains `initial_cost`,
-`depth_rows_gated` and `cheirality_rejections`, and the update
+`depth_rows_gated`, `cheirality_rejections` and `cheirality_points_held`, and
+the update
 `run_local_inertial_ba` returns carries them, with the write-back guard's
 count, in `BaUpdate::solve_stats` (`LocalBaStats`; `None` from the visual
 solvers).
@@ -223,8 +227,9 @@ equations by Huber's `w = min(1, √(k/s))` but scored the LM step with
 `½·w·s`, which for an outlier is `½√(k s)`: not the objective `w` is the
 derivative of, so steps were accepted and refused on the wrong numbers. The
 cost is now Huber's `½ρ(s)` (`s` inside the threshold, `2√(k s) − k` past it),
-whose gradient is the weighted one; tests check the numeric derivative of each
-cost against its normal equations. Inlier costs are unchanged; outlier costs
+whose gradient is the weighted one; tests check the numeric derivative of the
+shared Huber objective, and of the IMU, wheel and stationary costs, against
+their normal equations. Inlier costs are unchanged; outlier costs
 are higher, so reported costs are not comparable with earlier builds.
 
 **Stationary initialization refuses inputs that gave a NaN state.** A
@@ -239,11 +244,18 @@ struct literal needs `..ViBaParams::default()`. `ViBaResult` is
 `#[non_exhaustive]` too, each with a constructor: `WheelOdomMeasurement`
 (`new`, `with_out_of_plane_sigmas`), `WheelOdomFactor` (`new`),
 `StationaryFactor` (`new`, `with_gyro`), `StationaryGyro` (`new`),
-`KeyframeEvidence` (`new`, `Default`), `KeyframeCullingConfig` (`Default`) and
+`KeyframeEvidence` (`new`, `with_median_parallax_px`, `Default`),
+`KeyframeCullingConfig` (`Default`) and
 `StillNeighbour` (`new`). Code outside the crate can no longer build them with
 a struct literal (functional update `..Default::default()` included); it
-starts from the constructor and sets the public fields. `StillSide`, a
+starts from the constructor and sets the public fields
+(`tests/non_exhaustive_api.rs` builds each one that way). `StillSide`, a
 two-valued enum, stays exhaustive.
+
+**`merge_imu_edges = false` keeps stationary boundaries.** Culling removed a
+keyframe at the boundary between a stationary and an IMU edge, moving its IMU
+edge onto the still neighbour, even with `merge_imu_edges` off; it now keeps
+it (counted in `kept_for_edges`).
 
 **The IMU buffer stays bounded while bootstrap fails.** `SlamSystem` dropped
 buffered IMU samples only once a map existed or a monocular bootstrap

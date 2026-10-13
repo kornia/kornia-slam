@@ -516,8 +516,12 @@ fn inertial_ba_repropagation_keeps_the_elided_bias_walk() {
 /// or flung (more than tenfold farther from its nearest observer, and beyond
 /// 50 m), at its old position; ordinary refinements, near or far, pass.
 ///
-/// Mutation: dropping the `> WRITE_BACK_FAR_M` half refused the 5 cm → 2 m
-/// refinement be refused.
+/// Mutations (2026-10-13, each in place): dropping the `> WRITE_BACK_FAR_M`
+/// half refused the 5 cm → 2 m refinement; dropping the tenfold-growth half
+/// refused the 300 m → 400 m one; dropping the behind check wrote back the
+/// landmark at z = −1 m. Dropping `is_finite` stays green: a NaN position
+/// gives no finite distance (`f64::min` skips NaN, leaving ∞), which the
+/// flung test already refuses; the check is kept as a second line.
 #[test]
 fn write_back_guard_refuses_landmarks_behind_or_flung() {
     let kf = |x: f64| ViBaKeyframe {

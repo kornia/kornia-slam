@@ -85,6 +85,15 @@ impl KeyframeEvidence {
             median_parallax_px: None,
         }
     }
+
+    /// `self` with the measured median parallax (`None` when it was not
+    /// measured), pixels.
+    pub fn with_median_parallax_px(self, median_parallax_px: Option<f64>) -> Self {
+        Self {
+            median_parallax_px,
+            ..self
+        }
+    }
 }
 
 /// Fewest tracked inliers for which a low reference ratio still earns a

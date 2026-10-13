@@ -38,9 +38,13 @@
 //! Supports Huber-robustified reprojection, stereo depth, IMU, wheel
 //! odometry and stationary residuals, an accel-bias prior, fixed keyframes
 //! and fixed points.
-//! A damped step is kept only if it lowers the cost and moves no observed
-//! landmark from in front of an observing camera to behind it; otherwise λ
-//! grows and the step is retried.
+//! A damped step is kept only if it lowers the cost; otherwise λ grows and
+//! the step is retried. A step must also keep landmarks in front of the
+//! cameras that observe them: a free landmark whose own step would cross an
+//! observing camera's image plane keeps its old position for that step, and
+//! a step whose camera motion still puts a landmark behind a camera is
+//! refused, unless every observation that flips is a Huber outlier (a
+//! mismatched association, whose pull the robust cost already bounds).
 //!
 //! A landmark seen from (nearly) one viewpoint, as every landmark of a parked
 //! window is, has an unobservable depth: its C block is rank 2. C is
@@ -234,14 +238,17 @@ pub struct ViBaResult {
     pub converged: bool,
     /// Robust cost after the last accepted step; `f64::MAX` if none was.
     pub final_cost: f64,
-    /// Robust cost at the starting state (`f64::MAX` if the first system
-    /// could never be factored).
+    /// Robust cost at the starting state (`f64::MAX` only if no iteration
+    /// ran, i.e. `max_iterations == 0`).
     pub initial_cost: f64,
     /// Depth rows left out by [`ViBaParams::depth_gate_factor`].
     pub depth_rows_gated: usize,
-    /// Steps refused because they moved an observed landmark behind an
-    /// observing camera.
+    /// Steps refused because their camera motion moved a landmark behind a
+    /// camera whose observation of it is a Huber inlier.
     pub cheirality_rejections: usize,
+    /// Landmark steps held back (the landmark kept its position for that
+    /// step) because they would have moved it behind an observing camera.
+    pub cheirality_points_held: usize,
 }
 
 /// Whether each observation's stereo depth row enters the solve, and how many
@@ -272,13 +279,13 @@ fn depth_gate(
     (keep, gated)
 }
 
-/// Observations whose landmark is in front of the observing camera in
-/// `before` and not in `after` (camera depth `<= 0`).
+/// Indices of the observations whose landmark is in front of the observing
+/// camera in `before` and not in `after` (camera depth `<= 0`).
 fn cheirality_flips(
     observations: &[BaObservation],
     before: (&[ViBaKeyframe], &[Vec3F64]),
     after: (&[ViBaKeyframe], &[Vec3F64]),
-) -> usize {
+) -> Vec<usize> {
     let depth = |(kfs, xyz): (&[ViBaKeyframe], &[Vec3F64]), obs: &BaObservation| {
         kfs[obs.pose_idx]
             .pose
@@ -287,9 +294,54 @@ fn cheirality_flips(
     };
     observations
         .iter()
-        .filter(|obs| obs.pose_idx < before.0.len() && obs.point_idx < before.1.len())
-        .filter(|obs| depth(before, obs) > 0.0 && depth(after, obs) <= 0.0)
-        .count()
+        .enumerate()
+        .filter(|(_, obs)| obs.pose_idx < before.0.len() && obs.point_idx < before.1.len())
+        .filter(|(_, obs)| depth(before, obs) > 0.0 && depth(after, obs) <= 0.0)
+        .map(|(o, _)| o)
+        .collect()
+}
+
+/// What the cheirality check made of a trial step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CheiralityOutcome {
+    /// Free landmarks whose step was undone in the trial state.
+    points_held: usize,
+    /// Whether the step must be refused: after the holds, an observation
+    /// that is a Huber inlier at the linearization point still flips.
+    refuse: bool,
+}
+
+/// Keeps a trial step's landmarks in front of the cameras that observe them,
+/// one landmark at a time. A free landmark (`point_local >= 0`) with an
+/// observation that flips gets its old position back in `after_xyz`; a flip
+/// left after that comes from the camera motion and refuses the step only if
+/// that observation is a Huber inlier (`inlier`, per observation, at the
+/// linearization point). An outlier's flip is accepted: its reprojection is
+/// already Huber-bounded, and refusing it would stall the whole window on one
+/// mismatched association.
+fn enforce_cheirality(
+    observations: &[BaObservation],
+    inlier: &[bool],
+    point_local: &[i64],
+    before: (&[ViBaKeyframe], &[Vec3F64]),
+    after_kfs: &[ViBaKeyframe],
+    after_xyz: &mut [Vec3F64],
+) -> CheiralityOutcome {
+    let mut points_held = 0;
+    for o in cheirality_flips(observations, before, (after_kfs, after_xyz)) {
+        let j = observations[o].point_idx;
+        if point_local[j] >= 0 && after_xyz[j] != before.1[j] {
+            after_xyz[j] = before.1[j];
+            points_held += 1;
+        }
+    }
+    let refuse = cheirality_flips(observations, before, (after_kfs, after_xyz))
+        .into_iter()
+        .any(|o| inlier[o]);
+    CheiralityOutcome {
+        points_held,
+        refuse,
+    }
 }
 
 /// Marquardt-damps each 3×3 point block in place, `C + λ·diag(C)`, as the
@@ -1243,6 +1295,10 @@ pub fn visual_inertial_bundle_adjust(
     let mut final_cost = f64::MAX;
     let mut initial_cost = f64::MAX;
     let mut cheirality_rejections = 0usize;
+    let mut cheirality_points_held = 0usize;
+    // Whether each observation's reprojection is a Huber inlier at the
+    // current linearization point (refreshed by every system build).
+    let mut vis_inlier = vec![false; observations.len()];
 
     for _iter in 0..params.max_iterations {
         iters_done += 1;
@@ -1267,7 +1323,12 @@ pub fn visual_inertial_bundle_adjust(
 
         let mut cost_vis = 0.0f64;
 
-        for (obs, &depth_row) in observations.iter().zip(&depth_on) {
+        for ((obs, &depth_row), inlier) in observations
+            .iter()
+            .zip(&depth_on)
+            .zip(vis_inlier.iter_mut())
+        {
+            *inlier = false;
             if obs.pose_idx >= n_kf || obs.point_idx >= n_pts {
                 continue;
             }
@@ -1282,6 +1343,7 @@ pub fn visual_inertial_bundle_adjust(
             let jx_raw: [f64; 6] = std::array::from_fn(|i| jx_f32[i] as f64);
 
             let chi2_vis = r_raw[0] * r_raw[0] + r_raw[1] * r_raw[1];
+            *inlier = chi2_vis <= params.huber_reproj_px_sq;
             let (hw_vis, c_vis) = visual_huber(chi2_vis, params.huber_reproj_px_sq);
             cost_vis += c_vis;
             let sqrt_hw_vis = hw_vis.sqrt();
@@ -1715,9 +1777,19 @@ pub fn visual_inertial_bundle_adjust(
 
         // A step that puts an observed landmark behind its camera is not a
         // better fit, whatever the cost says: the projection clamps such a
-        // depth (MIN_Z), so the cost no longer describes it. Treat it as a
-        // cost increase.
-        if cheirality_flips(observations, (&kfs, &xyz), (&kfs_trial, &xyz_trial)) > 0 {
+        // depth (MIN_Z), so the cost no longer describes it. Hold the
+        // landmarks whose own step does it; a step whose camera motion still
+        // does it to an inlier observation counts as a cost increase.
+        let cheirality = enforce_cheirality(
+            observations,
+            &vis_inlier,
+            &point_local,
+            (&kfs, &xyz),
+            &kfs_trial,
+            &mut xyz_trial,
+        );
+        cheirality_points_held += cheirality.points_held;
+        if cheirality.refuse {
             cheirality_rejections += 1;
             lambda *= 10.0;
             if lambda > 1e10 {
@@ -1876,12 +1948,64 @@ pub fn visual_inertial_bundle_adjust(
         initial_cost,
         depth_rows_gated,
         cheirality_rejections,
+        cheirality_points_held,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ViBaParams, visual_huber};
+    use super::{ViBaParams, imu_weight_and_cost, visual_huber};
+
+    /// The IMU edge's cost (used by both the system build and the trial
+    /// step) has the gradient the normal equations use: `w Ω r` on the
+    /// Huber-robustified nav rows 0-8, `Ω r` on the quadratic bias rows
+    /// 9-14, inside and past `huber_imu_chi2`.
+    ///
+    /// Red (2026-10-13, mutated in place) with the old `½ w chi²` nav cost,
+    /// and with the bias block taken over rows 8-14.
+    #[test]
+    fn imu_cost_gradient_is_the_weighted_gradient() {
+        // Block-diagonal SPD omega: a coupled nav block, a diagonal bias block.
+        let mut omega = [0.0f64; 225];
+        for i in 0..9 {
+            for j in 0..9 {
+                omega[i * 15 + j] = if i == j {
+                    4.0 + i as f64
+                } else {
+                    0.3 / (1.0 + (i as f64 - j as f64).abs())
+                };
+            }
+        }
+        for i in 9..15 {
+            omega[i * 15 + i] = 50.0 + 10.0 * i as f64;
+        }
+        let k = ViBaParams::default().huber_imu_chi2;
+        for scale in [0.05, 3.0] {
+            let res: [f64; 15] = std::array::from_fn(|i| {
+                scale * (0.4 + 0.1 * i as f64) * if i % 2 == 0 { 1.0 } else { -1.0 }
+            });
+            let (w, _) = imu_weight_and_cost(&res, &omega, k);
+            assert!(
+                if scale > 1.0 { w < 1.0 } else { w == 1.0 },
+                "{scale}: w = {w}"
+            );
+            for d in 0..15 {
+                let h = 1e-6;
+                let (mut up, mut down) = (res, res);
+                up[d] += h;
+                down[d] -= h;
+                let numeric = (imu_weight_and_cost(&up, &omega, k).1
+                    - imu_weight_and_cost(&down, &omega, k).1)
+                    / (2.0 * h);
+                let omega_r: f64 = (0..15).map(|m| omega[d * 15 + m] * res[m]).sum();
+                let analytic = if d < 9 { w * omega_r } else { omega_r };
+                assert!(
+                    (numeric - analytic).abs() <= 1e-5 * analytic.abs().max(1.0),
+                    "scale {scale}, row {d}: {numeric} vs {analytic}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn visual_huber_defaults_and_weights() {

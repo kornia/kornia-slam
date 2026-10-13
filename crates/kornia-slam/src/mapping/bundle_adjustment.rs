@@ -539,6 +539,7 @@ pub fn run_local_inertial_ba(
         converged: vi_result.converged,
         depth_rows_gated: vi_result.depth_rows_gated,
         cheirality_rejections: vi_result.cheirality_rejections,
+        cheirality_points_held: vi_result.cheirality_points_held,
         points_rejected,
     });
     update
