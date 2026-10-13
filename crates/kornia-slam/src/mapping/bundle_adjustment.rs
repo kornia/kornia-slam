@@ -550,7 +550,7 @@ pub fn run_local_inertial_ba(
 /// the nearest observer grown more than [`WRITE_BACK_MAX_GROWTH`]-fold and
 /// beyond [`WRITE_BACK_FAR_M`]). States are `(keyframes, landmarks)` before
 /// and after the solve.
-fn landmarks_to_write_back(
+pub(super) fn landmarks_to_write_back(
     observations: &[BaObservation],
     before: (&[ViBaKeyframe], &[Vec3F64]),
     after: (&[ViBaKeyframe], &[Vec3F64]),

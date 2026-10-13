@@ -47,13 +47,20 @@
 //! mismatched association, whose pull the robust cost already bounds).
 //!
 //! A landmark seen from (nearly) one viewpoint, as every landmark of a parked
-//! window is, has an unobservable depth: its C block is rank 2. C is
-//! therefore Marquardt-damped like the keyframe system, and a stereo depth row
-//! whose landmark is far from the measured depth at the start is left out of
-//! the solve ([`ViBaParams::depth_gate_factor`]). Without both, a landmark
-//! flung far along its ray in one window made the next window's depth row a
-//! residual of ~1e8 sigma, which the solver lowered by turning a keyframe by
-//! ~90°.
+//! window is, has an unobservable depth: its C block is rank 2, or nearly so.
+//! C is therefore Marquardt-damped like the keyframe system. That keeps the
+//! point step finite (undamped, a parked window flung such a landmark ~1e7 m
+//! along its ray), but it does not make the depth observable: over a chain of
+//! parked windows a depth-free landmark still walks out along its ray with the
+//! tracking noise, to tens or hundreds of times its depth. What keeps a
+//! landmark that got far from turning a keyframe is the depth gate: a stereo
+//! depth row whose landmark is far from the measured depth at the start is
+//! left out of the solve ([`ViBaParams::depth_gate_factor`]). Without it, a
+//! flung landmark made
+//! the next window's depth row a residual of ~1e8 sigma, which the solver
+//! lowered by turning a keyframe by ~90°. `run_local_inertial_ba` also refuses
+//! to write back a landmark one solve moved more than tenfold and beyond 50 m,
+//! which catches a fling but not a slow walk.
 
 use faer::Mat;
 use faer::prelude::Solve;
@@ -347,7 +354,9 @@ fn enforce_cheirality(
 /// Marquardt-damps each 3×3 point block in place, `C + λ·diag(C)`, as the
 /// keyframe system is damped. A landmark seen from one viewpoint has a rank-2
 /// C (no curvature along its ray); undamped, its inverse sends the point step
-/// out along the ray by whatever round-off left there.
+/// out along the ray by whatever round-off left there. Damping bounds the
+/// step, not the depth: λ falls to its floor on accepted steps, so a
+/// depth-free landmark still drifts along its ray across windows.
 fn damp_point_blocks(c_blocks: &mut [[f64; 9]], lambda: f64) {
     for cb in c_blocks {
         for d in 0..3 {

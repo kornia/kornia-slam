@@ -138,8 +138,9 @@ fn max_active_rotation_deg(result: &ViBaResult) -> f64 {
 /// Red without the fix (2026-10-13, guards reverted in place): with the point
 /// block undamped, no depth gate and no cheirality check an active keyframe
 /// turns by 136.7°; with only the gate reverted, by 90.1°. The gate is the
-/// guard that rescues a landmark already flung; damping is what keeps a solve
-/// from flinging it ([`damping_makes_a_rank_two_point_block_invertible`]).
+/// guard here: damping bounds a solve's point step, but a depth-free landmark
+/// still walks far along its ray over parked windows
+/// ([`damping_bounds_how_far_a_parked_chain_walks_a_depth_free_landmark`]).
 #[test]
 fn a_flung_landmark_with_a_stereo_depth_does_not_rotate_the_window() {
     let (keyframes, points, observations) = flung_window();
@@ -550,4 +551,200 @@ fn a_moving_window_converges_past_a_near_plane_outlier() {
         .z;
     assert!(z < 0.0, "the keyframe never passed the outlier (z = {z})");
     assert_eq!(result.cheirality_rejections, 0);
+}
+
+/// Deterministic standard-normal draws (xorshift64* and Box-Muller), so the
+/// parked chain below is reproducible without a `rand` dependency.
+struct Gauss(u64);
+
+impl Gauss {
+    fn uniform(&mut self) -> f64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        ((self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    }
+
+    fn normal(&mut self) -> f64 {
+        let (a, b) = (self.uniform(), self.uniform());
+        (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
+    }
+
+    fn vec3(&mut self, sigma: f64) -> Vec3F64 {
+        Vec3F64::new(self.normal(), self.normal(), self.normal()) * sigma
+    }
+}
+
+/// A camera parked for many windows. Every window has six keyframes (the
+/// first three fixed) whose pose estimates are the true parked pose plus
+/// tracking noise (1 mm, 0.02°), and pixels that are the true projections
+/// plus 0.3 px. The landmarks are [`flung_window`]'s grid: the even ones have
+/// stereo depth, the odd ones none, and every one starts at its true
+/// position. Each window starts from the landmarks the previous one left.
+struct ParkedChain {
+    rng: Gauss,
+    truth: Vec<Vec3F64>,
+    points: Vec<Vec3F64>,
+}
+
+impl ParkedChain {
+    fn new(seed: u64) -> Self {
+        let pose = parked_pose();
+        let mut truth = Vec::new();
+        for i in 0..6 {
+            for j in 0..5 {
+                let (u, v) = (60.0 + 100.0 * i as f64, 40.0 + 80.0 * j as f64);
+                let z = 1.0 + 0.4 * ((i + 2 * j) % 7) as f64;
+                truth.push(point_at(&pose, u, v, z));
+            }
+        }
+        Self {
+            rng: Gauss(0x9e37_79b9_7f4a_7c15 ^ seed),
+            points: truth.clone(),
+            truth,
+        }
+    }
+
+    /// Solves the next window with the default parameters (so the default λ
+    /// schedule) and takes its landmarks: all of them, or with `guard` only
+    /// those [`landmarks_to_write_back`] keeps, as `run_local_inertial_ba`
+    /// does. With `stereo_on_depth_free`, the newest keyframe also measures
+    /// every depth-free landmark by stereo, at its true depth.
+    fn window(&mut self, guard: bool, stereo_on_depth_free: bool) -> ViBaResult {
+        let truth_pose = parked_pose();
+        let rng = &mut self.rng;
+        let keyframes: Vec<ViBaKeyframe> = (0..N_KF)
+            .map(|k| {
+                let r_cw =
+                    SO3F64::exp(rng.vec3(0.02f64.to_radians())).matrix() * truth_pose.rotation;
+                let centre = truth_pose.inverse().translation + rng.vec3(1e-3);
+                ViBaKeyframe {
+                    pose: Pose3d::new(r_cw, -(r_cw * centre)),
+                    velocity: Vec3F64::ZERO,
+                    bias: ImuBias::default(),
+                    fixed: k < N_FIXED,
+                }
+            })
+            .collect();
+        let mut observations = Vec::new();
+        for (k, kf) in keyframes.iter().enumerate() {
+            for (j, p) in self.truth.iter().enumerate() {
+                let px = pixel(&truth_pose, p);
+                let measured = j % 2 == 0 || (stereo_on_depth_free && k == N_KF - 1);
+                let (depth_meas, depth_sigma) = if measured {
+                    stereo(truth_pose.transform_point(p).z)
+                } else {
+                    (None, 1.0)
+                };
+                observations.push(BaObservation {
+                    pose_idx: k,
+                    point_idx: j,
+                    pixel: [
+                        px[0] + (0.3 * rng.normal()) as f32,
+                        px[1] + (0.3 * rng.normal()) as f32,
+                    ],
+                    fixed_pose: kf.fixed,
+                    fixed_point: false,
+                    depth_meas,
+                    depth_sigma,
+                });
+            }
+        }
+        let result = visual_inertial_bundle_adjust(
+            &keyframes,
+            &self.points,
+            &observations,
+            &[],
+            &[],
+            &[],
+            &camera(),
+            &ViBaParams::default(),
+        )
+        .unwrap();
+        let keep = if guard {
+            crate::mapping::bundle_adjustment::landmarks_to_write_back(
+                &observations,
+                (&keyframes, &self.points),
+                (&result.keyframes, &result.points),
+            )
+        } else {
+            vec![true; result.points.len()]
+        };
+        for ((p, new), keep) in self.points.iter_mut().zip(&result.points).zip(keep) {
+            if keep {
+                *p = *new;
+            }
+        }
+        result
+    }
+
+    /// The largest factor by which a depth-free landmark's camera depth is
+    /// off its true depth, either way (1 = every one where it should be).
+    fn worst_depth_ratio(&self) -> f64 {
+        let pose = parked_pose();
+        let z = |p: &Vec3F64| pose.transform_point(p).z;
+        (1..self.truth.len())
+            .step_by(2)
+            .map(|j| (z(&self.points[j]) / z(&self.truth[j])).abs())
+            .map(|r| r.max(1.0 / r))
+            .fold(1.0, f64::max)
+    }
+}
+
+const CHAIN_WINDOWS: usize = 12;
+
+/// Damping at the solver, from landmarks at their true depth: a parked chain
+/// with tracking noise and the default λ schedule. Damping does NOT keep a
+/// depth-free landmark at its depth: none is observable from one place, and
+/// across windows these walk out along their rays with the noise, to tens or
+/// hundreds of times their depth (measured 2026-10-13: up to 542x and 2315x
+/// for the two seeds). What it bounds is the step: with the point blocks
+/// undamped (mutated in place, same date) the same chain flings them
+/// 4.3e6x-1.7e7x, the ~1e7 m the parked robot showed, and this test is red.
+/// A landmark that got that far is the depth gate's job
+/// ([`a_flung_landmark_with_a_stereo_depth_does_not_rotate_the_window`]).
+#[test]
+fn damping_bounds_how_far_a_parked_chain_walks_a_depth_free_landmark() {
+    for seed in [1, 2] {
+        let mut chain = ParkedChain::new(seed);
+        let mut worst = 1.0f64;
+        for _ in 0..CHAIN_WINDOWS {
+            chain.window(false, false);
+            worst = worst.max(chain.worst_depth_ratio());
+        }
+        assert!(
+            worst < 1e5,
+            "seed {seed}: a depth-free landmark walked {worst:.3e}x its depth"
+        );
+    }
+}
+
+/// The walk damping leaves ([`damping_bounds_how_far_a_parked_chain_walks_a_depth_free_landmark`]),
+/// through the write-back guard as `run_local_inertial_ba` applies it: the
+/// guard does not hold the depth either (each window may grow a landmark up
+/// to tenfold, or to 50 m). When the newest keyframe of the next window then
+/// measures every depth-free landmark by stereo at its true depth, the rows
+/// of the landmarks that walked far are gated, and no keyframe turns.
+///
+/// Only the gated count goes red with the gate removed (2026-10-13, mutated
+/// in place): a walk of this size, unlike a ~1e7 fling, does not turn a
+/// keyframe even ungated, nor with cheirality and damping removed too; the
+/// Huber kernel and the well-measured grid hold it.
+#[test]
+fn a_parked_chain_s_walked_landmarks_are_gated_when_stereo_measures_them() {
+    for seed in [1, 2] {
+        let mut chain = ParkedChain::new(seed);
+        for _ in 0..CHAIN_WINDOWS {
+            chain.window(true, false);
+        }
+        let walked = chain.worst_depth_ratio();
+        assert!(walked > 10.0, "seed {seed}: walked only {walked:.1}x");
+        let result = chain.window(true, true);
+        assert!(result.depth_rows_gated > 0, "seed {seed}: nothing gated");
+        let rot = max_active_rotation_deg(&result);
+        assert!(
+            rot < 1.0,
+            "seed {seed}: an active keyframe turned by {rot:.2} deg"
+        );
+    }
 }
