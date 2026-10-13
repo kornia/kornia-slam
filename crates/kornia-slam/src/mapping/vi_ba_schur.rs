@@ -92,6 +92,16 @@ const MIN_DAMPING_FLOOR: f64 = 1e-6;
 /// gated by the noise of a small depth (see [`ViBaParams::depth_gate_factor`]).
 const DEPTH_GATE_MARGIN_M: f64 = 1.0;
 
+/// A landmark whose starting depth exceeds this many times the depth gate's
+/// bound is re-seeded on a single depth row: no plausible scene puts it
+/// there, so the measurement is the better guess (the ~1e7 m landmarks a
+/// parked window flung). Nearer than that, a single row may be the bad one,
+/// and a re-seed needs a second row that agrees.
+const RESEED_UNCORROBORATED_FACTOR: f64 = 100.0;
+
+/// Sigmas within which a second depth row must agree with a re-seed.
+const RESEED_AGREEMENT_SIGMAS: f64 = 3.0;
+
 /// Errors specific to VI-BA.
 #[derive(Debug, Error)]
 pub enum ViBaError {
@@ -115,6 +125,8 @@ pub enum ViBaError {
     StationaryFactorOutOfRange(usize, usize),
     #[error("Stationary edge {0} is invalid (see StationaryFactor::is_valid)")]
     InvalidStationaryFactor(usize),
+    #[error("depth_gate_factor {0} is not positive (NaN, zero and negative are refused)")]
+    InvalidDepthGateFactor(f64),
     #[error(transparent)]
     Ba(#[from] BaError),
 }
@@ -210,8 +222,13 @@ pub struct ViBaParams {
     /// landmark whose every depth row is beyond the bound (in front of the
     /// camera) is first moved along its best measured ray to that depth, and
     /// its rows then enter the solve: gated, nothing else would ever restore
-    /// its depth. Default 10; `f64::INFINITY` gates only landmarks behind
-    /// the camera.
+    /// its depth. That move needs corroboration: a second gated depth row
+    /// that agrees with the re-seeded position, or a starting depth beyond
+    /// 100 times the gate bound; otherwise the rows are only gated, so one
+    /// bad stereo match cannot pull a correct landmark onto itself. Default
+    /// 10; `f64::INFINITY` gates only landmarks behind the camera. Must be
+    /// positive: NaN, zero or a negative value is refused
+    /// ([`ViBaError::InvalidDepthGateFactor`]).
     pub depth_gate_factor: f64,
 }
 
@@ -260,7 +277,8 @@ pub struct ViBaResult {
     pub depth_rows_gated: usize,
     /// Free landmarks moved, before the solve, to the measured depth along
     /// an observing ray because every depth row on them was beyond the depth
-    /// gate (see [`ViBaParams::depth_gate_factor`]).
+    /// gate and the move was corroborated (see
+    /// [`ViBaParams::depth_gate_factor`]).
     pub points_reseeded: usize,
     /// Steps refused because their camera motion moved a landmark behind a
     /// camera whose observation of it is a Huber inlier.
@@ -284,6 +302,13 @@ fn depth_gate_bound(d: f32, factor: f64) -> f64 {
 /// bearing, so without this it would stay gated, and wrong, in every later
 /// window. A landmark any depth row agrees with, or one behind a camera, is
 /// left alone.
+///
+/// One erroneous stereo depth must not pull a correct far landmark onto
+/// itself, so the move needs corroboration: another gated depth row whose
+/// predicted depth at the re-seeded position is within
+/// [`RESEED_AGREEMENT_SIGMAS`] of its measurement, or a starting depth past
+/// [`RESEED_UNCORROBORATED_FACTOR`] times the gate bound. Without it the
+/// landmark stays put and its rows are only gated.
 fn reseed_walked_landmarks(
     keyframes: &[ViBaKeyframe],
     points: &mut [Vec3F64],
@@ -291,8 +316,8 @@ fn reseed_walked_landmarks(
     point_free: &[bool],
     factor: f64,
 ) -> usize {
-    // Per landmark: (any depth row in the gate or behind, best gated row).
-    let mut rows: Vec<(bool, Option<(f32, usize)>)> = vec![(false, None); points.len()];
+    // Per landmark: (any depth row in the gate or behind, gated rows).
+    let mut rows: Vec<(bool, Vec<usize>)> = vec![(false, Vec::new()); points.len()];
     for (o, obs) in observations.iter().enumerate() {
         let Some(d) = obs.depth_meas else {
             continue;
@@ -304,25 +329,45 @@ fn reseed_walked_landmarks(
         let row = &mut rows[obs.point_idx];
         if z <= 0.0 || z < depth_gate_bound(d, factor) {
             row.0 = true;
-        } else if row.1.is_none_or(|(sigma, _)| obs.depth_sigma < sigma) {
-            row.1 = Some((obs.depth_sigma, o));
+        } else {
+            row.1.push(o);
         }
     }
-    let mut moved = 0;
-    for (j, (blocked, best)) in rows.into_iter().enumerate() {
-        let (false, Some((_, o)), true) = (blocked, best, point_free[j]) else {
-            continue;
-        };
+    let depth_of = |o: usize| {
         let obs = &observations[o];
-        let Some(d) = obs.depth_meas else {
+        (obs.depth_meas.unwrap_or_default(), obs.depth_sigma as f64)
+    };
+    let mut moved = 0;
+    for (j, (blocked, gated)) in rows.into_iter().enumerate() {
+        if blocked || !point_free[j] {
+            continue;
+        }
+        let Some(&best) = gated
+            .iter()
+            .min_by(|&&a, &&b| depth_of(a).1.total_cmp(&depth_of(b).1))
+        else {
             continue;
         };
-        let pose = &keyframes[obs.pose_idx].pose;
+        let (d, sigma) = depth_of(best);
+        let pose = &keyframes[observations[best].pose_idx].pose;
         let p_cam = pose.transform_point(&points[j]);
-        points[j] = pose
+        let candidate = pose
             .inverse()
             .transform_point(&(p_cam * (d as f64 / p_cam.z)));
-        moved += 1;
+        let implausible = p_cam.z > RESEED_UNCORROBORATED_FACTOR * depth_gate_bound(d, factor);
+        let corroborated = gated.iter().filter(|&&o| o != best).any(|&o| {
+            let (d_o, sigma_o) = depth_of(o);
+            let z_o = keyframes[observations[o].pose_idx]
+                .pose
+                .transform_point(&candidate)
+                .z;
+            let tolerance = RESEED_AGREEMENT_SIGMAS * (sigma * sigma + sigma_o * sigma_o).sqrt();
+            (z_o - d_o as f64).abs() <= tolerance
+        });
+        if implausible || corroborated {
+            points[j] = candidate;
+            moved += 1;
+        }
     }
     moved
 }
@@ -564,10 +609,13 @@ fn depth_residual_and_jacobian(
     let s21 = pz * r20 - px * r22;
     let s22 = -py * r20 + px * r21;
 
+    // Right perturbation `T · exp([ρ|ω])`: z = row 2 of `R (p_w + ρ + ω×p_w) + t`
+    // to first order, so the translation part is row 2 of R, the same row the
+    // point Jacobian takes (not `(0, 0, 1)`, which holds only for R = I).
     let j_pose = [
-        0.0,
-        0.0,
-        inv_sigma,
+        r20 * inv_sigma,
+        r21 * inv_sigma,
+        r22 * inv_sigma,
         s20 * inv_sigma,
         s21 * inv_sigma,
         s22 * inv_sigma,
@@ -1282,6 +1330,12 @@ pub fn visual_inertial_bundle_adjust(
     params: &ViBaParams,
 ) -> Result<ViBaResult, ViBaError> {
     const KF_DOF: usize = 15; // keyframe dimensions
+
+    // NaN would gate (and first re-seed) every depth row; 0 or less would
+    // gate every correct one. +inf is the documented "no upper bound".
+    if params.depth_gate_factor.is_nan() || params.depth_gate_factor <= 0.0 {
+        return Err(ViBaError::InvalidDepthGateFactor(params.depth_gate_factor));
+    }
 
     let n_kf = keyframes.len();
     let n_pts = points.len();
@@ -2041,7 +2095,89 @@ pub fn visual_inertial_bundle_adjust(
 
 #[cfg(test)]
 mod tests {
-    use super::{ViBaParams, imu_weight_and_cost, visual_huber};
+    use super::{ViBaParams, depth_residual_and_jacobian, imu_weight_and_cost, visual_huber};
+    use kornia_algebra::{SE3F32, SO3F32, SO3F64, Vec3AF32, Vec3F64};
+
+    /// The stereo depth row's analytic Jacobian matches central differences
+    /// of the predicted depth under the solver's right perturbation
+    /// `T · exp([ρ|ω])` (the convention of `SE3F32::retract`), for a rotated
+    /// camera. The reference is evaluated in f64 from the same rotation
+    /// entries, so the two agree to 1e-6.
+    ///
+    /// Red on the old code (2026-10-13): its translation part was
+    /// `(0, 0, 1/σ)`, right only for R = I; here row 2 of R is
+    /// `(0.673, 0.254, 0.695)`, so it is off by up to 0.67/σ.
+    #[test]
+    fn depth_jacobian_matches_numeric_differentiation() {
+        let r = SO3F32::exp(Vec3AF32::new(0.4, -0.7, 0.3));
+        let pose = SE3F32 {
+            r,
+            t: Vec3AF32::new(0.2, -0.1, 0.5),
+        };
+        let point = Vec3F64::new(0.8, -0.3, 3.1);
+        let (d_meas, sigma) = (2.5, 0.07);
+        let (r_z, j_pose, j_point) = depth_residual_and_jacobian(&pose, &point, d_meas, sigma);
+
+        let m = pose.r.matrix();
+        let rot: [[f64; 3]; 3] = std::array::from_fn(|i| {
+            let c = [m.col(0), m.col(1), m.col(2)];
+            std::array::from_fn(|j| [c[j].x, c[j].y, c[j].z][i] as f64)
+        });
+        let t = [pose.t.x as f64, pose.t.y as f64, pose.t.z as f64];
+        // Residual at `T · exp([ρ|ω])` and world point `p`, first-order exact
+        // in ρ (V(ω) = I + O(ω)).
+        let residual = |rho: [f64; 3], omega: [f64; 3], p: Vec3F64| {
+            let q = SO3F64::exp(Vec3F64::new(omega[0], omega[1], omega[2])).matrix() * p;
+            let local = [q.x + rho[0], q.y + rho[1], q.z + rho[2]];
+            let z: f64 = (0..3).map(|j| rot[2][j] * local[j]).sum::<f64>() + t[2];
+            (z - d_meas) / sigma
+        };
+        let z0 = residual([0.0; 3], [0.0; 3], point);
+        // r_z is computed in f32 for the point transform.
+        assert!((z0 - r_z).abs() < 1e-4, "{z0} vs {r_z}");
+
+        let h = 1e-6;
+        for k in 0..6 {
+            let (mut up, mut down) = ([0.0f64; 6], [0.0f64; 6]);
+            up[k] = h;
+            down[k] = -h;
+            let eval = |d: [f64; 6]| residual([d[0], d[1], d[2]], [d[3], d[4], d[5]], point);
+            let numeric = (eval(up) - eval(down)) / (2.0 * h);
+            assert!(
+                (numeric - j_pose[k]).abs() < 1e-6 * numeric.abs().max(1.0),
+                "pose column {k}: numeric {numeric} vs analytic {}",
+                j_pose[k]
+            );
+        }
+        for k in 0..3 {
+            let shifted = |dh: f64| {
+                let mut a = [point.x, point.y, point.z];
+                a[k] += dh;
+                Vec3F64::new(a[0], a[1], a[2])
+            };
+            let (up, down) = (shifted(h), shifted(-h));
+            let numeric =
+                (residual([0.0; 3], [0.0; 3], up) - residual([0.0; 3], [0.0; 3], down)) / (2.0 * h);
+            assert!(
+                (numeric - j_point[k]).abs() < 1e-6 * numeric.abs().max(1.0),
+                "point column {k}: numeric {numeric} vs analytic {}",
+                j_point[k]
+            );
+        }
+
+        // The reference perturbs the way the solver's retraction does: a
+        // coarse f32 step through `SE3F32::retract` moves the depth by J·δ.
+        for k in 0..6 {
+            let mut delta = [0.0f32; 6];
+            delta[k] = 1e-2;
+            let moved = depth_residual_and_jacobian(&pose.retract(&delta), &point, d_meas, sigma).0;
+            let predicted = r_z + j_pose[k] * 1e-2;
+            assert!(
+                (moved - predicted).abs() < 2e-3 * (1.0 / sigma),
+                "retract column {k}: {moved} vs {predicted}"
+            );
+        }
+    }
 
     /// The IMU edge's cost (used by both the system build and the trial
     /// step) has the gradient the normal equations use: `w Ω r` on the

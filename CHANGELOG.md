@@ -207,12 +207,18 @@ keyframe by 137° with them reverted):
   that got far from turning a keyframe when stereo next measures it;
 - a stereo depth row is left out of the solve when, at the start, the
   landmark's depth in that camera is outside `(0, 10·d + 1 m)` for measured
-  depth `d` (`ViBaParams::depth_gate_factor`, default 10). A free landmark
+  depth `d` (`ViBaParams::depth_gate_factor`, default 10; NaN, zero and
+  negative values are refused with `ViBaError::InvalidDepthGateFactor`,
+  `f64::INFINITY` keeps only the behind-the-camera check). A free landmark
   whose every depth row lies beyond that bound is first moved along the ray
   of its best measured observation to the measured depth, and its rows then
   enter the solve: reprojection rows constrain only its bearing, so a gated
   landmark would otherwise stay wrong (and gated) in every later window,
-  including the moving ones after the robot drives off;
+  including the moving ones after the robot drives off. The move needs
+  corroboration, so one bad stereo match cannot pull a correct landmark onto
+  itself: a second gated depth row that agrees with the moved position within
+  three combined sigmas, or a starting depth more than 100 times the gate's
+  bound (the ~1e7 m flings). Otherwise the rows are only gated;
 - a step may not move a landmark from in front of an observing camera to
   behind it: a free landmark whose own step does that keeps its old position
   for that step, and a step whose camera motion does it is refused (λ grows)
@@ -232,6 +238,15 @@ the update
 `run_local_inertial_ba` returns carries them, with the write-back guard's
 count, in `BaUpdate::solve_stats` (`LocalBaStats`; `None` from the visual
 solvers).
+
+**The stereo depth row's pose Jacobian is right for a rotated camera.** Its
+translation part was `(0, 0, 1/σ)`, which holds only when the camera's
+rotation is the identity; under the solver's right perturbation it is row 2
+of the rotation, `(r20, r21, r22)/σ`, as the reprojection rows and the
+depth row's own point Jacobian already had. With the wrong column, every
+rotated keyframe's Gauss-Newton step from a stereo depth row pushed its
+translation along the wrong axis. A numeric-differentiation test pins it.
+Expect small changes in VI-BA results on stereo-inertial data.
 
 **Huber costs match their weights.** Every robustified VI-BA term (reprojection,
 stereo depth, IMU navigation block, wheel, stationary) weighted its normal

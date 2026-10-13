@@ -197,7 +197,10 @@ fn a_fixed_flung_landmark_is_gated_and_does_not_rotate_the_window() {
 }
 
 /// The re-seed moves a free landmark only when every depth row on it is
-/// beyond the gate, along the best measured row's ray, to its depth.
+/// beyond the gate, along the best measured row's ray, to its depth. (The
+/// flung landmark here is 1e7 m out, past the uncorroborated bound, so its
+/// one row is enough; see
+/// [`a_single_bad_depth_row_does_not_reseed_a_plausible_landmark`].)
 #[test]
 fn reseed_moves_only_landmarks_every_depth_row_disagrees_with() {
     let (keyframes, points, mut observations) = flung_window();
@@ -686,8 +689,9 @@ impl ParkedChain {
     /// Solves the next window with the default parameters (so the default λ
     /// schedule) and takes its landmarks: all of them, or with `guard` only
     /// those [`landmarks_to_write_back`] keeps, as `run_local_inertial_ba`
-    /// does. With `stereo_on_depth_free`, the newest keyframe also measures
-    /// every depth-free landmark by stereo, at its true depth.
+    /// does. With `stereo_on_depth_free`, the newest two keyframes also
+    /// measure every depth-free landmark by stereo, at its true depth (two
+    /// rows, so a re-seed is corroborated).
     fn window(&mut self, guard: bool, stereo_on_depth_free: bool) -> ViBaResult {
         self.window_moving(guard, stereo_on_depth_free, 0.0)
     }
@@ -731,7 +735,7 @@ impl ParkedChain {
             let truth_pose = &truth_poses[k];
             for (j, p) in self.truth.iter().enumerate() {
                 let px = pixel(truth_pose, p);
-                let measured = j % 2 == 0 || (stereo_on_depth_free && k == N_KF - 1);
+                let measured = j % 2 == 0 || (stereo_on_depth_free && k >= N_KF - 2);
                 let (depth_meas, depth_sigma) = if measured {
                     stereo(truth_pose.transform_point(p).z)
                 } else {
@@ -823,8 +827,8 @@ fn damping_bounds_how_far_a_parked_chain_walks_a_depth_free_landmark() {
 /// The walk damping leaves ([`damping_bounds_how_far_a_parked_chain_walks_a_depth_free_landmark`]),
 /// through the write-back guard as `run_local_inertial_ba` applies it: the
 /// guard does not hold the depth either (each window may grow a landmark up
-/// to tenfold, or to 50 m). When the newest keyframe of the next window then
-/// measures every depth-free landmark by stereo at its true depth, the
+/// to tenfold, or to 50 m). When the newest two keyframes of the next window then
+/// measure every depth-free landmark by stereo at its true depth, the
 /// landmarks that walked past the depth gate are re-seeded at the measured
 /// depth instead of gated, no keyframe turns, and every depth-free landmark
 /// ends near its true depth. A moving window after that (the robot drives
@@ -864,5 +868,95 @@ fn a_parked_chain_s_walked_landmarks_are_restored_when_stereo_measures_them() {
             after < 1.2,
             "seed {seed}: after driving off a landmark is {after:.2}x off its depth"
         );
+    }
+}
+
+/// One erroneous stereo depth must not pull a correct far landmark onto
+/// itself. A landmark at 30 m, measured once at 2 m: its row is gated (bound
+/// 21 m) but the landmark stays where it is. A second gated row that agrees
+/// with the 2 m re-seed corroborates it and the landmark moves; a second row
+/// that disagrees (2.6 m, beyond three combined sigmas) does not.
+///
+/// Red before corroboration was required (2026-10-13): the single row
+/// re-seeded the landmark to 2 m.
+#[test]
+fn a_single_bad_depth_row_does_not_reseed_a_plausible_landmark() {
+    let (keyframes, mut points, mut observations) = flung_window();
+    let pose = parked_pose();
+    points[0] = point_at(&pose, 410.0, 150.0, 30.0);
+    let start = points.clone();
+    let free = vec![true; points.len()];
+    let row_of = |k: usize| {
+        observations
+            .iter()
+            .position(|o| o.point_idx == 0 && o.pose_idx == k)
+            .unwrap()
+    };
+    let (newest, second) = (row_of(N_KF - 1), row_of(N_KF - 2));
+    (
+        observations[newest].depth_meas,
+        observations[newest].depth_sigma,
+    ) = stereo(2.0);
+    let reseed = |pts: &mut Vec<Vec3F64>, obs: &[BaObservation]| {
+        reseed_walked_landmarks(&keyframes, pts, obs, &free, 10.0)
+    };
+
+    let mut pts = start.clone();
+    assert_eq!(reseed(&mut pts, &observations), 0);
+    assert_eq!(pts, start);
+    let (_, gated) = depth_gate(&keyframes, &pts, &observations, 10.0);
+    assert_eq!(gated, 1, "the bad row is still kept out of the solve");
+
+    // Disagreeing second row: still left alone.
+    (
+        observations[second].depth_meas,
+        observations[second].depth_sigma,
+    ) = stereo(2.6);
+    let mut pts = start.clone();
+    assert_eq!(reseed(&mut pts, &observations), 0);
+    assert_eq!(pts, start);
+
+    // Agreeing second row: corroborated, moved to 2 m along the ray.
+    (
+        observations[second].depth_meas,
+        observations[second].depth_sigma,
+    ) = stereo(2.05);
+    let mut pts = start.clone();
+    assert_eq!(reseed(&mut pts, &observations), 1);
+    let z = pose.transform_point(&pts[0]).z;
+    assert!((z - 2.0).abs() < 1e-5, "re-seeded to {z} m");
+}
+
+/// `depth_gate_factor` must be positive: NaN would gate (and first re-seed)
+/// every depth row, zero or a negative value would gate every correct one.
+/// `f64::INFINITY` is the documented "no upper bound" and is accepted.
+#[test]
+fn depth_gate_factor_must_be_positive() {
+    let (keyframes, points, observations) = flung_window();
+    let solve = |factor: f64| {
+        visual_inertial_bundle_adjust(
+            &keyframes,
+            &points,
+            &observations,
+            &[],
+            &[],
+            &[],
+            &camera(),
+            &ViBaParams {
+                max_iterations: 2,
+                depth_gate_factor: factor,
+                ..ViBaParams::default()
+            },
+        )
+    };
+    for bad in [f64::NAN, 0.0, -1.0, f64::NEG_INFINITY] {
+        let refused = matches!(
+            solve(bad),
+            Err(ViBaError::InvalidDepthGateFactor(f)) if f.to_bits() == bad.to_bits()
+        );
+        assert!(refused, "{bad} was accepted");
+    }
+    for good in [1e-3, 10.0, f64::INFINITY] {
+        assert!(solve(good).is_ok(), "{good} was refused");
     }
 }
