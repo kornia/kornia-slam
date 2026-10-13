@@ -49,8 +49,10 @@ impl Default for KeyframePolicy {
 }
 
 /// What the tracker measured on the current frame, for
-/// [`KeyframePolicy::should_insert_with`].
+/// [`KeyframePolicy::should_insert_with`]. `#[non_exhaustive]`: build it with
+/// [`Self::new`] or from [`Default`].
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[non_exhaustive]
 pub struct KeyframeEvidence {
     /// `Frame::idx` of the current frame.
     pub curr_idx: usize,
@@ -64,6 +66,25 @@ pub struct KeyframeEvidence {
     /// the last keyframe, pixels (see [`super::median_parallax_px`]); `None`
     /// when it was not measured.
     pub median_parallax_px: Option<f64>,
+}
+
+impl KeyframeEvidence {
+    /// Evidence without a parallax measurement; set `median_parallax_px`
+    /// when it was measured.
+    pub fn new(
+        curr_idx: usize,
+        last_keyframe_idx: Option<usize>,
+        tracked_inliers: usize,
+        n_ref_map_points: usize,
+    ) -> Self {
+        Self {
+            curr_idx,
+            last_keyframe_idx,
+            tracked_inliers,
+            n_ref_map_points,
+            median_parallax_px: None,
+        }
+    }
 }
 
 /// Fewest tracked inliers for which a low reference ratio still earns a
@@ -82,13 +103,12 @@ impl KeyframePolicy {
         tracked_inliers: usize,
         n_ref_map_points: usize,
     ) -> bool {
-        self.should_insert_with(&KeyframeEvidence {
+        self.should_insert_with(&KeyframeEvidence::new(
             curr_idx,
             last_keyframe_idx,
             tracked_inliers,
             n_ref_map_points,
-            median_parallax_px: None,
-        })
+        ))
     }
 
     /// Decide whether a new keyframe should be inserted.

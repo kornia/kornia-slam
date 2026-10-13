@@ -1,6 +1,7 @@
 use super::*;
 use crate::mapping::map::tests::test_frame;
 use crate::mapping::map::{ImuFactor, LandmarkSeed, MapInsertion, ObservationKey};
+use kornia_algebra::{Mat3F64, SO3F64};
 use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 
 const KF_IDS: [usize; 5] = [80, 10, 90, 30, 120];
@@ -509,4 +510,82 @@ fn inertial_ba_repropagation_keeps_the_elided_bias_walk() {
         assert!((g - walk(calib.gyro_bias_noise)).abs() < 1e-3 * g, "{g}");
         assert!((a - walk(calib.accel_bias_noise)).abs() < 1e-3 * a, "{a}");
     }
+}
+
+/// The write-back guard keeps a landmark the solve left behind an observer,
+/// or flung (more than tenfold farther from its nearest observer, and beyond
+/// 50 m), at its old position; ordinary refinements, near or far, pass.
+///
+/// Mutation: dropping the `> WRITE_BACK_FAR_M` half refused the 5 cm → 2 m
+/// refinement be refused.
+#[test]
+fn write_back_guard_refuses_landmarks_behind_or_flung() {
+    let kf = |x: f64| ViBaKeyframe {
+        pose: Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(-x, 0.0, 0.0)),
+        velocity: Vec3F64::ZERO,
+        bias: ImuBias::default(),
+        fixed: false,
+    };
+    let keyframes = [kf(0.0), kf(0.5)];
+    let at = |z: f64| Vec3F64::new(0.1, 0.0, z);
+    // (before, after, written back?)
+    let cases = [
+        (at(2.0), at(2.1), true),
+        (at(0.05), at(2.0), true),      // ~18× but within 50 m
+        (at(300.0), at(400.0), true),   // beyond 50 m but not 10×
+        (at(2.0), at(1e7), false),      // flung along the ray
+        (at(2.0), at(-1.0), false),     // behind both observers
+        (at(2.0), at(f64::NAN), false), // not finite
+    ];
+    let before: Vec<Vec3F64> = cases.iter().map(|c| c.0).collect();
+    let after: Vec<Vec3F64> = cases.iter().map(|c| c.1).collect();
+    let mut observations: Vec<BaObservation> = (0..cases.len())
+        .flat_map(|j| {
+            (0..2).map(move |k| BaObservation {
+                pose_idx: k,
+                point_idx: j,
+                pixel: [0.0, 0.0],
+                fixed_pose: false,
+                fixed_point: false,
+                depth_meas: None,
+                depth_sigma: 1.0,
+            })
+        })
+        .collect();
+    let keep = landmarks_to_write_back(&observations, (&keyframes, &before), (&keyframes, &after));
+    let want: Vec<bool> = cases.iter().map(|c| c.2).collect();
+    assert_eq!(keep, want);
+
+    // Behind only one observer is enough; unobserved landmarks pass.
+    let mut moved = keyframes.clone();
+    moved[1].pose = Pose3d::new(
+        SO3F64::exp(Vec3F64::new(0.0, std::f64::consts::PI, 0.0)).matrix(),
+        Vec3F64::ZERO,
+    );
+    observations.retain(|o| o.point_idx == 0);
+    let keep = landmarks_to_write_back(&observations, (&keyframes, &before), (&moved, &before));
+    assert_eq!(keep, [false, true, true, true, true, true]);
+}
+
+/// `run_local_inertial_ba` reports what its solve did.
+#[test]
+fn local_inertial_ba_reports_its_solve() {
+    let map = fixture();
+    let update = run_local_inertial_ba(
+        map.ba_snapshot(&local_window(&map)),
+        &camera(),
+        None,
+        Vec3F64::ZERO,
+        &[],
+        &[],
+    );
+    let stats = update.solve_stats().expect("the solver ran");
+    assert!(stats.iterations > 0);
+    assert!(stats.initial_cost.is_finite() && stats.final_cost <= stats.initial_cost);
+    assert_eq!(stats.points_rejected, 0);
+    assert!(
+        run_local_ba(map.ba_snapshot(&local_window(&map)), &camera())
+            .solve_stats()
+            .is_none()
+    );
 }

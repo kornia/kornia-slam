@@ -63,7 +63,7 @@ pub use keyframe::Keyframe;
 pub use map_point::{LandmarkObservation, MapPoint, ObservationKey};
 pub use ops::{
     BaSnapshot, BaUpdate, BaUpdateError, BaWindow, InertialAlignment, InertialAlignmentError,
-    KeyframeBaCorrection, KeyframeVelocity, LocalBaMergeResult, MapPointMergeResult,
+    KeyframeBaCorrection, KeyframeVelocity, LocalBaMergeResult, LocalBaStats, MapPointMergeResult,
     PoseGraphCorrectionError, PoseGraphCorrectionResult,
 };
 pub use ops::{

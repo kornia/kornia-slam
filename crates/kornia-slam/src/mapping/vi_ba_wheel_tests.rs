@@ -185,6 +185,23 @@ fn wheel_edge_errors_are_reported() {
         run(nan_extrinsic),
         Err(ViBaError::NonFiniteWheelFactor(0))
     ));
+    // A self-loop's residual is a constant: refused by name.
+    assert!(matches!(
+        run(WheelOdomFactor {
+            to_idx: 1,
+            from_idx: 1,
+            ..edge
+        }),
+        Err(ViBaError::WheelFactorSelfLoop(0))
+    ));
+    for k in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        let mut bad_huber = edge;
+        bad_huber.huber_chi2 = Some(k);
+        assert!(
+            matches!(run(bad_huber), Err(ViBaError::InvalidWheelHuber(0))),
+            "huber {k}"
+        );
+    }
 }
 
 /// Deterministic N(0, 1) samples.

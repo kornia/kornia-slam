@@ -4,9 +4,11 @@
 //! map owns capture and writeback; the local-mapping worker owns scheduling.
 
 use crate::mapping::map::{
-    BaSnapshot, BaUpdate, BaUpdateError, BaWindow, Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR,
+    BaSnapshot, BaUpdate, BaUpdateError, BaWindow, Keyframe, LocalBaStats, Map, ORB_N_LEVELS,
+    ORB_SCALE_FACTOR,
 };
 use crate::mapping::stationary::StationaryFactor;
+use crate::mapping::vi_ba_schur::ViBaKeyframe;
 use crate::mapping::wheel_odom::WheelOdomFactor;
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
@@ -26,6 +28,14 @@ pub const STEREO_DEPTH_MIN_SIGMA: f32 = 0.02;
 
 /// Keyframes a local BA optimizes; older keyframes enter only as fixed poses.
 const MAX_ACTIVE_KFS: usize = 3;
+
+/// Write-back guard of [`run_local_inertial_ba`]: an optimized landmark whose
+/// distance from its nearest observer grew by more than this factor...
+const WRITE_BACK_MAX_GROWTH: f64 = 10.0;
+/// ...and ended beyond this many metres is not written back. Both, so that a
+/// near landmark refined from 5 cm to 1 m, or a far one from 300 to 400 m,
+/// is kept.
+const WRITE_BACK_FAR_M: f64 = 50.0;
 
 /// The local BA window: the three newest keyframes and the live
 /// landmarks they observe, plus, as fixed context, every other keyframe that
@@ -303,6 +313,12 @@ pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
 /// [`StationaryFactor::is_valid`]). Capture the window with
 /// [`local_window_with_neighbors`] so a stationary neighbour of the active
 /// keyframes is in it.
+///
+/// A landmark the solve left behind any keyframe observing it, or flung far
+/// away (its distance from the nearest observer grown more than tenfold and
+/// beyond 50 m), keeps its old position: such a landmark had no depth the
+/// window could observe, and written back it would poison the next window.
+/// [`BaUpdate::solve_stats`] reports how many, with the solver's own counts.
 pub fn run_local_inertial_ba(
     snapshot: BaSnapshot,
     camera: &PinholeCamera,
@@ -314,7 +330,7 @@ pub fn run_local_inertial_ba(
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
     use crate::mapping::vi_ba_schur::{
-        ImuFactor as ViBaImuFactor, ViBaKeyframe, ViBaParams, visual_inertial_bundle_adjust,
+        ImuFactor as ViBaImuFactor, ViBaParams, visual_inertial_bundle_adjust,
     };
 
     const MIN_OBSERVATIONS: usize = 8;
@@ -504,8 +520,72 @@ pub fn run_local_inertial_ba(
         update.keyframes[kf_idx].imu_bias = vi_kf.bias;
     }
 
-    window.write_back(&vi_result.points, &mut update.map_points);
+    let keep = landmarks_to_write_back(
+        &observations,
+        (&vi_keyframes, &window.positions),
+        (&vi_result.keyframes, &vi_result.points),
+    );
+    let points_rejected = keep.iter().filter(|&&k| !k).count();
+    if points_rejected > 0 {
+        debug_eprintln!(
+            "[vi_ba] write-back guard kept {points_rejected} landmark(s) at their old position"
+        );
+    }
+    window.write_back_where(&vi_result.points, &keep, &mut update.map_points);
+    update.solve_stats = Some(LocalBaStats {
+        initial_cost: vi_result.initial_cost,
+        final_cost: vi_result.final_cost,
+        iterations: vi_result.iterations,
+        converged: vi_result.converged,
+        depth_rows_gated: vi_result.depth_rows_gated,
+        cheirality_rejections: vi_result.cheirality_rejections,
+        points_rejected,
+    });
     update
+}
+
+/// Per window landmark, whether its optimized position may be written back:
+/// not behind any keyframe observing it, and not flung far (its distance from
+/// the nearest observer grown more than [`WRITE_BACK_MAX_GROWTH`]-fold and
+/// beyond [`WRITE_BACK_FAR_M`]). States are `(keyframes, landmarks)` before
+/// and after the solve.
+fn landmarks_to_write_back(
+    observations: &[BaObservation],
+    before: (&[ViBaKeyframe], &[Vec3F64]),
+    after: (&[ViBaKeyframe], &[Vec3F64]),
+) -> Vec<bool> {
+    let n = after.1.len();
+    let mut behind = vec![false; n];
+    let mut nearest = vec![(f64::INFINITY, f64::INFINITY); n];
+    let camera_centre = |pose: &Pose3d| pose.inverse().translation;
+    for obs in observations {
+        let (Some(kf_before), Some(kf_after)) =
+            (before.0.get(obs.pose_idx), after.0.get(obs.pose_idx))
+        else {
+            continue;
+        };
+        let (Some(p_before), Some(p_after)) =
+            (before.1.get(obs.point_idx), after.1.get(obs.point_idx))
+        else {
+            continue;
+        };
+        let j = obs.point_idx;
+        behind[j] |= kf_after.pose.transform_point(p_after).z <= 0.0;
+        let d_before = (*p_before - camera_centre(&kf_before.pose)).length();
+        let d_after = (*p_after - camera_centre(&kf_after.pose)).length();
+        nearest[j] = (nearest[j].0.min(d_before), nearest[j].1.min(d_after));
+    }
+    (0..n)
+        .map(|j| {
+            let (d_before, d_after) = nearest[j];
+            if d_before == f64::INFINITY {
+                // Unobserved: the solver did not move it.
+                return true;
+            }
+            let flung = d_after > WRITE_BACK_FAR_M && d_after > WRITE_BACK_MAX_GROWTH * d_before;
+            !behind[j] && d_after.is_finite() && !flung
+        })
+        .collect()
 }
 
 /// Live landmarks a BA window observes, ordered by ascending map index; a
@@ -591,7 +671,18 @@ impl WindowPoints {
     }
 
     fn write_back(&self, optimized: &[Vec3F64], map_points: &mut [Vec3F64]) {
-        for (&slot, point) in self.slots.iter().zip(optimized) {
+        self.write_back_where(optimized, &vec![true; optimized.len()], map_points);
+    }
+
+    /// [`Self::write_back`] of the landmarks whose `keep` is true.
+    fn write_back_where(&self, optimized: &[Vec3F64], keep: &[bool], map_points: &mut [Vec3F64]) {
+        for ((&slot, point), _) in self
+            .slots
+            .iter()
+            .zip(optimized)
+            .zip(keep)
+            .filter(|(_, keep)| **keep)
+        {
             if let Some(mp) = map_points.get_mut(slot) {
                 *mp = *point;
             }

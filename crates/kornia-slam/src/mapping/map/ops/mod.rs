@@ -16,4 +16,4 @@ pub use mutation::{
     MapPointMergeResult, ObservationLink,
 };
 pub use removal::{KeyframeRemoval, KeyframeRemovalError, StillNeighbour, StillSide};
-pub use snapshot::{BaSnapshot, BaUpdate, BaWindow};
+pub use snapshot::{BaSnapshot, BaUpdate, BaWindow, LocalBaStats};

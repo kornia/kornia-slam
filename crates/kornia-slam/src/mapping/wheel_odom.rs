@@ -21,7 +21,6 @@
 //! check, so the few f64 SE(3) pieces live here.
 
 use kornia_3d::pose::Pose3d;
-use kornia_3d::ransac::{HuberKernel, RobustKernel};
 use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 
 /// 6×6 row-major block over the pose tangent `[ρ; ω]`.
@@ -33,7 +32,10 @@ pub(crate) type Mat6 = [[f64; 6]; 6];
 /// not observe z, roll or pitch, so the lift to SE(3) holds them at zero with
 /// the stiff `z_sigma` / `tilt_sigma`; a floor that is not flat is what those
 /// two absorb.
+///
+/// `#[non_exhaustive]`: build it with [`Self::new`].
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct WheelOdomMeasurement {
     /// `(dx, dy, dθ)`: base j in base i, metres and radians.
     pub delta: [f64; 3],
@@ -51,12 +53,23 @@ impl WheelOdomMeasurement {
     pub const DEFAULT_Z_SIGMA: f64 = 0.01;
     pub const DEFAULT_TILT_SIGMA: f64 = 0.01;
 
+    /// A measurement with the default out-of-plane sigmas.
     pub fn new(delta: [f64; 3], covariance: [[f64; 3]; 3]) -> Self {
         Self {
             delta,
             covariance,
             z_sigma: Self::DEFAULT_Z_SIGMA,
             tilt_sigma: Self::DEFAULT_TILT_SIGMA,
+        }
+    }
+
+    /// `self` with the out-of-plane sigmas `z_sigma` (metres) and
+    /// `tilt_sigma` (radians).
+    pub fn with_out_of_plane_sigmas(self, z_sigma: f64, tilt_sigma: f64) -> Self {
+        Self {
+            z_sigma,
+            tilt_sigma,
+            ..self
         }
     }
 
@@ -77,13 +90,19 @@ impl WheelOdomMeasurement {
     /// planar block is therefore `J⁻ᵀ Σ⁻¹ J⁻¹`, so that `rᵀ Ω r` is the
     /// Mahalanobis distance of `δz` under `covariance` whatever the turn.
     ///
-    /// `None` if `delta` is not finite, the covariance is not symmetric
-    /// positive definite, or a sigma is not positive.
+    /// `None` if `delta` or the covariance is not finite, the covariance is
+    /// not symmetric positive definite, or a sigma is not finite and positive.
     pub fn information(&self) -> Option<Mat6> {
-        if !(self.z_sigma > 0.0 && self.tilt_sigma > 0.0) {
+        let positive = |x: f64| x.is_finite() && x > 0.0;
+        if !(positive(self.z_sigma) && positive(self.tilt_sigma)) {
             return None;
         }
-        if !self.delta.iter().all(|v| v.is_finite()) {
+        if !self
+            .delta
+            .iter()
+            .chain(self.covariance.iter().flatten())
+            .all(|v| v.is_finite())
+        {
             return None;
         }
         let c = &self.covariance;
@@ -182,7 +201,10 @@ fn congruence(j: &[[f64; 3]; 3], sigma: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
 }
 
 /// A wheel-odometry constraint between keyframes `from_idx` and `to_idx`.
+///
+/// `#[non_exhaustive]`: build it with [`Self::new`].
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct WheelOdomFactor {
     pub from_idx: usize,
     pub to_idx: usize,
@@ -197,12 +219,41 @@ pub struct WheelOdomFactor {
 }
 
 impl WheelOdomFactor {
-    /// Whether the factor can enter a solve: the measurement has an
-    /// information matrix ([`WheelOdomMeasurement::information`]) and both
-    /// extrinsics are finite. [`super::bundle_adjustment::run_local_inertial_ba`]
-    /// skips a factor that is not; `visual_inertial_bundle_adjust` refuses it.
+    /// A factor between keyframes `from_idx` and `to_idx` with the
+    /// base-to-camera extrinsic at each end and an optional Huber threshold.
+    pub fn new(
+        from_idx: usize,
+        to_idx: usize,
+        measurement: WheelOdomMeasurement,
+        t_cb_from: Pose3d,
+        t_cb_to: Pose3d,
+        huber_chi2: Option<f64>,
+    ) -> Self {
+        Self {
+            from_idx,
+            to_idx,
+            measurement,
+            t_cb_from,
+            t_cb_to,
+            huber_chi2,
+        }
+    }
+
+    /// Whether the factor can enter a solve: it links two distinct
+    /// keyframes, the measurement has an information matrix
+    /// ([`WheelOdomMeasurement::information`]), both extrinsics are finite and
+    /// the Huber threshold, if any, is finite and positive.
+    /// [`super::bundle_adjustment::run_local_inertial_ba`] skips a factor that
+    /// is not; `visual_inertial_bundle_adjust` refuses it.
     pub fn is_valid(&self) -> bool {
-        self.extrinsics_finite() && self.measurement.information().is_some()
+        self.from_idx != self.to_idx
+            && self.huber_valid()
+            && self.extrinsics_finite()
+            && self.measurement.information().is_some()
+    }
+
+    pub(crate) fn huber_valid(&self) -> bool {
+        self.huber_chi2.is_none_or(|k| k.is_finite() && k > 0.0)
     }
 
     pub(crate) fn extrinsics_finite(&self) -> bool {
@@ -278,15 +329,14 @@ pub(crate) fn relative_pose_residual(
     )
 }
 
-/// The robust weight and the weighted cost `½ w rᵀΩr` of one residual.
+/// The robust weight and the Huber cost `½ρ(rᵀΩr)` of one residual
+/// ([`super::robust`]).
 pub(crate) fn robust_weight_and_cost(
     r: &[f64; 6],
     info: &Mat6,
     huber_chi2: Option<f64>,
 ) -> (f64, f64) {
-    let chi2 = quadratic_form(info, r);
-    let w = huber_chi2.map_or(1.0, |k| HuberKernel.weight(chi2, k));
-    (w, 0.5 * w * chi2)
+    super::robust::huber_weight_and_cost(quadratic_form(info, r), huber_chi2)
 }
 
 pub(crate) fn quadratic_form(m: &Mat6, v: &[f64; 6]) -> f64 {
@@ -686,6 +736,29 @@ mod tests {
         let mut f = good;
         f.measurement.covariance = [[0.0; 3]; 3];
         assert!(!f.is_valid());
+        let mut f = good;
+        f.measurement.covariance[0][2] = f64::NAN;
+        f.measurement.covariance[2][0] = f64::NAN;
+        assert!(!f.is_valid());
+        for sigma in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut f = good;
+            f.measurement.z_sigma = sigma;
+            assert!(!f.is_valid(), "z_sigma {sigma}");
+            let mut f = good;
+            f.measurement.tilt_sigma = sigma;
+            assert!(!f.is_valid(), "tilt_sigma {sigma}");
+        }
+        for k in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut f = good;
+            f.huber_chi2 = Some(k);
+            assert!(!f.is_valid(), "huber {k}");
+        }
+        let mut f = good;
+        f.huber_chi2 = Some(12.59);
+        assert!(f.is_valid());
+        let mut f = good;
+        f.to_idx = f.from_idx;
+        assert!(!f.is_valid(), "a self-loop");
     }
 
     #[test]
@@ -699,7 +772,38 @@ mod tests {
         let r = [4.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         assert_eq!(robust_weight_and_cost(&r, &info, None), (1.0, 8.0));
         assert_eq!(robust_weight_and_cost(&r, &info, Some(25.0)), (1.0, 8.0));
-        assert_eq!(robust_weight_and_cost(&r, &info, Some(4.0)), (0.5, 4.0));
+        // ½ρ(16) with k = 4: √64 − 2.
+        assert_eq!(robust_weight_and_cost(&r, &info, Some(4.0)), (0.5, 6.0));
+    }
+
+    /// The robust cost's gradient in `r` is the weighted `w Ω r` the normal
+    /// equations use, inside and past the Huber threshold.
+    ///
+    /// Mutation: the old `½ w rᵀΩr` cost turned this red past the threshold.
+    #[test]
+    fn robust_cost_gradient_is_the_weighted_gradient() {
+        let mut rng = Lcg(11);
+        let info = random_factor(&mut rng).measurement.information().unwrap();
+        for scale in [1e-3, 0.05, 1.0] {
+            let r: [f64; 6] = std::array::from_fn(|_| rng.next() * scale);
+            for k in [None, Some(12.59), Some(1e-3)] {
+                let (w, _) = robust_weight_and_cost(&r, &info, k);
+                for a in 0..6 {
+                    let h = 1e-7 * scale.max(1e-3);
+                    let (mut rp, mut rm) = (r, r);
+                    rp[a] += h;
+                    rm[a] -= h;
+                    let numeric = (robust_weight_and_cost(&rp, &info, k).1
+                        - robust_weight_and_cost(&rm, &info, k).1)
+                        / (2.0 * h);
+                    let analytic = w * (0..6).map(|b| info[a][b] * r[b]).sum::<f64>();
+                    assert!(
+                        (numeric - analytic).abs() <= 1e-5 * analytic.abs().max(1.0),
+                        "scale {scale} k {k:?} row {a}: {numeric} vs {analytic}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

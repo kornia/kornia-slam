@@ -77,11 +77,25 @@ pub enum StillSide {
 
 /// A keyframe linked to the one being removed by a stationary constraint held
 /// outside the map: neither moved over the `span_s` seconds between them.
+/// `#[non_exhaustive]`: build it with [`Self::new`].
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct StillNeighbour {
     pub keyframe_idx: usize,
     pub side: StillSide,
     pub span_s: f64,
+}
+
+impl StillNeighbour {
+    /// Keyframe `keyframe_idx` (`Frame::idx`), on `side` of the removed one,
+    /// still for `span_s` seconds.
+    pub fn new(keyframe_idx: usize, side: StillSide, span_s: f64) -> Self {
+        Self {
+            keyframe_idx,
+            side,
+            span_s,
+        }
+    }
 }
 
 /// How the IMU chain through a removed keyframe is repaired, validated but

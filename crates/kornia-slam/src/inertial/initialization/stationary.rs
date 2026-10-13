@@ -154,6 +154,14 @@ pub enum StationaryInitError {
         /// The tolerance it was checked against.
         tolerance: f64,
     },
+    /// `max_gravity_norm_error` is not a finite non-negative number, so no
+    /// window could be judged against it.
+    #[error("invalid gravity tolerance {0}: must be finite and non-negative")]
+    InvalidTolerance(f64),
+    /// The window's mean angular rate is not finite (the gyro bias would be
+    /// NaN).
+    #[error("the window's mean gyro rate is not finite")]
+    NonFiniteGyro,
 }
 
 impl ImuInitializer {
@@ -206,10 +214,20 @@ impl ImuInitializer {
             return Err(StationaryInitError::MonocularWindow);
         }
 
+        if !(max_gravity_norm_error.is_finite() && max_gravity_norm_error >= 0.0) {
+            return Err(StationaryInitError::InvalidTolerance(
+                max_gravity_norm_error,
+            ));
+        }
+        if !finite(stats.mean_gyro) {
+            return Err(StationaryInitError::NonFiniteGyro);
+        }
         let f_body = stats.mean_accel - prior_bias.accel;
         let norm = f_body.length();
-        #[allow(clippy::neg_cmp_op_on_partial_ord)] // a NaN norm must be refused too
-        if !((norm - GRAVITY_MAGNITUDE).abs() <= max_gravity_norm_error) {
+        // A NaN norm must be refused too, and a zero one (the along-gravity
+        // correction divides by it) whatever the tolerance.
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
+        if !(norm > 0.0 && (norm - GRAVITY_MAGNITUDE).abs() <= max_gravity_norm_error) {
             return Err(StationaryInitError::ImplausibleGravity {
                 norm,
                 tolerance: max_gravity_norm_error,
@@ -532,6 +550,47 @@ mod tests {
             init.initialize_stationary(&mono, extrinsic(), ImuBias::default(), 0, &stats, 0.3)
                 .err(),
             Some(StationaryInitError::MonocularWindow)
+        );
+    }
+
+    /// A tolerance that is not finite and non-negative, a zero specific force
+    /// and a non-finite gyro mean are refused instead of yielding a NaN state.
+    ///
+    /// Mutation: dropping the `norm > 0` guard let the infinite-tolerance
+    /// zero-force case through with a NaN accel bias.
+    #[test]
+    fn stationary_init_refuses_inputs_that_would_give_a_nan_state() {
+        let map = still_map(3, 0.6, Mat3F64::IDENTITY, Vec3F64::ZERO);
+        let samples: Vec<ImuMeasurement> = map
+            .imu_factors()
+            .iter()
+            .flat_map(|f| f.raw_samples.iter().copied())
+            .collect();
+        let good = ImuWindowStats::from_samples(&samples).unwrap();
+        let init = initializer();
+        let run = |stats: &ImuWindowStats, tol: f64| {
+            init.initialize_stationary(&map, extrinsic(), ImuBias::default(), 0, stats, tol)
+        };
+        for tol in [f64::NAN, f64::INFINITY, -0.1] {
+            assert!(
+                matches!(
+                    run(&good, tol),
+                    Err(StationaryInitError::InvalidTolerance(_))
+                ),
+                "{tol}"
+            );
+        }
+        let mut zero = good;
+        zero.mean_accel = Vec3F64::ZERO;
+        assert!(matches!(
+            run(&zero, 1e6),
+            Err(StationaryInitError::ImplausibleGravity { norm, .. }) if norm == 0.0
+        ));
+        let mut nan_gyro = good;
+        nan_gyro.mean_gyro.y = f64::NAN;
+        assert_eq!(
+            run(&nan_gyro, 0.3).err(),
+            Some(StationaryInitError::NonFiniteGyro)
         );
     }
 

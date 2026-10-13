@@ -120,10 +120,12 @@ fn stacked(edge: &StationaryFactor, kfs: &[ViBaKeyframe]) -> (Vec<f64>, Vec<f64>
 /// `accumulate_stationary_edges`' normal equations against `JᵀWΩJ` and
 /// `−JᵀWΩr` from a central-difference Jacobian of the residual over both
 /// 15-DOF tangents (the robust weight held at the linearization point, as
-/// IRLS does), and its cost against `½ rᵀWΩr`. Each entry is judged against
-/// its Cauchy–Schwarz scale (`√(H_aa H_bb)`, `√H_aa · √(rᵀWΩr)`), so the
-/// stiff bias rows cannot hide an error in the pose rows. Returns the worst
-/// mismatch in units of 1e-6 of that scale.
+/// IRLS does), its cost against the Huber objective `½ρ(chi²_nav) + ½ chi²_bias`
+/// ([`crate::mapping::robust`]), and its gradient against a central difference
+/// of that cost (so cost and weight are one objective). Each entry is judged
+/// against its Cauchy–Schwarz scale (`√(H_aa H_bb)`, `√H_aa · √(rᵀWΩr)`), so
+/// the stiff bias rows cannot hide an error in the pose rows. Returns the
+/// worst mismatch in units of 1e-6 of that scale.
 fn normal_equation_error(edge: &StationaryFactor, kfs: &[ViBaKeyframe]) -> f64 {
     const EPS: f64 = 1e-6;
     let infos = stationary_information(std::slice::from_ref(edge), 2).unwrap();
@@ -145,7 +147,14 @@ fn normal_equation_error(edge: &StationaryFactor, kfs: &[ViBaKeyframe]) -> f64 {
     let (r0, w) = stacked(edge, kfs);
     let rows = r0.len();
     let chi2: f64 = r0.iter().zip(&w).map(|(r, w)| w * r * r).sum();
-    let mut worst = (cost - 0.5 * chi2).abs() / (1e-6 * chi2.max(1e-12));
+    // The first 12 rows (pose, velocities) carry the robust weight.
+    let weight = stationary_eval(edge, &infos[0], &kfs[0], &kfs[1]).weight;
+    let weighted =
+        |range: std::ops::Range<usize>| -> f64 { range.map(|k| w[k] * r0[k] * r0[k]).sum() };
+    let expected_cost =
+        crate::mapping::robust::huber_weight_and_cost(weighted(0..12) / weight, edge.huber_chi2).1
+            + 0.5 * weighted(12..rows);
+    let mut worst = (cost - expected_cost).abs() / (1e-6 * chi2.max(1e-12));
     let mut jac = vec![[0.0f64; 30]; rows];
     for col in 0..30 {
         let shifted = |s: f64| {
@@ -162,10 +171,21 @@ fn normal_equation_error(edge: &StationaryFactor, kfs: &[ViBaKeyframe]) -> f64 {
     }
     let h = |a: usize, b: usize| -> f64 { (0..rows).map(|k| jac[k][a] * w[k] * jac[k][b]).sum() };
     let diag: Vec<f64> = (0..30).map(|a| h(a, a)).collect();
+    let cost_at = |col: usize, s: f64| {
+        let mut d = [0.0; 15];
+        d[col % 15] = s;
+        let mut moved = kfs.to_vec();
+        moved[col / 15] = retract(&kfs[col / 15], &d);
+        stationary_cost(&moved, &[0, 1], std::slice::from_ref(edge), &infos)
+    };
     for a in 0..30 {
         let g: f64 = (0..rows).map(|k| jac[k][a] * w[k] * r0[k]).sum();
         let tol = 1e-6 * (diag[a] * chi2).sqrt() + 1e-12;
         worst = worst.max((m_vec[a] + g).abs() / tol);
+        // The weighted gradient is the cost's own: d cost / d x_a = −m_a.
+        // Its central difference carries an O(ε²) error, judged 100× looser.
+        let numeric = (cost_at(a, EPS) - cost_at(a, -EPS)) / (2.0 * EPS);
+        worst = worst.max((m_vec[a] + numeric).abs() / (100.0 * tol));
         for b in 0..30 {
             let tol = 1e-6 * (diag[a] * diag[b]).sqrt() + 1e-12;
             worst = worst.max((m_mat[(a, b)] - h(a, b)).abs() / tol);
@@ -214,8 +234,11 @@ fn huber_weights_only_pose_and_velocity_rows() {
             + info.accel_bias * e.accel_bias.dot(e.accel_bias)
             + info.gyro_mean.unwrap().1 * g.dot(g))
     };
-    let nav = |e: &crate::mapping::stationary::StationaryResidual| (e.cost - bias(e)) / e.weight;
-    assert!((nav(&e) - nav(&q)).abs() < 1e-9 * nav(&q));
+    // The nav part is the Huber objective ½ρ of the quadratic one's chi².
+    let chi2_nav = 2.0 * (q.cost - bias(&q));
+    let (w, huber_nav) = crate::mapping::robust::huber_weight_and_cost(chi2_nav, Some(1.0));
+    assert_eq!(w, e.weight);
+    assert!(((e.cost - bias(&e)) - huber_nav).abs() < 1e-9 * huber_nav);
     assert_eq!(bias(&e), bias(&q));
 }
 
@@ -460,6 +483,15 @@ fn stationary_edge_errors_are_reported() {
     assert!(matches!(
         run(StationaryFactor {
             span_s: 0.0,
+            ..edge
+        }),
+        Err(ViBaError::InvalidStationaryFactor(0))
+    ));
+    // A self-loop is refused, not accumulated.
+    assert!(matches!(
+        run(StationaryFactor {
+            to_idx: 1,
+            from_idx: 1,
             ..edge
         }),
         Err(ViBaError::InvalidStationaryFactor(0))

@@ -15,12 +15,18 @@ use std::collections::{HashMap, HashSet};
 const MIN_OBSERVATIONS: u32 = 5;
 /// Match rate below which a sufficiently-observed landmark is dropped.
 const MIN_FOUND_RATIO: f64 = 0.20;
+/// Distance from its nearest observing keyframe beyond which a landmark is
+/// dropped, metres. Far past anything a camera triangulates or a stereo rig
+/// measures, so only a landmark a solve flung out along its ray (to 1e7 m and
+/// more, from a window that could not observe its depth) reaches it.
+const MAX_LANDMARK_DISTANCE_M: f64 = 1e4;
 
 /// Ids of the landmarks that fail the culling policy.
 ///
-/// Two criteria, as before: a poor found ratio once a landmark has been seen
-/// enough times to judge, and any landmark sitting behind a keyframe that
-/// observes it.
+/// A poor found ratio once a landmark has been seen enough times to judge,
+/// any landmark sitting behind a keyframe that observes it, and any farther
+/// than [`MAX_LANDMARK_DISTANCE_M`] from every keyframe observing it (the map
+/// holds only finite positions).
 fn select_for_culling(map: &Map) -> Vec<usize> {
     let mut selected: HashSet<usize> = HashSet::new();
 
@@ -33,7 +39,9 @@ fn select_for_culling(map: &Map) -> Vec<usize> {
         }
     }
 
+    let mut nearest: HashMap<usize, f64> = HashMap::new();
     for kf in map.keyframes() {
+        let centre = kf.frame.pose_world_to_cam.inverse().translation;
         for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
             if let Some(mp) = map.map_points().get(*mp_idx)
                 && !mp.culled
@@ -42,9 +50,18 @@ fn select_for_culling(map: &Map) -> Vec<usize> {
                 if p_cam.z <= 1e-8 {
                     selected.insert(*mp_idx);
                 }
+                let d = (mp.position - centre).length();
+                let entry = nearest.entry(*mp_idx).or_insert(f64::INFINITY);
+                *entry = entry.min(d);
             }
         }
     }
+    selected.extend(
+        nearest
+            .into_iter()
+            .filter(|&(_, d)| d > MAX_LANDMARK_DISTANCE_M)
+            .map(|(idx, _)| idx),
+    );
 
     let mut selected: Vec<usize> = selected.into_iter().collect();
     selected.sort_unstable();
@@ -67,8 +84,10 @@ pub fn cull_landmarks(map: &mut Map) -> usize {
 /// Redundant-keyframe culling (ORB-SLAM's local-mapping `KeyFrameCulling`).
 ///
 /// Off unless the caller runs [`cull_redundant_keyframes`]; the defaults are
-/// ORB-SLAM3's where it has one.
+/// ORB-SLAM3's where it has one. `#[non_exhaustive]`: start from
+/// [`Default`] and set the fields.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct KeyframeCullingConfig {
     /// Fraction of a keyframe's live landmarks that must be redundant for the
     /// keyframe to be (ORB-SLAM: 0.9).
@@ -600,6 +619,31 @@ mod tests {
 
         assert_eq!(cull_landmarks(&mut map), 0);
         assert!(!map.map_points()[idx].culled);
+    }
+
+    /// A landmark farther than `MAX_LANDMARK_DISTANCE_M` from its observer
+    /// (one a solve flung out along its ray) is culled; one at 5 km is not.
+    #[test]
+    fn culls_a_landmark_flung_absurdly_far() {
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]; 3])))
+            .unwrap();
+        let seed = |feature, z| LandmarkSeed {
+            position: Vec3F64::new(0.0, 0.0, z),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 0,
+                feature_idx: feature,
+            },
+        };
+        let near = map.insert_landmark(seed(0, 5.0)).unwrap();
+        let far = map.insert_landmark(seed(1, 5e3)).unwrap();
+        let flung = map.insert_landmark(seed(2, 1e7)).unwrap();
+
+        assert_eq!(cull_landmarks(&mut map), 1);
+        assert!(!map.map_points()[near].culled);
+        assert!(!map.map_points()[far].culled);
+        assert!(map.map_points()[flung].culled);
     }
 }
 

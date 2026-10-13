@@ -32,14 +32,17 @@
 //! [`super::wheel_odom::WheelOdomFactor`]) and decides which intervals were
 //! stationary.
 
+use crate::mapping::robust::huber_weight_and_cost;
 use crate::mapping::wheel_odom::{self, Mat6};
 use kornia_3d::pose::Pose3d;
-use kornia_3d::ransac::{HuberKernel, RobustKernel};
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::{ImuBias, ImuCalib};
 
 /// The mean raw gyro rate measured while the rig was still.
+///
+/// `#[non_exhaustive]`: build it with [`Self::new`].
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct StationaryGyro {
     /// Mean raw gyro rate, body frame, rad/s.
     pub mean: Vec3F64,
@@ -47,8 +50,19 @@ pub struct StationaryGyro {
     pub covered_s: f64,
 }
 
+impl StationaryGyro {
+    /// The mean rate `mean` (rad/s, body frame) over `covered_s` seconds.
+    pub fn new(mean: Vec3F64, covered_s: f64) -> Self {
+        Self { mean, covered_s }
+    }
+}
+
 /// A stationary constraint between keyframes `from_idx` and `to_idx`.
+///
+/// `#[non_exhaustive]`: build it with [`Self::new`] (and
+/// [`Self::with_gyro`]), then set the public fields.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct StationaryFactor {
     /// Earlier keyframe.
     pub from_idx: usize,
@@ -94,6 +108,14 @@ impl StationaryFactor {
             rotation_sigma_rad: Self::DEFAULT_ROTATION_SIGMA_RAD,
             velocity_sigma_m_s: Self::DEFAULT_VELOCITY_SIGMA_M_S,
             huber_chi2: Some(Self::DEFAULT_HUBER_CHI2),
+        }
+    }
+
+    /// `self` with the mean gyro rate of the still span.
+    pub fn with_gyro(self, gyro: StationaryGyro) -> Self {
+        Self {
+            gyro: Some(gyro),
+            ..self
         }
     }
 
@@ -213,7 +235,8 @@ pub(crate) struct StationaryResidual {
     pub(crate) gyro_mean: Option<Vec3F64>,
     /// Robust weight of the pose and velocity rows.
     pub(crate) weight: f64,
-    /// `½ (w · chi²_nav + chi²_bias)`.
+    /// `½ρ(chi²_nav) + ½ chi²_bias`, `ρ` the Huber objective of `weight`
+    /// ([`super::robust`]).
     pub(crate) cost: f64,
 }
 
@@ -246,9 +269,7 @@ pub(crate) fn residual(
 
     let chi2_nav = wheel_odom::quadratic_form(&info.pose, &pose)
         + info.velocity * (i.velocity.dot(i.velocity) + j.velocity.dot(j.velocity));
-    let weight = factor
-        .huber_chi2
-        .map_or(1.0, |k| HuberKernel.weight(chi2_nav, k));
+    let (weight, nav_cost) = huber_weight_and_cost(chi2_nav, factor.huber_chi2);
     let chi2_bias = info.gyro_bias * gyro_bias.dot(gyro_bias)
         + info.accel_bias * accel_bias.dot(accel_bias)
         + info
@@ -264,7 +285,7 @@ pub(crate) fn residual(
         accel_bias,
         gyro_mean,
         weight,
-        cost: 0.5 * (weight * chi2_nav + chi2_bias),
+        cost: nav_cost + 0.5 * chi2_bias,
     }
 }
 
