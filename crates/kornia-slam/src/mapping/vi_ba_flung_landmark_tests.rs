@@ -689,21 +689,16 @@ impl ParkedChain {
     /// Solves the next window with the default parameters (so the default λ
     /// schedule) and takes its landmarks: all of them, or with `guard` only
     /// those [`landmarks_to_write_back`] keeps, as `run_local_inertial_ba`
-    /// does. With `stereo_on_depth_free`, the newest two keyframes also
-    /// measure every depth-free landmark by stereo, at its true depth (two
-    /// rows, so a re-seed is corroborated).
-    fn window(&mut self, guard: bool, stereo_on_depth_free: bool) -> ViBaResult {
-        self.window_moving(guard, stereo_on_depth_free, 0.0)
+    /// does. The newest `stereo_rows` keyframes also measure every
+    /// depth-free landmark by stereo, at its true depth (two or more rows
+    /// corroborate a re-seed; one does not).
+    fn window(&mut self, guard: bool, stereo_rows: usize) -> ViBaResult {
+        self.window_moving(guard, stereo_rows, 0.0)
     }
 
     /// [`Self::window`] with keyframe `k` moved `k · step_m` along the
     /// camera's x axis from the parked pose (0: parked).
-    fn window_moving(
-        &mut self,
-        guard: bool,
-        stereo_on_depth_free: bool,
-        step_m: f64,
-    ) -> ViBaResult {
+    fn window_moving(&mut self, guard: bool, stereo_rows: usize, step_m: f64) -> ViBaResult {
         let parked = parked_pose();
         let truth_poses: Vec<Pose3d> = (0..N_KF)
             .map(|k| {
@@ -735,7 +730,7 @@ impl ParkedChain {
             let truth_pose = &truth_poses[k];
             for (j, p) in self.truth.iter().enumerate() {
                 let px = pixel(truth_pose, p);
-                let measured = j % 2 == 0 || (stereo_on_depth_free && k >= N_KF - 2);
+                let measured = j % 2 == 0 || k + stereo_rows >= N_KF;
                 let (depth_meas, depth_sigma) = if measured {
                     stereo(truth_pose.transform_point(p).z)
                 } else {
@@ -814,7 +809,7 @@ fn damping_bounds_how_far_a_parked_chain_walks_a_depth_free_landmark() {
         let mut chain = ParkedChain::new(seed);
         let mut worst = 1.0f64;
         for _ in 0..CHAIN_WINDOWS {
-            chain.window(false, false);
+            chain.window(false, 0);
             worst = worst.max(chain.worst_depth_ratio());
         }
         assert!(
@@ -827,8 +822,10 @@ fn damping_bounds_how_far_a_parked_chain_walks_a_depth_free_landmark() {
 /// The walk damping leaves ([`damping_bounds_how_far_a_parked_chain_walks_a_depth_free_landmark`]),
 /// through the write-back guard as `run_local_inertial_ba` applies it: the
 /// guard does not hold the depth either (each window may grow a landmark up
-/// to tenfold, or to 50 m). When the newest two keyframes of the next window then
-/// measure every depth-free landmark by stereo at its true depth, the
+/// to tenfold, or to 50 m). When only the newest keyframe of the next
+/// window measures every depth-free landmark by stereo, one row is no
+/// corroboration: the walked landmarks are gated, not moved, and no keyframe
+/// turns. When the newest two then measure them at their true depth, the
 /// landmarks that walked past the depth gate are re-seeded at the measured
 /// depth instead of gated, no keyframe turns, and every depth-free landmark
 /// ends near its true depth. A moving window after that (the robot drives
@@ -843,11 +840,23 @@ fn a_parked_chain_s_walked_landmarks_are_restored_when_stereo_measures_them() {
     for seed in [1, 2] {
         let mut chain = ParkedChain::new(seed);
         for _ in 0..CHAIN_WINDOWS {
-            chain.window(true, false);
+            chain.window(true, 0);
         }
         let walked = chain.worst_depth_ratio();
         assert!(walked > 10.0, "seed {seed}: walked only {walked:.1}x");
-        let result = chain.window(true, true);
+        // One stereo row is no corroboration: the walked landmarks' rows are
+        // gated, nothing moves, and no keyframe turns.
+        let single = chain.window(true, 1);
+        assert_eq!(single.points_reseeded, 0, "seed {seed}");
+        assert!(single.depth_rows_gated > 0, "seed {seed}: nothing gated");
+        let rot = max_active_rotation_deg(&single);
+        assert!(
+            rot < 1.0,
+            "seed {seed}: an active keyframe turned by {rot:.2} deg"
+        );
+        assert!(chain.worst_depth_ratio() > 10.0, "seed {seed}");
+
+        let result = chain.window(true, 2);
         assert!(result.points_reseeded > 0, "seed {seed}: nothing re-seeded");
         assert_eq!(result.depth_rows_gated, 0, "seed {seed}");
         let rot = max_active_rotation_deg(&result);
@@ -861,7 +870,7 @@ fn a_parked_chain_s_walked_landmarks_are_restored_when_stereo_measures_them() {
             "seed {seed}: a landmark is still {restored:.2}x off its depth"
         );
 
-        let moving = chain.window_moving(true, false, 0.05);
+        let moving = chain.window_moving(true, 0, 0.05);
         assert_eq!(moving.points_reseeded, 0, "seed {seed}");
         let after = chain.worst_depth_ratio();
         assert!(
