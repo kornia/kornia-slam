@@ -55,7 +55,10 @@
 //! tracking noise, to tens or hundreds of times its depth. What keeps a
 //! landmark that got far from turning a keyframe is the depth gate: a stereo
 //! depth row whose landmark is far from the measured depth at the start is
-//! left out of the solve ([`ViBaParams::depth_gate_factor`]). Without it, a
+//! left out of the solve ([`ViBaParams::depth_gate_factor`]), and a free
+//! landmark that every depth row disagrees with that way is first moved back
+//! along its ray to the measured depth, so the gate does not leave it wrong
+//! for good. Without the gate, a
 //! flung landmark made
 //! the next window's depth row a residual of ~1e8 sigma, which the solver
 //! lowered by turning a keyframe by ~90°. `run_local_inertial_ba` also refuses
@@ -203,8 +206,12 @@ pub struct ViBaParams {
     /// wrong, not the measurement (a landmark whose depth a parked window
     /// could not observe), and its depth residual can be ~1e8 sigma: enough
     /// that the cheapest way to lower it is to rotate the camera until the
-    /// landmark leaves the view. The reprojection rows stay in. Default 10;
-    /// `f64::INFINITY` gates only landmarks behind the camera.
+    /// landmark leaves the view. The reprojection rows stay in. A free
+    /// landmark whose every depth row is beyond the bound (in front of the
+    /// camera) is first moved along its best measured ray to that depth, and
+    /// its rows then enter the solve: gated, nothing else would ever restore
+    /// its depth. Default 10; `f64::INFINITY` gates only landmarks behind
+    /// the camera.
     pub depth_gate_factor: f64,
 }
 
@@ -248,14 +255,76 @@ pub struct ViBaResult {
     /// Robust cost at the starting state (`f64::MAX` only if no iteration
     /// ran, i.e. `max_iterations == 0`).
     pub initial_cost: f64,
-    /// Depth rows left out by [`ViBaParams::depth_gate_factor`].
+    /// Depth rows left out by [`ViBaParams::depth_gate_factor`], counted
+    /// after the re-seed below.
     pub depth_rows_gated: usize,
+    /// Free landmarks moved, before the solve, to the measured depth along
+    /// an observing ray because every depth row on them was beyond the depth
+    /// gate (see [`ViBaParams::depth_gate_factor`]).
+    pub points_reseeded: usize,
     /// Steps refused because their camera motion moved a landmark behind a
     /// camera whose observation of it is a Huber inlier.
     pub cheirality_rejections: usize,
     /// Landmark steps held back (the landmark kept its position for that
     /// step) because they would have moved it behind an observing camera.
     pub cheirality_points_held: usize,
+}
+
+/// Upper bound of the depth gate for a measured depth `d`, metres.
+fn depth_gate_bound(d: f32, factor: f64) -> f64 {
+    factor * d as f64 + DEPTH_GATE_MARGIN_M
+}
+
+/// Moves each free landmark whose stereo depth rows all lie beyond the depth
+/// gate (in front of their cameras, but farther than
+/// [`ViBaParams::depth_gate_factor`] allows) along the ray of its best
+/// measured observation (smallest `depth_sigma`) to that measured depth;
+/// returns how many moved. Such a landmark walked out along its ray while no
+/// window could observe its depth; reprojection rows constrain only its
+/// bearing, so without this it would stay gated, and wrong, in every later
+/// window. A landmark any depth row agrees with, or one behind a camera, is
+/// left alone.
+fn reseed_walked_landmarks(
+    keyframes: &[ViBaKeyframe],
+    points: &mut [Vec3F64],
+    observations: &[BaObservation],
+    point_free: &[bool],
+    factor: f64,
+) -> usize {
+    // Per landmark: (any depth row in the gate or behind, best gated row).
+    let mut rows: Vec<(bool, Option<(f32, usize)>)> = vec![(false, None); points.len()];
+    for (o, obs) in observations.iter().enumerate() {
+        let Some(d) = obs.depth_meas else {
+            continue;
+        };
+        let (Some(kf), Some(p)) = (keyframes.get(obs.pose_idx), points.get(obs.point_idx)) else {
+            continue;
+        };
+        let z = kf.pose.transform_point(p).z;
+        let row = &mut rows[obs.point_idx];
+        if z <= 0.0 || z < depth_gate_bound(d, factor) {
+            row.0 = true;
+        } else if row.1.is_none_or(|(sigma, _)| obs.depth_sigma < sigma) {
+            row.1 = Some((obs.depth_sigma, o));
+        }
+    }
+    let mut moved = 0;
+    for (j, (blocked, best)) in rows.into_iter().enumerate() {
+        let (false, Some((_, o)), true) = (blocked, best, point_free[j]) else {
+            continue;
+        };
+        let obs = &observations[o];
+        let Some(d) = obs.depth_meas else {
+            continue;
+        };
+        let pose = &keyframes[obs.pose_idx].pose;
+        let p_cam = pose.transform_point(&points[j]);
+        points[j] = pose
+            .inverse()
+            .transform_point(&(p_cam * (d as f64 / p_cam.z)));
+        moved += 1;
+    }
+    moved
 }
 
 /// Whether each observation's stereo depth row enters the solve, and how many
@@ -278,7 +347,7 @@ fn depth_gate(
                 return false;
             };
             let z = kf.pose.transform_point(p).z;
-            let keep = z > 0.0 && z < factor * d as f64 + DEPTH_GATE_MARGIN_M;
+            let keep = z > 0.0 && z < depth_gate_bound(d, factor);
             gated += usize::from(!keep);
             keep
         })
@@ -1295,8 +1364,16 @@ pub fn visual_inertial_bundle_adjust(
     // SE3F32 mirrors for the reprojection Jacobian (matches residual_and_jacobians).
     let mut se3s: Vec<SE3F32> = kfs.iter().map(|kf| pose_to_se3(&kf.pose)).collect();
 
+    let point_free: Vec<bool> = point_local.iter().map(|&j| j >= 0).collect();
+    let points_reseeded = reseed_walked_landmarks(
+        keyframes,
+        &mut xyz,
+        observations,
+        &point_free,
+        params.depth_gate_factor,
+    );
     let (depth_on, depth_rows_gated) =
-        depth_gate(keyframes, points, observations, params.depth_gate_factor);
+        depth_gate(keyframes, &xyz, observations, params.depth_gate_factor);
 
     let mut lambda = params.initial_lambda;
     let mut iters_done = 0usize;
@@ -1956,6 +2033,7 @@ pub fn visual_inertial_bundle_adjust(
         final_cost,
         initial_cost,
         depth_rows_gated,
+        points_reseeded,
         cheirality_rejections,
         cheirality_points_held,
     })

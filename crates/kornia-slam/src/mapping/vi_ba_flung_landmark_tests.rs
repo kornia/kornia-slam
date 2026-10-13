@@ -137,9 +137,12 @@ fn max_active_rotation_deg(result: &ViBaResult) -> f64 {
 ///
 /// Red without the fix (2026-10-13, guards reverted in place): with the point
 /// block undamped, no depth gate and no cheirality check an active keyframe
-/// turns by 136.7°; with only the gate reverted, by 90.1°. The gate is the
-/// guard here: damping bounds a solve's point step, but a depth-free landmark
-/// still walks far along its ray over parked windows
+/// turns by 136.7°; with only the gate reverted, by 90.1° (before the
+/// re-seed existed). Now the re-seed moves the landmark back to its measured
+/// depth before the gate sees it; a landmark that cannot be re-seeded is the
+/// gate's ([`a_fixed_flung_landmark_is_gated_and_does_not_rotate_the_window`]).
+/// Damping alone does not do it: it bounds a solve's point step, but a
+/// depth-free landmark still walks far along its ray over parked windows
 /// ([`damping_bounds_how_far_a_parked_chain_walks_a_depth_free_landmark`]).
 #[test]
 fn a_flung_landmark_with_a_stereo_depth_does_not_rotate_the_window() {
@@ -157,8 +160,83 @@ fn a_flung_landmark_with_a_stereo_depth_does_not_rotate_the_window() {
     .unwrap();
     let rot = max_active_rotation_deg(&result);
     assert!(rot < 1.0, "an active keyframe turned by {rot:.2} deg");
-    assert_eq!(result.depth_rows_gated, 1);
+    assert_eq!(result.points_reseeded, 1);
+    assert_eq!(result.depth_rows_gated, 0);
+    let z = parked_pose().transform_point(&result.points[0]).z;
+    assert!(
+        (z / TRUE_DEPTH - 1.0).abs() < 0.05,
+        "the flung landmark ends at depth {z:.3} m"
+    );
     assert!(result.initial_cost.is_finite() && result.initial_cost > 0.0);
+}
+
+/// The same window with the flung landmark held fixed, so it cannot be
+/// re-seeded: its depth row is gated and still no keyframe turns.
+#[test]
+fn a_fixed_flung_landmark_is_gated_and_does_not_rotate_the_window() {
+    let (keyframes, points, mut observations) = flung_window();
+    for o in observations.iter_mut().filter(|o| o.point_idx == 0) {
+        o.fixed_point = true;
+    }
+    let result = visual_inertial_bundle_adjust(
+        &keyframes,
+        &points,
+        &observations,
+        &[],
+        &[],
+        &[],
+        &camera(),
+        &params(),
+    )
+    .unwrap();
+    let rot = max_active_rotation_deg(&result);
+    assert!(rot < 1.0, "an active keyframe turned by {rot:.2} deg");
+    assert_eq!(result.points_reseeded, 0);
+    assert_eq!(result.depth_rows_gated, 1);
+    assert_eq!(result.points[0], points[0]);
+}
+
+/// The re-seed moves a free landmark only when every depth row on it is
+/// beyond the gate, along the best measured row's ray, to its depth.
+#[test]
+fn reseed_moves_only_landmarks_every_depth_row_disagrees_with() {
+    let (keyframes, points, mut observations) = flung_window();
+    let pose = parked_pose();
+    let free = vec![true; points.len()];
+    let reseed = |pts: &mut Vec<Vec3F64>, obs: &[BaObservation], free: &[bool]| {
+        reseed_walked_landmarks(&keyframes, pts, obs, free, 10.0)
+    };
+
+    let mut pts = points.clone();
+    assert_eq!(reseed(&mut pts, &observations, &free), 1);
+    let truth = point_at(&pose, 410.0, 150.0, TRUE_DEPTH);
+    // Along the ray, to the f32 measured depth.
+    assert!((pts[0] - truth).length() < 1e-6, "{:?}", pts[0] - truth);
+    assert_eq!(pts[1..], points[1..]);
+
+    // Fixed: left alone.
+    let mut fixed = free.clone();
+    fixed[0] = false;
+    let mut pts = points.clone();
+    assert_eq!(reseed(&mut pts, &observations, &fixed), 0);
+    assert_eq!(pts, points);
+
+    // A second depth row that agrees with the landmark: left alone.
+    let agreeing = observations
+        .iter()
+        .position(|o| o.point_idx == 0 && o.depth_meas.is_none())
+        .unwrap();
+    observations[agreeing].depth_meas = Some(FLUNG_DEPTH as f32);
+    let mut pts = points.clone();
+    assert_eq!(reseed(&mut pts, &observations, &free), 0);
+    observations[agreeing].depth_meas = None;
+
+    // Behind the camera: left alone (the cheirality guards own it).
+    let mut pts = points.clone();
+    pts[0] = point_at(&pose, 410.0, 150.0, -2.0);
+    let behind = pts[0];
+    assert_eq!(reseed(&mut pts, &observations, &free), 0);
+    assert_eq!(pts[0], behind);
 }
 
 /// The gate drops exactly the rows whose landmark depth disagrees with the
@@ -611,10 +689,32 @@ impl ParkedChain {
     /// does. With `stereo_on_depth_free`, the newest keyframe also measures
     /// every depth-free landmark by stereo, at its true depth.
     fn window(&mut self, guard: bool, stereo_on_depth_free: bool) -> ViBaResult {
-        let truth_pose = parked_pose();
-        let rng = &mut self.rng;
-        let keyframes: Vec<ViBaKeyframe> = (0..N_KF)
+        self.window_moving(guard, stereo_on_depth_free, 0.0)
+    }
+
+    /// [`Self::window`] with keyframe `k` moved `k · step_m` along the
+    /// camera's x axis from the parked pose (0: parked).
+    fn window_moving(
+        &mut self,
+        guard: bool,
+        stereo_on_depth_free: bool,
+        step_m: f64,
+    ) -> ViBaResult {
+        let parked = parked_pose();
+        let truth_poses: Vec<Pose3d> = (0..N_KF)
             .map(|k| {
+                let centre =
+                    parked
+                        .inverse()
+                        .transform_point(&Vec3F64::new(k as f64 * step_m, 0.0, 0.0));
+                Pose3d::new(parked.rotation, -(parked.rotation * centre))
+            })
+            .collect();
+        let rng = &mut self.rng;
+        let keyframes: Vec<ViBaKeyframe> = truth_poses
+            .iter()
+            .enumerate()
+            .map(|(k, truth_pose)| {
                 let r_cw =
                     SO3F64::exp(rng.vec3(0.02f64.to_radians())).matrix() * truth_pose.rotation;
                 let centre = truth_pose.inverse().translation + rng.vec3(1e-3);
@@ -628,8 +728,9 @@ impl ParkedChain {
             .collect();
         let mut observations = Vec::new();
         for (k, kf) in keyframes.iter().enumerate() {
+            let truth_pose = &truth_poses[k];
             for (j, p) in self.truth.iter().enumerate() {
-                let px = pixel(&truth_pose, p);
+                let px = pixel(truth_pose, p);
                 let measured = j % 2 == 0 || (stereo_on_depth_free && k == N_KF - 1);
                 let (depth_meas, depth_sigma) = if measured {
                     stereo(truth_pose.transform_point(p).z)
@@ -723,15 +824,18 @@ fn damping_bounds_how_far_a_parked_chain_walks_a_depth_free_landmark() {
 /// through the write-back guard as `run_local_inertial_ba` applies it: the
 /// guard does not hold the depth either (each window may grow a landmark up
 /// to tenfold, or to 50 m). When the newest keyframe of the next window then
-/// measures every depth-free landmark by stereo at its true depth, the rows
-/// of the landmarks that walked far are gated, and no keyframe turns.
+/// measures every depth-free landmark by stereo at its true depth, the
+/// landmarks that walked past the depth gate are re-seeded at the measured
+/// depth instead of gated, no keyframe turns, and every depth-free landmark
+/// ends near its true depth. A moving window after that (the robot drives
+/// off, no stereo on those landmarks) keeps them there.
 ///
-/// Only the gated count goes red with the gate removed (2026-10-13, mutated
-/// in place): a walk of this size, unlike a ~1e7 fling, does not turn a
-/// keyframe even ungated, nor with cheirality and damping removed too; the
-/// Huber kernel and the well-measured grid hold it.
+/// Red with the re-seed removed (2026-10-13, mutated in place): the walked
+/// landmarks' rows are gated (seed 1: 4 rows), the worst landmark stays
+/// 166x off its depth, and a moving window of 5 cm steps brings it only to
+/// 16x.
 #[test]
-fn a_parked_chain_s_walked_landmarks_are_gated_when_stereo_measures_them() {
+fn a_parked_chain_s_walked_landmarks_are_restored_when_stereo_measures_them() {
     for seed in [1, 2] {
         let mut chain = ParkedChain::new(seed);
         for _ in 0..CHAIN_WINDOWS {
@@ -740,11 +844,25 @@ fn a_parked_chain_s_walked_landmarks_are_gated_when_stereo_measures_them() {
         let walked = chain.worst_depth_ratio();
         assert!(walked > 10.0, "seed {seed}: walked only {walked:.1}x");
         let result = chain.window(true, true);
-        assert!(result.depth_rows_gated > 0, "seed {seed}: nothing gated");
+        assert!(result.points_reseeded > 0, "seed {seed}: nothing re-seeded");
+        assert_eq!(result.depth_rows_gated, 0, "seed {seed}");
         let rot = max_active_rotation_deg(&result);
         assert!(
             rot < 1.0,
             "seed {seed}: an active keyframe turned by {rot:.2} deg"
+        );
+        let restored = chain.worst_depth_ratio();
+        assert!(
+            restored < 1.2,
+            "seed {seed}: a landmark is still {restored:.2}x off its depth"
+        );
+
+        let moving = chain.window_moving(true, false, 0.05);
+        assert_eq!(moving.points_reseeded, 0, "seed {seed}");
+        let after = chain.worst_depth_ratio();
+        assert!(
+            after < 1.2,
+            "seed {seed}: after driving off a landmark is {after:.2}x off its depth"
         );
     }
 }

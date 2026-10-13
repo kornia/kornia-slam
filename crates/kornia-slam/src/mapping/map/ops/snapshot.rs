@@ -69,6 +69,9 @@ pub struct LocalBaStats {
     /// Stereo depth rows left out of the solve because the landmark's depth
     /// in that camera disagreed with the measurement at the start.
     pub depth_rows_gated: usize,
+    /// Landmarks moved back along their ray to the stereo depth before the
+    /// solve, because every depth row on them was beyond the depth gate.
+    pub points_reseeded: usize,
     /// LM steps refused because their camera motion moved a landmark behind
     /// a camera whose observation of it is a Huber inlier.
     pub cheirality_rejections: usize,

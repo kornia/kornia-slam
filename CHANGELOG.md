@@ -207,7 +207,12 @@ keyframe by 137° with them reverted):
   that got far from turning a keyframe when stereo next measures it;
 - a stereo depth row is left out of the solve when, at the start, the
   landmark's depth in that camera is outside `(0, 10·d + 1 m)` for measured
-  depth `d` (`ViBaParams::depth_gate_factor`, default 10);
+  depth `d` (`ViBaParams::depth_gate_factor`, default 10). A free landmark
+  whose every depth row lies beyond that bound is first moved along the ray
+  of its best measured observation to the measured depth, and its rows then
+  enter the solve: reprojection rows constrain only its bearing, so a gated
+  landmark would otherwise stay wrong (and gated) in every later window,
+  including the moving ones after the robot drives off;
 - a step may not move a landmark from in front of an observing camera to
   behind it: a free landmark whose own step does that keeps its old position
   for that step, and a step whose camera motion does it is refused (λ grows)
@@ -221,7 +226,8 @@ keyframe by 137° with them reverted):
   every keyframe observing it (it already retired one behind an observer).
 
 The solve now reports what it did: `ViBaResult` gains `initial_cost`,
-`depth_rows_gated`, `cheirality_rejections` and `cheirality_points_held`, and
+`depth_rows_gated`, `points_reseeded`, `cheirality_rejections` and
+`cheirality_points_held`, and
 the update
 `run_local_inertial_ba` returns carries them, with the write-back guard's
 count, in `BaUpdate::solve_stats` (`LocalBaStats`; `None` from the visual
