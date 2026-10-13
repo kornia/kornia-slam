@@ -299,9 +299,8 @@ fn depth_gate_bound(d: f32, factor: f64) -> f64 {
 
 /// Moves each free landmark whose stereo depth rows all lie beyond the depth
 /// gate (in front of their cameras, but farther than
-/// [`ViBaParams::depth_gate_factor`] allows) along the ray of its best
-/// measured observation (smallest `depth_sigma`) to that measured depth;
-/// returns how many moved. Such a landmark walked out along its ray while no
+/// [`ViBaParams::depth_gate_factor`] allows) along the ray of one of those
+/// observations to its measured depth; returns how many moved. Such a landmark walked out along its ray while no
 /// window could observe its depth; reprojection rows constrain only its
 /// bearing, so without this it would stay gated, and wrong, in every later
 /// window. A landmark any depth row agrees with, or one behind a camera, is
@@ -310,9 +309,13 @@ fn depth_gate_bound(d: f32, factor: f64) -> f64 {
 /// A one-off erroneous stereo depth must not pull a correct far landmark
 /// onto itself, so the move needs corroboration: another gated depth row
 /// whose predicted depth at the re-seeded position is within
-/// [`RESEED_AGREEMENT_SIGMAS`] of its measurement, or a starting depth past
-/// [`RESEED_UNCORROBORATED_FACTOR`] times the gate bound. Without it the
-/// landmark stays put and its rows are only gated.
+/// [`RESEED_AGREEMENT_SIGMAS`] of its measurement. The gated rows are tried
+/// as the re-seed in ascending `depth_sigma` (best measured first) and the
+/// first corroborated one wins, so a bad nearest row (the smallest sigma,
+/// since sigma grows with depth) cannot veto two rows that agree. With no
+/// corroborated row the landmark moves to the best row only if its starting
+/// depth is past [`RESEED_UNCORROBORATED_FACTOR`] times that row's gate
+/// bound; otherwise it stays put and its rows are only gated.
 ///
 /// The second row is not checked for geometric independence. In a parked
 /// window every keyframe sees the same image from the same pose, so a
@@ -349,33 +352,51 @@ fn reseed_walked_landmarks(
         (obs.depth_meas.unwrap_or_default(), obs.depth_sigma as f64)
     };
     let mut moved = 0;
-    for (j, (blocked, gated)) in rows.into_iter().enumerate() {
-        if blocked || !point_free[j] {
+    for (j, (blocked, mut gated)) in rows.into_iter().enumerate() {
+        if blocked || !point_free[j] || gated.is_empty() {
             continue;
         }
-        let Some(&best) = gated
-            .iter()
-            .min_by(|&&a, &&b| depth_of(a).1.total_cmp(&depth_of(b).1))
-        else {
-            continue;
+        // Best measured first; ties keep observation order.
+        gated.sort_by(|&a, &b| depth_of(a).1.total_cmp(&depth_of(b).1));
+        // The landmark moved along `o`'s ray to `o`'s measured depth.
+        let candidate_of = |o: usize| {
+            let pose = &keyframes[observations[o].pose_idx].pose;
+            let p_cam = pose.transform_point(&points[j]);
+            let d = depth_of(o).0 as f64;
+            (
+                pose.inverse().transform_point(&(p_cam * (d / p_cam.z))),
+                p_cam.z,
+            )
         };
-        let (d, sigma) = depth_of(best);
-        let pose = &keyframes[observations[best].pose_idx].pose;
-        let p_cam = pose.transform_point(&points[j]);
-        let candidate = pose
-            .inverse()
-            .transform_point(&(p_cam * (d as f64 / p_cam.z)));
-        let implausible = p_cam.z > RESEED_UNCORROBORATED_FACTOR * depth_gate_bound(d, factor);
-        let corroborated = gated.iter().filter(|&&o| o != best).any(|&o| {
-            let (d_o, sigma_o) = depth_of(o);
-            let z_o = keyframes[observations[o].pose_idx]
-                .pose
-                .transform_point(&candidate)
-                .z;
-            let tolerance = RESEED_AGREEMENT_SIGMAS * (sigma * sigma + sigma_o * sigma_o).sqrt();
-            (z_o - d_o as f64).abs() <= tolerance
-        });
-        if implausible || corroborated {
+        let corroborated = |c: usize, candidate: &Vec3F64| {
+            let sigma = depth_of(c).1;
+            gated.iter().filter(|&&o| o != c).any(|&o| {
+                let (d_o, sigma_o) = depth_of(o);
+                let z_o = keyframes[observations[o].pose_idx]
+                    .pose
+                    .transform_point(candidate)
+                    .z;
+                let tolerance =
+                    RESEED_AGREEMENT_SIGMAS * (sigma * sigma + sigma_o * sigma_o).sqrt();
+                (z_o - d_o as f64).abs() <= tolerance
+            })
+        };
+        // Each gated row in turn, so one bad best row cannot veto two rows
+        // that agree with each other; failing that, the best row alone if
+        // the landmark's depth is implausible.
+        let reseed = gated
+            .iter()
+            .find_map(|&c| {
+                let (candidate, _) = candidate_of(c);
+                corroborated(c, &candidate).then_some(candidate)
+            })
+            .or_else(|| {
+                let best = gated[0];
+                let (candidate, z) = candidate_of(best);
+                let bound = depth_gate_bound(depth_of(best).0, factor);
+                (z > RESEED_UNCORROBORATED_FACTOR * bound).then_some(candidate)
+            });
+        if let Some(candidate) = reseed {
             points[j] = candidate;
             moved += 1;
         }

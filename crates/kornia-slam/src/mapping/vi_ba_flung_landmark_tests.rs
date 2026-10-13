@@ -940,6 +940,39 @@ fn a_single_bad_depth_row_does_not_reseed_a_plausible_landmark() {
     assert!((z - 2.0).abs() < 1e-5, "re-seeded to {z} m");
 }
 
+/// A bad nearest row must not veto two rows that agree. Depth sigma grows
+/// with depth, so the nearest row is the best measured one; trying only it
+/// as the re-seed left a landmark walked to 50 m (truth 3 m) gated in every
+/// window that still held a 0.5 m outlier, although two 3 m rows corroborate
+/// each other. Every gated row is tried, best measured first, and a
+/// corroborated row wins over a lone row's implausibility (a 1e7 m landmark
+/// with the same rows goes to 3 m, not to the outlier).
+#[test]
+fn a_bad_nearest_row_does_not_veto_two_agreeing_rows() {
+    let (keyframes, mut points, mut observations) = flung_window();
+    let pose = parked_pose();
+    let free = vec![true; points.len()];
+    for (k, d) in [(N_KF - 1, 0.5), (N_KF - 2, 3.0), (N_KF - 3, 3.0)] {
+        let o = observations
+            .iter()
+            .position(|o| o.point_idx == 0 && o.pose_idx == k)
+            .unwrap();
+        (observations[o].depth_meas, observations[o].depth_sigma) = stereo(d);
+    }
+    for start in [50.0, FLUNG_DEPTH] {
+        points[0] = point_at(&pose, 410.0, 150.0, start);
+        let mut pts = points.clone();
+        assert_eq!(
+            reseed_walked_landmarks(&keyframes, &mut pts, &observations, &free, 10.0),
+            1,
+            "from {start} m"
+        );
+        let z = pose.transform_point(&pts[0]).z;
+        assert!((z - 3.0).abs() < 1e-5, "from {start} m: re-seeded to {z} m");
+        assert_eq!(pts[1..], points[1..]);
+    }
+}
+
 /// `depth_gate_factor` must be positive: NaN would gate (and first re-seed)
 /// every depth row, zero or a negative value would gate every correct one.
 /// `f64::INFINITY` is the documented "no upper bound" and is accepted.
