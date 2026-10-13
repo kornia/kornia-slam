@@ -199,7 +199,12 @@ and the cheapest way the solver found to lower it was to turn a keyframe by
 ~90°; downstream this was a VIO pose refused as an 80° jump after hours
 parked. Four guards, each with a regression test (the end-to-end one turns a
 keyframe by 137° with them reverted):
-- the landmark blocks are Marquardt-damped like the keyframe system;
+- the landmark blocks are Marquardt-damped like the keyframe system. This
+  bounds the point step (undamped, a parked chain flung landmarks ~1e7 times
+  their depth) but does not make the depth observable: over many parked
+  windows a depth-free landmark still drifts out along its ray, to tens or
+  hundreds of times its depth. The depth gate below is what keeps a landmark
+  that got far from turning a keyframe when stereo next measures it;
 - a stereo depth row is left out of the solve when, at the start, the
   landmark's depth in that camera is outside `(0, 10·d + 1 m)` for measured
   depth `d` (`ViBaParams::depth_gate_factor`, default 10);
@@ -210,9 +215,10 @@ keyframe by 137° with them reverted):
   near-plane association cannot stall a moving window;
 - `run_local_inertial_ba` does not write back a landmark the solve left behind
   any observer, or whose distance from its nearest observer grew more than
-  tenfold and beyond 50 m; it keeps its old position. `cull_landmarks` also
-  retires a landmark farther than 10 km from every keyframe observing it (it
-  already retired one behind an observer).
+  tenfold and beyond 50 m; it keeps its old position. This catches a fling
+  in one solve, not a slow drift (each window may grow a landmark almost
+  tenfold). `cull_landmarks` also retires a landmark farther than 10 km from
+  every keyframe observing it (it already retired one behind an observer).
 
 The solve now reports what it did: `ViBaResult` gains `initial_cost`,
 `depth_rows_gated`, `cheirality_rejections` and `cheirality_points_held`, and
