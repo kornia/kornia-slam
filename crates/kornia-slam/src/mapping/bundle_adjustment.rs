@@ -673,7 +673,11 @@ impl WindowPoints {
     }
 
     fn write_back(&self, optimized: &[Vec3F64], map_points: &mut [Vec3F64]) {
-        self.write_back_where(optimized, &vec![true; optimized.len()], map_points);
+        for (&slot, point) in self.slots.iter().zip(optimized) {
+            if let Some(mp) = map_points.get_mut(slot) {
+                *mp = *point;
+            }
+        }
     }
 
     /// [`Self::write_back`] of the landmarks whose `keep` is true.
