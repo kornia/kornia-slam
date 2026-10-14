@@ -842,9 +842,9 @@ fn accum_jt_omega_j(
         for c in 0..15 {
             let mut s = 0.0f64;
             for k in 0..15 {
-                s += omega[r * 15 + k] * j_b[k * 15 + c];
+                s += omega[idx15(r, k)] * j_b[idx15(k, c)];
             }
-            omega_jb[r * 15 + c] = s;
+            omega_jb[idx15(r, c)] = s;
         }
     }
 
@@ -853,7 +853,7 @@ fn accum_jt_omega_j(
         for j in 0..15 {
             let mut s = 0.0f64;
             for k in 0..15 {
-                s += j_a[k * 15 + i] * omega_jb[k * 15 + j];
+                s += j_a[idx15(k, i)] * omega_jb[idx15(k, j)];
             }
             m_mat[(row_base + i, col_base + j)] += s;
         }
@@ -864,17 +864,24 @@ fn accum_jt_omega_j(
         let mut omega_r = [0.0f64; 15];
         for k in 0..15 {
             for m in 0..15 {
-                omega_r[k] += omega[k * 15 + m] * res[m];
+                omega_r[k] += omega[idx15(k, m)] * res[m];
             }
         }
         for i in 0..15 {
             let mut s = 0.0f64;
             for k in 0..15 {
-                s += j_a[k * 15 + i] * omega_r[k];
+                s += j_a[idx15(k, i)] * omega_r[k];
             }
             m_vec[row_base + i] -= s;
         }
     }
+}
+
+/// Row-major index of `(row, col)` in a 15×15 matrix stored as `[f64; 225]`
+/// (the IMU edge's information, Jacobians and products).
+#[inline]
+const fn idx15(row: usize, col: usize) -> usize {
+    row * 15 + col
 }
 
 /// Huber weight and cost of one IMU edge. The 9-dim nav block
@@ -887,7 +894,7 @@ fn imu_weight_and_cost(res: &[f64; 15], omega_raw: &[f64; 225], chi2_threshold: 
         let mut chi2 = 0.0f64;
         for i in range.clone() {
             for j in range.clone() {
-                chi2 += res[i] * omega_raw[i * 15 + j] * res[j];
+                chi2 += res[i] * omega_raw[idx15(i, j)] * res[j];
             }
         }
         chi2
@@ -911,9 +918,10 @@ fn imu_information_matrix(pim: &PreintegratedImu, weight: f64) -> [f64; 225] {
     // rotation, velocity, and position errors (gyro drives all three; accel
     // drives velocity and position).
     if let Some(nav_inv) = invert_9x9_f64(&pim.covariance) {
-        for c in 0..9 {
-            for r in 0..9 {
-                omega[c * 15 + r] = weight * nav_inv[c * 9 + r];
+        for r in 0..9 {
+            for c in 0..9 {
+                // `nav_inv` is column-major, like the covariance it inverts.
+                omega[idx15(r, c)] = weight * nav_inv[c * 9 + r];
             }
         }
     } else {
@@ -933,14 +941,14 @@ fn imu_information_matrix(pim: &PreintegratedImu, weight: f64) -> [f64; 225] {
         }
         for i in 0..9 {
             let var = pim.covariance[i * 10]; // diagonal: col-major index i*9+i
-            omega[i * 15 + i] = weight * if var > 1e-20 { 1.0 / var } else { 1e6 };
+            omega[idx15(i, i)] = weight * if var > 1e-20 { 1.0 / var } else { 1e6 };
         }
     }
 
     // Bias random-walk block (6×6): uncorrelated, diagonal is exact.
     for i in 0..6 {
         let var = pim.bias_covariance[i * 7]; // diagonal: col-major index i*6+i
-        omega[(9 + i) * 15 + (9 + i)] = weight * if var > 1e-20 { 1.0 / var } else { 1e6 };
+        omega[idx15(9 + i, 9 + i)] = weight * if var > 1e-20 { 1.0 / var } else { 1e6 };
     }
     omega
 }
@@ -1044,7 +1052,7 @@ fn set_block_15x15(m: &mut [f64; 225], row: usize, col: usize, block: &Mat3F64) 
     let cols = block.to_cols_array(); // column-major from glam
     for c in 0..3 {
         for r in 0..3 {
-            m[(row + r) * 15 + (col + c)] = cols[c * 3 + r];
+            m[idx15(row + r, col + c)] = cols[c * 3 + r];
         }
     }
 }
@@ -1730,9 +1738,9 @@ pub fn visual_inertial_bundle_adjust(
             cost_imu += c_imu;
             let omega: [f64; 225] = {
                 let mut o = omega_raw;
-                for c in 0..9 {
-                    for r in 0..9 {
-                        o[c * 15 + r] *= hw;
+                for r in 0..9 {
+                    for c in 0..9 {
+                        o[idx15(r, c)] *= hw;
                     }
                 }
                 o

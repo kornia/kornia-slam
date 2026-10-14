@@ -39,7 +39,8 @@ fn select_for_culling(map: &Map) -> Vec<usize> {
         }
     }
 
-    let mut nearest: HashMap<usize, f64> = HashMap::new();
+    // Map point indices are dense, so a slot per point beats a hash map on large maps.
+    let mut nearest = vec![f64::INFINITY; map.map_points().len()];
     for kf in map.keyframes() {
         let centre = kf.frame.pose_world_to_cam.inverse().translation;
         for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
@@ -51,15 +52,15 @@ fn select_for_culling(map: &Map) -> Vec<usize> {
                     selected.insert(*mp_idx);
                 }
                 let d = (mp.position - centre).length();
-                let entry = nearest.entry(*mp_idx).or_insert(f64::INFINITY);
-                *entry = entry.min(d);
+                nearest[*mp_idx] = nearest[*mp_idx].min(d);
             }
         }
     }
     selected.extend(
         nearest
-            .into_iter()
-            .filter(|&(_, d)| d > MAX_LANDMARK_DISTANCE_M)
+            .iter()
+            .enumerate()
+            .filter(|&(_, &d)| d.is_finite() && d > MAX_LANDMARK_DISTANCE_M)
             .map(|(idx, _)| idx),
     );
 
