@@ -36,34 +36,46 @@ See [ROADMAP.md](ROADMAP.md) for what's next.
 
 ## Install
 
-- **Prebuilt binaries (v0.1.0)**
-  - Linux x86_64 (glibc 2.35+):
-    ```bash
-    cd /tmp
-    curl -LO https://github.com/kornia/kornia-slam/releases/download/v0.1.0/kornia-slam-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-    tar -xzf kornia-slam-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-    cd kornia-slam-v0.1.0-x86_64-unknown-linux-gnu
-    ./kornia-slam euroc --data ./data/euroc/MH_01_easy
-    ```
-  - Linux aarch64 (Jetson / JetPack 6):
-    ```bash
-    cd /tmp
-    curl -LO https://github.com/kornia/kornia-slam/releases/download/v0.1.0/kornia-slam-v0.1.0-aarch64-unknown-linux-gnu.tar.gz
-    tar -xzf kornia-slam-v0.1.0-aarch64-unknown-linux-gnu.tar.gz
-    cd kornia-slam-v0.1.0-aarch64-unknown-linux-gnu
-    ./kornia-slam euroc --data ./data/euroc/MH_01_easy
-    ```
-  - What’s included: the v0.1.0 archives contain the `kornia-slam` CLI, `README.md`, `CHANGELOG.md` and `LICENSE`. They do not include `configs/` (the run-file CLI landed after v0.1.0).
-  - Features in the release binaries: built with the app’s default features (includes visualization; excludes live cameras). Live OAK-D/UVC support is not in these binaries. To use live cameras, build from source with features:
-    - OAK-D: `cargo run --release -p kornia-slam-app --features oakd -- --config configs/oakd-stereo.ron`
-    - UVC: `cargo run --release -p kornia-slam-app --features uvc -- --config configs/uvc.ron`
-  - CLI note: the v0.1.0 binary predates configurable run files (PR #149). It uses subcommands and flags, e.g.:
-    - v0.1.0 release binary: `./kornia-slam euroc --data ./data/euroc/MH_01_easy`
-    - main / build from source: `kornia-slam --config configs/euroc.ron`
+### Prebuilt binaries (v0.1.0)
 
-- **Build from source**
-  - With Cargo (Rust 1.91+ for the CLI): see `apps/kornia-slam-app/README.md` for build and run instructions.
-  - With Pixi: the workspace includes tasks for lint/test and a ready toolchain; see `apps/kornia-slam-app/README.md`.
+Linux x86_64 and aarch64 builds need glibc 2.35+ (Ubuntu 22.04+, Jetson JetPack 6):
+
+```bash
+TARGET=x86_64-unknown-linux-gnu   # or aarch64-unknown-linux-gnu
+NAME=kornia-slam-v0.1.0-$TARGET
+curl -L --remote-name-all https://github.com/kornia/kornia-slam/releases/download/v0.1.0/$NAME.tar.gz{,.sha256}
+sha256sum -c $NAME.tar.gz.sha256
+tar -xzf $NAME.tar.gz
+
+# stereo + IMU on an EuRoC sequence, with evaluation against ground truth
+./$NAME/kornia-slam euroc --data /path/to/MH_01_easy --stereo --imu --evaluate
+```
+
+The archive holds the binary, `README.md`, `CHANGELOG.md` and `LICENSE`.
+
+The v0.1.0 binary predates run files: it takes a source subcommand and flags
+(`kornia-slam --help`, `kornia-slam euroc --help`) rather than the `--config`
+run files described below. Global options go before the subcommand, e.g. loop
+closing with the vocabulary from [Quick start](#quick-start):
+`kornia-slam --vocab /path/to/ORBvoc.txt --apply-pgo euroc …`.
+
+It is built with the default features: Rerun streaming (`--rerun-stream`, which
+needs the `rerun` 0.29.2 viewer on `PATH`, e.g. `pip install rerun-sdk==0.29.2`)
+is in, live OAK-D and UVC cameras are not. Build from source with
+`--features oakd` or `--features uvc` for those; OAK-D has extra prerequisites,
+see [apps/kornia-slam-app](apps/kornia-slam-app/README.md#oak-d-camera).
+
+### From source
+
+The app needs Rust 1.91+ (the libraries 1.89+). Build and run with Cargo as in
+[Quick start](#quick-start), or with [Pixi](https://pixi.sh), which provides the
+toolchain:
+
+```bash
+pixi run rust-run -- --config configs/euroc.ron
+pixi run rust-lint
+pixi run rust-test
+```
 
 ## Quick start
 
