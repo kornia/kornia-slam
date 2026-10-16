@@ -23,19 +23,42 @@ const MAX_LANDMARK_DISTANCE_M: f64 = 1e4;
 
 /// Ids of the landmarks that fail the culling policy.
 ///
-/// A poor found ratio once a landmark has been seen enough times to judge,
-/// any landmark sitting behind a keyframe that observes it, and any farther
-/// than [`MAX_LANDMARK_DISTANCE_M`] from every keyframe observing it (the map
-/// holds only finite positions).
+/// Three criteria: a poor found ratio once a landmark has been seen at least
+/// [`MIN_OBSERVATIONS`] times, a landmark sitting behind its reference keyframe,
+/// and any landmark farther than [`MAX_LANDMARK_DISTANCE_M`] from every keyframe
+/// observing it (the map holds only finite positions).
 fn select_for_culling(map: &Map) -> Vec<usize> {
     let mut selected: HashSet<usize> = HashSet::new();
 
+    let slot_of: HashMap<usize, usize> = map
+        .keyframes()
+        .iter()
+        .enumerate()
+        .map(|(slot, kf)| (kf.frame.idx, slot))
+        .collect();
+
     for (idx, mp) in map.map_points().iter().enumerate() {
-        if mp.culled || mp.n_visible < MIN_OBSERVATIONS {
+        if mp.culled {
             continue;
         }
-        if mp.found_ratio() < MIN_FOUND_RATIO {
+
+        // Criterion 1: Low found ratio once a landmark has been observed enough times to judge.
+        if mp.n_visible >= MIN_OBSERVATIONS && mp.found_ratio() < MIN_FOUND_RATIO {
             selected.insert(idx);
+            continue;
+        }
+
+        // Criterion 2: Landmark sitting behind its reference keyframe.
+        // A landmark's scale geometry and initial coordinate frame are anchored
+        // to its reference keyframe. Checking depth relative to its reference
+        // keyframe prevents over-culling points that are valid in front of other
+        // keyframes as the camera moves past them or during local pose adjustments.
+        if let Some(&slot) = slot_of.get(&mp.keyframe_idx) {
+            let ref_kf = &map.keyframes()[slot];
+            let p_cam = ref_kf.frame.pose_world_to_cam.transform_point(&mp.position);
+            if p_cam.z <= 1e-8 {
+                selected.insert(idx);
+            }
         }
     }
 
@@ -47,10 +70,6 @@ fn select_for_culling(map: &Map) -> Vec<usize> {
             if let Some(mp) = map.map_points().get(*mp_idx)
                 && !mp.culled
             {
-                let p_cam = kf.frame.pose_world_to_cam.transform_point(&mp.position);
-                if p_cam.z <= 1e-8 {
-                    selected.insert(*mp_idx);
-                }
                 let d = (mp.position - centre).length();
                 nearest[*mp_idx] = nearest[*mp_idx].min(d);
             }
@@ -549,7 +568,7 @@ mod tests {
     use crate::frame::Frame;
     use crate::mapping::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
     use kornia_3d::pose::Pose3d;
-    use kornia_algebra::Vec3F64;
+    use kornia_algebra::{Mat3F64, Vec3F64};
     use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbFeatures;
 
@@ -648,6 +667,57 @@ mod tests {
         assert!(!map.map_points()[near].culled);
         assert!(!map.map_points()[far].culled);
         assert!(map.map_points()[flung].culled);
+    }
+
+    #[test]
+    fn spares_landmark_that_falls_behind_a_different_keyframe() {
+        let mut map = Map::new();
+        // KF0 at origin (0,0,0) facing +Z
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])))
+            .unwrap();
+        // Point created at (0,0,5) relative to KF0
+        let idx = map
+            .insert_landmark(LandmarkSeed {
+                position: Vec3F64::new(0.0, 0.0, 5.0),
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx: 0,
+                },
+            })
+            .unwrap();
+
+        // KF1 at (0,0,10) facing +Z (so point at Z=5 is behind KF1 at Z_cam = -5)
+        let mut kf1_frame = test_frame(1, vec![[0u8; 32]]);
+        kf1_frame.pose_world_to_cam = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.0, 0.0, -10.0));
+        map.insert_keyframe(Keyframe::from_frame(kf1_frame))
+            .unwrap();
+        map.link_observation(1, 0, idx).unwrap();
+
+        // Under the fix, the point is in front of its reference KF0 (Z=5 > 0),
+        // so it must NOT be culled even though it is behind KF1.
+        assert_eq!(cull_landmarks(&mut map), 0);
+        assert!(!map.map_points()[idx].culled);
+    }
+
+    #[test]
+    fn culls_landmark_if_behind_reference_keyframe() {
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])))
+            .unwrap();
+        let idx = map
+            .insert_landmark(LandmarkSeed {
+                position: Vec3F64::new(0.0, 0.0, -2.0), // Behind KF0
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx: 0,
+                },
+            })
+            .unwrap();
+
+        assert_eq!(cull_landmarks(&mut map), 1);
+        assert!(map.map_points()[idx].culled);
     }
 }
 
