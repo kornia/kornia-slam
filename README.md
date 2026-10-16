@@ -102,12 +102,12 @@ More sources and options: [apps/kornia-slam-app](apps/kornia-slam-app/README.md)
 ## Library
 
 A system configuration and the source's calibrated rig build a `SlamSystem`,
-which then takes images and IMU samples and returns poses. Feature extraction,
+which then takes IMU samples and images as they arrive and returns poses. Feature extraction,
 stereo matching and frame history are the system's; sources supply
 synchronized, calibrated (and, for stereo, rectified) images.
 
 ```rust,ignore
-use kornia_slam::{CameraSelection, SensorFrame, SensorSelection, SlamSystem, SystemConfig};
+use kornia_slam::{CameraSelection, ImageFrame, SensorSelection, SlamSystem, SystemConfig};
 
 let config = SystemConfig {
     sensors: SensorSelection { cameras: CameraSelection::Stereo, imu: true },
@@ -115,12 +115,12 @@ let config = SystemConfig {
 };
 let mut system = SlamSystem::build(config, rig)?; // rig: kornia_slam::SensorRig
 for (idx, frame) in frames.enumerate() {
-    let result = system.process(SensorFrame {
+    system.process_imu(&frame.imu);
+    let result = system.process_image(ImageFrame {
         idx,
         timestamp_sec: frame.timestamp_sec,
         image: &frame.left,
         right_image: Some(&frame.right),
-        imu_samples: &frame.imu,
     })?;
     println!("{idx}: {:?} {:?}", result.status, result.pose_world_to_cam);
 }

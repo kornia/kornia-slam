@@ -1,5 +1,3 @@
-use kornia_sensors::imu::ImuMeasurement;
-
 use super::*;
 
 const FRONTEND_FIXTURE: &str = include_str!("../../tests/fixtures/frontend/frontend.txt");
@@ -105,14 +103,12 @@ fn indexed_features(keypoints_xy: Vec<[f32; 2]>) -> OrbFeatures {
     }
 }
 
-fn input<'a>(image: &'a Image<u8, 1>, right: Option<&'a Image<u8, 1>>) -> SensorFrame<'a> {
-    const NO_SAMPLES: &[ImuMeasurement] = &[];
-    SensorFrame {
+fn input<'a>(image: &'a Image<u8, 1>, right: Option<&'a Image<u8, 1>>) -> ImageFrame<'a> {
+    ImageFrame {
         idx: 3,
         timestamp_sec: 0.1,
         image,
         right_image: right,
-        imu_samples: NO_SAMPLES,
     }
 }
 

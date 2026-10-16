@@ -9,7 +9,7 @@ use kornia_algebra::Vec2F64;
 use kornia_image::{Image, ImageError, ImageSize, InterpolationMode};
 use kornia_imgproc::features::{OrbDetector, OrbFeatures};
 use kornia_imgproc::resize::resize_fast_mono;
-use kornia_sensors::{SensorFrame, SensorRig};
+use kornia_sensors::{ImageFrame, SensorRig};
 
 use crate::Frame;
 use crate::stereo::{StereoMatchConfig, compute_stereo_matches};
@@ -69,7 +69,7 @@ impl OrbFrontend {
 
     /// Extracts and prepares the features of a validated input. The
     /// observation is updated only when preparation succeeds.
-    pub(crate) fn prepare(&mut self, input: &SensorFrame<'_>) -> Result<Frame, ImageError> {
+    pub(crate) fn prepare(&mut self, input: &ImageFrame<'_>) -> Result<Frame, ImageError> {
         let start = Instant::now();
         let image = input.image;
         let mut features = self.detector.detect_and_extract_u8(image)?;

@@ -2,7 +2,7 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_image::{Image, ImageSize};
 use kornia_slam::{
-    CameraSelection, SensorFrame, SensorRig, SensorSelection, SlamSystem, SystemConfig,
+    CameraSelection, ImageFrame, SensorRig, SensorSelection, SlamSystem, SystemConfig,
     TrackingStatus,
 };
 
@@ -41,12 +41,11 @@ fn slam_system_builds_and_processes_through_the_public_api() {
     )
     .unwrap();
     let result = system
-        .process(SensorFrame {
+        .process_image(ImageFrame {
             idx: 0,
             timestamp_sec: 0.0,
             image: &image,
             right_image: None,
-            imu_samples: &[],
         })
         .unwrap();
     assert_eq!(result.status, TrackingStatus::Skipped);
