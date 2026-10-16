@@ -55,11 +55,16 @@ impl InertialState {
         }
     }
 
-    /// Appends samples, then drops those more than [`MAX_BUFFERED_SEC`] older
-    /// than the newest, so a camera that stops delivering frames cannot grow
-    /// the buffer without bound.
+    /// Inserts samples in time order, then drops those more than
+    /// [`MAX_BUFFERED_SEC`] older than the newest, so a camera that stops
+    /// delivering frames cannot grow the buffer without bound.
     pub(crate) fn buffer_samples(&mut self, samples: Vec<ImuMeasurement>) {
-        self.pending_samples.extend(samples);
+        for sample in samples {
+            let at = self
+                .pending_samples
+                .partition_point(|m| m.timestamp <= sample.timestamp);
+            self.pending_samples.insert(at, sample);
+        }
         let Some(newest) = self.pending_samples.back().map(|m| m.timestamp) else {
             return;
         };
@@ -198,6 +203,22 @@ mod tests {
         let kept = state.pending_sample_count();
         assert!(kept <= (MAX_BUFFERED_SEC * 100.0) as usize + 1, "{kept}");
         assert!(kept > (MAX_BUFFERED_SEC * 100.0) as usize - 2, "{kept}");
+    }
+
+    #[test]
+    fn out_of_order_samples_are_kept_in_time_order_within_the_window() {
+        let mut state = InertialState::new();
+        let count = (3.0 * MAX_BUFFERED_SEC * 100.0) as usize;
+        for i in 0..count {
+            let t = i as f64 * 0.01;
+            // A sample far ahead first, then a late one behind the newest.
+            state.buffer_samples(vec![sample(t + 0.004), sample(t)]);
+        }
+        let times: Vec<f64> = state.pending_samples.iter().map(|m| m.timestamp).collect();
+        let newest = *times.last().unwrap();
+        assert!(times.windows(2).all(|w| w[0] <= w[1]));
+        assert!(times.iter().all(|&t| t >= newest - MAX_BUFFERED_SEC));
+        assert!(times.len() <= 2 * (MAX_BUFFERED_SEC * 100.0) as usize + 2);
     }
 
     /// Windows overlap by design, and the samples handed to a map factor must
