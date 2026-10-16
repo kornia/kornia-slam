@@ -23,6 +23,9 @@ use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, 
 /// Longest span of IMU samples kept while no frame prunes them, well beyond
 /// the gap between keyframes.
 const MAX_BUFFERED_SEC: f64 = 30.0;
+/// Hard cap on buffered samples, for timestamps that stop advancing. Covers
+/// [`MAX_BUFFERED_SEC`] at 1 kHz; a faster stream keeps a shorter span.
+const MAX_BUFFERED_SAMPLES: usize = 32_768;
 
 pub(crate) struct InertialState {
     pub(crate) bias: ImuBias,
@@ -56,8 +59,9 @@ impl InertialState {
     }
 
     /// Inserts samples in time order, then drops those more than
-    /// [`MAX_BUFFERED_SEC`] older than the newest, so a camera that stops
-    /// delivering frames cannot grow the buffer without bound.
+    /// [`MAX_BUFFERED_SEC`] older than the newest and the oldest beyond
+    /// [`MAX_BUFFERED_SAMPLES`], so a camera that stops delivering frames
+    /// cannot grow the buffer without bound.
     pub(crate) fn buffer_samples(&mut self, samples: Vec<ImuMeasurement>) {
         for sample in samples {
             let at = self
@@ -75,6 +79,11 @@ impl InertialState {
         {
             self.pending_samples.pop_front();
         }
+        let excess = self
+            .pending_samples
+            .len()
+            .saturating_sub(MAX_BUFFERED_SAMPLES);
+        self.pending_samples.drain(..excess);
     }
 
     #[cfg(test)]
@@ -172,7 +181,10 @@ pub(crate) struct AppliedInitialization {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImuInitResult, InertialAlignmentError, InertialState, MAX_BUFFERED_SEC, Map};
+    use super::{
+        ImuInitResult, InertialAlignmentError, InertialState, MAX_BUFFERED_SAMPLES,
+        MAX_BUFFERED_SEC, Map,
+    };
     use kornia_algebra::Vec3F64;
     use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement};
 
@@ -219,6 +231,15 @@ mod tests {
         assert!(times.windows(2).all(|w| w[0] <= w[1]));
         assert!(times.iter().all(|&t| t >= newest - MAX_BUFFERED_SEC));
         assert!(times.len() <= 2 * (MAX_BUFFERED_SEC * 100.0) as usize + 2);
+    }
+
+    #[test]
+    fn a_stalled_clock_cannot_grow_the_buffer_past_the_sample_cap() {
+        let mut state = InertialState::new();
+        for _ in 0..2 * MAX_BUFFERED_SAMPLES {
+            state.buffer_samples(vec![sample(5.0)]);
+        }
+        assert_eq!(state.pending_sample_count(), MAX_BUFFERED_SAMPLES);
     }
 
     /// Windows overlap by design, and the samples handed to a map factor must
