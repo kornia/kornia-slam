@@ -33,6 +33,9 @@ crossterm = "0.28"
 libc = "0.2"
 depthai = { version = "0.1", optional = true }
 nokhwa = { version = "0.10", optional = true, default-features = false, features = ["input-native", "decoding"] }
+# Needs a sourced ROS 2 installation whose messages include Rust bindings.
+rclrs = { version = "0.8", optional = true }
+ros-env = { version = "0.3", optional = true }
 mcap = "0.21"
 ciborium = "0.2"
 ron = "0.12"
@@ -45,3 +48,4 @@ default = ["viz"]
 viz = ["dep:rerun"]
 oakd = ["dep:depthai"]
 uvc = ["dep:nokhwa"]
+ros2 = ["dep:rclrs", "dep:ros-env"]

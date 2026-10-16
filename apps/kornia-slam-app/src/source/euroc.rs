@@ -184,6 +184,7 @@ impl FrameSource for EurocSource {
         Ok(Some(FrameItem {
             idx,
             timestamp_sec,
+            stamp_ns: None,
             image,
             right_image,
             imu_samples,

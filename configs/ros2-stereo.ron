@@ -1,0 +1,20 @@
+// Rectified stereo from ROS 2 topics; requires `--features ros2` and a sourced
+// ROS 2 installation (INTEGRATIONS.md). The topic names below are the defaults;
+// relative names resolve under the node's namespace. For mono, drop the right
+// topics and the sensors line.
+(
+    source: Ros2((
+        image: "left/image_rect",
+        camera_info: "left/camera_info",
+        right_image: "right/image_rect",
+        right_camera_info: "right/camera_info",
+        // With `imu: true`: the IMU topic and the rectified left camera's pose
+        // in the IMU frame (X_imu = R * X_cam + t, R row-major).
+        // imu: "imu",
+        // camera_to_imu: ( rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1], translation: [0, 0, 0] ),
+    )),
+    system: (
+        version: 1,
+        sensors: ( cameras: Stereo ),
+    ),
+)

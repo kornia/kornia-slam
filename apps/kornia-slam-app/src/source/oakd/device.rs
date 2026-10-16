@@ -219,6 +219,7 @@ impl FrameSource for OakdSource {
         Ok(Some(FrameItem {
             idx,
             timestamp_sec,
+            stamp_ns: None,
             image,
             right_image,
             imu_samples: Vec::new(),

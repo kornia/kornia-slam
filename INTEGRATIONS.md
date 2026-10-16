@@ -108,3 +108,59 @@ The extrinsic and noise values above belong to one rig; measure your own. Leave 
 
 For a self-contained graph on synthetic input, see `examples/stereo_vio.ron` in
 [cu-kornia-vio](https://github.com/kornia/cu-kornia-vio).
+
+## ROS 2
+
+The app subscribes to ROS 2 topics and publishes the camera pose through
+[ros2_rust](https://github.com/ros2-rust/ros2_rust) (`rclrs`), behind the `ros2` feature.
+
+### Building
+
+`rclrs` links against a ROS 2 installation and takes its message bindings from it, so build in a
+shell where ROS 2 is sourced. Kilted and later ship the Rust bindings of the standard messages
+(`share/<package>/rust`); older distributions have to generate them first, see the ros2_rust
+[building guide](https://github.com/ros2-rust/ros2_rust/blob/main/docs/building.md). `bindgen`
+also needs `libclang-dev`.
+
+```bash
+source /opt/ros/kilted/setup.bash
+cargo run --release -p kornia-slam-app --no-default-features --features ros2 -- \
+    --config configs/ros2-stereo.ron --ros2-publish
+```
+
+### Subscribing
+
+A `Ros2` source in the run file reads (topic names are the defaults; see
+[`configs/ros2-stereo.ron`](configs/ros2-stereo.ron)):
+
+| Topic | Type | Read |
+| --- | --- | --- |
+| `left/image_rect` | `sensor_msgs/Image` | always |
+| `left/camera_info` | `sensor_msgs/CameraInfo` | always |
+| `right/image_rect`, `right/camera_info` | as above | with stereo cameras |
+| `imu` | `sensor_msgs/Imu` | with `imu: true` |
+
+- **Images** must be rectified (`mono8`, `rgb8` or `bgr8`), e.g. the output of
+  [`image_proc`](https://docs.ros.org/en/rolling/p/image_proc/) or `stereo_image_proc`. The camera
+  comes from the `CameraInfo` projection matrix `P`, and the stereo baseline from the right
+  `P[3] = -fx * baseline`. Calibration is read once at startup; `wait_s` bounds the wait.
+- **Stereo** views are paired on identical header stamps.
+- **IMU** samples are handed to the frame whose stamp follows them, so both streams need stamps
+  from the same clock. The rectified left camera's pose in the IMU frame goes in `camera_to_imu`.
+- **Back-pressure:** up to `queue` frames wait for the tracker, then the oldest is dropped and a
+  `[ros2] tracker behind` line is logged. IMU samples are never dropped. When replaying a bag,
+  slow it down (`ros2 bag play --rate`) or raise `queue` to process every frame.
+
+### Publishing
+
+`--ros2-publish` publishes each tracked frame's camera pose, stamped with the image's stamp:
+
+- `kornia_slam/odometry` (`nav_msgs/Odometry`, pose only)
+- TF `map` → `kornia_slam_camera`
+
+`map` is the SLAM world frame, which inertial initialization can rotate and rescale.
+`kornia_slam_camera` is the left camera's optical frame (x right, y down, z forward). Link them
+into an existing TF tree with static transforms.
+
+Nodes start with no ROS arguments: the domain comes from `ROS_DOMAIN_ID`, and topics are renamed
+in the run file rather than with `--ros-args` remapping.

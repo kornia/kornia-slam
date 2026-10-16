@@ -1,11 +1,12 @@
-//! Frame sources: offline datasets (EuRoC, Hilti, MCAP recordings) and live
-//! cameras (OAK-D, UVC) behind one [`FrameSource`] trait. Each source module
+//! Frame sources: offline datasets (EuRoC, Hilti, MCAP recordings), live
+//! cameras (OAK-D, UVC) and ROS 2 topics behind one [`FrameSource`] trait. Each source module
 //! also owns the run-file settings it is opened from.
 
 pub mod euroc;
 pub mod hilti;
 pub mod mcap;
 pub mod oakd;
+pub mod ros2;
 pub mod uvc;
 
 use std::path::{Path, PathBuf};
@@ -23,6 +24,7 @@ use euroc::EurocConfig;
 use hilti::HiltiConfig;
 use mcap::McapConfig;
 use oakd::OakdConfig;
+use ros2::Ros2Config;
 use uvc::UvcConfig;
 
 /// One frame yielded by a source.
@@ -31,6 +33,10 @@ pub struct FrameItem {
     pub idx: usize,
     /// Capture timestamp in seconds (host clock for live sources).
     pub timestamp_sec: f64,
+    /// The exact capture stamp in nanoseconds, when the source has one that
+    /// `timestamp_sec` cannot hold to the nanosecond (ROS 2 header stamps).
+    #[cfg_attr(not(feature = "ros2"), expect(dead_code))]
+    pub stamp_ns: Option<i64>,
     /// Grayscale image (rectified left view when the source is stereo).
     pub image: Image<u8, 1>,
     /// Rectified right view, when the source provides a stereo pair.
@@ -99,6 +105,7 @@ pub enum SourceConfig {
     Hilti(HiltiConfig),
     Mcap(McapConfig),
     Oakd(OakdConfig),
+    Ros2(Ros2Config),
     Uvc(UvcConfig),
 }
 
@@ -112,6 +119,7 @@ impl SourceConfig {
             Self::Hilti(hilti) => hilti.validate(sensors),
             Self::Mcap(mcap) => mcap.validate(sensors),
             Self::Oakd(oakd) => oakd.validate(sensors),
+            Self::Ros2(ros2) => ros2.validate(sensors),
             Self::Uvc(uvc) => uvc.validate(sensors),
         }
     }
@@ -123,7 +131,7 @@ impl SourceConfig {
             Self::Hilti(hilti) => hilti.resolve_paths(base_dir),
             Self::Mcap(mcap) => mcap.resolve_paths(base_dir),
             Self::Oakd(oakd) => oakd.resolve_paths(base_dir),
-            Self::Uvc(_) => {}
+            Self::Ros2(_) | Self::Uvc(_) => {}
         }
     }
 
@@ -135,6 +143,7 @@ impl SourceConfig {
             Self::Hilti(hilti) => hilti.open(),
             Self::Mcap(mcap) => mcap.open(stereo),
             Self::Oakd(oakd) => oakd.open(stereo),
+            Self::Ros2(ros2) => ros2.open(sensors),
             Self::Uvc(uvc) => uvc.open(),
         }
     }

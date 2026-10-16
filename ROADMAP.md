@@ -43,7 +43,7 @@ Themes derived from ongoing studies of industrial and egocentric deployments. Th
 
 - [ ] Pixi environment and tasks for reproducible cross-platform builds
       ([#77](https://github.com/kornia/kornia-slam/issues/77), [#79](https://github.com/kornia/kornia-slam/pull/79))
-- [ ] ROS 2 integration via [ros2_rust](https://github.com/ros2-rust/ros2_rust)
+- [x] ROS 2 integration via [ros2_rust](https://github.com/ros2-rust/ros2_rust)
       ([#75](https://github.com/kornia/kornia-slam/issues/75))
 
 ## Experimental — sensors, maps, agents

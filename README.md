@@ -29,7 +29,7 @@ keypoints, and a follow view.</sub>
 - Monocular, stereo, and visual-inertial ORB SLAM
 - Local bundle adjustment, including visual-inertial BA
 - Place recognition (DBoW2) and loop closure with pose-graph optimization
-- Sources: EuRoC, Hilti, MCAP, OAK-D, UVC webcams
+- Sources: EuRoC, Hilti, MCAP, OAK-D, UVC webcams, ROS 2 topics
 - Terminal UI, Rerun streaming, ATE/RPE evaluation
 
 See [ROADMAP.md](ROADMAP.md) for what's next.
@@ -134,6 +134,9 @@ from a RON file, the `system` section of a run file.
 - **[Copper](https://github.com/copper-project/copper-rs):** stereo visual-inertial odometry as
   Copper tasks via [cu-kornia-vio](https://github.com/kornia/cu-kornia-vio). See
   [INTEGRATIONS.md](INTEGRATIONS.md#copper) for setup, graph wiring and timing requirements.
+- **[ROS 2](https://docs.ros.org):** subscribe to image, `CameraInfo` and IMU topics and publish
+  the camera pose, via [ros2_rust](https://github.com/ros2-rust/ros2_rust). See
+  [INTEGRATIONS.md](INTEGRATIONS.md#ros-2).
 
 ## Development
 

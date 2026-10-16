@@ -11,6 +11,8 @@
 mod config;
 mod datasets;
 mod evaluation;
+#[cfg(feature = "ros2")]
+mod ros2_output;
 mod source;
 mod tui;
 mod utils;
@@ -49,6 +51,11 @@ struct Args {
     #[argh(switch)]
     #[cfg(feature = "viz")]
     rerun_stream: bool,
+
+    /// publish the camera pose to ROS 2 (odometry and TF; requires `--features ros2`)
+    #[argh(switch)]
+    #[cfg(feature = "ros2")]
+    ros2_publish: bool,
 
     /// disable the terminal UI (status lines stream to stderr instead)
     #[argh(switch)]
@@ -120,6 +127,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    #[cfg(feature = "ros2")]
+    let pose_publisher = args
+        .ros2_publish
+        .then(ros2_output::PosePublisher::new)
+        .transpose()?;
+
     let mut tui_state = if tui_active {
         let (term, guard) = tui::setup_terminal(std::path::Path::new("tui_stderr.log"))?;
         let mut app = tui::TuiApp::new(n_frames_hint.unwrap_or(0));
@@ -143,12 +156,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         last_frame_walltime = Instant::now();
 
+        #[cfg(feature = "ros2")]
+        let stamp_ns = item.stamp_ns;
         let FrameItem {
             idx,
             timestamp_sec,
             image,
             right_image,
             imu_samples,
+            ..
         } = item;
         #[cfg(feature = "viz")]
         if let Some(ref rec) = rec {
@@ -200,6 +216,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 result.status, keyframe_idx, map_point_count,
             );
             eprintln!("{status_line}");
+        }
+
+        #[cfg(feature = "ros2")]
+        if let Some(publisher) = &pose_publisher
+            && result.status != kornia_slam::TrackingStatus::Skipped
+        {
+            let stamp = ros2_output::frame_stamp(stamp_ns, timestamp_sec);
+            publisher.publish(stamp, &result.pose_world_to_cam)?;
         }
 
         let traj_pt = trajectory_point_from_pose(&result.pose_world_to_cam);

@@ -265,6 +265,7 @@ impl FrameSource for McapSource {
         Ok(Some(FrameItem {
             idx,
             timestamp_sec: prepared.timestamp_sec,
+            stamp_ns: None,
             image: prepared.image,
             right_image: prepared.right_image,
             imu_samples: Vec::new(),

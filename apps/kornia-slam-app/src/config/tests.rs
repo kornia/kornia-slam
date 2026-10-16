@@ -83,6 +83,21 @@ fn source_settings_keep_their_defaults() {
     };
     assert_eq!((oakd.width, oakd.height, oakd.fps), (640, 400, 30.0));
 
+    let run = parse("(source: Ros2(()))").unwrap();
+    let SourceConfig::Ros2(ros2) = run.source else {
+        panic!("expected ROS 2, got {:?}", run.source);
+    };
+    assert_eq!(
+        (
+            ros2.image.as_str(),
+            ros2.camera_info.as_str(),
+            ros2.imu.as_str()
+        ),
+        ("left/image_rect", "left/camera_info", "imu")
+    );
+    assert!(ros2.camera_to_imu.is_none());
+    assert_eq!((ros2.queue, ros2.wait_s, ros2.max_frames), (4, 10.0, 0));
+
     let run = parse("(source: Uvc((fx: 600, fy: 600, cx: 320, cy: 240)))").unwrap();
     let SourceConfig::Uvc(uvc) = run.source else {
         panic!("expected UVC, got {:?}", run.source);
@@ -162,6 +177,13 @@ fn sources_are_checked_before_opening() {
         (mcap, imu, "no IMU data"),
         ("Oakd(())", imu, "no IMU data"),
         (uvc, imu, "no IMU data"),
+        ("Ros2(())", imu, "needs `camera_to_imu`"),
+        ("Ros2((queue: 0))", mono, "queue is 0"),
+        (
+            "Ros2((camera_to_imu: (rotation: [1, 0, 0], translation: [0, 0, 0])))",
+            imu,
+            "9 rotation and 3 translation",
+        ),
         ("Oakd((fps: 0))", mono, "fps is 0"),
         ("Oakd((width: 0))", mono, "width is 0"),
         ("Uvc((fx: -1, fy: 600, cx: 320, cy: 240))", mono, "fx is -1"),
@@ -178,6 +200,10 @@ fn sources_are_checked_before_opening() {
     for (source, sensors) in [
         (r#"Mcap((path: "r.mcap", calib: "c.yaml"))"#, stereo),
         (r#"Euroc((data: "d"))"#, "(cameras: Stereo, imu: true)"),
+        (
+            "Ros2((camera_to_imu: (rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1], translation: [0, 0, 0])))",
+            "(cameras: Stereo, imu: true)",
+        ),
     ] {
         assert!(parse(&run(source, sensors)).is_ok(), "{source} {sensors}");
     }

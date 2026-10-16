@@ -131,6 +131,7 @@ impl FrameSource for UvcSource {
         Ok(Some(FrameItem {
             idx,
             timestamp_sec,
+            stamp_ns: None,
             image,
             right_image: None,
             imu_samples: Vec::new(),
