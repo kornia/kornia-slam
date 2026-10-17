@@ -4,6 +4,7 @@ use kornia_3d::pose::Pose3d;
 
 use crate::frame::Frame;
 use crate::inertial::AlignedTrackingState;
+use crate::initialization::two_view::TwoViewRejectReason;
 use kornia_algebra::Vec3F64;
 
 /// Status of processing one frame.
@@ -104,6 +105,22 @@ impl SystemState {
         self.velocity_world = Vec3F64::ZERO;
     }
 
+    /// Counts a rejected two-view attempt against the bootstrap reference and
+    /// reports whether more than `max_low_matches` attempts in a row failed to
+    /// match it.
+    pub(crate) fn bootstrap_reference_lost(
+        &mut self,
+        reason: &TwoViewRejectReason,
+        max_low_matches: usize,
+    ) -> bool {
+        if matches!(reason, TwoViewRejectReason::LowMatches) {
+            self.bootstrap_low_match_rejections += 1;
+        } else {
+            self.bootstrap_low_match_rejections = 0;
+        }
+        self.bootstrap_low_match_rejections > max_low_matches
+    }
+
     /// Resumes tracking from an applied inertial initialization.
     pub(crate) fn adopt_inertial_initialization(&mut self, aligned: Option<AlignedTrackingState>) {
         if let Some(aligned) = aligned {
@@ -125,6 +142,7 @@ impl Default for SystemState {
 mod tests {
     use super::SystemState;
     use crate::inertial::AlignedTrackingState;
+    use crate::initialization::two_view::TwoViewRejectReason;
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::Vec3F64;
 
@@ -147,5 +165,18 @@ mod tests {
         );
         assert_eq!(state.pose_world_to_cam, pose);
         assert_eq!(state.velocity_world, Vec3F64::new(0.5, 0.0, 0.0));
+    }
+
+    #[test]
+    fn only_consecutive_low_match_rejections_lose_the_bootstrap_reference() {
+        let mut state = SystemState::new();
+        for _ in 0..3 {
+            assert!(!state.bootstrap_reference_lost(&TwoViewRejectReason::LowMatches, 3));
+        }
+        assert!(!state.bootstrap_reference_lost(&TwoViewRejectReason::LowParallax, 3));
+        for _ in 0..3 {
+            assert!(!state.bootstrap_reference_lost(&TwoViewRejectReason::LowMatches, 3));
+        }
+        assert!(state.bootstrap_reference_lost(&TwoViewRejectReason::LowMatches, 3));
     }
 }

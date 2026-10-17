@@ -46,7 +46,7 @@ use crate::initialization::bootstrap::{
     self, BootstrapDecision, MIN_KEYPOINTS_FOR_BOOTSTRAP, MIN_STEREO_POINTS, MIN_VALID_POINTS,
     TooFewStereoPoints, evaluate_bootstrap,
 };
-use crate::initialization::two_view::{TwoViewInitConfig, TwoViewRejectReason};
+use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{LoopCloser, LoopClosingContext, LoopClosureEvent};
 use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
 use crate::mapping::map::{
@@ -427,15 +427,15 @@ impl SlamSystem {
                 // A reference that keeps failing to match has lost the scene
                 // (ORB-SLAM3 replaces it on the first such frame; waiting a
                 // little keeps the better-conditioned early pairs).
-                if matches!(reason, TwoViewRejectReason::LowMatches) {
-                    self.state.bootstrap_low_match_rejections += 1;
-                    if self.state.bootstrap_low_match_rejections > MAX_LOW_MATCH_REJECTIONS {
-                        self.dbg(format!(
-                            "[bootstrap] frame={} replaces reference {reference_idx}",
-                            curr_frame.idx
-                        ));
-                        self.store_bootstrap_reference(curr_frame, timestamp_sec);
-                    }
+                if self
+                    .state
+                    .bootstrap_reference_lost(&reason, MAX_LOW_MATCH_REJECTIONS)
+                {
+                    self.dbg(format!(
+                        "[bootstrap] frame={} replaces reference {reference_idx}",
+                        curr_frame.idx
+                    ));
+                    self.store_bootstrap_reference(curr_frame, timestamp_sec);
                 }
                 return self.frame_result(TrackingStatus::Skipped);
             }
