@@ -994,8 +994,6 @@ impl SlamSystem {
         let Some(loop_closer) = self.loop_closer.as_ref() else {
             return false;
         };
-        let candidates =
-            loop_closer.relocalization_candidates(&frame.features.descriptors, MAX_CANDIDATES);
         // A pose far from where the motion model put the camera belongs to a
         // part of the map that has drifted from here; adopting it would
         // teleport the trajectory.
@@ -1003,6 +1001,11 @@ impl SlamSystem {
         let mut refused = Vec::new();
         let found = {
             let map = self.map.lock().unwrap();
+            let candidates = loop_closer.relocalization_candidates(
+                &frame.features.descriptors,
+                &map,
+                MAX_CANDIDATES,
+            );
             self.tracker
                 .relocalize(frame, &candidates, &map, &self.rig.camera, |found| {
                     let jump =
