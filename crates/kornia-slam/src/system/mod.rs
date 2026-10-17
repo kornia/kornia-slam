@@ -58,7 +58,7 @@ use build::SystemSettings;
 use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
 use kornia_sensors::imu::ImuMeasurement;
-use kornia_sensors::{SensorFrame, SensorRig};
+use kornia_sensors::{ImageFrame, SensorRig};
 
 /// Top-level ORB-SLAM system: orchestrates tracking, mapping, and state transitions.
 pub struct SlamSystem {
@@ -142,13 +142,32 @@ impl SlamSystem {
         &self.rig
     }
 
-    /// Extracts features from one input frame and tracks it.
+    /// Buffers IMU samples for the frames to come, in the body frame. Call it
+    /// as samples arrive; each frame uses the samples up to its own
+    /// timestamp, so feed them before the image they close. Samples with a
+    /// non-finite timestamp are ignored, and so are all samples when the rig
+    /// has no IMU.
+    pub fn process_imu(&mut self, samples: &[ImuMeasurement]) {
+        if self.rig.imu.is_none() {
+            return;
+        }
+        self.inertial.buffer_samples(
+            samples
+                .iter()
+                .filter(|sample| sample.timestamp.is_finite())
+                .copied()
+                .collect(),
+        );
+    }
+
+    /// Extracts features from one camera frame and tracks it.
     ///
     /// # Errors
     ///
     /// Invalid input or a feature-extraction failure; the system state,
-    /// including buffered IMU samples and image history, is then unchanged.
-    pub fn process(&mut self, input: SensorFrame<'_>) -> Result<TrackingResult, ProcessError> {
+    /// including image history, is then unchanged. IMU samples already
+    /// buffered are kept.
+    pub fn process_image(&mut self, input: ImageFrame<'_>) -> Result<TrackingResult, ProcessError> {
         input::validate(&input, self.rig.stereo_baseline_m.is_some())?;
         let frame = self
             .frontend
@@ -158,11 +177,6 @@ impl SlamSystem {
                 source,
             })?;
         self.report_stereo(&frame);
-        let imu_samples = if self.rig.imu.is_some() {
-            input.imu_samples.to_vec()
-        } else {
-            Vec::new()
-        };
         // Taken out for the call so tracking can borrow it alongside `self`.
         let previous_image = self.previous_image.take();
         let tracking_start = Instant::now();
@@ -171,7 +185,6 @@ impl SlamSystem {
             previous_image.as_ref(),
             input.image,
             input.timestamp_sec,
-            imu_samples,
         );
         self.tracking_duration = tracking_start.elapsed();
         self.retain_previous_image(input.image, previous_image);
@@ -227,7 +240,6 @@ impl SlamSystem {
         previous_image: Option<&Image<u8, 1>>,
         current_image: &Image<u8, 1>,
         timestamp_sec: f64,
-        imu_samples: Vec<ImuMeasurement>,
     ) -> TrackingResult {
         // Local-BA snapshots, merges, and their correction messages can only
         // cross this boundary between complete tracking frames.
@@ -239,7 +251,6 @@ impl SlamSystem {
         // Fill the per-frame undistortion cache once; tracking, BA gathering,
         // growth, and fuse all read from it.
         frame.ensure_undistorted(&self.rig.camera);
-        self.inertial.buffer_samples(imu_samples);
 
         match self.state.mode {
             SystemMode::Bootstrap => self.bootstrap_step(frame, timestamp_sec),

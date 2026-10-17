@@ -2,7 +2,8 @@
 //!
 //! [`SlamSystem`] is the runtime: [`SlamSystem::build`] assembles it from a
 //! [`SystemConfig`] and the source's calibrated [`SensorRig`], and
-//! [`SlamSystem::process`] tracks one [`SensorFrame`] of images and IMU samples.
+//! [`SlamSystem::process_imu`] buffers IMU samples as they arrive and
+//! [`SlamSystem::process_image`] tracks one [`ImageFrame`].
 //! Images are in the coordinates of the rig's camera, rectified for stereo,
 //! except for a rig with [`SensorRig::fisheye`], whose raw fisheye images
 //! the system maps into that camera keypoint by keypoint.
@@ -10,17 +11,16 @@
 //! ```no_run
 //! # use kornia_3d::camera::PinholeCamera;
 //! # use kornia_image::Image;
-//! use kornia_slam::{SystemConfig, SensorFrame, SensorRig, SlamSystem};
+//! use kornia_slam::{SystemConfig, ImageFrame, SensorRig, SlamSystem};
 //!
 //! # fn run(camera: PinholeCamera, images: Vec<Image<u8, 1>>) -> Result<(), Box<dyn std::error::Error>> {
 //! let mut system = SlamSystem::build(SystemConfig::default(), SensorRig::new(camera))?;
 //! for (idx, image) in images.iter().enumerate() {
-//!     let result = system.process(SensorFrame {
+//!     let result = system.process_image(ImageFrame {
 //!         idx,
 //!         timestamp_sec: idx as f64 / 20.0,
 //!         image,
 //!         right_image: None,
-//!         imu_samples: &[],
 //!     })?;
 //!     println!("{idx}: {:?}", result.status);
 //! }
@@ -59,7 +59,7 @@ pub mod tracking;
 pub use frame::Frame;
 pub use frontend::FrontendObservation;
 pub use kornia_imgproc::features::OrbFeatures;
-pub use kornia_sensors::{ImuCalibration, SensorFrame, SensorRig};
+pub use kornia_sensors::{ImageFrame, ImuCalibration, SensorRig};
 pub use loop_closure::{LoopClosingConfig, LoopClosureEvent};
 #[cfg(feature = "serde")]
 pub use system::LoadError;

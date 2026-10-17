@@ -1,7 +1,7 @@
-//! Validation of the input to [`SlamSystem::process`](super::SlamSystem::process).
+//! Validation of the input to [`SlamSystem::process_image`](super::SlamSystem::process_image).
 
 use kornia_image::{ImageError, ImageSize};
-use kornia_sensors::SensorFrame;
+use kornia_sensors::ImageFrame;
 
 /// A frame the system cannot process. The system state is unchanged.
 #[derive(Debug, thiserror::Error)]
@@ -32,7 +32,7 @@ pub enum ProcessError {
 /// Checks the input before any system state is touched. `stereo` is whether
 /// the pipeline selected stereo cameras; inputs for sensors it did not select
 /// are ignored.
-pub(crate) fn validate(input: &SensorFrame<'_>, stereo: bool) -> Result<(), ProcessError> {
+pub(crate) fn validate(input: &ImageFrame<'_>, stereo: bool) -> Result<(), ProcessError> {
     let idx = input.idx;
     if !input.timestamp_sec.is_finite() {
         return Err(ProcessError::NonFiniteTimestamp {
@@ -73,13 +73,12 @@ mod tests {
         Image::from_size_val(ImageSize { width, height }, 0).unwrap()
     }
 
-    fn frame<'a>(image: &'a Image<u8, 1>, right: Option<&'a Image<u8, 1>>) -> SensorFrame<'a> {
-        SensorFrame {
+    fn frame<'a>(image: &'a Image<u8, 1>, right: Option<&'a Image<u8, 1>>) -> ImageFrame<'a> {
+        ImageFrame {
             idx: 7,
             timestamp_sec: 1.0,
             image,
             right_image: right,
-            imu_samples: &[],
         }
     }
 
@@ -117,7 +116,7 @@ mod tests {
     fn rejects_non_finite_timestamps() {
         let left = image(8, 6);
         for timestamp_sec in [f64::NAN, f64::INFINITY] {
-            let input = SensorFrame {
+            let input = ImageFrame {
                 timestamp_sec,
                 ..frame(&left, None)
             };

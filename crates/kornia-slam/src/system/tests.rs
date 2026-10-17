@@ -57,13 +57,12 @@ fn textured(shift: usize) -> Image<u8, 1> {
     synthetic_pair(376, 240, shift).1
 }
 
-fn input<'a>(idx: usize, image: &'a Image<u8, 1>, imu: &'a [ImuMeasurement]) -> SensorFrame<'a> {
-    SensorFrame {
+fn input(idx: usize, image: &Image<u8, 1>) -> ImageFrame<'_> {
+    ImageFrame {
         idx,
         timestamp_sec: idx as f64 * 0.05,
         image,
         right_image: None,
-        imu_samples: imu,
     }
 }
 
@@ -90,7 +89,7 @@ impl Drop for SavedVocabulary {
 /// configuration can name it.
 fn saved_vocabulary(name: &str) -> SavedVocabulary {
     let features = OrbFrontend::new(mono().orb_detector(), &SensorRig::new(camera()))
-        .prepare(&input(0, &textured(0), &[]))
+        .prepare(&input(0, &textured(0)))
         .unwrap()
         .features;
     let descriptors: Vec<_> = features
@@ -184,12 +183,14 @@ fn disabled_imu_input_is_ignored() {
     let image = textured(0);
 
     let mut visual = SlamSystem::build(mono(), stereo_imu_rig()).unwrap();
-    visual.process(input(0, &image, &samples)).unwrap();
+    visual.process_imu(&samples);
+    visual.process_image(input(0, &image)).unwrap();
     assert_eq!(visual.inertial.pending_sample_count(), 0);
 
     let inertial = config(CameraSelection::Mono, true, LoopClosingMode::Disabled);
     let mut inertial = SlamSystem::build(inertial, stereo_imu_rig()).unwrap();
-    inertial.process(input(0, &image, &samples)).unwrap();
+    inertial.process_imu(&samples);
+    inertial.process_image(input(0, &image)).unwrap();
     assert_eq!(inertial.inertial.pending_sample_count(), samples.len());
 }
 
@@ -199,18 +200,18 @@ fn stereo_input_without_a_right_image_changes_nothing() {
     let mut system = SlamSystem::build(stereo, stereo_imu_rig()).unwrap();
     let samples = imu_samples();
     let image = textured(0);
-    let err = system.process(input(0, &image, &samples)).unwrap_err();
+    system.process_imu(&samples);
+    let err = system.process_image(input(0, &image)).unwrap_err();
     assert!(matches!(err, ProcessError::MissingRightImage { idx: 0 }));
     assert!(system.previous_image.is_none());
     assert!(system.frontend_observation().keypoints_xy.is_empty());
-    assert_eq!(system.inertial.pending_sample_count(), 0);
 
     let right = textured(8);
-    let pair = SensorFrame {
+    let pair = ImageFrame {
         right_image: Some(&right),
-        ..input(0, &image, &samples)
+        ..input(0, &image)
     };
-    assert!(system.process(pair).is_ok());
+    assert!(system.process_image(pair).is_ok());
     assert!(system.frontend_observation().stereo_matched.unwrap() > 0);
 }
 
@@ -245,12 +246,12 @@ fn imu_buffer_stays_bounded_while_bootstrap_keeps_failing() {
         let config = config(cameras, true, LoopClosingMode::Disabled);
         let mut system = SlamSystem::build(config, stereo_imu_rig()).unwrap();
         for idx in 0..400 {
-            let samples = frame_samples(idx);
-            let frame = SensorFrame {
+            system.process_imu(&frame_samples(idx));
+            let frame = ImageFrame {
                 right_image: stereo.then_some(&dark),
-                ..input(idx, if stereo { &left } else { &dark }, &samples)
+                ..input(idx, if stereo { &left } else { &dark })
             };
-            let result = system.process(frame).unwrap();
+            let result = system.process_image(frame).unwrap();
             assert_eq!(result.status, TrackingStatus::Skipped);
             assert!(
                 system.inertial.pending_sample_count() <= 10,
@@ -266,7 +267,7 @@ fn image_history_follows_successful_frames_only() {
     let mut system = SlamSystem::build(mono(), stereo_imu_rig()).unwrap();
     let (first, second, third) = (textured(0), textured(2), textured(4));
 
-    let result = system.process(input(0, &first, &[])).unwrap();
+    let result = system.process_image(input(0, &first)).unwrap();
     // The first frame only becomes the bootstrap reference, yet still
     // becomes the previous image.
     assert_eq!(result.status, TrackingStatus::Skipped);
@@ -275,17 +276,17 @@ fn image_history_follows_successful_frames_only() {
         first.as_slice()
     );
 
-    let invalid = SensorFrame {
+    let invalid = ImageFrame {
         timestamp_sec: f64::NAN,
-        ..input(1, &second, &[])
+        ..input(1, &second)
     };
-    assert!(system.process(invalid).is_err());
+    assert!(system.process_image(invalid).is_err());
     assert_eq!(
         system.previous_image.as_ref().unwrap().as_slice(),
         first.as_slice()
     );
 
-    system.process(input(2, &third, &[])).unwrap();
+    system.process_image(input(2, &third)).unwrap();
     assert_eq!(
         system.previous_image.as_ref().unwrap().as_slice(),
         third.as_slice()
