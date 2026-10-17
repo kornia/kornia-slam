@@ -408,9 +408,10 @@ impl EurocDataset {
         self.right_samples.get(right_idx)
     }
 
-    /// Whether the dataset has a usable right camera (calibration + samples).
+    /// Whether the dataset has a usable right camera: its calibration and at
+    /// least one image synchronised with a left one.
     pub fn is_stereo(&self) -> bool {
-        self.right_calibration.is_some() && !self.right_samples.is_empty()
+        self.right_calibration.is_some() && self.right_for_left.iter().any(Option::is_some)
     }
 
     /// Whether the dataset has IMU samples
@@ -786,5 +787,34 @@ mod tests {
         let right = samples_at(&[0.000_128, 49.999_9]);
         let pairs = match_by_timestamp(&left, &right, STEREO_SYNC_TOLERANCE_SEC);
         assert_eq!(pairs, vec![Some(0), Some(1)]);
+    }
+
+    fn dataset_with_right(right_ms: &[f64]) -> EurocDataset {
+        const IDENTITY: [f64; 16] = [
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        let left_samples = samples_at(&[0.0, 50.0, 100.0]);
+        let right_samples = samples_at(right_ms);
+        EurocDataset {
+            root: PathBuf::new(),
+            right_for_left: match_by_timestamp(
+                &left_samples,
+                &right_samples,
+                STEREO_SYNC_TOLERANCE_SEC,
+            ),
+            left_samples,
+            left_calibration: stereo_cam(IDENTITY, 367.0, 248.0),
+            right_samples,
+            right_calibration: Some(stereo_cam(IDENTITY, 367.0, 248.0)),
+            ground_truth: Vec::new(),
+            imu_samples: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_right_camera_with_no_synchronised_image_is_not_stereo() {
+        assert!(dataset_with_right(&[50.0]).is_stereo());
+        assert!(!dataset_with_right(&[25.0, 75.0]).is_stereo());
+        assert!(!dataset_with_right(&[]).is_stereo());
     }
 }
