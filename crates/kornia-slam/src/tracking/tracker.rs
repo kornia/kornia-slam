@@ -53,14 +53,16 @@ impl Tracker {
         }
     }
 
-    /// Recovers the pose against one of the candidate keyframes; on success
-    /// the optical-flow tracks, which belonged to the lost pose, are dropped.
+    /// Recovers the pose against one of the candidate keyframes, taking the
+    /// first that `accept` agrees to; only then are the optical-flow tracks,
+    /// which belonged to the lost pose, dropped.
     pub(crate) fn relocalize(
         &mut self,
         frame: &Frame,
         candidates: &[usize],
         map: &Map,
         camera: &PinholeCamera,
+        accept: impl FnMut(&Relocalization) -> bool,
     ) -> Option<Relocalization> {
         let found = relocalize(
             frame,
@@ -69,6 +71,7 @@ impl Tracker {
             camera,
             &self.estimator,
             &RelocalizationConfig::default(),
+            accept,
         );
         if found.is_some() {
             self.reset_tracks();

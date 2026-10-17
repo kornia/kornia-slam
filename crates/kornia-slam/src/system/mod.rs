@@ -996,27 +996,33 @@ impl SlamSystem {
         };
         let candidates =
             loop_closer.relocalization_candidates(&frame.features.descriptors, MAX_CANDIDATES);
-        let found = {
-            let map = self.map.lock().unwrap();
-            self.tracker
-                .relocalize(frame, &candidates, &map, &self.rig.camera)
-        };
-        let Some(found) = found else {
-            return false;
-        };
         // A pose far from where the motion model put the camera belongs to a
         // part of the map that has drifted from here; adopting it would
         // teleport the trajectory.
-        let jump = (found.estimate.pose.inverse().translation
-            - self.state.pose_world_to_cam.inverse().translation)
-            .length();
-        if jump > RELOCALIZATION_MAX_JUMP_M {
+        let predicted_position = self.state.pose_world_to_cam.inverse().translation;
+        let mut refused = Vec::new();
+        let found = {
+            let map = self.map.lock().unwrap();
+            self.tracker
+                .relocalize(frame, &candidates, &map, &self.rig.camera, |found| {
+                    let jump =
+                        (found.estimate.pose.inverse().translation - predicted_position).length();
+                    let near = jump <= RELOCALIZATION_MAX_JUMP_M;
+                    if !near {
+                        refused.push((found.keyframe_idx, jump));
+                    }
+                    near
+                })
+        };
+        for (keyframe_idx, jump) in refused {
             self.dbg(format!(
-                "[reloc] frame={} refused kf={} jump={jump:.2}m",
-                frame.idx, found.keyframe_idx
+                "[reloc] frame={} refused kf={keyframe_idx} jump={jump:.2}m",
+                frame.idx
             ));
-            return false;
         }
+        let Some(found) = found else {
+            return false;
+        };
         self.dbg(format!(
             "[reloc] frame={} against kf={} inliers={}",
             frame.idx, found.keyframe_idx, found.estimate.inliers

@@ -61,7 +61,7 @@ pub struct Relocalization {
 }
 
 /// Tries each candidate keyframe in order and returns the first pose with
-/// enough support.
+/// enough support that `accept` also takes.
 pub fn relocalize(
     frame: &Frame,
     candidates: &[usize],
@@ -69,6 +69,7 @@ pub fn relocalize(
     camera: &PinholeCamera,
     estimator: &MapProjectionEstimator,
     config: &RelocalizationConfig,
+    mut accept: impl FnMut(&Relocalization) -> bool,
 ) -> Option<Relocalization> {
     candidates.iter().find_map(|&keyframe_idx| {
         let keyframe = map.get_keyframe(keyframe_idx)?;
@@ -89,10 +90,12 @@ pub fn relocalize(
                 Some(inliers),
             )
             .ok()?;
-        (estimate.inliers >= config.min_inliers).then_some(Relocalization {
-            estimate,
-            keyframe_idx,
-        })
+        (estimate.inliers >= config.min_inliers)
+            .then_some(Relocalization {
+                estimate,
+                keyframe_idx,
+            })
+            .filter(|found| accept(found))
     })
 }
 
@@ -284,7 +287,12 @@ mod tests {
         )
     }
 
-    fn relocalize_query(query: &Frame, map: &Map, candidates: &[usize]) -> Option<Relocalization> {
+    fn relocalize_query(
+        query: &Frame,
+        map: &Map,
+        candidates: &[usize],
+        accept: impl FnMut(&Relocalization) -> bool,
+    ) -> Option<Relocalization> {
         let estimator = MapProjectionEstimator::new(MapProjectionConfig::default());
         relocalize(
             query,
@@ -293,6 +301,7 @@ mod tests {
             &camera(),
             &estimator,
             &RelocalizationConfig::default(),
+            accept,
         )
     }
 
@@ -302,7 +311,8 @@ mod tests {
         let truth = query_pose();
         let query = frame(50, truth, (0..LANDMARKS).map(descriptor).collect());
 
-        let found = relocalize_query(&query, &map, &[0]).expect("the keyframe sees the query");
+        let found =
+            relocalize_query(&query, &map, &[0], |_| true).expect("the keyframe sees the query");
 
         assert_eq!(found.keyframe_idx, 0);
         assert!(found.estimate.inliers >= 50);
@@ -323,6 +333,29 @@ mod tests {
             .collect();
         let query = frame(50, query_pose(), unrelated);
 
-        assert!(relocalize_query(&query, &map, &[0]).is_none());
+        assert!(relocalize_query(&query, &map, &[0], |_| true).is_none());
+    }
+
+    #[test]
+    fn a_refused_pose_moves_on_to_the_next_candidate() {
+        let map = mapped_keyframe();
+        let query = frame(50, query_pose(), (0..LANDMARKS).map(descriptor).collect());
+        let mut offered = 0;
+
+        let found = relocalize_query(&query, &map, &[0, 0], |_| {
+            offered += 1;
+            offered > 1
+        });
+
+        assert!(found.is_some());
+        assert_eq!(offered, 2);
+    }
+
+    #[test]
+    fn fails_when_every_supported_pose_is_refused() {
+        let map = mapped_keyframe();
+        let query = frame(50, query_pose(), (0..LANDMARKS).map(descriptor).collect());
+
+        assert!(relocalize_query(&query, &map, &[0, 0], |_| false).is_none());
     }
 }
