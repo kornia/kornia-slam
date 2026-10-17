@@ -182,11 +182,12 @@ impl KeyframePolicy {
 /// keep extending the map at the predicted pose every
 /// `keyframe_interval_while_lost_sec`: after a fast turn the camera faces
 /// space the map does not cover, and only new landmarks there let tracking
-/// resume. A map that's too young, or an inertial state that hasn't settled
-/// yet, gets the short visual grace period.
+/// resume. Without a settled inertial state tracking gets only the short
+/// visual grace period, and a map that's too young is reset at once.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TrackingLossRecoveryPolicy {
-    /// Minimum keyframe count before any grace period is granted.
+    /// A map with at most this many keyframes is reset as soon as tracking
+    /// fails, with no grace period.
     pub min_keyframes_for_grace: usize,
     /// Grace period once the IMU has been initialized for at least
     /// `min_imu_confidence_sec`.
