@@ -22,6 +22,7 @@ kornia-slam = { path = "crates/kornia-slam", version = "0.2.0" }
 
 kornia-3d = "0.2.0"
 kornia-algebra = "0.2.0"
+kornia-apriltag = "0.2.0"
 kornia-bow = "0.2.0"
 kornia-image = "0.2.0"
 kornia-imgproc = "0.2.0"

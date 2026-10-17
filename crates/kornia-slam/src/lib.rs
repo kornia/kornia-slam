@@ -45,6 +45,8 @@ pub(crate) fn debug_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KORNIA_SLAM_DEBUG").is_some())
 }
 
+#[cfg(feature = "apriltag")]
+pub mod apriltag_anchor;
 pub mod frame;
 pub(crate) mod frontend;
 pub mod inertial;
@@ -52,15 +54,21 @@ pub mod initialization;
 pub mod loop_closure;
 pub mod mapping;
 mod pose_conversion;
+pub mod sim3;
 pub mod stereo;
 pub mod system;
 pub mod tracking;
 
+#[cfg(feature = "apriltag")]
+pub use apriltag_anchor::{
+    AprilTagAnchor, AprilTagAnchorConfig, AprilTagAnchorError, TagFamilyKind,
+};
 pub use frame::Frame;
 pub use frontend::FrontendObservation;
 pub use kornia_imgproc::features::OrbFeatures;
 pub use kornia_sensors::{ImuCalibration, SensorFrame, SensorRig};
 pub use loop_closure::{LoopClosingConfig, LoopClosureEvent};
+pub use sim3::{HuberIrlsConfig, Sim3Alignment, Sim3Error, align_sim3, align_sim3_robust};
 #[cfg(feature = "serde")]
 pub use system::LoadError;
 pub use system::{

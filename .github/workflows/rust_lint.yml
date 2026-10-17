@@ -131,6 +131,24 @@ jobs:
             command: >-
               cargo clippy -p kornia-slam --all-targets -- -D warnings
 
+          # Library with the opt-in AprilTag metric anchor.
+          - name: slam-apriltag
+            apt: ""
+            command: >-
+              cargo clippy -p kornia-slam --features apriltag --all-targets -- -D warnings
+
+          # App with the AprilTag feature: compiles main.rs's cfg(apriltag)
+          # block and the anchored-evaluation path, which the library axis
+          # does not reach.
+          - name: app-apriltag
+            apt: ""
+            command: >-
+              cargo clippy
+              --manifest-path apps/kornia-slam-app/Cargo.toml
+              --features apriltag
+              --all-targets
+              -- -D warnings
+
           # App with no default features — exercises the non-viz, non-rerun
           # build path. TUI deps are now unconditional, so this also verifies
           # the app still compiles without the rerun integration.

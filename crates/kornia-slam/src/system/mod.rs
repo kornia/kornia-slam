@@ -13,6 +13,8 @@ mod state;
 mod validation;
 
 pub use build::BuildError;
+#[cfg(feature = "apriltag")]
+pub use config::AprilTagAnchorMode;
 pub use config::{
     CameraSelection, FrontendConfig, LoopClosingMode, MappingConfig, OrbFrontendConfig,
     OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection,
@@ -38,7 +40,12 @@ use crate::tracking::tracker::{FrameInput, Tracker};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "apriltag")]
+use std::collections::HashMap;
+
 use crate::Frame;
+#[cfg(feature = "apriltag")]
+use crate::apriltag_anchor::{AprilTagAnchor, AprilTagAnchorError};
 use crate::inertial::{
     AppliedInitialization, ImuInitResult, InertialState, viba0_accel_bias_prior,
 };
@@ -49,11 +56,15 @@ use crate::initialization::bootstrap::{
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{LoopCloser, LoopClosingContext, LoopClosureEvent};
 use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
+#[cfg(feature = "apriltag")]
+use crate::mapping::map::WorldSimilarityError;
 use crate::mapping::map::{
     InertialAlignmentError, Keyframe, Map, MapInsertion, MapMutationError, MapPoint,
 };
 use crate::mapping::{KeyframeJob, LocalMapping};
 use crate::pose_conversion::apply_reference_pose_correction;
+#[cfg(feature = "apriltag")]
+use crate::sim3::Sim3Alignment;
 use build::SystemSettings;
 use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
@@ -85,6 +96,23 @@ pub struct SlamSystem {
     // The last processed image, for optical-flow tracks into the next frame.
     previous_image: Option<Image<u8, 1>>,
     tracking_duration: Duration,
+    // Optional AprilTag metric anchor: observes the tag in published keyframes
+    // and can apply one post-hoc world correction.
+    #[cfg(feature = "apriltag")]
+    apriltag_anchor: Option<AprilTagAnchor>,
+}
+
+/// Failure to solve and apply the AprilTag metric anchor.
+#[cfg(feature = "apriltag")]
+#[derive(Debug, thiserror::Error)]
+pub enum AnchorApplyError {
+    /// The anchor could not be solved (no anchor configured, too few
+    /// observations, or a degenerate fit).
+    #[error(transparent)]
+    Anchor(#[from] AprilTagAnchorError),
+    /// The map refused the solved transform.
+    #[error("map refused the anchor transform: {0}")]
+    Map(#[from] WorldSimilarityError),
 }
 
 impl SlamSystem {
@@ -130,6 +158,8 @@ impl SlamSystem {
             frontend,
             previous_image: None,
             tracking_duration: Duration::ZERO,
+            #[cfg(feature = "apriltag")]
+            apriltag_anchor: settings.apriltag.map(AprilTagAnchor::new),
         }
     }
 
@@ -241,7 +271,7 @@ impl SlamSystem {
         frame.ensure_undistorted(&self.rig.camera);
         self.inertial.buffer_samples(imu_samples);
 
-        match self.state.mode {
+        let result = match self.state.mode {
             SystemMode::Bootstrap => self.bootstrap_step(frame, timestamp_sec),
             SystemMode::ImuInit => {
                 self.inertial_init_step(frame, previous_image, current_image, timestamp_sec)
@@ -249,7 +279,118 @@ impl SlamSystem {
             SystemMode::Tracking => {
                 self.tracking_step(frame, previous_image, current_image, timestamp_sec)
             }
+        };
+
+        // A keyframe was just published: let the anchor observe the tag. The
+        // observation stores the camera-frame tag pose, so it stays valid when
+        // local BA later refines the keyframe's pose.
+        #[cfg(feature = "apriltag")]
+        if result.status == TrackingStatus::KeyframeAccepted
+            && let Some(kf_idx) = self.state.current_keyframe_idx
+        {
+            let mut observed = None;
+            if let Some(anchor) = self.apriltag_anchor.as_mut() {
+                let before = anchor.num_observations();
+                anchor.on_keyframe(kf_idx, current_image, &self.rig.camera);
+                if anchor.num_observations() > before {
+                    observed = Some(anchor.num_observations());
+                }
+            }
+            if let Some(total) = observed {
+                self.dbg(format!(
+                    "[anchor] tag observed in kf={kf_idx} (total observations={total})"
+                ));
+            }
         }
+        result
+    }
+
+    /// Solves the AprilTag metric anchor from the keyframe observations gathered
+    /// during the run and applies it once to the whole map.
+    ///
+    /// On an IMU-initialized map (gravity-aligned and metric) the correction is
+    /// a gravity-preserving yaw + translation with scale fixed at 1; otherwise
+    /// it is the full Sim3 the tag geometry defines. The map publication gate is
+    /// held across the solve and writeback, so an in-flight local-mapping worker
+    /// cannot publish between them. Intended to be called once, after processing.
+    /// The tracking pose and the metric world velocity are corrected with the
+    /// same similarity; the relative `state.velocity` is invariant under a world
+    /// similarity and is left untouched.
+    ///
+    /// # Errors
+    ///
+    /// [`AnchorApplyError`] when no anchor is configured, too few keyframes
+    /// observed the tag, the fit is degenerate, or the map refuses the
+    /// transform. In every case the map is left unchanged.
+    #[cfg(feature = "apriltag")]
+    pub fn apply_apriltag_anchor(&mut self) -> Result<Sim3Alignment, AnchorApplyError> {
+        let publication_gate = self.map_publication_gate.clone();
+        let _publication = publication_gate
+            .as_ref()
+            .map(|gate| gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+
+        let (alignment, config, observations, keyframes) = {
+            let Some(anchor) = self.apriltag_anchor.as_ref() else {
+                return Err(AprilTagAnchorError::AnchorNotConfigured.into());
+            };
+            // Snapshot the final keyframe poses so the closure never holds the
+            // map lock while the anchor solves.
+            let poses: HashMap<usize, Pose3d> = {
+                let map = self
+                    .map
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                map.keyframes()
+                    .iter()
+                    .map(|kf| (kf.frame.idx, kf.frame.pose_world_to_cam))
+                    .collect()
+            };
+            let alignment = if self.state.imu_initialized {
+                anchor.solve_gravity_preserving(
+                    |idx| poses.get(&idx).copied(),
+                    self.inertial.gravity_world,
+                )?
+            } else {
+                anchor.solve(|idx| poses.get(&idx).copied())?
+            };
+            (
+                alignment,
+                anchor.config().clone(),
+                anchor.num_observations(),
+                anchor.num_distinct_keyframes(),
+            )
+        };
+
+        self.map
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .apply_world_similarity(alignment.scale, &alignment.rotation, alignment.translation)?;
+
+        // Keep the runtime tracking state consistent with the corrected map:
+        // the pose and the metric world velocity live in the world frame, so
+        // both take the same similarity. `state.velocity` is a *relative* pose
+        // between consecutive camera frames, which a world similarity leaves
+        // unchanged, so it needs no correction.
+        let cam_to_world = self.state.pose_world_to_cam.inverse();
+        let new_translation = alignment.scale * (alignment.rotation * cam_to_world.translation)
+            + alignment.translation;
+        let new_rotation = alignment.rotation * cam_to_world.rotation;
+        self.state.pose_world_to_cam = Pose3d::from_rt(new_rotation, new_translation).inverse();
+        self.state.velocity_world =
+            alignment.scale * (alignment.rotation * self.state.velocity_world);
+
+        // Clear the observation set so a second call cannot re-apply.
+        self.apriltag_anchor = Some(AprilTagAnchor::new(config));
+        self.dbg(format!(
+            "[anchor] applied: scale={:.6} obs={observations} kfs={keyframes} {:?}",
+            alignment.scale,
+            (if self.state.imu_initialized {
+                "gravity-preserving"
+            } else {
+                "full-sim3"
+            })
+        ));
+        Ok(alignment)
     }
 
     /// Runs `f` against the live map points, holding the map lock only for the
@@ -273,6 +414,12 @@ impl SlamSystem {
     /// Returns the number of active (non-culled) map points.
     pub fn num_active_map_points(&self) -> usize {
         self.map.lock().unwrap().num_active_map_points()
+    }
+
+    /// Whether an AprilTag metric-anchor stage is configured.
+    #[cfg(feature = "apriltag")]
+    pub fn apriltag_anchor_enabled(&self) -> bool {
+        self.apriltag_anchor.is_some()
     }
 
     /// Drain any debug messages accumulated since the last call.

@@ -5,6 +5,14 @@
 //! cargo run --release -p kornia-slam-app -- --config configs/euroc.ron
 //! ```
 //!
+//! Anchor the final map to a physical AprilTag (requires `--features apriltag`;
+//! enable the `apriltag_anchor` stage in the run file):
+//!
+//! ```text
+//! cargo run --release -p kornia-slam-app --features apriltag -- \
+//!     --config configs/apriltag-anchor.ron
+//! ```
+//!
 //! A run file names the source (EuRoC, Hilti, MCAP, or a live OAK-D or UVC
 //! camera) and the system to run on it; see `configs/` and [`config`].
 
@@ -281,11 +289,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
     );
+
+    // Metric anchor: solve and apply once, then report. On IMU-initialized
+    // maps the correction is gravity-preserving (scale stays 1); otherwise it
+    // is the full Sim3 the tag geometry defines.
+    //
+    // Only a *successful* anchor is the alignment of record: the recorded
+    // trajectory is corrected by the same Sim3 the map received, and the
+    // evaluation then registers it to ground truth with a scale-fixed (rigid)
+    // transform, so a wrong anchor scale still surfaces as error instead of
+    // being absorbed by a second best-fit. A failed solve leaves the map in its
+    // arbitrary frame, so the report falls back to the best-fit Sim3.
+    #[cfg(feature = "apriltag")]
+    let anchor_trusted = if system.apriltag_anchor_enabled() {
+        match system.apply_apriltag_anchor() {
+            Ok(a) => {
+                est_positions = est_positions.iter().map(|&p| a.apply(p)).collect();
+                eprintln!(
+                    "[apriltag-anchor] scale={:.6} translation=({:.4}, {:.4}, {:.4})",
+                    a.scale, a.translation.x, a.translation.y, a.translation.z
+                );
+                true
+            }
+            Err(e) => {
+                eprintln!("[apriltag-anchor] failed: {e} (map left unanchored)");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    #[cfg(not(feature = "apriltag"))]
+    let anchor_trusted = false;
+
+    // Median/max distance of active map points from the map origin, in map
+    // units: a stable telemetry signal for auditing the anchor's metric scale.
+    let (median_depth, max_depth) = system.with_map_points(|map_points| {
+        let mut depths: Vec<f64> = map_points
+            .iter()
+            .filter(|mp| !mp.culled)
+            .map(|mp| mp.position.length())
+            .collect();
+        if depths.is_empty() {
+            return (0.0, 0.0);
+        }
+        depths.sort_by(|a, b| a.total_cmp(b));
+        let median = depths[depths.len() / 2];
+        (median, *depths.last().unwrap_or(&0.0))
+    });
+    eprintln!("Map depth (map units): median={median_depth:.3}  max={max_depth:.3}");
+
     if args.evaluate {
         evaluation::report(
             &est_positions,
             &gt_positions,
             std::path::Path::new(&args.eval_out),
+            anchor_trusted,
         )?;
     }
     Ok(())
