@@ -58,15 +58,14 @@ fn enabled() -> bool {
     true
 }
 
+const ROTATED_WITH_IMU: &str = "Hilti with the IMU needs `rotate_180: false`: the \
+     camera-IMU extrinsic of rotated images is not supported yet";
+
 impl HiltiConfig {
     pub(super) fn validate(&self, sensors: SensorSelection) -> Result<(), String> {
         mono_only("Hilti", sensors)?;
         if sensors.imu && self.rotate_180 {
-            return Err(
-                "Hilti with the IMU needs `rotate_180: false`: the camera-IMU \
-                        extrinsic of rotated images is not supported yet"
-                    .into(),
-            );
+            return Err(ROTATED_WITH_IMU.into());
         }
         Ok(())
     }
@@ -129,6 +128,9 @@ impl HiltiSource {
         rotate_180: bool,
         imu: bool,
     ) -> Result<Self, SourceError> {
+        if imu && rotate_180 {
+            return Err(SourceError::other(ROTATED_WITH_IMU));
+        }
         let dataset = HiltiDataset::open(data_root, calibration).map_err(SourceError::other)?;
         let n = dataset.samples().len();
         let start = window.start_frame.min(n);
@@ -309,5 +311,17 @@ mod tests {
         .unwrap();
         let rot = rotate_180_mono(&img);
         assert_eq!(rot.as_slice(), &[4u8, 3, 2, 1]);
+    }
+
+    #[test]
+    fn open_refuses_rotated_images_with_the_imu() {
+        let window = FrameWindow {
+            start_frame: 0,
+            max_frames: 0,
+        };
+        let Err(err) = HiltiSource::open("missing", "missing", window, true, true) else {
+            panic!("rotated images with the IMU must be refused");
+        };
+        assert!(err.to_string().contains("rotate_180: false"), "{err}");
     }
 }
