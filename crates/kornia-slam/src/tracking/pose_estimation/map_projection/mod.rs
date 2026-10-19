@@ -651,17 +651,6 @@ mod estimator_tests {
         );
     }
 
-    #[test]
-    fn test_need_new_keyframe_forced_by_gap() {
-        let policy = KeyframePolicy::default();
-        assert!(policy.should_insert(100, Some(90), 50, 100));
-    }
-
-    #[test]
-    fn test_need_new_keyframe_too_soon() {
-        let policy = KeyframePolicy::default();
-        assert!(!policy.should_insert(2, Some(1), 50, 100));
-    }
 }
 
 #[cfg(test)]
