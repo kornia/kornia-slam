@@ -31,6 +31,8 @@ pub struct KeyframeRemoval {
     /// `(prev, next)` keyframes of the IMU edge that replaced the two through
     /// the removed keyframe.
     pub merged_imu_edge: Option<(usize, usize)>,
+    /// `(prev, next)` keyframes of the IMU edge dropped with an evicted one.
+    pub dropped_imu_edge: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -59,6 +61,15 @@ pub enum KeyframeRemovalError {
     DuplicateImuFactor { prev: usize, next: usize },
     #[error("re-preintegrating the imu edges through keyframe {0} gave an invalid result")]
     InvalidMergedImu(usize),
+    #[error(
+        "keyframe {keyframe_idx} has {incoming} incoming and {outgoing} outgoing imu edges; \
+         only the start of the chain can be evicted"
+    )]
+    NotImuChainStart {
+        keyframe_idx: usize,
+        incoming: usize,
+        outgoing: usize,
+    },
     #[error("still neighbour {neighbour} of keyframe {keyframe_idx} cannot take over its imu edge")]
     InvalidStillNeighbour {
         keyframe_idx: usize,
@@ -111,12 +122,28 @@ enum ImuRepair {
     /// The edge at `position` is replaced by `factor`, its endpoint moved to
     /// the still neighbour.
     Move { position: usize, factor: ImuFactor },
+    /// The edge at `position`, `(prev, next)`, is dropped.
+    Drop {
+        position: usize,
+        edge: (usize, usize),
+    },
 }
 
 impl ImuRepair {
-    fn edge(&self) -> (usize, usize) {
-        let (Self::Merge { factor, .. } | Self::Move { factor, .. }) = self;
-        (factor.prev_kf_idx, factor.curr_kf_idx)
+    fn merged_edge(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Merge { factor, .. } | Self::Move { factor, .. } => {
+                Some((factor.prev_kf_idx, factor.curr_kf_idx))
+            }
+            Self::Drop { .. } => None,
+        }
+    }
+
+    fn dropped_edge(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Drop { edge, .. } => Some(*edge),
+            Self::Merge { .. } | Self::Move { .. } => None,
+        }
     }
 }
 
@@ -179,6 +206,54 @@ impl Map {
         ))
     }
 
+    /// Evicts keyframe `keyframe_idx` from the start of the IMU chain, the
+    /// answer to a map bound that culling cannot meet: unlike
+    /// [`Self::remove_keyframe`] nothing is merged, so whatever its outgoing
+    /// IMU edge constrained is lost with it. Landmarks are repaired as in
+    /// [`Self::remove_keyframe`].
+    ///
+    /// Refused, with the map untouched, unless the keyframe has no incoming
+    /// IMU edge and at most one outgoing.
+    pub fn evict_keyframe(
+        &mut self,
+        keyframe_idx: usize,
+    ) -> Result<KeyframeRemoval, KeyframeRemovalError> {
+        let slot = self.keyframe_slot(keyframe_idx)?;
+        let repair = self.imu_chain_start(keyframe_idx)?;
+        Ok(self.remove_validated(slot, keyframe_idx, repair))
+    }
+
+    /// The outgoing edge of a keyframe at the start of the IMU chain, to drop.
+    fn imu_chain_start(
+        &self,
+        keyframe_idx: usize,
+    ) -> Result<Option<ImuRepair>, KeyframeRemovalError> {
+        let incoming = self
+            .imu_factors
+            .iter()
+            .filter(|f| f.curr_kf_idx == keyframe_idx)
+            .count();
+        let outgoing: Vec<usize> = self
+            .imu_factors
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.prev_kf_idx == keyframe_idx)
+            .map(|(pos, _)| pos)
+            .collect();
+        match (incoming, outgoing.as_slice()) {
+            (0, []) => Ok(None),
+            (0, &[position]) => Ok(Some(ImuRepair::Drop {
+                position,
+                edge: (keyframe_idx, self.imu_factors[position].curr_kf_idx),
+            })),
+            (incoming, outgoing) => Err(KeyframeRemovalError::NotImuChainStart {
+                keyframe_idx,
+                incoming,
+                outgoing: outgoing.len(),
+            }),
+        }
+    }
+
     fn keyframe_slot(&self, keyframe_idx: usize) -> Result<usize, KeyframeRemovalError> {
         self.keyframes
             .iter()
@@ -199,7 +274,8 @@ impl Map {
             keyframe_idx,
             observations_removed: 0,
             landmarks_retired: 0,
-            merged_imu_edge: repair.as_ref().map(ImuRepair::edge),
+            merged_imu_edge: repair.as_ref().and_then(ImuRepair::merged_edge),
+            dropped_imu_edge: repair.as_ref().and_then(ImuRepair::dropped_edge),
         };
         let mut dirty = Vec::new();
         for mp_idx in 0..self.map_points.len() {
@@ -235,6 +311,9 @@ impl Map {
                 self.imu_factors.remove(outgoing);
             }
             Some(ImuRepair::Move { position, factor }) => self.imu_factors[position] = factor,
+            Some(ImuRepair::Drop { position, .. }) => {
+                self.imu_factors.remove(position);
+            }
             None => {}
         }
         removal
