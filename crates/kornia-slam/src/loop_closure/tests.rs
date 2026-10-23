@@ -575,6 +575,69 @@ fn inertial_pgo_uses_four_dof_and_preserves_gravity() {
     );
 }
 
+#[test]
+fn optimize_pose_graph_reports_unusable_when_max_iterations_too_low() {
+    let mut map = Map::new();
+    let pose_count = 50;
+    for index in 0..pose_count {
+        let center = Vec3F64::new(index as f64, 0.0, 0.0);
+        let pose = Pose3d::new(Mat3F64::IDENTITY, -center);
+        map.insert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())))
+            .unwrap();
+    }
+    let verified = VerifiedLoopEdge {
+        query_kf_idx: pose_count - 1,
+        candidate_kf_idx: 0,
+        candidate_to_query: Pose3d::IDENTITY,
+        correspondences: 40,
+        inliers: 35,
+        inlier_ratio: 0.875,
+        reprojection_rmse_px: 1.0,
+        occupied_cells: 8,
+    };
+    let config = PgoConfig {
+        max_iterations: 1,
+        ..PgoConfig::default()
+    };
+    let result = optimize_pose_graph(&map, &[verified], &config, None).unwrap();
+    assert!(
+        !result.usable,
+        "under-iterated solve must report usable=false"
+    );
+    assert_eq!(result.iterations, 1);
+}
+
+#[test]
+fn optimize_pose_graph_reports_unusable_when_loop_residual_does_not_improve() {
+    let mut map = Map::new();
+    for index in 0..4 {
+        let center = Vec3F64::new(index as f64, 0.0, 0.0);
+        let pose = Pose3d::new(Mat3F64::IDENTITY, -center);
+        map.insert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())))
+            .unwrap();
+    }
+    // Loop edge with an incompatible measurement that pulls against odometry
+    // with very low weight, so the optimizer barely moves the nodes and the
+    // residual does not improve.
+    let verified = VerifiedLoopEdge {
+        query_kf_idx: 3,
+        candidate_kf_idx: 0,
+        candidate_to_query: Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(10.0, 0.0, 0.0)),
+        correspondences: 40,
+        inliers: 35,
+        inlier_ratio: 0.875,
+        reprojection_rmse_px: 1.0,
+        occupied_cells: 8,
+    };
+    let config = PgoConfig {
+        loop_edge_weight: 1e-4,
+        max_iterations: 1,
+        ..PgoConfig::default()
+    };
+    let result = optimize_pose_graph(&map, &[verified], &config, None).unwrap();
+    assert!(!result.usable);
+}
+
 fn closing_config() -> LoopClosingConfig {
     LoopClosingConfig {
         episode: LoopEpisodeConfig {

@@ -1938,4 +1938,129 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn sparse_lm_converges_at_f32_cost_noise_floor_without_damping_escalation() {
+        // Pre-fix baseline on 500 keyframes burned 19 trials (damping escalated
+        // to 1e2), and 1000 keyframes hit max_iterations (30) with converged=false.
+        // With cost accumulation in f64 and noise-floor convergence detection,
+        // the solver converges cleanly in 7 trials without escalating damping.
+        const PRE_FIX_ITERATIONS: usize = 19;
+        const POST_FIX_ITERATION_CAP: usize = 10;
+        let (poses, edges) = se3_scaling_graph(500);
+        let initial_cost = normal_cost(&poses, &edges);
+        let mut hooks = SparsePgoTestHooks::default();
+        let params = PgoParams::default();
+
+        let result = sparse_pose_graph_optimize_with_test_hooks(
+            &poses,
+            &edges,
+            &[0],
+            &params,
+            &Se3Manifold,
+            &mut hooks,
+        )
+        .unwrap();
+
+        let final_cost = normal_cost(&result.poses, &edges);
+        assert!(
+            result.converged,
+            "solver must report converged=true at noise floor"
+        );
+        assert!(
+            result.iterations <= POST_FIX_ITERATION_CAP,
+            "iterations ({}) must be well below max_iterations ({}) and pre-fix baseline ({PRE_FIX_ITERATIONS})",
+            result.iterations,
+            params.max_iterations
+        );
+        assert!(result.iterations < PRE_FIX_ITERATIONS);
+        assert!(
+            final_cost < initial_cost * 0.01,
+            "final cost must be significantly reduced"
+        );
+        assert!(
+            final_cost <= 3e-5,
+            "final cost must be no worse than pre-fix (2.57e-5)"
+        );
+        assert!(
+            !hooks.iterations.iter().any(|it| it.damping >= 1e3),
+            "damping must not escalate up to 1e3 at the noise floor"
+        );
+        assert!(
+            hooks.iterations.iter().all(|it| it.damping <= 1e-3),
+            "damping should remain small throughout optimization"
+        );
+
+        // Verify that optimize_pose_graph produces a usable result for the live map
+        let mut map = crate::mapping::map::Map::new();
+        for (idx, pose) in poses.iter().enumerate() {
+            let frame = crate::Frame {
+                idx,
+                features: kornia_imgproc::features::OrbFeatures {
+                    keypoints_xy: Vec::new(),
+                    orientations: Vec::new(),
+                    descriptors: Vec::new(),
+                    octaves: Vec::new(),
+                },
+                pose_world_to_cam: *pose,
+                image_size: kornia_image::ImageSize {
+                    width: 640,
+                    height: 480,
+                },
+                keypoint_colors: Vec::new(),
+                u_right: Vec::new(),
+                depth: Vec::new(),
+                keypoints_undist: Vec::new(),
+            };
+            map.insert_keyframe(crate::mapping::map::Keyframe::from_frame(frame))
+                .unwrap();
+        }
+        let verified_loops = edges[poses.len() - 1..]
+            .iter()
+            .map(|edge| crate::loop_closure::VerifiedLoopEdge {
+                query_kf_idx: edge.pose_b,
+                candidate_kf_idx: edge.pose_a,
+                candidate_to_query: crate::pose_conversion::se3_to_pose(&edge.t_ab_meas),
+                correspondences: 40,
+                inliers: 35,
+                inlier_ratio: 0.875,
+                reprojection_rmse_px: 1.0,
+                occupied_cells: 8,
+            })
+            .collect::<Vec<_>>();
+        let pgo_result = crate::loop_closure::pose_graph::optimize_pose_graph(
+            &map,
+            &verified_loops,
+            &crate::loop_closure::pose_graph::PgoConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            pgo_result.usable,
+            "pose graph at noise floor must be usable"
+        );
+        assert!(
+            pgo_result.iterations <= POST_FIX_ITERATION_CAP,
+            "PGO iterations ({}) must be <= {POST_FIX_ITERATION_CAP}",
+            pgo_result.iterations
+        );
+    }
+
+    #[test]
+    fn sparse_lm_reports_unconverged_when_max_iterations_exceeded() {
+        let (poses, edges) = se3_scaling_graph(500);
+        let params = PgoParams {
+            max_iterations: 2,
+            ..PgoParams::default()
+        };
+
+        let result =
+            sparse_pose_graph_optimize(&poses, &edges, &[0], &params, &Se3Manifold).unwrap();
+
+        assert!(
+            !result.converged,
+            "solver must report converged=false when iteration budget runs out"
+        );
+        assert_eq!(result.iterations, 2);
+    }
 }
