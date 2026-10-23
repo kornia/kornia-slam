@@ -1122,7 +1122,7 @@ mod tests {
 
     use kornia_3d::pgo::{PgoEdge, PgoParams};
     use kornia_3d::pose::Pose3d;
-    use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
+    use kornia_algebra::{Mat3F64, SE3F32, SO3F64, Vec3F64};
 
     use super::{
         GravityManifold, PoseManifold, Se3Manifold, SparsePgoError, SparsePgoTestHooks,
@@ -2062,5 +2062,207 @@ mod tests {
             "solver must report converged=false when iteration budget runs out"
         );
         assert_eq!(result.iterations, 2);
+    }
+
+    #[test]
+    #[ignore = "offline replay hook for graphs dumped via KORNIA_PGO_DUMP"]
+    fn replay_pgo_dump() {
+        let dump_path = match std::env::var("KORNIA_PGO_REPLAY") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => {
+                eprintln!("Set KORNIA_PGO_REPLAY=<path> to replay a dumped pose graph");
+                return;
+            }
+        };
+        let dump = load_pgo_dump(&dump_path).expect("failed to load dump");
+        let mut hooks = SparsePgoTestHooks::default();
+        let params = PgoParams::default();
+        let result = if let Some(gravity) = dump.gravity {
+            let manifold = GravityManifold::new(gravity).unwrap();
+            sparse_pose_graph_optimize_with_test_hooks(
+                &dump.poses,
+                &dump.edges,
+                &[0],
+                &params,
+                &manifold,
+                &mut hooks,
+            )
+        } else {
+            sparse_pose_graph_optimize_with_test_hooks(
+                &dump.poses,
+                &dump.edges,
+                &[0],
+                &params,
+                &Se3Manifold,
+                &mut hooks,
+            )
+        };
+        println!(
+            "Replay result: converged={:?}",
+            result.as_ref().map(|r| (r.converged, r.iterations))
+        );
+        println!("Iterations count: {}", hooks.iterations.len());
+        for (i, it) in hooks.iterations.iter().enumerate() {
+            println!(
+                "  iteration {i}: accepted={}, damping={:e}",
+                it.accepted, it.damping
+            );
+        }
+    }
+
+    pub(crate) struct PgoDump {
+        pub poses: Vec<Pose3d>,
+        pub edges: Vec<PgoEdge>,
+        pub gravity: Option<Vec3F64>,
+    }
+
+    pub(crate) fn load_pgo_dump(path: &std::path::Path) -> Result<PgoDump, SparsePgoError> {
+        let content = std::fs::read_to_string(path).map_err(|error| {
+            SparsePgoError::InvalidInput(format!("failed to read dump: {error}"))
+        })?;
+        let mut poses = Vec::new();
+        let mut edges = Vec::new();
+        let mut gravity = None;
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            match tokens.as_slice() {
+                ["GRAVITY", x, y, z] => {
+                    let gx = x
+                        .parse::<f64>()
+                        .map_err(|e| SparsePgoError::InvalidInput(e.to_string()))?;
+                    let gy = y
+                        .parse::<f64>()
+                        .map_err(|e| SparsePgoError::InvalidInput(e.to_string()))?;
+                    let gz = z
+                        .parse::<f64>()
+                        .map_err(|e| SparsePgoError::InvalidInput(e.to_string()))?;
+                    gravity = Some(Vec3F64::new(gx, gy, gz));
+                }
+                [
+                    "POSE",
+                    _node,
+                    r00,
+                    r01,
+                    r02,
+                    r10,
+                    r11,
+                    r12,
+                    r20,
+                    r21,
+                    r22,
+                    tx,
+                    ty,
+                    tz,
+                ] => {
+                    let parse_f64 = |val: &str| {
+                        val.parse::<f64>()
+                            .map_err(|e| SparsePgoError::InvalidInput(e.to_string()))
+                    };
+                    let rot = Mat3F64::from_cols_array(&[
+                        parse_f64(r00)?,
+                        parse_f64(r10)?,
+                        parse_f64(r20)?,
+                        parse_f64(r01)?,
+                        parse_f64(r11)?,
+                        parse_f64(r21)?,
+                        parse_f64(r02)?,
+                        parse_f64(r12)?,
+                        parse_f64(r22)?,
+                    ]);
+                    let translation = Vec3F64::new(parse_f64(tx)?, parse_f64(ty)?, parse_f64(tz)?);
+                    poses.push(Pose3d::new(rot, translation));
+                }
+                [
+                    "EDGE",
+                    a,
+                    b,
+                    weight,
+                    r00,
+                    r01,
+                    r02,
+                    r10,
+                    r11,
+                    r12,
+                    r20,
+                    r21,
+                    r22,
+                    tx,
+                    ty,
+                    tz,
+                ] => {
+                    let pose_a = a
+                        .parse::<usize>()
+                        .map_err(|e| SparsePgoError::InvalidInput(e.to_string()))?;
+                    let pose_b = b
+                        .parse::<usize>()
+                        .map_err(|e| SparsePgoError::InvalidInput(e.to_string()))?;
+                    let parse_f32 = |val: &str| {
+                        val.parse::<f32>()
+                            .map_err(|e| SparsePgoError::InvalidInput(e.to_string()))
+                    };
+                    let w = parse_f32(weight)?;
+                    let rot32 = kornia_algebra::Mat3AF32::from_cols_array(&[
+                        parse_f32(r00)?,
+                        parse_f32(r10)?,
+                        parse_f32(r20)?,
+                        parse_f32(r01)?,
+                        parse_f32(r11)?,
+                        parse_f32(r21)?,
+                        parse_f32(r02)?,
+                        parse_f32(r12)?,
+                        parse_f32(r22)?,
+                    ]);
+                    let translation = kornia_algebra::Vec3AF32::new(
+                        parse_f32(tx)?,
+                        parse_f32(ty)?,
+                        parse_f32(tz)?,
+                    );
+                    let se3 = SE3F32::new(kornia_algebra::SO3F32::from_matrix(&rot32), translation);
+                    edges.push(PgoEdge {
+                        pose_a,
+                        pose_b,
+                        t_ab_meas: se3,
+                        weight: w,
+                    });
+                }
+                _ => {
+                    return Err(SparsePgoError::InvalidInput(format!(
+                        "unrecognized line in dump: {line}"
+                    )));
+                }
+            }
+        }
+        Ok(PgoDump {
+            poses,
+            edges,
+            gravity,
+        })
+    }
+
+    #[test]
+    fn dump_and_load_roundtrip() {
+        let (poses, edges) = drifting_loop_graph();
+        let temp_dir = std::env::temp_dir().join(format!("kornia_pgo_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        super::super::pose_graph::dump_pose_graph(
+            &temp_dir,
+            &poses,
+            &edges,
+            Some(Vec3F64::new(0.0, 0.0, -9.81)),
+        )
+        .unwrap();
+
+        let dump_file = temp_dir.join("pgo_dump_0.txt");
+        assert!(dump_file.exists());
+        let loaded = load_pgo_dump(&dump_file).unwrap();
+        assert_eq!(loaded.poses.len(), poses.len());
+        assert_eq!(loaded.edges.len(), edges.len());
+        assert!(loaded.gravity.is_some());
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
