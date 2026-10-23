@@ -441,6 +441,18 @@ fn sparse_pose_graph_optimize_impl<const DOF: usize>(
     // One iteration is one evaluated trial. Retrying a failed linear solve
     // changes damping but does not consume the nonlinear iteration budget.
     let mut iterations = 0usize;
+    // Each residual component is computed in f32 and carries machine-epsilon
+    // rounding error (~1.19e-7). When summing M squared residuals, the expected
+    // relative rounding uncertainty in the accumulated cost is on the order of
+    // M * eps. If an unaccepted trial's cost increase is within this f32
+    // precision floor, the solver has reached the noise limit of single-precision
+    // residuals and cannot resolve further descent.
+    let active_edges = edges
+        .iter()
+        .filter(|edge| pose_to_block[edge.pose_a].is_some() || pose_to_block[edge.pose_b].is_some())
+        .count();
+    let residual_components = active_edges * RESIDUAL_DIM;
+    let noise_floor_threshold = residual_components as f64 * f64::from(f32::EPSILON);
     let mut solve_cache = None;
 
     loop {
@@ -524,7 +536,7 @@ fn sparse_pose_graph_optimize_impl<const DOF: usize>(
                         accepted: true,
                         numerical_failure: false,
                     });
-                    if relative_cost_change < params.cost_tolerance {
+                    if relative_cost_change < f64::from(params.cost_tolerance) {
                         return Ok(SparsePgoResult {
                             poses: accepted_poses,
                             iterations,
@@ -533,14 +545,49 @@ fn sparse_pose_graph_optimize_impl<const DOF: usize>(
                     }
                     break;
                 }
-                _rejection @ (TrialOutcome::CostRejected | TrialOutcome::NumericalFailure) => {
+                TrialOutcome::CostRejected { cost } => {
+                    iterations += 1;
+                    let relative_cost_increase = if current_cost > 0.0 {
+                        (cost - current_cost) / current_cost
+                    } else {
+                        cost - current_cost
+                    };
+                    if relative_cost_increase <= noise_floor_threshold {
+                        #[cfg(test)]
+                        test_hooks.iterations.push(SparsePgoTestIteration {
+                            damping,
+                            accepted: false,
+                            numerical_failure: false,
+                        });
+                        return Ok(SparsePgoResult {
+                            poses: accepted_poses,
+                            iterations,
+                            converged: true,
+                        });
+                    }
+                    damping = increased_damping(damping);
+                    #[cfg(test)]
+                    test_hooks.iterations.push(SparsePgoTestIteration {
+                        damping,
+                        accepted: false,
+                        numerical_failure: false,
+                    });
+                    if damping > LAMBDA_MAX || iterations >= params.max_iterations {
+                        return Ok(SparsePgoResult {
+                            poses: accepted_poses,
+                            iterations,
+                            converged: false,
+                        });
+                    }
+                }
+                TrialOutcome::NumericalFailure => {
                     iterations += 1;
                     damping = increased_damping(damping);
                     #[cfg(test)]
                     test_hooks.iterations.push(SparsePgoTestIteration {
                         damping,
                         accepted: false,
-                        numerical_failure: matches!(_rejection, TrialOutcome::NumericalFailure),
+                        numerical_failure: true,
                     });
                     if damping > LAMBDA_MAX || iterations >= params.max_iterations {
                         return Ok(SparsePgoResult {
@@ -556,8 +603,8 @@ fn sparse_pose_graph_optimize_impl<const DOF: usize>(
 }
 
 enum TrialOutcome {
-    Accepted { poses: Vec<Pose3d>, cost: f32 },
-    CostRejected,
+    Accepted { poses: Vec<Pose3d>, cost: f64 },
+    CostRejected { cost: f64 },
     NumericalFailure,
 }
 
@@ -567,7 +614,7 @@ fn evaluate_trial<const DOF: usize>(
     pose_to_block: &[Option<usize>],
     manifold: &impl PoseManifold<DOF>,
     step: &[f32],
-    current_cost: f32,
+    current_cost: f64,
 ) -> Result<TrialOutcome, SparsePgoError> {
     if pose_to_block.len() != poses.len() {
         return Err(SparsePgoError::InvalidInput(
@@ -611,7 +658,7 @@ fn evaluate_trial<const DOF: usize>(
             cost: trial_cost,
         })
     } else {
-        Ok(TrialOutcome::CostRejected)
+        Ok(TrialOutcome::CostRejected { cost: trial_cost })
     }
 }
 
@@ -727,13 +774,13 @@ fn active_total_squared_residual_cost(
     poses: &[Pose3d],
     edges: &[PgoEdge],
     pose_to_block: &[Option<usize>],
-) -> Result<f32, SparsePgoError> {
+) -> Result<f64, SparsePgoError> {
     if pose_to_block.len() != poses.len() {
         return Err(SparsePgoError::InvalidInput(
             "pose-to-block map has an invalid dimension".into(),
         ));
     }
-    let mut cost = 0.0f32;
+    let mut cost = 0.0f64;
     for edge in edges {
         if pose_to_block[edge.pose_a].is_some() || pose_to_block[edge.pose_b].is_some() {
             accumulate_edge_squared_cost(poses, edge, &mut cost)?;
@@ -745,7 +792,7 @@ fn active_total_squared_residual_cost(
 fn accumulate_edge_squared_cost(
     poses: &[Pose3d],
     edge: &PgoEdge,
-    cost: &mut f32,
+    cost: &mut f64,
 ) -> Result<(), SparsePgoError> {
     let residual = weighted_relative_residual(
         &poses[edge.pose_a],
@@ -754,7 +801,14 @@ fn accumulate_edge_squared_cost(
         edge.weight,
     )?;
     for value in residual {
-        *cost += value * value;
+        let squared_f32 = value * value;
+        if !squared_f32.is_finite() {
+            return Err(SparsePgoError::InvalidInput(
+                "pose-graph cost must be finite".into(),
+            ));
+        }
+        let v = f64::from(value);
+        *cost += v * v;
         if !cost.is_finite() {
             return Err(SparsePgoError::InvalidInput(
                 "pose-graph cost must be finite".into(),
