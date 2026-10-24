@@ -2271,11 +2271,17 @@ mod tests {
 
         let temp_dir = std::env::temp_dir().join(format!("kornia_pgo_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_dir);
-        super::super::pose_graph::dump_pose_graph(&temp_dir, &poses, &edges, Some(gravity))
-            .unwrap();
-
-        let dump_file = temp_dir.join("pgo_dump_0.txt");
+        let dump_file =
+            super::super::pose_graph::dump_pose_graph(&temp_dir, &poses, &edges, Some(gravity))
+                .unwrap();
         assert!(dump_file.exists());
+
+        let second_file =
+            super::super::pose_graph::dump_pose_graph(&temp_dir, &poses, &edges, Some(gravity))
+                .unwrap();
+        assert_ne!(dump_file, second_file);
+        assert!(second_file.exists());
+
         let loaded = load_pgo_dump(&dump_file).unwrap();
         assert_eq!(loaded.poses.len(), poses.len());
         for (loaded_pose, orig_pose) in loaded.poses.iter().zip(&poses) {

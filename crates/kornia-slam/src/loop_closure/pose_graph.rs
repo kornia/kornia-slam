@@ -180,11 +180,9 @@ pub(crate) fn dump_pose_graph(
     poses: &[Pose3d],
     edges: &[PgoEdge],
     gravity: Option<Vec3F64>,
-) -> std::io::Result<()> {
+) -> std::io::Result<std::path::PathBuf> {
     static DUMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let index = DUMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     std::fs::create_dir_all(dir)?;
-    let path = dir.join(format!("pgo_dump_{index}.txt"));
     let mut out = String::new();
     out.push_str("# kornia-pgo-dump v1\n");
     if let Some(gravity) = gravity {
@@ -232,7 +230,25 @@ pub(crate) fn dump_pose_graph(
             edge.t_ab_meas.t.z,
         ));
     }
-    std::fs::write(path, out)
+    let mut index = DUMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let path = dir.join(format!("pgo_dump_{index}.txt"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(out.as_bytes())?;
+                return Ok(path);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                index = DUMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 pub(super) fn max_gravity_alignment_error(
