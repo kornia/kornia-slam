@@ -608,6 +608,10 @@ enum TrialOutcome {
     NumericalFailure,
 }
 
+/// Evaluates candidate trial poses for LM step acceptance.
+///
+/// Returns `Accepted` if trial cost strictly decreases, `CostRejected` with candidate
+/// cost if cost increases or stagnates, and `NumericalFailure` on non-finite poses or cost.
 fn evaluate_trial<const DOF: usize>(
     poses: &[Pose3d],
     edges: &[PgoEdge],
@@ -770,6 +774,10 @@ fn validate_pose_graph(
     Ok(pose_to_block)
 }
 
+/// Computes total squared residual cost across active edges accumulated in `f64`.
+///
+/// Evaluates each residual in `f32` and accumulates in `f64` to prevent machine-epsilon
+/// rounding error accumulation across thousands of residuals from masking descent steps.
 fn active_total_squared_residual_cost(
     poses: &[Pose3d],
     edges: &[PgoEdge],
@@ -789,6 +797,10 @@ fn active_total_squared_residual_cost(
     Ok(cost)
 }
 
+/// Accumulates one edge's squared residual components into `f64` cost.
+///
+/// Sums squared `f32` residual components into `f64` to avoid catastrophic cancellation
+/// near the single-precision noise floor.
 fn accumulate_edge_squared_cost(
     poses: &[Pose3d],
     edge: &PgoEdge,
@@ -1727,8 +1739,11 @@ mod tests {
         assert!(normal_cost(&result.poses, &edges) < normal_cost(&poses, &edges));
     }
 
+    /// Verifies that an uphill trial step far above the noise floor escalates LM damping without modifying poses.
     #[test]
     fn rejected_step_increases_damping_without_mutating_poses() {
+        // Note: forced_step = 100.0 exercises the large-step rejection path where
+        // cost increase is far above the noise floor, asserting damping escalation.
         let (poses, edges) = drifting_loop_graph();
         let mut forced_step = vec![0.0; 18];
         forced_step[0] = 100.0;
@@ -1757,6 +1772,48 @@ mod tests {
         assert_eq!(hooks.iterations[0].damping, params.initial_lambda * 10.0);
         assert_eq!(result.iterations, 1);
         assert!(!result.converged);
+        for (actual, expected) in result.poses.iter().zip(&poses) {
+            assert_eq!(actual.rotation, expected.rotation);
+            assert_eq!(actual.translation, expected.translation);
+        }
+    }
+
+    /// Verifies that a rejected trial step whose relative cost increase is within the `f32` noise floor
+    /// (`6 * num_edges * f32::EPSILON`) triggers convergence and returns the last accepted poses.
+    #[test]
+    fn rejected_step_within_noise_floor_converges_without_mutating_poses() {
+        let (poses, edges) = se3_scaling_graph(100);
+        let block_dim = (poses.len() - 1) * 6;
+        let mut forced_step = vec![0.0; block_dim];
+        forced_step[0] = 1e-4;
+        let mut hooks = SparsePgoTestHooks {
+            forced_step: Some(forced_step),
+            ..SparsePgoTestHooks::default()
+        };
+        let params = PgoParams {
+            max_iterations: 1,
+            gradient_tolerance: 0.0,
+            ..PgoParams::default()
+        };
+
+        let result = sparse_pose_graph_optimize_with_test_hooks(
+            &poses,
+            &edges,
+            &[0],
+            &params,
+            &Se3Manifold,
+            &mut hooks,
+        )
+        .unwrap();
+
+        assert_eq!(hooks.iterations.len(), 1);
+        assert!(!hooks.iterations[0].accepted);
+        assert!(!hooks.iterations[0].numerical_failure);
+        assert!(
+            result.converged,
+            "rejected step within noise floor must report converged=true"
+        );
+        assert_eq!(result.iterations, 1);
         for (actual, expected) in result.poses.iter().zip(&poses) {
             assert_eq!(actual.rotation, expected.rotation);
             assert_eq!(actual.translation, expected.translation);
@@ -1939,6 +1996,10 @@ mod tests {
         }
     }
 
+    /// Pins LM convergence at the `f32` cost noise floor on large graphs without damping escalation.
+    ///
+    /// Evaluates a 500-keyframe graph where `f64` cost accumulation prevents spurious trial rejections
+    /// caused by single-precision residual summation noise (~`6 * num_edges * f32::EPSILON`).
     #[test]
     fn sparse_lm_converges_at_f32_cost_noise_floor_without_damping_escalation() {
         // Pre-fix baseline on 500 keyframes burned 19 trials (damping escalated
@@ -2046,6 +2107,7 @@ mod tests {
         );
     }
 
+    /// Verifies that exhausting the iteration budget without meeting convergence criteria reports `converged: false`.
     #[test]
     fn sparse_lm_reports_unconverged_when_max_iterations_exceeded() {
         let (poses, edges) = se3_scaling_graph(500);
@@ -2064,6 +2126,7 @@ mod tests {
         assert_eq!(result.iterations, 2);
     }
 
+    /// Offline replay hook for dumped pose graphs specified via `KORNIA_PGO_REPLAY=<path>`.
     #[test]
     #[ignore = "offline replay hook for graphs dumped via KORNIA_PGO_DUMP"]
     fn replay_pgo_dump() {
@@ -2110,12 +2173,17 @@ mod tests {
         }
     }
 
+    /// Deserialized pose-graph dump containing poses, edges, and optional gravity vector.
     pub(crate) struct PgoDump {
         pub poses: Vec<Pose3d>,
         pub edges: Vec<PgoEdge>,
         pub gravity: Option<Vec3F64>,
     }
 
+    /// Deserializes a pose graph from a plain-text dump file written by [`dump_pose_graph`].
+    ///
+    /// Parses rotation tokens in column-major file order (`c0r0`..`c2r2`) into `from_cols_array`,
+    /// matching the `to_cols_array()` writer format.
     pub(crate) fn load_pgo_dump(path: &std::path::Path) -> Result<PgoDump, SparsePgoError> {
         let content = std::fs::read_to_string(path).map_err(|error| {
             SparsePgoError::InvalidInput(format!("failed to read dump: {error}"))
@@ -2244,6 +2312,10 @@ mod tests {
         })
     }
 
+    /// Verifies plain-text pose-graph dump serialization and deserialization roundtrip.
+    ///
+    /// Checks that non-symmetric rotations, translations, edge SE(3) measurements, and gravity vectors
+    /// are preserved exactly without transposition across column-major I/O.
     #[test]
     fn dump_and_load_roundtrip() {
         let rot = SO3F64::exp(Vec3F64::new(0.2, -0.3, 0.4)).matrix();

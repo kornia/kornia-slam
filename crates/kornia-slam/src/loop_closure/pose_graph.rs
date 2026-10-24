@@ -175,6 +175,11 @@ pub fn optimize_pose_graph(
     })
 }
 
+/// Serializes a pose graph (poses, edges, optional gravity) to a plain-text dump file.
+///
+/// Rotation matrices are serialized in column-major order (`to_cols_array()`), matching `from_cols_array`.
+/// Creates files with `create_new(true)` to atomically allocate sequential indices (`pgo_dump_{n}.txt`)
+/// without overwriting dumps from previous runs.
 pub(crate) fn dump_pose_graph(
     dir: &std::path::Path,
     poses: &[Pose3d],

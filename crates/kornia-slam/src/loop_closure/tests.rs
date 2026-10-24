@@ -575,6 +575,7 @@ fn inertial_pgo_uses_four_dof_and_preserves_gravity() {
     );
 }
 
+/// Verifies that an under-iterated PGO solve reports `usable: false` for live map update.
 #[test]
 fn optimize_pose_graph_reports_unusable_when_max_iterations_too_low() {
     let mut map = Map::new();
@@ -607,6 +608,7 @@ fn optimize_pose_graph_reports_unusable_when_max_iterations_too_low() {
     assert_eq!(result.iterations, 1);
 }
 
+/// Verifies that a loop edge that fails to improve residual error reports `usable: false`.
 #[test]
 fn optimize_pose_graph_reports_unusable_when_loop_residual_does_not_improve() {
     let mut map = Map::new();
