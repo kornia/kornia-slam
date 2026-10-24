@@ -13,10 +13,17 @@ pub use initialization::{
 };
 pub(crate) use schedule::{InertialInitSchedule, viba0_accel_bias_prior};
 
+use std::collections::VecDeque;
+
 use crate::mapping::Map;
 use crate::mapping::map::{ImuFactor, InertialAlignmentError};
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
+
+/// Longest span of IMU samples kept while no keyframe prunes them, well beyond
+/// the gap between keyframes. Also how far ahead of the latest image a sample
+/// may be before it is taken for a clock glitch.
+const MAX_BUFFERED_SEC: f64 = 30.0;
 
 pub(crate) struct InertialState {
     pub(crate) bias: ImuBias,
@@ -24,9 +31,12 @@ pub(crate) struct InertialState {
     /// Timestamp of the frame the map was bootstrapped from.
     pub(crate) bootstrap_timestamp_sec: Option<f64>,
     pub(crate) last_keyframe_timestamp_sec: Option<f64>,
+    /// Reference for the buffer's age window, so that a single far-off IMU
+    /// timestamp cannot move it.
+    pub(crate) latest_image_timestamp_sec: Option<f64>,
     pub(crate) initializer: ImuInitializer,
     pub(crate) schedule: InertialInitSchedule,
-    pending_samples: Vec<ImuMeasurement>,
+    pending_samples: VecDeque<ImuMeasurement>,
 }
 
 impl InertialState {
@@ -36,6 +46,7 @@ impl InertialState {
             gravity_world: Vec3F64::new(0.0, 0.0, -GRAVITY_MAGNITUDE),
             bootstrap_timestamp_sec: None,
             last_keyframe_timestamp_sec: None,
+            latest_image_timestamp_sec: None,
             // Matches ORB-SLAM3's LocalMapping::InitializeIMU VIBA0 gate
             // (nMinKF=10; minTime=1.0s stereo/2.0s mono — `ready()` doubles
             // this for mono).
@@ -45,12 +56,38 @@ impl InertialState {
                 min_motion: 0.05,
             }),
             schedule: InertialInitSchedule::default(),
-            pending_samples: Vec::new(),
+            pending_samples: VecDeque::new(),
         }
     }
 
-    pub(crate) fn buffer_samples(&mut self, samples: Vec<ImuMeasurement>) {
-        self.pending_samples.extend(samples);
+    /// Inserts samples in time order, then drops those more than
+    /// [`MAX_BUFFERED_SEC`] older than the latest image (the newest sample
+    /// before the first image). Samples more than that ahead of the latest
+    /// image are rejected, so a camera that stops delivering frames cannot grow
+    /// the buffer without bound.
+    pub(crate) fn insert_buffer_samples(&mut self, samples: &[ImuMeasurement]) {
+        let image_ts = self.latest_image_timestamp_sec;
+        for sample in samples
+            .iter()
+            .filter(|m| m.timestamp.is_finite())
+            .filter(|m| image_ts.is_none_or(|t| m.timestamp <= t + MAX_BUFFERED_SEC))
+            .copied()
+        {
+            let at = self
+                .pending_samples
+                .partition_point(|m| m.timestamp <= sample.timestamp);
+            self.pending_samples.insert(at, sample);
+        }
+        let Some(reference) = image_ts.or(self.pending_samples.back().map(|m| m.timestamp)) else {
+            return;
+        };
+        while self
+            .pending_samples
+            .front()
+            .is_some_and(|m| m.timestamp < reference - MAX_BUFFERED_SEC)
+        {
+            self.pending_samples.pop_front();
+        }
     }
 
     #[cfg(test)]
@@ -148,7 +185,7 @@ pub(crate) struct AppliedInitialization {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImuInitResult, InertialAlignmentError, InertialState, Map};
+    use super::{ImuInitResult, InertialAlignmentError, InertialState, MAX_BUFFERED_SEC, Map};
     use kornia_algebra::Vec3F64;
     use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement};
 
@@ -169,12 +206,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn buffering_without_frames_keeps_the_latest_window() {
+        let mut state = InertialState::new();
+        let count = (3.0 * MAX_BUFFERED_SEC * 100.0) as usize;
+        for i in 0..count {
+            state.insert_buffer_samples(&[sample(i as f64 * 0.01)]);
+        }
+        let kept = state.pending_sample_count();
+        assert!(kept <= (MAX_BUFFERED_SEC * 100.0) as usize + 1, "{kept}");
+        assert!(kept > (MAX_BUFFERED_SEC * 100.0) as usize - 2, "{kept}");
+    }
+
+    #[test]
+    fn out_of_order_samples_are_kept_in_time_order_within_the_window() {
+        let mut state = InertialState::new();
+        let count = (3.0 * MAX_BUFFERED_SEC * 100.0) as usize;
+        for i in 0..count {
+            let t = i as f64 * 0.01;
+            // A sample far ahead first, then a late one behind the newest.
+            state.insert_buffer_samples(&[sample(t + 0.004), sample(t)]);
+        }
+        let times: Vec<f64> = state.pending_samples.iter().map(|m| m.timestamp).collect();
+        let newest = *times.last().unwrap();
+        assert!(times.windows(2).all(|w| w[0] <= w[1]));
+        assert!(times.iter().all(|&t| t >= newest - MAX_BUFFERED_SEC));
+        assert!(times.len() <= 2 * (MAX_BUFFERED_SEC * 100.0) as usize + 2);
+    }
+
+    /// A glitched far-future timestamp must not become the age-window
+    /// reference and flush every later sample.
+    #[test]
+    fn a_far_future_sample_does_not_flush_later_samples() {
+        let mut state = InertialState::new();
+        state.latest_image_timestamp_sec = Some(0.0);
+        state.insert_buffer_samples(&[sample(1e6)]);
+        for i in 0..100 {
+            state.insert_buffer_samples(&[sample(i as f64 * 0.01)]);
+        }
+        let times: Vec<f64> = state.pending_samples.iter().map(|m| m.timestamp).collect();
+        assert_eq!(times.len(), 100);
+        assert!(times.iter().all(|&t| t < 1.0));
+    }
+
+    #[test]
+    fn a_stalled_camera_keeps_the_buffer_bounded() {
+        let mut state = InertialState::new();
+        state.latest_image_timestamp_sec = Some(0.0);
+        let count = (3.0 * MAX_BUFFERED_SEC * 100.0) as usize;
+        for i in 0..count {
+            state.insert_buffer_samples(&[sample(i as f64 * 0.01)]);
+        }
+        let kept = state.pending_sample_count();
+        assert!(kept <= (MAX_BUFFERED_SEC * 100.0) as usize + 1, "{kept}");
+        assert!(kept > (MAX_BUFFERED_SEC * 100.0) as usize - 2, "{kept}");
+    }
+
     /// Windows overlap by design, and the samples handed to a map factor must
     /// outlive pruning of the buffer they came from.
     #[test]
     fn overlapping_windows_survive_preintegration_and_keep_the_pruning_boundary() {
         let mut state = InertialState::new();
-        state.buffer_samples(vec![sample(0.0), sample(0.5), sample(1.0), sample(1.5)]);
+        state.insert_buffer_samples(&[sample(0.0), sample(0.5), sample(1.0), sample(1.5)]);
 
         let (_, first) = state.preintegrate_window(noise(), 0.0, 1.0);
         let (_, overlapping) = state.preintegrate_window(noise(), 0.5, 1.5);
@@ -204,7 +297,7 @@ mod tests {
         let mut state = InertialState::new();
         state.bias.gyro = Vec3F64::new(0.01, 0.02, 0.03);
         state.bias.accel = Vec3F64::new(0.1, 0.2, 0.3);
-        state.buffer_samples(vec![sample(0.0), sample(0.5)]);
+        state.insert_buffer_samples(&[sample(0.0), sample(0.5)]);
 
         let (pre, _) = state.preintegrate_window(noise(), 0.0, 0.5);
 
@@ -216,7 +309,7 @@ mod tests {
     #[test]
     fn a_keyframe_edge_needs_a_window_with_time_in_it() {
         let mut state = InertialState::new();
-        state.buffer_samples(vec![sample(0.0), sample(0.5), sample(1.0)]);
+        state.insert_buffer_samples(&[sample(0.0), sample(0.5), sample(1.0)]);
 
         assert!(state.keyframe_edge(noise(), 1, 2, 1.0, 1.0).is_none());
 

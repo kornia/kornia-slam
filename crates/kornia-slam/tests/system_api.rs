@@ -2,8 +2,7 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_image::{Image, ImageSize};
 use kornia_slam::{
-    CameraSelection, SensorFrame, SensorRig, SensorSelection, SlamSystem, SystemConfig,
-    TrackingStatus,
+    CameraSelection, SensorRig, SensorSelection, SlamSystem, SystemConfig, TrackingStatus,
 };
 
 fn test_camera() -> PinholeCamera {
@@ -40,15 +39,7 @@ fn slam_system_builds_and_processes_through_the_public_api() {
         0u8,
     )
     .unwrap();
-    let result = system
-        .process(SensorFrame {
-            idx: 0,
-            timestamp_sec: 0.0,
-            image: &image,
-            right_image: None,
-            imu_samples: &[],
-        })
-        .unwrap();
+    let result = system.process_image(0.0, &image).unwrap();
     assert_eq!(result.status, TrackingStatus::Skipped);
     assert!(system.frontend_observation().keypoints_xy.is_empty());
 }

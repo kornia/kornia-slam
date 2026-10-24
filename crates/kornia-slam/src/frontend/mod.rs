@@ -9,10 +9,10 @@ use kornia_algebra::Vec2F64;
 use kornia_image::{Image, ImageError, ImageSize, InterpolationMode};
 use kornia_imgproc::features::{OrbDetector, OrbFeatures};
 use kornia_imgproc::resize::resize_fast_mono;
-use kornia_sensors::{SensorFrame, SensorRig};
+use kornia_sensors::SensorRig;
 
 use crate::Frame;
-use crate::stereo::{StereoMatchConfig, compute_stereo_matches};
+use crate::stereo::{StereoMatchConfig, StereoMatches, compute_stereo_matches};
 
 /// Fisheye keypoints beyond this incidence angle are dropped: a pinhole cannot
 /// represent rays at or past 90°, and precision degrades well before that.
@@ -67,30 +67,56 @@ impl OrbFrontend {
         &self.observation
     }
 
-    /// Extracts and prepares the features of a validated input. The
-    /// observation is updated only when preparation succeeds.
-    pub(crate) fn prepare(&mut self, input: &SensorFrame<'_>) -> Result<Frame, ImageError> {
+    /// Extracts and prepares the features of one validated image, numbering
+    /// the frame `idx`. The observation is updated only when preparation
+    /// succeeds.
+    pub(crate) fn prepare_image(
+        &mut self,
+        idx: usize,
+        image: &Image<u8, 1>,
+    ) -> Result<Frame, ImageError> {
         let start = Instant::now();
-        let image = input.image;
-        let mut features = self.detector.detect_and_extract_u8(image)?;
+        let features = self.detector.detect_and_extract_u8(image)?;
+        Ok(self.finish_frame(idx, image, features, None, start))
+    }
 
-        let (u_right, depth, stereo_matched) = match (&self.stereo, input.right_image) {
-            (Some(config), Some(right)) => {
-                let right_features = self.detector.detect_and_extract_u8(right)?;
-                let left_pyramid = self.build_pyramid(image)?;
-                let right_pyramid = self.build_pyramid(right)?;
-                let matches = compute_stereo_matches(
-                    &left_pyramid,
-                    &right_pyramid,
-                    &features,
-                    &right_features,
-                    config,
-                );
-                let matched = matches.num_matched();
-                (matches.u_right, matches.depth, Some(matched))
-            }
-            _ => (Vec::new(), Vec::new(), None),
+    /// Like [`Self::prepare_image`] for a validated, rectified stereo pair,
+    /// giving each left feature its right-image match and depth. Without a
+    /// stereo rig the right image is ignored.
+    pub(crate) fn prepare_stereo_pair(
+        &mut self,
+        idx: usize,
+        left: &Image<u8, 1>,
+        right: &Image<u8, 1>,
+    ) -> Result<Frame, ImageError> {
+        let start = Instant::now();
+        let features = self.detector.detect_and_extract_u8(left)?;
+        let Some(config) = &self.stereo else {
+            return Ok(self.finish_frame(idx, left, features, None, start));
         };
+        let right_features = self.detector.detect_and_extract_u8(right)?;
+        let left_pyramid = self.build_pyramid(left)?;
+        let right_pyramid = self.build_pyramid(right)?;
+        let matches = compute_stereo_matches(
+            &left_pyramid,
+            &right_pyramid,
+            &features,
+            &right_features,
+            config,
+        );
+        Ok(self.finish_frame(idx, left, features, Some(matches), start))
+    }
+
+    fn finish_frame(
+        &mut self,
+        idx: usize,
+        image: &Image<u8, 1>,
+        mut features: OrbFeatures,
+        stereo: Option<StereoMatches>,
+        start: Instant,
+    ) -> Frame {
+        let stereo_matched = stereo.as_ref().map(StereoMatches::num_matched);
+        let StereoMatches { u_right, depth } = stereo.unwrap_or_default();
 
         self.observation.keypoints_xy.clear();
         self.observation
@@ -105,8 +131,8 @@ impl OrbFrontend {
 
         self.observation.stereo_matched = stereo_matched;
         self.observation.duration = start.elapsed();
-        Ok(Frame {
-            idx: input.idx,
+        Frame {
+            idx,
             features,
             pose_world_to_cam: Pose3d::IDENTITY,
             image_size: image.size(),
@@ -114,7 +140,7 @@ impl OrbFrontend {
             u_right,
             depth,
             keypoints_undist: Vec::new(),
-        })
+        }
     }
 
     /// Builds an ORB-consistent pyramid: level `o` is the full image

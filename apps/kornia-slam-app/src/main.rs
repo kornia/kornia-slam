@@ -18,7 +18,7 @@ use config::RunConfig;
 use evaluation::associate_gt;
 use kornia_algebra::Vec3F64;
 use kornia_slam::system::PipelineDefinition;
-use kornia_slam::{LoopClosureEvent, SensorFrame, SlamSystem};
+use kornia_slam::{LoopClosureEvent, SlamSystem};
 use source::{FrameItem, OpenedSource};
 use std::time::{Duration, Instant};
 use utils::trajectory_point_from_pose;
@@ -156,13 +156,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rec.set_duration_secs("timestamp", timestamp_sec);
         }
 
-        let result = system.process(SensorFrame {
-            idx,
-            timestamp_sec,
-            image: &image,
-            right_image: right_image.as_ref(),
-            imu_samples: &imu_samples,
-        })?;
+        system.process_imu(&imu_samples);
+        let result = match right_image.as_ref() {
+            Some(right) => system.process_stereo(timestamp_sec, &image, right)?,
+            None => system.process_image(timestamp_sec, &image)?,
+        };
         let frame_ms = system.tracking_duration().as_secs_f64() * 1000.0;
         let frontend_ms = system.frontend_observation().duration.as_secs_f64() * 1000.0;
         #[cfg(feature = "viz")]

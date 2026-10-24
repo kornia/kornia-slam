@@ -57,8 +57,8 @@ use crate::pose_conversion::apply_reference_pose_correction;
 use build::SystemSettings;
 use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
+use kornia_sensors::SensorRig;
 use kornia_sensors::imu::ImuMeasurement;
-use kornia_sensors::{SensorFrame, SensorRig};
 
 /// Top-level ORB-SLAM system: orchestrates tracking, mapping, and state transitions.
 pub struct SlamSystem {
@@ -85,6 +85,8 @@ pub struct SlamSystem {
     // The last processed image, for optical-flow tracks into the next frame.
     previous_image: Option<Image<u8, 1>>,
     tracking_duration: Duration,
+    // Number given to the next frame; it becomes the keyframe's id in the map.
+    next_frame_idx: usize,
 }
 
 impl SlamSystem {
@@ -130,6 +132,7 @@ impl SlamSystem {
             frontend,
             previous_image: None,
             tracking_duration: Duration::ZERO,
+            next_frame_idx: 0,
         }
     }
 
@@ -142,40 +145,83 @@ impl SlamSystem {
         &self.rig
     }
 
-    /// Extracts features from one input frame and tracks it.
+    /// Buffers IMU samples for the frames to come, in the body frame. Call it
+    /// as samples arrive; each frame uses the samples up to its own
+    /// timestamp. The caller must feed every sample up to an image's
+    /// timestamp before passing that image: a frame processed ahead of its
+    /// samples predicts from stale ones, and its keyframe's IMU edge stays
+    /// short for good. Samples with a non-finite timestamp or more than 30 s
+    /// ahead of the latest image are ignored, and so are all samples when the
+    /// rig has no IMU.
+    pub fn process_imu(&mut self, samples: &[ImuMeasurement]) {
+        if self.rig.imu.is_none() {
+            return;
+        }
+        self.inertial.insert_buffer_samples(samples);
+    }
+
+    /// Extracts features from one image captured at `timestamp_sec` (on the
+    /// IMU samples' clock) and tracks it. The system numbers its frames
+    /// itself, in call order. For a rig with a fisheye model the image is the
+    /// raw fisheye image (see [`SensorRig`]).
     ///
     /// # Errors
     ///
-    /// Invalid input or a feature-extraction failure; the system state,
-    /// including buffered IMU samples and image history, is then unchanged.
-    pub fn process(&mut self, input: SensorFrame<'_>) -> Result<TrackingResult, ProcessError> {
-        input::validate(&input, self.rig.stereo_baseline_m.is_some())?;
+    /// Invalid input, a stereo rig (use [`Self::process_stereo`]) or a
+    /// feature-extraction failure; the system state, including image history,
+    /// is then unchanged. IMU samples already buffered are kept.
+    pub fn process_image(
+        &mut self,
+        timestamp_sec: f64,
+        image: &Image<u8, 1>,
+    ) -> Result<TrackingResult, ProcessError> {
+        input::validate_image(timestamp_sec, image)?;
+        if self.rig.stereo_baseline_m.is_some() {
+            return Err(ProcessError::StereoRequired);
+        }
         let frame = self
             .frontend
-            .prepare(&input)
-            .map_err(|source| ProcessError::Frontend {
-                idx: input.idx,
-                source,
-            })?;
+            .prepare_image(self.next_frame_idx, image)
+            .map_err(ProcessError::Frontend)?;
+        Ok(self.track_frame(frame, image, timestamp_sec))
+    }
+
+    /// Like [`Self::process_image`] for a rectified stereo pair; a mono
+    /// pipeline rejects it (use [`Self::process_image`]).
+    pub fn process_stereo(
+        &mut self,
+        timestamp_sec: f64,
+        left: &Image<u8, 1>,
+        right: &Image<u8, 1>,
+    ) -> Result<TrackingResult, ProcessError> {
+        input::validate_stereo_pair(timestamp_sec, left, right)?;
+        if self.rig.stereo_baseline_m.is_none() {
+            return Err(ProcessError::MonoPipeline);
+        }
+        let frame = self
+            .frontend
+            .prepare_stereo_pair(self.next_frame_idx, left, right)
+            .map_err(ProcessError::Frontend)?;
+        Ok(self.track_frame(frame, left, timestamp_sec))
+    }
+
+    /// Takes a prepared frame as the next one and tracks it.
+    fn track_frame(
+        &mut self,
+        frame: Frame,
+        image: &Image<u8, 1>,
+        timestamp_sec: f64,
+    ) -> TrackingResult {
+        self.next_frame_idx += 1;
+        self.inertial.latest_image_timestamp_sec = Some(timestamp_sec);
         self.report_stereo(&frame);
-        let imu_samples = if self.rig.imu.is_some() {
-            input.imu_samples.to_vec()
-        } else {
-            Vec::new()
-        };
         // Taken out for the call so tracking can borrow it alongside `self`.
         let previous_image = self.previous_image.take();
         let tracking_start = Instant::now();
-        let result = self.process_prepared(
-            frame,
-            previous_image.as_ref(),
-            input.image,
-            input.timestamp_sec,
-            imu_samples,
-        );
+        let result = self.process_prepared(frame, previous_image.as_ref(), image, timestamp_sec);
         self.tracking_duration = tracking_start.elapsed();
-        self.retain_previous_image(input.image, previous_image);
-        Ok(result)
+        self.retain_previous_image(image, previous_image);
+        result
     }
 
     /// Time the latest successfully processed frame spent in tracking and
@@ -227,7 +273,6 @@ impl SlamSystem {
         previous_image: Option<&Image<u8, 1>>,
         current_image: &Image<u8, 1>,
         timestamp_sec: f64,
-        imu_samples: Vec<ImuMeasurement>,
     ) -> TrackingResult {
         // Local-BA snapshots, merges, and their correction messages can only
         // cross this boundary between complete tracking frames.
@@ -239,7 +284,6 @@ impl SlamSystem {
         // Fill the per-frame undistortion cache once; tracking, BA gathering,
         // growth, and fuse all read from it.
         frame.ensure_undistorted(&self.rig.camera);
-        self.inertial.buffer_samples(imu_samples);
 
         match self.state.mode {
             SystemMode::Bootstrap => self.bootstrap_step(frame, timestamp_sec),

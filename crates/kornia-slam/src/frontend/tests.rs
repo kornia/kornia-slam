@@ -1,7 +1,5 @@
 use std::f32::consts::{PI, TAU};
 
-use kornia_sensors::imu::ImuMeasurement;
-
 use super::*;
 
 const FRONTEND_FIXTURE: &str = include_str!("../../tests/fixtures/frontend/frontend.txt");
@@ -125,17 +123,6 @@ fn indexed_features(keypoints_xy: Vec<[f32; 2]>) -> OrbFeatures {
     }
 }
 
-fn input<'a>(image: &'a Image<u8, 1>, right: Option<&'a Image<u8, 1>>) -> SensorFrame<'a> {
-    const NO_SAMPLES: &[ImuMeasurement] = &[];
-    SensorFrame {
-        idx: 3,
-        timestamp_sec: 0.1,
-        image,
-        right_image: right,
-        imu_samples: NO_SAMPLES,
-    }
-}
-
 fn stereo_frontend() -> OrbFrontend {
     let rig = SensorRig::new(pinhole(435.0, 435.0, 188.0, 120.0)).with_stereo_baseline(0.11);
     let detector = OrbDetector {
@@ -149,7 +136,7 @@ fn stereo_frontend() -> OrbFrontend {
 fn stereo_preparation_matches_the_recorded_baseline() {
     let (left, right) = synthetic_pair(376, 240, 8);
     let mut frontend = stereo_frontend();
-    let frame = frontend.prepare(&input(&left, Some(&right))).unwrap();
+    let frame = frontend.prepare_stereo_pair(3, &left, &right).unwrap();
     let f = &frame.features;
 
     let hashes = [
@@ -249,7 +236,7 @@ fn featureless_images_prepare_empty_frames() {
     )
     .unwrap();
     let mut frontend = stereo_frontend();
-    let frame = frontend.prepare(&input(&blank, Some(&blank))).unwrap();
+    let frame = frontend.prepare_stereo_pair(3, &blank, &blank).unwrap();
     assert!(frame.features.keypoints_xy.is_empty());
     assert!(frame.keypoint_colors.is_empty());
     assert!(frame.depth.is_empty());
@@ -262,7 +249,7 @@ fn unrelated_stereo_views_prepare_without_matches() {
     let (left, _) = synthetic_pair(376, 240, 8);
     let blank = Image::from_size_val(left.size(), 128u8).unwrap();
     let mut frontend = stereo_frontend();
-    let frame = frontend.prepare(&input(&left, Some(&blank))).unwrap();
+    let frame = frontend.prepare_stereo_pair(3, &left, &blank).unwrap();
     assert!(!frame.features.keypoints_xy.is_empty());
     assert_eq!(frame.depth.len(), frame.features.keypoints_xy.len());
     assert!(frame.depth.iter().all(|&d| d <= 0.0));
@@ -276,7 +263,7 @@ fn fisheye_observation_keeps_raw_image_keypoints() {
     let rig = SensorRig::new(pinhole(fisheye.fx, fisheye.fy, fisheye.cx, fisheye.cy))
         .with_fisheye(fisheye);
     let mut frontend = OrbFrontend::new(OrbDetector::default(), &rig);
-    let frame = frontend.prepare(&input(&image, None)).unwrap();
+    let frame = frontend.prepare_image(3, &image).unwrap();
 
     let observed = &frontend.observation().keypoints_xy;
     assert!(observed.len() > frame.features.keypoints_xy.len());
