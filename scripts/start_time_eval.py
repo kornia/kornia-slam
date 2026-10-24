@@ -24,6 +24,7 @@ import json
 import math
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -248,7 +249,7 @@ class StartTimeMetrics:
     ate_rmse_m: float
     tracking_loss_events: int
     wall_time_sec: float
-    status: str  # "ok", "diverged", "init_failed", "skipped"
+    status: str  # "ok", "diverged", "init_failed", "timeout", "dry_run", etc.
 
 
 # ==============================================================================
@@ -262,6 +263,7 @@ def run_synthetic_smoke_test(
 
     Validates that the harness correctly executes Sim(3) alignment, computes
     ATE RMSE, tracks time-to-init, measures scale errors, and reports statistics.
+    NOTE: This is a harness self-test and does NOT reflect kornia-slam performance.
     """
     total_frames = 1200
     # Ground truth: a 3D helix
@@ -296,8 +298,6 @@ def run_synthetic_smoke_test(
             continue
 
         # Simulating start-time sensitivity effect:
-        # Later starts in certain phases have slight initialization latency and drift
-        # Deterministic variation function:
         phase = (offset / fps) * 0.4
         synthetic_scale = 0.96 + 0.05 * math.sin(phase)  # scale oscillates slightly
         init_delay_frames = 20 + int(8 * abs(math.sin(phase * 1.5)))
@@ -309,11 +309,9 @@ def run_synthetic_smoke_test(
 
         # Synthetic tracking drift
         for idx, g in enumerate(eval_gt):
-            # Noise drift increases over time
             drift_x = 0.02 * math.sin(idx * 0.05) + 0.0005 * idx
             drift_y = 0.02 * math.cos(idx * 0.05) - 0.0003 * idx
             drift_z = 0.01 * math.sin(idx * 0.02)
-            # Unaligned monocular estimate at synthetic scale
             p = Vec3(
                 (g.x + drift_x) * synthetic_scale,
                 (g.y + drift_y) * synthetic_scale,
@@ -352,6 +350,20 @@ def run_synthetic_smoke_test(
 # Real Dataset Execution Harness
 # ==============================================================================
 
+def count_dataset_frames(dataset_path: Path) -> Optional[int]:
+    """Counts available camera frames in an EuRoC/ASL dataset directory."""
+    for rel_path in ["mav0/cam0/data.csv", "cam0/data.csv"]:
+        cam0_csv = dataset_path / rel_path
+        if cam0_csv.exists():
+            try:
+                with open(cam0_csv, "r", encoding="utf-8") as f:
+                    lines = sum(1 for line in f if line.strip() and not line.startswith("#"))
+                    return max(0, lines - 1)
+            except Exception:
+                pass
+    return None
+
+
 def generate_override_ron(
     base_ron_path: Path, dataset_path: Path, start_frame: int, out_ron_path: Path
 ) -> None:
@@ -389,14 +401,32 @@ def run_offset_real(
     start_frame: int,
     offset_out_dir: Path,
     fps: float = 20.0,
+    dry_run: bool = False,
 ) -> StartTimeMetrics:
-    """Executes kornia-slam on a real sequence from a specific start_frame offset."""
+    """Executes kornia-slam on a real sequence from a specific start_frame offset.
+
+    Initialisation Detection Protocol:
+    1. Primary Detection (App Logs):
+       - Searches standard output/stderr for `[imu_init] applying:` (inertial initialization),
+         `[bootstrap]` / `bootstrap accepted` (visual bootstrap), or tracking status
+         `KeyframeAccepted` / `Tracked`.
+       - The frame index `init_frame_idx` of the first accepted keyframe or IMU alignment
+         determines `time_to_init_sec = (init_frame_idx - start_frame) / fps`.
+    2. Fallback Detection (CSV Files):
+       - If logging formats change, the harness inspects `kornia_slam_aligned.csv`.
+       - If the file exists and contains valid rows, initialization is inferred from the
+         first evaluated frame index.
+    3. Failure Detection:
+       - If the process exits with a non-zero code, times out, or produces fewer than 2
+         evaluated frames, `init_success` is recorded as `False` and status records the failure.
+    """
     offset_out_dir.mkdir(parents=True, exist_ok=True)
     temp_ron = offset_out_dir / f"run_offset_{start_frame}.ron"
     generate_override_ron(base_ron_path, dataset_path, start_frame, temp_ron)
 
-    cmd = [
-        kornia_slam_bin,
+    # Support either direct binary ("target/release/kornia-slam") or command string ("cargo run ...")
+    bin_cmd = shlex.split(kornia_slam_bin)
+    cmd = bin_cmd + [
         "--config",
         str(temp_ron),
         "--no-tui",
@@ -404,6 +434,22 @@ def run_offset_real(
         "--eval-out",
         str(offset_out_dir),
     ]
+
+    if dry_run:
+        print(f"    [DRY-RUN] Command: {' '.join(cmd)}")
+        return StartTimeMetrics(
+            offset_frames=start_frame,
+            offset_sec=start_frame / fps,
+            init_success=True,
+            time_to_init_sec=1.0,
+            frames_evaluated=100,
+            scale=1.0,
+            scale_error=0.0,
+            ate_rmse_m=0.0,
+            tracking_loss_events=0,
+            wall_time_sec=0.001,
+            status="dry_run",
+        )
 
     start_wall = time.time()
     try:
@@ -445,8 +491,22 @@ def run_offset_real(
             status=f"error: {e}",
         )
 
+    if proc.returncode != 0:
+        return StartTimeMetrics(
+            offset_frames=start_frame,
+            offset_sec=start_frame / fps,
+            init_success=False,
+            time_to_init_sec=float("nan"),
+            frames_evaluated=0,
+            scale=float("nan"),
+            scale_error=float("nan"),
+            ate_rmse_m=float("nan"),
+            tracking_loss_events=0,
+            wall_time_sec=round(wall_time, 2),
+            status=f"failed (code {proc.returncode})",
+        )
+
     # Parse stdout/stderr for metrics
-    # Look for [bootstrap] or [imu_init] or tracking loss
     init_success = False
     init_frame_idx = None
     tracking_loss_count = 0
@@ -457,14 +517,14 @@ def run_offset_real(
             m = re.search(r"\[(\d+)\]", line)
             if m and init_frame_idx is None:
                 init_frame_idx = int(m.group(1))
+        if "KeyframeAccepted" in line or "Tracked" in line:
+            if init_frame_idx is None:
+                m = re.search(r"\[\s*(\d+)\]", line)
+                if m:
+                    init_frame_idx = int(m.group(1))
+                    init_success = True
         if "Skipped" in line or "tracking lost" in line.lower():
             tracking_loss_count += 1
-
-    time_to_init = (
-        (init_frame_idx - start_frame) / fps
-        if (init_frame_idx is not None and init_frame_idx >= start_frame)
-        else (20.0 / fps if init_success else float("nan"))
-    )
 
     # Read evaluation CSV if generated
     aligned_csv = offset_out_dir / "kornia_slam_aligned.csv"
@@ -476,25 +536,41 @@ def run_offset_real(
     if aligned_csv.exists():
         est_pts: List[Vec3] = []
         gt_pts: List[Vec3] = []
-        with open(aligned_csv, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                est_pts.append(
-                    Vec3(float(row["x"]), float(row["y"]), float(row["z"]))
-                )
-                gt_pts.append(
-                    Vec3(float(row["gt_x"]), float(row["gt_y"]), float(row["gt_z"]))
-                )
+        first_csv_idx = None
+        try:
+            with open(aligned_csv, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if first_csv_idx is None and "idx" in row:
+                        first_csv_idx = int(row["idx"])
+                    est_pts.append(
+                        Vec3(float(row["x"]), float(row["y"]), float(row["z"]))
+                    )
+                    gt_pts.append(
+                        Vec3(float(row["gt_x"]), float(row["gt_y"]), float(row["gt_z"]))
+                    )
+        except Exception:
+            pass
 
         frames_evaluated = len(est_pts)
         if frames_evaluated >= 2:
             ate_rmse = compute_ate_rmse(est_pts, gt_pts)
+            # Fallback initialization confirmation from CSV if logs changed
+            init_success = True
+            if init_frame_idx is None and first_csv_idx is not None:
+                init_frame_idx = first_csv_idx
 
         # Parse scale from output text if present
         m_scale = re.search(r"Scale\s*:\s*([0-9.]+)", output)
         if m_scale:
             scale = float(m_scale.group(1))
             scale_error = abs(scale - 1.0)
+
+    time_to_init = (
+        (init_frame_idx - start_frame) / fps
+        if (init_frame_idx is not None and init_frame_idx >= start_frame)
+        else (20.0 / fps if init_success else float("nan"))
+    )
 
     status = "ok" if (init_success and not math.isnan(ate_rmse)) else "init_failed"
 
@@ -553,9 +629,19 @@ def compute_summary(metrics: List[StartTimeMetrics]) -> Dict[str, Dict[str, floa
     }
 
 
-def print_table(metrics: List[StartTimeMetrics], summary: Dict[str, Dict[str, float]]) -> None:
+def print_table(
+    metrics: List[StartTimeMetrics],
+    summary: Dict[str, Dict[str, float]],
+    is_smoke_test: bool = False,
+    is_dry_run: bool = False,
+) -> None:
     print("\n" + "=" * 90)
-    print("                 KORNIA-SLAM START-TIME SENSITIVITY EVALUATION")
+    if is_smoke_test:
+        print("  HARNESS SELF-TEST ON SYNTHETIC DATA -- NOT KORNIA-SLAM PERFORMANCE")
+    elif is_dry_run:
+        print("                 KORNIA-SLAM START-TIME EVALUATION (DRY-RUN)")
+    else:
+        print("                 KORNIA-SLAM START-TIME SENSITIVITY EVALUATION")
     print("=" * 90)
     print(
         f"{'Offset (f)':<11} {'Offset (s)':<11} {'Status':<12} {'Init (s)':<10} "
@@ -598,6 +684,8 @@ def print_table(metrics: List[StartTimeMetrics], summary: Dict[str, Dict[str, fl
         f"  Total Runs       : {int(summ['total_runs'])} | Succeeded: {int(summ['successful_runs'])} | "
         f"Failure Rate: {summ['failure_rate_pct']:.1f}%"
     )
+    if is_smoke_test:
+        print("  Note: Synthetic smoke test validates harness execution and Sim(3) math only; not real SLAM results.")
     print("=" * 90 + "\n")
 
 
@@ -637,7 +725,7 @@ def main() -> None:
         "--config",
         type=Path,
         default=Path("configs/euroc.ron"),
-        help="Base RON configuration file.",
+        help="Base RON configuration file (default: configs/euroc.ron).",
     )
     parser.add_argument(
         "--start-offsets",
@@ -661,12 +749,17 @@ def main() -> None:
         "--bin-path",
         type=str,
         default="target/release/kornia-slam",
-        help="Path to compiled kornia-slam binary (default: target/release/kornia-slam).",
+        help="Path to compiled kornia-slam binary or command (default: target/release/kornia-slam).",
     )
     parser.add_argument(
         "--smoke-test",
         action="store_true",
-        help="Run self-contained synthetic smoke test without external datasets.",
+        help="Run self-contained synthetic smoke test without external datasets (harness self-test only).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print kornia-slam execution commands without executing them.",
     )
 
     args = parser.parse_args()
@@ -678,13 +771,27 @@ def main() -> None:
         print(f"[*] Running synthetic smoke test over offsets: {start_offsets}")
         metrics = run_synthetic_smoke_test(start_offsets, fps=args.fps)
     else:
-        if not args.dataset_path or not args.dataset_path.exists():
+        # Validate base config exists
+        if not args.config.exists():
             print(
-                f"[ERROR] Dataset path '{args.dataset_path}' does not exist.\n"
-                "To test the harness without local data, run with '--smoke-test'.",
+                f"[ERROR] Config file '{args.config}' not found. Please provide a valid RON config.",
                 file=sys.stderr,
             )
             sys.exit(1)
+
+        # Validate dataset path exists
+        if not args.dataset_path or not args.dataset_path.exists():
+            print(
+                f"[ERROR] Dataset path '{args.dataset_path}' does not exist.\n"
+                "To test the harness without local data, run with '--smoke-test' or '--dry-run'.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Check total dataset frames if available to catch out-of-range offsets
+        total_frames = count_dataset_frames(args.dataset_path)
+        if total_frames is not None:
+            print(f"[*] Dataset '{args.sequence_name}' contains {total_frames} camera frames.")
 
         print(
             f"[*] Running start-time evaluation on '{args.sequence_name}' "
@@ -692,7 +799,29 @@ def main() -> None:
         )
         metrics = []
         for offset in start_offsets:
-            print(f"  -> Testing start offset: {offset} frames ({offset / args.fps:.2f} s)...")
+            offset_sec = offset / args.fps
+            if total_frames is not None and offset >= total_frames:
+                print(
+                    f"  [!] Start offset {offset} frames ({offset_sec:.2f} s) exceeds dataset length ({total_frames} frames). Recording failure."
+                )
+                metrics.append(
+                    StartTimeMetrics(
+                        offset_frames=offset,
+                        offset_sec=offset_sec,
+                        init_success=False,
+                        time_to_init_sec=float("nan"),
+                        frames_evaluated=0,
+                        scale=float("nan"),
+                        scale_error=float("nan"),
+                        ate_rmse_m=float("nan"),
+                        tracking_loss_events=0,
+                        wall_time_sec=0.0,
+                        status="offset_exceeds_dataset_len",
+                    )
+                )
+                continue
+
+            print(f"  -> Testing start offset: {offset} frames ({offset_sec:.2f} s)...")
             res = run_offset_real(
                 kornia_slam_bin=args.bin_path,
                 base_ron_path=args.config,
@@ -700,11 +829,12 @@ def main() -> None:
                 start_frame=offset,
                 offset_out_dir=args.output_dir / f"offset_{offset}",
                 fps=args.fps,
+                dry_run=args.dry_run,
             )
             metrics.append(res)
 
     summary = compute_summary(metrics)
-    print_table(metrics, summary)
+    print_table(metrics, summary, is_smoke_test=args.smoke_test, is_dry_run=args.dry_run)
 
     # Save CSV
     csv_path = args.output_dir / "start_time_metrics.csv"
@@ -721,6 +851,7 @@ def main() -> None:
             {
                 "sequence_name": args.sequence_name,
                 "is_smoke_test": args.smoke_test,
+                "is_dry_run": args.dry_run,
                 "fps": args.fps,
                 "metrics": [asdict(m) for m in metrics],
                 "summary": summary,
