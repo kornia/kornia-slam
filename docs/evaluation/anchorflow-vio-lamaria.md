@@ -89,13 +89,23 @@ To assess whether `kornia-slam` exhibits start-time sensitivity similar to that 
 A dedicated evaluation harness is implemented in [`scripts/start_time_eval.py`](file:///d:/kornia/kornia-slam/scripts/start_time_eval.py).
 
 ### 4.1 Implementation Highlights
-- **Zero Heavy Dependencies:** Written entirely in standard Python 3 (`argparse`, `dataclasses`, `json`, `csv`, `math`, `subprocess`, `time`).
+- **Zero Heavy Dependencies:** Written entirely in standard Python 3 (`argparse`, `dataclasses`, `json`, `csv`, `math`, `shlex`, `subprocess`, `time`).
 - **Mathematical Equivalence:** Implements the exact Umeyama Sim(3) alignment and ATE RMSE equations matching `apps/kornia-slam-app/src/evaluation.rs`. Singular value decomposition is implemented via one-sided Jacobi orthogonalization with guaranteed non-negative singular values and proper reflection handling ($\det(U V^T) > 0$).
-- **Dual Execution Modes:**
+- **Triple Execution Modes:**
   1. **Synthetic Smoke Test (`--smoke-test`):** Generates a 3D helical trajectory with deterministic phase-dependent visual-inertial noise, tests all offsets, verifies Sim(3) fitting, and validates reporting without requiring external dataset downloads.
-  2. **Real Pipeline Runner:** Takes a dataset path and base RON configuration, writes temporary configs with `--start-frame`, invokes `kornia-slam`, extracts runtime diagnostics, parses evaluation CSVs, and produces summary tables.
+  2. **Dry Run Mode (`--dry-run`):** Generates override RON configs and prints exact `kornia-slam` commands without launching subprocesses.
+  3. **Real Pipeline Runner:** Takes a dataset path and base RON configuration, validates dataset length against start offsets, writes temporary configs with `--start-frame`, invokes `kornia-slam` with synchronous mapping, extracts runtime diagnostics, parses evaluation CSVs, and produces summary tables.
+- **Initialisation & Failure Detection:**
+  - *Primary (Logs):* Inspects stderr/stdout for `[imu_init] applying:` (inertial initialization), `[bootstrap]` (visual bootstrap), or tracking status `KeyframeAccepted` / `Tracked`. The frame index of the first accepted keyframe or IMU alignment determines `time_to_init_sec = (init_frame_idx - start_frame) / fps`.
+  - *Fallback (CSVs):* If application logging format changes, the harness inspects `kornia_slam_aligned.csv`. If valid evaluated poses exist ($\ge 2$ rows), initialization is inferred from the first evaluated frame index.
+  - *Failure Handling:* If the subprocess exits non-zero, times out, or produces fewer than 2 evaluated frames, `init_success = False`, metrics are recorded as `NaN`, and the offset is recorded as a failure rather than aborting the experiment.
 
-### 4.2 Smoke Test Validation Results
+### 4.2 Harness Smoke Test Validation (Harness Self-Test on Synthetic Data — Not kornia-slam Performance)
+
+> [!IMPORTANT]
+> **Harness self-test on synthetic data, not kornia-slam performance.**
+> The numbers below are generated from an idealized synthetic 3D helical motion fixture used strictly to verify that the harness's Umeyama Sim(3) alignment, ATE RMSE calculation, process execution, and CSV/JSON reporting functions execute without errors. They **do not** reflect `kornia-slam` tracking performance on real sensor data.
+
 Command:
 ```bash
 python scripts/start_time_eval.py --smoke-test --output-dir eval_output/smoke_test
@@ -104,7 +114,7 @@ python scripts/start_time_eval.py --smoke-test --output-dir eval_output/smoke_te
 Recorded Output:
 ```text
 ==========================================================================================
-                 KORNIA-SLAM START-TIME SENSITIVITY EVALUATION
+  HARNESS SELF-TEST ON SYNTHETIC DATA — NOT KORNIA-SLAM PERFORMANCE
 ==========================================================================================
 Offset (f)  Offset (s)  Status       Init (s)   Scale      Scale Err   ATE RMSE (m)   Losses   Wall (s) 
 ------------------------------------------------------------------------------------------
@@ -121,6 +131,7 @@ SUMMARY STATISTICS across start offsets:
   Time-to-Init (s) : Mean=1.13  Std=0.10  Min=1.00  Max=1.30
   Wall Time (s)    : Mean=0.10  Std=0.02  Min=0.07  Max=0.13
   Total Runs       : 6 | Succeeded: 6 | Failure Rate: 0.0%
+  Note: Synthetic smoke test validates harness execution and Sim(3) math only; not real SLAM results.
 ==========================================================================================
 ```
 
@@ -130,12 +141,12 @@ Outputs generated:
 
 ---
 
-## 5. Results on kornia-slam
+## 5. Results on kornia-slam (Real-Data Results: PENDING)
 
 ### 5.1 Real Data Results
-*Status:* **Pending - needs local dataset sequence.**
+*Status:* **PENDING — Needs local dataset sequence.**
 
-In accordance with repository hard rules, no external datasets were downloaded without explicit user authorization, and no experimental numbers have been fabricated.
+In accordance with repository hard rules, no external datasets were downloaded without explicit user authorization, and no experimental numbers have been fabricated. Real-data results remain pending until a local dataset sequence is provided.
 
 To execute real evaluations on an EuRoC sequence (e.g. `MH_05_difficult` or `MH_01_easy`):
 - **Recommended sequence:** `MH_05_difficult` (or `MH_01_easy`).
@@ -206,9 +217,20 @@ To determine the engineering effort required to run `kornia-slam` on the LaMAria
 
 ## 9. Reproduction Commands
 
-### Run Synthetic Smoke Test
+### Run Synthetic Smoke Test (Harness Self-Test Only)
 ```bash
 python scripts/start_time_eval.py --smoke-test --output-dir eval_output/smoke_test
+```
+
+### Dry-Run Verification (Validates Config & Commands Without Subprocesses)
+```bash
+python scripts/start_time_eval.py \
+    --dataset-path data/euroc/MH_05_difficult \
+    --sequence-name MH_05_difficult \
+    --config configs/euroc.ron \
+    --start-offsets 0,100,200,300,400,600 \
+    --dry-run \
+    --output-dir eval_output/dry_run
 ```
 
 ### Run on EuRoC Dataset (Once Available)
