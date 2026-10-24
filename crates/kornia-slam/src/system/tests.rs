@@ -381,3 +381,94 @@ mod keyframe_evidence {
         assert!(!system.keyframe_due(&parked, 1e6), "no bound unless set");
     }
 }
+
+#[cfg(feature = "apriltag")]
+mod apriltag_anchor_tests {
+    use super::*;
+    use crate::apriltag_anchor::AprilTagAnchorError;
+
+    #[test]
+    fn apply_without_anchor_is_refused() {
+        let mut system = SlamSystem::build(mono(), stereo_imu_rig()).unwrap();
+        let err = system.apply_apriltag_anchor().unwrap_err();
+        assert!(matches!(
+            err,
+            AnchorApplyError::Anchor(AprilTagAnchorError::AnchorNotConfigured)
+        ));
+    }
+
+    #[test]
+    fn apply_with_anchor_but_no_observations_reports_insufficient() {
+        let mut system_config = mono();
+        let PipelineDefinition::OrbSlam(orb) = &mut system_config.pipeline;
+        orb.apriltag_anchor = AprilTagAnchorMode::Enabled {
+            tag_id: 2,
+            tag_size_m: 0.1,
+            family: "tag36_h11".to_string(),
+        };
+        let mut system = SlamSystem::build(system_config, stereo_imu_rig()).unwrap();
+
+        let err = system.apply_apriltag_anchor().unwrap_err();
+        assert!(matches!(
+            err,
+            AnchorApplyError::Anchor(AprilTagAnchorError::InsufficientObservations {
+                keyframes: 0
+            })
+        ));
+    }
+}
+
+#[cfg(feature = "apriltag")]
+mod apriltag_gravity_mode_tests {
+    use super::*;
+    use crate::apriltag_anchor::TagObservation;
+    use crate::mapping::map::Keyframe;
+    use crate::mapping::map::tests::test_frame_with_pose;
+    use kornia_algebra::SO3F64;
+
+    #[test]
+    fn imu_initialized_map_gets_a_gravity_preserving_correction() {
+        let mut system_config = mono();
+        let PipelineDefinition::OrbSlam(orb) = &mut system_config.pipeline;
+        orb.apriltag_anchor = AprilTagAnchorMode::Enabled {
+            tag_id: 2,
+            tag_size_m: 0.1,
+            family: "tag36_h11".to_string(),
+        };
+        let mut system = SlamSystem::build(system_config, stereo_imu_rig()).unwrap();
+
+        // Two keyframes whose final poses carry a tilt off gravity. A full
+        // Sim3 would adopt that tilt; the gravity-preserving mode must not.
+        let tilt = SO3F64::exp(Vec3F64::new(1.0, 0.4, 0.0) * 0.6).matrix();
+        for kf_idx in [0, 1] {
+            let pose = Pose3d::from_rt(tilt, Vec3F64::new(0.3, -0.2, 1.0));
+            system
+                .map
+                .lock()
+                .unwrap()
+                .insert_keyframe(Keyframe::from_frame(test_frame_with_pose(
+                    kf_idx,
+                    vec![[0; 32]],
+                    pose,
+                )))
+                .unwrap();
+            system
+                .apriltag_anchor
+                .as_mut()
+                .unwrap()
+                .push_observation_for_test(TagObservation {
+                    kf_idx,
+                    tag_to_cam: Pose3d::IDENTITY,
+                });
+        }
+        system.state.imu_initialized = true;
+        let gravity = Vec3F64::new(0.1, -0.2, -9.81);
+        system.inertial.gravity_world = gravity;
+        let g_hat = gravity / gravity.length();
+
+        let fit = system.apply_apriltag_anchor().unwrap();
+        assert!((fit.scale - 1.0).abs() < 1e-12, "scale must stay 1");
+        let moved = (fit.rotation * g_hat) - g_hat;
+        assert!(moved.length() < 1e-9, "gravity must stay fixed");
+    }
+}

@@ -7,6 +7,8 @@ mod queries;
 mod removal;
 mod snapshot;
 
+#[cfg(feature = "apriltag")]
+pub use correction::WorldSimilarityError;
 pub use correction::{
     BaUpdateError, InertialAlignment, InertialAlignmentError, KeyframeBaCorrection,
     KeyframeVelocity, LocalBaMergeResult, PoseGraphCorrectionError, PoseGraphCorrectionResult,

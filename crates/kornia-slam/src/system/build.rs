@@ -35,6 +35,9 @@ pub(crate) struct SystemSettings {
     /// keyframe back-projects its unassociated "close" (`z < threshold`) stereo
     /// keypoints directly into metric map points.
     pub stereo_close_depth_m: Option<f64>,
+    /// Opt-in AprilTag metric anchor configuration, when enabled.
+    #[cfg(feature = "apriltag")]
+    pub apriltag: Option<crate::apriltag_anchor::AprilTagAnchorConfig>,
 }
 
 impl SensorSelection {
@@ -68,6 +71,8 @@ impl SystemConfig {
             stereo_close_depth_m: rig
                 .stereo_baseline_m
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
+            #[cfg(feature = "apriltag")]
+            apriltag: orb.apriltag_anchor.config(),
         }
     }
 

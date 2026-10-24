@@ -9,6 +9,8 @@
 use super::snapshot::KeyframeBaState;
 use crate::mapping::map::{BaUpdate, Map};
 use kornia_3d::pose::Pose3d;
+#[cfg(feature = "apriltag")]
+use kornia_algebra::Mat3F64;
 use kornia_algebra::{SO3F64, Vec3F64};
 use kornia_sensors::imu::ImuBias;
 use std::collections::{HashMap, HashSet};
@@ -397,6 +399,91 @@ impl Map {
             point.position = position;
         }
     }
+
+    /// Applies the world similarity `X' = s·R·X + t` to every keyframe camera
+    /// centre/orientation, every map point, and every keyframe's metric world
+    /// velocity.
+    ///
+    /// The complete numerical payload is computed and checked before the first
+    /// write, so a refused transform leaves the map — and its world epoch —
+    /// untouched. This is the post-hoc metric anchor's writeback: `s`, `R` and
+    /// `t` map the (arbitrary, monocular) map frame onto the metric reference
+    /// frame a known-size target defines.
+    #[cfg(feature = "apriltag")]
+    pub fn apply_world_similarity(
+        &mut self,
+        scale: f64,
+        rotation: &Mat3F64,
+        translation: Vec3F64,
+    ) -> Result<(), WorldSimilarityError> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(WorldSimilarityError::InvalidScale(scale));
+        }
+        if !finite_mat3(rotation) || !finite_vec3(translation) || !proper_rotation(rotation) {
+            return Err(WorldSimilarityError::InvalidRotation);
+        }
+
+        // The scale acts on the camera centre, which lives in the inverted
+        // (camera-to-world) pose, so the stored world-to-camera pose is that
+        // intermediate inverted back. Check the *stored* pose: the inversion is
+        // itself an overflow site.
+        let mut poses = Vec::with_capacity(self.keyframes.len());
+        for keyframe in &self.keyframes {
+            let cam_to_world = keyframe.frame.pose_world_to_cam.inverse();
+            let new_translation = scale * (*rotation * cam_to_world.translation) + translation;
+            let rot_so3 = SO3F64::from_matrix(&cam_to_world.rotation);
+            let new_rot_so3 = SO3F64::from_matrix(rotation) * rot_so3;
+            let stored = Pose3d::from_rt(new_rot_so3.matrix(), new_translation).inverse();
+            if !finite_pose(&stored) {
+                return Err(WorldSimilarityError::NonFiniteTransform);
+            }
+            poses.push(stored);
+        }
+
+        let mut positions = Vec::with_capacity(self.map_points.len());
+        for point in &self.map_points {
+            let moved = scale * (*rotation * point.position) + translation;
+            if !finite_vec3(moved) {
+                return Err(WorldSimilarityError::NonFiniteTransform);
+            }
+            positions.push(moved);
+        }
+
+        let mut velocities = Vec::with_capacity(self.keyframes.len());
+        for keyframe in &self.keyframes {
+            let moved = scale * (*rotation * keyframe.velocity_world);
+            if !finite_vec3(moved) {
+                return Err(WorldSimilarityError::NonFiniteTransform);
+            }
+            velocities.push(moved);
+        }
+
+        self.world_epoch = self.world_epoch.wrapping_add(1);
+        for ((keyframe, pose), velocity) in self.keyframes.iter_mut().zip(poses).zip(velocities) {
+            keyframe.frame.pose_world_to_cam = pose;
+            keyframe.velocity_world = velocity;
+        }
+        for (point, position) in self.map_points.iter_mut().zip(positions) {
+            point.position = position;
+        }
+        // Every camera centre moved; finalize once over the whole live map
+        // after the complete correction.
+        let live = self.live_landmarks();
+        self.finalize_landmark_geometry(live);
+        Ok(())
+    }
+}
+
+/// Refusal to apply a world similarity transform to the live map.
+#[cfg(feature = "apriltag")]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum WorldSimilarityError {
+    #[error("invalid similarity scale {0}")]
+    InvalidScale(f64),
+    #[error("similarity rotation is not a proper orthonormal rotation")]
+    InvalidRotation,
+    #[error("similarity transform produces a non-finite world transform")]
+    NonFiniteTransform,
 }
 
 /// The exact values an inertial alignment will store, indexed by the map's own
@@ -568,6 +655,25 @@ fn finite_bias(bias: &ImuBias) -> bool {
     finite_vec3(bias.gyro) && finite_vec3(bias.accel)
 }
 
+/// Accepts a rotation matrix only if it is a proper orthonormal rotation
+/// (`RᵀR = I`, `det R = +1`) within [`ROTATION_NORM_TOLERANCE`] — rejecting
+/// both scaled/unnormalized matrices and reflections.
+#[cfg(feature = "apriltag")]
+fn proper_rotation(rotation: &Mat3F64) -> bool {
+    if !finite_mat3(rotation) {
+        return false;
+    }
+    let gram = rotation.transpose() * *rotation;
+    let max_gram_err = gram
+        .to_cols_array()
+        .iter()
+        .zip(Mat3F64::IDENTITY.to_cols_array().iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    max_gram_err <= ROTATION_NORM_TOLERANCE
+        && (rotation.determinant() - 1.0).abs() <= ROTATION_NORM_TOLERANCE
+}
+
 /// Accepts a rotation only if its stored quaternion is finite and of unit
 /// norm within [`ROTATION_NORM_TOLERANCE`].
 fn valid_rotation(rotation: &SO3F64) -> bool {
@@ -623,6 +729,8 @@ mod tests {
         tests::{test_frame, test_frame_with_pose},
     };
     use kornia_3d::pose::Pose3d;
+    #[cfg(feature = "apriltag")]
+    use kornia_algebra::Mat3F64;
     use kornia_algebra::{SO3F64, Vec3F64};
 
     #[test]
@@ -928,6 +1036,124 @@ mod tests {
             ),
             retired_geometry
         );
+    }
+
+    #[cfg(feature = "apriltag")]
+    #[test]
+    fn world_similarity_transforms_keyframes_landmarks_and_velocities() {
+        let scale = 1.7;
+        let rotation = SO3F64::exp(Vec3F64::new(0.3, -0.4, 0.5)).matrix();
+        let translation = Vec3F64::new(2.0, -1.5, 0.25);
+
+        let mut map = Map::new();
+        let pose = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(-1.0, 0.5, 3.0));
+        map.insert_keyframe(Keyframe::from_frame(test_frame_with_pose(
+            0,
+            vec![[0; 32]],
+            pose,
+        )))
+        .unwrap();
+        let point_before = Vec3F64::new(0.5, -2.0, 4.0);
+        let point_idx = map
+            .insert_landmark(LandmarkSeed {
+                position: point_before,
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx: 0,
+                },
+            })
+            .unwrap();
+        let velocity_before = Vec3F64::new(0.2, 1.0, -0.3);
+        map.get_keyframe_mut(0).unwrap().velocity_world = velocity_before;
+        let center_before = pose.inverse().translation;
+
+        map.apply_world_similarity(scale, &rotation, translation)
+            .expect("valid similarity should apply");
+
+        let center_after = map
+            .get_keyframe(0)
+            .unwrap()
+            .frame
+            .pose_world_to_cam
+            .inverse()
+            .translation;
+        let expected_center = scale * (rotation * center_before) + translation;
+        assert!((center_after - expected_center).length() < 1e-9);
+
+        let expected_point = scale * (rotation * point_before) + translation;
+        assert!((map.map_points()[point_idx].position - expected_point).length() < 1e-9);
+
+        let expected_velocity = scale * (rotation * velocity_before);
+        assert!((map.get_keyframe(0).unwrap().velocity_world - expected_velocity).length() < 1e-9);
+    }
+
+    #[cfg(feature = "apriltag")]
+    #[test]
+    fn world_similarity_rejects_invalid_inputs_without_mutation() {
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0; 32]])))
+            .unwrap();
+        map.insert_landmark(LandmarkSeed {
+            position: Vec3F64::new(0.0, 0.0, 5.0),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 0,
+                feature_idx: 0,
+            },
+        })
+        .unwrap();
+        let before = map.state_fingerprint_for_test();
+
+        let identity = Mat3F64::IDENTITY;
+        assert!(matches!(
+            map.apply_world_similarity(0.0, &identity, Vec3F64::ZERO),
+            Err(WorldSimilarityError::InvalidScale(_))
+        ));
+        // A reflection is not a proper rotation and must be refused.
+        let reflection = Mat3F64::from_cols(
+            Vec3F64::new(1.0, 0.0, 0.0),
+            Vec3F64::new(0.0, 1.0, 0.0),
+            Vec3F64::new(0.0, 0.0, -1.0),
+        );
+        assert!(matches!(
+            map.apply_world_similarity(1.0, &reflection, Vec3F64::ZERO),
+            Err(WorldSimilarityError::InvalidRotation)
+        ));
+
+        // Validation runs before the first write, so nothing (including the
+        // world epoch) changed.
+        assert_eq!(map.state_fingerprint_for_test(), before);
+    }
+
+    #[cfg(feature = "apriltag")]
+    #[test]
+    fn world_similarity_identity_leaves_geometry_unchanged() {
+        let mut map = Map::new();
+        let pose = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(-1.0, 0.5, 3.0));
+        map.insert_keyframe(Keyframe::from_frame(test_frame_with_pose(
+            0,
+            vec![[0; 32]],
+            pose,
+        )))
+        .unwrap();
+        let point_idx = map
+            .insert_landmark(LandmarkSeed {
+                position: Vec3F64::new(0.5, -2.0, 4.0),
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx: 0,
+                },
+            })
+            .unwrap();
+        let point_before = map.map_points()[point_idx].position;
+
+        map.apply_world_similarity(1.0, &Mat3F64::IDENTITY, Vec3F64::ZERO)
+            .expect("identity similarity should apply");
+
+        assert!((map.map_points()[point_idx].position - point_before).length() < 1e-12);
+        assert_eq!(map.get_keyframe(0).unwrap().frame.pose_world_to_cam, pose);
     }
 }
 

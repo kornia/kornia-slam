@@ -1,0 +1,30 @@
+// AprilTag metric-anchor demo: run the monocular pipeline over a capture of a
+// known physical tag, then anchor the final map metric. Requires a build with
+// `--features apriltag`.
+//
+//   cargo run --release -p kornia-slam-app --features apriltag -- \
+//     --config configs/apriltag-anchor.ron --no-tui
+//
+// `data` is a capture extracted to EuRoC layout (mav0/cam0/data plus data.csv
+// and sensor.yaml with your pinhole intrinsics); point it at your own. The tag
+// id, size and family below are examples: print a tag and set them to match.
+// Relative paths resolve against this file's dir.
+(
+    source: Euroc((
+        data: "../data/apriltag/demo",
+        start_frame: 0,
+        max_frames: 0,
+    )),
+    system: (
+        version: 1,
+        sensors: ( cameras: Mono, imu: false ),
+        pipeline: OrbSlam((
+            // A 100 mm tag36_h11 with id 2 makes the final map metric.
+            apriltag_anchor: Enabled(
+                tag_id: 2,
+                tag_size_m: 0.1,
+                family: "tag36_h11",
+            ),
+        )),
+    ),
+)

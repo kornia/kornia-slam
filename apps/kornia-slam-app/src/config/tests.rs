@@ -250,12 +250,37 @@ fn shipped_run_files_load() {
     for entry in std::fs::read_dir(configs_dir()).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|ext| ext == "ron") {
+            // This run file enables the opt-in anchor stage, which a build
+            // without the feature does not know about.
+            if !cfg!(feature = "apriltag")
+                && path
+                    .file_name()
+                    .is_some_and(|name| name == "apriltag-anchor.ron")
+            {
+                continue;
+            }
             RunConfig::from_ron_file(&path)
                 .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
             loaded += 1;
         }
     }
     assert!(loaded > 0, "no run files in {}", configs_dir().display());
+}
+
+#[cfg(feature = "apriltag")]
+#[test]
+fn apriltag_run_file_enables_the_stage() {
+    use kornia_slam::system::AprilTagAnchorMode;
+    let run = RunConfig::from_ron_file(configs_dir().join("apriltag-anchor.ron")).unwrap();
+    let PipelineDefinition::OrbSlam(orb) = &run.system.pipeline;
+    assert_eq!(
+        orb.apriltag_anchor,
+        AprilTagAnchorMode::Enabled {
+            tag_id: 2,
+            tag_size_m: 0.1,
+            family: "tag36_h11".to_string(),
+        }
+    );
 }
 
 /// `euroc.ron` documents every system default, so it must stay equal to them.

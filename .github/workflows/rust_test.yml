@@ -55,6 +55,23 @@ jobs:
             test_cmd: cargo test -p kornia-slam
             build_cmd: cargo build -p kornia-slam
 
+          # Library with the opt-in AprilTag metric anchor.
+          - name: slam-apriltag
+            apt: ""
+            test_cmd: cargo test -p kornia-slam --features apriltag
+            build_cmd: ""
+
+          # App with the AprilTag feature: the app's apriltag unit tests and
+          # the CLI smoke path with the anchor stage available.
+          - name: app-apriltag
+            apt: ""
+            test_cmd: cargo test --manifest-path apps/kornia-slam-app/Cargo.toml --features apriltag
+            build_cmd: >-
+              cargo run
+              --manifest-path apps/kornia-slam-app/Cargo.toml
+              --features apriltag
+              -- --help
+
           # App with no default features — just confirms the non-viz build
           # links and the CLI parses.
           - name: app-no-default
@@ -97,7 +114,7 @@ jobs:
         run: ${{ matrix.test_cmd }}
 
       - name: Build / smoke-run
-        if: env.RUST_CHANGED == 'true'
+        if: env.RUST_CHANGED == 'true' && matrix.build_cmd != ''
         run: ${{ matrix.build_cmd }}
 
       - name: Show sccache stats

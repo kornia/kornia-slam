@@ -18,6 +18,8 @@ kornia-algebra.workspace = true
 kornia-image.workspace = true
 kornia-imgproc.workspace = true
 kornia-bow.workspace = true
+# AprilTag detection for the opt-in metric anchor (`apriltag` feature).
+kornia-apriltag = { workspace = true, optional = true }
 kornia-sensors.workspace = true
 # Sparse LLT for pose-graph optimization and dense Cholesky for the reduced
 # camera system in visual-inertial Schur-complement BA.
@@ -29,6 +31,9 @@ serde = { version = "1", features = ["derive"], optional = true }
 [features]
 # Serialization of the system configuration and its RON file loading.
 serde = ["dep:serde", "dep:ron"]
+# Opt-in AprilTag metric anchor: observe a physical tag in keyframes and apply
+# one post-hoc Sim3 correction to the map.
+apriltag = ["dep:kornia-apriltag"]
 
 [package.metadata.docs.rs]
-features = ["serde"]
+features = ["serde", "apriltag"]
