@@ -2,7 +2,9 @@ target/
 runs/
 mono_vo_run-*/
 .worktrees/
-docs/
+/docs/*
+!/docs/evaluation/
+eval_output/
 
 # Pixi
 .pixi/
