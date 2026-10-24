@@ -2132,10 +2132,7 @@ mod tests {
     fn replay_pgo_dump() {
         let dump_path = match std::env::var("KORNIA_PGO_REPLAY") {
             Ok(p) => std::path::PathBuf::from(p),
-            Err(_) => {
-                eprintln!("Set KORNIA_PGO_REPLAY=<path> to replay a dumped pose graph");
-                return;
-            }
+            Err(_) => panic!("Set KORNIA_PGO_REPLAY=<path> to replay a dumped pose graph"),
         };
         let dump = load_pgo_dump(&dump_path).expect("failed to load dump");
         let mut hooks = SparsePgoTestHooks::default();
@@ -2164,6 +2161,10 @@ mod tests {
             "Replay result: converged={:?}",
             result.as_ref().map(|r| (r.converged, r.iterations))
         );
+        if let Ok(res) = &result {
+            let final_cost = normal_cost(&res.poses, &dump.edges);
+            println!("Replay final cost: {final_cost:.6e}");
+        }
         println!("Iterations count: {}", hooks.iterations.len());
         for (i, it) in hooks.iterations.iter().enumerate() {
             println!(
