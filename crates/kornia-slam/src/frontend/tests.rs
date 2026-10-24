@@ -1,9 +1,15 @@
+use std::f32::consts::{PI, TAU};
+
 use kornia_sensors::imu::ImuMeasurement;
 
 use super::*;
 
 const FRONTEND_FIXTURE: &str = include_str!("../../tests/fixtures/frontend/frontend.txt");
 const HILTI_FIXTURE: &str = include_str!("../../tests/fixtures/frontend/hilti.txt");
+const ORIENTATIONS_FIXTURE: &str = include_str!("../../tests/fixtures/frontend/orientations.txt");
+/// Well above the last-bit differences between libm `atan2f` implementations
+/// (~1e-7 rad), well below any change to how ORB computes orientation.
+const ORIENTATION_TOLERANCE_RAD: f32 = 1e-5;
 
 /// Deterministic texture of 4x4 blocks of noise. The right view is the left
 /// view shifted by `disparity` pixels, so a point at `x` appears at `x - d`.
@@ -51,6 +57,20 @@ fn fixture_value<'a>(fixture: &'a str, key: &str) -> &'a str {
         .lines()
         .find_map(|line| line.strip_prefix(key)?.strip_prefix(' '))
         .unwrap_or_else(|| panic!("fixture has no {key}"))
+}
+
+/// ORB orientations come from `f32::atan2`, which calls the platform's libm, so
+/// they are compared within a tolerance rather than hashed.
+fn assert_orientations_match(got: &[f32], fixture: &str) {
+    let expected: Vec<f32> = fixture.lines().map(|line| line.parse().unwrap()).collect();
+    assert_eq!(got.len(), expected.len(), "orientation count");
+    for (i, (&got, &want)) in got.iter().zip(&expected).enumerate() {
+        let diff = (got - want + PI).rem_euclid(TAU) - PI;
+        assert!(
+            diff.abs() <= ORIENTATION_TOLERANCE_RAD,
+            "orientation {i}: {got} vs {want}"
+        );
+    }
 }
 
 fn pinhole(fx: f64, fy: f64, cx: f64, cy: f64) -> PinholeCamera {
@@ -137,10 +157,6 @@ fn stereo_preparation_matches_the_recorded_baseline() {
             "keypoints_xy",
             fnv(f32_bytes(&f.keypoints_xy.concat()).collect::<Vec<_>>()),
         ),
-        (
-            "orientations",
-            fnv(f32_bytes(&f.orientations).collect::<Vec<_>>()),
-        ),
         ("descriptors", fnv(f.descriptors.concat())),
         ("octaves", fnv(f.octaves.iter().copied())),
         (
@@ -161,6 +177,7 @@ fn stereo_preparation_matches_the_recorded_baseline() {
             "{key}"
         );
     }
+    assert_orientations_match(&f.orientations, ORIENTATIONS_FIXTURE);
     let matched = frontend.observation().stereo_matched.unwrap();
     assert_eq!(
         matched.to_string(),
