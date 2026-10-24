@@ -2146,15 +2146,15 @@ mod tests {
                 [
                     "POSE",
                     _node,
-                    r00,
-                    r01,
-                    r02,
-                    r10,
-                    r11,
-                    r12,
-                    r20,
-                    r21,
-                    r22,
+                    c0r0,
+                    c0r1,
+                    c0r2,
+                    c1r0,
+                    c1r1,
+                    c1r2,
+                    c2r0,
+                    c2r1,
+                    c2r2,
                     tx,
                     ty,
                     tz,
@@ -2164,15 +2164,15 @@ mod tests {
                             .map_err(|e| SparsePgoError::InvalidInput(e.to_string()))
                     };
                     let rot = Mat3F64::from_cols_array(&[
-                        parse_f64(r00)?,
-                        parse_f64(r10)?,
-                        parse_f64(r20)?,
-                        parse_f64(r01)?,
-                        parse_f64(r11)?,
-                        parse_f64(r21)?,
-                        parse_f64(r02)?,
-                        parse_f64(r12)?,
-                        parse_f64(r22)?,
+                        parse_f64(c0r0)?,
+                        parse_f64(c0r1)?,
+                        parse_f64(c0r2)?,
+                        parse_f64(c1r0)?,
+                        parse_f64(c1r1)?,
+                        parse_f64(c1r2)?,
+                        parse_f64(c2r0)?,
+                        parse_f64(c2r1)?,
+                        parse_f64(c2r2)?,
                     ]);
                     let translation = Vec3F64::new(parse_f64(tx)?, parse_f64(ty)?, parse_f64(tz)?);
                     poses.push(Pose3d::new(rot, translation));
@@ -2182,15 +2182,15 @@ mod tests {
                     a,
                     b,
                     weight,
-                    r00,
-                    r01,
-                    r02,
-                    r10,
-                    r11,
-                    r12,
-                    r20,
-                    r21,
-                    r22,
+                    c0r0,
+                    c0r1,
+                    c0r2,
+                    c1r0,
+                    c1r1,
+                    c1r2,
+                    c2r0,
+                    c2r1,
+                    c2r2,
                     tx,
                     ty,
                     tz,
@@ -2207,15 +2207,15 @@ mod tests {
                     };
                     let w = parse_f32(weight)?;
                     let rot32 = kornia_algebra::Mat3AF32::from_cols_array(&[
-                        parse_f32(r00)?,
-                        parse_f32(r10)?,
-                        parse_f32(r20)?,
-                        parse_f32(r01)?,
-                        parse_f32(r11)?,
-                        parse_f32(r21)?,
-                        parse_f32(r02)?,
-                        parse_f32(r12)?,
-                        parse_f32(r22)?,
+                        parse_f32(c0r0)?,
+                        parse_f32(c0r1)?,
+                        parse_f32(c0r2)?,
+                        parse_f32(c1r0)?,
+                        parse_f32(c1r1)?,
+                        parse_f32(c1r2)?,
+                        parse_f32(c2r0)?,
+                        parse_f32(c2r1)?,
+                        parse_f32(c2r2)?,
                     ]);
                     let translation = kornia_algebra::Vec3AF32::new(
                         parse_f32(tx)?,
@@ -2246,23 +2246,77 @@ mod tests {
 
     #[test]
     fn dump_and_load_roundtrip() {
-        let (poses, edges) = drifting_loop_graph();
+        let rot = SO3F64::exp(Vec3F64::new(0.2, -0.3, 0.4)).matrix();
+        let poses = vec![
+            Pose3d::new(rot, Vec3F64::new(1.1, 0.2, -0.3)),
+            Pose3d::new(
+                SO3F64::exp(Vec3F64::new(-0.1, 0.2, 0.3)).matrix(),
+                Vec3F64::new(2.1, -0.4, 0.5),
+            ),
+        ];
+        let edge_rot =
+            kornia_algebra::SO3F32::from_matrix(&kornia_algebra::Mat3AF32::from_cols_array(
+                &SO3F64::exp(Vec3F64::new(0.15, 0.25, -0.35))
+                    .matrix()
+                    .to_cols_array()
+                    .map(|v| v as f32),
+            ));
+        let edges = vec![PgoEdge {
+            pose_a: 0,
+            pose_b: 1,
+            t_ab_meas: SE3F32::new(edge_rot, kornia_algebra::Vec3AF32::new(0.5, -0.2, 0.1)),
+            weight: 1.5,
+        }];
+        let gravity = Vec3F64::new(0.1, -0.2, -9.81);
+
         let temp_dir = std::env::temp_dir().join(format!("kornia_pgo_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_dir);
-        super::super::pose_graph::dump_pose_graph(
-            &temp_dir,
-            &poses,
-            &edges,
-            Some(Vec3F64::new(0.0, 0.0, -9.81)),
-        )
-        .unwrap();
+        super::super::pose_graph::dump_pose_graph(&temp_dir, &poses, &edges, Some(gravity))
+            .unwrap();
 
         let dump_file = temp_dir.join("pgo_dump_0.txt");
         assert!(dump_file.exists());
         let loaded = load_pgo_dump(&dump_file).unwrap();
         assert_eq!(loaded.poses.len(), poses.len());
+        for (loaded_pose, orig_pose) in loaded.poses.iter().zip(&poses) {
+            for (a, b) in loaded_pose
+                .rotation
+                .to_cols_array()
+                .iter()
+                .zip(&orig_pose.rotation.to_cols_array())
+            {
+                assert!((a - b).abs() < 1e-6, "pose rotation mismatch: {a} vs {b}");
+            }
+            assert!((loaded_pose.translation.x - orig_pose.translation.x).abs() < 1e-6);
+            assert!((loaded_pose.translation.y - orig_pose.translation.y).abs() < 1e-6);
+            assert!((loaded_pose.translation.z - orig_pose.translation.z).abs() < 1e-6);
+        }
+
         assert_eq!(loaded.edges.len(), edges.len());
-        assert!(loaded.gravity.is_some());
+        for (loaded_edge, orig_edge) in loaded.edges.iter().zip(&edges) {
+            assert_eq!(loaded_edge.pose_a, orig_edge.pose_a);
+            assert_eq!(loaded_edge.pose_b, orig_edge.pose_b);
+            assert!((loaded_edge.weight - orig_edge.weight).abs() < 1e-5);
+            for (a, b) in loaded_edge
+                .t_ab_meas
+                .r
+                .matrix()
+                .to_cols_array()
+                .iter()
+                .zip(&orig_edge.t_ab_meas.r.matrix().to_cols_array())
+            {
+                assert!((a - b).abs() < 1e-5, "edge rotation mismatch: {a} vs {b}");
+            }
+            assert!((loaded_edge.t_ab_meas.t.x - orig_edge.t_ab_meas.t.x).abs() < 1e-5);
+            assert!((loaded_edge.t_ab_meas.t.y - orig_edge.t_ab_meas.t.y).abs() < 1e-5);
+            assert!((loaded_edge.t_ab_meas.t.z - orig_edge.t_ab_meas.t.z).abs() < 1e-5);
+        }
+
+        let load_g = loaded.gravity.unwrap();
+        assert!((load_g.x - gravity.x).abs() < 1e-6);
+        assert!((load_g.y - gravity.y).abs() < 1e-6);
+        assert!((load_g.z - gravity.z).abs() < 1e-6);
+
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
