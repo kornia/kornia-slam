@@ -120,6 +120,19 @@ pub fn optimize_pose_graph(
         gradient_tolerance: config.gradient_tolerance,
         initial_lambda: config.initial_lambda,
     };
+    if let Some(dump_dir) = std::env::var_os("KORNIA_PGO_DUMP")
+        && let Err(error) = dump_pose_graph(
+            std::path::Path::new(&dump_dir),
+            &original_poses,
+            &edges,
+            inertial.map(|context| context.gravity_world),
+        )
+    {
+        eprintln!(
+            "kornia-slam: failed to dump pose graph to {}: {error}",
+            std::path::Path::new(&dump_dir).display()
+        );
+    }
     let result = if let Some(context) = inertial {
         let manifold = GravityManifold::new(context.gravity_world)
             .map_err(|error| PgoError::Solver(error.to_string()))?;
@@ -152,15 +165,6 @@ pub fn optimize_pose_graph(
         && gravity_preserved
         && final_cost < initial_cost
         && new_loop_residual_after <= new_loop_residual_before;
-
-    if let Some(dump_dir) = std::env::var_os("KORNIA_PGO_DUMP") {
-        let _ = dump_pose_graph(
-            std::path::Path::new(&dump_dir),
-            &original_poses,
-            &edges,
-            inertial.map(|context| context.gravity_world),
-        );
-    }
 
     Ok(PgoResult {
         keyframe_indices,
