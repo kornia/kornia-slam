@@ -10,6 +10,17 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**Wheel-odometry and stationary factors move to a new `kornia-factors` crate.**
+Their residuals, Jacobians, information matrices and the Huber cost the VI-BA
+factors share no longer live inside `kornia-slam`'s mapping module, so another
+estimator or solver can use them without the SLAM pipeline.
+`kornia_slam::mapping::wheel_odom` is now `kornia_factors::wheel_odometry`,
+`kornia_slam::mapping::stationary` is `kornia_factors::stationary`, and the
+f64 SE(3) pieces they share are in `kornia_factors::se3`. `WheelOdomMeasurement`
+now holds the `kornia_sensors::wheel::PlanarMotion` that `WheelPreintegration`
+produces: `WheelOdomMeasurement::new(motion)` replaces `new(delta, covariance)`,
+and `delta` / `covariance` are read through `motion`.
+
 **Stereo-inertial tracking rides through fast motion instead of resetting.**
 Once the IMU has settled, a tracking failure now coasts on the inertial
 prediction for up to 5 s (was 1 s, ORB-SLAM3's `time_recently_lost`), keeps

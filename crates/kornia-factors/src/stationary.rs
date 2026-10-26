@@ -16,7 +16,7 @@
 //! with `T = T_cw` perturbed as `T ← T · Exp(ξ)`. The pose residual is the
 //! wheel factor's with identity extrinsics and an identity delta, so its
 //! Jacobian is `J_l⁻¹(r) · Ad(T_i)` for `i` and the negation for `j`
-//! ([`super::wheel_odom`]).
+//! ([`crate::se3::relative_pose_residual`]).
 //!
 //! The mean-gyro row keeps the gyro bias observable while parked: at rest the
 //! raw gyro reads bias plus white noise, so the mean of `T` seconds of samples
@@ -28,12 +28,12 @@
 //! Unlike an IMU edge, a stationary factor has no span limit, and two of them
 //! through a removed keyframe compose into one ([`StationaryFactor::compose`]),
 //! so keyframe culling can merge a parked stretch indefinitely. The caller
-//! holds the factors (keyed by `Frame::idx`, like
-//! [`super::wheel_odom::WheelOdomFactor`]) and decides which intervals were
-//! stationary.
+//! holds the factors (keyed by its keyframe index, like
+//! [`crate::wheel_odometry::WheelOdomFactor`]) and decides which intervals
+//! were stationary.
 
-use crate::mapping::robust::huber_weight_and_cost;
-use crate::mapping::wheel_odom::{self, Mat6};
+use crate::robust::huber_weight_and_cost;
+use crate::se3::{Mat6, quadratic_form, relative_pose_residual};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::{ImuBias, ImuCalib};
@@ -122,8 +122,7 @@ impl StationaryFactor {
     /// Whether the factor can enter a solve: two distinct keyframes, a
     /// positive finite span, sigmas and bias densities, a positive Huber
     /// threshold if any, and a finite gyro mean over a positive time (with a
-    /// positive gyro noise density). [`super::bundle_adjustment::run_local_inertial_ba`]
-    /// skips a factor that is not; `visual_inertial_bundle_adjust` refuses it.
+    /// positive gyro noise density).
     pub fn is_valid(&self) -> bool {
         let positive = |x: f64| x.is_finite() && x > 0.0;
         let gyro_ok = self.gyro.is_none_or(|g| {
@@ -184,7 +183,7 @@ impl StationaryFactor {
 
     /// The (diagonal) information of each residual block. Meaningful only
     /// for a factor that [`Self::is_valid`].
-    pub(crate) fn information(&self) -> StationaryInfo {
+    pub fn information(&self) -> StationaryInfo {
         let t = 1.0 / (self.translation_sigma_m * self.translation_sigma_m);
         let r = 1.0 / (self.rotation_sigma_rad * self.rotation_sigma_rad);
         let mut pose = [[0.0; 6]; 6];
@@ -210,14 +209,14 @@ impl StationaryFactor {
 
 /// Per-block information of a [`StationaryFactor`]; every block is diagonal.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct StationaryInfo {
-    pub(crate) pose: Mat6,
+pub struct StationaryInfo {
+    pub pose: Mat6,
     /// Per axis, for each of `v_i` and `v_j`.
-    pub(crate) velocity: f64,
-    pub(crate) gyro_bias: f64,
-    pub(crate) accel_bias: f64,
+    pub velocity: f64,
+    pub gyro_bias: f64,
+    pub accel_bias: f64,
     /// The measured mean rate and its per-axis information.
-    pub(crate) gyro_mean: Option<(Vec3F64, f64)>,
+    pub gyro_mean: Option<(Vec3F64, f64)>,
 }
 
 /// The residual blocks of one stationary factor at a state, and the pose
@@ -225,36 +224,38 @@ pub(crate) struct StationaryInfo {
 /// blocks have constant Jacobians: identity on `v_i` / `v_j`, `∓I` on the
 /// bias walk, `−I/2` on each gyro bias for the mean-gyro row.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct StationaryResidual {
-    pub(crate) pose: [f64; 6],
-    pub(crate) pose_jacobian_i: Mat6,
-    pub(crate) velocity_i: Vec3F64,
-    pub(crate) velocity_j: Vec3F64,
-    pub(crate) gyro_bias: Vec3F64,
-    pub(crate) accel_bias: Vec3F64,
-    pub(crate) gyro_mean: Option<Vec3F64>,
+pub struct StationaryResidual {
+    pub pose: [f64; 6],
+    pub pose_jacobian_i: Mat6,
+    pub velocity_i: Vec3F64,
+    pub velocity_j: Vec3F64,
+    pub gyro_bias: Vec3F64,
+    pub accel_bias: Vec3F64,
+    pub gyro_mean: Option<Vec3F64>,
     /// Robust weight of the pose and velocity rows.
-    pub(crate) weight: f64,
+    pub weight: f64,
     /// `½ρ(chi²_nav) + ½ chi²_bias`, `ρ` the Huber objective of `weight`
-    /// ([`super::robust`]).
-    pub(crate) cost: f64,
+    /// ([`crate::robust`]).
+    pub cost: f64,
 }
 
 /// One keyframe's state as the factor reads it.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct StationaryState<'a> {
-    pub(crate) pose_cw: &'a Pose3d,
-    pub(crate) velocity: Vec3F64,
-    pub(crate) bias: ImuBias,
+pub struct StationaryState<'a> {
+    pub pose_cw: &'a Pose3d,
+    pub velocity: Vec3F64,
+    pub bias: ImuBias,
 }
 
-pub(crate) fn residual(
+/// The residual blocks of `factor` between the states `i` and `j`, with
+/// `info` its [`StationaryFactor::information`].
+pub fn residual(
     factor: &StationaryFactor,
     info: &StationaryInfo,
     i: StationaryState<'_>,
     j: StationaryState<'_>,
 ) -> StationaryResidual {
-    let (pose, pose_jacobian_i) = wheel_odom::relative_pose_residual(
+    let (pose, pose_jacobian_i) = relative_pose_residual(
         i.pose_cw,
         j.pose_cw,
         &Pose3d::IDENTITY,
@@ -267,7 +268,7 @@ pub(crate) fn residual(
         .gyro_mean
         .map(|(mean, _)| mean - (i.bias.gyro + j.bias.gyro) * 0.5);
 
-    let chi2_nav = wheel_odom::quadratic_form(&info.pose, &pose)
+    let chi2_nav = quadratic_form(&info.pose, &pose)
         + info.velocity * (i.velocity.dot(i.velocity) + j.velocity.dot(j.velocity));
     let (weight, nav_cost) = huber_weight_and_cost(chi2_nav, factor.huber_chi2);
     let chi2_bias = info.gyro_bias * gyro_bias.dot(gyro_bias)

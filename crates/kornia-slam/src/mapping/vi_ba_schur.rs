@@ -70,12 +70,13 @@ use faer::prelude::Solve;
 use kornia_algebra::{Mat3F64, SE3F32, SO3F64, Vec3F64};
 use thiserror::Error;
 
-use crate::mapping::robust::huber_weight_and_cost;
-use crate::mapping::stationary::{
+use crate::pose_conversion::{pose_to_se3, se3_to_pose, vec3_to_f32};
+use kornia_factors::robust::huber_weight_and_cost;
+use kornia_factors::se3::Mat6;
+use kornia_factors::stationary::{
     self, StationaryFactor, StationaryInfo, StationaryResidual, StationaryState,
 };
-use crate::mapping::wheel_odom::{self, Mat6, WheelOdomFactor};
-use crate::pose_conversion::{pose_to_se3, se3_to_pose, vec3_to_f32};
+use kornia_factors::wheel_odometry::{self, WheelOdomFactor};
 
 use kornia_3d::ba::{BaError, BaObservation};
 use kornia_3d::camera::PinholeCamera;
@@ -1088,7 +1089,9 @@ fn wheel_information(edges: &[WheelOdomFactor], n_kf: usize) -> Result<Vec<Mat6>
             }
             // A NaN delta or extrinsic makes every cost NaN, so LM could
             // never accept a step; refuse it by name instead.
-            if !(edge.extrinsics_finite() && edge.measurement.delta.iter().all(|v| v.is_finite())) {
+            if !(edge.extrinsics_finite()
+                && edge.measurement.motion.delta.iter().all(|v| v.is_finite()))
+            {
                 return Err(ViBaError::NonFiniteWheelFactor(k));
             }
             if !edge.huber_valid() {
@@ -1118,12 +1121,12 @@ fn accumulate_wheel_edges(
         if li < 0 && lj < 0 {
             continue;
         }
-        let (r, j) = wheel_odom::residual_and_jacobian(
+        let (r, j) = wheel_odometry::residual_and_jacobian(
             &kfs[edge.from_idx].pose,
             &kfs[edge.to_idx].pose,
             edge,
         );
-        let (w, c) = wheel_odom::robust_weight_and_cost(&r, info, edge.huber_chi2);
+        let (w, c) = wheel_odometry::robust_weight_and_cost(&r, info, edge.huber_chi2);
         cost += c;
         accumulate_pose_pair(m_mat, m_vec, li, lj, &r, &j, info, w);
     }
@@ -1192,12 +1195,12 @@ fn wheel_cost(
         .zip(infos)
         .filter(|(edge, _)| kf_local[edge.from_idx] >= 0 || kf_local[edge.to_idx] >= 0)
         .map(|(edge, info)| {
-            let (r, _) = wheel_odom::residual_and_jacobian(
+            let (r, _) = wheel_odometry::residual_and_jacobian(
                 &kfs[edge.from_idx].pose,
                 &kfs[edge.to_idx].pose,
                 edge,
             );
-            wheel_odom::robust_weight_and_cost(&r, info, edge.huber_chi2).1
+            wheel_odometry::robust_weight_and_cost(&r, info, edge.huber_chi2).1
         })
         .sum()
 }
