@@ -1,6 +1,6 @@
 # Releasing
 
-kornia-slam publishes two things: the `kornia-sensors` and `kornia-slam` crates to
+kornia-slam publishes two things: the `kornia-sensors`, `kornia-factors` and `kornia-slam` crates to
 crates.io, and prebuilt `kornia-slam` CLI binaries attached to a GitHub Release.
 `kornia-slam-app` is `publish = false`.
 
@@ -16,7 +16,7 @@ crates.io, and prebuilt `kornia-slam` CLI binaries attached to a GitHub Release.
 ## Cutting a release
 
 1. **Bump the version.** Set `[workspace.package].version` in `Cargo.toml`, and the
-   `kornia-sensors` / `kornia-slam` pins in `[workspace.dependencies]` to the same
+   `kornia-sensors` / `kornia-factors` / `kornia-slam` pins in `[workspace.dependencies]` to the same
    value. `scripts/check_version_pins.py` (also run in CI) fails if they disagree.
 2. **Update `CHANGELOG.md`.** Move the `[Unreleased]` items into a dated
    `[X.Y.Z]` section and fix the link references at the bottom.
@@ -29,7 +29,7 @@ crates.io, and prebuilt `kornia-slam` CLI binaries attached to a GitHub Release.
    draft GitHub Release with them.
 5. **Publish the crates.** Run the `Rust Release` workflow from the Actions tab on the
    tag and type `publish` to confirm. It runs `scripts/release_rust.sh`, which publishes
-   `kornia-sensors` before `kornia-slam` and skips anything already on crates.io, so a
+   `kornia-sensors`, then `kornia-factors`, then `kornia-slam` and skips anything already on crates.io, so a
    failed run can be re-run.
 6. **Publish the GitHub Release.** Review the draft, paste the CHANGELOG section into
    the notes, and publish it.
