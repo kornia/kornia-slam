@@ -25,6 +25,8 @@ pub enum WheelError {
     MixedReadings,
     #[error("wheel noise must be finite and non-negative")]
     InvalidNoise,
+    #[error("wheel kinematics parameters are not usable")]
+    InvalidKinematics,
 }
 
 /// What the wheel encoders report, `[left, right]`.
@@ -79,6 +81,12 @@ pub struct BodyTwist {
 
 /// Maps wheel angular velocities to the base twist.
 pub trait WheelKinematics {
+    /// Whether the parameters give finite twists; checked by
+    /// [`WheelPreintegration::new`].
+    fn is_valid(&self) -> bool {
+        true
+    }
+
     /// Encoder counts per wheel revolution.
     fn ticks_per_revolution(&self) -> f64;
 
@@ -110,6 +118,16 @@ pub struct DifferentialDrive {
 }
 
 impl WheelKinematics for DifferentialDrive {
+    fn is_valid(&self) -> bool {
+        [
+            self.wheel_radius,
+            self.track_width,
+            self.ticks_per_revolution,
+        ]
+        .iter()
+        .all(|v| v.is_finite() && *v > 0.0)
+    }
+
     fn ticks_per_revolution(&self) -> f64 {
         self.ticks_per_revolution
     }
@@ -285,6 +303,9 @@ impl<K: WheelKinematics> WheelPreintegration<K> {
         if !noise.is_valid() {
             return Err(WheelError::InvalidNoise);
         }
+        if !kinematics.is_valid() {
+            return Err(WheelError::InvalidKinematics);
+        }
         Ok(Self {
             kinematics,
             noise,
@@ -368,16 +389,46 @@ impl<K: WheelKinematics> WheelPreintegration<K> {
 
     /// Motion over `dt` seconds at constant wheel rates, with white rate and
     /// lateral-velocity noise: `Var(u) = (J diag(σ_w²) Jᵀ + diag(0, σ_y², 0))·dt`.
+    ///
+    /// Mapping a whole interval's noise through one exponential Jacobian
+    /// treats it as a constant perturbation, which loses the translation
+    /// variance a white noise builds up along a turn (all of it over a full
+    /// turn). The interval is therefore split into `2^k` identical substeps
+    /// of at most [`MAX_SUBSTEP_SECONDS`] and [`MAX_SUBSTEP_ANGLE`], composed
+    /// by repeated squaring: the two halves' noise is independent.
     fn interval_motion(&self, rates: [f64; 2], dt: f64) -> PlanarMotion {
         let twist = self.kinematics.twist(rates);
-        let u = [twist.vx * dt, twist.vy * dt, twist.wz * dt];
         let [d_left, d_right] = self.kinematics.twist_jacobian(rates);
         let j = Mat3F64::from_cols(d_left, d_right, Vec3F64::ZERO);
         let lateral =
             Mat3F64::from_diagonal(Vec3F64::new(0.0, self.noise.lateral_velocity.powi(2), 0.0));
-        let q = (j * j.transpose() * self.noise.wheel_rate.powi(2) + lateral) * dt;
-        PlanarMotion::from_twist_increment(u, q)
+        let q_rate = j * j.transpose() * self.noise.wheel_rate.powi(2) + lateral;
+
+        let halvings = substep_halvings(dt, twist.wz * dt);
+        let h = dt / f64::from(1u32 << halvings);
+        let u = [twist.vx * h, twist.vy * h, twist.wz * h];
+        let mut motion = PlanarMotion::from_twist_increment(u, q_rate * h);
+        for _ in 0..halvings {
+            motion = motion.compose(&motion);
+        }
+        motion
     }
+}
+
+/// Longest substep of [`WheelPreintegration`]'s noise integration, seconds.
+pub const MAX_SUBSTEP_SECONDS: f64 = 0.01;
+/// Largest heading change of one substep, radians.
+pub const MAX_SUBSTEP_ANGLE: f64 = 0.02;
+
+/// Halvings `k` that bring an interval of `dt` seconds turning `angle`
+/// radians within the substep bounds; capped at 2^20 substeps.
+fn substep_halvings(dt: f64, angle: f64) -> u32 {
+    let ratio = (dt / MAX_SUBSTEP_SECONDS).max(angle.abs() / MAX_SUBSTEP_ANGLE);
+    // The tolerance keeps a nominal 10 ms sample, rounded up, at one step.
+    if ratio <= 1.0 + 1e-9 {
+        return 0;
+    }
+    (ratio.log2().ceil() as u32).min(20)
 }
 
 fn is_finite(m: &WheelMeasurement) -> bool {
@@ -391,6 +442,7 @@ fn is_finite(m: &WheelMeasurement) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f64::consts::PI;
 
     const DRIVE: DifferentialDrive = DifferentialDrive {
         wheel_radius: 0.1,
@@ -589,6 +641,74 @@ mod tests {
             WheelPreintegration::new(DRIVE, noise).err(),
             Some(WheelError::InvalidNoise)
         );
+    }
+
+    #[test]
+    fn unusable_kinematics_are_refused() {
+        for drive in [
+            DifferentialDrive {
+                track_width: 0.0,
+                ..DRIVE
+            },
+            DifferentialDrive {
+                wheel_radius: -0.1,
+                ..DRIVE
+            },
+            DifferentialDrive {
+                ticks_per_revolution: f64::NAN,
+                ..DRIVE
+            },
+        ] {
+            assert_eq!(
+                WheelPreintegration::new(drive, WheelNoise::default()).err(),
+                Some(WheelError::InvalidKinematics)
+            );
+        }
+    }
+
+    /// One `seconds`-long interval at constant `rates`.
+    fn single_interval(rates: [f64; 2], seconds: f64) -> WheelPreintegration {
+        let mut pre = WheelPreintegration::new(DRIVE, WheelNoise::default()).unwrap();
+        for t in [0.0, seconds] {
+            pre.integrate(&WheelMeasurement::angular_velocity(t, rates))
+                .unwrap();
+        }
+        pre
+    }
+
+    #[test]
+    fn a_full_turn_keeps_its_translation_variance() {
+        // 2π in place over 2 s: white forward and lateral velocity noise,
+        // rotated through every heading, averages to (σ_vx² + σ_y²)/2 per axis.
+        let noise = WheelNoise::default();
+        let rate = PI * DRIVE.track_width / (2.0 * DRIVE.wheel_radius);
+        let sigma_vx2 = 0.5 * (DRIVE.wheel_radius * noise.wheel_rate).powi(2);
+        let want = 0.5 * (sigma_vx2 + noise.lateral_velocity.powi(2)) * 2.0;
+        let coarse = single_interval([-rate, rate], 2.0);
+        let fine = constant_rates([-rate, rate], 2.0);
+        for pre in [&coarse, &fine] {
+            let c = pre.motion().covariance;
+            for var in [c.x_axis.x, c.y_axis.y] {
+                assert!((var - want).abs() < 0.01 * want, "{var:e} vs {want:e}");
+            }
+        }
+        assert_delta(coarse.motion().delta, fine.motion().delta, 1e-9);
+    }
+
+    #[test]
+    fn straight_line_lateral_variance_is_the_heading_random_walk() {
+        // Var(y) = v² σ_ω² T³/3 + σ_y² T, with σ_ω² = 2 (r σ_w / b)².
+        let noise = WheelNoise::default();
+        let (rate, t) = (2.0, 2.0_f64);
+        let v = DRIVE.wheel_radius * rate;
+        let sigma_w2 = 2.0 * (DRIVE.wheel_radius * noise.wheel_rate / DRIVE.track_width).powi(2);
+        let want = v * v * sigma_w2 * t.powi(3) / 3.0 + noise.lateral_velocity.powi(2) * t;
+        let got = single_interval([rate, rate], t)
+            .motion()
+            .covariance
+            .y_axis
+            .y;
+        assert!((got - want).abs() < 1e-3 * want, "{got:e} vs {want:e}");
     }
 
     #[test]
