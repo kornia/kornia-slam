@@ -1,6 +1,6 @@
 [package]
 name = "kornia-sensors"
-description = "Physical sensor processing for kornia: IMU preintegration, noise models, sensor-rig calibration and synchronized sensor frames."
+description = "Physical sensor processing for kornia: IMU and wheel-odometry preintegration, noise models, sensor-rig calibration and synchronized sensor frames."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,3 +16,12 @@ kornia-3d.workspace = true
 kornia-algebra.workspace = true
 kornia-image.workspace = true
 glam = "0.33"
+serde = { version = "1", features = ["derive"], optional = true }
+thiserror = "1"
+
+[dev-dependencies]
+ron = "0.12"
+
+[features]
+# Serialization of the wheel kinematics and noise parameters.
+serde = ["dep:serde"]

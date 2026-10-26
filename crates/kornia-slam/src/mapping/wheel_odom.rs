@@ -22,6 +22,7 @@
 
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
+use kornia_sensors::wheel::PlanarMotion;
 
 /// 6×6 row-major block over the pose tangent `[ρ; ω]`.
 pub(crate) type Mat6 = [[f64; 6]; 6];
@@ -73,13 +74,17 @@ impl WheelOdomMeasurement {
         }
     }
 
+    /// The planar delta and its covariance.
+    pub fn planar_motion(&self) -> PlanarMotion {
+        PlanarMotion {
+            delta: self.delta,
+            covariance: self.covariance,
+        }
+    }
+
     /// The planar delta as a transform taking base-j coordinates to base-i.
     pub fn delta_pose(&self) -> Pose3d {
-        let [dx, dy, dtheta] = self.delta;
-        Pose3d::new(
-            SO3F64::exp(Vec3F64::new(0.0, 0.0, dtheta)).matrix(),
-            Vec3F64::new(dx, dy, 0.0),
-        )
+        self.planar_motion().delta_pose()
     }
 
     /// Information over the residual tangent `[x, y, z, roll, pitch, yaw]`.
@@ -148,56 +153,26 @@ impl WheelOdomMeasurement {
 }
 
 impl WheelOdomMeasurement {
-    /// The motion `self` then `next` (base k in base i from i→j and j→k).
-    ///
-    /// The planar covariance propagates to first order through the SE(2)
-    /// composition, `Jᵢ Σᵢ Jᵢᵀ + Jⱼ Σⱼ Jⱼᵀ` (the two intervals' wheel noise is
-    /// independent); the out-of-plane sigmas add in quadrature.
+    /// The motion `self` then `next` (base k in base i from i→j and j→k):
+    /// the planar part composes as [`PlanarMotion::compose`], the
+    /// out-of-plane sigmas add in quadrature.
     pub fn compose(&self, next: &Self) -> Self {
-        let [x1, y1, th1] = self.delta;
-        let [x2, y2, th2] = next.delta;
-        let (s, c) = th1.sin_cos();
-        let delta = [
-            x1 + c * x2 - s * y2,
-            y1 + s * x2 + c * y2,
-            (th1 + th2).sin().atan2((th1 + th2).cos()),
-        ];
-        let j_first = [
-            [1.0, 0.0, -s * x2 - c * y2],
-            [0.0, 1.0, c * x2 - s * y2],
-            [0.0, 0.0, 1.0],
-        ];
-        let j_next = [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]];
-        let a = congruence(&j_first, &self.covariance);
-        let b = congruence(&j_next, &next.covariance);
-        let mut covariance = [[0.0; 3]; 3];
-        for (r, row) in covariance.iter_mut().enumerate() {
-            for (col, x) in row.iter_mut().enumerate() {
-                // Symmetrized: `information` refuses an asymmetric covariance.
-                *x = 0.5 * (a[r][col] + a[col][r] + b[r][col] + b[col][r]);
-            }
-        }
+        let planar = self.planar_motion().compose(&next.planar_motion());
         Self {
-            delta,
-            covariance,
+            delta: planar.delta,
+            covariance: planar.covariance,
             z_sigma: self.z_sigma.hypot(next.z_sigma),
             tilt_sigma: self.tilt_sigma.hypot(next.tilt_sigma),
         }
     }
 }
 
-/// `J Σ Jᵀ` for row-major 3×3 matrices.
-fn congruence(j: &[[f64; 3]; 3], sigma: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    let mut out = [[0.0; 3]; 3];
-    for (r, row) in out.iter_mut().enumerate() {
-        for (c, x) in row.iter_mut().enumerate() {
-            *x = (0..3)
-                .flat_map(|k| (0..3).map(move |l| (k, l)))
-                .map(|(k, l)| j[r][k] * sigma[k][l] * j[c][l])
-                .sum();
-        }
+/// Preintegrated wheel odometry ([`kornia_sensors::wheel::WheelPreintegration`])
+/// with the default out-of-plane sigmas.
+impl From<PlanarMotion> for WheelOdomMeasurement {
+    fn from(motion: PlanarMotion) -> Self {
+        Self::new(motion.delta, motion.covariance)
     }
-    out
 }
 
 /// A wheel-odometry constraint between keyframes `from_idx` and `to_idx`.
@@ -844,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn composed_covariance_is_the_linearized_propagation() {
+    fn composed_measurement_composes_the_planar_motion() {
         let first = WheelOdomMeasurement::new(
             [0.3, -0.1, 0.7],
             [[2e-4, 1e-5, 0.0], [1e-5, 1e-4, 2e-5], [0.0, 2e-5, 3e-4]],
@@ -853,37 +828,11 @@ mod tests {
             [0.2, 0.15, -0.4],
             [[1e-4, 0.0, 1e-5], [0.0, 4e-4, 0.0], [1e-5, 0.0, 2e-4]],
         );
-        // Central differences of the composed delta wrt each input delta.
-        const EPS: f64 = 1e-6;
-        let jacobian = |which: usize| {
-            let mut j = [[0.0; 3]; 3];
-            for k in 0..3 {
-                let shifted = |sign: f64| {
-                    let (mut a, mut b) = (first, next);
-                    let d = if which == 0 {
-                        &mut a.delta
-                    } else {
-                        &mut b.delta
-                    };
-                    d[k] += sign * EPS;
-                    a.compose(&b).delta
-                };
-                let (plus, minus) = (shifted(1.0), shifted(-1.0));
-                for r in 0..3 {
-                    j[r][k] = (plus[r] - minus[r]) / (2.0 * EPS);
-                }
-            }
-            j
-        };
-        let a = congruence(&jacobian(0), &first.covariance);
-        let b = congruence(&jacobian(1), &next.covariance);
         let joined = first.compose(&next);
-        for r in 0..3 {
-            for c in 0..3 {
-                let want = a[r][c] + b[r][c];
-                assert!((joined.covariance[r][c] - want).abs() < 1e-12, "[{r}][{c}]");
-            }
-        }
+        assert_eq!(
+            joined.planar_motion(),
+            first.planar_motion().compose(&next.planar_motion())
+        );
         assert!((joined.z_sigma - 0.01 * 2f64.sqrt()).abs() < 1e-15);
         assert!((joined.tilt_sigma - 0.01 * 2f64.sqrt()).abs() < 1e-15);
     }
