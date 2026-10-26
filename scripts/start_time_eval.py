@@ -30,7 +30,14 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+# Enable relative import of scripts helper modules
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from lamaria_adapter import LamariaAdapter
+except ImportError:
+    LamariaAdapter = None  # type: ignore
 
 
 # ==============================================================================
@@ -357,10 +364,10 @@ def count_dataset_frames(dataset_path: Path) -> Optional[int]:
         if cam0_csv.exists():
             try:
                 with open(cam0_csv, "r", encoding="utf-8") as f:
-                    lines = sum(1 for line in f if line.strip() and not line.startswith("#"))
-                    return max(0, lines - 1)
-            except Exception:
-                pass
+                    # Nonblank lines that do not start with '#'
+                    return sum(1 for line in f if line.strip() and not line.startswith("#"))
+            except OSError as e:
+                print(f"[WARN] Failed to read frame count from {cam0_csv}: {e}", file=sys.stderr)
     return None
 
 
@@ -374,21 +381,32 @@ def generate_override_ron(
     # Normalize Windows backslashes for RON string paths
     data_str = str(dataset_path.resolve()).replace("\\", "/")
 
-    # Replace or insert data path
-    content = re.sub(r'data:\s*"[^"]*"', f'data: "{data_str}"', content)
+    # Replace data path with validation of exact substitution count
+    content, count_data = re.subn(r'data:\s*"[^"]*"', f'data: "{data_str}"', content, count=1)
+    if count_data != 1:
+        raise ValueError(f"Expected exactly 1 'data:' field replacement in {base_ron_path}, found {count_data}")
+
     # Replace or insert start_frame
     if "start_frame:" in content:
-        content = re.sub(r"start_frame:\s*\d+", f"start_frame: {start_frame}", content)
+        content, count_sf = re.subn(r"start_frame:\s*\d+", f"start_frame: {start_frame}", content, count=1)
+        if count_sf != 1:
+            raise ValueError(f"Failed to replace 'start_frame' in {base_ron_path}")
     else:
-        content = re.sub(
-            r"(source:\s*Euroc\(\(\s*)",
+        content, count_sf = re.subn(
+            r"(source:\s*[A-Za-z0-9_]+\(\(\s*)",
             rf"\1start_frame: {start_frame},\n        ",
             content,
+            count=1,
         )
+        if count_sf != 1:
+            raise ValueError(f"Failed to insert 'start_frame' into source in {base_ron_path}")
 
     # Force synchronous mapping for deterministic evaluation replay
     if "execution: Asynchronous" in content:
         content = content.replace("execution: Asynchronous", "execution: Synchronous")
+
+    if "execution: Synchronous" not in content:
+        raise ValueError("Config does not contain 'execution: Synchronous'; deterministic replay requires Synchronous mapping.")
 
     with open(out_ron_path, "w", encoding="utf-8") as f:
         f.write(content)
@@ -403,28 +421,20 @@ def run_offset_real(
     fps: float = 20.0,
     dry_run: bool = False,
 ) -> StartTimeMetrics:
-    """Executes kornia-slam on a real sequence from a specific start_frame offset.
-
-    Initialisation Detection Protocol:
-    1. Primary Detection (App Logs):
-       - Searches standard output/stderr for `[imu_init] applying:` (inertial initialization),
-         `[bootstrap]` / `bootstrap accepted` (visual bootstrap), or tracking status
-         `KeyframeAccepted` / `Tracked`.
-       - The frame index `init_frame_idx` of the first accepted keyframe or IMU alignment
-         determines `time_to_init_sec = (init_frame_idx - start_frame) / fps`.
-    2. Fallback Detection (CSV Files):
-       - If logging formats change, the harness inspects `kornia_slam_aligned.csv`.
-       - If the file exists and contains valid rows, initialization is inferred from the
-         first evaluated frame index.
-    3. Failure Detection:
-       - If the process exits with a non-zero code, times out, or produces fewer than 2
-         evaluated frames, `init_success` is recorded as `False` and status records the failure.
-    """
+    """Executes kornia-slam on a real sequence from a specific start_frame offset."""
     offset_out_dir.mkdir(parents=True, exist_ok=True)
     temp_ron = offset_out_dir / f"run_offset_{start_frame}.ron"
     generate_override_ron(base_ron_path, dataset_path, start_frame, temp_ron)
 
-    # Support either direct binary ("target/release/kornia-slam") or command string ("cargo run ...")
+    # Clean up stale CSV files from any prior runs in this directory
+    for stale_csv in ["kornia_slam_aligned.csv", "kornia_slam_raw.csv"]:
+        stale_path = offset_out_dir / stale_csv
+        if stale_path.exists():
+            try:
+                stale_path.unlink()
+            except OSError:
+                pass
+
     bin_cmd = shlex.split(kornia_slam_bin)
     cmd = bin_cmd + [
         "--config",
@@ -436,18 +446,18 @@ def run_offset_real(
     ]
 
     if dry_run:
-        print(f"    [DRY-RUN] Command: {' '.join(cmd)}")
+        print(f"    [DRY-RUN] Command: {shlex.join(cmd)}")
         return StartTimeMetrics(
             offset_frames=start_frame,
             offset_sec=start_frame / fps,
-            init_success=True,
-            time_to_init_sec=1.0,
-            frames_evaluated=100,
-            scale=1.0,
-            scale_error=0.0,
-            ate_rmse_m=0.0,
+            init_success=False,
+            time_to_init_sec=float("nan"),
+            frames_evaluated=0,
+            scale=float("nan"),
+            scale_error=float("nan"),
+            ate_rmse_m=float("nan"),
             tracking_loss_events=0,
-            wall_time_sec=0.001,
+            wall_time_sec=0.0,
             status="dry_run",
         )
 
@@ -532,33 +542,27 @@ def run_offset_real(
     scale_error = float("nan")
     ate_rmse = float("nan")
     frames_evaluated = 0
+    csv_error: Optional[str] = None
 
     if aligned_csv.exists():
         est_pts: List[Vec3] = []
         gt_pts: List[Vec3] = []
-        first_csv_idx = None
         try:
             with open(aligned_csv, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    if first_csv_idx is None and "idx" in row:
-                        first_csv_idx = int(row["idx"])
                     est_pts.append(
                         Vec3(float(row["x"]), float(row["y"]), float(row["z"]))
                     )
                     gt_pts.append(
                         Vec3(float(row["gt_x"]), float(row["gt_y"]), float(row["gt_z"]))
                     )
-        except Exception:
-            pass
-
-        frames_evaluated = len(est_pts)
-        if frames_evaluated >= 2:
-            ate_rmse = compute_ate_rmse(est_pts, gt_pts)
-            # Fallback initialization confirmation from CSV if logs changed
-            init_success = True
-            if init_frame_idx is None and first_csv_idx is not None:
-                init_frame_idx = first_csv_idx
+            frames_evaluated = len(est_pts)
+            if frames_evaluated >= 2:
+                ate_rmse = compute_ate_rmse(est_pts, gt_pts)
+                init_success = True
+        except Exception as e:
+            csv_error = str(e)
 
         # Parse scale from output text if present
         m_scale = re.search(r"Scale\s*:\s*([0-9.]+)", output)
@@ -569,10 +573,19 @@ def run_offset_real(
     time_to_init = (
         (init_frame_idx - start_frame) / fps
         if (init_frame_idx is not None and init_frame_idx >= start_frame)
-        else (20.0 / fps if init_success else float("nan"))
+        else float("nan")
     )
 
-    status = "ok" if (init_success and not math.isnan(ate_rmse)) else "init_failed"
+    if csv_error:
+        status = f"csv_parse_error: {csv_error}"
+    elif frames_evaluated < 2 and init_success:
+        status = "init_failed"
+    elif init_success and not math.isnan(ate_rmse):
+        status = "ok"
+    elif proc.returncode != 0:
+        status = f"failed (code {proc.returncode})"
+    else:
+        status = "init_failed"
 
     return StartTimeMetrics(
         offset_frames=start_frame,
@@ -705,6 +718,17 @@ def parse_offsets(offsets_arg: str, fps: float) -> List[int]:
     return sorted(list(set(offsets)))
 
 
+def sanitize_json(obj: Any) -> Any:
+    """Recursively replaces NaN and infinite floats with None for valid JSON serialization."""
+    if isinstance(obj, float):
+        return None if (math.isnan(obj) or math.isinf(obj)) else obj
+    elif isinstance(obj, dict):
+        return {k: sanitize_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_json(v) for v in obj]
+    return obj
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="kornia-slam start-time sensitivity evaluation harness."
@@ -713,13 +737,38 @@ def main() -> None:
         "--dataset-path",
         type=Path,
         default=None,
-        help="Path to sequence dataset directory (e.g. MH_05_difficult).",
+        help="Path to sequence dataset directory (e.g. MH_05_difficult or R_01_easy).",
     )
     parser.add_argument(
         "--sequence-name",
         type=str,
         default="sequence",
         help="Identifier name for the sequence.",
+    )
+    parser.add_argument(
+        "--dataset-format",
+        type=str,
+        choices=["auto", "euroc", "lamaria"],
+        default="auto",
+        help="Dataset layout format: 'euroc', 'lamaria', or 'auto' (default: auto).",
+    )
+    parser.add_argument(
+        "--calib-path",
+        type=Path,
+        default=None,
+        help="Optional path to pinhole calibration JSON or sensor.yaml (for LaMAria).",
+    )
+    parser.add_argument(
+        "--gt-path",
+        type=Path,
+        default=None,
+        help="Optional path to ground truth file (for LaMAria).",
+    )
+    parser.add_argument(
+        "--imu-time-offset-ms",
+        type=float,
+        default=4.2,
+        help="Hardware IMU latency to subtract in milliseconds (default: 4.2 ms for LaMAria).",
     )
     parser.add_argument(
         "--config",
@@ -770,32 +819,65 @@ def main() -> None:
     if args.smoke_test:
         print(f"[*] Running synthetic smoke test over offsets: {start_offsets}")
         metrics = run_synthetic_smoke_test(start_offsets, fps=args.fps)
+        active_format = "synthetic"
     else:
-        # Validate base config exists
-        if not args.config.exists():
-            print(
-                f"[ERROR] Config file '{args.config}' not found. Please provide a valid RON config.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
         # Validate dataset path exists
         if not args.dataset_path or not args.dataset_path.exists():
             print(
                 f"[ERROR] Dataset path '{args.dataset_path}' does not exist.\n"
-                "To test the harness without local data, run with '--smoke-test' or '--dry-run'.",
+                "To test the harness without local data, run with '--smoke-test'.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Detect or resolve dataset format
+        active_dataset_path = args.dataset_path
+        active_config = args.config
+        active_format = args.dataset_format
+
+        if active_format == "auto":
+            if (args.dataset_path / "mav0").exists():
+                active_format = "euroc"
+            elif (args.dataset_path / "pinhole_calibrations").exists() or (args.dataset_path / "cam0").exists():
+                active_format = "lamaria"
+            else:
+                active_format = "euroc"
+
+        # Adapt LaMAria sequences if needed
+        if active_format == "lamaria":
+            if LamariaAdapter is None:
+                print("[ERROR] LamariaAdapter helper module could not be imported.", file=sys.stderr)
+                sys.exit(1)
+            print(f"[*] Detected/specified LaMAria dataset format for '{args.sequence_name}'.")
+            adapted_dir = args.output_dir / f"{args.sequence_name}_adapted"
+            adapter = LamariaAdapter(
+                sequence_dir=args.dataset_path,
+                calib_path=args.calib_path,
+                gt_path=args.gt_path,
+                imu_time_offset_ns=int(round(args.imu_time_offset_ms * 1_000_000)),
+            )
+            print(f"[*] Adapting LaMAria layout into '{adapted_dir}'...")
+            active_dataset_path = adapter.adapt(adapted_dir)
+            # Default to configs/lamaria.ron if euroc.ron was passed by default
+            if args.config == Path("configs/euroc.ron") and Path("configs/lamaria.ron").exists():
+                active_config = Path("configs/lamaria.ron")
+
+        # Validate active config exists
+        if not active_config.exists():
+            print(
+                f"[ERROR] Config file '{active_config}' not found. Please provide a valid RON config.",
                 file=sys.stderr,
             )
             sys.exit(1)
 
         # Check total dataset frames if available to catch out-of-range offsets
-        total_frames = count_dataset_frames(args.dataset_path)
+        total_frames = count_dataset_frames(active_dataset_path)
         if total_frames is not None:
             print(f"[*] Dataset '{args.sequence_name}' contains {total_frames} camera frames.")
 
         print(
             f"[*] Running start-time evaluation on '{args.sequence_name}' "
-            f"({len(start_offsets)} start offsets)..."
+            f"({len(start_offsets)} start offsets, format={active_format})..."
         )
         metrics = []
         for offset in start_offsets:
@@ -824,8 +906,8 @@ def main() -> None:
             print(f"  -> Testing start offset: {offset} frames ({offset_sec:.2f} s)...")
             res = run_offset_real(
                 kornia_slam_bin=args.bin_path,
-                base_ron_path=args.config,
-                dataset_path=args.dataset_path,
+                base_ron_path=active_config,
+                dataset_path=active_dataset_path,
                 start_frame=offset,
                 offset_out_dir=args.output_dir / f"offset_{offset}",
                 fps=args.fps,
@@ -844,21 +926,21 @@ def main() -> None:
         for m in metrics:
             writer.writerow(asdict(m))
 
-    # Save JSON
+    # Save sanitized JSON
     json_path = args.output_dir / "start_time_summary.json"
+    payload = sanitize_json(
+        {
+            "sequence_name": args.sequence_name,
+            "dataset_format": active_format,
+            "is_smoke_test": args.smoke_test,
+            "is_dry_run": args.dry_run,
+            "fps": args.fps,
+            "metrics": [asdict(m) for m in metrics],
+            "summary": summary,
+        }
+    )
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "sequence_name": args.sequence_name,
-                "is_smoke_test": args.smoke_test,
-                "is_dry_run": args.dry_run,
-                "fps": args.fps,
-                "metrics": [asdict(m) for m in metrics],
-                "summary": summary,
-            },
-            f,
-            indent=2,
-        )
+        json.dump(payload, f, indent=2, allow_nan=False)
 
     print(f"[+] Saved metrics CSV to: {csv_path}")
     print(f"[+] Saved summary JSON to: {json_path}")
