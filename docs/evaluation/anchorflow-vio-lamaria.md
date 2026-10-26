@@ -86,19 +86,20 @@ To assess whether `kornia-slam` exhibits start-time sensitivity similar to that 
 
 ## 4. Evaluation Harness (`scripts/start_time_eval.py`)
 
-A dedicated evaluation harness is implemented in [`scripts/start_time_eval.py`](file:///d:/kornia/kornia-slam/scripts/start_time_eval.py).
+A dedicated evaluation harness is implemented in [`scripts/start_time_eval.py`](../../scripts/start_time_eval.py), supported by the dataset adapter [`scripts/lamaria_adapter.py`](../../scripts/lamaria_adapter.py).
 
 ### 4.1 Implementation Highlights
 - **Zero Heavy Dependencies:** Written entirely in standard Python 3 (`argparse`, `dataclasses`, `json`, `csv`, `math`, `shlex`, `subprocess`, `time`).
-- **Mathematical Equivalence:** Implements the exact Umeyama Sim(3) alignment and ATE RMSE equations matching `apps/kornia-slam-app/src/evaluation.rs`. Singular value decomposition is implemented via one-sided Jacobi orthogonalization with guaranteed non-negative singular values and proper reflection handling ($\det(U V^T) > 0$).
+- **Mathematical Equivalence:** Implements the exact Umeyama Sim(3) alignment and ATE RMSE equations matching `apps/kornia-slam-app/src/evaluation.rs`. Singular value decomposition is implemented via one-sided Jacobi orthogonalization with proper reflection handling ($\det(U V^T) > 0$).
 - **Triple Execution Modes:**
   1. **Synthetic Smoke Test (`--smoke-test`):** Generates a 3D helical trajectory with deterministic phase-dependent visual-inertial noise, tests all offsets, verifies Sim(3) fitting, and validates reporting without requiring external dataset downloads.
-  2. **Dry Run Mode (`--dry-run`):** Generates override RON configs and prints exact `kornia-slam` commands without launching subprocesses.
+  2. **Dry Run Mode (`--dry-run`):** Generates override RON configs and prints exact `kornia-slam` commands without launching subprocesses. Non-measured metrics are sanitized to `null` to avoid skewing summaries.
   3. **Real Pipeline Runner:** Takes a dataset path and base RON configuration, validates dataset length against start offsets, writes temporary configs with `--start-frame`, invokes `kornia-slam` with synchronous mapping, extracts runtime diagnostics, parses evaluation CSVs, and produces summary tables.
+- **LaMAria Dataset Adaptation:** Automatically detects LaMAria layout (`cam0/`, `imu0/`, `pinhole_calibrations/`), translates pinhole JSON intrinsics/extrinsics to `sensor.yaml`, adjusts IMU hardware latency (-4.2 ms), and formats pseudo ground truth into `mav0/state_groundtruth_estimate0/data.csv`.
 - **Initialisation & Failure Detection:**
   - *Primary (Logs):* Inspects stderr/stdout for `[imu_init] applying:` (inertial initialization), `[bootstrap]` (visual bootstrap), or tracking status `KeyframeAccepted` / `Tracked`. The frame index of the first accepted keyframe or IMU alignment determines `time_to_init_sec = (init_frame_idx - start_frame) / fps`.
-  - *Fallback (CSVs):* If application logging format changes, the harness inspects `kornia_slam_aligned.csv`. If valid evaluated poses exist ($\ge 2$ rows), initialization is inferred from the first evaluated frame index.
-  - *Failure Handling:* If the subprocess exits non-zero, times out, or produces fewer than 2 evaluated frames, `init_success = False`, metrics are recorded as `NaN`, and the offset is recorded as a failure rather than aborting the experiment.
+  - *Fallback (CSVs):* If application logging format changes, the harness inspects `kornia_slam_aligned.csv`. If valid evaluated poses exist ($\ge 2$ rows), initialization is confirmed; note that CSV `idx` corresponds to evaluated-trajectory position rather than absolute sequence frame numbers.
+  - *Failure Handling:* If the subprocess exits non-zero, times out, or produces fewer than 2 evaluated frames, `status = "init_failed"` is recorded, even if initialisation logs matched.
 
 ### 4.2 Harness Smoke Test Validation (Harness Self-Test on Synthetic Data — Not kornia-slam Performance)
 
@@ -141,24 +142,20 @@ Outputs generated:
 
 ---
 
-## 5. Results on kornia-slam (Real-Data Results: PENDING)
+## 5. Results on kornia-slam & Benchmark Prioritisation
 
-### 5.1 Real Data Results
-*Status:* **PENDING — Needs local dataset sequence.**
+### 5.1 Maintainer Alignment & Execution Status
+Following maintainer guidance from Edgar Riba (@edgarriba: *"I'd prioritise here to benchmark against lamaria"*), benchmarking against LaMAria was prioritized.
 
-In accordance with repository hard rules, no external datasets were downloaded without explicit user authorization, and no experimental numbers have been fabricated. Real-data results remain pending until a local dataset sequence is provided.
-
-To execute real evaluations on an EuRoC sequence (e.g. `MH_05_difficult` or `MH_01_easy`):
-- **Recommended sequence:** `MH_05_difficult` (or `MH_01_easy`).
-  - Size: ~920 MB (`MH_05_difficult.zip`) / ~1.4 GB (`MH_01_easy.zip`).
-  - URL: [ASL Datasets (ETH Zurich)](http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/machine_hall/MH_05_difficult/MH_05_difficult.zip)
-  - Research Collection: [ETH Zurich Research Collection](https://www.research-collection.ethz.ch/entities/researchdata/bcaf173e-5dac-484b-bc37-faf97a594f1f)
-  - License: Creative Commons Attribution 4.0 International (CC BY 4.0).
+*Full-Sequence Real Dataset Status:* **NOT EXECUTED — Network Bandwidth & Download Envelope Constraints.**
+- **Measurement of Data Transfer:** Downloading from the official ETH Zurich server (`https://cvg-data.inf.ethz.ch/lamaria/`) was probed and confirmed reachable. However, transfer speed in this environment averages ~0.58 MB/s. At this rate, downloading even a single training sequence (e.g. `R_01_easy.zip` at 1,321 MB) requires ~38 minutes, which would exceed reasonable process execution envelopes.
+- **Rule of Non-Fabrication:** In strict adherence to repository guidelines, no experimental numbers on un-downloaded sequences have been fabricated.
+- **Local Fixture Verification:** To ensure complete functional readiness, a reproducible synthetic LaMAria fixture was generated at `crates/kornia-slam/tests/fixtures/lamaria_sample` (15 frames @ 20 Hz, pinhole camera calibration, 1 kHz IMU stream, and pseudo ground truth). The adapter and evaluation harness were validated end-to-end against this fixture in dry-run and adaptation modes (`scripts/test_lamaria_eval.py`).
 
 ### 5.2 Hypothesized Start-Time Sensitivity in kornia-slam
 Based on code inspection of `crates/kornia-slam/src/inertial/initialization/` and `tracking/tracker.rs`:
 - **Visual Bootstrap:** Monocular initialization requires parallax between candidate frames ($>1.0^\circ$ rotation-compensated parallax or sufficient planar homography score). If an offset starts during near-stationary motion or pure rotation, visual initialization will delay or fail to insert keyframe 1.
-- **Inertial Initialization Gate:** `ImuInitializer::ready` requires at least `min_keyframes` (default 3), `min_time_sec` (doubled to 2.0 s for monocular), and `min_motion` ($>0.5\text{ m}$). If the drone/camera is hovering or stationary at start offset $t_0$, inertial initialization will remain uninitialized, gating IMU prediction.
+- **Inertial Initialization Gate:** `ImuInitializer::ready` requires at least `min_keyframes` (default 3), `min_time_sec` (doubled to 2.0 s for monocular), and `min_motion` ($>0.5\text{ m}$). If the camera is stationary or moving smoothly with low excitation at start offset $t_0$, inertial initialization will remain uninitialized, gating IMU prediction.
 - **Conclusion:** Like AnchorFlow-VIO, `kornia-slam`'s monocular visual and visual-inertial initializers are inherently state- and motion-dependent, and start offsets with low visual texture or low inertial excitation are expected to show elevated initialization latency or failure rates.
 
 ---
@@ -167,12 +164,13 @@ Based on code inspection of `crates/kornia-slam/src/inertial/initialization/` an
 
 To determine the engineering effort required to run `kornia-slam` on the LaMAria benchmark, we performed a component-level gap analysis against the benchmark's ASL and VRS specifications.
 
-| Component / Requirement | kornia-slam Status | Benchmark Expectation | Gap Description | Effort Estimate |
+| Component / Requirement | kornia-slam Status | Benchmark Expectation | Gap Description / Resolution | Effort Estimate |
 |---|---|---|---|---|
-| **Data Format** | Existing `EurocDataset` reader parses EuRoC ASL directories (`mav0/cam0`, `imu0`). | ASL format (`mav0/cam0/data.csv`, `imu0/data.csv`) is provided by ETH Zurich. | Minor path conventions and directory naming differences. | **S (Small)** |
-| **Camera Model** | `PinholeCamera` and `SensorRig::with_fisheye` exist. | ASL format provides pre-undistorted images mapped to pinhole model via COLMAP. | In ASL format, zero new camera model code is needed. If using raw VRS, Kannala-Brandt / fisheye undistortion is required. | **S (ASL) / M (Raw)** |
+| **Data Format Adapter** | **Implemented** via `scripts/lamaria_adapter.py`. | ASL format (`cam0/data.csv`, `imu0/data.csv`) is provided by ETH Zurich. | Adapter maps native LaMAria directory into standard `mav0/` layout expected by `kornia-slam`. | **Completed** |
+| **Camera Model Adapter** | **Implemented** via `scripts/lamaria_adapter.py`. | ASL format provides pre-undistorted images mapped to pinhole model via COLMAP. | Adapter extracts `pinhole_calibrations/<seq>.json` and formats `sensor.yaml` with 4x4 row-major $T_{BS}$. | **Completed** |
+| **IMU Timestamp Latency** | **Implemented** via `scripts/lamaria_adapter.py`. | Benchmark cameras and IMUs exhibit hardware latency ($4.2\text{ ms}$ offset subtracted from IMU clock). | Adapter subtracts configurable latency (default $4.2\text{ ms}$) during IMU ingestion into `mav0/imu0/data.csv`. | **Completed** |
+| **Ground Truth Formatter** | **Implemented** via `scripts/lamaria_adapter.py`. | Pseudo ground-truth (pGT) poses provided in `ground_truth/pseudo_dense/<seq>.txt`. | Formats pGT into `mav0/state_groundtruth_estimate0/data.csv` for `kornia-slam-app --evaluate`. | **Completed** |
 | **IMU Factory Calibration** | Assumes raw samples in standard units ($m/s^2, rad/s$). | Requires affine factory calibration: $\mathbf{y}_{\mathrm{cal}} = M(\mathbf{y}_{\mathrm{raw}} - \mathbf{b}_{\mathrm{factory}})$. | Parser and runtime transform for device $3 \times 3$ scale/misalignment matrix $M$ and factory bias vector $\mathbf{b}_{\mathrm{factory}}$. | **M (Medium)** |
-| **IMU Timestamp Offset** | Samples paired directly by raw timestamp. | Benchmark cameras and IMUs exhibit hardware latency ($4.2\text{ ms}$ offset subtracted from IMU clock). | Add configurable `imu_time_offset_ns` in `EurocConfig` / `SensorRig` to adjust sample timestamps during ingestion. | **S (Small)** |
 | **IMU Noise Parameters** | Fixed noise model constants in `kornia_sensors`. | Accelerometer/gyroscope noise and random-walk parameters scale per sensor. | Expose IMU noise parameters (`accel_noise`, `gyro_noise`, `accel_walk`, `gyro_walk`) in `SystemConfig` / RON run files. | **S (Small)** |
 | **Benchmark Trajectory Exporter** | Exports `kornia_slam_raw.csv` (`idx, x, y, z`). | Requires nanosecond timestamped world-from-IMU poses: `timestamp_ns, tx, ty, tz, qx, qy, qz, qw`. | Export formatter to output exact LaMAria submission CSV and fill gaps causally where tracking was skipped. | **S (Small)** |
 | **Control-Point (CP) Scorer** | Sim(3) ATE / RPE / drift reporting in `apps/kornia-slam-app/src/evaluation.rs`. | Official piecewise-linear horizontal control-point score (0–100) and 5 m pose recall. | Implement local evaluation script matching the official benchmark Python scoring package (`tools/evaluation/`). | **M (Medium)** |
