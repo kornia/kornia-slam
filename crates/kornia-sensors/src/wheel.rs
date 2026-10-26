@@ -6,7 +6,7 @@
 //! roll and pitch.
 
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{SO3F64, Vec3F64};
+use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 use std::f64::consts::TAU;
 
 /// Errors from [`WheelPreintegration::integrate`]. The preintegration is left
@@ -85,8 +85,8 @@ pub trait WheelKinematics {
     /// Base twist from wheel angular velocities `[left, right]` in rad/s.
     fn twist(&self, wheel_rates: [f64; 2]) -> BodyTwist;
 
-    /// `∂(vx, vy, wz) / ∂(left, right)` at `wheel_rates`, row-major.
-    fn twist_jacobian(&self, wheel_rates: [f64; 2]) -> [[f64; 2]; 3];
+    /// `∂(vx, vy, wz)/∂left` and `∂(vx, vy, wz)/∂right` at `wheel_rates`.
+    fn twist_jacobian(&self, wheel_rates: [f64; 2]) -> [Vec3F64; 2];
 
     /// Mean wheel angular velocities in rad/s from a change of `tick_delta`
     /// encoder counts over `dt` seconds.
@@ -122,10 +122,13 @@ impl WheelKinematics for DifferentialDrive {
         }
     }
 
-    fn twist_jacobian(&self, _: [f64; 2]) -> [[f64; 2]; 3] {
+    fn twist_jacobian(&self, _: [f64; 2]) -> [Vec3F64; 2] {
         let half_r = 0.5 * self.wheel_radius;
         let r_b = self.wheel_radius / self.track_width;
-        [[half_r, half_r], [0.0, 0.0], [-r_b, r_b]]
+        [
+            Vec3F64::new(half_r, 0.0, -r_b),
+            Vec3F64::new(half_r, 0.0, r_b),
+        ]
     }
 }
 
@@ -166,24 +169,21 @@ impl WheelNoise {
 pub struct PlanarMotion {
     /// `(dx, dy, dθ)`: base j in base i, metres and radians.
     pub delta: [f64; 3],
-    /// Covariance of `delta`, row-major (m², m·rad, rad²).
-    pub covariance: [[f64; 3]; 3],
+    /// Covariance of `delta` (m², m·rad, rad²).
+    pub covariance: Mat3F64,
 }
 
 impl PlanarMotion {
     /// No motion, no uncertainty.
     pub const IDENTITY: Self = Self {
         delta: [0.0; 3],
-        covariance: [[0.0; 3]; 3],
+        covariance: Mat3F64::ZERO,
     };
 
     /// The delta as a transform taking base-j coordinates to base-i.
     pub fn delta_pose(&self) -> Pose3d {
         let [dx, dy, dtheta] = self.delta;
-        Pose3d::new(
-            SO3F64::exp(Vec3F64::new(0.0, 0.0, dtheta)).matrix(),
-            Vec3F64::new(dx, dy, 0.0),
-        )
+        Pose3d::new(yaw_rotation(dtheta), Vec3F64::new(dx, dy, 0.0))
     }
 
     /// The motion `self` then `next` (base k in base i from i→j and j→k).
@@ -194,45 +194,47 @@ impl PlanarMotion {
     pub fn compose(&self, next: &Self) -> Self {
         let [x1, y1, th1] = self.delta;
         let [x2, y2, th2] = next.delta;
-        let (s, c) = th1.sin_cos();
+        let j_next = yaw_rotation(th1);
+        let t2 = j_next * Vec3F64::new(x2, y2, 0.0);
         let delta = [
-            x1 + c * x2 - s * y2,
-            y1 + s * x2 + c * y2,
+            x1 + t2.x,
+            y1 + t2.y,
             (th1 + th2).sin().atan2((th1 + th2).cos()),
         ];
-        let j_first = [
-            [1.0, 0.0, -s * x2 - c * y2],
-            [0.0, 1.0, c * x2 - s * y2],
-            [0.0, 0.0, 1.0],
-        ];
-        let j_next = [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]];
-        let a = congruence(&j_first, &self.covariance);
-        let b = congruence(&j_next, &next.covariance);
-        let mut covariance = [[0.0; 3]; 3];
-        for (r, row) in covariance.iter_mut().enumerate() {
-            for (col, x) in row.iter_mut().enumerate() {
-                // Symmetrized, bit-exactly given the grouping: consumers
-                // check symmetry before inverting.
-                *x = 0.5 * ((a[r][col] + a[col][r]) + (b[r][col] + b[col][r]));
-            }
-        }
+        let j_first = Mat3F64::from_cols(
+            Vec3F64::new(1.0, 0.0, 0.0),
+            Vec3F64::new(0.0, 1.0, 0.0),
+            Vec3F64::new(-t2.y, t2.x, 1.0),
+        );
+        let a = j_first * self.covariance * j_first.transpose();
+        let b = j_next * next.covariance * j_next.transpose();
+        // Symmetrized, bit-exactly given the grouping: consumers check
+        // symmetry before inverting.
+        let covariance = ((a + a.transpose()) + (b + b.transpose())) * 0.5;
         Self { delta, covariance }
     }
 
     /// The motion of holding the twist increment `u = (vx, vy, wz)·dt` for
     /// the interval (an arc), with `u`'s covariance `q` mapped through the
     /// SE(2) exponential.
-    fn from_twist_increment(u: [f64; 3], q: &[[f64; 3]; 3]) -> Self {
+    fn from_twist_increment(u: [f64; 3], q: Mat3F64) -> Self {
         let (delta, jacobian) = se2_exp(u);
         Self {
             delta,
-            covariance: congruence(&jacobian, q),
+            covariance: jacobian * q * jacobian.transpose(),
         }
     }
 }
 
+fn yaw_rotation(theta: f64) -> Mat3F64 {
+    SO3F64::exp(Vec3F64::new(0.0, 0.0, theta)).matrix()
+}
+
 /// SE(2) exponential of `(a, b, w)` as `(x, y, θ)`, and its Jacobian.
-fn se2_exp([a, b, w]: [f64; 3]) -> ([f64; 3], [[f64; 3]; 3]) {
+///
+/// kornia-algebra's SE(2) is f32-only and its Jacobians are over the tangent
+/// space, not over `(x, y, θ)` as the wheel factor's covariance is.
+fn se2_exp([a, b, w]: [f64; 3]) -> ([f64; 3], Mat3F64) {
     // x = A·a − B·b, y = B·a + A·b with A = sin w / w, B = (1 − cos w) / w;
     // A' and B' are their derivatives in w. Below 1e-3 the closed forms
     // cancel catastrophically, so use the Taylor series instead.
@@ -251,26 +253,12 @@ fn se2_exp([a, b, w]: [f64; 3]) -> ([f64; 3], [[f64; 3]; 3]) {
         (aa, bb, (c - aa) / w, (s - bb) / w)
     };
     let delta = [aa * a - bb * b, bb * a + aa * b, w];
-    let jacobian = [
-        [aa, -bb, da * a - db * b],
-        [bb, aa, db * a + da * b],
-        [0.0, 0.0, 1.0],
-    ];
+    let jacobian = Mat3F64::from_cols(
+        Vec3F64::new(aa, bb, 0.0),
+        Vec3F64::new(-bb, aa, 0.0),
+        Vec3F64::new(da * a - db * b, db * a + da * b, 1.0),
+    );
     (delta, jacobian)
-}
-
-/// `J Σ Jᵀ` for row-major 3×3 matrices.
-fn congruence(j: &[[f64; 3]; 3], sigma: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    let mut out = [[0.0; 3]; 3];
-    for (r, row) in out.iter_mut().enumerate() {
-        for (c, x) in row.iter_mut().enumerate() {
-            *x = (0..3)
-                .flat_map(|k| (0..3).map(move |l| (k, l)))
-                .map(|(k, l)| j[r][k] * sigma[k][l] * j[c][l])
-                .sum();
-        }
-    }
-    out
 }
 
 /// Wheel odometry accumulated between the first and the last integrated
@@ -369,12 +357,7 @@ impl<K: WheelKinematics> WheelPreintegration<K> {
         };
         let step = self.interval_motion(rates, dt);
         let motion = self.motion.compose(&step);
-        if !motion
-            .delta
-            .iter()
-            .chain(motion.covariance.iter().flatten())
-            .all(|v| v.is_finite())
-        {
+        if !(motion.delta.iter().all(|v| v.is_finite()) && motion.covariance.is_finite()) {
             return Err(WheelError::NonFinite);
         }
         self.motion = motion;
@@ -388,16 +371,12 @@ impl<K: WheelKinematics> WheelPreintegration<K> {
     fn interval_motion(&self, rates: [f64; 2], dt: f64) -> PlanarMotion {
         let twist = self.kinematics.twist(rates);
         let u = [twist.vx * dt, twist.vy * dt, twist.wz * dt];
-        let j = self.kinematics.twist_jacobian(rates);
-        let rate_var = self.noise.wheel_rate * self.noise.wheel_rate;
-        let mut q = [[0.0; 3]; 3];
-        for (r, row) in q.iter_mut().enumerate() {
-            for (c, x) in row.iter_mut().enumerate() {
-                *x = rate_var * (j[r][0] * j[c][0] + j[r][1] * j[c][1]) * dt;
-            }
-        }
-        q[1][1] += self.noise.lateral_velocity * self.noise.lateral_velocity * dt;
-        PlanarMotion::from_twist_increment(u, &q)
+        let [d_left, d_right] = self.kinematics.twist_jacobian(rates);
+        let j = Mat3F64::from_cols(d_left, d_right, Vec3F64::ZERO);
+        let lateral =
+            Mat3F64::from_diagonal(Vec3F64::new(0.0, self.noise.lateral_velocity.powi(2), 0.0));
+        let q = (j * j.transpose() * self.noise.wheel_rate.powi(2) + lateral) * dt;
+        PlanarMotion::from_twist_increment(u, q)
     }
 }
 
@@ -436,30 +415,25 @@ mod tests {
         }
     }
 
-    fn assert_matrix_near(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3], rel: f64) {
-        let scale = b.iter().flatten().fold(0.0f64, |m, v| m.max(v.abs()));
-        for (ra, rb) in a.iter().zip(b) {
-            for (x, y) in ra.iter().zip(rb) {
-                assert!((x - y).abs() <= rel * scale, "{a:?} vs {b:?}");
-            }
+    fn assert_matrix_near(a: Mat3F64, b: Mat3F64, rel: f64) {
+        let (a, b) = (a.to_cols_array(), b.to_cols_array());
+        let scale = b.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        for (x, y) in a.iter().zip(b) {
+            assert!((x - y).abs() <= rel * scale, "{a:?} vs {b:?}");
         }
     }
 
-    fn assert_positive_definite(c: &[[f64; 3]; 3]) {
-        for r in 0..3 {
-            for k in 0..3 {
-                assert_eq!(c[r][k], c[k][r], "asymmetric {c:?}");
-            }
-        }
-        let minor2 = c[0][0] * c[1][1] - c[0][1] * c[1][0];
-        let det = c[0][0] * (c[1][1] * c[2][2] - c[1][2] * c[2][1])
-            - c[0][1] * (c[1][0] * c[2][2] - c[1][2] * c[2][0])
-            + c[0][2] * (c[1][0] * c[2][1] - c[1][1] * c[2][0]);
-        assert!(c[0][0] > 0.0 && minor2 > 0.0 && det > 0.0, "{c:?}");
+    fn assert_positive_definite(c: Mat3F64) {
+        assert_eq!(c, c.transpose(), "asymmetric");
+        let minor2 = c.x_axis.x * c.y_axis.y - c.y_axis.x * c.x_axis.y;
+        assert!(
+            c.x_axis.x > 0.0 && minor2 > 0.0 && c.determinant() > 0.0,
+            "{c:?}"
+        );
     }
 
-    fn trace(c: &[[f64; 3]; 3]) -> f64 {
-        c[0][0] + c[1][1] + c[2][2]
+    fn trace(c: Mat3F64) -> f64 {
+        c.x_axis.x + c.y_axis.y + c.z_axis.z
     }
 
     #[test]
@@ -525,7 +499,7 @@ mod tests {
         }
         let composed = first.unwrap().compose(split.motion());
         assert_delta(composed.delta, whole.motion().delta, 1e-12);
-        assert_matrix_near(&composed.covariance, &whole.motion().covariance, 1e-12);
+        assert_matrix_near(composed.covariance, whole.motion().covariance, 1e-12);
     }
 
     #[test]
@@ -537,7 +511,7 @@ mod tests {
             let m = WheelMeasurement::angular_velocity(t, [2.0 + t.sin(), 3.0 - t.cos()]);
             pre.integrate(&m).unwrap();
             if k > 0 {
-                let c = &pre.motion().covariance;
+                let c = pre.motion().covariance;
                 assert_positive_definite(c);
                 assert!(trace(c) > prev_trace);
                 prev_trace = trace(c);
@@ -556,16 +530,12 @@ mod tests {
         assert_eq!(pre.motion().delta, [0.0; 3]);
         let t = 5.0;
         let (r, b, s2) = (0.1, 0.5, noise.wheel_rate * noise.wheel_rate);
-        let want = [
-            [0.5 * r * r * s2 * t, 0.0, 0.0],
-            [
-                0.0,
-                noise.lateral_velocity * noise.lateral_velocity * t,
-                0.0,
-            ],
-            [0.0, 0.0, 2.0 * r * r / (b * b) * s2 * t],
-        ];
-        assert_matrix_near(&pre.motion().covariance, &want, 1e-9);
+        let want = Mat3F64::from_diagonal(Vec3F64::new(
+            0.5 * r * r * s2 * t,
+            noise.lateral_velocity.powi(2) * t,
+            2.0 * r * r / (b * b) * s2 * t,
+        ));
+        assert_matrix_near(pre.motion().covariance, want, 1e-9);
     }
 
     #[test]
@@ -638,17 +608,20 @@ mod tests {
     fn composed_covariance_is_the_linearized_propagation() {
         let first = PlanarMotion {
             delta: [0.3, -0.1, 0.7],
-            covariance: [[2e-4, 1e-5, 0.0], [1e-5, 1e-4, 2e-5], [0.0, 2e-5, 3e-4]],
+            covariance: Mat3F64::from_cols_array(&[
+                2e-4, 1e-5, 0.0, 1e-5, 1e-4, 2e-5, 0.0, 2e-5, 3e-4,
+            ]),
         };
         let next = PlanarMotion {
             delta: [0.2, 0.15, -0.4],
-            covariance: [[1e-4, 0.0, 1e-5], [0.0, 4e-4, 0.0], [1e-5, 0.0, 2e-4]],
+            covariance: Mat3F64::from_cols_array(&[
+                1e-4, 0.0, 1e-5, 0.0, 4e-4, 0.0, 1e-5, 0.0, 2e-4,
+            ]),
         };
         // Central differences of the composed delta wrt each input delta.
         const EPS: f64 = 1e-6;
         let jacobian = |which: usize| {
-            let mut j = [[0.0; 3]; 3];
-            for k in 0..3 {
+            let column = |k: usize| {
                 let shifted = |sign: f64| {
                     let (mut a, mut b) = (first, next);
                     let d = if which == 0 {
@@ -657,23 +630,18 @@ mod tests {
                         &mut b.delta
                     };
                     d[k] += sign * EPS;
-                    a.compose(&b).delta
+                    Vec3F64::from_array(a.compose(&b).delta)
                 };
-                let (plus, minus) = (shifted(1.0), shifted(-1.0));
-                for r in 0..3 {
-                    j[r][k] = (plus[r] - minus[r]) / (2.0 * EPS);
-                }
-            }
-            j
+                (shifted(1.0) - shifted(-1.0)) * (0.5 / EPS)
+            };
+            Mat3F64::from_cols(column(0), column(1), column(2))
         };
-        let a = congruence(&jacobian(0), &first.covariance);
-        let b = congruence(&jacobian(1), &next.covariance);
-        let joined = first.compose(&next);
-        for r in 0..3 {
-            for c in 0..3 {
-                let want = a[r][c] + b[r][c];
-                assert!((joined.covariance[r][c] - want).abs() < 1e-12, "[{r}][{c}]");
-            }
+        let (j_first, j_next) = (jacobian(0), jacobian(1));
+        let want = j_first * first.covariance * j_first.transpose()
+            + j_next * next.covariance * j_next.transpose();
+        let got = first.compose(&next).covariance.to_cols_array();
+        for (g, w) in got.iter().zip(want.to_cols_array()) {
+            assert!((g - w).abs() < 1e-12, "{got:?} vs {want:?}");
         }
     }
 
@@ -689,7 +657,7 @@ mod tests {
                 let (p, m) = (se2_exp(up).0, se2_exp(down).0);
                 for r in 0..3 {
                     let fd = (p[r] - m[r]) / (2.0 * EPS);
-                    assert!((fd - jac[r][k]).abs() < 1e-8, "u={u:?} ({r},{k})");
+                    assert!((fd - jac.col(k)[r]).abs() < 1e-8, "u={u:?} ({r},{k})");
                 }
             }
         }

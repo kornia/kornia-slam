@@ -76,9 +76,10 @@ impl WheelOdomMeasurement {
 
     /// The planar delta and its covariance.
     pub fn planar_motion(&self) -> PlanarMotion {
+        let [r0, r1, r2] = self.covariance.map(Vec3F64::from_array);
         PlanarMotion {
             delta: self.delta,
-            covariance: self.covariance,
+            covariance: Mat3F64::from_cols(r0, r1, r2).transpose(),
         }
     }
 
@@ -124,17 +125,15 @@ impl WheelOdomMeasurement {
         if !(c[0][0] > 0.0 && c[0][0] * c[1][1] - c[0][1] * c[1][0] > 0.0) {
             return None;
         }
-        let cov = Mat3F64::from_cols_array(&[
-            c[0][0], c[1][0], c[2][0], c[0][1], c[1][1], c[2][1], c[0][2], c[1][2], c[2][2],
-        ]);
+        let motion = self.planar_motion();
+        let cov = motion.covariance;
         let det = cov.determinant();
         if !(det.is_finite() && det > 0.0) {
             return None;
         }
         // J⁻¹ = blockdiag(R(dθ), 1) rotates a base-j residual back into the
         // base-i axes the covariance is written in.
-        let (sin, cos) = self.delta[2].sin_cos();
-        let j_inv = Mat3F64::from_cols_array(&[cos, sin, 0.0, -sin, cos, 0.0, 0.0, 0.0, 1.0]);
+        let j_inv = motion.delta_pose().rotation;
         let planar = (j_inv.transpose() * cov.inverse() * j_inv).to_cols_array();
         // delta rows (x, y, θ) sit at tangent indices (0, 1, 5).
         const AXES: [usize; 3] = [0, 1, 5];
@@ -160,7 +159,7 @@ impl WheelOdomMeasurement {
         let planar = self.planar_motion().compose(&next.planar_motion());
         Self {
             delta: planar.delta,
-            covariance: planar.covariance,
+            covariance: planar.covariance.transpose().to_cols_array_2d(),
             z_sigma: self.z_sigma.hypot(next.z_sigma),
             tilt_sigma: self.tilt_sigma.hypot(next.tilt_sigma),
         }
@@ -171,7 +170,10 @@ impl WheelOdomMeasurement {
 /// with the default out-of-plane sigmas.
 impl From<PlanarMotion> for WheelOdomMeasurement {
     fn from(motion: PlanarMotion) -> Self {
-        Self::new(motion.delta, motion.covariance)
+        Self::new(
+            motion.delta,
+            motion.covariance.transpose().to_cols_array_2d(),
+        )
     }
 }
 
