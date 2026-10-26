@@ -5,9 +5,10 @@
 
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, Vec3F64};
+use kornia_factors::imu::ImuFactor;
 use kornia_factors::stationary::{StationaryFactor, StationaryGyro};
 use kornia_factors::wheel_odometry::{WheelOdomFactor, WheelOdomMeasurement};
-use kornia_sensors::imu::ImuCalib;
+use kornia_sensors::imu::{ImuBias, ImuCalib, PreintegratedImu};
 use kornia_sensors::wheel::PlanarMotion;
 
 fn calib() -> ImuCalib {
@@ -17,6 +18,16 @@ fn calib() -> ImuCalib {
         gyro_bias_noise: 1.9e-5,
         accel_bias_noise: 3.0e-3,
     }
+}
+
+#[test]
+fn imu_factor_with_every_field_set() {
+    let pim = PreintegratedImu::new(ImuBias::default(), calib());
+    let mut f = ImuFactor::new(4, 5, pim.clone());
+    assert_eq!((f.from_idx, f.to_idx), (4, 5));
+    f.to_idx = 6;
+    f.preintegrated = pim;
+    assert_eq!(f.to_idx, 6);
 }
 
 #[test]

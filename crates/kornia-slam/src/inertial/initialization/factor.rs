@@ -17,6 +17,7 @@
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::optim::{Factor, FactorError, FactorResult, LinearizationResult};
 use kornia_algebra::{DMatF64, DVecF64, Mat3F64, SO3F64, Vec3F64};
+use kornia_factors::imu::body_frame;
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, PreintegratedImu};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -34,14 +35,9 @@ pub struct KfConst {
 }
 
 impl KfConst {
-    /// Mirrors `vi_ba_schur::body_frame` (`crates/kornia-slam/src/mapping/vi_ba_schur.rs`):
-    /// `R_bw = R_bc · R_cw`, `t_wb = -R_bw^T · (R_bc·t_cw + t_bc)`.
+    /// The body frame of a keyframe ([`kornia_factors::imu::body_frame`]).
     pub fn new(pose_world_to_cam: &Pose3d, imu_t_bc: &Pose3d) -> Self {
-        let r_bc = imu_t_bc.rotation;
-        let r_cw = pose_world_to_cam.rotation;
-        let r_bw = r_bc * r_cw;
-        let t_bw = r_bc * pose_world_to_cam.translation + imu_t_bc.translation;
-        let t_wb = -(r_bw.transpose() * t_bw);
+        let (r_bw, t_wb) = body_frame(pose_world_to_cam, Some(imu_t_bc));
         Self { r_bw, t_wb }
     }
 }
@@ -135,8 +131,8 @@ impl Factor for InertialInitFactor {
         let r_wb_j = self.kf_j.r_bw.transpose();
 
         // Bias-corrected preintegrated deltas (first-order correction around
-        // the preintegration's own linearization bias — same helper the rest
-        // of imu_init.rs / vi_ba_schur.rs already use).
+        // the preintegration's own linearization bias — same helper
+        // `kornia_factors::imu` uses).
         let bias = ImuBias {
             gyro: bg,
             accel: ba,

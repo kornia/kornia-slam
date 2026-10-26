@@ -34,9 +34,10 @@
 
 use crate::robust::huber_weight_and_cost;
 use crate::se3::{Mat6, quadratic_form, relative_pose_residual};
+use crate::state::NavState;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
-use kornia_sensors::imu::{ImuBias, ImuCalib};
+use kornia_sensors::imu::ImuCalib;
 
 /// The mean raw gyro rate measured while the rig was still.
 ///
@@ -239,21 +240,13 @@ pub struct StationaryResidual {
     pub cost: f64,
 }
 
-/// One keyframe's state as the factor reads it.
-#[derive(Debug, Clone, Copy)]
-pub struct StationaryState<'a> {
-    pub pose_cw: &'a Pose3d,
-    pub velocity: Vec3F64,
-    pub bias: ImuBias,
-}
-
 /// The residual blocks of `factor` between the states `i` and `j`, with
 /// `info` its [`StationaryFactor::information`].
 pub fn residual(
     factor: &StationaryFactor,
     info: &StationaryInfo,
-    i: StationaryState<'_>,
-    j: StationaryState<'_>,
+    i: NavState<'_>,
+    j: NavState<'_>,
 ) -> StationaryResidual {
     let (pose, pose_jacobian_i) = relative_pose_residual(
         i.pose_cw,

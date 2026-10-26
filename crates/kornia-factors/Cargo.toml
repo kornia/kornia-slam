@@ -1,6 +1,6 @@
 [package]
 name = "kornia-factors"
-description = "State-estimation factors for kornia: wheel-odometry and stationary residuals, Jacobians, information matrices and robust costs, independent of any map or solver."
+description = "State-estimation factors for kornia: IMU, wheel-odometry and stationary residuals, Jacobians, information matrices and robust costs, independent of any map or solver."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

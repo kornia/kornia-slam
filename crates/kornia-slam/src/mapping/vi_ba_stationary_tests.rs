@@ -1,4 +1,5 @@
 use super::*;
+use kornia_algebra::{Mat3F64, SO3F64};
 use kornia_factors::stationary::{StationaryFactor, StationaryGyro};
 use kornia_sensors::imu::{ImuCalib, ImuMeasurement};
 
@@ -404,11 +405,7 @@ fn stationary_and_imu_edges_solve_together_around_fixed_keyframes() {
         StationaryFactor::new(0, 1, 30.0, calib()),
         StationaryFactor::new(1, 2, 30.0, calib()),
     ];
-    let imu = [ImuFactor {
-        from_idx: 3,
-        to_idx: 4,
-        preintegrated: pim,
-    }];
+    let imu = [ImuFactor::new(3, 4, pim)];
     let p = ViBaParams {
         gravity,
         ..params()
