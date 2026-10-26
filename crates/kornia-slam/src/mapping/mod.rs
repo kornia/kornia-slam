@@ -10,7 +10,7 @@
 //! keeps admission, core publication and the tracker/IMU lifecycle.
 //!
 //! [`vi_ba_schur`] is the visual-inertial solver behind [`bundle_adjustment`];
-//! its wheel-odometry and parked-robot factors come from `kornia_factors`.
+//! its IMU, wheel-odometry and parked-robot factors come from `kornia_factors`.
 
 pub mod bundle_adjustment;
 pub mod culling;

@@ -10,12 +10,15 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
-**Wheel-odometry and stationary factors move to a new `kornia-factors` crate.**
+**IMU, wheel-odometry and stationary factors move to a new `kornia-factors` crate.**
 Their residuals, Jacobians, information matrices and the Huber cost the VI-BA
 factors share no longer live inside `kornia-slam`'s mapping module, so another
 estimator or solver can use them without the SLAM pipeline.
+`kornia_slam::mapping::vi_ba_schur::ImuFactor` is now
+`kornia_factors::imu::ImuFactor`, built with `ImuFactor::new(from, to, preintegrated)`;
 `kornia_slam::mapping::wheel_odom` is now `kornia_factors::wheel_odometry`,
-`kornia_slam::mapping::stationary` is `kornia_factors::stationary`, and the
+`kornia_slam::mapping::stationary` is `kornia_factors::stationary`, the
+keyframe state the inertial factors read is `kornia_factors::state::NavState`, and the
 f64 SE(3) pieces they share are in `kornia_factors::se3`. `WheelOdomMeasurement`
 now holds the `kornia_sensors::wheel::PlanarMotion` that `WheelPreintegration`
 produces: `WheelOdomMeasurement::new(motion)` replaces `new(delta, covariance)`,
