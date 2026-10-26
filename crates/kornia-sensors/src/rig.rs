@@ -1,14 +1,15 @@
-//! Fixed calibration of a camera rig with optional stereo and IMU, independent
-//! of any estimated state.
+//! Fixed calibration of a camera rig with optional stereo, IMU and wheel
+//! odometry, independent of any estimated state.
 
 use crate::imu::ImuCalib;
+use crate::wheel::{DifferentialDrive, WheelNoise};
 use kornia_3d::camera::{FisheyeCamera, PinholeCamera};
 use kornia_3d::pose::Pose3d;
 
-/// Camera calibration plus optional stereo and IMU calibration.
+/// Camera calibration plus optional stereo, IMU and wheel calibration.
 ///
 /// `camera` is the geometry camera: keypoint coordinates, the stereo baseline
-/// and the IMU extrinsics all refer to it. For rectified or pinhole images it
+/// and the IMU and wheel extrinsics all refer to it. For rectified or pinhole images it
 /// also describes the supplied images. With [`SensorRig::fisheye`] the images
 /// are raw fisheye instead, and `camera` is a virtual pinhole that keypoints
 /// are mapped into.
@@ -24,6 +25,8 @@ pub struct SensorRig {
     /// Kannala-Brandt model of raw fisheye images, in image pixels. `None`
     /// when the images are already in `camera`'s coordinates.
     pub fisheye: Option<FisheyeCamera>,
+    /// `None` for a rig without wheel odometry.
+    pub wheels: Option<WheelCalibration>,
 }
 
 impl SensorRig {
@@ -34,6 +37,7 @@ impl SensorRig {
             stereo_baseline_m: None,
             imu: None,
             fisheye: None,
+            wheels: None,
         }
     }
 
@@ -47,6 +51,13 @@ impl SensorRig {
     /// noise parameters (see [`ImuCalibration::new`]).
     pub fn with_imu(mut self, camera_to_body: Pose3d) -> Self {
         self.imu = Some(ImuCalibration::new(camera_to_body));
+        self
+    }
+
+    /// Adds wheel odometry with the given base-to-camera extrinsic,
+    /// kinematics and the default noise (see [`WheelCalibration::new`]).
+    pub fn with_wheels(mut self, base_to_camera: Pose3d, kinematics: DifferentialDrive) -> Self {
+        self.wheels = Some(WheelCalibration::new(base_to_camera, kinematics));
         self
     }
 
@@ -94,6 +105,28 @@ impl ImuCalibration {
         Self {
             noise: default_imu_noise(),
             camera_to_body,
+        }
+    }
+}
+
+/// Wheel-odometry model and the wheeled base's rigid relationship to the camera.
+#[derive(Debug, Clone, Copy)]
+pub struct WheelCalibration {
+    pub kinematics: DifferentialDrive,
+    pub noise: WheelNoise,
+    /// Base-to-camera transform `T_CB`: `X_camera = T_CB * X_base`. The base
+    /// frame is the REP-103 frame of [`crate::wheel`].
+    pub base_to_camera: Pose3d,
+}
+
+impl WheelCalibration {
+    /// Uses [`WheelNoise::default`]; supply `noise` explicitly once it is
+    /// measured for the robot.
+    pub fn new(base_to_camera: Pose3d, kinematics: DifferentialDrive) -> Self {
+        Self {
+            kinematics,
+            noise: WheelNoise::default(),
+            base_to_camera,
         }
     }
 }

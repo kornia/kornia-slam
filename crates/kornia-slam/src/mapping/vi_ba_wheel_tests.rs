@@ -144,6 +144,54 @@ fn single_wheel_edge_recovers_the_delta_and_respects_the_fixed_end() {
 }
 
 #[test]
+fn preintegrated_encoder_ticks_drive_the_wheel_edge() {
+    use kornia_sensors::WheelCalibration;
+    use kornia_sensors::wheel::{DifferentialDrive, WheelMeasurement, WheelPreintegration};
+    use std::f64::consts::PI;
+
+    let drive = DifferentialDrive {
+        wheel_radius: 0.1,
+        track_width: 0.5,
+        ticks_per_revolution: 1024.0,
+    };
+    let wheels = WheelCalibration::new(t_cb(0.2), drive);
+    let mut pre = WheelPreintegration::new(wheels.kinematics, wheels.noise).unwrap();
+    // 2π and 4π rad/s for 2 s at 128 Hz: v = 0.3π m/s, ω = 0.4π rad/s.
+    for k in 0..=256i64 {
+        pre.integrate(&WheelMeasurement::ticks(k as f64 / 128.0, [k * 8, k * 16]))
+            .unwrap();
+    }
+    let (v, w, t) = (0.3 * PI, 0.4 * PI, 2.0);
+    let wb_i = base(1.0, -0.5, 0.3);
+    let wb_j = wb_i.compose(&base(
+        v / w * (w * t).sin(),
+        v / w * (1.0 - (w * t).cos()),
+        w * t,
+    ));
+    let edge = WheelOdomFactor::new(
+        0,
+        1,
+        WheelOdomMeasurement::from(*pre.motion()),
+        wheels.base_to_camera,
+        wheels.base_to_camera,
+        None,
+    );
+    assert!(edge.is_valid());
+
+    let truth_j = camera_pose(&wb_j, &wheels.base_to_camera);
+    let wrong_j = camera_pose(
+        &wb_j.compose(&base(0.2, -0.1, 0.15)),
+        &wheels.base_to_camera,
+    );
+    let kfs = [
+        keyframe(camera_pose(&wb_i, &wheels.base_to_camera), true),
+        keyframe(wrong_j, false),
+    ];
+    let out = solve(&kfs, &[], &[], &[edge]);
+    assert_pose_near(&out.keyframes[1].pose, &truth_j, 1e-4);
+}
+
+#[test]
 fn wheel_edge_errors_are_reported() {
     let kfs = [
         keyframe(Pose3d::IDENTITY, true),
