@@ -1,0 +1,29 @@
+// LaMAria benchmark sequence configuration (monocular + IMU).
+// Evaluates single-camera, single-IMU visual-inertial odometry as formulated
+// in AnchorFlow-VIO (arXiv:2610.26210) on the LaMAria benchmark (arXiv:2509.26639).
+// Mapping execution is set to Synchronous to ensure deterministic evaluation replays.
+(
+    source: Euroc((
+        data: "../crates/kornia-slam/tests/fixtures/lamaria_sample_adapted",
+        start_frame: 0,
+        max_frames: 0,
+    )),
+    system: (
+        version: 1,
+        sensors: ( cameras: Mono, imu: true ),
+        pipeline: OrbSlam((
+            frontend: Orb((
+                n_keypoints: 1000,
+                stereo_close_depth: Disabled,
+            )),
+            keyframes: (
+                min_frames_between: 3,
+                max_frames_between: 8,
+                ref_ratio: 0.6,
+                min_parallax_px: None,
+            ),
+            mapping: ( execution: Synchronous ),
+            loop_closing: Disabled,
+        )),
+    ),
+)
