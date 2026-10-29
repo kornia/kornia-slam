@@ -463,3 +463,35 @@ fn a_still_boundary_move_that_would_break_the_chain_is_refused_without_a_write()
         assert_eq!(map.state_fingerprint_for_test(), before);
     }
 }
+
+#[test]
+fn evicting_the_chain_start_drops_its_imu_edge() {
+    let mut map = inertial_map();
+    let removal = map.evict_keyframe(10).unwrap();
+    assert_eq!(removal.dropped_imu_edge, Some((10, 20)));
+    assert_eq!(removal.merged_imu_edge, None);
+    let edges: Vec<_> = map
+        .imu_factors()
+        .iter()
+        .map(|f| (f.prev_kf_idx, f.curr_kf_idx))
+        .collect();
+    assert_eq!(edges, vec![(20, 30), (30, 40)]);
+    assert!(!map.map_points()[2].is_observed_by(10));
+    assert_eq!(map.map_points()[2].keyframe_idx, 20, "reference adopted");
+    assert_map_consistent(&map);
+}
+
+#[test]
+fn eviction_inside_the_imu_chain_is_refused_without_a_write() {
+    let mut map = inertial_map();
+    let before = map.state_fingerprint_for_test();
+    assert_eq!(
+        map.evict_keyframe(20).unwrap_err(),
+        KeyframeRemovalError::NotImuChainStart {
+            keyframe_idx: 20,
+            incoming: 1,
+            outgoing: 1,
+        }
+    );
+    assert_eq!(map.state_fingerprint_for_test(), before);
+}

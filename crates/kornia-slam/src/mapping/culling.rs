@@ -246,6 +246,64 @@ pub fn cull_redundant_keyframes(
     report
 }
 
+/// What [`evict_oldest_keyframes`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KeyframeEvictReport {
+    /// Evicted keyframes (`Frame::idx`), oldest first. Anything outside the
+    /// map that holds keyframe ids must drop these, as for
+    /// [`KeyframeCullReport::removed`].
+    pub evicted: Vec<usize>,
+    pub imu_edges_dropped: usize,
+    pub wheel_edges_dropped: usize,
+    pub stationary_edges_dropped: usize,
+    /// Landmarks retired because an evicted keyframe was their last observer.
+    pub landmarks_retired: usize,
+}
+
+/// Evicts the oldest keyframes until the map holds `keep` of them: a
+/// sliding window, for a bounded map whose keyframes are not redundant
+/// enough for [`cull_redundant_keyframes`] to make room. Each evicted
+/// keyframe takes its IMU edge ([`Map::evict_keyframe`]) and every wheel and
+/// stationary factor touching it, so the new oldest keyframe is the start of
+/// every chain. Stops early at the first keyframe the map refuses.
+pub fn evict_oldest_keyframes(
+    map: &mut Map,
+    keep: usize,
+    mut wheel_factors: Option<&mut Vec<WheelOdomFactor>>,
+    mut stationary_factors: Option<&mut Vec<StationaryFactor>>,
+) -> KeyframeEvictReport {
+    let mut report = KeyframeEvictReport::default();
+    while map.keyframes().len() > keep.max(1) {
+        let kf_idx = map.keyframes()[0].frame.idx;
+        let Ok(removal) = map.evict_keyframe(kf_idx) else {
+            break;
+        };
+        report.evicted.push(kf_idx);
+        report.landmarks_retired += removal.landmarks_retired;
+        report.imu_edges_dropped += usize::from(removal.dropped_imu_edge.is_some());
+        if let Some(factors) = wheel_factors.as_deref_mut() {
+            report.wheel_edges_dropped +=
+                drop_touching(factors, kf_idx, |f| (f.from_idx, f.to_idx));
+        }
+        if let Some(factors) = stationary_factors.as_deref_mut() {
+            report.stationary_edges_dropped +=
+                drop_touching(factors, kf_idx, |f| (f.from_idx, f.to_idx));
+        }
+    }
+    report
+}
+
+/// Drops the factors with `kf_idx` at either end; returns how many.
+fn drop_touching<F>(factors: &mut Vec<F>, kf_idx: usize, ends: fn(&F) -> (usize, usize)) -> usize {
+    let before = factors.len();
+    factors.retain(|f| {
+        let (from, to) = ends(f);
+        from != kf_idx && to != kf_idx
+    });
+    before - factors.len()
+}
+
 /// What [`cull_one`] did with a candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
