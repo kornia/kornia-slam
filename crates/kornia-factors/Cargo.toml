@@ -1,0 +1,17 @@
+[package]
+name = "kornia-factors"
+description = "State-estimation factors for kornia: IMU, wheel-odometry and stationary residuals, Jacobians, information matrices and robust costs, independent of any map or solver."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+keywords = ["factor-graph", "odometry", "estimation", "robotics", "kornia"]
+
+[dependencies]
+kornia-3d.workspace = true
+kornia-algebra.workspace = true
+kornia-sensors.workspace = true

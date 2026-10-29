@@ -1,4 +1,4 @@
-//! The Huber objective the BA factors share, consistent with the IRLS weight.
+//! The Huber objective the factors share, consistent with the IRLS weight.
 //!
 //! [`HuberKernel`] gives the weight `w(s) = min(1, √(k/s))` of a residual with
 //! squared norm `s = rᵀΩr`. The objective whose derivative that weight is,
@@ -19,7 +19,7 @@ use kornia_3d::ransac::{HuberKernel, RobustKernel};
 /// The Huber weight and cost `½ρ(chi2)` of one residual block with squared
 /// (Mahalanobis) norm `chi2`; `None` (or a non-positive `k`, which
 /// [`HuberKernel`] treats as no kernel) keeps it quadratic.
-pub(crate) fn huber_weight_and_cost(chi2: f64, k: Option<f64>) -> (f64, f64) {
+pub fn huber_weight_and_cost(chi2: f64, k: Option<f64>) -> (f64, f64) {
     match k {
         Some(k) if k > 0.0 && chi2 > k => {
             let w = HuberKernel.weight(chi2, k);

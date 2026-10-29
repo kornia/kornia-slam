@@ -6040,6 +6040,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kornia-factors"
+version = "0.2.0"
+dependencies = [
+ "kornia-3d",
+ "kornia-algebra",
+ "kornia-sensors",
+]
+
+[[package]]
 name = "kornia-image"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6105,6 +6114,7 @@ dependencies = [
  "kornia-3d",
  "kornia-algebra",
  "kornia-bow",
+ "kornia-factors",
  "kornia-image",
  "kornia-imgproc",
  "kornia-sensors",

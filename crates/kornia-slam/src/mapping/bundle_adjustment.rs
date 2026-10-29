@@ -7,15 +7,16 @@ use crate::mapping::map::{
     BaSnapshot, BaUpdate, BaUpdateError, BaWindow, Keyframe, LocalBaStats, Map, ORB_N_LEVELS,
     ORB_SCALE_FACTOR,
 };
-use crate::mapping::stationary::StationaryFactor;
 use crate::mapping::vi_ba_schur::ViBaKeyframe;
-use crate::mapping::wheel_odom::WheelOdomFactor;
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::ransac::RobustKernelKind;
 use kornia_algebra::Vec3F64;
+use kornia_factors::imu;
+use kornia_factors::stationary::StationaryFactor;
+use kornia_factors::wheel_odometry::WheelOdomFactor;
 use std::collections::{HashMap, HashSet};
 
 /// Relative standard deviation of a stereo depth measurement, as a fraction of
@@ -329,9 +330,7 @@ pub fn run_local_inertial_ba(
 ) -> BaUpdate {
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
-    use crate::mapping::vi_ba_schur::{
-        ImuFactor as ViBaImuFactor, ViBaParams, visual_inertial_bundle_adjust,
-    };
+    use crate::mapping::vi_ba_schur::{ViBaParams, visual_inertial_bundle_adjust};
 
     const MIN_OBSERVATIONS: usize = 8;
 
@@ -414,7 +413,7 @@ pub fn run_local_inertial_ba(
     }
 
     // Build IMU edges; include only edges where at least one endpoint is active.
-    let imu_edges: Vec<ViBaImuFactor> = snapshot
+    let imu_edges: Vec<imu::ImuFactor> = snapshot
         .imu_factors()
         .iter()
         .zip(&update.imu_preintegrations)
@@ -424,11 +423,7 @@ pub fn run_local_inertial_ba(
             if from < active_start && to < active_start {
                 return None;
             }
-            Some(ViBaImuFactor {
-                from_idx: from,
-                to_idx: to,
-                preintegrated: preintegrated.clone(),
-            })
+            Some(imu::ImuFactor::new(from, to, preintegrated.clone()))
         })
         .collect();
 
@@ -450,11 +445,9 @@ pub fn run_local_inertial_ba(
                 );
                 return None;
             }
-            Some(WheelOdomFactor {
-                from_idx: from,
-                to_idx: to,
-                ..*f
-            })
+            let mut f = *f;
+            (f.from_idx, f.to_idx) = (from, to);
+            Some(f)
         })
         .collect();
 
@@ -474,11 +467,9 @@ pub fn run_local_inertial_ba(
                 );
                 return None;
             }
-            Some(StationaryFactor {
-                from_idx: from,
-                to_idx: to,
-                ..*f
-            })
+            let mut f = *f;
+            (f.from_idx, f.to_idx) = (from, to);
+            Some(f)
         })
         .collect();
 

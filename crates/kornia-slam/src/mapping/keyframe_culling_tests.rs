@@ -5,13 +5,14 @@ use crate::mapping::bundle_adjustment::{
 use crate::mapping::map::tests::{assert_map_consistent, test_frame_with_pose};
 use crate::mapping::map::{ImuFactor, MapInsertion};
 use crate::mapping::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
-use crate::mapping::stationary::StationaryFactor;
-use crate::mapping::wheel_odom::WheelOdomMeasurement;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Mat3F64;
 use kornia_algebra::Vec3F64;
+use kornia_factors::stationary::StationaryFactor;
+use kornia_factors::wheel_odometry::{WheelOdomFactor, WheelOdomMeasurement};
 use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
+use kornia_sensors::wheel::PlanarMotion;
 
 /// Frame ids of the keyframe fixture: non-contiguous so ids and slots differ.
 const IDS: [usize; 8] = [3, 7, 11, 15, 19, 23, 27, 31];
@@ -387,17 +388,18 @@ fn a_keyframe_without_imu_edges_is_culled_even_with_merging_off() {
 }
 
 fn wheel(slot: usize) -> WheelOdomFactor {
-    WheelOdomFactor {
-        from_idx: IDS[slot],
-        to_idx: IDS[slot + 1],
-        measurement: WheelOdomMeasurement::new(
-            [0.1, 0.0, 0.02],
-            [[1e-4, 0.0, 0.0], [0.0, 1e-4, 0.0], [0.0, 0.0, 1e-4]],
-        ),
-        t_cb_from: Pose3d::IDENTITY,
-        t_cb_to: Pose3d::IDENTITY,
-        huber_chi2: None,
-    }
+    let measurement = WheelOdomMeasurement::new(PlanarMotion {
+        delta: [0.1, 0.0, 0.02],
+        covariance: Mat3F64::from_diagonal(Vec3F64::new(1e-4, 1e-4, 1e-4)),
+    });
+    WheelOdomFactor::new(
+        IDS[slot],
+        IDS[slot + 1],
+        measurement,
+        Pose3d::IDENTITY,
+        Pose3d::IDENTITY,
+        None,
+    )
 }
 
 #[test]
@@ -495,9 +497,9 @@ fn an_invalid_wheel_factor_is_skipped_not_fatal_to_inertial_ba() {
     // A parked driver's all-zero covariance, a NaN delta from a zero-length
     // tick interval, and a NaN extrinsic from an unread joint.
     let mut zero_cov = wheel(2);
-    zero_cov.measurement.covariance = [[0.0; 3]; 3];
+    zero_cov.measurement.motion.covariance = Mat3F64::ZERO;
     let mut nan_delta = wheel(3);
-    nan_delta.measurement.delta[0] = f64::NAN;
+    nan_delta.measurement.motion.delta[0] = f64::NAN;
     let mut nan_extrinsic = wheel(4);
     nan_extrinsic.t_cb_to.translation.z = f64::NAN;
     let mut with_bad = valid.clone();
@@ -843,10 +845,9 @@ fn inertial_ba_holds_parked_keyframes_with_stationary_factors() {
         assert!(kf.velocity_world.length() < 1e-3, "slot {slot}");
     }
     let mut bad = factors.clone();
-    bad.push(StationaryFactor {
-        span_s: f64::NAN,
-        ..stationary(ids[4], ids[5], 1.0)
-    });
+    let mut nan_span = stationary(ids[4], ids[5], 1.0);
+    nan_span.span_s = f64::NAN;
+    bad.push(nan_span);
     let reference: Vec<Pose3d> = update
         .keyframes
         .iter()

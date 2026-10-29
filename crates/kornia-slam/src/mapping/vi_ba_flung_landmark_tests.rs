@@ -5,6 +5,7 @@
 //! (a ~1e8-sigma residual) was lowered by turning a keyframe by ~90°.
 
 use super::*;
+use kornia_algebra::{Mat3F64, SO3F64};
 
 fn camera() -> PinholeCamera {
     PinholeCamera {

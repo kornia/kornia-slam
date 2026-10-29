@@ -1,5 +1,7 @@
 use super::*;
-use crate::mapping::wheel_odom::WheelOdomMeasurement;
+use kornia_algebra::{Mat3F64, SO3F64};
+use kornia_factors::wheel_odometry::WheelOdomMeasurement;
+use kornia_sensors::wheel::PlanarMotion;
 
 fn camera() -> PinholeCamera {
     PinholeCamera {
@@ -55,17 +57,11 @@ fn planar_delta(t_wb_i: &Pose3d, t_wb_j: &Pose3d) -> [f64; 3] {
 
 fn wheel_edge(i: usize, j: usize, delta: [f64; 3], sigma: f64, t_cb: Pose3d) -> WheelOdomFactor {
     let var = sigma * sigma;
-    WheelOdomFactor {
-        from_idx: i,
-        to_idx: j,
-        measurement: WheelOdomMeasurement::new(
-            delta,
-            [[var, 0.0, 0.0], [0.0, var, 0.0], [0.0, 0.0, var]],
-        ),
-        t_cb_from: t_cb,
-        t_cb_to: t_cb,
-        huber_chi2: None,
-    }
+    let measurement = WheelOdomMeasurement::new(PlanarMotion {
+        delta,
+        covariance: Mat3F64::from_diagonal(Vec3F64::new(var, var, var)),
+    });
+    WheelOdomFactor::new(i, j, measurement, t_cb, t_cb, None)
 }
 
 fn solve(
@@ -137,7 +133,7 @@ fn single_wheel_edge_recovers_the_delta_and_respects_the_fixed_end() {
             &base_pose(&out.keyframes[0].pose, &cb_i),
             &base_pose(&out.keyframes[1].pose, &cb_j),
         );
-        for (got, want) in solved_delta.iter().zip(edge.measurement.delta) {
+        for (got, want) in solved_delta.iter().zip(edge.measurement.motion.delta) {
             assert!((got - want).abs() < 1e-4, "{solved_delta:?}");
         }
     }
@@ -210,19 +206,24 @@ fn wheel_edge_errors_are_reported() {
         )
     };
     let edge = wheel_edge(0, 1, [0.1, 0.0, 0.0], 0.01, t_cb(0.0));
+    let linking = |from_idx, to_idx| {
+        let mut e = edge;
+        (e.from_idx, e.to_idx) = (from_idx, to_idx);
+        e
+    };
     assert!(matches!(
-        run(WheelOdomFactor { to_idx: 2, ..edge }),
+        run(linking(0, 2)),
         Err(ViBaError::WheelFactorOutOfRange(0, 2))
     ));
     let mut singular = edge;
-    singular.measurement.covariance[1][1] = 0.0;
+    singular.measurement.motion.covariance.y_axis.y = 0.0;
     assert!(matches!(
         run(singular),
         Err(ViBaError::InvalidWheelCovariance(0))
     ));
     // A NaN delta or extrinsic is named, not left to stall LM on a NaN cost.
     let mut nan_delta = edge;
-    nan_delta.measurement.delta[2] = f64::NAN;
+    nan_delta.measurement.motion.delta[2] = f64::NAN;
     assert!(matches!(
         run(nan_delta),
         Err(ViBaError::NonFiniteWheelFactor(0))
@@ -235,11 +236,7 @@ fn wheel_edge_errors_are_reported() {
     ));
     // A self-loop's residual is a constant: refused by name.
     assert!(matches!(
-        run(WheelOdomFactor {
-            to_idx: 1,
-            from_idx: 1,
-            ..edge
-        }),
+        run(linking(1, 1)),
         Err(ViBaError::WheelFactorSelfLoop(0))
     ));
     for k in [0.0, -1.0, f64::NAN, f64::INFINITY] {
