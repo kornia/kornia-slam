@@ -167,6 +167,28 @@ impl LoopCloser {
                 .close(map, camera, kf_idx, &candidates, context)
         }
     }
+
+    /// Removes state keyed by map keyframes that canonical map culling has
+    /// retired. Keeping any of these IDs would let later loop verification or
+    /// pose-graph optimization refer to an absent keyframe.
+    pub(crate) fn forget_keyframes(&mut self, removed: &[usize]) {
+        if removed.is_empty() {
+            return;
+        }
+        let removed: HashSet<usize> = removed.iter().copied().collect();
+        for &kf_idx in &removed {
+            self.kf_database.erase(kf_idx);
+        }
+        self.acceptance
+            .verified_loop_pairs
+            .retain(|(query, candidate)| !removed.contains(query) && !removed.contains(candidate));
+        self.acceptance.verified_loops.retain(|edge| {
+            !removed.contains(&edge.query_kf_idx) && !removed.contains(&edge.candidate_kf_idx)
+        });
+        // The tracker stores a representative edge privately. Resetting is
+        // conservative and avoids retaining it if either endpoint was culled.
+        self.acceptance.episode_tracker.reset();
+    }
 }
 
 #[cfg(test)]

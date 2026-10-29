@@ -8,7 +8,8 @@ use super::config::{
 };
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopClosingConfig;
-use crate::tracking::KeyframePolicy;
+use crate::mapping::KeyframeCullingStrategy;
+use crate::mapping::keyframes::{KeyframeInsertionStrategy, KeyframePolicy};
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
 
 /// A system configuration that cannot be built or does not fit its source.
@@ -78,6 +79,7 @@ impl OrbSlamPipeline {
             FrontendConfig::Orb(orb) => orb.validate()?,
         }
         validate_keyframes(&self.keyframes, sensors.imu)?;
+        validate_keyframe_culling(&self.mapping.keyframe_culling)?;
         validate_loop_closing(&self.loop_closing, sensors)?;
         validate_tuning(&self.tuning, self.loop_closing.is_enabled())
     }
@@ -119,8 +121,11 @@ fn validate_keyframes(policy: &KeyframePolicy, imu: bool) -> Result<(), ConfigEr
     if !(0.0..=1.0).contains(&policy.ref_ratio) {
         return Err(ConfigError::InvalidRefRatio(policy.ref_ratio));
     }
-    if let Some(px) = policy.min_parallax_px {
-        check("keyframes.min_parallax_px", px, POSITIVE)?;
+    if let KeyframeInsertionStrategy::Parallax {
+        min_parallax_px: px,
+    } = policy.insertion
+    {
+        check("keyframes.insertion.min_parallax_px", px, POSITIVE)?;
     }
     if let Some(secs) = policy.max_interval_sec {
         check("keyframes.max_interval_sec", secs, POSITIVE)?;
@@ -129,6 +134,30 @@ fn validate_keyframes(policy: &KeyframePolicy, imu: bool) -> Result<(), ConfigEr
     // bound would buffer them, and grow the next IMU edge, without limit.
     if imu && max == usize::MAX && policy.max_interval_sec.is_none() {
         return Err(ConfigError::UnboundedInertialKeyframes);
+    }
+    Ok(())
+}
+
+fn validate_keyframe_culling(strategy: &KeyframeCullingStrategy) -> Result<(), ConfigError> {
+    let KeyframeCullingStrategy::Redundancy(config) = strategy else {
+        return Ok(());
+    };
+    check(
+        "mapping.keyframe_culling.redundant_ratio",
+        config.redundant_ratio,
+        UNIT_INTERVAL,
+    )?;
+    check(
+        "mapping.keyframe_culling.max_merged_imu_span_sec",
+        config.max_merged_imu_span_sec,
+        POSITIVE,
+    )?;
+    if let Some(depth) = config.stereo_close_depth_m {
+        check(
+            "mapping.keyframe_culling.stereo_close_depth_m",
+            depth,
+            POSITIVE,
+        )?;
     }
     Ok(())
 }

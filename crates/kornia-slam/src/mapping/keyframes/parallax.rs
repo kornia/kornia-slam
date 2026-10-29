@@ -1,5 +1,5 @@
 //! Rotation-compensated parallax between a keyframe and the current frame,
-//! the motion measure behind [`super::KeyframePolicy::min_parallax_px`].
+//! the motion measure behind [`super::KeyframeInsertionStrategy::Parallax`].
 
 use crate::frame::Frame;
 use crate::mapping::map::Map;

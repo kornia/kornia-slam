@@ -21,18 +21,21 @@
                 // at each keyframe: Baselines(n) | Metres(m) | Disabled.
                 stereo_close_depth: Baselines(35.0),
             )),
-            // Frames since the last keyframe; ref_ratio in [0, 1]. min_parallax_px
-            // (pixels, None = ignored) also inserts on rotation-compensated
-            // parallax since the last keyframe.
+            // Frames since the last keyframe; ref_ratio in [0, 1]. Insertion
+            // is FrameBased or Parallax(min_parallax_px: pixels).
             keyframes: (
                 min_frames_between: 3,
                 max_frames_between: 8,
                 ref_ratio: 0.6,
-                min_parallax_px: None,
+                insertion: FrameBased,
             ),
             // Synchronous runs local mapping before each frame returns, which
             // makes runs replay identically; Asynchronous uses a background worker.
-            mapping: ( execution: Asynchronous ),
+            mapping: (
+                execution: Asynchronous,
+                // Disabled preserves the default; Redundancy(()) opts in.
+                keyframe_culling: Disabled,
+            ),
             // Disabled | Enabled(vocabulary: "…"): detection with pose-graph
             // correction; needs stereo or IMU input.
             loop_closing: Disabled,

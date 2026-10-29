@@ -27,9 +27,8 @@ pub use validation::ConfigError;
 use crate::frontend::{FrontendObservation, OrbFrontend};
 use state::{SystemMode, SystemState};
 
-use crate::tracking::{
-    KeyframeEvidence, KeyframePolicy, TrackingLossRecoveryPolicy, median_parallax_px,
-};
+use crate::mapping::keyframes::{KeyframeEvidence, KeyframePolicy, median_parallax_px};
+use crate::tracking::TrackingLossRecoveryPolicy;
 
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 use crate::tracking::motion::{InertialPrediction, predict_pose};
@@ -110,8 +109,12 @@ impl SlamSystem {
     ) -> Self {
         let camera = rig.camera.clone();
         let map = Arc::new(Mutex::new(Map::new()));
-        let local_mapping =
-            LocalMapping::new(settings.local_mapping, Arc::clone(&map), camera.clone());
+        let local_mapping = LocalMapping::new_with_keyframe_culling(
+            settings.local_mapping,
+            Arc::clone(&map),
+            camera.clone(),
+            settings.keyframe_culling,
+        );
         let map_publication_gate = local_mapping.publication_gate();
         Self {
             rig,
@@ -335,28 +338,64 @@ impl SlamSystem {
     }
 
     fn apply_local_mapping_results(&mut self) {
-        let Some(reference_idx) = self.state.current_keyframe_idx else {
-            // Still drain results so a completed worker cannot build a result backlog.
-            let _ = self.local_mapping.drain_results();
-            return;
+        for completion in self.local_mapping.drain_completions() {
+            let result = completion.result;
+            if let Some(reference_idx) = self.state.current_keyframe_idx
+                && let Some(correction) = result
+                    .keyframe_corrections
+                    .iter()
+                    .find(|correction| correction.kf_idx == reference_idx)
+            {
+                self.state.pose_world_to_cam = apply_reference_pose_correction(
+                    self.state.pose_world_to_cam,
+                    correction.pose_before,
+                    correction.pose_after,
+                );
+                self.state.velocity_world = correction.velocity_world;
+                self.inertial.bias = correction.imu_bias;
+            }
+            self.forget_keyframes(&completion.removed_keyframes);
+        }
+    }
+
+    /// Drops loop-closing state for keyframes removed by canonical map
+    /// culling before later recognition or pose-graph work can reference them.
+    fn forget_keyframes(&mut self, removed_keyframes: &[usize]) {
+        let (state_reference_missing, last_keyframe_missing, replacement) = {
+            let map = self.map.lock().unwrap();
+            let state_reference_missing = self
+                .state
+                .current_keyframe_idx
+                .is_some_and(|idx| map.get_keyframe(idx).is_none());
+            let last_keyframe_missing = self
+                .state
+                .last_keyframe_idx
+                .is_some_and(|idx| map.get_keyframe(idx).is_none());
+            let replacement = (state_reference_missing || last_keyframe_missing)
+                .then(|| map.keyframes().last())
+                .flatten()
+                .map(|kf| kf.frame.idx);
+            (state_reference_missing, last_keyframe_missing, replacement)
         };
-
-        for result in self.local_mapping.drain_results() {
-            let Some(correction) = result
-                .keyframe_corrections
-                .iter()
-                .find(|correction| correction.kf_idx == reference_idx)
-            else {
-                continue;
-            };
-
-            self.state.pose_world_to_cam = apply_reference_pose_correction(
-                self.state.pose_world_to_cam,
-                correction.pose_before,
-                correction.pose_after,
-            );
-            self.state.velocity_world = correction.velocity_world;
-            self.inertial.bias = correction.imu_bias;
+        if state_reference_missing || last_keyframe_missing {
+            if let Some(idx) = replacement {
+                if state_reference_missing {
+                    self.state.current_keyframe_idx = Some(idx);
+                }
+                if last_keyframe_missing {
+                    self.state.last_keyframe_idx = Some(idx);
+                }
+            } else {
+                if state_reference_missing {
+                    self.state.current_keyframe_idx = None;
+                }
+                if last_keyframe_missing {
+                    self.state.last_keyframe_idx = None;
+                }
+            }
+        }
+        if let Some(loop_closer) = self.loop_closer.as_mut() {
+            loop_closer.forget_keyframes(removed_keyframes);
         }
     }
 
@@ -984,7 +1023,7 @@ impl SlamSystem {
         // Measured only when the policy reads it: it walks every match.
         let median_parallax_px = self
             .keyframe_policy
-            .min_parallax_px
+            .parallax_threshold_px()
             .zip(self.state.last_keyframe_idx)
             .and_then(|(_, last)| {
                 median_parallax_px(

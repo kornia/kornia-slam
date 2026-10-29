@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use kornia_3d::camera::PinholeCamera;
 use kornia_algebra::Vec3F64;
 use kornia_image::ImageSize;
+use kornia_sensors::imu::ImuBias;
 
 use super::*;
 use crate::frontend::OrbFrontend;
@@ -306,7 +307,7 @@ fn frames_are_numbered_in_call_order_and_failures_keep_the_number() {
 
 mod keyframe_evidence {
     use super::*;
-    use crate::tracking::parallax::tests::{
+    use crate::mapping::keyframes::parallax::tests::{
         all_matches, camera, frame_seeing_points, map_with_keyframe_at,
     };
     use kornia_algebra::{Mat3F64, SO3F64};
@@ -317,7 +318,13 @@ mod keyframe_evidence {
     fn system_tracked_at(min_parallax_px: Option<f64>, tracked: Pose3d) -> SlamSystem {
         let mut config = mono();
         let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
-        orb.keyframes.min_parallax_px = min_parallax_px;
+        orb.keyframes.insertion = min_parallax_px
+            .map(
+                |min_parallax_px| crate::mapping::KeyframeInsertionStrategy::Parallax {
+                    min_parallax_px,
+                },
+            )
+            .unwrap_or(crate::mapping::KeyframeInsertionStrategy::FrameBased);
         let mut system = SlamSystem::build(config, SensorRig::new(camera())).unwrap();
         let mut map = map_with_keyframe_at(Pose3d::IDENTITY);
         let ref_pose = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.5, 0.0, 0.0));
@@ -374,7 +381,9 @@ mod keyframe_evidence {
         let mut config = mono();
         let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
         orb.keyframes.max_frames_between = usize::MAX;
-        orb.keyframes.min_parallax_px = Some(10.0);
+        orb.keyframes.insertion = crate::mapping::KeyframeInsertionStrategy::Parallax {
+            min_parallax_px: 10.0,
+        };
         orb.keyframes.max_interval_sec = Some(0.5);
         let mut system = SlamSystem::build(config, SensorRig::new(camera())).unwrap();
         system.state.last_keyframe_idx = Some(100);
@@ -391,5 +400,54 @@ mod keyframe_evidence {
         assert!(system.keyframe_due(&parked, 10.5));
         system.keyframe_policy.max_interval_sec = None;
         assert!(!system.keyframe_due(&parked, 1e6), "no bound unless set");
+    }
+
+    #[test]
+    fn a_culled_tracking_reference_is_replaced_before_the_next_insertion() {
+        let mut system = SlamSystem::build(mono(), SensorRig::new(camera())).unwrap();
+        let mut map = map_with_keyframe_at(Pose3d::IDENTITY);
+        map.insert_keyframe(Keyframe::from_frame(frame_seeing_points(
+            1,
+            Pose3d::IDENTITY,
+            &[],
+        )))
+        .unwrap();
+        map.insert_keyframe(Keyframe::from_frame(frame_seeing_points(
+            2,
+            Pose3d::IDENTITY,
+            &[],
+        )))
+        .unwrap();
+        map.remove_keyframe(1).unwrap();
+        *system.map.lock().unwrap() = map;
+        // Relocalization can make an older, subsequently redundant keyframe
+        // the tracking reference; it is not necessarily the most recent
+        // keyframe, which remains a valid insertion reference.
+        system.state.current_keyframe_idx = Some(1);
+        system.state.last_keyframe_idx = Some(2);
+        let tracked_pose = Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            Vec3F64::new(0.3, -0.2, 0.1),
+        );
+        let tracked_velocity = Vec3F64::new(1.0, -2.0, 3.0);
+        let tracked_bias = ImuBias {
+            gyro: Vec3F64::new(0.01, 0.02, 0.03),
+            accel: Vec3F64::new(-0.1, 0.2, -0.3),
+        };
+        system.state.pose_world_to_cam = tracked_pose;
+        system.state.velocity_world = tracked_velocity;
+        system.inertial.bias = tracked_bias;
+
+        system.forget_keyframes(&[1]);
+
+        assert_eq!(system.state.current_keyframe_idx, Some(2));
+        assert_eq!(system.state.last_keyframe_idx, Some(2));
+        assert_eq!(system.state.pose_world_to_cam, tracked_pose);
+        assert_eq!(system.state.velocity_world, tracked_velocity);
+        assert_eq!(system.inertial.bias.gyro, tracked_bias.gyro);
+        assert_eq!(system.inertial.bias.accel, tracked_bias.accel);
+        let next = frame_seeing_points(3, Pose3d::IDENTITY, &[]);
+        assert!(system.insert_keyframe(&next, 0.1, &[]));
+        assert!(system.map.lock().unwrap().get_keyframe(3).is_some());
     }
 }
