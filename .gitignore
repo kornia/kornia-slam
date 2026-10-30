@@ -2,7 +2,9 @@ target/
 runs/
 mono_vo_run-*/
 .worktrees/
-docs/
+/docs/*
+!/docs/evaluation/
+eval_output/
 
 # Pixi
 .pixi/
@@ -10,3 +12,8 @@ docs/
 # Datasets and the ORB vocabulary the example run files point at
 /data/
 /weights/
+
+# Python
+__pycache__/
+*.py[cod]
+
