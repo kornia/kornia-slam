@@ -120,6 +120,19 @@ pub fn optimize_pose_graph(
         gradient_tolerance: config.gradient_tolerance,
         initial_lambda: config.initial_lambda,
     };
+    if let Some(dump_dir) = std::env::var_os("KORNIA_PGO_DUMP")
+        && let Err(error) = dump_pose_graph(
+            std::path::Path::new(&dump_dir),
+            &original_poses,
+            &edges,
+            inertial.map(|context| context.gravity_world),
+        )
+    {
+        eprintln!(
+            "kornia-slam: failed to dump pose graph to {}: {error}",
+            std::path::Path::new(&dump_dir).display()
+        );
+    }
     let result = if let Some(context) = inertial {
         let manifold = GravityManifold::new(context.gravity_world)
             .map_err(|error| PgoError::Solver(error.to_string()))?;
@@ -160,6 +173,87 @@ pub fn optimize_pose_graph(
         iterations: result.iterations,
         usable,
     })
+}
+
+/// Serializes a pose graph (poses, edges, optional gravity) to a plain-text dump file.
+///
+/// Rotation matrices are serialized in column-major order (`to_cols_array()`), matching `from_cols_array`.
+/// Creates files with `create_new(true)` to atomically allocate sequential indices (`pgo_dump_{n}.txt`)
+/// without overwriting dumps from previous runs.
+pub(crate) fn dump_pose_graph(
+    dir: &std::path::Path,
+    poses: &[Pose3d],
+    edges: &[PgoEdge],
+    gravity: Option<Vec3F64>,
+) -> std::io::Result<std::path::PathBuf> {
+    static DUMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    std::fs::create_dir_all(dir)?;
+    let mut out = String::new();
+    out.push_str("# kornia-pgo-dump v1\n");
+    if let Some(gravity) = gravity {
+        out.push_str(&format!(
+            "GRAVITY {} {} {}\n",
+            gravity.x, gravity.y, gravity.z
+        ));
+    }
+    for (node, pose) in poses.iter().enumerate() {
+        let c = pose.rotation.to_cols_array();
+        out.push_str(&format!(
+            "POSE {node} {} {} {} {} {} {} {} {} {} {} {} {}\n",
+            c[0],
+            c[1],
+            c[2],
+            c[3],
+            c[4],
+            c[5],
+            c[6],
+            c[7],
+            c[8],
+            pose.translation.x,
+            pose.translation.y,
+            pose.translation.z,
+        ));
+    }
+    for edge in edges {
+        let c = edge.t_ab_meas.r.matrix().to_cols_array();
+        out.push_str(&format!(
+            "EDGE {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}\n",
+            edge.pose_a,
+            edge.pose_b,
+            edge.weight,
+            c[0],
+            c[1],
+            c[2],
+            c[3],
+            c[4],
+            c[5],
+            c[6],
+            c[7],
+            c[8],
+            edge.t_ab_meas.t.x,
+            edge.t_ab_meas.t.y,
+            edge.t_ab_meas.t.z,
+        ));
+    }
+    let mut index = DUMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let path = dir.join(format!("pgo_dump_{index}.txt"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(out.as_bytes())?;
+                return Ok(path);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                index = DUMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 pub(super) fn max_gravity_alignment_error(
