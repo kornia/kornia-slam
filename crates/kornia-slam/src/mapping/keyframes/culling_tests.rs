@@ -2,6 +2,7 @@ use super::*;
 use crate::mapping::bundle_adjustment::{
     local_window, local_window_with_neighbors, run_local_ba, run_local_inertial_ba,
 };
+use crate::mapping::culling::evict_oldest_keyframes;
 use crate::mapping::map::tests::{assert_map_consistent, test_frame_with_pose};
 use crate::mapping::map::{ImuFactor, MapInsertion};
 use crate::mapping::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
@@ -859,5 +860,22 @@ fn inertial_ba_holds_parked_keyframes_with_stationary_factors() {
         .collect();
     assert_eq!(skipped, reference);
     map.apply_ba_update(update).unwrap();
+    assert_map_consistent(&map);
+}
+
+#[test]
+fn eviction_slides_the_window_and_every_chain_starts_at_the_new_oldest() {
+    let mut map = inertial_fixture();
+    let mut factors: Vec<WheelOdomFactor> = (0..IDS.len() - 1).map(wheel).collect();
+    let keep = IDS.len() - 2;
+    let report = evict_oldest_keyframes(&mut map, keep, Some(&mut factors), None);
+    assert_eq!(report.evicted, IDS[..2].to_vec());
+    assert_eq!(
+        (report.imu_edges_dropped, report.wheel_edges_dropped),
+        (2, 2)
+    );
+    assert_eq!(ids(&map), IDS[2..].to_vec());
+    assert_eq!(imu_chain(&map)[0].0, IDS[2]);
+    assert_eq!(factors[0].from_idx, IDS[2]);
     assert_map_consistent(&map);
 }

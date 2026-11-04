@@ -1,6 +1,5 @@
-pub mod frame;
 pub mod imu;
 pub mod rig;
+pub mod wheel;
 
-pub use frame::SensorFrame;
-pub use rig::{ImuCalibration, SensorRig};
+pub use rig::{ImuCalibration, SensorRig, WheelCalibration};

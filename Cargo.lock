@@ -6092,6 +6092,9 @@ dependencies = [
  "kornia-3d",
  "kornia-algebra",
  "kornia-image",
+ "ron 0.12.2",
+ "serde",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
