@@ -120,6 +120,11 @@ impl LoopEpisodeTracker {
             }
         }
     }
+
+    /// Invalidates a pending consistency episode after keyframe removal.
+    pub(crate) fn reset(&mut self) {
+        self.current = None;
+    }
 }
 
 fn edge_quality_better(candidate: &VerifiedLoopEdge, current: &VerifiedLoopEdge) -> bool {

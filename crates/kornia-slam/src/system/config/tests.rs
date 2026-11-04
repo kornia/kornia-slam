@@ -5,7 +5,9 @@ use kornia_3d::pose::Pose3d;
 use kornia_sensors::SensorRig;
 
 use super::*;
-use crate::mapping::LocalMappingMode;
+use crate::mapping::{
+    KeyframeCullingConfig, KeyframeCullingStrategy, KeyframeInsertionStrategy, LocalMappingMode,
+};
 use crate::system::ConfigError;
 #[cfg(feature = "serde")]
 use crate::system::LoadError;
@@ -59,7 +61,9 @@ fn display_describes_the_pipeline() {
     let mut parallax = SystemConfig::default();
     let keyframes = &mut orb_mut(&mut parallax).keyframes;
     keyframes.max_frames_between = usize::MAX;
-    keyframes.min_parallax_px = Some(10.0);
+    keyframes.insertion = KeyframeInsertionStrategy::Parallax {
+        min_parallax_px: 10.0,
+    };
     for (config, expected) in [
         (
             SystemConfig::default(),
@@ -156,9 +160,11 @@ fn frontend_and_keyframe_settings_are_range_checked() {
         );
     }
 
-    let parallax = |min_parallax_px| {
+    let parallax = |min_parallax_px: Option<f64>| {
         let mut config = SystemConfig::default();
-        orb_mut(&mut config).keyframes.min_parallax_px = min_parallax_px;
+        orb_mut(&mut config).keyframes.insertion = min_parallax_px
+            .map(|min_parallax_px| KeyframeInsertionStrategy::Parallax { min_parallax_px })
+            .unwrap_or(KeyframeInsertionStrategy::FrameBased);
         invalid_setting(&config)
     };
     assert_eq!(parallax(None), None);
@@ -166,7 +172,7 @@ fn frontend_and_keyframe_settings_are_range_checked() {
     for px in [0.0, -1.0, f64::NAN, f64::INFINITY] {
         assert_eq!(
             parallax(Some(px)).as_deref(),
-            Some("keyframes.min_parallax_px"),
+            Some("keyframes.insertion.min_parallax_px"),
             "parallax {px}"
         );
     }
@@ -197,7 +203,9 @@ fn an_inertial_system_needs_a_keyframe_bound() {
         };
         let keyframes = &mut orb_mut(&mut config).keyframes;
         keyframes.max_frames_between = max_frames_between;
-        keyframes.min_parallax_px = Some(10.0);
+        keyframes.insertion = KeyframeInsertionStrategy::Parallax {
+            min_parallax_px: 10.0,
+        };
         keyframes.max_interval_sec = max_interval_sec;
         config.validate()
     };
@@ -267,6 +275,17 @@ fn settings_are_range_checked() {
     );
     orb_mut(&mut config).loop_closing = LoopClosingMode::Disabled;
     assert_eq!(config.validate(), Ok(()));
+
+    let mut config = SystemConfig::default();
+    let culling = KeyframeCullingConfig {
+        redundant_ratio: f64::NAN,
+        ..KeyframeCullingConfig::default()
+    };
+    orb_mut(&mut config).mapping.keyframe_culling = KeyframeCullingStrategy::Redundancy(culling);
+    assert_eq!(
+        invalid_setting(&config).as_deref(),
+        Some("mapping.keyframe_culling.redundant_ratio")
+    );
 }
 
 #[test]
@@ -353,10 +372,12 @@ mod runtime_settings {
             ..OrbFrontendConfig::default()
         });
         orb.keyframes = KeyframePolicy {
+            insertion: KeyframeInsertionStrategy::Parallax {
+                min_parallax_px: 12.0,
+            },
             min_frames_between: 2,
             max_frames_between: 5,
             ref_ratio: 0.8,
-            min_parallax_px: Some(12.0),
             max_interval_sec: Some(0.5),
         };
         orb.mapping.execution = LocalMappingMode::Synchronous;
@@ -462,8 +483,113 @@ mod ron_files {
         )
         .unwrap();
         assert_eq!(orb(&config).keyframes.max_frames_between, usize::MAX);
-        assert_eq!(orb(&config).keyframes.min_parallax_px, Some(10.0));
+        assert_eq!(
+            orb(&config).keyframes.insertion,
+            KeyframeInsertionStrategy::Parallax {
+                min_parallax_px: 10.0
+            }
+        );
         assert_eq!(orb(&config).keyframes.max_interval_sec, Some(0.5));
+    }
+
+    #[test]
+    fn keyframe_insertion_accepts_legacy_or_canonical_ron_but_not_both() {
+        let legacy_none =
+            parse("(version: 1, pipeline: OrbSlam((keyframes: (min_parallax_px: None))))").unwrap();
+        assert_eq!(
+            orb(&legacy_none).keyframes.insertion,
+            KeyframeInsertionStrategy::FrameBased
+        );
+
+        let canonical = parse(
+            "(version: 1, pipeline: OrbSlam((keyframes: (insertion: Parallax(min_parallax_px: 12.0)))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&canonical).keyframes.insertion,
+            KeyframeInsertionStrategy::Parallax {
+                min_parallax_px: 12.0
+            }
+        );
+        let serialized = ron(&canonical);
+        assert!(serialized.contains("insertion: Parallax"));
+        assert!(!serialized.contains("min_parallax_px: Some"));
+
+        assert!(matches!(
+            parse_error(
+                "(version: 1, pipeline: OrbSlam((keyframes: (insertion: FrameBased, min_parallax_px: None))))",
+            ),
+            ron::Error::Message(message)
+                if message == "keyframes.insertion and legacy keyframes.min_parallax_px are ambiguous"
+        ));
+    }
+
+    #[test]
+    fn mapping_culling_selection_is_independent_of_insertion() {
+        let cases = [
+            ("FrameBased", "Disabled", false, false),
+            ("FrameBased", "Redundancy((min_keyframes: 2))", false, true),
+            ("Parallax(min_parallax_px: 12.0)", "Disabled", true, false),
+            (
+                "Parallax(min_parallax_px: 12.0)",
+                "Redundancy((min_keyframes: 2))",
+                true,
+                true,
+            ),
+        ];
+        for (insertion, culling, parallax, redundancy) in cases {
+            let expected_culling = if redundancy {
+                KeyframeCullingStrategy::Redundancy(KeyframeCullingConfig {
+                    min_keyframes: 2,
+                    ..KeyframeCullingConfig::default()
+                })
+            } else {
+                KeyframeCullingStrategy::Disabled
+            };
+            let config = parse(&format!(
+                "(version: 1, pipeline: OrbSlam((keyframes: (insertion: {insertion}), mapping: (keyframe_culling: {culling}))))"
+            ))
+            .unwrap();
+            assert_eq!(
+                matches!(
+                    orb(&config).keyframes.insertion,
+                    KeyframeInsertionStrategy::Parallax {
+                        min_parallax_px: 12.0
+                    }
+                ),
+                parallax,
+                "{insertion}"
+            );
+            assert_eq!(
+                orb(&config).mapping.keyframe_culling,
+                expected_culling,
+                "{culling}"
+            );
+            let reloaded = parse(&ron(&config)).unwrap();
+            assert_eq!(
+                matches!(
+                    orb(&reloaded).keyframes.insertion,
+                    KeyframeInsertionStrategy::Parallax {
+                        min_parallax_px: 12.0
+                    }
+                ),
+                parallax,
+                "round trip {insertion}"
+            );
+            assert_eq!(
+                orb(&reloaded).mapping.keyframe_culling,
+                expected_culling,
+                "round trip {culling}"
+            );
+            if redundancy {
+                let KeyframeCullingStrategy::Redundancy(config) =
+                    orb(&reloaded).mapping.keyframe_culling
+                else {
+                    unreachable!("{culling} must deserialize as Redundancy");
+                };
+                assert_eq!(config.min_keyframes, 2, "round trip {culling}");
+            }
+        }
     }
 
     /// Tuning is not part of the file format, so a file cannot set it.
@@ -517,8 +643,16 @@ mod ron_files {
                 "gap",
             ),
             (
+                "(version: 1, pipeline: OrbSlam((keyframes: (insertion: Parallax(threshold: 3.0)))))",
+                "threshold",
+            ),
+            (
                 "(version: 1, pipeline: OrbSlam((mapping: (window: 3))))",
                 "window",
+            ),
+            (
+                "(version: 1, pipeline: OrbSlam((mapping: (keyframe_culling: Redundancy((ratio: 0.9))))))",
+                "ratio",
             ),
             (
                 "(version: 1, pipeline: OrbSlam((loop_closing: Enabled(vocabulary: \"v.txt\", pgo: true))))",

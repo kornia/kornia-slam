@@ -9,9 +9,10 @@ use super::validation::ConfigError;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopCloser;
 use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabulary};
-use crate::mapping::LocalMappingMode;
+use crate::mapping::keyframes::KeyframePolicy;
+use crate::mapping::{KeyframeCullingStrategy, LocalMappingMode};
+use crate::tracking::TrackingLossRecoveryPolicy;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
-use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
 /// A [`SlamSystem`](crate::SlamSystem) that cannot be built from its
 /// configuration and rig.
@@ -29,6 +30,7 @@ pub(crate) struct SystemSettings {
     pub two_view_init: TwoViewInitConfig,
     pub map_projection: MapProjectionConfig,
     pub keyframe_policy: KeyframePolicy,
+    pub keyframe_culling: KeyframeCullingStrategy,
     pub tracking_loss_recovery: TrackingLossRecoveryPolicy,
     pub local_mapping: LocalMappingMode,
     /// Near/far depth threshold `mThDepth` (metres). When `Some`, each new
@@ -63,6 +65,7 @@ impl SystemConfig {
             two_view_init: tuning.initialization.clone(),
             map_projection: tuning.map_projection.clone(),
             keyframe_policy: orb.keyframes,
+            keyframe_culling: orb.mapping.keyframe_culling,
             tracking_loss_recovery: tuning.loss_recovery,
             local_mapping: orb.mapping.execution,
             stereo_close_depth_m: rig
