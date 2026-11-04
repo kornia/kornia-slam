@@ -358,11 +358,14 @@ impl SlamSystem {
         }
     }
 
-    /// Drops loop-closing state for keyframes removed by canonical map
-    /// culling before later recognition or pose-graph work can reference them.
+    /// Repairs tracking references to removed keyframes and drops their
+    /// loop-closing state before later recognition or pose-graph work.
     fn forget_keyframes(&mut self, removed_keyframes: &[usize]) {
         let (state_reference_missing, last_keyframe_missing, replacement) = {
-            let map = self.map.lock().unwrap();
+            let map = self
+                .map
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let state_reference_missing = self
                 .state
                 .current_keyframe_idx

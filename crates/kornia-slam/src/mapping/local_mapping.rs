@@ -215,6 +215,17 @@ impl LocalMapping {
             LocalMappingBackend::Asynchronous { handle, .. } => handle.drain_completions(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn push_completion_for_test(&self, completion: LocalMappingCompletion) {
+        let LocalMappingBackend::Synchronous { results, .. } = &self.backend else {
+            panic!("test completion injection requires synchronous local mapping");
+        };
+        results
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(completion);
+    }
 }
 
 #[derive(Default)]
