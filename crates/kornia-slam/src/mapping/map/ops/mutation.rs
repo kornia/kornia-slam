@@ -9,6 +9,13 @@ use crate::mapping::map::{
 use kornia_algebra::Vec3F64;
 use std::collections::{HashMap, HashSet};
 
+/// What [`Map::compact_landmarks`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LandmarkCompaction {
+    pub slots_before: usize,
+    pub slots_after: usize,
+}
+
 /// Result of replacing a duplicate landmark with a surviving landmark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MapPointMergeResult {
@@ -24,6 +31,7 @@ impl Map {
         self.keyframes.clear();
         self.map_points.clear();
         self.imu_factors.clear();
+        self.next_stable_id = 0;
     }
 
     /// Update `n_visible` and `n_found` counters for map points.
@@ -202,6 +210,12 @@ pub enum MapMutationError {
     InvalidNewLandmark(usize),
     #[error("landmark position is not finite")]
     NonFinitePosition,
+    #[error("feature {feature_idx} of keyframe {keyframe_idx} holds dead landmark {landmark}")]
+    DanglingLandmark {
+        keyframe_idx: usize,
+        feature_idx: usize,
+        landmark: usize,
+    },
     #[error("imu factor connects keyframe {0} to itself")]
     SelfImuFactor(usize),
     #[error("imu factor {prev} -> {curr} already exists")]
@@ -238,16 +252,73 @@ impl Map {
         Ok(())
     }
 
+    /// Removes every retired landmark's slot, and renumbers the rest in order.
+    ///
+    /// Every landmark id held outside the map is invalid afterwards, so call it
+    /// only between frames. The world epoch advances, so an in-flight BA
+    /// snapshot, which holds ids, is refused. [`MapPoint::stable_id`] survives.
+    /// A keyframe holding a dead landmark refuses the whole call before the
+    /// first write. O(slots + associations), and it allocates one id table.
+    pub fn compact_landmarks(&mut self) -> Result<LandmarkCompaction, MapMutationError> {
+        let slots_before = self.map_points.len();
+        for kf in &self.keyframes {
+            for (feature_idx, landmark) in kf.map_point_by_desc_idx.iter().enumerate() {
+                let Some(landmark) = *landmark else { continue };
+                if self.map_points.get(landmark).is_none_or(|mp| mp.culled) {
+                    return Err(MapMutationError::DanglingLandmark {
+                        keyframe_idx: kf.frame.idx,
+                        feature_idx,
+                        landmark,
+                    });
+                }
+            }
+        }
+        let mut next = 0;
+        let new_ids: Vec<usize> = self
+            .map_points
+            .iter()
+            .map(|mp| {
+                let id = next;
+                next += usize::from(!mp.culled);
+                id
+            })
+            .collect();
+        if next == slots_before {
+            return Ok(LandmarkCompaction {
+                slots_before,
+                slots_after: slots_before,
+            });
+        }
+        self.map_points.retain(|mp| !mp.culled);
+        for kf in &mut self.keyframes {
+            for landmark in kf.map_point_by_desc_idx.iter_mut().flatten() {
+                *landmark = new_ids[*landmark];
+            }
+        }
+        self.world_epoch = self.world_epoch.wrapping_add(1);
+        Ok(LandmarkCompaction {
+            slots_before,
+            slots_after: next,
+        })
+    }
+
+    /// Stores a new landmark under the next [`MapPoint::stable_id`].
+    fn push_landmark(&mut self, mut landmark: MapPoint) -> usize {
+        landmark.stable_id = self.next_stable_id;
+        self.next_stable_id += 1;
+        self.map_points.push(landmark);
+        self.map_points.len() - 1
+    }
+
     /// Appends a landmark and establishes its reference observation. Retired
-    /// slots are never reused, so existing ids keep their meaning.
+    /// slots are reused only through [`Map::compact_landmarks`].
     pub fn insert_landmark(&mut self, seed: LandmarkSeed) -> Result<usize, MapMutationError> {
         if !seed.position.length().is_finite() {
             return Err(MapMutationError::NonFinitePosition);
         }
         let (descriptor, octave) = self.feature_data(seed.reference)?;
         self.require_free_feature(seed.reference)?;
-        let idx = self.map_points.len();
-        self.map_points.push(MapPoint::new(
+        let idx = self.push_landmark(MapPoint::new(
             seed.position,
             descriptor,
             octave,
@@ -508,15 +579,13 @@ impl Map {
         let mut landmark_ids = Vec::with_capacity(landmarks.len());
         for seed in &landmarks {
             let (descriptor, octave) = self.feature_data(seed.reference).expect("validated above");
-            let idx = self.map_points.len();
-            self.map_points.push(MapPoint::new(
+            landmark_ids.push(self.push_landmark(MapPoint::new(
                 seed.position,
                 descriptor,
                 octave,
                 seed.color,
                 seed.reference.keyframe_idx,
-            ));
-            landmark_ids.push(idx);
+            )));
         }
 
         // `accepted` is the deduplicated set validation approved, in request
