@@ -116,16 +116,17 @@ impl Map {
 
     /// Refreshes derived geometry once per affected landmark, in ascending id
     /// order so a correction's finalization is deterministic regardless of how
-    /// its dependency sets were assembled.
+    /// its dependency sets were assembled. Returns how many were refreshed.
     pub(in crate::mapping::map) fn finalize_landmark_geometry(
         &mut self,
         landmark_ids: impl IntoIterator<Item = usize>,
-    ) {
+    ) -> usize {
         let mut ids: Vec<usize> = landmark_ids.into_iter().collect();
         ids.sort_unstable();
         ids.dedup();
-        for idx in ids {
+        for &idx in &ids {
             self.update_map_point_geometry(idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
         }
+        ids.len()
     }
 }

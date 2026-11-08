@@ -7,6 +7,7 @@
 //! reaching into it.
 
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
@@ -101,6 +102,25 @@ pub(crate) struct LoopClosingOutcome {
     pub pgo_applied: bool,
     /// The accumulated map correction, set only when the map was corrected.
     pub correction: Option<Correction>,
+    pub timing: LoopTiming,
+}
+
+/// Where one loop-closure attempt spent its time, for the runtime's `[loop-time]` log.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct LoopTiming {
+    /// BoW and database query.
+    pub detect: Duration,
+    /// Verification, gates and episode logic: everything not counted below.
+    pub verify: Duration,
+    /// Graph sync, loop edges and the solve.
+    pub solve: Duration,
+    /// Map writeback, `geometry` included.
+    pub writeback: Duration,
+    pub geometry: Duration,
+    pub fuse: Duration,
+    pub graph_edges: usize,
+    pub iterations: usize,
+    pub landmarks_refreshed: usize,
 }
 
 /// Place recognition and loop closing for every keyframe.
@@ -164,6 +184,7 @@ impl LoopCloser {
         context: LoopClosingContext,
     ) -> LoopClosingOutcome {
         const MIN_COVIS_WEIGHT: usize = 15;
+        let started = Instant::now();
         let Some(kf) = map.get_keyframe(kf_idx) else {
             return LoopClosingOutcome::default();
         };
@@ -195,11 +216,14 @@ impl LoopCloser {
                 ..Default::default()
             };
         }
+        let detect = started.elapsed();
+        let mut outcome = self
+            .acceptance
+            .close(map, camera, kf_idx, &candidates, context);
+        outcome.timing.detect = detect;
         LoopClosingOutcome {
             debug_message,
-            ..self
-                .acceptance
-                .close(map, camera, kf_idx, &candidates, context)
+            ..outcome
         }
     }
 
@@ -293,6 +317,7 @@ impl LoopAcceptance {
         let inertial_pgo = context.imu_initialized.then_some(InertialPgoContext {
             gravity_world: context.gravity_world,
         });
+        let started = Instant::now();
         let mut outcome = LoopClosingOutcome::default();
         let mut accepted = None;
         for candidate in candidates {
@@ -361,6 +386,7 @@ impl LoopAcceptance {
                             .chain(std::iter::once(&representative))
                             .cloned()
                             .collect();
+                        let solve_started = Instant::now();
                         let solved = solve_in_graph(
                             &mut self.graph,
                             map,
@@ -369,6 +395,7 @@ impl LoopAcceptance {
                             self.config.information,
                             inertial_pgo,
                         );
+                        outcome.timing.solve = solve_started.elapsed();
                         let solved = solved.map(|(result, new_world)| {
                             if new_world {
                                 self.loops_in_graph.clear();
@@ -378,6 +405,7 @@ impl LoopAcceptance {
                         });
                         match solved {
                             Ok(result) => {
+                                outcome.timing.iterations = result.iterations;
                                 if result.usable {
                                     let tracking_correction = context
                                         .current_keyframe_idx
@@ -401,18 +429,26 @@ impl LoopAcceptance {
                                             )
                                         });
                                     if let Some((pose, velocity, world)) = tracking_correction {
-                                        match map.apply_pose_graph_correction(
+                                        let writeback_started = Instant::now();
+                                        let written = map.apply_pose_graph_correction(
                                             &result.keyframe_indices,
                                             &result.original_poses,
                                             &result.optimized_poses,
-                                        ) {
-                                            Ok(_) => {
+                                        );
+                                        outcome.timing.writeback = writeback_started.elapsed();
+                                        match written {
+                                            Ok(written) => {
+                                                outcome.timing.geometry = written.geometry_refresh;
+                                                outcome.timing.landmarks_refreshed =
+                                                    written.landmarks_refreshed;
+                                                let fuse_started = Instant::now();
                                                 fuse_verified_loop(
                                                     map,
                                                     camera,
                                                     &representative,
                                                     &self.config.fusion,
                                                 );
+                                                outcome.timing.fuse = fuse_started.elapsed();
                                                 outcome.tracking_correction =
                                                     Some((pose, velocity));
                                                 outcome.pgo_applied = true;
@@ -471,6 +507,11 @@ impl LoopAcceptance {
             self.verified_loop_pairs.insert(pair);
             self.verified_loops.push(edge);
         }
+        let timing = &mut outcome.timing;
+        timing.graph_edges = self.graph.edges().count();
+        timing.verify = started
+            .elapsed()
+            .saturating_sub(timing.solve + timing.writeback + timing.fuse);
         outcome
     }
 
