@@ -37,6 +37,8 @@ pub enum PoseGraphCorrectionError {
     NonFiniteCorrection,
     #[error("map point references a keyframe outside the pose graph")]
     MissingReferenceKeyframe,
+    #[error("pose graph solve belongs to an obsolete world frame")]
+    ObsoleteWorldFrame,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -234,7 +236,155 @@ impl Map {
             geometry_refresh: refresh_started.elapsed(),
         })
     }
+}
 
+/// A keyframe's live pose before and after a pose-graph writeback, world-to-camera.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeyframePoseChange {
+    pub kf_idx: usize,
+    pub before: Pose3d,
+    pub after: Pose3d,
+}
+
+/// What [`Map::apply_graph_correction`] wrote.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GraphCorrectionResult {
+    /// Every live keyframe, in map order.
+    pub keyframes: Vec<KeyframePoseChange>,
+    pub map_points_corrected: usize,
+    /// Landmarks whose derived geometry was refreshed, and the time that took.
+    pub landmarks_refreshed: usize,
+    pub geometry_refresh: Duration,
+}
+
+impl Map {
+    /// Writes a pose-graph solve made from an earlier snapshot of this map: `snapshot` the
+    /// world-to-camera poses it read and `solved` the ones it found, per keyframe in
+    /// `keyframe_indices`, at the map's `world_epoch` then.
+    ///
+    /// Each keyframe moves by its world correction `C = solved^-1 * snapshot`. One still at its
+    /// snapshot pose takes the solved pose exactly; one bundle adjustment moved since keeps that
+    /// refinement (`T' = T * C^-1`); one created during the solve takes the correction of the
+    /// last snapshot keyframe, as ORB-SLAM3 propagates keyframes inserted during the solve and
+    /// VINS-Fusion applies its drift to every later keyframe. Velocities rotate with their
+    /// keyframe, and landmarks move with their reference keyframe; snapshot keyframes the map
+    /// has since dropped are skipped.
+    ///
+    /// # Errors
+    /// The map changed world since the snapshot, the inputs disagree in length or are not
+    /// finite, or a landmark's reference keyframe is not in the map. Nothing is written then.
+    pub fn apply_graph_correction(
+        &mut self,
+        world_epoch: u64,
+        keyframe_indices: &[usize],
+        snapshot: &[Pose3d],
+        solved: &[Pose3d],
+    ) -> Result<GraphCorrectionResult, PoseGraphCorrectionError> {
+        if self.world_epoch != world_epoch {
+            return Err(PoseGraphCorrectionError::ObsoleteWorldFrame);
+        }
+        if keyframe_indices.is_empty()
+            || snapshot.len() != keyframe_indices.len()
+            || solved.len() != keyframe_indices.len()
+        {
+            return Err(PoseGraphCorrectionError::LengthMismatch);
+        }
+        if !solved.iter().all(finite_pose) {
+            return Err(PoseGraphCorrectionError::NonFinitePose);
+        }
+        let corrections: Vec<Pose3d> = snapshot
+            .iter()
+            .zip(solved)
+            .map(|(before, after)| after.inverse().compose(before))
+            .collect();
+        let node_by_keyframe: HashMap<usize, usize> = keyframe_indices
+            .iter()
+            .enumerate()
+            .map(|(node, &idx)| (idx, node))
+            .collect();
+        let frontier = corrections[corrections.len() - 1];
+
+        let mut changes = Vec::with_capacity(self.keyframes.len());
+        let mut keyframe_corrections = HashMap::with_capacity(self.keyframes.len());
+        let mut velocities = Vec::with_capacity(self.keyframes.len());
+        for keyframe in &self.keyframes {
+            let idx = keyframe.frame.idx;
+            let before = keyframe.frame.pose_world_to_cam;
+            let (after, correction) = match node_by_keyframe.get(&idx) {
+                Some(&node) if before == snapshot[node] => (solved[node], corrections[node]),
+                Some(&node) => (
+                    before.compose(&corrections[node].inverse()),
+                    corrections[node],
+                ),
+                None => (before.compose(&frontier.inverse()), frontier),
+            };
+            if !finite_pose(&correction) || !finite_pose(&after) {
+                return Err(PoseGraphCorrectionError::NonFiniteCorrection);
+            }
+            let velocity = correction.rotation * keyframe.velocity_world;
+            if !finite_vec3(velocity) {
+                return Err(PoseGraphCorrectionError::NonFiniteCorrection);
+            }
+            changes.push(KeyframePoseChange {
+                kf_idx: idx,
+                before,
+                after,
+            });
+            keyframe_corrections.insert(idx, correction);
+            velocities.push(velocity);
+        }
+        let mut positions = Vec::with_capacity(self.map_points.len());
+        for point in &self.map_points {
+            if point.culled {
+                positions.push(None);
+                continue;
+            }
+            let correction = keyframe_corrections
+                .get(&point.keyframe_idx)
+                .ok_or(PoseGraphCorrectionError::MissingReferenceKeyframe)?;
+            let corrected = correction.transform_point(&point.position);
+            if !finite_vec3(corrected) {
+                return Err(PoseGraphCorrectionError::NonFiniteCorrection);
+            }
+            positions.push(Some(corrected));
+        }
+
+        self.world_epoch = self.world_epoch.wrapping_add(1);
+        for ((keyframe, change), velocity) in
+            self.keyframes.iter_mut().zip(&changes).zip(velocities)
+        {
+            keyframe.frame.pose_world_to_cam = change.after;
+            keyframe.velocity_world = velocity;
+        }
+        let mut changed_points = Vec::new();
+        for (idx, (point, corrected)) in self.map_points.iter_mut().zip(positions).enumerate() {
+            if let Some(corrected) = corrected
+                && corrected != point.position
+            {
+                point.position = corrected;
+                changed_points.push(idx);
+            }
+        }
+        let map_points_corrected = changed_points.len();
+        let moved_keyframes: HashSet<usize> = changes
+            .iter()
+            .filter(|change| change.before != change.after)
+            .map(|change| change.kf_idx)
+            .collect();
+        let refresh_started = Instant::now();
+        let observers_moved = self.landmarks_observed_by(&moved_keyframes);
+        let landmarks_refreshed =
+            self.finalize_landmark_geometry(changed_points.into_iter().chain(observers_moved));
+        Ok(GraphCorrectionResult {
+            keyframes: changes,
+            map_points_corrected,
+            landmarks_refreshed,
+            geometry_refresh: refresh_started.elapsed(),
+        })
+    }
+}
+
+impl Map {
     /// Applies a validated inertial alignment: scales and rotates the world,
     /// then writes each keyframe's velocity and bias.
     ///
@@ -622,6 +772,10 @@ fn keyframe_ba_state_changed(
         || before.imu_bias.gyro != after.imu_bias.gyro
         || before.imu_bias.accel != after.imu_bias.accel
 }
+
+#[cfg(test)]
+#[path = "graph_correction_tests.rs"]
+mod graph_correction_tests;
 
 #[cfg(test)]
 mod tests {
