@@ -19,7 +19,7 @@ mod sparse_pgo;
 mod verification;
 mod worker;
 
-pub(crate) use closer::{LoopCloser, LoopClosingContext};
+pub(crate) use closer::{LoopCloser, LoopClosingContext, LoopClosingOutcome, LoopTiming};
 pub use closer::{LoopClosingConfig, LoopClosureEvent, LoopGraphInformation};
 pub use episode::{LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker};
 pub use fusion::{LoopFusionConfig, LoopFusionStats, fuse_verified_loop};
@@ -41,6 +41,7 @@ pub use sparse_pgo::{
 pub use verification::{
     LoopVerificationConfig, LoopVerificationReject, VerifiedLoopEdge, verify_loop_candidate,
 };
+pub(crate) use worker::LoopSolver;
 
 #[cfg(test)]
 use closer::{keyframe_poses, optimize_through_graph, snapshot_graph_config, solve_in_graph};

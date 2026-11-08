@@ -28,6 +28,7 @@ fn with_loop_closing(mode: LoopClosingMode, sensors: SensorSelection) -> SystemC
 fn loop_closing() -> LoopClosingMode {
     LoopClosingMode::Enabled {
         vocabulary: PathBuf::from("ORBvoc.txt"),
+        execution: LoopClosingExecution::default(),
     }
 }
 
@@ -274,10 +275,32 @@ fn vocabulary_path_must_not_be_empty() {
     let config = with_loop_closing(
         LoopClosingMode::Enabled {
             vocabulary: PathBuf::new(),
+            execution: LoopClosingExecution::default(),
         },
         SensorSelection::default(),
     );
     assert_eq!(config.validate(), Err(ConfigError::EmptyVocabularyPath));
+}
+
+#[test]
+fn follow_mapping_resolves_to_the_mapping_execution() {
+    use LoopClosingExecution::*;
+    assert_eq!(
+        FollowMapping.resolve(LocalMappingMode::Synchronous),
+        Synchronous
+    );
+    assert_eq!(
+        FollowMapping.resolve(LocalMappingMode::Asynchronous),
+        Asynchronous
+    );
+    assert_eq!(
+        Deferred { frames: 2 }.resolve(LocalMappingMode::Asynchronous),
+        Deferred { frames: 2 }
+    );
+    assert_eq!(
+        Synchronous.resolve(LocalMappingMode::Asynchronous),
+        Synchronous
+    );
 }
 
 #[test]
@@ -580,6 +603,31 @@ mod ron_files {
     }
 
     #[test]
+    fn loop_closing_execution_is_optional_and_parses() {
+        let text = |execution: &str| {
+            format!(
+                "(version: 1, sensors: (cameras: Stereo), pipeline: OrbSlam((loop_closing: Enabled(vocabulary: \"v.txt\"{execution}))))"
+            )
+        };
+        let execution = |config: &SystemConfig| match &orb(config).loop_closing {
+            LoopClosingMode::Enabled { execution, .. } => *execution,
+            LoopClosingMode::Disabled => panic!("loop closing is enabled"),
+        };
+        assert_eq!(
+            execution(&parse(&text("")).unwrap()),
+            LoopClosingExecution::FollowMapping
+        );
+        assert_eq!(
+            execution(&parse(&text(", execution: Deferred(frames: 4)")).unwrap()),
+            LoopClosingExecution::Deferred { frames: 4 }
+        );
+        assert_eq!(
+            execution(&parse(&text(", execution: Asynchronous")).unwrap()),
+            LoopClosingExecution::Asynchronous
+        );
+    }
+
+    #[test]
     fn missing_file_is_an_io_error() {
         let err = SystemConfig::from_ron_file("/nonexistent/orb.ron").unwrap_err();
         assert!(matches!(err, LoadError::Io { .. }));
@@ -590,6 +638,7 @@ mod ron_files {
         let mut config = with_loop_closing(
             LoopClosingMode::Enabled {
                 vocabulary: PathBuf::from("/weights/ORBvoc.bin"),
+                execution: LoopClosingExecution::default(),
             },
             sensors(CameraSelection::Stereo, true),
         );

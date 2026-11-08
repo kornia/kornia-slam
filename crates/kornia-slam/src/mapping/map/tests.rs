@@ -29,6 +29,12 @@ impl Map {
         }
     }
 
+    /// Moves the map to a new world epoch without touching its geometry, as a
+    /// concurrent inertial refinement or compaction would.
+    pub(crate) fn advance_world_epoch_for_test(&mut self) {
+        self.world_epoch = self.world_epoch.wrapping_add(1);
+    }
+
     /// A comparable rendering of the complete stored state.
     ///
     /// For unchanged-on-error assertions: comparing two of these catches a

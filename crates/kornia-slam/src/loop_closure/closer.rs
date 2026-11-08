@@ -17,7 +17,7 @@ use crate::loop_closure::place_recognition::{
     Candidate, KeyFrameDatabase, Vocabulary, compute_bow,
 };
 use crate::loop_closure::pose_graph::max_gravity_alignment_error;
-use crate::loop_closure::worker::{LoopSolveJob, LoopSolveOutcome};
+use crate::loop_closure::worker::{LoopSolveJob, LoopSolveOutcome, LoopSolver, WorkerStopped};
 use crate::loop_closure::{
     Correction, DriftModel, GateDecision, GraphManifold, InertialPgoContext, LoopCorrection,
     LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker, LoopFusionConfig, LoopGate,
@@ -104,6 +104,10 @@ pub(crate) struct LoopClosingOutcome {
     /// The accumulated map correction, set only when the map was corrected.
     pub correction: Option<Correction>,
     pub timing: LoopTiming,
+    /// A loop was accepted and waits for a background solve.
+    pub queued: bool,
+    /// A background solve was written back (or discarded) this long after it was submitted.
+    pub written_back: Option<Duration>,
 }
 
 /// Where one loop-closure attempt spent its time, for the runtime's `[loop-time]` log.
@@ -239,6 +243,28 @@ impl LoopCloser {
     pub(crate) fn graph_nodes(&self) -> usize {
         self.acceptance.graph.nodes().len()
     }
+
+    /// Runs solves on `solver` instead of inline.
+    pub(crate) fn with_solver(mut self, solver: LoopSolver) -> Self {
+        self.acceptance.solver = solver;
+        self
+    }
+
+    /// Whether solves are written back at frame boundaries, through [`Self::on_frame`].
+    pub(crate) fn runs_in_background(&self) -> bool {
+        !self.acceptance.solver.is_synchronous()
+    }
+
+    /// Called at every frame boundary: writes back a finished background solve, then submits
+    /// the loops accepted meanwhile.
+    pub(crate) fn on_frame(
+        &mut self,
+        map: &mut Map,
+        camera: &PinholeCamera,
+        context: LoopClosingContext,
+    ) -> LoopClosingOutcome {
+        self.acceptance.on_frame(map, camera, context)
+    }
 }
 
 #[cfg(test)]
@@ -278,7 +304,21 @@ struct LoopAcceptance {
     /// Verified loops whose edge is in `graph`.
     loops_in_graph: HashSet<(usize, usize)>,
     map_from_odometry: Pose3d,
+    solver: LoopSolver,
+    /// Accepted loops waiting for a background solve; each reports `Accepted` at its writeback.
+    queued: Vec<VerifiedLoopEdge>,
+    /// The loops the solve in flight reports, and when it was submitted.
+    in_flight: Vec<VerifiedLoopEdge>,
+    submitted_at: Option<Instant>,
+    /// Background results discarded in a row because the map changed world during the solve.
+    discards: usize,
+    /// The worker stopped: loops are still accepted, never corrected.
+    stopped: bool,
 }
+
+/// A background result is discarded while the map keeps changing world under it, and the loops
+/// are given up on after this many in a row.
+const MAX_DISCARDS: usize = 3;
 
 impl LoopAcceptance {
     fn new(config: LoopClosingConfig, require_imu_initialized: bool) -> Self {
@@ -302,6 +342,12 @@ impl LoopAcceptance {
             graph,
             loops_in_graph: HashSet::new(),
             map_from_odometry: Pose3d::IDENTITY,
+            solver: LoopSolver::Synchronous,
+            queued: Vec::new(),
+            in_flight: Vec::new(),
+            submitted_at: None,
+            discards: 0,
+            stopped: false,
         }
     }
 
@@ -320,10 +366,17 @@ impl LoopAcceptance {
         if let Some(representative) =
             self.accept(map, camera, kf_idx, candidates, context, &mut outcome)
         {
-            let job = self.solve_job(map, &representative, context);
-            let solved = job.run();
-            self.apply_synchronous(map, camera, solved, &representative, context, &mut outcome);
-            self.record(representative);
+            if self.solver.is_synchronous() {
+                let job = self.solve_job(map, self.pending_loops(Some(&representative)), context);
+                let solved = job.run();
+                self.apply_synchronous(map, camera, solved, &representative, context, &mut outcome);
+                self.record(representative);
+            } else {
+                self.record(representative.clone());
+                self.queued.push(representative);
+                outcome.queued = true;
+                self.submit_queued(map, context, &mut outcome);
+            }
         }
         let timing = &mut outcome.timing;
         timing.graph_edges = self.graph.edges().count();
@@ -409,17 +462,9 @@ impl LoopAcceptance {
         self.verified_loops.push(edge);
     }
 
-    /// The solve `newest` needs, detached from the map: the keyframe poses now, the graph as it
-    /// stands, and every verified loop not yet in it with `newest` last. The graph is cloned, so
-    /// `self.graph` stays the rollback until a result is applied.
-    fn solve_job(
-        &self,
-        map: &Map,
-        newest: &VerifiedLoopEdge,
-        context: LoopClosingContext,
-    ) -> LoopSolveJob {
-        let loops = self
-            .verified_loops
+    /// Every verified loop not yet in the graph, then `newest` when it is not recorded yet.
+    fn pending_loops(&self, newest: Option<&VerifiedLoopEdge>) -> Vec<VerifiedLoopEdge> {
+        self.verified_loops
             .iter()
             .filter(|edge| {
                 !self.loops_in_graph.contains(&normalized_loop_pair(
@@ -427,10 +472,22 @@ impl LoopAcceptance {
                     edge.candidate_kf_idx,
                 ))
             })
-            .chain(std::iter::once(newest))
+            .chain(newest)
             .cloned()
-            .collect();
+            .collect()
+    }
+
+    /// The solve of `loops` (the last is the newest), detached from the map: the keyframe poses
+    /// now and the graph as it stands. The graph is cloned, so `self.graph` stays the rollback
+    /// until a result is applied.
+    fn solve_job(
+        &self,
+        map: &Map,
+        loops: Vec<VerifiedLoopEdge>,
+        context: LoopClosingContext,
+    ) -> LoopSolveJob {
         LoopSolveJob {
+            world_epoch: map.world_epoch(),
             keyframe_poses: keyframe_poses(map),
             loops,
             graph: self.graph.clone(),
@@ -544,6 +601,204 @@ impl LoopAcceptance {
             edge: representative.clone(),
             applied: outcome.pgo_applied,
         });
+    }
+
+    /// Submits every queued loop as one solve when none is in flight: loops accepted during a
+    /// solve coalesce into the next, which is never aborted.
+    fn submit_queued(
+        &mut self,
+        map: &Map,
+        context: LoopClosingContext,
+        outcome: &mut LoopClosingOutcome,
+    ) {
+        if self.stopped || self.queued.is_empty() || self.solver.in_flight() {
+            return;
+        }
+        let job = self.solve_job(map, self.pending_loops(None), context);
+        self.in_flight = std::mem::take(&mut self.queued);
+        self.submitted_at = Some(Instant::now());
+        if let Err(WorkerStopped) = self.solver.submit(job) {
+            self.stop(outcome);
+        }
+    }
+
+    fn on_frame(
+        &mut self,
+        map: &mut Map,
+        camera: &PinholeCamera,
+        context: LoopClosingContext,
+    ) -> LoopClosingOutcome {
+        let mut outcome = LoopClosingOutcome::default();
+        match self.solver.poll() {
+            Ok(Some(solved)) => self.apply_background(map, camera, solved, context, &mut outcome),
+            Ok(None) => {}
+            Err(WorkerStopped) => self.stop(&mut outcome),
+        }
+        self.submit_queued(map, context, &mut outcome);
+        outcome.timing.graph_edges = self.graph.edges().count();
+        outcome
+    }
+
+    /// The worker is gone: loop correction stays off, and tracking carries on uncorrected.
+    fn stop(&mut self, outcome: &mut LoopClosingOutcome) {
+        self.stopped = true;
+        self.submitted_at = None;
+        let mut loops = std::mem::take(&mut self.in_flight);
+        loops.append(&mut self.queued);
+        let (query_kf_idx, candidate_kf_idx) = loops
+            .last()
+            .map_or((0, 0), |edge| (edge.query_kf_idx, edge.candidate_kf_idx));
+        outcome.events.push(LoopClosureEvent::PgoFailed {
+            query_kf_idx,
+            candidate_kf_idx,
+            reason: "loop-closing worker stopped; loop correction is off".into(),
+        });
+        outcome
+            .events
+            .extend(loops.into_iter().map(|edge| LoopClosureEvent::Accepted {
+                edge,
+                applied: false,
+            }));
+    }
+
+    /// Writes a finished background solve back at a frame boundary. A result from another world
+    /// is discarded and its loops queued again; anything else reports every loop it carried.
+    fn apply_background(
+        &mut self,
+        map: &mut Map,
+        camera: &PinholeCamera,
+        solved: LoopSolveOutcome,
+        context: LoopClosingContext,
+        outcome: &mut LoopClosingOutcome,
+    ) {
+        outcome.timing.solve = solved.solve_time;
+        outcome.written_back = self
+            .submitted_at
+            .take()
+            .map(|submitted| submitted.elapsed());
+        let report = std::mem::take(&mut self.in_flight);
+        let Some(newest) = report.last().cloned() else {
+            return;
+        };
+        let failed = |reason: String| LoopClosureEvent::PgoFailed {
+            query_kf_idx: newest.query_kf_idx,
+            candidate_kf_idx: newest.candidate_kf_idx,
+            reason,
+        };
+        if solved.world_epoch != map.world_epoch() {
+            self.discards += 1;
+            if self.discards < MAX_DISCARDS {
+                self.queued.splice(0..0, report);
+                return;
+            }
+            self.discards = 0;
+            outcome.events.push(failed(format!(
+                "the map changed world during {MAX_DISCARDS} solves in a row"
+            )));
+        } else {
+            self.discards = 0;
+            let result = solved.solved.map(|(result, new_world)| {
+                if new_world {
+                    self.loops_in_graph.clear();
+                    self.map_from_odometry = Pose3d::IDENTITY;
+                }
+                result
+            });
+            match result {
+                Ok(result) => {
+                    outcome.timing.iterations = result.iterations;
+                    if result.usable
+                        && let Err(reason) = self.write_back(
+                            map,
+                            camera,
+                            &result,
+                            solved.world_epoch,
+                            &report,
+                            context,
+                            outcome,
+                        )
+                    {
+                        outcome.events.push(failed(reason));
+                    }
+                }
+                Err(error) => outcome.events.push(failed(error.to_string())),
+            }
+            if outcome.pgo_applied {
+                self.loops_in_graph.extend(
+                    solved
+                        .loops
+                        .iter()
+                        .map(|edge| normalized_loop_pair(edge.query_kf_idx, edge.candidate_kf_idx)),
+                );
+                self.graph = solved.graph;
+            }
+        }
+        let applied = outcome.pgo_applied;
+        outcome.events.extend(
+            report
+                .into_iter()
+                .map(|edge| LoopClosureEvent::Accepted { edge, applied }),
+        );
+    }
+
+    /// Moves the live map by the solve, then the tracking state and the map correction by the
+    /// current reference keyframe's live correction, and fuses the loops whose ends are live.
+    #[allow(clippy::too_many_arguments)]
+    fn write_back(
+        &mut self,
+        map: &mut Map,
+        camera: &PinholeCamera,
+        result: &PgoResult,
+        world_epoch: u64,
+        loops: &[VerifiedLoopEdge],
+        context: LoopClosingContext,
+        outcome: &mut LoopClosingOutcome,
+    ) -> Result<(), String> {
+        let reference = context
+            .current_keyframe_idx
+            .filter(|&kf_idx| map.get_keyframe(kf_idx).is_some())
+            .ok_or("current reference keyframe is not in the map")?;
+        let writeback_started = Instant::now();
+        let written = map.apply_graph_correction(
+            world_epoch,
+            &result.keyframe_indices,
+            &result.original_poses,
+            &result.optimized_poses,
+        );
+        outcome.timing.writeback = writeback_started.elapsed();
+        let written = written.map_err(|error| format!("live map correction rejected: {error}"))?;
+        outcome.timing.geometry = written.geometry_refresh;
+        outcome.timing.landmarks_refreshed = written.landmarks_refreshed;
+        outcome.pgo_applied = true;
+        if let Some(change) = written
+            .keyframes
+            .iter()
+            .find(|change| change.kf_idx == reference)
+        {
+            let world = change.after.inverse().compose(&change.before);
+            outcome.tracking_correction = Some((
+                apply_reference_pose_correction(
+                    context.pose_world_to_cam,
+                    change.before,
+                    change.after,
+                ),
+                world.rotation * context.velocity_world,
+            ));
+            self.map_from_odometry = world.compose(&self.map_from_odometry);
+        }
+        outcome.correction = Some(Correction {
+            map_from_odometry: self.map_from_odometry,
+        });
+        let fuse_started = Instant::now();
+        for edge in loops {
+            if map.get_keyframe(edge.query_kf_idx).is_some()
+                && map.get_keyframe(edge.candidate_kf_idx).is_some()
+            {
+                fuse_verified_loop(map, camera, edge, &self.config.fusion);
+            }
+        }
+        outcome.timing.fuse = fuse_started.elapsed();
+        Ok(())
     }
 
     /// Whether an accepted loop already matched a keyframe within the episode
