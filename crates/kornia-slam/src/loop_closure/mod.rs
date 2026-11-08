@@ -7,6 +7,11 @@
 //! [`PoseGraph`] kept across solves, so keyframes the map culls or evicts stay
 //! as nodes and their loops keep constraining it. [`optimize_pose_graph`] is
 //! the earlier per-solve snapshot optimizer, kept as the `w * I` reference.
+//!
+//! A solve can run off the tracking thread ([`crate::LoopClosingExecution`]): it
+//! reads a copy of the keyframe poses and the graph, and its result is written
+//! back at a frame boundary, moving keyframes created during the solve with the
+//! last one it saw, as ORB-SLAM3's `CorrectLoop` and VINS-Fusion's pose graph do.
 
 mod closer;
 mod episode;

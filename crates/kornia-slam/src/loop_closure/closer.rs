@@ -244,6 +244,17 @@ impl LoopCloser {
         self.acceptance.graph.nodes().len()
     }
 
+    /// How many corrections have been written to the map: it advances with every applied loop,
+    /// so consumers of [`Self::map_correction`] re-anchor when it changes.
+    pub(crate) fn correction_epoch(&self) -> u64 {
+        self.acceptance.correction_epoch
+    }
+
+    /// Whether a background solve is running or waiting for its writeback.
+    pub(crate) fn solve_in_flight(&self) -> bool {
+        self.acceptance.solver.in_flight()
+    }
+
     /// Runs solves on `solver` instead of inline.
     pub(crate) fn with_solver(mut self, solver: LoopSolver) -> Self {
         self.acceptance.solver = solver;
@@ -304,6 +315,7 @@ struct LoopAcceptance {
     /// Verified loops whose edge is in `graph`.
     loops_in_graph: HashSet<(usize, usize)>,
     map_from_odometry: Pose3d,
+    correction_epoch: u64,
     solver: LoopSolver,
     /// Accepted loops waiting for a background solve; each reports `Accepted` at its writeback.
     queued: Vec<VerifiedLoopEdge>,
@@ -342,6 +354,7 @@ impl LoopAcceptance {
             graph,
             loops_in_graph: HashSet::new(),
             map_from_odometry: Pose3d::IDENTITY,
+            correction_epoch: 0,
             solver: LoopSolver::Synchronous,
             queued: Vec::new(),
             in_flight: Vec::new(),
@@ -570,6 +583,7 @@ impl LoopAcceptance {
                                 outcome.timing.fuse = fuse_started.elapsed();
                                 outcome.tracking_correction = Some((pose, velocity));
                                 outcome.pgo_applied = true;
+                                self.correction_epoch += 1;
                                 self.map_from_odometry = world.compose(&self.map_from_odometry);
                                 outcome.correction = Some(Correction {
                                     map_from_odometry: self.map_from_odometry,
@@ -770,6 +784,7 @@ impl LoopAcceptance {
         outcome.timing.geometry = written.geometry_refresh;
         outcome.timing.landmarks_refreshed = written.landmarks_refreshed;
         outcome.pgo_applied = true;
+        self.correction_epoch += 1;
         if let Some(change) = written
             .keyframes
             .iter()

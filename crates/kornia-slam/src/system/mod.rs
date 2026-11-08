@@ -153,6 +153,23 @@ impl SlamSystem {
         )
     }
 
+    /// Advances by one with every loop correction written to the map, so a
+    /// consumer publishing odometry as `T_map * map_correction()` re-anchors
+    /// when it changes; 0 without loop closing or before the first correction.
+    pub fn correction_epoch(&self) -> u64 {
+        self.loop_closer
+            .as_ref()
+            .map_or(0, LoopCloser::correction_epoch)
+    }
+
+    /// Whether a background loop solve is running or waiting for its
+    /// writeback at a frame boundary.
+    pub fn loop_solve_in_flight(&self) -> bool {
+        self.loop_closer
+            .as_ref()
+            .is_some_and(LoopCloser::solve_in_flight)
+    }
+
     /// The system's sensor calibration, restricted to the selected sensors.
     pub fn rig(&self) -> &SensorRig {
         &self.rig

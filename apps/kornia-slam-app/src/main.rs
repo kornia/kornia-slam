@@ -221,13 +221,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if applied {
                         let correction = system.map_correction().map_from_odometry;
                         let t = correction.translation;
-                        let angle = SO3F64::from_matrix(&correction.rotation).log().length();
+                        let rotation = SO3F64::from_matrix(&correction.rotation);
+                        let [qx, qy, qz, qw] = rotation.to_array();
                         eprintln!(
-                            "[map-correction] map_from_odometry t=({:.3},{:.3},{:.3}) rot_deg={:.2}",
+                            "[map-correction] map_from_odometry t=({:.3},{:.3},{:.3}) rot_deg={:.2} \
+                             epoch={} q=({qx:.9},{qy:.9},{qz:.9},{qw:.9}) t_full=({:.9},{:.9},{:.9})",
                             t.x,
                             t.y,
                             t.z,
-                            angle.to_degrees(),
+                            rotation.log().length().to_degrees(),
+                            system.correction_epoch(),
+                            t.x,
+                            t.y,
+                            t.z,
                         );
                     }
                 }
