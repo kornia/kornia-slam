@@ -1102,3 +1102,42 @@ fn long_compaction_churn_never_leaves_a_dangling_slot() {
         }
     }
 }
+
+/// The whole-map refresh reads camera centres from a table built once; it must
+/// leave exactly the state the per-landmark lookup does, bit for bit.
+#[test]
+fn tabulated_geometry_refresh_matches_the_per_landmark_lookup() {
+    let mut map = Map::new();
+    for kf in 0..4 {
+        let pose = Pose3d::new(
+            kornia_algebra::SO3F64::exp(Vec3F64::new(0.01 * kf as f64, -0.02, 0.03)).matrix(),
+            Vec3F64::new(-0.3 * kf as f64, 0.1, 0.05 * kf as f64),
+        );
+        let mut keyframe = Keyframe::from_frame(test_frame_with_pose(kf, vec![[0u8; 32]; 3], pose));
+        keyframe.frame.features.octaves = vec![0, 1, 3];
+        map.insert_keyframe(keyframe).unwrap();
+    }
+    let mut ids = Vec::new();
+    for feature in 0..3 {
+        let id = map
+            .insert_landmark(seed(feature, feature, 4.0 + feature as f64))
+            .unwrap();
+        for kf in (0..4).filter(|&kf| kf != feature) {
+            map.link_observation(kf, feature, id).unwrap();
+        }
+        ids.push(id);
+    }
+    map.remove_landmark(ids[2]).unwrap();
+    let mut looked_up = map.clone();
+    for &id in &ids {
+        looked_up.update_map_point_geometry(id, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+    }
+
+    let refreshed = map.finalize_landmark_geometry(ids.iter().copied());
+
+    assert_eq!(refreshed, ids.len());
+    assert_eq!(
+        map.state_fingerprint_for_test(),
+        looked_up.state_fingerprint_for_test()
+    );
+}
