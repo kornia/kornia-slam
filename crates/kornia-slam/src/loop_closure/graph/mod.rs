@@ -170,6 +170,12 @@ pub struct Edge {
     pub kind: EdgeKind,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    seq: u64,
+    edge: Edge,
+}
+
 /// Where the newest pose hangs from: `estimate = odometry * vio_ref^-1 * offset * pose(node)`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Anchor {
@@ -212,7 +218,8 @@ pub struct PoseGraph<P> {
     by_keyframe: HashMap<usize, NodeId>,
     /// Keyed by (from, to, kind): a repeated loop between two nodes replaces, so edges grow with
     /// area too.
-    edges: BTreeMap<(NodeId, NodeId, EdgeKind), Edge>,
+    edges: BTreeMap<(NodeId, NodeId, EdgeKind), Slot>,
+    next_seq: u64,
     anchor: Option<Anchor>,
     last_odometry: Option<Pose3d>,
     path_m: f64,
@@ -227,6 +234,7 @@ impl<P> PoseGraph<P> {
             nodes: Vec::new(),
             by_keyframe: HashMap::new(),
             edges: BTreeMap::new(),
+            next_seq: 0,
             anchor: None,
             last_odometry: None,
             path_m: 0.0,
@@ -244,7 +252,7 @@ impl<P> PoseGraph<P> {
     }
 
     pub fn edges(&self) -> impl Iterator<Item = &Edge> {
-        self.edges.values()
+        self.edges.values().map(|slot| &slot.edge)
     }
 
     pub fn loops_accepted(&self) -> u64 {
@@ -341,9 +349,14 @@ impl<P> PoseGraph<P> {
         self.nodes[node.0].odometry = pose;
         self.nodes[node.0].pose = pose;
         let nodes = &self.nodes;
-        for edge in self.edges.values_mut().filter(|edge| {
-            edge.kind == EdgeKind::Odometry && (edge.from == node || edge.to == node)
-        }) {
+        for edge in self
+            .edges
+            .values_mut()
+            .map(|slot| &mut slot.edge)
+            .filter(|edge| {
+                edge.kind == EdgeKind::Odometry && (edge.from == node || edge.to == node)
+            })
+        {
             edge.measurement =
                 Pose3d::between(&nodes[edge.from.0].odometry, &nodes[edge.to.0].odometry);
         }
@@ -626,17 +639,14 @@ impl<P> PoseGraph<P> {
         let (measurement, sigma_m, sigma_rad) = self.odometry_since_anchor(&odometry);
         let from = self.anchor.map_or(NodeId(0), |anchor| anchor.node);
         let to = self.push_node(keyframe, t_s, odometry, estimate, payload);
-        self.edges.insert(
-            (from, to, EdgeKind::Odometry),
-            Edge {
-                from,
-                to,
-                measurement,
-                sigma_m,
-                sigma_rad,
-                kind: EdgeKind::Odometry,
-            },
-        );
+        self.insert_edge(Edge {
+            from,
+            to,
+            measurement,
+            sigma_m,
+            sigma_rad,
+            kind: EdgeKind::Odometry,
+        });
         self.anchor = Some(self.anchor_at_node(to, t_s));
         to
     }
@@ -692,8 +702,7 @@ impl<P> PoseGraph<P> {
         };
         let mut previous = Vec::with_capacity(loops.len());
         for edge in &loops {
-            let key = (edge.from, edge.to, edge.kind);
-            previous.push((key, self.edges.insert(key, *edge)));
+            previous.push(self.insert_edge(*edge));
         }
         match self.solve(&last) {
             Ok((poses, report)) => {
@@ -716,13 +725,23 @@ impl<P> PoseGraph<P> {
         }
     }
 
+    fn insert_edge(&mut self, edge: Edge) -> ((NodeId, NodeId, EdgeKind), Option<Slot>) {
+        let key = (edge.from, edge.to, edge.kind);
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        (key, self.edges.insert(key, Slot { seq, edge }))
+    }
+
     /// Solve over every node, the first fixed.
     fn solve(&self, new_loop: &Edge) -> Result<(Vec<Pose3d>, SolveReport), PoseGraphError> {
         let poses: Vec<Pose3d> = self.nodes.iter().map(|node| node.pose).collect();
-        let edges: Vec<InformationEdge> = self
-            .edges
-            .values()
-            .map(|edge| self.information_edge(edge))
+        // Odometry then loops, each in insertion order: the f32 normal equations then sum in the
+        // order `optimize_pose_graph` uses, which LM's accept path is sensitive to.
+        let mut slots: Vec<&Slot> = self.edges.values().collect();
+        slots.sort_by_key(|slot| (slot.edge.kind, slot.seq));
+        let edges: Vec<InformationEdge> = slots
+            .into_iter()
+            .map(|slot| self.information_edge(&slot.edge))
             .collect::<Result<_, _>>()?;
         let params = PgoParams {
             max_iterations: self.config.max_iterations,

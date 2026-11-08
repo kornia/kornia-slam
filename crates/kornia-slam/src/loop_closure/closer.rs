@@ -12,14 +12,16 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 
-use crate::loop_closure::odometry_gate::TemporalConsistencyTracker;
 use crate::loop_closure::place_recognition::{
     Candidate, KeyFrameDatabase, Vocabulary, compute_bow,
 };
+use crate::loop_closure::pose_graph::max_gravity_alignment_error;
 use crate::loop_closure::{
-    InertialPgoContext, LoopCorrection, LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker,
-    LoopFusionConfig, LoopOdometryGate, LoopTemporalConsistency, LoopVerificationConfig, PgoConfig,
-    TemporalDecision, VerifiedLoopEdge, fuse_verified_loop, optimize_pose_graph,
+    GateDecision, GraphManifold, InertialPgoContext, LoopCorrection, LoopEpisodeConfig,
+    LoopEpisodeDecision, LoopEpisodeTracker, LoopFusionConfig, LoopGate, LoopMeasurement,
+    LoopOdometryGate, LoopProposal, LoopTemporalConsistency, LoopVerificationConfig,
+    OdometryConsistencyGate, PgoConfig, PgoError, PgoResult, PoseGraph, PoseGraphConfig,
+    PoseGraphError, RejectAll, TemporalConsistencyGate, VerifiedLoopEdge, fuse_verified_loop,
     verify_loop_candidate,
 };
 use crate::mapping::Map;
@@ -202,7 +204,8 @@ struct LoopAcceptance {
     config: LoopClosingConfig,
     require_imu_initialized: bool,
     episode_tracker: LoopEpisodeTracker,
-    temporal_tracker: TemporalConsistencyTracker,
+    odometry_gate: OdometryConsistencyGate,
+    temporal_gate: TemporalConsistencyGate,
     verified_loops: Vec<VerifiedLoopEdge>,
     verified_loop_pairs: HashSet<(usize, usize)>,
 }
@@ -210,13 +213,15 @@ struct LoopAcceptance {
 impl LoopAcceptance {
     fn new(config: LoopClosingConfig, require_imu_initialized: bool) -> Self {
         let episode_tracker = LoopEpisodeTracker::new(config.episode);
-        let temporal_tracker =
-            TemporalConsistencyTracker::new(config.temporal_consistency, config.episode);
+        let odometry_gate = OdometryConsistencyGate(config.odometry_gate);
+        let temporal_gate =
+            TemporalConsistencyGate::new(config.temporal_consistency, config.episode);
         Self {
             config,
             require_imu_initialized,
             episode_tracker,
-            temporal_tracker,
+            odometry_gate,
+            temporal_gate,
             verified_loops: Vec::new(),
             verified_loop_pairs: HashSet::new(),
         }
@@ -262,17 +267,20 @@ impl LoopAcceptance {
                 let gravity = context.imu_initialized.then_some(context.gravity_world);
                 let correction = loop_correction(map, query_order, candidate_order, &edge, gravity);
                 if let Some(correction) = correction {
-                    if !self.admit(&edge, &correction, &mut outcome.gate_messages) {
-                        continue;
-                    }
-                    if !self.temporally_consistent(
-                        map,
+                    let proposal = LoopProposal {
+                        edge: &edge,
+                        correction,
                         query_order,
                         candidate_order,
-                        &edge,
-                        correction,
-                        &mut outcome.gate_messages,
-                    ) {
+                    };
+                    let log = &mut outcome.gate_messages;
+                    if let GateDecision::Reject(_) = self.odometry_gate.decide(&proposal, log) {
+                        continue;
+                    }
+                    if self.temporal_gate.is_enabled()
+                        && !self.region_has_loop(map, candidate_order)
+                        && self.temporal_gate.decide(&proposal, log) == GateDecision::Hold
+                    {
                         break;
                     }
                 }
@@ -289,8 +297,12 @@ impl LoopAcceptance {
                         );
                         let mut loops = self.verified_loops.clone();
                         loops.push(representative.clone());
-                        match optimize_pose_graph(map, &loops, &self.config.optimizer, inertial_pgo)
-                        {
+                        match optimize_through_graph(
+                            map,
+                            &loops,
+                            &self.config.optimizer,
+                            inertial_pgo,
+                        ) {
                             Ok(result) => {
                                 if result.usable {
                                     let tracking_correction = context
@@ -375,71 +387,6 @@ impl LoopAcceptance {
         outcome
     }
 
-    /// The odometry gate: `false` rejects the verified edge as if verification
-    /// had failed, so the next candidate is tried.
-    fn admit(
-        &self,
-        edge: &VerifiedLoopEdge,
-        correction: &LoopCorrection,
-        log: &mut Vec<String>,
-    ) -> bool {
-        let Some(verdict) = self.config.odometry_gate.judge(correction) else {
-            return true;
-        };
-        log.push(format!(
-            "[loop-gate] kf={}~{} path_m={:.2} path_rot_deg={:.1} corr_t={:.3} corr_yaw_deg={:.2} sigma_t={:.3} sigma_yaw_deg={:.2} k={} {}",
-            edge.query_kf_idx,
-            edge.candidate_kf_idx,
-            correction.path_m,
-            correction.path_rotation_rad.to_degrees(),
-            correction.translation_m(),
-            correction.yaw_rad.to_degrees(),
-            verdict.sigma_t_m,
-            verdict.sigma_yaw_rad.to_degrees(),
-            verdict.k_sigma,
-            if verdict.accepted { "accept" } else { "reject" },
-        ));
-        verdict.accepted
-    }
-
-    /// The temporal rule, applied only where no loop was accepted yet: `false`
-    /// holds the detection back until enough consecutive ones agree.
-    fn temporally_consistent(
-        &mut self,
-        map: &Map,
-        query_order: usize,
-        candidate_order: usize,
-        edge: &VerifiedLoopEdge,
-        correction: LoopCorrection,
-        log: &mut Vec<String>,
-    ) -> bool {
-        if self.config.temporal_consistency == LoopTemporalConsistency::Disabled
-            || self.region_has_loop(map, candidate_order)
-        {
-            return true;
-        }
-        let Some(decision) =
-            self.temporal_tracker
-                .observe(query_order, candidate_order, correction)
-        else {
-            return true;
-        };
-        let (passed, state) = match decision {
-            TemporalDecision::Pass => (true, "pass".to_string()),
-            TemporalDecision::Pending { hits, required } => {
-                (false, format!("pending {hits}/{required}"))
-            }
-        };
-        log.push(format!(
-            "[loop-temporal] kf={}~{} corr_t={:.3} corr_yaw_deg={:.2} {state}",
-            edge.query_kf_idx,
-            edge.candidate_kf_idx,
-            correction.translation_m(),
-            correction.yaw_rad.to_degrees(),
-        ));
-        passed
-    }
-
     /// Whether an accepted loop already matched a keyframe within the episode
     /// neighbourhood of `candidate_order`.
     fn region_has_loop(&self, map: &Map, candidate_order: usize) -> bool {
@@ -450,6 +397,94 @@ impl LoopAcceptance {
                 .position(|keyframe| keyframe.frame.idx == accepted.candidate_kf_idx)
                 .is_some_and(|order| order.abs_diff(candidate_order) <= radius)
         })
+    }
+}
+
+/// [`optimize_pose_graph`] through a [`PoseGraph`] of every keyframe, with `w * I`
+/// square-root information: the same snapshot, edges, solver and usability test.
+///
+/// [`optimize_pose_graph`]: crate::loop_closure::optimize_pose_graph
+pub(super) fn optimize_through_graph(
+    map: &Map,
+    verified_loops: &[VerifiedLoopEdge],
+    config: &PgoConfig,
+    inertial: Option<InertialPgoContext>,
+) -> Result<PgoResult, PgoError> {
+    let keyframes = map.keyframes();
+    if keyframes.len() < 2 {
+        return Err(PgoError::TooFewKeyframes);
+    }
+    let mut graph = PoseGraph::new(snapshot_graph_config(config, inertial));
+    for keyframe in keyframes {
+        let frame = &keyframe.frame;
+        graph
+            .add_keyframe(frame.idx, 0.0, frame.pose_world_to_cam, (), &mut RejectAll)
+            .map_err(|error| PgoError::Solver(error.to_string()))?;
+    }
+    let loop_sigma = 1.0 / f64::from(config.loop_edge_weight);
+    let loops = verified_loops.iter().map(|edge| {
+        let measurement = LoopMeasurement {
+            candidate_to_query: edge.candidate_to_query,
+            sigma_m: loop_sigma,
+            sigma_rad: loop_sigma,
+        };
+        (edge.candidate_kf_idx, edge.query_kf_idx, measurement)
+    });
+    if verified_loops.is_empty() {
+        return Err(PgoError::MissingLoopKeyframe);
+    }
+    let report = graph.add_loop_edges(loops).map_err(|error| match error {
+        PoseGraphError::UnknownKeyframe(_) => PgoError::MissingLoopKeyframe,
+        error => PgoError::Solver(error.to_string()),
+    })?;
+    let (keyframe_indices, original_poses, optimized_poses) = graph.poses_before_after();
+    let gravity_error = inertial.map(|context| {
+        max_gravity_alignment_error(&original_poses, &optimized_poses, context.gravity_world)
+    });
+    let metrics_finite = [
+        report.cost_before,
+        report.cost_after,
+        report.loop_residual_before,
+        report.loop_residual_after,
+    ]
+    .into_iter()
+    .all(f64::is_finite);
+    let usable = report.converged
+        && metrics_finite
+        && gravity_error.is_none_or(|error| error.is_finite() && error <= 1e-4)
+        && report.cost_after < report.cost_before
+        && report.loop_residual_after <= report.loop_residual_before;
+    Ok(PgoResult {
+        keyframe_indices,
+        original_poses,
+        optimized_poses,
+        iterations: report.iterations,
+        usable,
+    })
+}
+
+/// Every keyframe a node, `sigma = 1 / w` with `w = 1` on odometry edges, least squares.
+fn snapshot_graph_config(
+    config: &PgoConfig,
+    inertial: Option<InertialPgoContext>,
+) -> PoseGraphConfig {
+    PoseGraphConfig {
+        manifold: inertial.map_or(GraphManifold::Se3, |context| {
+            GraphManifold::Gravity(context.gravity_world)
+        }),
+        node_spacing: None,
+        drift_m_per_m: 0.0,
+        drift_rad_per_rad: 0.0,
+        drift_rad_per_m: 0.0,
+        min_sigma_m: 1.0,
+        min_sigma_rad: 1.0,
+        loop_max_candidates: 0,
+        loop_cauchy_scale: None,
+        max_iterations: config.max_iterations,
+        cost_tolerance: config.cost_tolerance,
+        gradient_tolerance: config.gradient_tolerance,
+        initial_lambda: config.initial_lambda,
+        ..PoseGraphConfig::default()
     }
 }
 

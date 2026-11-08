@@ -798,6 +798,42 @@ fn optimize_pose_graph_output_is_bit_identical_to_b1be250() {
     assert_eq!(pgo_result_fingerprint(&inertial), 0xd892_637a_5121_1385);
 }
 
+/// The closer's PoseGraph path with `w * I` information takes the snapshot optimizer's LM path,
+/// on both manifolds.
+#[test]
+fn pose_graph_with_scalar_information_matches_optimize_pose_graph() {
+    let gravity = Vec3F64::new(0.1, -9.7, 0.4);
+    let (map, loops) = drifting_lap_map(gravity.normalize());
+    for inertial in [
+        None,
+        Some(InertialPgoContext {
+            gravity_world: gravity,
+        }),
+    ] {
+        let expected = optimize_pose_graph(&map, &loops, &PgoConfig::default(), inertial).unwrap();
+        let actual = optimize_through_graph(&map, &loops, &PgoConfig::default(), inertial).unwrap();
+        assert_eq!(actual.keyframe_indices, expected.keyframe_indices);
+        assert_eq!(actual.original_poses, expected.original_poses);
+        assert_eq!(actual.usable, expected.usable);
+        assert!(actual.usable);
+        let largest = actual
+            .optimized_poses
+            .iter()
+            .zip(&expected.optimized_poses)
+            .map(|(a, e)| (a.inverse().translation - e.inverse().translation).length())
+            .fold(0.0, f64::max);
+        assert_eq!(actual.iterations, expected.iterations);
+        assert!(largest < 1e-5, "largest centre difference {largest} m");
+        let moved = expected
+            .original_poses
+            .iter()
+            .zip(&expected.optimized_poses)
+            .map(|(b, a)| (b.inverse().translation - a.inverse().translation).length())
+            .fold(0.0, f64::max);
+        assert!(moved > 0.05, "the loops must move the lap: {moved} m");
+    }
+}
+
 #[test]
 fn loop_closer_gate_rejects_correction_beyond_odometry_drift() {
     let config = LoopClosingConfig {
