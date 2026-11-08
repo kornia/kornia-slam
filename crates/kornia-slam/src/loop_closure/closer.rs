@@ -1,8 +1,8 @@
 //! Loop closing for one keyframe: place recognition, verification, episode
 //! consistency, pose-graph optimization and map writeback.
 //!
-//! [`LoopCloser`] owns the bag-of-words database and the acceptance history,
-//! and decides what happens to the map. It reports what the runtime must apply
+//! [`LoopCloser`] owns the bag-of-words database, the acceptance history and
+//! the pose graph, and decides what happens to the map. It reports what the runtime must apply
 //! to its own tracking state through [`LoopClosingOutcome`] rather than
 //! reaching into it.
 

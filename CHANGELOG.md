@@ -10,6 +10,20 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**Loop closing keeps one global pose graph, behind an odometry gate.** A
+verified loop whose correction is more than 3 sigma of the odometry drift
+model (1.9 %/m + 0.10 m, 0.026 deg/m + 1 deg) is now rejected before it reaches
+the pose graph, so repeated structure can no longer bend the trajectory (on a
+sim recording in EuRoC format, ATE 1.55 m ungated → 0.12 m gated; 0.32 m
+without loop closing). Loops then close through `PoseGraph`, which keeps every
+keyframe the map has held across solves: a culled or evicted keyframe stays a
+node, so loops that touch it keep constraining the map instead of failing with
+`MissingLoopKeyframe`. Odometry edges carry the drift model's sigmas and loop
+edges its floors under a Cauchy kernel (`LoopClosingConfig::information`;
+`ScalarWeights` restores the old `w*I` weights). `SlamSystem::map_correction()`
+reports the composed map-from-odometry correction. `PoseGraph<P>`, its
+`LoopVerifier` and the `LoopGate` trait are public for other front ends.
+
 **Stereo-inertial tracking rides through fast motion instead of resetting.**
 Once the IMU has settled, a tracking failure now coasts on the inertial
 prediction for up to 5 s (was 1 s, ORB-SLAM3's `time_recently_lost`), keeps
