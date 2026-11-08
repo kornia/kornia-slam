@@ -711,3 +711,87 @@ fn loop_closer_missing_reference_records_acceptance_without_mutating_map() {
     assert_eq!(map.get_keyframe(10).unwrap().num_associated_points(), 0);
     assert_eq!(closer.verified_loop_count(), 1);
 }
+
+/// A 24-keyframe square lap with yaw and translation drift and two loop edges, for the golden test.
+fn drifting_lap_map(gravity_axis: Vec3F64) -> (Map, Vec<VerifiedLoopEdge>) {
+    let tilt = SO3F64::exp(Vec3F64::new(0.04, -0.03, 0.02)).matrix();
+    let mut map = Map::new();
+    for index in 0..24 {
+        let side = index / 6;
+        let along = (index % 6) as f64 * 0.5;
+        let (x, y) = match side {
+            0 => (along, 0.0),
+            1 => (3.0, along),
+            2 => (3.0 - along, 3.0),
+            _ => (0.0, 3.0 - along),
+        };
+        let drift = index as f64;
+        let yaw = side as f64 * std::f64::consts::FRAC_PI_2 + 0.004 * drift;
+        let rotation = tilt * SO3F64::exp(gravity_axis * -yaw).matrix();
+        let center = Vec3F64::new(x + 0.01 * drift, y - 0.006 * drift, 0.002 * drift);
+        let pose = Pose3d::new(rotation, -(rotation * center));
+        map.insert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())))
+            .unwrap();
+    }
+    let edge = |candidate_kf_idx, query_kf_idx, candidate_to_query| VerifiedLoopEdge {
+        query_kf_idx,
+        candidate_kf_idx,
+        candidate_to_query,
+        correspondences: 40,
+        inliers: 35,
+        inlier_ratio: 0.875,
+        reprojection_rmse_px: 1.0,
+        occupied_cells: 8,
+    };
+    let quarter = SO3F64::exp(gravity_axis * -std::f64::consts::FRAC_PI_2).matrix();
+    let loops = vec![
+        edge(1, 23, Pose3d::new(quarter, Vec3F64::new(0.1, -0.2, 0.05))),
+        edge(0, 22, Pose3d::new(quarter, Vec3F64::new(-0.3, 0.4, 0.0))),
+    ];
+    (map, loops)
+}
+
+/// FNV-1a over every bit of the optimizer's output, so any change in arithmetic order shows.
+fn pgo_result_fingerprint(result: &PgoResult) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut feed = |bits: u64| {
+        for byte in bits.to_le_bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for pose in &result.optimized_poses {
+        for column in 0..3 {
+            let value = pose.rotation.col(column);
+            feed(value.x.to_bits());
+            feed(value.y.to_bits());
+            feed(value.z.to_bits());
+        }
+        feed(pose.translation.x.to_bits());
+        feed(pose.translation.y.to_bits());
+        feed(pose.translation.z.to_bits());
+    }
+    feed(result.iterations as u64);
+    feed(u64::from(result.usable));
+    hash
+}
+
+#[test]
+fn optimize_pose_graph_output_is_bit_identical_to_b1be250() {
+    let gravity = Vec3F64::new(0.1, -9.7, 0.4);
+    let (map, loops) = drifting_lap_map(gravity.normalize());
+    let se3 = optimize_pose_graph(&map, &loops, &PgoConfig::default(), None).unwrap();
+    let inertial = optimize_pose_graph(
+        &map,
+        &loops,
+        &PgoConfig::default(),
+        Some(InertialPgoContext {
+            gravity_world: gravity,
+        }),
+    )
+    .unwrap();
+    // Captured at b1be250, before the solver took information-weighted and robust edges.
+    assert_eq!((se3.iterations, se3.usable), (9, true));
+    assert_eq!((inertial.iterations, inertial.usable), (6, true));
+    assert_eq!(pgo_result_fingerprint(&se3), 0xc41d_4b73_a9e1_94a0);
+    assert_eq!(pgo_result_fingerprint(&inertial), 0xd892_637a_5121_1385);
+}
