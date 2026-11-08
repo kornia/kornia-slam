@@ -1333,3 +1333,25 @@ fn a_stopped_worker_turns_loop_correction_off() {
         drifted
     );
 }
+
+/// The correction epoch advances once per correction written, inline or at a writeback, and a
+/// deferred solve is in flight until it is written back.
+#[test]
+fn correction_epoch_counts_written_corrections() {
+    let (mut closer, mut map) = closing_fixture(background_config(), false);
+    assert_eq!(closer.correction_epoch(), 0);
+    let context = closing_context(&map);
+    closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert_eq!(closer.correction_epoch(), 1);
+    assert!(!closer.solve_in_flight());
+
+    let (closer, mut map) = closing_fixture(background_config(), false);
+    let mut closer = closer.with_solver(LoopSolver::deferred(2));
+    closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert!(closer.solve_in_flight());
+    closer.on_frame(&mut map, &camera(), context);
+    assert_eq!(closer.correction_epoch(), 0);
+    closer.on_frame(&mut map, &camera(), context);
+    assert_eq!(closer.correction_epoch(), 1);
+    assert!(!closer.solve_in_flight());
+}

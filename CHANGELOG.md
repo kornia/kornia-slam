@@ -10,6 +10,20 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**Loop closing can solve off the tracking thread.** `LoopClosingMode::Enabled`
+gains an optional `execution` (source-breaking for code that builds the variant
+by hand): `FollowMapping`, the default, keeps today's inline solve with
+synchronous local mapping and otherwise solves on a `slam-loop-closing` thread;
+`Synchronous`, `Asynchronous` and `Deferred { frames }` (inline, but written
+back `frames` frames later through the background path, so runs replay) choose
+explicitly. A background result is written back at a frame boundary; keyframes
+created or refined by bundle adjustment during the solve keep their relative
+pose, and a result from another world frame is solved again. The map then jumps
+once per correction: `SlamSystem::correction_epoch()` advances with each one,
+so consumers publishing odometry as `T_map * map_correction()` can re-anchor,
+and `loop_solve_in_flight()` reports a pending solve. The landmark geometry
+refresh after a correction no longer scans the keyframe list per observer.
+
 **Loop closing keeps one global pose graph, behind an odometry gate.** A
 verified loop whose correction is more than 3 sigma of the odometry drift
 model (1.9 %/m + 0.10 m, 0.026 deg/m + 1 deg) is now rejected before it reaches
