@@ -592,6 +592,8 @@ fn closing_config() -> LoopClosingConfig {
             },
             ..LoopVerificationConfig::default()
         },
+        // The fixture drifts 0.6 m over a 0.76 m path, far beyond odometry drift.
+        odometry_gate: LoopOdometryGate::Disabled,
         ..LoopClosingConfig::default()
     }
 }
@@ -794,4 +796,92 @@ fn optimize_pose_graph_output_is_bit_identical_to_b1be250() {
     assert_eq!((inertial.iterations, inertial.usable), (6, true));
     assert_eq!(pgo_result_fingerprint(&se3), 0xc41d_4b73_a9e1_94a0);
     assert_eq!(pgo_result_fingerprint(&inertial), 0xd892_637a_5121_1385);
+}
+
+#[test]
+fn loop_closer_gate_rejects_correction_beyond_odometry_drift() {
+    let config = LoopClosingConfig {
+        odometry_gate: LoopOdometryGate::default(),
+        ..closing_config()
+    };
+    let (mut closer, mut map) = closing_fixture(config, false);
+    let before = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    let context = closing_context(&map);
+    let outcome = closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert!(outcome.events.is_empty());
+    assert!(outcome.tracking_correction.is_none());
+    assert!(matches!(
+        outcome.gate_messages.as_slice(),
+        [line] if line.starts_with("[loop-gate] kf=10~0 ") && line.ends_with(" reject")
+    ));
+    assert_eq!(closer.verified_loop_count(), 0);
+    assert_eq!(
+        map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
+        before
+    );
+}
+
+/// Out 12 m along x and 6 m back: the last keyframe sits 6 m from the first.
+fn out_and_back_map() -> Map {
+    let mut map = Map::new();
+    let centres = (0..=12).chain((6..12).rev()).map(|x| x as f64);
+    for (idx, x) in centres.enumerate() {
+        let centre = Vec3F64::new(x, if idx > 12 { 0.5 } else { 0.0 }, 0.0);
+        let pose = Pose3d::new(Mat3F64::IDENTITY, -centre);
+        map.insert_keyframe(Keyframe::from_frame(frame(idx, pose, &[], Vec::new())))
+            .unwrap();
+    }
+    map
+}
+
+fn edge_placing_query_at(map: &Map, query_kf_idx: usize, centre: Vec3F64) -> VerifiedLoopEdge {
+    let candidate = map.get_keyframe(0).unwrap().frame.pose_world_to_cam;
+    let query = Pose3d::new(Mat3F64::IDENTITY, -centre);
+    VerifiedLoopEdge {
+        candidate_to_query: Pose3d::between(&candidate, &query),
+        ..verified_edge(query_kf_idx, 0, 62, 0.6, 0.73, 10)
+    }
+}
+
+/// A repeated-structure match claims the last keyframe, 6 m from the first
+/// along 18 m of path, is back at the start. Optimizing with that edge drags
+/// the trajectory by metres; the gate refuses it and keeps a drift-sized loop.
+#[test]
+fn false_loop_edge_distorts_pose_graph_and_gate_rejects_it() {
+    let map = out_and_back_map();
+    let query_kf_idx = map.keyframes().last().unwrap().frame.idx;
+    let query = map
+        .get_keyframe(query_kf_idx)
+        .unwrap()
+        .frame
+        .pose_world_to_cam;
+    let candidate = map.get_keyframe(0).unwrap().frame.pose_world_to_cam;
+    let path = || map.keyframes().iter().map(|kf| kf.frame.pose_world_to_cam);
+
+    let false_edge = edge_placing_query_at(&map, query_kf_idx, Vec3F64::new(0.1, 0.0, 0.0));
+    let config = PgoConfig {
+        loop_edge_weight: 10.0,
+        ..PgoConfig::default()
+    };
+    let distorted =
+        optimize_pose_graph(&map, std::slice::from_ref(&false_edge), &config, None).unwrap();
+    let largest_shift = distorted
+        .original_poses
+        .iter()
+        .zip(&distorted.optimized_poses)
+        .map(|(before, after)| {
+            (before.inverse().translation - after.inverse().translation).length()
+        })
+        .fold(0.0, f64::max);
+    assert!(largest_shift > 3.0, "shift {largest_shift}");
+
+    let gate = LoopOdometryGate::default();
+    let false_correction = LoopCorrection::measure(candidate, query, path(), &false_edge, None);
+    assert!((false_correction.path_m - (17.0 + 1.25_f64.sqrt())).abs() < 1e-9);
+    assert!((false_correction.translation_m() - 5.92).abs() < 0.01);
+    assert!(!gate.judge(&false_correction).unwrap().accepted);
+
+    let true_edge = edge_placing_query_at(&map, query_kf_idx, Vec3F64::new(6.2, 0.3, 0.0));
+    let true_correction = LoopCorrection::measure(candidate, query, path(), &true_edge, None);
+    assert!(gate.judge(&true_correction).unwrap().accepted);
 }

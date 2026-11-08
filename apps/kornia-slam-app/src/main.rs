@@ -17,6 +17,7 @@ mod utils;
 use config::RunConfig;
 use evaluation::associate_gt;
 use kornia_algebra::Vec3F64;
+use kornia_slam::loop_closure::{LoopOdometryGate, LoopTemporalConsistency};
 use kornia_slam::system::PipelineDefinition;
 use kornia_slam::{LoopClosureEvent, SlamSystem};
 use source::{FrameItem, OpenedSource};
@@ -60,6 +61,40 @@ struct Args {
     debug: bool,
 }
 
+/// Evaluation switches for loop-closure tuning that configuration files do not
+/// expose: `KORNIA_SLAM_LOOP_GATE=off` disables the odometry gate, and
+/// `KORNIA_SLAM_LOOP_TEMPORAL=<n>` requires `n` agreeing detections before the
+/// first loop in a place.
+fn apply_loop_gate_overrides(
+    pipeline: &mut PipelineDefinition,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let PipelineDefinition::OrbSlam(orb) = pipeline;
+    let loop_correction = &mut orb.tuning.loop_correction;
+    if let Some(value) = std::env::var_os("KORNIA_SLAM_LOOP_GATE") {
+        match value.to_str() {
+            Some("off") => loop_correction.odometry_gate = LoopOdometryGate::Disabled,
+            Some("on") => {}
+            _ => return Err("KORNIA_SLAM_LOOP_GATE must be `on` or `off`".into()),
+        }
+    }
+    if let Some(value) = std::env::var_os("KORNIA_SLAM_LOOP_TEMPORAL") {
+        let min_detections: usize = value
+            .to_str()
+            .and_then(|text| text.parse().ok())
+            .ok_or("KORNIA_SLAM_LOOP_TEMPORAL must be a detection count")?;
+        loop_correction.temporal_consistency = LoopTemporalConsistency::enabled(min_detections);
+    }
+    if std::env::var_os("KORNIA_SLAM_LOOP_GATE").is_some()
+        || std::env::var_os("KORNIA_SLAM_LOOP_TEMPORAL").is_some()
+    {
+        eprintln!(
+            "  loop gate: {:?}; temporal: {:?}",
+            loop_correction.odometry_gate, loop_correction.temporal_consistency
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Args = argh::from_env();
 
@@ -68,7 +103,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "viz"))]
     let tui_active = !args.no_tui;
 
-    let run = RunConfig::from_ron_file(&args.config)?;
+    let mut run = RunConfig::from_ron_file(&args.config)?;
+    apply_loop_gate_overrides(&mut run.system.pipeline)?;
     if !tui_active {
         eprint!("{}", run.system);
     }
