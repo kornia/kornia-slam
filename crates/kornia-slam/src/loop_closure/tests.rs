@@ -842,6 +842,48 @@ fn pose_graph_with_scalar_information_matches_optimize_pose_graph() {
     }
 }
 
+/// Map rotations off orthonormal by 1e-6, as bundle adjustment leaves them: the graph must seed
+/// its solve with the map's own poses, not with poses chained through `R^T` as an inverse.
+#[test]
+fn pose_graph_seeds_from_map_poses_that_are_not_quite_rotations() {
+    let gravity = Vec3F64::new(0.1, -9.7, 0.4);
+    let (clean, loops) = drifting_lap_map(gravity.normalize());
+    let mut map = Map::new();
+    for (index, keyframe) in clean.keyframes().iter().enumerate() {
+        let mut pose = keyframe.frame.pose_world_to_cam;
+        let wobble = 1e-6 * ((index * 7919) % 13) as f64 / 13.0;
+        let mut columns = pose.rotation.to_cols_array();
+        columns[..3]
+            .iter_mut()
+            .for_each(|value| *value *= 1.0 + wobble);
+        columns[6..]
+            .iter_mut()
+            .for_each(|value| *value *= 1.0 - wobble);
+        pose.rotation = Mat3F64::from_cols_array(&columns);
+        map.insert_keyframe(Keyframe::from_frame(frame(
+            keyframe.frame.idx,
+            pose,
+            &[],
+            Vec::new(),
+        )))
+        .unwrap();
+    }
+    let inertial = Some(InertialPgoContext {
+        gravity_world: gravity,
+    });
+    let expected = optimize_pose_graph(&map, &loops, &PgoConfig::default(), inertial).unwrap();
+    let actual = optimize_through_graph(
+        &map,
+        &loops,
+        &PgoConfig::default(),
+        LoopGraphInformation::ScalarWeights,
+        inertial,
+    )
+    .unwrap();
+    assert_eq!(actual.iterations, expected.iterations);
+    assert_eq!(actual.optimized_poses, expected.optimized_poses);
+}
+
 /// A 24-keyframe square lap, 0.5 m apart, drifting `drift` rad of yaw and a few mm per
 /// keyframe about gravity; `drift = 0` is the truth.
 fn square_lap(gravity_axis: Vec3F64, drift: f64) -> Vec<Pose3d> {
