@@ -11,9 +11,9 @@
 //! depends on a camera centre that solve moved, even though its own position
 //! must never be written back from that stale capture.
 
-use crate::mapping::map::{Map, ORB_N_LEVELS, ORB_SCALE_FACTOR};
+use crate::mapping::map::{Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
 use kornia_algebra::Vec3F64;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 impl Map {
     /// Recomputes the mean viewing direction and scale-invariance distance
@@ -29,55 +29,21 @@ impl Map {
         scale_factor: f64,
         n_levels: usize,
     ) {
-        let (position, kf_indices, ref_kf_idx, ref_octave) = {
-            let Some(mp) = self.map_points.get(mp_idx) else {
-                return;
-            };
-            if mp.culled {
-                return;
-            }
-            (
-                mp.position,
-                mp.observer_keyframes().collect::<Vec<_>>(),
-                mp.keyframe_idx,
-                mp.reference_octave,
-            )
+        let keyframes = &self.keyframes;
+        let centre = |kf_idx: usize| {
+            keyframes
+                .iter()
+                .find(|kf| kf.frame.idx == kf_idx)
+                .map(camera_centre)
         };
-
-        let mut normal = Vec3F64::ZERO;
-        let mut n = 0usize;
-        for kf_idx in &kf_indices {
-            if let Some(kf) = self.get_keyframe(*kf_idx) {
-                let cam_center = kf.frame.pose_world_to_cam.inverse().translation;
-                let dir = position - cam_center;
-                let len = dir.length();
-                if len > 1e-9 {
-                    normal += dir / len;
-                    n += 1;
-                }
-            }
-        }
-
-        let Some(ref_kf) = self.get_keyframe(ref_kf_idx) else {
+        let Some(geometry) = self
+            .map_points
+            .get(mp_idx)
+            .and_then(|mp| refreshed_geometry(mp, centre, scale_factor, n_levels))
+        else {
             return;
         };
-        let ref_center = ref_kf.frame.pose_world_to_cam.inverse().translation;
-        let dist = (position - ref_center).length();
-        let level_scale = scale_factor.powi(ref_octave as i32);
-        let max_dist = dist * level_scale;
-        let min_dist = if n_levels > 0 {
-            max_dist / scale_factor.powi(n_levels as i32 - 1)
-        } else {
-            max_dist
-        };
-
-        if let Some(mp) = self.map_points.get_mut(mp_idx) {
-            if n > 0 {
-                mp.mean_viewing_direction = normal / n as f64;
-            }
-            mp.max_distance = max_dist;
-            mp.min_distance = min_dist;
-        }
+        geometry.write(&mut self.map_points[mp_idx]);
     }
 
     /// Live landmark ids observed by any keyframe in `keyframe_indices`.
@@ -117,6 +83,9 @@ impl Map {
     /// Refreshes derived geometry once per affected landmark, in ascending id
     /// order so a correction's finalization is deterministic regardless of how
     /// its dependency sets were assembled. Returns how many were refreshed.
+    ///
+    /// Camera centres are tabulated once: looking each observer up in the
+    /// keyframe list made a whole-map refresh O(landmarks x observers x keyframes).
     pub(in crate::mapping::map) fn finalize_landmark_geometry(
         &mut self,
         landmark_ids: impl IntoIterator<Item = usize>,
@@ -124,9 +93,84 @@ impl Map {
         let mut ids: Vec<usize> = landmark_ids.into_iter().collect();
         ids.sort_unstable();
         ids.dedup();
+        let centres: HashMap<usize, Vec3F64> = self
+            .keyframes
+            .iter()
+            .map(|kf| (kf.frame.idx, camera_centre(kf)))
+            .collect();
+        let centre = |kf_idx: usize| centres.get(&kf_idx).copied();
         for &idx in &ids {
-            self.update_map_point_geometry(idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+            let Some(geometry) = self
+                .map_points
+                .get(idx)
+                .and_then(|mp| refreshed_geometry(mp, centre, ORB_SCALE_FACTOR, ORB_N_LEVELS))
+            else {
+                continue;
+            };
+            geometry.write(&mut self.map_points[idx]);
         }
         ids.len()
     }
+}
+
+fn camera_centre(keyframe: &Keyframe) -> Vec3F64 {
+    keyframe.frame.pose_world_to_cam.inverse().translation
+}
+
+/// A landmark's derived geometry; the viewing direction is `None` when no
+/// observer centre was usable, which keeps the stored one.
+struct LandmarkGeometry {
+    mean_viewing_direction: Option<Vec3F64>,
+    max_distance: f64,
+    min_distance: f64,
+}
+
+impl LandmarkGeometry {
+    fn write(self, mp: &mut MapPoint) {
+        if let Some(direction) = self.mean_viewing_direction {
+            mp.mean_viewing_direction = direction;
+        }
+        mp.max_distance = self.max_distance;
+        mp.min_distance = self.min_distance;
+    }
+}
+
+/// `None` if the point is culled or its reference keyframe has no centre.
+fn refreshed_geometry(
+    mp: &MapPoint,
+    centre: impl Fn(usize) -> Option<Vec3F64>,
+    scale_factor: f64,
+    n_levels: usize,
+) -> Option<LandmarkGeometry> {
+    if mp.culled {
+        return None;
+    }
+    let position = mp.position;
+    let mut normal = Vec3F64::ZERO;
+    let mut n = 0usize;
+    for kf_idx in mp.observer_keyframes() {
+        if let Some(cam_center) = centre(kf_idx) {
+            let dir = position - cam_center;
+            let len = dir.length();
+            if len > 1e-9 {
+                normal += dir / len;
+                n += 1;
+            }
+        }
+    }
+
+    let ref_center = centre(mp.keyframe_idx)?;
+    let dist = (position - ref_center).length();
+    let level_scale = scale_factor.powi(mp.reference_octave as i32);
+    let max_dist = dist * level_scale;
+    let min_dist = if n_levels > 0 {
+        max_dist / scale_factor.powi(n_levels as i32 - 1)
+    } else {
+        max_dist
+    };
+    Some(LandmarkGeometry {
+        mean_viewing_direction: (n > 0).then(|| normal / n as f64),
+        max_distance: max_dist,
+        min_distance: min_dist,
+    })
 }
