@@ -17,7 +17,7 @@ use crate::loop_closure::place_recognition::{
 };
 use crate::loop_closure::pose_graph::max_gravity_alignment_error;
 use crate::loop_closure::{
-    GateDecision, GraphManifold, InertialPgoContext, LoopCorrection, LoopEpisodeConfig,
+    DriftModel, GateDecision, GraphManifold, InertialPgoContext, LoopCorrection, LoopEpisodeConfig,
     LoopEpisodeDecision, LoopEpisodeTracker, LoopFusionConfig, LoopGate, LoopMeasurement,
     LoopOdometryGate, LoopProposal, LoopTemporalConsistency, LoopVerificationConfig,
     OdometryConsistencyGate, PgoConfig, PgoError, PgoResult, PoseGraph, PoseGraphConfig,
@@ -36,6 +36,31 @@ pub struct LoopClosingConfig {
     pub odometry_gate: LoopOdometryGate,
     pub temporal_consistency: LoopTemporalConsistency,
     pub optimizer: PgoConfig,
+    pub information: LoopGraphInformation,
+}
+
+/// The information odometry and loop edges carry in the pose graph.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LoopGraphInformation {
+    /// `w * I` from [`PgoConfig`]: the scalar weights of [`optimize_pose_graph`].
+    ///
+    /// [`optimize_pose_graph`]: crate::loop_closure::optimize_pose_graph
+    ScalarWeights,
+    /// Odometry edges at the drift model's per-metre sigmas over their own path, loop edges at
+    /// its floors (the verified pose's own noise) under a Cauchy kernel in whitened units.
+    Drift {
+        drift: DriftModel,
+        loop_cauchy_scale: f64,
+    },
+}
+
+impl Default for LoopGraphInformation {
+    fn default() -> Self {
+        Self::Drift {
+            drift: DriftModel::default(),
+            loop_cauchy_scale: 3.0,
+        }
+    }
 }
 
 /// Concise externally visible result of a loop-closure attempt.
@@ -301,6 +326,7 @@ impl LoopAcceptance {
                             map,
                             &loops,
                             &self.config.optimizer,
+                            self.config.information,
                             inertial_pgo,
                         ) {
                             Ok(result) => {
@@ -400,33 +426,42 @@ impl LoopAcceptance {
     }
 }
 
-/// [`optimize_pose_graph`] through a [`PoseGraph`] of every keyframe, with `w * I`
-/// square-root information: the same snapshot, edges, solver and usability test.
+/// [`optimize_pose_graph`]'s snapshot, edges, solver and usability test through a [`PoseGraph`]
+/// of every keyframe, at `information`.
 ///
 /// [`optimize_pose_graph`]: crate::loop_closure::optimize_pose_graph
 pub(super) fn optimize_through_graph(
     map: &Map,
     verified_loops: &[VerifiedLoopEdge],
     config: &PgoConfig,
+    information: LoopGraphInformation,
     inertial: Option<InertialPgoContext>,
 ) -> Result<PgoResult, PgoError> {
     let keyframes = map.keyframes();
     if keyframes.len() < 2 {
         return Err(PgoError::TooFewKeyframes);
     }
-    let mut graph = PoseGraph::new(snapshot_graph_config(config, inertial));
+    let mut graph = PoseGraph::new(snapshot_graph_config(config, information, inertial));
     for keyframe in keyframes {
         let frame = &keyframe.frame;
         graph
             .add_keyframe(frame.idx, 0.0, frame.pose_world_to_cam, (), &mut RejectAll)
             .map_err(|error| PgoError::Solver(error.to_string()))?;
     }
-    let loop_sigma = 1.0 / f64::from(config.loop_edge_weight);
+    let (sigma_m, sigma_rad) = match information {
+        LoopGraphInformation::ScalarWeights => {
+            let sigma = 1.0 / f64::from(config.loop_edge_weight);
+            (sigma, sigma)
+        }
+        LoopGraphInformation::Drift { drift, .. } => {
+            (drift.translation_floor_m, drift.yaw_floor_rad)
+        }
+    };
     let loops = verified_loops.iter().map(|edge| {
         let measurement = LoopMeasurement {
             candidate_to_query: edge.candidate_to_query,
-            sigma_m: loop_sigma,
-            sigma_rad: loop_sigma,
+            sigma_m,
+            sigma_rad,
         };
         (edge.candidate_kf_idx, edge.query_kf_idx, measurement)
     });
@@ -463,28 +498,45 @@ pub(super) fn optimize_through_graph(
     })
 }
 
-/// Every keyframe a node, `sigma = 1 / w` with `w = 1` on odometry edges, least squares.
+/// Every keyframe a node. Scalar weights put `sigma = 1 / w = 1` on odometry edges; the drift
+/// model has no per-radian term, and its odometry sigmas keep the graph's floors.
 fn snapshot_graph_config(
     config: &PgoConfig,
+    information: LoopGraphInformation,
     inertial: Option<InertialPgoContext>,
 ) -> PoseGraphConfig {
+    let defaults = PoseGraphConfig::default();
+    let (drift_m_per_m, drift_rad_per_m, min_sigma_m, min_sigma_rad, loop_cauchy_scale) =
+        match information {
+            LoopGraphInformation::ScalarWeights => (0.0, 0.0, 1.0, 1.0, None),
+            LoopGraphInformation::Drift {
+                drift,
+                loop_cauchy_scale,
+            } => (
+                drift.translation_per_m,
+                drift.yaw_per_m_rad,
+                defaults.min_sigma_m,
+                defaults.min_sigma_rad,
+                Some(loop_cauchy_scale),
+            ),
+        };
     PoseGraphConfig {
         manifold: inertial.map_or(GraphManifold::Se3, |context| {
             GraphManifold::Gravity(context.gravity_world)
         }),
         node_spacing: None,
-        drift_m_per_m: 0.0,
+        drift_m_per_m,
         drift_rad_per_rad: 0.0,
-        drift_rad_per_m: 0.0,
-        min_sigma_m: 1.0,
-        min_sigma_rad: 1.0,
+        drift_rad_per_m,
+        min_sigma_m,
+        min_sigma_rad,
         loop_max_candidates: 0,
-        loop_cauchy_scale: None,
+        loop_cauchy_scale,
         max_iterations: config.max_iterations,
         cost_tolerance: config.cost_tolerance,
         gradient_tolerance: config.gradient_tolerance,
         initial_lambda: config.initial_lambda,
-        ..PoseGraphConfig::default()
+        ..defaults
     }
 }
 
