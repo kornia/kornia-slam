@@ -247,6 +247,11 @@ impl<P> PoseGraph<P> {
         &self.config
     }
 
+    /// The next solve moves poses in `manifold`; gravity can be refined between solves.
+    pub fn set_manifold(&mut self, manifold: GraphManifold) {
+        self.config.manifold = manifold;
+    }
+
     pub fn nodes(&self) -> &[Node<P>] {
         &self.nodes
     }
