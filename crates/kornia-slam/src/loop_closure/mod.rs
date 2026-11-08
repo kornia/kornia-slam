@@ -4,6 +4,7 @@
 mod closer;
 mod episode;
 mod fusion;
+mod graph;
 mod odometry_gate;
 pub mod place_recognition;
 mod pose_graph;
@@ -14,6 +15,11 @@ pub(crate) use closer::{LoopCloser, LoopClosingContext};
 pub use closer::{LoopClosingConfig, LoopClosureEvent};
 pub use episode::{LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker};
 pub use fusion::{LoopFusionConfig, LoopFusionStats, fuse_verified_loop};
+pub use graph::{
+    Correction, Edge, EdgeKind, GraphManifold, KeyframeOutcome, LoopCandidate, LoopMeasurement,
+    LoopQuery, LoopVerifier, Node, NodeId, NodeSpacing, PoseGraph, PoseGraphConfig, PoseGraphError,
+    RejectAll, SolveReport,
+};
 pub use odometry_gate::{
     DriftModel, LoopCorrection, LoopGateVerdict, LoopOdometryGate, LoopTemporalConsistency,
     TemporalDecision,
