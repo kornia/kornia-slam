@@ -16,7 +16,7 @@ mod tui;
 mod utils;
 use config::RunConfig;
 use evaluation::associate_gt;
-use kornia_algebra::Vec3F64;
+use kornia_algebra::{SO3F64, Vec3F64};
 use kornia_slam::loop_closure::{LoopOdometryGate, LoopTemporalConsistency};
 use kornia_slam::system::PipelineDefinition;
 use kornia_slam::{LoopClosureEvent, SlamSystem};
@@ -210,13 +210,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         for event in system.drain_loop_closure_events() {
             match event {
-                LoopClosureEvent::Accepted { edge, applied } => eprintln!(
-                    "[loop-closure] accepted kf={} ~ kf={} inliers={} rmse={:.2}px applied={applied}",
-                    edge.query_kf_idx,
-                    edge.candidate_kf_idx,
-                    edge.inliers,
-                    edge.reprojection_rmse_px,
-                ),
+                LoopClosureEvent::Accepted { edge, applied } => {
+                    eprintln!(
+                        "[loop-closure] accepted kf={} ~ kf={} inliers={} rmse={:.2}px applied={applied}",
+                        edge.query_kf_idx,
+                        edge.candidate_kf_idx,
+                        edge.inliers,
+                        edge.reprojection_rmse_px,
+                    );
+                    if applied {
+                        let correction = system.map_correction().map_from_odometry;
+                        let t = correction.translation;
+                        let angle = SO3F64::from_matrix(&correction.rotation).log().length();
+                        eprintln!(
+                            "[map-correction] map_from_odometry t=({:.3},{:.3},{:.3}) rot_deg={:.2}",
+                            t.x,
+                            t.y,
+                            t.z,
+                            angle.to_degrees(),
+                        );
+                    }
+                }
                 LoopClosureEvent::PgoFailed {
                     query_kf_idx,
                     candidate_kf_idx,

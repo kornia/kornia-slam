@@ -906,6 +906,79 @@ fn drift_information_pulls_a_true_loop_towards_the_truth() {
     assert!(after < before, "end error {before} m -> {after} m");
 }
 
+/// A loop keeps constraining the map after its candidate keyframe is culled: the persistent
+/// graph still holds the node, where the snapshot optimizer loses the loop.
+#[test]
+fn persistent_graph_keeps_a_loop_whose_keyframe_was_culled() {
+    let gravity = Vec3F64::new(0.0, -9.81, 0.0);
+    let truth = square_lap(gravity.normalize(), 0.0);
+    let mut map = Map::new();
+    for (index, pose) in square_lap(gravity.normalize(), 0.004)
+        .into_iter()
+        .enumerate()
+    {
+        map.insert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())))
+            .unwrap();
+    }
+    let loop_from = |candidate: usize, query: usize| VerifiedLoopEdge {
+        candidate_to_query: Pose3d::between(&truth[candidate], &truth[query]),
+        ..verified_edge(query, candidate, 40, 0.875, 1.0, 8)
+    };
+    let (first, second) = (loop_from(1, 23), loop_from(0, 22));
+    let config = PgoConfig::default();
+    let information = LoopGraphInformation::default();
+    let inertial = Some(InertialPgoContext {
+        gravity_world: gravity,
+    });
+    let mut graph = PoseGraph::new(snapshot_graph_config(&config, information, inertial));
+    let apply = |map: &mut Map, result: &PgoResult| {
+        map.apply_pose_graph_correction(
+            &result.keyframe_indices,
+            &result.original_poses,
+            &result.optimized_poses,
+        )
+        .unwrap();
+    };
+
+    let (result, new_world) = solve_in_graph(
+        &mut graph,
+        &map,
+        std::slice::from_ref(&first),
+        &config,
+        information,
+        inertial,
+    )
+    .unwrap();
+    assert!(!new_world && result.usable);
+    apply(&mut map, &result);
+    map.remove_keyframe(1).unwrap();
+
+    assert!(matches!(
+        optimize_pose_graph(&map, &[first, second.clone()], &config, inertial),
+        Err(PgoError::MissingLoopKeyframe)
+    ));
+    let (result, _) = solve_in_graph(
+        &mut graph,
+        &map,
+        std::slice::from_ref(&second),
+        &config,
+        information,
+        inertial,
+    )
+    .unwrap();
+    assert_eq!(result.keyframe_indices.len(), 23);
+    assert_eq!(graph.nodes().len(), 24);
+    assert_eq!(graph.node_of_keyframe(1), None);
+    assert_eq!(
+        graph
+            .edges()
+            .filter(|edge| edge.kind == EdgeKind::Loop)
+            .count(),
+        2
+    );
+    apply(&mut map, &result);
+}
+
 #[test]
 fn loop_closer_gate_rejects_correction_beyond_odometry_drift() {
     let config = LoopClosingConfig {

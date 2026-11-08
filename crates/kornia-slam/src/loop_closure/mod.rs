@@ -35,7 +35,7 @@ pub use verification::{
 };
 
 #[cfg(test)]
-use closer::optimize_through_graph;
+use closer::{optimize_through_graph, snapshot_graph_config, solve_in_graph};
 #[cfg(test)]
 use pose_graph::{max_gravity_alignment_error, pose_graph_cost};
 #[cfg(test)]

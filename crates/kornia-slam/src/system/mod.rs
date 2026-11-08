@@ -47,7 +47,7 @@ use crate::initialization::bootstrap::{
     TooFewStereoPoints, evaluate_bootstrap,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
-use crate::loop_closure::{LoopCloser, LoopClosingContext, LoopClosureEvent};
+use crate::loop_closure::{Correction, LoopCloser, LoopClosingContext, LoopClosureEvent};
 use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
 use crate::mapping::map::{
     InertialAlignmentError, Keyframe, Map, MapInsertion, MapMutationError, MapPoint,
@@ -138,6 +138,17 @@ impl SlamSystem {
 
     pub fn drain_loop_closure_events(&mut self) -> Vec<LoopClosureEvent> {
         std::mem::take(&mut self.loop_closure_events)
+    }
+
+    /// Where loop closing has moved the map relative to the world tracking drifted into;
+    /// identity without loop closing or before the first correction.
+    pub fn map_correction(&self) -> Correction {
+        self.loop_closer.as_ref().map_or(
+            Correction {
+                map_from_odometry: Pose3d::IDENTITY,
+            },
+            LoopCloser::map_correction,
+        )
     }
 
     /// The system's sensor calibration, restricted to the selected sensors.
@@ -1310,12 +1321,20 @@ impl SlamSystem {
             imu_initialized: self.state.imu_initialized,
             gravity_world: self.inertial.gravity_world,
         };
+        let started = Instant::now();
         let outcome = {
             let mut map = self.map.lock().unwrap();
             loop_closer.on_keyframe(&mut map, &self.rig.camera, kf_idx, context)
         };
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let graph_nodes = loop_closer.graph_nodes();
         if let Some(message) = outcome.debug_message {
             self.dbg(message);
+        }
+        if !outcome.events.is_empty() {
+            self.dbg(format!(
+                "[loop-time] kf={kf_idx} on_keyframe_ms={elapsed_ms:.1} graph_nodes={graph_nodes}"
+            ));
         }
         for message in outcome.gate_messages {
             self.dbg(message);
