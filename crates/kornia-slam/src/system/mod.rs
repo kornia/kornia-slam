@@ -1317,6 +1317,9 @@ impl SlamSystem {
         if let Some(message) = outcome.debug_message {
             self.dbg(message);
         }
+        for message in outcome.gate_messages {
+            self.dbg(message);
+        }
         if let Some((corrected_tracking_pose, corrected_velocity)) = outcome.tracking_correction {
             self.state.pose_world_to_cam = corrected_tracking_pose;
             self.state.velocity_world = corrected_velocity;

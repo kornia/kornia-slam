@@ -12,13 +12,15 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 
+use crate::loop_closure::odometry_gate::TemporalConsistencyTracker;
 use crate::loop_closure::place_recognition::{
     Candidate, KeyFrameDatabase, Vocabulary, compute_bow,
 };
 use crate::loop_closure::{
-    InertialPgoContext, LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker,
-    LoopFusionConfig, LoopVerificationConfig, PgoConfig, VerifiedLoopEdge, fuse_verified_loop,
-    optimize_pose_graph, verify_loop_candidate,
+    InertialPgoContext, LoopCorrection, LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker,
+    LoopFusionConfig, LoopOdometryGate, LoopTemporalConsistency, LoopVerificationConfig, PgoConfig,
+    TemporalDecision, VerifiedLoopEdge, fuse_verified_loop, optimize_pose_graph,
+    verify_loop_candidate,
 };
 use crate::mapping::Map;
 use crate::pose_conversion::apply_reference_pose_correction;
@@ -29,6 +31,8 @@ pub struct LoopClosingConfig {
     pub episode: LoopEpisodeConfig,
     pub fusion: LoopFusionConfig,
     pub verification: LoopVerificationConfig,
+    pub odometry_gate: LoopOdometryGate,
+    pub temporal_consistency: LoopTemporalConsistency,
     pub optimizer: PgoConfig,
 }
 
@@ -61,6 +65,8 @@ pub(crate) struct LoopClosingContext {
 pub(crate) struct LoopClosingOutcome {
     /// The best place-recognition match, for the runtime's debug log.
     pub debug_message: Option<String>,
+    /// One `[loop-gate]` or `[loop-temporal]` line per decision.
+    pub gate_messages: Vec<String>,
     pub events: Vec<LoopClosureEvent>,
     /// Corrected `(pose_world_to_cam, velocity_world)`, set only when the map
     /// was actually corrected.
@@ -196,6 +202,7 @@ struct LoopAcceptance {
     config: LoopClosingConfig,
     require_imu_initialized: bool,
     episode_tracker: LoopEpisodeTracker,
+    temporal_tracker: TemporalConsistencyTracker,
     verified_loops: Vec<VerifiedLoopEdge>,
     verified_loop_pairs: HashSet<(usize, usize)>,
 }
@@ -203,10 +210,13 @@ struct LoopAcceptance {
 impl LoopAcceptance {
     fn new(config: LoopClosingConfig, require_imu_initialized: bool) -> Self {
         let episode_tracker = LoopEpisodeTracker::new(config.episode);
+        let temporal_tracker =
+            TemporalConsistencyTracker::new(config.temporal_consistency, config.episode);
         Self {
             config,
             require_imu_initialized,
             episode_tracker,
+            temporal_tracker,
             verified_loops: Vec::new(),
             verified_loop_pairs: HashSet::new(),
         }
@@ -249,6 +259,23 @@ impl LoopAcceptance {
                     .iter()
                     .position(|keyframe| keyframe.frame.idx == candidate.kf_idx)
                     .expect("verified candidate keyframe must be in the map");
+                let gravity = context.imu_initialized.then_some(context.gravity_world);
+                let correction = loop_correction(map, query_order, candidate_order, &edge, gravity);
+                if let Some(correction) = correction {
+                    if !self.admit(&edge, &correction, &mut outcome.gate_messages) {
+                        continue;
+                    }
+                    if !self.temporally_consistent(
+                        map,
+                        query_order,
+                        candidate_order,
+                        &edge,
+                        correction,
+                        &mut outcome.gate_messages,
+                    ) {
+                        break;
+                    }
+                }
                 let decision =
                     self.episode_tracker
                         .observe(query_order, candidate_order, edge.clone());
@@ -347,6 +374,106 @@ impl LoopAcceptance {
         }
         outcome
     }
+
+    /// The odometry gate: `false` rejects the verified edge as if verification
+    /// had failed, so the next candidate is tried.
+    fn admit(
+        &self,
+        edge: &VerifiedLoopEdge,
+        correction: &LoopCorrection,
+        log: &mut Vec<String>,
+    ) -> bool {
+        let Some(verdict) = self.config.odometry_gate.judge(correction) else {
+            return true;
+        };
+        log.push(format!(
+            "[loop-gate] kf={}~{} path_m={:.2} path_rot_deg={:.1} corr_t={:.3} corr_yaw_deg={:.2} sigma_t={:.3} sigma_yaw_deg={:.2} k={} {}",
+            edge.query_kf_idx,
+            edge.candidate_kf_idx,
+            correction.path_m,
+            correction.path_rotation_rad.to_degrees(),
+            correction.translation_m(),
+            correction.yaw_rad.to_degrees(),
+            verdict.sigma_t_m,
+            verdict.sigma_yaw_rad.to_degrees(),
+            verdict.k_sigma,
+            if verdict.accepted { "accept" } else { "reject" },
+        ));
+        verdict.accepted
+    }
+
+    /// The temporal rule, applied only where no loop was accepted yet: `false`
+    /// holds the detection back until enough consecutive ones agree.
+    fn temporally_consistent(
+        &mut self,
+        map: &Map,
+        query_order: usize,
+        candidate_order: usize,
+        edge: &VerifiedLoopEdge,
+        correction: LoopCorrection,
+        log: &mut Vec<String>,
+    ) -> bool {
+        if self.config.temporal_consistency == LoopTemporalConsistency::Disabled
+            || self.region_has_loop(map, candidate_order)
+        {
+            return true;
+        }
+        let Some(decision) =
+            self.temporal_tracker
+                .observe(query_order, candidate_order, correction)
+        else {
+            return true;
+        };
+        let (passed, state) = match decision {
+            TemporalDecision::Pass => (true, "pass".to_string()),
+            TemporalDecision::Pending { hits, required } => {
+                (false, format!("pending {hits}/{required}"))
+            }
+        };
+        log.push(format!(
+            "[loop-temporal] kf={}~{} corr_t={:.3} corr_yaw_deg={:.2} {state}",
+            edge.query_kf_idx,
+            edge.candidate_kf_idx,
+            correction.translation_m(),
+            correction.yaw_rad.to_degrees(),
+        ));
+        passed
+    }
+
+    /// Whether an accepted loop already matched a keyframe within the episode
+    /// neighbourhood of `candidate_order`.
+    fn region_has_loop(&self, map: &Map, candidate_order: usize) -> bool {
+        let radius = self.config.episode.candidate_neighborhood_radius;
+        self.verified_loops.iter().any(|accepted| {
+            map.keyframes()
+                .iter()
+                .position(|keyframe| keyframe.frame.idx == accepted.candidate_kf_idx)
+                .is_some_and(|order| order.abs_diff(candidate_order) <= radius)
+        })
+    }
+}
+
+/// The correction `edge` would apply, over the keyframe path between its ends.
+fn loop_correction(
+    map: &Map,
+    query_order: usize,
+    candidate_order: usize,
+    edge: &VerifiedLoopEdge,
+    gravity: Option<Vec3F64>,
+) -> Option<LoopCorrection> {
+    let keyframes = map.keyframes();
+    let pose = |order: usize| keyframes.get(order).map(|kf| kf.frame.pose_world_to_cam);
+    let span = candidate_order.min(query_order)..=candidate_order.max(query_order);
+    Some(LoopCorrection::measure(
+        pose(candidate_order)?,
+        pose(query_order)?,
+        keyframes
+            .get(span)?
+            .iter()
+            .map(|kf| kf.frame.pose_world_to_cam),
+        edge,
+        gravity,
+    ))
 }
 
 fn normalized_loop_pair(a: usize, b: usize) -> (usize, usize) {

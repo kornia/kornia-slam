@@ -7,7 +7,7 @@ use super::config::{
     SystemConfig,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
-use crate::loop_closure::LoopClosingConfig;
+use crate::loop_closure::{LoopClosingConfig, LoopOdometryGate, LoopTemporalConsistency};
 use crate::tracking::KeyframePolicy;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
 
@@ -311,6 +311,51 @@ fn validate_correction(config: &LoopClosingConfig) -> Result<(), ConfigError> {
         config.episode.min_consistent_edges as f64,
         AT_LEAST_ONE,
     )?;
+    if let LoopOdometryGate::Enabled { drift, k_sigma } = config.odometry_gate {
+        check(at("odometry_gate.k_sigma"), k_sigma, POSITIVE)?;
+        check(
+            at("odometry_gate.drift.translation_per_m"),
+            drift.translation_per_m,
+            NON_NEGATIVE,
+        )?;
+        check(
+            at("odometry_gate.drift.translation_floor_m"),
+            drift.translation_floor_m,
+            POSITIVE,
+        )?;
+        check(
+            at("odometry_gate.drift.yaw_per_m_rad"),
+            drift.yaw_per_m_rad,
+            NON_NEGATIVE,
+        )?;
+        check(
+            at("odometry_gate.drift.yaw_floor_rad"),
+            drift.yaw_floor_rad,
+            POSITIVE,
+        )?;
+    }
+    if let LoopTemporalConsistency::Enabled {
+        min_detections,
+        max_translation_m,
+        max_yaw_rad,
+    } = config.temporal_consistency
+    {
+        check(
+            at("temporal_consistency.min_detections"),
+            min_detections as f64,
+            AT_LEAST_ONE,
+        )?;
+        check(
+            at("temporal_consistency.max_translation_m"),
+            max_translation_m,
+            POSITIVE,
+        )?;
+        check(
+            at("temporal_consistency.max_yaw_rad"),
+            max_yaw_rad,
+            POSITIVE,
+        )?;
+    }
     let fusion = &config.fusion;
     check(
         at("fusion.search_radius_px"),
