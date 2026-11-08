@@ -14,6 +14,10 @@ pub use closer::{LoopClosingConfig, LoopClosureEvent};
 pub use episode::{LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker};
 pub use fusion::{LoopFusionConfig, LoopFusionStats, fuse_verified_loop};
 pub use pose_graph::{InertialPgoContext, PgoConfig, PgoError, PgoResult, optimize_pose_graph};
+pub use sparse_pgo::{
+    GravityManifold, InformationEdge, PoseGraphEdge, PoseManifold, RobustKernel, Se3Manifold,
+    SparsePgoError, SparsePgoResult, sparse_pose_graph_optimize,
+};
 pub use verification::{
     LoopVerificationConfig, LoopVerificationReject, VerifiedLoopEdge, verify_loop_candidate,
 };
