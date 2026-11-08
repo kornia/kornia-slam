@@ -60,7 +60,7 @@ pub use loop_closure::{LoopClosingConfig, LoopClosureEvent};
 #[cfg(feature = "serde")]
 pub use system::LoadError;
 pub use system::{
-    BuildError, CameraSelection, ConfigError, LoopClosingMode, ProcessError, SensorSelection,
-    SlamSystem, SystemConfig, TrackingResult, TrackingStatus,
+    BuildError, CameraSelection, ConfigError, LoopClosingExecution, LoopClosingMode, ProcessError,
+    SensorSelection, SlamSystem, SystemConfig, TrackingResult, TrackingStatus,
 };
 pub use tracking::{KeyframePolicy, MapProjectionEstimator};

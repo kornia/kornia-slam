@@ -150,6 +150,12 @@ impl Map {
         self.map_points.iter().filter(|mp| !mp.culled).count()
     }
 
+    /// Advances whenever the map's world frame changes; a result computed from an older epoch
+    /// belongs to another world.
+    pub(crate) fn world_epoch(&self) -> u64 {
+        self.world_epoch
+    }
+
     /// Returns all keyframe-to-keyframe IMU factors in insertion order.
     pub fn imu_factors(&self) -> &[ImuFactor] {
         &self.imu_factors

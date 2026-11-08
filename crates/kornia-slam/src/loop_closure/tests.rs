@@ -1175,3 +1175,161 @@ fn false_loop_is_gated_and_cauchy_keeps_the_map_when_the_gate_is_off() {
     assert!(cauchy < 0.05, "Cauchy shift {cauchy} m");
     assert!(least_squares > 3.0, "least-squares shift {least_squares} m");
 }
+
+/// The fixture's loop, strong enough to correct the drift and fuse.
+fn background_config() -> LoopClosingConfig {
+    let mut config = closing_config();
+    config.optimizer.loop_edge_weight = 100.0;
+    config.information = LoopGraphInformation::ScalarWeights;
+    config
+}
+
+/// The synchronous closure of the fixture's loop: the map and the tracking correction.
+fn synchronous_closure() -> (Map, (Pose3d, Vec3F64)) {
+    let (mut closer, mut map) = closing_fixture(background_config(), false);
+    let context = closing_context(&map);
+    let outcome = closer.on_keyframe(&mut map, &camera(), 10, context);
+    (map, outcome.tracking_correction.unwrap())
+}
+
+/// Frame boundaries until a background outcome reports events, at most `limit` of them.
+fn frames_until_reported(
+    closer: &mut LoopCloser,
+    map: &mut Map,
+    context: LoopClosingContext,
+    limit: usize,
+) -> (usize, LoopClosingOutcome) {
+    for frame in 1..=limit {
+        let outcome = closer.on_frame(map, &camera(), context);
+        if !outcome.events.is_empty() {
+            return (frame, outcome);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("no background outcome within {limit} frames");
+}
+
+/// Deferred by three frames, the loop is queued at the keyframe and written back at the third
+/// frame boundary, onto an unchanged map exactly as the synchronous path writes it.
+#[test]
+fn deferred_writeback_matches_the_synchronous_closure() {
+    let (expected_map, expected_tracking) = synchronous_closure();
+    let (closer, mut map) = closing_fixture(background_config(), false);
+    let mut closer = closer.with_solver(LoopSolver::deferred(3));
+    let context = closing_context(&map);
+
+    let queued = closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert!(queued.queued && queued.events.is_empty() && !queued.pgo_applied);
+    let (frames, outcome) = frames_until_reported(&mut closer, &mut map, context, 10);
+
+    assert_eq!(frames, 3);
+    assert!(matches!(
+        outcome.events.as_slice(),
+        [LoopClosureEvent::Accepted { applied: true, .. }]
+    ));
+    assert_eq!(outcome.tracking_correction, Some(expected_tracking));
+    assert_eq!(
+        map.state_fingerprint_for_test(),
+        expected_map.state_fingerprint_for_test()
+    );
+}
+
+/// On the worker thread the same closure arrives within 2 s and writes the same map.
+#[test]
+fn asynchronous_writeback_matches_the_synchronous_closure() {
+    let (expected_map, _) = synchronous_closure();
+    let (closer, mut map) = closing_fixture(background_config(), false);
+    let mut closer = closer.with_solver(LoopSolver::asynchronous().unwrap());
+    let context = closing_context(&map);
+    let started = std::time::Instant::now();
+
+    assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
+    let (_, outcome) = frames_until_reported(&mut closer, &mut map, context, 2000);
+
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(outcome.pgo_applied && outcome.written_back.is_some());
+    assert_eq!(
+        map.state_fingerprint_for_test(),
+        expected_map.state_fingerprint_for_test()
+    );
+}
+
+/// A world change during the solve discards the result and solves again; after three in a row
+/// the loop is reported unapplied and the map keeps its pose.
+#[test]
+fn a_world_change_during_the_solve_discards_and_retries() {
+    let (closer, mut map) = closing_fixture(background_config(), false);
+    let mut closer = closer.with_solver(LoopSolver::deferred(1));
+    let context = closing_context(&map);
+    let drifted = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+
+    assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
+    for _ in 0..2 {
+        map.advance_world_epoch_for_test();
+        let outcome = closer.on_frame(&mut map, &camera(), context);
+        assert!(outcome.events.is_empty() && outcome.written_back.is_some());
+    }
+    map.advance_world_epoch_for_test();
+    let outcome = closer.on_frame(&mut map, &camera(), context);
+
+    assert!(matches!(outcome.events.as_slice(), [
+        LoopClosureEvent::PgoFailed { reason, .. },
+        LoopClosureEvent::Accepted { applied: false, .. }
+    ] if reason.contains("changed world")));
+    assert_eq!(
+        map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
+        drifted
+    );
+    assert!(
+        closer
+            .on_frame(&mut map, &camera(), context)
+            .events
+            .is_empty()
+    );
+}
+
+/// One discard is followed by a fresh solve that is applied.
+#[test]
+fn a_discarded_solve_is_resubmitted_and_applied() {
+    let (closer, mut map) = closing_fixture(background_config(), false);
+    let mut closer = closer.with_solver(LoopSolver::deferred(1));
+    let context = closing_context(&map);
+
+    closer.on_keyframe(&mut map, &camera(), 10, context);
+    map.advance_world_epoch_for_test();
+    assert!(
+        closer
+            .on_frame(&mut map, &camera(), context)
+            .events
+            .is_empty()
+    );
+    let outcome = closer.on_frame(&mut map, &camera(), context);
+
+    assert!(outcome.pgo_applied);
+    assert!(matches!(
+        outcome.events.as_slice(),
+        [LoopClosureEvent::Accepted { applied: true, .. }]
+    ));
+}
+
+/// A worker that died turns loop correction off with an event; the map is left as it was.
+#[test]
+fn a_stopped_worker_turns_loop_correction_off() {
+    let (closer, mut map) = closing_fixture(background_config(), false);
+    let mut closer = closer.with_solver(LoopSolver::panicking_for_test());
+    let context = closing_context(&map);
+    let drifted = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+
+    assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
+    let (_, outcome) = frames_until_reported(&mut closer, &mut map, context, 2000);
+
+    assert!(matches!(outcome.events.as_slice(), [
+        LoopClosureEvent::PgoFailed { reason, .. },
+        LoopClosureEvent::Accepted { applied: false, .. }
+    ] if reason.contains("worker stopped")));
+    assert!(!outcome.pgo_applied && outcome.tracking_correction.is_none());
+    assert_eq!(
+        map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
+        drifted
+    );
+}

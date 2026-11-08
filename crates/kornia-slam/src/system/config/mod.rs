@@ -177,14 +177,46 @@ pub enum LoopClosingMode {
     Disabled,
     /// Needs metric input: stereo cameras or the IMU. With the IMU selected,
     /// corrections wait for inertial initialization.
-    Enabled { vocabulary: PathBuf },
+    Enabled {
+        vocabulary: PathBuf,
+        #[cfg_attr(feature = "serde", serde(default))]
+        execution: LoopClosingExecution,
+    },
+}
+
+/// Where an accepted loop's pose-graph solve runs and when it is written back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum LoopClosingExecution {
+    /// `Synchronous` with synchronous local mapping, else `Asynchronous`.
+    #[default]
+    FollowMapping,
+    /// Solved and written back inside the keyframe that accepted the loop.
+    Synchronous,
+    /// Solved inline, written back through the asynchronous path `frames`
+    /// frames later (at least one): reproducible runs of the background path.
+    Deferred { frames: usize },
+    /// Solved on a background thread and written back at the first frame
+    /// boundary after it ends.
+    Asynchronous,
+}
+
+impl LoopClosingExecution {
+    /// The execution `FollowMapping` stands for under `mapping`.
+    pub fn resolve(self, mapping: LocalMappingMode) -> Self {
+        match (self, mapping) {
+            (Self::FollowMapping, LocalMappingMode::Synchronous) => Self::Synchronous,
+            (Self::FollowMapping, LocalMappingMode::Asynchronous) => Self::Asynchronous,
+            (execution, _) => execution,
+        }
+    }
 }
 
 impl LoopClosingMode {
     pub fn vocabulary(&self) -> Option<&Path> {
         match self {
             Self::Disabled => None,
-            Self::Enabled { vocabulary } => Some(vocabulary),
+            Self::Enabled { vocabulary, .. } => Some(vocabulary),
         }
     }
 
@@ -199,7 +231,7 @@ impl SystemConfig {
     /// from. Absolute paths are kept.
     pub fn resolve_paths(&mut self, base_dir: &Path) {
         let PipelineDefinition::OrbSlam(orb) = &mut self.pipeline;
-        if let LoopClosingMode::Enabled { vocabulary } = &mut orb.loop_closing
+        if let LoopClosingMode::Enabled { vocabulary, .. } = &mut orb.loop_closing
             && vocabulary.is_relative()
         {
             *vocabulary = base_dir.join(&*vocabulary);
@@ -262,8 +294,20 @@ impl fmt::Display for SystemConfig {
             LocalMappingMode::Asynchronous => "asynchronous",
         };
         writeln!(f, "  local mapping: {execution}")?;
-        if let Some(vocabulary) = orb.loop_closing.vocabulary() {
-            writeln!(f, "  loop closing: {}", vocabulary.display())?;
+        if let LoopClosingMode::Enabled {
+            vocabulary,
+            execution,
+        } = &orb.loop_closing
+        {
+            write!(f, "  loop closing: {}", vocabulary.display())?;
+            match execution {
+                LoopClosingExecution::FollowMapping => writeln!(f)?,
+                LoopClosingExecution::Synchronous => writeln!(f, ", synchronous")?,
+                LoopClosingExecution::Deferred { frames } => {
+                    writeln!(f, ", deferred by {frames} frames")?
+                }
+                LoopClosingExecution::Asynchronous => writeln!(f, ", asynchronous")?,
+            }
         }
         Ok(())
     }
