@@ -17,6 +17,7 @@ pub mod place_recognition;
 mod pose_graph;
 mod sparse_pgo;
 mod verification;
+mod worker;
 
 pub(crate) use closer::{LoopCloser, LoopClosingContext};
 pub use closer::{LoopClosingConfig, LoopClosureEvent, LoopGraphInformation};
@@ -42,7 +43,7 @@ pub use verification::{
 };
 
 #[cfg(test)]
-use closer::{optimize_through_graph, snapshot_graph_config, solve_in_graph};
+use closer::{keyframe_poses, optimize_through_graph, snapshot_graph_config, solve_in_graph};
 #[cfg(test)]
 use pose_graph::{max_gravity_alignment_error, pose_graph_cost};
 #[cfg(test)]
