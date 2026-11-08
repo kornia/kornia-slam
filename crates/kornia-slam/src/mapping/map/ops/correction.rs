@@ -12,12 +12,16 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::{SO3F64, Vec3F64};
 use kornia_sensors::imu::ImuBias;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 /// Geometry changed by an accepted global pose-graph correction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PoseGraphCorrectionResult {
     pub keyframes_corrected: usize,
     pub map_points_corrected: usize,
+    /// Landmarks whose derived geometry was refreshed, and the time that took.
+    pub landmarks_refreshed: usize,
+    pub geometry_refresh: Duration,
 }
 
 /// Refusal to apply a pose-graph result to the live map.
@@ -218,12 +222,16 @@ impl Map {
             }
         }
         let map_points_corrected = changed_points.len();
+        let refresh_started = Instant::now();
         let observers_moved = self.landmarks_observed_by(&moved_keyframes);
-        self.finalize_landmark_geometry(changed_points.into_iter().chain(observers_moved));
+        let landmarks_refreshed =
+            self.finalize_landmark_geometry(changed_points.into_iter().chain(observers_moved));
 
         Ok(PoseGraphCorrectionResult {
             keyframes_corrected,
             map_points_corrected,
+            landmarks_refreshed,
+            geometry_refresh: refresh_started.elapsed(),
         })
     }
 

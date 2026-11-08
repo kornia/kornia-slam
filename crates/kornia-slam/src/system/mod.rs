@@ -1332,8 +1332,21 @@ impl SlamSystem {
             self.dbg(message);
         }
         if !outcome.events.is_empty() {
+            let t = outcome.timing;
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
             self.dbg(format!(
-                "[loop-time] kf={kf_idx} on_keyframe_ms={elapsed_ms:.1} graph_nodes={graph_nodes}"
+                "[loop-time] kf={kf_idx} on_keyframe_ms={elapsed_ms:.1} graph_nodes={graph_nodes} \
+                 graph_edges={} iterations={} detect_ms={:.1} verify_ms={:.1} solve_ms={:.1} \
+                 writeback_ms={:.1} geometry_ms={:.1} fuse_ms={:.1} landmarks_refreshed={}",
+                t.graph_edges,
+                t.iterations,
+                ms(t.detect),
+                ms(t.verify),
+                ms(t.solve),
+                ms(t.writeback),
+                ms(t.geometry),
+                ms(t.fuse),
+                t.landmarks_refreshed,
             ));
         }
         for message in outcome.gate_messages {
