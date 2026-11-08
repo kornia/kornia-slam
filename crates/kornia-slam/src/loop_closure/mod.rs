@@ -16,9 +16,10 @@ pub use closer::{LoopClosingConfig, LoopClosureEvent};
 pub use episode::{LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker};
 pub use fusion::{LoopFusionConfig, LoopFusionStats, fuse_verified_loop};
 pub use graph::{
-    Correction, Edge, EdgeKind, GraphManifold, KeyframeOutcome, LoopCandidate, LoopMeasurement,
-    LoopQuery, LoopVerifier, Node, NodeId, NodeSpacing, PoseGraph, PoseGraphConfig, PoseGraphError,
-    RejectAll, SolveReport,
+    Correction, Edge, EdgeKind, GateDecision, GraphManifold, KeyframeOutcome, LoopCandidate,
+    LoopGate, LoopMeasurement, LoopProposal, LoopQuery, LoopVerifier, Node, NodeId, NodeSpacing,
+    OdometryConsistencyGate, PoseGraph, PoseGraphConfig, PoseGraphError, RejectAll, SolveReport,
+    TemporalConsistencyGate,
 };
 pub use odometry_gate::{
     DriftModel, LoopCorrection, LoopGateVerdict, LoopOdometryGate, LoopTemporalConsistency,

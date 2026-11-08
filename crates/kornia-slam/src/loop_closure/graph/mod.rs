@@ -5,6 +5,7 @@
 //! first node is fixed. A keyframe inside an existing node's footprint makes no
 //! node, so the graph grows with the area covered rather than with time.
 
+mod gate;
 mod verify;
 
 #[cfg(test)]
@@ -23,6 +24,9 @@ use crate::loop_closure::sparse_pgo::{
 };
 use crate::pose_conversion::pose_to_se3;
 
+pub use gate::{
+    GateDecision, LoopGate, LoopProposal, OdometryConsistencyGate, TemporalConsistencyGate,
+};
 pub use verify::{LoopCandidate, LoopMeasurement, LoopQuery, LoopVerifier, RejectAll};
 
 /// A node's index, in creation order.
