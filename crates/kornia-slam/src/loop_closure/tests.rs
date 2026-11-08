@@ -984,7 +984,7 @@ fn persistent_graph_keeps_a_loop_whose_keyframe_was_culled() {
 
     let (result, new_world) = solve_in_graph(
         &mut graph,
-        &map,
+        &keyframe_poses(&map),
         std::slice::from_ref(&first),
         &config,
         information,
@@ -1001,7 +1001,7 @@ fn persistent_graph_keeps_a_loop_whose_keyframe_was_culled() {
     ));
     let (result, _) = solve_in_graph(
         &mut graph,
-        &map,
+        &keyframe_poses(&map),
         std::slice::from_ref(&second),
         &config,
         information,
