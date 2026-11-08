@@ -655,6 +655,7 @@ fn loop_closer_applies_map_correction_and_returns_tracking_correction() {
     // Make this synthetic loop strong enough to bring projections within the
     // unchanged fusion gates; the default weight only partially corrects drift.
     config.optimizer.loop_edge_weight = 100.0;
+    config.information = LoopGraphInformation::ScalarWeights;
     let (mut closer, mut map) = closing_fixture(config, false);
     let before = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
     let anchor = map.get_keyframe(0).unwrap().frame.pose_world_to_cam;
@@ -811,7 +812,14 @@ fn pose_graph_with_scalar_information_matches_optimize_pose_graph() {
         }),
     ] {
         let expected = optimize_pose_graph(&map, &loops, &PgoConfig::default(), inertial).unwrap();
-        let actual = optimize_through_graph(&map, &loops, &PgoConfig::default(), inertial).unwrap();
+        let actual = optimize_through_graph(
+            &map,
+            &loops,
+            &PgoConfig::default(),
+            LoopGraphInformation::ScalarWeights,
+            inertial,
+        )
+        .unwrap();
         assert_eq!(actual.keyframe_indices, expected.keyframe_indices);
         assert_eq!(actual.original_poses, expected.original_poses);
         assert_eq!(actual.usable, expected.usable);
@@ -832,6 +840,70 @@ fn pose_graph_with_scalar_information_matches_optimize_pose_graph() {
             .fold(0.0, f64::max);
         assert!(moved > 0.05, "the loops must move the lap: {moved} m");
     }
+}
+
+/// A 24-keyframe square lap, 0.5 m apart, drifting `drift` rad of yaw and a few mm per
+/// keyframe about gravity; `drift = 0` is the truth.
+fn square_lap(gravity_axis: Vec3F64, drift: f64) -> Vec<Pose3d> {
+    (0..24)
+        .map(|index| {
+            let side = index / 6;
+            let along = (index % 6) as f64 * 0.5;
+            let (x, y) = match side {
+                0 => (along, 0.0),
+                1 => (3.0, along),
+                2 => (3.0 - along, 3.0),
+                _ => (0.0, 3.0 - along),
+            };
+            let walked = index as f64 * drift;
+            let yaw = side as f64 * std::f64::consts::FRAC_PI_2 + walked;
+            let rotation = SO3F64::exp(gravity_axis * -yaw).matrix();
+            let centre = Vec3F64::new(x + 2.5 * walked, y - 1.5 * walked, 0.0);
+            Pose3d::new(rotation, -(rotation * centre))
+        })
+        .collect()
+}
+
+/// Drift-model information with a loop measured from the truth: the query keyframe moves
+/// towards the truth, but only a little. The keyframes are 0.5 m apart, so each odometry edge
+/// sits on the 0.01 m / 0.002 rad floor and the lap chains to ~0.05 m / 0.01 rad, stiffer than
+/// the loop's 0.10 m / 1 deg; the 5 deg correction starts near 6 sigma, where Cauchy at 3 keeps
+/// a fifth of its weight. Measured: 0.268 m -> 0.255 m.
+#[test]
+fn drift_information_pulls_a_true_loop_towards_the_truth() {
+    let gravity = Vec3F64::new(0.0, -9.81, 0.0);
+    let truth = square_lap(gravity.normalize(), 0.0);
+    let mut map = Map::new();
+    for (index, pose) in square_lap(gravity.normalize(), 0.004)
+        .into_iter()
+        .enumerate()
+    {
+        map.insert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())))
+            .unwrap();
+    }
+    let edge = VerifiedLoopEdge {
+        candidate_to_query: Pose3d::between(&truth[0], &truth[23]),
+        ..verified_edge(23, 0, 40, 0.875, 1.0, 8)
+    };
+    let result = optimize_through_graph(
+        &map,
+        std::slice::from_ref(&edge),
+        &PgoConfig::default(),
+        LoopGraphInformation::default(),
+        Some(InertialPgoContext {
+            gravity_world: gravity,
+        }),
+    )
+    .unwrap();
+    let error = |poses: &[Pose3d]| {
+        (poses[23].inverse().translation - truth[23].inverse().translation).length()
+    };
+    let (before, after) = (
+        error(&result.original_poses),
+        error(&result.optimized_poses),
+    );
+    assert!(result.usable);
+    assert!(after < before, "end error {before} m -> {after} m");
 }
 
 #[test]
