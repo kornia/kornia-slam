@@ -1066,3 +1066,70 @@ fn false_loop_edge_distorts_pose_graph_and_gate_rejects_it() {
     let true_correction = LoopCorrection::measure(candidate, query, path(), &true_edge, None);
     assert!(gate.judge(&true_correction).unwrap().accepted);
 }
+
+/// The sim's false loop kf1398~345 in miniature: out 9.65 m along x and 3.65 m back, so the
+/// path is 13.3 m and the last keyframe sits 6.0 m from the first, and a verified edge that
+/// puts it back at the start.
+fn false_loop_fixture() -> (Map, VerifiedLoopEdge) {
+    let centres = (0..=28)
+        .map(|step| 9.65 * step as f64 / 28.0)
+        .chain((0..11).rev().map(|step| 6.0 + 3.65 * step as f64 / 11.0));
+    let mut map = Map::new();
+    for (index, x) in centres.enumerate() {
+        let pose = Pose3d::new(Mat3F64::IDENTITY, -Vec3F64::new(x, 0.0, 0.0));
+        map.insert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())))
+            .unwrap();
+    }
+    let query_kf_idx = map.keyframes().last().unwrap().frame.idx;
+    let edge = edge_placing_query_at(&map, query_kf_idx, Vec3F64::ZERO);
+    (map, edge)
+}
+
+/// Theory: the gate's 3 sigma at 13.3 m is 3 * (0.019 * 13.3 + 0.10) = 1.06 m, far below 6 m.
+/// With the gate off, the Cauchy loop edge starts 60 sigma out and keeps 1/400 of its weight;
+/// against the odometry chain (39 edges at 0.01 m) it moves the far end by millimetres, where
+/// least squares at `w * I` drags it most of the 6 m.
+#[test]
+fn false_loop_is_gated_and_cauchy_keeps_the_map_when_the_gate_is_off() {
+    let (map, false_edge) = false_loop_fixture();
+    let query = map.keyframes().last().unwrap().frame.pose_world_to_cam;
+    let candidate = map.get_keyframe(0).unwrap().frame.pose_world_to_cam;
+    let path = map.keyframes().iter().map(|kf| kf.frame.pose_world_to_cam);
+    let correction = LoopCorrection::measure(candidate, query, path, &false_edge, None);
+    assert!((correction.path_m - 13.3).abs() < 1e-9);
+    assert!((correction.translation_m() - 6.0).abs() < 1e-9);
+    let proposal = LoopProposal {
+        edge: &false_edge,
+        correction,
+        query_order: map.keyframes().len() - 1,
+        candidate_order: 0,
+    };
+    let mut gate = OdometryConsistencyGate(LoopOdometryGate::default());
+    assert!(matches!(
+        gate.decide(&proposal, &mut Vec::new()),
+        GateDecision::Reject(_)
+    ));
+
+    let largest_shift = |information| {
+        let result = optimize_through_graph(
+            &map,
+            std::slice::from_ref(&false_edge),
+            &PgoConfig::default(),
+            information,
+            None,
+        )
+        .unwrap();
+        result
+            .original_poses
+            .iter()
+            .zip(&result.optimized_poses)
+            .map(|(before, after)| {
+                (before.inverse().translation - after.inverse().translation).length()
+            })
+            .fold(0.0, f64::max)
+    };
+    let cauchy = largest_shift(LoopGraphInformation::default());
+    let least_squares = largest_shift(LoopGraphInformation::ScalarWeights);
+    assert!(cauchy < 0.05, "Cauchy shift {cauchy} m");
+    assert!(least_squares > 3.0, "least-squares shift {least_squares} m");
+}
