@@ -125,6 +125,8 @@ pub(crate) struct LoopTiming {
     pub writeback: Duration,
     pub geometry: Duration,
     pub fuse: Duration,
+    /// Copying the loop neighbourhoods at submit, on the calling thread.
+    pub fuse_capture: Duration,
     /// The background fusion search on the solved snapshot, its operations and the stale ones.
     pub fuse_plan: Duration,
     pub fusion_ops: usize,
@@ -406,7 +408,7 @@ impl LoopAcceptance {
         timing.graph_edges = self.graph.edges().count();
         timing.verify = started
             .elapsed()
-            .saturating_sub(timing.solve + timing.writeback + timing.fuse);
+            .saturating_sub(timing.solve + timing.writeback + timing.fuse + timing.fuse_capture);
         outcome
     }
 
@@ -646,7 +648,9 @@ impl LoopAcceptance {
         if self.stopped || self.queued.is_empty() || self.solver.in_flight() {
             return;
         }
+        let capture_started = Instant::now();
         let fusion = FusionSnapshot::capture(map, camera, &self.queued, &self.config.fusion);
+        outcome.timing.fuse_capture = capture_started.elapsed();
         let job = self.solve_job(map, self.pending_loops(None), context, Some(fusion));
         self.in_flight = std::mem::take(&mut self.queued);
         self.submitted_at = Some(Instant::now());
@@ -816,6 +820,12 @@ impl LoopAcceptance {
             &seen,
             context.pose_world_to_cam,
         ) {
+            if change.kf_idx != reference {
+                outcome.gate_messages.push(format!(
+                    "[loop-view] reference kf={reference} follows kf={}: most of its local map does",
+                    change.kf_idx
+                ));
+            }
             let world = change.after.inverse().compose(&change.before);
             outcome.tracking_correction = Some((
                 apply_reference_pose_correction(
