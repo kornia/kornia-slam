@@ -16,7 +16,7 @@ use kornia_algebra::Vec3F64;
 use crate::loop_closure::place_recognition::{
     Candidate, KeyFrameDatabase, Vocabulary, compute_bow,
 };
-use crate::loop_closure::pose_graph::max_gravity_alignment_error;
+use crate::loop_closure::pose_graph::{max_gravity_alignment_error, unusable_reason};
 use crate::loop_closure::worker::{LoopSolveJob, LoopSolveOutcome, LoopSolver, WorkerStopped};
 use crate::loop_closure::{
     Correction, DriftModel, GateDecision, GraphManifold, InertialPgoContext, LoopCorrection,
@@ -598,6 +598,10 @@ impl LoopAcceptance {
                             "current reference keyframe is outside the PGO snapshot".into(),
                         ));
                     }
+                } else {
+                    outcome
+                        .events
+                        .push(failed(result.unusable_reason.unwrap_or_default()));
                 }
             }
             Err(error) => outcome.events.push(failed(error.to_string())),
@@ -721,8 +725,9 @@ impl LoopAcceptance {
             match result {
                 Ok(result) => {
                     outcome.timing.iterations = result.iterations;
-                    if result.usable
-                        && let Err(reason) = self.write_back(
+                    let written = match result.unusable_reason.clone() {
+                        Some(reason) => Err(reason),
+                        None => self.write_back(
                             map,
                             camera,
                             &result,
@@ -730,8 +735,9 @@ impl LoopAcceptance {
                             &report,
                             context,
                             outcome,
-                        )
-                    {
+                        ),
+                    };
+                    if let Err(reason) = written {
                         outcome.events.push(failed(reason));
                     }
                 }
@@ -912,25 +918,20 @@ pub(super) fn solve_in_graph(
     let gravity_error = inertial.map(|context| {
         max_gravity_alignment_error(&original_poses, &optimized_poses, context.gravity_world)
     });
-    let metrics_finite = [
-        report.cost_before,
-        report.cost_after,
-        report.loop_residual_before,
-        report.loop_residual_after,
-    ]
-    .into_iter()
-    .all(f64::is_finite);
-    let usable = report.converged
-        && metrics_finite
-        && gravity_error.is_none_or(|error| error.is_finite() && error <= 1e-4)
-        && report.cost_after < report.cost_before
-        && report.loop_residual_after <= report.loop_residual_before;
+    let unusable_reason = unusable_reason(
+        report.converged,
+        report.iterations,
+        (report.cost_before, report.cost_after),
+        (report.loop_residual_before, report.loop_residual_after),
+        gravity_error,
+    );
     let result = PgoResult {
         keyframe_indices,
         original_poses,
         optimized_poses,
         iterations: report.iterations,
-        usable,
+        usable: unusable_reason.is_none(),
+        unusable_reason,
     };
     Ok((result, new_world))
 }

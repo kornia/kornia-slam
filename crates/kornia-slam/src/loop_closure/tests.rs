@@ -1355,3 +1355,34 @@ fn correction_epoch_counts_written_corrections() {
     assert_eq!(closer.correction_epoch(), 1);
     assert!(!closer.solve_in_flight());
 }
+
+/// A solve cut off before it converges is not written back, and says why: an unusable result is
+/// never a silent `applied: false`, inline or in the background.
+#[test]
+fn an_unusable_solve_reports_why() {
+    let mut config = background_config();
+    config.optimizer.max_iterations = 1;
+    let unusable = |events: &[LoopClosureEvent]| {
+        matches!(events, [
+            LoopClosureEvent::PgoFailed { reason, .. },
+            LoopClosureEvent::Accepted { applied: false, .. }
+        ] if reason.starts_with("unusable solve") && reason.contains("not converged"))
+    };
+
+    let (mut closer, mut map) = closing_fixture(config.clone(), false);
+    let context = closing_context(&map);
+    let inline = closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert!(unusable(&inline.events), "{:?}", inline.events);
+
+    let (closer, mut map) = closing_fixture(config, false);
+    let mut closer = closer.with_solver(LoopSolver::deferred(1));
+    let drifted = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
+    let background = closer.on_frame(&mut map, &camera(), context);
+    assert!(unusable(&background.events), "{:?}", background.events);
+    assert!(!background.pgo_applied);
+    assert_eq!(
+        map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
+        drifted
+    );
+}
