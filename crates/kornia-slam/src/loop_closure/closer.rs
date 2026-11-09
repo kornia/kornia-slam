@@ -13,6 +13,7 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 
+use crate::loop_closure::fusion_plan::{FusionOp, FusionSnapshot, apply_fusion};
 use crate::loop_closure::place_recognition::{
     Candidate, KeyFrameDatabase, Vocabulary, compute_bow,
 };
@@ -123,6 +124,10 @@ pub(crate) struct LoopTiming {
     pub writeback: Duration,
     pub geometry: Duration,
     pub fuse: Duration,
+    /// The background fusion search on the solved snapshot, its operations and the stale ones.
+    pub fuse_plan: Duration,
+    pub fusion_ops: usize,
+    pub fusion_stale: usize,
     pub graph_edges: usize,
     pub iterations: usize,
     pub landmarks_refreshed: usize,
@@ -380,7 +385,12 @@ impl LoopAcceptance {
             self.accept(map, camera, kf_idx, candidates, context, &mut outcome)
         {
             if self.solver.is_synchronous() {
-                let job = self.solve_job(map, self.pending_loops(Some(&representative)), context);
+                let job = self.solve_job(
+                    map,
+                    self.pending_loops(Some(&representative)),
+                    context,
+                    None,
+                );
                 let solved = job.run();
                 self.apply_synchronous(map, camera, solved, &representative, context, &mut outcome);
                 self.record(representative);
@@ -388,7 +398,7 @@ impl LoopAcceptance {
                 self.record(representative.clone());
                 self.queued.push(representative);
                 outcome.queued = true;
-                self.submit_queued(map, context, &mut outcome);
+                self.submit_queued(map, camera, context, &mut outcome);
             }
         }
         let timing = &mut outcome.timing;
@@ -498,6 +508,7 @@ impl LoopAcceptance {
         map: &Map,
         loops: Vec<VerifiedLoopEdge>,
         context: LoopClosingContext,
+        fusion: Option<FusionSnapshot>,
     ) -> LoopSolveJob {
         LoopSolveJob {
             world_epoch: map.world_epoch(),
@@ -509,6 +520,7 @@ impl LoopAcceptance {
             inertial: context.imu_initialized.then_some(InertialPgoContext {
                 gravity_world: context.gravity_world,
             }),
+            fusion,
         }
     }
 
@@ -626,13 +638,15 @@ impl LoopAcceptance {
     fn submit_queued(
         &mut self,
         map: &Map,
+        camera: &PinholeCamera,
         context: LoopClosingContext,
         outcome: &mut LoopClosingOutcome,
     ) {
         if self.stopped || self.queued.is_empty() || self.solver.in_flight() {
             return;
         }
-        let job = self.solve_job(map, self.pending_loops(None), context);
+        let fusion = FusionSnapshot::capture(map, camera, &self.queued, &self.config.fusion);
+        let job = self.solve_job(map, self.pending_loops(None), context, Some(fusion));
         self.in_flight = std::mem::take(&mut self.queued);
         self.submitted_at = Some(Instant::now());
         if let Err(WorkerStopped) = self.solver.submit(job) {
@@ -652,7 +666,7 @@ impl LoopAcceptance {
             Ok(None) => {}
             Err(WorkerStopped) => self.stop(&mut outcome),
         }
-        self.submit_queued(map, context, &mut outcome);
+        self.submit_queued(map, camera, context, &mut outcome);
         outcome.timing.graph_edges = self.graph.edges().count();
         outcome
     }
@@ -690,6 +704,8 @@ impl LoopAcceptance {
         outcome: &mut LoopClosingOutcome,
     ) {
         outcome.timing.solve = solved.solve_time;
+        outcome.timing.fuse_plan = solved.fusion_plan_time;
+        outcome.timing.fusion_ops = solved.fusion_ops.len();
         outcome.written_back = self
             .submitted_at
             .take()
@@ -732,7 +748,7 @@ impl LoopAcceptance {
                             camera,
                             &result,
                             solved.world_epoch,
-                            &report,
+                            &solved.fusion_ops,
                             context,
                             outcome,
                         ),
@@ -762,7 +778,7 @@ impl LoopAcceptance {
     }
 
     /// Moves the live map by the solve, then the tracking state and the map correction by the
-    /// current reference keyframe's live correction, and fuses the loops whose ends are live.
+    /// current reference keyframe's live correction, and applies the fusion planned on the solve.
     #[allow(clippy::too_many_arguments)]
     fn write_back(
         &mut self,
@@ -770,7 +786,7 @@ impl LoopAcceptance {
         camera: &PinholeCamera,
         result: &PgoResult,
         world_epoch: u64,
-        loops: &[VerifiedLoopEdge],
+        fusion: &[FusionOp],
         context: LoopClosingContext,
         outcome: &mut LoopClosingOutcome,
     ) -> Result<(), String> {
@@ -811,14 +827,9 @@ impl LoopAcceptance {
             map_from_odometry: self.map_from_odometry,
         });
         let fuse_started = Instant::now();
-        for edge in loops {
-            if map.get_keyframe(edge.query_kf_idx).is_some()
-                && map.get_keyframe(edge.candidate_kf_idx).is_some()
-            {
-                fuse_verified_loop(map, camera, edge, &self.config.fusion);
-            }
-        }
+        let fused = apply_fusion(map, camera, fusion, &self.config.fusion);
         outcome.timing.fuse = fuse_started.elapsed();
+        outcome.timing.fusion_stale = fused.stale;
         Ok(())
     }
 

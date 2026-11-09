@@ -1,5 +1,6 @@
 use super::*;
 use crate::Frame;
+use crate::loop_closure::fusion_plan::{FusionOp, FusionSnapshot, apply_fusion};
 use crate::loop_closure::sparse_pgo::{Se3Manifold, sparse_pose_graph_optimize};
 use crate::mapping::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
 use crate::pose_conversion::pose_to_se3;
@@ -1385,4 +1386,130 @@ fn an_unusable_solve_reports_why() {
         map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
         drifted
     );
+}
+
+/// The fixture with the query keyframe holding its own drifted duplicates of the first 18
+/// landmarks, so fusing the loop merges them as well as linking the rest.
+fn duplicated_fixture(config: LoopClosingConfig) -> (LoopCloser, Map) {
+    let (closer, mut map) = closing_fixture(config, false);
+    let query = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    let true_query = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.15, -0.05, 0.1));
+    for feature in 0..18 {
+        let landmark = map.get_keyframe(0).unwrap().map_point(feature).unwrap();
+        let point = map.map_points()[landmark].position;
+        map.insert_landmark(LandmarkSeed {
+            position: query.untransform_point(&true_query.transform_point(&point)),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 10,
+                feature_idx: feature,
+            },
+        })
+        .unwrap();
+    }
+    (closer, map)
+}
+
+fn merged_landmarks(map: &Map) -> usize {
+    map.map_points().iter().filter(|point| point.culled).count()
+}
+
+/// Planned on the worker's snapshot and applied at the writeback, fusion of an unchanged map
+/// links and merges exactly what the synchronous closure's `fuse_verified_loop` does.
+#[test]
+fn planned_fusion_matches_the_synchronous_fusion() {
+    let (mut closer, mut expected) = duplicated_fixture(background_config());
+    let context = closing_context(&expected);
+    assert!(
+        closer
+            .on_keyframe(&mut expected, &camera(), 10, context)
+            .pgo_applied
+    );
+    assert_eq!(merged_landmarks(&expected), 18);
+
+    let (closer, mut map) = duplicated_fixture(background_config());
+    let mut closer = closer.with_solver(LoopSolver::deferred(1));
+    assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
+    let outcome = closer.on_frame(&mut map, &camera(), context);
+
+    assert!(outcome.pgo_applied);
+    assert_eq!(outcome.timing.fusion_ops, 36);
+    assert_eq!(outcome.timing.fusion_stale, 0);
+    crate::mapping::map::tests::assert_map_consistent(&map);
+    assert_eq!(
+        map.state_fingerprint_for_test(),
+        expected.state_fingerprint_for_test()
+    );
+}
+
+/// The planned operations, and the map with the solve written back but not yet fused.
+fn planned_fusion() -> (Map, Vec<FusionOp>, LoopFusionConfig) {
+    let config = background_config();
+    let (_, mut map) = duplicated_fixture(config.clone());
+    let edge = verify_loop_candidate(&map, &camera(), 10, 0, &config.verification).unwrap();
+    let solved = optimize_through_graph(
+        &map,
+        std::slice::from_ref(&edge),
+        &config.optimizer,
+        config.information,
+        None,
+    )
+    .unwrap();
+    let ops = FusionSnapshot::capture(&map, &camera(), &[edge], &config.fusion).plan(&solved);
+    map.apply_graph_correction(
+        map.world_epoch(),
+        &solved.keyframe_indices,
+        &solved.original_poses,
+        &solved.optimized_poses,
+    )
+    .unwrap();
+    (map, ops, config.fusion)
+}
+
+/// A landmark culled meanwhile, or a slot that changed hands, leaves its operation stale and
+/// skipped; the others still apply and the map stays consistent.
+#[test]
+fn stale_fusion_operations_are_skipped() {
+    let (mut map, ops, config) = planned_fusion();
+    let link = ops
+        .iter()
+        .find_map(|op| match *op {
+            FusionOp::Link { landmark, .. } => Some(landmark),
+            FusionOp::Merge { .. } => None,
+        })
+        .unwrap();
+    let (keyframe, feature) = ops
+        .iter()
+        .find_map(|op| match *op {
+            FusionOp::Merge {
+                target_keyframe,
+                target_feature,
+                ..
+            } => Some((target_keyframe, target_feature)),
+            FusionOp::Link { .. } => None,
+        })
+        .unwrap();
+    map.remove_landmark(link).unwrap();
+    map.unlink_observation(keyframe, feature).unwrap();
+
+    let applied = apply_fusion(&mut map, &camera(), &ops, &config);
+
+    assert_eq!(applied.stale, 2);
+    assert_eq!(applied.linked + applied.merged, ops.len() - 2);
+    crate::mapping::map::tests::assert_map_consistent(&map);
+}
+
+/// A keyframe bundle adjustment moved away after the snapshot no longer puts the planned
+/// landmarks on its features, so nothing is fused into it.
+#[test]
+fn fusion_into_a_keyframe_that_moved_is_skipped() {
+    let (mut map, ops, config) = planned_fusion();
+    let mut moved = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    moved.translation.x += 0.3;
+    map.set_keyframe_pose_for_test(10, moved);
+
+    let applied = apply_fusion(&mut map, &camera(), &ops, &config);
+
+    assert_eq!((applied.linked, applied.merged), (0, 0));
+    assert_eq!(applied.stale, ops.len());
 }

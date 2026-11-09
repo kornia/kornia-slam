@@ -68,7 +68,11 @@ pub fn fuse_verified_loop(
     stats
 }
 
-fn loop_side_keyframes(map: &Map, anchor: usize, config: &LoopFusionConfig) -> Vec<usize> {
+pub(super) fn loop_side_keyframes(
+    map: &Map,
+    anchor: usize,
+    config: &LoopFusionConfig,
+) -> Vec<usize> {
     if map.get_keyframe(anchor).is_none() {
         return Vec::new();
     }
