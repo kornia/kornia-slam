@@ -1426,7 +1426,7 @@ fn format_loop_timing(t: &LoopTiming) -> String {
     format!(
         "graph_edges={} iterations={} detect_ms={:.1} verify_ms={:.1} solve_ms={:.1} \
          writeback_ms={:.1} geometry_ms={:.1} fuse_ms={:.1} landmarks_refreshed={} \
-         fuse_plan_ms={:.1} fusion_ops={} fusion_stale={}",
+         fuse_capture_ms={:.1} fuse_plan_ms={:.1} fusion_ops={} fusion_stale={}",
         t.graph_edges,
         t.iterations,
         ms(t.detect),
@@ -1436,6 +1436,7 @@ fn format_loop_timing(t: &LoopTiming) -> String {
         ms(t.geometry),
         ms(t.fuse),
         t.landmarks_refreshed,
+        ms(t.fuse_capture),
         ms(t.fuse_plan),
         t.fusion_ops,
         t.fusion_stale,
