@@ -108,6 +108,41 @@ fn merge_map_points_redirects_associations_and_deduplicates_observers() {
     }
 }
 
+/// On a consistent map the record-driven merge writes exactly what the full sweep writes.
+#[test]
+fn merge_by_records_matches_the_full_sweep() {
+    let build = || {
+        let mut map = Map::new();
+        for idx in 0..4 {
+            map.insert_keyframe(Keyframe::from_frame(test_frame(
+                idx,
+                vec![[idx as u8; 32], [10 + idx as u8; 32]],
+            )))
+            .unwrap();
+        }
+        let survivor = map.insert_landmark(seed(0, 0, 5.0)).unwrap();
+        map.link_observation(1, 0, survivor).unwrap();
+        let replaced = map.insert_landmark(seed(2, 0, 5.01)).unwrap();
+        map.link_observation(1, 1, replaced).unwrap();
+        map.link_observation(3, 1, replaced).unwrap();
+        (map, survivor, replaced)
+    };
+    let (mut swept, survivor, replaced) = build();
+    let (mut by_records, ..) = build();
+
+    let expected = swept.merge_map_points(survivor, replaced).unwrap();
+    let actual = by_records
+        .merge_map_points_by_records(survivor, replaced)
+        .unwrap();
+
+    assert_eq!(actual, expected);
+    assert_map_consistent(&by_records);
+    assert_eq!(
+        by_records.state_fingerprint_for_test(),
+        swept.state_fingerprint_for_test()
+    );
+}
+
 #[test]
 fn merge_map_points_rejects_invalid_or_culled_inputs() {
     let mut map = Map::new();
