@@ -251,3 +251,32 @@ pub(crate) fn assert_map_consistent(map: &Map) {
         );
     }
 }
+
+#[test]
+fn keyframes_are_found_by_id_in_and_out_of_frame_order() {
+    let ids_of = |map: &Map, ids: &[usize]| {
+        ids.iter()
+            .map(|&id| map.get_keyframe(id).map(|kf| kf.frame.idx))
+            .collect::<Vec<_>>()
+    };
+    for order in [[10, 20, 30, 40], [30, 10, 40, 20]] {
+        let mut map = Map::new();
+        for id in order {
+            map.insert_keyframe(Keyframe::from_frame(test_frame(id, vec![[id as u8; 32]])))
+                .unwrap();
+        }
+        assert!(
+            map.insert_keyframe(Keyframe::from_frame(test_frame(20, vec![[0; 32]])))
+                .is_err()
+        );
+        assert_eq!(
+            ids_of(&map, &[10, 20, 30, 40, 5, 25, 99]),
+            vec![Some(10), Some(20), Some(30), Some(40), None, None, None]
+        );
+        map.remove_keyframe(30).unwrap();
+        assert_eq!(
+            ids_of(&map, &[10, 20, 30, 40]),
+            vec![Some(10), Some(20), None, Some(40)]
+        );
+    }
+}

@@ -31,10 +31,8 @@ impl Map {
     ) {
         let keyframes = &self.keyframes;
         let centre = |kf_idx: usize, camera: u8| {
-            keyframes
-                .iter()
-                .find(|kf| kf.frame.idx == kf_idx)
-                .map(|kf| camera_centre(kf, camera))
+            crate::mapping::map::keyframe_slot(keyframes, kf_idx)
+                .map(|slot| camera_centre(&keyframes[slot], camera))
         };
         let Some(geometry) = self
             .map_points

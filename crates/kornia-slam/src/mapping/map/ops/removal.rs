@@ -255,9 +255,7 @@ impl Map {
     }
 
     fn keyframe_slot(&self, keyframe_idx: usize) -> Result<usize, KeyframeRemovalError> {
-        self.keyframes
-            .iter()
-            .position(|kf| kf.frame.idx == keyframe_idx)
+        crate::mapping::map::keyframe_slot(&self.keyframes, keyframe_idx)
             .ok_or(KeyframeRemovalError::UnknownKeyframe(keyframe_idx))
     }
 
