@@ -23,6 +23,16 @@ once per correction: `SlamSystem::correction_epoch()` advances with each one,
 so consumers publishing odometry as `T_map * map_correction()` can re-anchor,
 and `loop_solve_in_flight()` reports a pending solve. The landmark geometry
 refresh after a correction no longer scans the keyframe list per observer.
+In the background modes the loop's landmark fusion is searched on the worker,
+on a copy of both loop neighbourhoods moved by the solve, and the writeback
+only re-checks and applies the links and merges it found
+(`Map::merge_map_points_by_records` merges without sweeping every keyframe).
+The tracking pose and the map correction then follow the correction most of
+the camera's local landmarks take rather than the reference keyframe's alone,
+so odometry stays continuous when a later solve moves the reference keyframe
+away from landmarks fused onto an earlier visit. An unusable solve now reports
+why (`PgoResult::unusable_reason`, a `PgoFailed` event) instead of a silent
+`applied: false`.
 
 **Loop closing keeps one global pose graph, behind an odometry gate.** A
 verified loop whose correction is more than 3 sigma of the odometry drift
