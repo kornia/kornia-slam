@@ -117,13 +117,13 @@ impl Map {
 
     /// Returns the keyframe with frame index `idx`, if present.
     pub fn get_keyframe(&self, idx: usize) -> Option<&Keyframe> {
-        self.keyframes.iter().find(|kf| kf.frame.idx == idx)
+        keyframe_slot(&self.keyframes, idx).map(|slot| &self.keyframes[slot])
     }
 
     /// Mutable access to one stored keyframe, for numeric writeback. Private
     /// for the same reason as [`Map::keyframes_mut`].
     fn get_keyframe_mut(&mut self, idx: usize) -> Option<&mut Keyframe> {
-        self.keyframes.iter_mut().find(|kf| kf.frame.idx == idx)
+        keyframe_slot(&self.keyframes, idx).map(|slot| &mut self.keyframes[slot])
     }
 
     /// Returns all map points.
@@ -166,3 +166,17 @@ impl Map {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// Slot of the keyframe with frame index `idx` (ids are unique). Keyframes
+/// are appended in frame order, so a binary search finds it in O(log n); the
+/// linear scan runs only for an absent id or an out-of-order list. Lookups by
+/// id run per landmark observer, and a parked map gives every landmark one
+/// observer per keyframe, so a linear find made keyframe insertion quadratic
+/// in the keyframe count.
+fn keyframe_slot(keyframes: &[Keyframe], idx: usize) -> Option<usize> {
+    let slot = keyframes.partition_point(|kf| kf.frame.idx < idx);
+    if keyframes.get(slot).is_some_and(|kf| kf.frame.idx == idx) {
+        return Some(slot);
+    }
+    keyframes.iter().position(|kf| kf.frame.idx == idx)
+}
