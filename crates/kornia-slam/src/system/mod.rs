@@ -958,7 +958,7 @@ impl SlamSystem {
         if status == TrackingStatus::Skipped {
             let policy = &self.tracking_loss_recovery;
 
-            let lost_since = *self.state.lost_since_sec.get_or_insert(timestamp_sec);
+            let lost_since = self.state.mark_lost(timestamp_sec, pose_before);
             let recently_lost_for = timestamp_sec - lost_since;
 
             let imu_confident = self.imu_confident(timestamp_sec);
@@ -972,7 +972,7 @@ impl SlamSystem {
                     frame.idx, recently_lost_for, map_established,
                 ));
                 self.tracker.reset_tracks();
-                self.state.reset();
+                self.state.reset_after_loss();
                 return self.bootstrap_step(frame, timestamp_sec);
             }
             if imu_confident
@@ -985,7 +985,7 @@ impl SlamSystem {
                 ));
             }
         } else {
-            self.state.lost_since_sec = None;
+            self.state.mark_tracked();
         }
         self.state.last_frame_timestamp_sec = timestamp_sec;
         // Samples older than the last keyframe can't enter any future window

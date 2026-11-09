@@ -54,6 +54,9 @@ pub(crate) struct SystemState {
     /// failures, or `None` while tracking is healthy. Drives the
     /// recently-lost grace period (mirrors ORB-SLAM3's `mTimeStampLost`).
     pub lost_since_sec: Option<f64>,
+    /// Pose at the end of the last frame tracked before `lost_since_sec`: the
+    /// last one with visual support.
+    pub pose_before_loss: Option<Pose3d>,
     /// Consecutive descriptor-starved two-view attempts against the stored
     /// bootstrap reference.
     pub bootstrap_low_match_rejections: usize,
@@ -81,6 +84,7 @@ impl SystemState {
             current_keyframe_idx: None,
             last_keyframe_idx: None,
             lost_since_sec: None,
+            pose_before_loss: None,
             bootstrap_low_match_rejections: 0,
             bootstrap_frame: None,
             imu_initialized: false,
@@ -96,6 +100,7 @@ impl SystemState {
         self.last_keyframe_idx = None;
         self.velocity = None;
         self.lost_since_sec = None;
+        self.pose_before_loss = None;
         self.bootstrap_low_match_rejections = 0;
         self.bootstrap_frame = None;
         // The new map starts at an unknown monocular scale, so the metric
@@ -103,6 +108,31 @@ impl SystemState {
         self.imu_initialized = false;
         self.imu_init_timestamp_sec = None;
         self.velocity_world = Vec3F64::ZERO;
+    }
+
+    /// Starts the lost clock at the first failed frame of a run, remembering
+    /// `pose_before` (that frame's starting pose); returns when the run began.
+    pub(crate) fn mark_lost(&mut self, timestamp_sec: f64, pose_before: Pose3d) -> f64 {
+        if self.lost_since_sec.is_none() {
+            self.pose_before_loss = Some(pose_before);
+        }
+        *self.lost_since_sec.get_or_insert(timestamp_sec)
+    }
+
+    pub(crate) fn mark_tracked(&mut self) {
+        self.lost_since_sec = None;
+        self.pose_before_loss = None;
+    }
+
+    /// [`Self::reset`] after giving up on a loss, with the new map to be seeded
+    /// at the last visually tracked pose. The pose carried through the loss is
+    /// the inertial extrapolation that was just judged untrusted; in the sim it
+    /// reached 1e57 m in 5 s, and a map seeded there never tracks (every PnP
+    /// fails), so each restart was lost again.
+    pub(crate) fn reset_after_loss(&mut self) {
+        let seed = self.pose_before_loss.unwrap_or(self.pose_world_to_cam);
+        self.reset();
+        self.pose_world_to_cam = seed;
     }
 
     /// Counts a rejected two-view attempt against the bootstrap reference and
@@ -165,6 +195,40 @@ mod tests {
         );
         assert_eq!(state.pose_world_to_cam, pose);
         assert_eq!(state.velocity_world, Vec3F64::new(0.5, 0.0, 0.0));
+    }
+
+    fn at(x: f64) -> Pose3d {
+        let mut pose = Pose3d::IDENTITY;
+        pose.translation = Vec3F64::new(x, 0.0, 0.0);
+        pose
+    }
+
+    #[test]
+    fn a_reset_after_loss_seeds_the_last_tracked_pose_not_the_coasted_one() {
+        let mut state = SystemState::new();
+        assert_eq!(state.mark_lost(10.0, at(1.0)), 10.0);
+        state.pose_world_to_cam = at(2.0);
+        assert_eq!(state.mark_lost(10.5, at(2.0)), 10.0, "the run's start");
+        state.pose_world_to_cam = at(-8.1e57);
+
+        state.reset_after_loss();
+
+        assert_eq!(state.pose_world_to_cam, at(1.0));
+        assert!(state.lost_since_sec.is_none() && state.pose_before_loss.is_none());
+        assert!(!state.imu_initialized);
+    }
+
+    #[test]
+    fn a_tracked_frame_ends_the_run_and_its_pose() {
+        let mut state = SystemState::new();
+        state.mark_lost(10.0, at(1.0));
+        state.mark_tracked();
+        state.mark_lost(12.0, at(3.0));
+        state.pose_world_to_cam = at(4.0);
+
+        state.reset_after_loss();
+
+        assert_eq!(state.pose_world_to_cam, at(3.0));
     }
 
     #[test]
