@@ -1513,3 +1513,41 @@ fn fusion_into_a_keyframe_that_moved_is_skipped() {
     assert_eq!((applied.linked, applied.merged), (0, 0));
     assert_eq!(applied.stale, ops.len());
 }
+
+/// The euroc3 Async defect: after an earlier loop's fusion the camera's local map is mostly
+/// landmarks of the earlier visit. A later solve moves the reference keyframe but not them, so
+/// tracking stays on them; the tracking correction and the map correction must follow them too,
+/// not the reference keyframe, or the odometry `M^-1 * T` jumps by the reference's correction.
+#[test]
+fn a_background_correction_follows_the_landmarks_the_camera_sees() {
+    let (closer, mut map) = closing_fixture(background_config(), false);
+    let mut closer = closer.with_solver(LoopSolver::deferred(1));
+    let context = closing_context(&map);
+    let reference_before = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
+    // Meanwhile local mapping fuses the query keyframe onto the earlier visit's landmarks.
+    for feature in 0..36 {
+        let landmark = map.get_keyframe(0).unwrap().map_point(feature).unwrap();
+        map.link_observation(10, feature, landmark).unwrap();
+    }
+
+    let outcome = closer.on_frame(&mut map, &camera(), context);
+
+    assert!(outcome.pgo_applied);
+    let reference_after = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    let reference_moved =
+        (reference_after.inverse().translation - reference_before.inverse().translation).length();
+    assert!(reference_moved > 0.3, "reference moved {reference_moved} m");
+    let (tracked, _) = outcome.tracking_correction.unwrap();
+    let camera_moved =
+        (tracked.inverse().translation - context.pose_world_to_cam.inverse().translation).length();
+    assert!(camera_moved < 1e-6, "camera moved {camera_moved} m");
+    assert!(
+        closer
+            .map_correction()
+            .map_from_odometry
+            .translation
+            .length()
+            < 1e-6
+    );
+}
