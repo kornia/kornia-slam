@@ -16,6 +16,7 @@
 mod closer;
 mod episode;
 mod fusion;
+mod fusion_plan;
 mod graph;
 mod odometry_gate;
 pub mod place_recognition;

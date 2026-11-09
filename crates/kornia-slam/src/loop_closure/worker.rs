@@ -14,6 +14,7 @@ use kornia_3d::pose::Pose3d;
 
 use crate::loop_closure::VerifiedLoopEdge;
 use crate::loop_closure::closer::{LoopGraphInformation, solve_in_graph};
+use crate::loop_closure::fusion_plan::{FusionOp, FusionSnapshot};
 use crate::loop_closure::{InertialPgoContext, PgoConfig, PgoError, PgoResult, PoseGraph};
 
 /// What one solve reads, copied from the map and the closer when its loop was accepted.
@@ -27,6 +28,8 @@ pub(crate) struct LoopSolveJob {
     pub optimizer: PgoConfig,
     pub information: LoopGraphInformation,
     pub inertial: Option<InertialPgoContext>,
+    /// The loop neighbourhoods to fuse once solved; `None` fuses at writeback instead.
+    pub fusion: Option<FusionSnapshot>,
 }
 
 /// A finished solve. `graph` holds the solved graph; the closer adopts it only once the result
@@ -38,6 +41,9 @@ pub(crate) struct LoopSolveOutcome {
     pub solved: Result<(PgoResult, bool), PgoError>,
     pub loops: Vec<VerifiedLoopEdge>,
     pub solve_time: Duration,
+    /// The fusion found on the solved snapshot, for the writeback to apply.
+    pub fusion_ops: Vec<FusionOp>,
+    pub fusion_plan_time: Duration,
 }
 
 impl LoopSolveJob {
@@ -52,12 +58,19 @@ impl LoopSolveJob {
             self.information,
             self.inertial,
         );
+        let solve_time = started.elapsed();
+        let fusion_ops = match (&solved, self.fusion) {
+            (Ok((result, _)), Some(snapshot)) if result.usable => snapshot.plan(result),
+            _ => Vec::new(),
+        };
         LoopSolveOutcome {
             world_epoch: self.world_epoch,
             graph,
             solved,
             loops: self.loops,
-            solve_time: started.elapsed(),
+            solve_time,
+            fusion_ops,
+            fusion_plan_time: started.elapsed() - solve_time,
         }
     }
 }
@@ -234,6 +247,7 @@ mod tests {
             optimizer: PgoConfig::default(),
             information: LoopGraphInformation::default(),
             inertial: None,
+            fusion: None,
         }
     }
 
