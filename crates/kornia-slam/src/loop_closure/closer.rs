@@ -28,6 +28,7 @@ use crate::loop_closure::{
     fuse_verified_loop, verify_loop_candidate,
 };
 use crate::mapping::Map;
+use crate::mapping::map::KeyframePoseChange;
 use crate::pose_conversion::apply_reference_pose_correction;
 
 /// Verification, episode consistency, fusion and pose-graph settings of loop correction.
@@ -778,7 +779,8 @@ impl LoopAcceptance {
     }
 
     /// Moves the live map by the solve, then the tracking state and the map correction by the
-    /// current reference keyframe's live correction, and applies the fusion planned on the solve.
+    /// correction the camera's view takes ([`viewed_correction`]), and applies the fusion planned
+    /// on the solve.
     #[allow(clippy::too_many_arguments)]
     fn write_back(
         &mut self,
@@ -794,6 +796,7 @@ impl LoopAcceptance {
             .current_keyframe_idx
             .filter(|&kf_idx| map.get_keyframe(kf_idx).is_some())
             .ok_or("current reference keyframe is not in the map")?;
+        let seen = local_landmark_references(map, reference);
         let writeback_started = Instant::now();
         let written = map.apply_graph_correction(
             world_epoch,
@@ -807,11 +810,12 @@ impl LoopAcceptance {
         outcome.timing.landmarks_refreshed = written.landmarks_refreshed;
         outcome.pgo_applied = true;
         self.correction_epoch += 1;
-        if let Some(change) = written
-            .keyframes
-            .iter()
-            .find(|change| change.kf_idx == reference)
-        {
+        if let Some(change) = viewed_correction(
+            &written.keyframes,
+            reference,
+            &seen,
+            context.pose_world_to_cam,
+        ) {
             let world = change.after.inverse().compose(&change.before);
             outcome.tracking_correction = Some((
                 apply_reference_pose_correction(
@@ -843,6 +847,84 @@ impl LoopAcceptance {
                 .position(|keyframe| keyframe.frame.idx == accepted.candidate_kf_idx)
                 .is_some_and(|order| order.abs_diff(candidate_order) <= radius)
         })
+    }
+}
+
+/// The keyframes whose views make up the camera's local map: the reference keyframe and its
+/// best covisible neighbours, as tracking's local map selects them.
+const VIEWED_NEIGHBOURS: usize = 10;
+const VIEWED_MIN_COVISIBILITY: usize = 15;
+
+/// Where a correction may move the camera centre and still count as the same correction (m).
+const VIEWED_AGREEMENT_M: f64 = 0.01;
+
+/// For every live landmark of the reference keyframe's local map, the keyframe it moves with.
+fn local_landmark_references(map: &Map, reference: usize) -> Vec<usize> {
+    let mut keyframes = vec![reference];
+    keyframes.extend(
+        map.covisible_keyframes_min_weight(reference, VIEWED_MIN_COVISIBILITY)
+            .into_iter()
+            .take(VIEWED_NEIGHBOURS)
+            .map(|(kf, _)| kf),
+    );
+    let mut seen = HashSet::new();
+    keyframes
+        .iter()
+        .filter_map(|&kf| map.get_keyframe(kf))
+        .flat_map(|keyframe| keyframe.map_point_by_desc_idx.iter().flatten())
+        .filter(|&&landmark| seen.insert(landmark))
+        .filter_map(|&landmark| map.map_points().get(landmark))
+        .filter(|point| !point.culled)
+        .map(|point| point.keyframe_idx)
+        .collect()
+}
+
+/// The keyframe whose correction the camera takes from a background writeback: the one most
+/// landmarks of its local map move like, judged by where each would move the camera centre.
+///
+/// A landmark moves with its own reference keyframe. After loop fusion much of the local map is
+/// referenced by keyframes of the earlier visit, which a later solve may barely move while the
+/// current reference keyframe moves by the full correction. Tracking then puts the camera back on
+/// those landmarks, so moving it, and the map correction, by the reference keyframe alone makes
+/// the odometry `M^-1 * T` jump. The reference keyframe's correction is kept whenever at least as
+/// many landmarks agree with it as with any other.
+fn viewed_correction(
+    changes: &[KeyframePoseChange],
+    reference: usize,
+    landmark_references: &[usize],
+    camera: Pose3d,
+) -> Option<KeyframePoseChange> {
+    let change = |kf: usize| changes.iter().find(|change| change.kf_idx == kf).copied();
+    let correction =
+        |kf: usize| change(kf).map(|change| change.after.inverse().compose(&change.before));
+    let reference_correction = correction(reference)?;
+    let mut counts: Vec<(usize, usize)> = Vec::new();
+    for &kf in landmark_references {
+        match counts.iter_mut().find(|(seen, _)| *seen == kf) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((kf, 1)),
+        }
+    }
+    let centre = camera.inverse().translation;
+    let moved: Vec<(usize, Vec3F64, usize)> = counts
+        .into_iter()
+        .filter_map(|(kf, count)| Some((kf, correction(kf)?.transform_point(&centre), count)))
+        .collect();
+    let support = |to: Vec3F64| -> usize {
+        moved
+            .iter()
+            .filter(|(_, other, _)| (*other - to).length() <= VIEWED_AGREEMENT_M)
+            .map(|(_, _, count)| count)
+            .sum()
+    };
+    let reference_support = support(reference_correction.transform_point(&centre));
+    let best = moved
+        .iter()
+        .map(|&(kf, to, _)| (support(to), std::cmp::Reverse(kf)))
+        .max();
+    match best {
+        Some((count, std::cmp::Reverse(kf))) if count > reference_support => change(kf),
+        _ => change(reference),
     }
 }
 
