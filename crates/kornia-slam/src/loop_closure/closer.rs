@@ -389,6 +389,24 @@ impl LoopCloser {
         outcome
     }
 
+    /// What the closer does with a loop the episode tracker made ready, inline or queued.
+    pub(crate) fn handle_accepted_for_test(
+        &mut self,
+        map: &mut Map,
+        camera: &PinholeCamera,
+        representative: VerifiedLoopEdge,
+        context: LoopClosingContext,
+    ) -> LoopClosingOutcome {
+        let mut outcome = LoopClosingOutcome::default();
+        self.acceptance
+            .handle_accepted(map, camera, representative, context, &mut outcome);
+        outcome
+    }
+
+    pub(crate) fn queued_for_test(&self) -> usize {
+        self.acceptance.queued.len()
+    }
+
     pub(crate) fn mark_verified_for_test(&mut self, a: usize, b: usize) {
         self.acceptance
             .verified_loop_pairs
@@ -477,14 +495,7 @@ impl LoopAcceptance {
         if let Some(representative) =
             self.accept(map, camera, kf_idx, candidates, context, &mut outcome)
         {
-            if self.solver.is_synchronous() {
-                self.close_loop(map, camera, representative, context, &mut outcome);
-            } else {
-                self.record(representative.clone());
-                self.queued.push(representative);
-                outcome.queued = true;
-                self.submit_queued(map, camera, context, &mut outcome);
-            }
+            self.handle_accepted(map, camera, representative, context, &mut outcome);
         }
         let timing = &mut outcome.timing;
         timing.graph_edges = self.graph.edges().count();
@@ -568,6 +579,32 @@ impl LoopAcceptance {
             edge.candidate_kf_idx,
         ));
         self.verified_loops.push(edge);
+    }
+
+    /// Closes `representative` inline, or queues it for the worker.
+    fn handle_accepted(
+        &mut self,
+        map: &mut Map,
+        camera: &PinholeCamera,
+        representative: VerifiedLoopEdge,
+        context: LoopClosingContext,
+        outcome: &mut LoopClosingOutcome,
+    ) {
+        if self.solver.is_synchronous() {
+            self.close_loop(map, camera, representative, context, outcome);
+        } else if self.stopped {
+            // No solve will run: report the loop now rather than queue it forever.
+            outcome.events.push(LoopClosureEvent::Accepted {
+                edge: representative.clone(),
+                applied: false,
+            });
+            self.record(representative);
+        } else {
+            self.record(representative.clone());
+            self.queued.push(representative);
+            outcome.queued = true;
+            self.submit_queued(map, camera, context, outcome);
+        }
     }
 
     /// Solves the graph with `representative` and every pending loop inline, corrects the map
