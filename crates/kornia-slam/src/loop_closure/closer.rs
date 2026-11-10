@@ -588,7 +588,7 @@ pub(super) fn solve_in_graph(
 /// Makes `graph`'s live keyframes the map's, in map order, at the map's poses: keyframes the map
 /// dropped are forgotten where the graph last placed them, new ones are appended. A map sharing
 /// no keyframe with the graph is a new world, and the graph starts over (`true`).
-fn sync_graph(graph: &mut PoseGraph<()>, map: &Map) -> Result<bool, PoseGraphError> {
+pub(super) fn sync_graph(graph: &mut PoseGraph<()>, map: &Map) -> Result<bool, PoseGraphError> {
     let keyframes = map.keyframes();
     let in_map: HashSet<usize> = keyframes
         .iter()

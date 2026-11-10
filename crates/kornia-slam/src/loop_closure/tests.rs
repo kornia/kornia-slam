@@ -1021,6 +1021,76 @@ fn persistent_graph_keeps_a_loop_whose_keyframe_was_culled() {
     apply(&mut map, &result);
 }
 
+/// A forgotten node's odometry edges are re-measured from its last solved pose: at the seed of the
+/// second solve after a cull, every odometry edge at the forgotten node has zero residual. Before,
+/// the forgotten end kept its pre-solve pose, so the edge measured the uncorrected geometry and the
+/// solve pulled the earlier loop back out.
+#[test]
+fn forgotten_node_edges_measure_from_its_solved_pose() {
+    let gravity = Vec3F64::new(0.0, -9.81, 0.0);
+    let truth = square_lap(gravity.normalize(), 0.0);
+    let mut map = Map::new();
+    for (index, pose) in square_lap(gravity.normalize(), 0.004)
+        .into_iter()
+        .enumerate()
+    {
+        map.insert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())))
+            .unwrap();
+    }
+    let loop_from = |candidate: usize, query: usize| VerifiedLoopEdge {
+        candidate_to_query: Pose3d::between(&truth[candidate], &truth[query]),
+        ..verified_edge(query, candidate, 40, 0.875, 1.0, 8)
+    };
+    let config = PgoConfig::default();
+    let information = LoopGraphInformation::default();
+    let inertial = Some(InertialPgoContext {
+        gravity_world: gravity,
+    });
+    let mut graph = PoseGraph::new(snapshot_graph_config(&config, information, inertial));
+    let solve = |map: &mut Map, graph: &mut PoseGraph<()>, edge: VerifiedLoopEdge| {
+        let (result, _) =
+            solve_in_graph(graph, map, &[edge], &config, information, inertial).unwrap();
+        assert!(result.usable);
+        map.apply_pose_graph_correction(
+            &result.keyframe_indices,
+            &result.original_poses,
+            &result.optimized_poses,
+        )
+        .unwrap();
+    };
+
+    solve(&mut map, &mut graph, loop_from(1, 23));
+    map.remove_keyframe(12).unwrap();
+    solve(&mut map, &mut graph, loop_from(0, 22));
+    let forgotten = NodeId(12);
+    assert_eq!(graph.nodes()[forgotten.0].keyframe, None);
+
+    sync_graph(&mut graph, &map).unwrap();
+    let at_forgotten: Vec<_> = graph
+        .edges()
+        .filter(|edge| {
+            edge.kind == EdgeKind::Odometry && (edge.from == forgotten || edge.to == forgotten)
+        })
+        .collect();
+    assert_eq!(at_forgotten.len(), 2);
+    for edge in at_forgotten {
+        let seeded = Pose3d::between(
+            &graph.nodes()[edge.from.0].pose,
+            &graph.nodes()[edge.to.0].pose,
+        );
+        let residual = seeded.inverse().compose(&edge.measurement);
+        let turn = SO3F64::from_matrix(&residual.rotation).log().length();
+        assert!(
+            residual.translation.length() < 1e-9 && turn < 1e-9,
+            "{:?}->{:?}: {} m, {turn} rad",
+            edge.from,
+            edge.to,
+            residual.translation.length()
+        );
+    }
+    solve(&mut map, &mut graph, loop_from(2, 21));
+}
+
 #[test]
 fn loop_closer_gate_rejects_correction_beyond_odometry_drift() {
     let config = LoopClosingConfig {
