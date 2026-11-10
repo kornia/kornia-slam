@@ -26,7 +26,7 @@ mod verification;
 mod worker;
 
 pub(crate) use closer::{LoopCloser, LoopClosingContext, LoopClosingOutcome, LoopTiming};
-pub use closer::{LoopClosingConfig, LoopClosureEvent, LoopGraphInformation};
+pub use closer::{LoopClosingConfig, LoopClosureEvent, LoopGraphInformation, OdometryRandomWalk};
 pub use episode::{LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker};
 pub use fusion::{LoopFusionConfig, LoopFusionStats, fuse_verified_loop};
 pub use graph::{
