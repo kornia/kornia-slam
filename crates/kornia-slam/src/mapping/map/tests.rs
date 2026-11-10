@@ -132,6 +132,7 @@ pub(crate) fn test_frame_with_pose(idx: usize, descriptors: Vec<[u8; 32]>, pose:
         u_right: Vec::new(),
         depth: Vec::new(),
         keypoints_undist: Vec::new(),
+        rig: Default::default(),
     }
 }
 

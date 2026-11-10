@@ -39,6 +39,9 @@ pub struct FrameItem {
     pub image: Image<u8, 1>,
     /// Rectified right view, when the source provides a stereo pair.
     pub right_image: Option<Image<u8, 1>>,
+    /// Images of the other rig cameras, in rig order after `image` (the
+    /// primary), when the source yields a multi-camera rig.
+    pub rig_images: Vec<Image<u8, 1>>,
     /// IMU samples between the previous yielded camera frame and this one.
     pub imu_samples: Vec<ImuMeasurement>,
 }
@@ -143,7 +146,7 @@ impl SourceConfig {
         match self {
             Self::Euroc(euroc) => euroc.open(stereo),
             Self::Hilti(hilti) => hilti.open(sensors.imu),
-            Self::Lamaria(lamaria) => lamaria.open(sensors.imu),
+            Self::Lamaria(lamaria) => lamaria.open(sensors),
             Self::Mcap(mcap) => mcap.open(stereo),
             Self::Oakd(oakd) => oakd.open(stereo),
             Self::TumVi(tumvi) => tumvi.open(sensors.imu),

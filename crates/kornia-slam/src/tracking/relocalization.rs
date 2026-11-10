@@ -257,6 +257,7 @@ mod tests {
             u_right: Vec::new(),
             depth: Vec::new(),
             keypoints_undist: pixels,
+            rig: Default::default(),
         }
     }
 

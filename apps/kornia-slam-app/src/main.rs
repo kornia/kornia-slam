@@ -201,6 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             timestamp_sec,
             image,
             right_image,
+            rig_images,
             imu_samples,
         } = item;
         #[cfg(feature = "viz")]
@@ -212,6 +213,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         system.process_imu(&imu_samples);
         let result = match right_image.as_ref() {
             Some(right) => system.process_stereo(timestamp_sec, &image, right)?,
+            None if !rig_images.is_empty() => {
+                let images: Vec<&kornia_image::Image<u8, 1>> =
+                    std::iter::once(&image).chain(&rig_images).collect();
+                system.process_rig(timestamp_sec, &images)?
+            }
             None => system.process_image(timestamp_sec, &image)?,
         };
         let frame_ms = system.tracking_duration().as_secs_f64() * 1000.0;

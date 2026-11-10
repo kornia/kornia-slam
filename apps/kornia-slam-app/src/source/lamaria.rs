@@ -14,12 +14,10 @@ use kornia_io::png::read_image_png_rgb8;
 use kornia_sensors::SensorRig;
 use kornia_sensors::imu::ImuMeasurement;
 use kornia_sensors::{ImuCalibration, RigCamera};
-use kornia_slam::SensorSelection;
+use kornia_slam::{CameraSelection, SensorSelection};
 use serde::Deserialize;
 
-use super::{
-    FrameItem, FrameSource, OpenedSource, SourceError, dataset_summary, mono_only, resolve,
-};
+use super::{FrameItem, FrameSource, OpenedSource, SourceError, dataset_summary, resolve};
 use crate::datasets::lamaria::LamariaDataset;
 
 /// A LaMAria sequence: `data` holds `aria/{cam0,cam1,imu0}`.
@@ -47,7 +45,9 @@ pub struct LamariaConfig {
 
 impl LamariaConfig {
     pub(super) fn validate(&self, sensors: SensorSelection) -> Result<(), String> {
-        mono_only("LaMAria", sensors)?;
+        if sensors.cameras == CameraSelection::Stereo {
+            return Err("LaMAria has no rectified pair; select the `Rig` cameras".into());
+        }
         if self.camera > 1 {
             return Err(format!(
                 "LaMAria camera is {}, but must be 0 or 1",
@@ -65,7 +65,8 @@ impl LamariaConfig {
         }
     }
 
-    pub(super) fn open(&self, imu: bool) -> Result<OpenedSource, SourceError> {
+    pub(super) fn open(&self, sensors: SensorSelection) -> Result<OpenedSource, SourceError> {
+        let imu = sensors.imu;
         let dataset = LamariaDataset::open(
             &self.data,
             &self.calib,
@@ -102,6 +103,7 @@ impl LamariaConfig {
         let source = LamariaSource {
             dataset,
             camera: self.camera,
+            rig: sensors.cameras == CameraSelection::Rig,
             with_imu: imu,
             cursor: start,
             end,
@@ -118,6 +120,8 @@ impl LamariaConfig {
 pub struct LamariaSource {
     dataset: LamariaDataset,
     camera: usize,
+    /// Yield the other camera's image too.
+    rig: bool,
     with_imu: bool,
     cursor: usize,
     end: usize,
@@ -172,12 +176,20 @@ impl FrameSource for LamariaSource {
         let sample = &self.dataset.cameras[self.camera][idx];
         let timestamp_sec = sample.timestamp_sec;
         let image = read_gray(&sample.image_path)?;
+        let rig_images = if self.rig {
+            vec![read_gray(
+                &self.dataset.cameras[1 - self.camera][idx].image_path,
+            )?]
+        } else {
+            Vec::new()
+        };
         let imu_samples = self.imu_samples_until(timestamp_sec);
         Ok(Some(FrameItem {
             idx,
             timestamp_sec,
             image,
             right_image: None,
+            rig_images,
             imu_samples,
         }))
     }
