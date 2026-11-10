@@ -258,7 +258,7 @@ fn validate_loop_closing(
     }
     // Correcting a visual-only monocular map would apply scale-ambiguous
     // corrections.
-    let metric = sensors.cameras == CameraSelection::Stereo || sensors.imu;
+    let metric = sensors.cameras != CameraSelection::Mono || sensors.imu;
     if mode.is_enabled() && !metric {
         return Err(ConfigError::LoopClosingWithoutMetricScale);
     }
@@ -428,6 +428,14 @@ impl SensorSelection {
         if self.cameras == CameraSelection::Stereo {
             if rig.stereo_baseline_m.is_none() {
                 return Err(ConfigError::MissingSensor("stereo cameras"));
+            }
+            if rig.fisheye.is_some() {
+                return Err(ConfigError::FisheyeStereo);
+            }
+        }
+        if self.cameras == CameraSelection::Rig {
+            if !rig.is_multi_camera() {
+                return Err(ConfigError::MissingSensor("a multi-camera rig"));
             }
             if rig.fisheye.is_some() {
                 return Err(ConfigError::FisheyeStereo);

@@ -56,6 +56,9 @@ pub enum CameraSelection {
     Mono,
     /// A rectified pair; the right image only adds depth to left-image features.
     Stereo,
+    /// Every camera of the source's multi-camera rig, each tracked with its
+    /// own model and extrinsic (ORB-SLAM3's non-rectified stereo).
+    Rig,
 }
 
 /// Graph family and its stage settings.
@@ -269,6 +272,9 @@ impl fmt::Display for SystemConfig {
                 }
                 StereoCloseDepth::Disabled => writeln!(f, "  stereo depth: rectified pair")?,
             }
+        }
+        if self.sensors.cameras == CameraSelection::Rig {
+            writeln!(f, "  cameras: multi-camera rig")?;
         }
         if self.sensors.imu {
             writeln!(f, "  IMU integration")?;
