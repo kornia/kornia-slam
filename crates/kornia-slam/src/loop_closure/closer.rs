@@ -46,19 +46,58 @@ pub enum LoopGraphInformation {
     ///
     /// [`optimize_pose_graph`]: crate::loop_closure::optimize_pose_graph
     ScalarWeights,
-    /// Odometry edges at the drift model's per-metre sigmas over their own path, loop edges at
-    /// its floors (the verified pose's own noise) under a Cauchy kernel in whitened units.
+    /// Odometry edges a random walk in path; loop edges at the verified pose's own noise
+    /// (`loop_sigma_m`, `loop_sigma_rad`) under a Cauchy kernel at `loop_cauchy_scale` sigmas.
     Drift {
-        drift: DriftModel,
+        odometry: OdometryRandomWalk,
+        loop_sigma_m: f64,
+        loop_sigma_rad: f64,
         loop_cauchy_scale: f64,
     },
 }
 
 impl Default for LoopGraphInformation {
     fn default() -> Self {
+        Self::drift()
+    }
+}
+
+impl LoopGraphInformation {
+    /// `Drift` with the default random walk, the [`DriftModel`] floors as the loop noise, and
+    /// Cauchy at 3 sigma.
+    pub fn drift() -> Self {
+        let floors = DriftModel::default();
         Self::Drift {
-            drift: DriftModel::default(),
+            odometry: OdometryRandomWalk::default(),
+            loop_sigma_m: floors.translation_floor_m,
+            loop_sigma_rad: floors.yaw_floor_rad,
             loop_cauchy_scale: 3.0,
+        }
+    }
+}
+
+/// Odometry noise between keyframes as a random walk in path: `sigma = sqrt(rate * path)`, so a
+/// chain of odometry edges has the same sigma whatever the keyframe spacing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OdometryRandomWalk {
+    pub translation_m2_per_m: f64,
+    /// Applied to every rotation axis; only yaw moves on a gravity manifold.
+    pub rotation_rad2_per_m: f64,
+    /// Conditioning floors for edges that barely move; small, because a per-edge floor
+    /// compounds along the chain like density-dependent noise.
+    pub floor_m: f64,
+    pub floor_rad: f64,
+}
+
+impl Default for OdometryRandomWalk {
+    /// The worst EuRoC Machine Hall rates with loop closing off: translation from MH_04's
+    /// relative-displacement error over 5-40 m, yaw from MH_02's revisit drift.
+    fn default() -> Self {
+        Self {
+            translation_m2_per_m: 0.0145,
+            rotation_rad2_per_m: 2.7e-6,
+            floor_m: 0.001,
+            floor_rad: 1e-4,
         }
     }
 }
@@ -536,9 +575,11 @@ pub(super) fn solve_in_graph(
             let sigma = 1.0 / f64::from(config.loop_edge_weight);
             (sigma, sigma)
         }
-        LoopGraphInformation::Drift { drift, .. } => {
-            (drift.translation_floor_m, drift.yaw_floor_rad)
-        }
+        LoopGraphInformation::Drift {
+            loop_sigma_m,
+            loop_sigma_rad,
+            ..
+        } => (loop_sigma_m, loop_sigma_rad),
     };
     let known = |kf: usize| graph.node_of_keyframe(kf).is_some();
     let loops: Vec<_> = earlier
@@ -630,25 +671,26 @@ pub(super) fn sync_graph(graph: &mut PoseGraph<()>, map: &Map) -> Result<bool, P
     Ok(new_world)
 }
 
-/// Every keyframe a node. Scalar weights put `sigma = 1 / w = 1` on odometry edges; the drift
-/// model has no per-radian term, and its odometry sigmas keep the graph's floors.
+/// Every keyframe a node. Scalar weights put `sigma = 1 / w = 1` on odometry edges; `Drift` makes
+/// them its random walk, with no linear or per-radian term.
 pub(super) fn snapshot_graph_config(
     config: &PgoConfig,
     information: LoopGraphInformation,
     inertial: Option<InertialPgoContext>,
 ) -> PoseGraphConfig {
     let defaults = PoseGraphConfig::default();
-    let (drift_m_per_m, drift_rad_per_m, min_sigma_m, min_sigma_rad, loop_cauchy_scale) =
+    let (walk_m2_per_m, walk_rad2_per_m, min_sigma_m, min_sigma_rad, loop_cauchy_scale) =
         match information {
             LoopGraphInformation::ScalarWeights => (0.0, 0.0, 1.0, 1.0, None),
             LoopGraphInformation::Drift {
-                drift,
+                odometry,
                 loop_cauchy_scale,
+                ..
             } => (
-                drift.translation_per_m,
-                drift.yaw_per_m_rad,
-                defaults.min_sigma_m,
-                defaults.min_sigma_rad,
+                odometry.translation_m2_per_m,
+                odometry.rotation_rad2_per_m,
+                odometry.floor_m,
+                odometry.floor_rad,
                 Some(loop_cauchy_scale),
             ),
         };
@@ -657,9 +699,11 @@ pub(super) fn snapshot_graph_config(
             GraphManifold::Gravity(context.gravity_world)
         }),
         node_spacing: None,
-        drift_m_per_m,
+        drift_m_per_m: 0.0,
         drift_rad_per_rad: 0.0,
-        drift_rad_per_m,
+        drift_rad_per_m: 0.0,
+        walk_m2_per_m,
+        walk_rad2_per_m,
         min_sigma_m,
         min_sigma_rad,
         loop_max_candidates: 0,
