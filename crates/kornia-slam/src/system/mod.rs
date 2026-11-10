@@ -447,7 +447,7 @@ impl SlamSystem {
         // Stereo frames carry metric per-keypoint depth, so we can build a
         // metric map from a single keyframe (ORB-SLAM3's StereoInitialization)
         // instead of waiting for two-view parallax.
-        if curr_frame.is_stereo() {
+        if curr_frame.is_metric() {
             return self.bootstrap_stereo(curr_frame, timestamp_sec);
         }
         self.bootstrap_mono(curr_frame, timestamp_sec)
@@ -772,7 +772,7 @@ impl SlamSystem {
                 .keyframes()
                 .iter()
                 .find(|kf| kf.frame.idx >= start_idx)
-                .map(|kf| kf.frame.is_stereo())
+                .map(|kf| kf.frame.is_metric())
                 .unwrap_or(false);
             let prior_a0 = viba0_accel_bias_prior(is_mono);
             // Drop the solve's map lock before applying its result with a new lock.

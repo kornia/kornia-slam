@@ -1,0 +1,16 @@
+// LaMAria stereo-inertial on both SLAM cameras as a non-rectified rig (cam0
+// primary), pinhole ASL export. `factory_calib` is the Aria factory
+// calibration record pulled from the recording's .vrs header; it rectifies
+// the raw IMU samples.
+(
+    source: Lamaria((
+        data: "../data/lamaria/sequence_1_19",
+        calib: "../data/lamaria/sequence_1_19/pinhole_calibrations/sequence_1_19.json",
+        factory_calib: "../data/lamaria/sequence_1_19/factory_calib.json",
+    )),
+    system: (
+        version: 1,
+        sensors: ( cameras: Rig, imu: true ),
+        pipeline: OrbSlam(()),
+    ),
+)

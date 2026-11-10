@@ -20,7 +20,7 @@ use crate::initialization::two_view::{
     TwoViewEstimate, TwoViewInitConfig, TwoViewRejectReason, try_initialize_two_view,
 };
 use crate::mapping::Map;
-use crate::mapping::growth::{accepted_pair_claims, stereo_seeds};
+use crate::mapping::growth::{accepted_pair_claims, rig_seeds, stereo_seeds};
 use crate::mapping::map::{
     Keyframe, LandmarkSeed, LandmarkTarget, MapInsertion, ObservationKey, ObservationLink,
 };
@@ -105,7 +105,14 @@ pub(crate) fn stereo_initial_map(
     keyframe: Keyframe,
     camera: &PinholeCamera,
 ) -> Result<MapInsertion, TooFewStereoPoints> {
-    let landmarks = stereo_seeds(&keyframe.frame, camera, f64::INFINITY, &[]);
+    let (landmarks, observations) = if keyframe.frame.is_rig() {
+        rig_seeds(&keyframe.frame, f64::INFINITY, &[])
+    } else {
+        (
+            stereo_seeds(&keyframe.frame, camera, f64::INFINITY, &[]),
+            Vec::new(),
+        )
+    };
     if landmarks.len() < MIN_STEREO_POINTS {
         return Err(TooFewStereoPoints {
             found: landmarks.len(),
@@ -114,6 +121,7 @@ pub(crate) fn stereo_initial_map(
     Ok(MapInsertion {
         keyframes: vec![keyframe],
         landmarks,
+        observations,
         ..Default::default()
     })
 }

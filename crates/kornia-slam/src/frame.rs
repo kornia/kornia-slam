@@ -63,6 +63,12 @@ pub struct RigFeatures {
 }
 
 impl Frame {
+    /// Whether the frame carries metric depth: rectified stereo or rig
+    /// overlap triangulation (scale is then observable from one frame).
+    pub fn is_metric(&self) -> bool {
+        self.is_stereo() || self.is_rig()
+    }
+
     /// Whether the features come from several rig cameras.
     pub fn is_rig(&self) -> bool {
         self.rig.camera_ranges.len() > 1

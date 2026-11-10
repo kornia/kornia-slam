@@ -67,6 +67,53 @@ pub fn stereo_seeds(
     seeds
 }
 
+/// Seeds and second observations for a rig frame's overlap-triangulated
+/// points nearer than `max_depth` (metres, primary camera), whose primary and
+/// camera-1 features are both unclaimed: each landmark is referenced to its
+/// primary feature and also observed by the camera-1 match (ORB-SLAM3's
+/// `StereoInitialization` and `CreateNewKeyFrame` for non-rectified stereo).
+/// Link targets index the returned seeds.
+pub fn rig_seeds(
+    frame: &Frame,
+    max_depth: f64,
+    claimed: &[Option<usize>],
+) -> (Vec<LandmarkSeed>, Vec<ObservationLink>) {
+    let pose_inv = frame.pose_world_to_cam.inverse();
+    let is_claimed = |i: usize| claimed.get(i).copied().flatten().is_some();
+    let mut seeds = Vec::new();
+    let mut links = Vec::new();
+    for (i, (point, right)) in frame
+        .rig
+        .stereo_points
+        .iter()
+        .zip(&frame.rig.left_to_right)
+        .enumerate()
+    {
+        let (Some(point), Some(right)) = (point, right) else {
+            continue;
+        };
+        if point.z > max_depth || is_claimed(i) || is_claimed(*right) {
+            continue;
+        }
+        links.push(ObservationLink {
+            observation: ObservationKey {
+                keyframe_idx: frame.idx,
+                feature_idx: *right,
+            },
+            landmark: LandmarkTarget::New(seeds.len()),
+        });
+        seeds.push(LandmarkSeed {
+            position: pose_inv.transform_point(point),
+            color: frame.keypoint_colors.get(i).copied().unwrap_or([128; 3]),
+            reference: ObservationKey {
+                keyframe_idx: frame.idx,
+                feature_idx: i,
+            },
+        });
+    }
+    (seeds, links)
+}
+
 /// Triangulates unassociated features shared by two stored keyframes.
 ///
 /// Both keyframes must already be in the map. Each new landmark is referenced
@@ -565,6 +612,31 @@ mod tests {
         assert_eq!(seeds.len(), 1);
         assert_eq!(seeds[0].reference.feature_idx, 1);
         assert_eq!(seeds[0].reference.keyframe_idx, 10);
+    }
+
+    #[test]
+    fn rig_seeds_link_both_cameras_of_close_unclaimed_overlap_points() {
+        // Features 0..3 are the primary camera's, 3..6 camera 1's.
+        let mut frame = test_frame(4, vec![[0; 32]; 6]);
+        frame.rig.camera_ranges = vec![0..3, 3..6];
+        frame.rig.left_to_right = vec![Some(3), Some(4), Some(5)];
+        frame.rig.stereo_points = vec![
+            Some(Vec3F64::new(0.0, 0.0, 2.0)),
+            Some(Vec3F64::new(0.0, 0.0, 40.0)),
+            Some(Vec3F64::new(0.0, 0.0, 3.0)),
+        ];
+        frame.pose_world_to_cam.translation = Vec3F64::new(-1.0, 0.0, 0.0);
+        // Camera 1's match of feature 2 is already tracked.
+        let claimed = vec![None, None, None, None, None, Some(9)];
+
+        let (seeds, links) = rig_seeds(&frame, 10.0, &claimed);
+
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].reference.feature_idx, 0);
+        assert_eq!(seeds[0].position, Vec3F64::new(1.0, 0.0, 2.0));
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].observation.feature_idx, 3);
+        assert_eq!(links[0].landmark, LandmarkTarget::New(0));
     }
 
     #[test]

@@ -161,6 +161,7 @@ pub fn run_initial_ba(
     let window = WindowPoints::collect(
         snapshot,
         kf_indices.iter().map(|&i| &snapshot.keyframes()[i]),
+        false,
     );
     if window.is_empty() {
         return Ok(InitialBaOutcome::Skipped);
@@ -256,7 +257,7 @@ pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
 
     let active_start = n_kfs.saturating_sub(MAX_ACTIVE_KFS);
 
-    let window = WindowPoints::collect(snapshot, &snapshot.keyframes()[active_start..]);
+    let window = WindowPoints::collect(snapshot, &snapshot.keyframes()[active_start..], false);
     if window.is_empty() {
         return update;
     }
@@ -342,7 +343,7 @@ pub fn run_local_inertial_ba(
 
     let active_start = n_kfs.saturating_sub(MAX_ACTIVE_KFS);
 
-    let window = WindowPoints::collect(snapshot, &snapshot.keyframes()[active_start..]);
+    let window = WindowPoints::collect(snapshot, &snapshot.keyframes()[active_start..], true);
     if window.is_empty() {
         return update;
     }
@@ -639,13 +640,23 @@ struct WindowPoints {
 }
 
 impl WindowPoints {
+    /// With `all_cameras` unset only landmarks a primary-camera feature
+    /// holds: a single-camera solve has no rows for the others, and a point
+    /// without rows has a singular block.
     fn collect<'a>(
         snapshot: &BaSnapshot,
         keyframes: impl IntoIterator<Item = &'a Keyframe>,
+        all_cameras: bool,
     ) -> Self {
         let mut unique: HashSet<usize> = HashSet::new();
         for kf in keyframes {
-            for &mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
+            let held = kf
+                .map_point_by_desc_idx
+                .iter()
+                .enumerate()
+                .filter(|&(desc_idx, _)| all_cameras || kf.frame.camera_of(desc_idx) == 0)
+                .filter_map(|(_, mp)| mp.as_ref());
+            for &mp_idx in held {
                 if let Some(slot) = snapshot.landmark_slot(mp_idx)
                     && !snapshot.map_points()[slot].culled
                 {

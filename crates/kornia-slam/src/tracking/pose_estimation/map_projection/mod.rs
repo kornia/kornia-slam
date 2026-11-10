@@ -486,24 +486,27 @@ impl MapProjectionEstimator {
         } else {
             self.config.pnp.clone()
         };
-        if let [primary] = grids {
-            let mut points_world = Vec::with_capacity(correspondences.len());
-            let mut points_image = Vec::with_capacity(correspondences.len());
-            for &(mp_idx, kp_idx) in correspondences {
-                if let (Some(mp), Some(&kp)) =
-                    (map_points.get(mp_idx), keypoints_undist.get(kp_idx))
-                {
-                    points_world.push(mp.position);
-                    points_image.push(Vec2F32::new(kp[0], kp[1]));
-                }
+        let primary = grids.first()?;
+        let mut points_world = Vec::with_capacity(correspondences.len());
+        let mut points_image = Vec::with_capacity(correspondences.len());
+        for &(mp_idx, kp_idx) in correspondences {
+            if kp_idx >= primary.offset + primary.len {
+                continue;
             }
-            return pnp::solve_pnp(
-                &points_world,
-                &points_image,
-                &primary.camera,
-                pose_init,
-                &pnp_config,
-            );
+            if let (Some(mp), Some(&kp)) = (map_points.get(mp_idx), keypoints_undist.get(kp_idx)) {
+                points_world.push(mp.position);
+                points_image.push(Vec2F32::new(kp[0], kp[1]));
+            }
+        }
+        let primary_solution = pnp::solve_pnp(
+            &points_world,
+            &points_image,
+            &primary.camera,
+            pose_init,
+            &pnp_config,
+        );
+        if grids.len() == 1 {
+            return primary_solution;
         }
         let observations: Vec<RigObservation> = correspondences
             .iter()
@@ -521,7 +524,11 @@ impl MapProjectionEstimator {
                 })
             })
             .collect();
-        solve_rig_pnp(&observations, pose_init, &pnp_config)
+        // The rig solve starts from the primary camera's solution when there
+        // is one: on real data the single-camera solver lands in the better
+        // basin from a drifted prediction.
+        let rig_start = primary_solution.map_or(*pose_init, |(pose, _)| pose);
+        solve_rig_pnp(&observations, &rig_start, &pnp_config)
     }
 
     /// Undistorts keypoints, builds one spatial grid per camera, and runs

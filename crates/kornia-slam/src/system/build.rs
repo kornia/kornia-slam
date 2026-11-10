@@ -56,6 +56,15 @@ impl SensorSelection {
     }
 }
 
+/// Distance between the primary rig camera and camera 1, the baseline of
+/// their overlap triangulation; `None` outside a multi-camera rig.
+fn rig_baseline_m(rig: &SensorRig) -> Option<f64> {
+    rig.is_multi_camera()
+        .then(|| rig.cameras.get(1))
+        .flatten()
+        .map(|camera| camera.primary_from_camera.translation.length())
+}
+
 impl SystemConfig {
     /// System settings for a rig returned by [`SensorSelection::select_rig`].
     ///
@@ -72,6 +81,7 @@ impl SystemConfig {
             local_mapping: orb.mapping.execution,
             stereo_close_depth_m: rig
                 .stereo_baseline_m
+                .or_else(|| rig_baseline_m(rig))
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
         }
     }
