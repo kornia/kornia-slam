@@ -1745,6 +1745,28 @@ fn a_stopped_worker_turns_loop_correction_off() {
     );
 }
 
+/// A loop accepted after the worker stopped is reported at once as not applied, and nothing is
+/// queued for a solve that will never run.
+#[test]
+fn a_loop_accepted_after_the_worker_stopped_is_reported_unapplied() {
+    let config = background_config();
+    let (closer, mut map) = closing_fixture(config.clone(), false);
+    let mut closer = closer.with_solver(LoopSolver::panicking_for_test());
+    let context = closing_context(&map);
+    assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
+    frames_until_reported(&mut closer, &mut map, context, 2000);
+    let edge = verify_loop_candidate(&map, &camera(), 10, 0, &config.verification).unwrap();
+
+    let outcome = closer.handle_accepted_for_test(&mut map, &camera(), edge, context);
+
+    assert!(!outcome.queued);
+    assert!(matches!(
+        outcome.events.as_slice(),
+        [LoopClosureEvent::Accepted { applied: false, .. }]
+    ));
+    assert_eq!(closer.queued_for_test(), 0);
+}
+
 /// The correction epoch advances once per correction written, inline or at a writeback, and a
 /// deferred solve is in flight until it is written back.
 #[test]
