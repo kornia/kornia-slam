@@ -386,6 +386,8 @@ impl SlamSystem {
                 correction.pose_before,
                 correction.pose_after,
             );
+            self.state
+                .correct_pose_before_loss(correction.pose_before, correction.pose_after);
             self.state.velocity_world = correction.velocity_world;
             self.inertial.bias = correction.imu_bias;
         }
@@ -1401,6 +1403,9 @@ impl SlamSystem {
             self.dbg(message);
         }
         if let Some((corrected_tracking_pose, corrected_velocity)) = outcome.tracking_correction {
+            let tracking_pose = self.state.pose_world_to_cam;
+            self.state
+                .correct_pose_before_loss(tracking_pose, corrected_tracking_pose);
             self.state.pose_world_to_cam = corrected_tracking_pose;
             self.state.velocity_world = corrected_velocity;
         }

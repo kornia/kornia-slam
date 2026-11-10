@@ -26,9 +26,8 @@
 //! Landmark deletion is logical. `remove_landmark` clears every referencing feature and
 //! marks the landmark culled; its slot, observation records and derived
 //! geometry stay in place, so readers must check `culled`. Landmark ids are
-//! indices held inside keyframes, stable until `compact_landmarks` frees the
-//! retired slots and renumbers the rest; only a caller holding no ids may run
-//! it. `MapPoint::stable_id` outlives it.
+//! stable indices held inside keyframes, so the vector is never compacted and a
+//! retired id is never reused.
 //! Unlinking the last observation retires the landmark; unlinking the reference
 //! observation promotes the smallest remaining `(keyframe, feature)` in its
 //! place.
@@ -69,8 +68,7 @@ pub use ops::{
     PoseGraphCorrectionResult,
 };
 pub use ops::{
-    InsertionResult, LandmarkCompaction, LandmarkSeed, LandmarkTarget, MapInsertion,
-    MapMutationError, ObservationLink,
+    InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError, ObservationLink,
 };
 pub use ops::{KeyframeRemoval, KeyframeRemovalError, StillNeighbour, StillSide};
 
@@ -89,7 +87,6 @@ pub struct Map {
     // Incremented whenever the map's world coordinate frame changes. Local BA
     // snapshots from an older epoch must never be merged into the new frame.
     world_epoch: u64,
-    next_stable_id: u64,
 }
 
 impl Map {
