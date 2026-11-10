@@ -9,7 +9,7 @@ use crate::loop_closure::LoopClosingConfig;
 use crate::mapping::LocalMappingMode;
 use crate::mapping::vi_ba_schur::ImuHuber;
 use crate::mapping::visual_information::VisualInformation;
-use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
+use crate::tracking::pose_estimation::map_projection::{KeyframeObservations, MapProjectionConfig};
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
 /// Schema version of [`SystemConfig`] this crate reads and writes.
@@ -166,6 +166,9 @@ pub struct MappingConfig {
     /// which makes runs replay identically.
     pub execution: LocalMappingMode,
     pub local_ba: LocalBaConfig,
+    /// Which tracked matches a new keyframe links; ORB-SLAM3 keeps only the
+    /// pose inliers.
+    pub keyframe_observations: KeyframeObservations,
 }
 
 /// The local BA / VI-BA window and its error model. The defaults are the
@@ -354,6 +357,13 @@ impl fmt::Display for SystemConfig {
             LocalMappingMode::Asynchronous => "asynchronous",
         };
         writeln!(f, "  local mapping: {execution}")?;
+        if orb.mapping.keyframe_observations != KeyframeObservations::default() {
+            writeln!(
+                f,
+                "  keyframe observations: {:?}",
+                orb.mapping.keyframe_observations
+            )?;
+        }
         let ba = &orb.mapping.local_ba;
         if *ba != LocalBaConfig::default() {
             writeln!(
