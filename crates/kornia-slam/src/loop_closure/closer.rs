@@ -724,6 +724,13 @@ pub(super) fn sync_graph(
             graph.refresh_odometry(kf, pose)?;
             graph.forget_keyframe(kf);
         }
+        let last_held = keyframes
+            .iter()
+            .rev()
+            .find(|keyframe| graph.node_of_keyframe(keyframe.frame.idx).is_some());
+        if let Some(keyframe) = last_held {
+            graph.rebase_path(keyframe.frame.pose_world_to_cam);
+        }
     }
     for keyframe in keyframes {
         let frame = &keyframe.frame;

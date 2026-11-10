@@ -1198,6 +1198,84 @@ fn default_closer_matches_optimize_pose_graph_through_a_run_with_culling() {
     );
 }
 
+/// The first keyframe after a correction chains its path from where the correction put the one
+/// before it, so its random-walk sigma is `sqrt(q * step)`; before, the path ran from that
+/// keyframe's pre-correction pose and took the correction's jump as distance travelled.
+#[test]
+fn path_after_a_correction_starts_at_the_corrected_keyframe() {
+    let gravity = Vec3F64::new(0.0, -9.81, 0.0);
+    let truth = square_lap(gravity.normalize(), 0.0);
+    let odometry = square_lap(gravity.normalize(), 0.004);
+    let mut map = Map::new();
+    for (index, pose) in odometry.iter().enumerate().take(20) {
+        map.insert_keyframe(Keyframe::from_frame(frame(index, *pose, &[], Vec::new())))
+            .unwrap();
+    }
+    let edge = VerifiedLoopEdge {
+        candidate_to_query: Pose3d::between(&truth[1], &truth[19]),
+        ..verified_edge(19, 1, 40, 0.875, 1.0, 8)
+    };
+    let config = PgoConfig::default();
+    let information = LoopGraphInformation::drift();
+    let settings = LoopGraphSettings {
+        information,
+        persistent: true,
+    };
+    let inertial = Some(InertialPgoContext {
+        gravity_world: gravity,
+    });
+    let mut graph = PoseGraph::new(snapshot_graph_config(&config, information, inertial));
+    let (result, _) =
+        solve_in_graph(&mut graph, &map, &[edge], &config, settings, inertial).unwrap();
+    assert!(result.usable);
+    map.apply_pose_graph_correction(
+        &result.keyframe_indices,
+        &result.original_poses,
+        &result.optimized_poses,
+    )
+    .unwrap();
+    let moved = (result.original_poses[19].inverse().translation
+        - result.optimized_poses[19].inverse().translation)
+        .length();
+    assert!(moved > 0.05, "the loop must move keyframe 19: {moved} m");
+    let corrected_19 = map.get_keyframe(19).unwrap().frame.pose_world_to_cam;
+    for (index, pose) in odometry.iter().enumerate().skip(20) {
+        let after_19 = Pose3d::between(&odometry[19], pose).compose(&corrected_19);
+        map.insert_keyframe(Keyframe::from_frame(frame(
+            index,
+            after_19,
+            &[],
+            Vec::new(),
+        )))
+        .unwrap();
+    }
+
+    sync_graph(&mut graph, &map, true).unwrap();
+    let edge = graph
+        .edges()
+        .find(|edge| edge.kind == EdgeKind::Odometry && edge.to == NodeId(20))
+        .unwrap();
+    let LoopGraphInformation::Drift { odometry: walk, .. } = information else {
+        unreachable!()
+    };
+    let centre = |kf| {
+        map.get_keyframe(kf)
+            .unwrap()
+            .frame
+            .pose_world_to_cam
+            .inverse()
+            .translation
+    };
+    let step = (centre(20) - centre(19)).length();
+    let expected = (walk.translation_m2_per_m * step).sqrt();
+    assert_eq!(edge.from, NodeId(19));
+    assert!(
+        (edge.sigma_m - expected).abs() < 1e-9,
+        "sigma {} m, expected {expected} m",
+        edge.sigma_m
+    );
+}
+
 /// A forgotten node's odometry edges are re-measured from its last solved pose: at the seed of the
 /// second solve after a cull, every odometry edge at the forgotten node has zero residual. Before,
 /// the forgotten end kept its pre-solve pose, so the edge measured the uncorrected geometry and the

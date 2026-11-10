@@ -381,6 +381,12 @@ impl<P> PoseGraph<P> {
         Ok(())
     }
 
+    /// The next keyframe's path is measured from `odometry`, for a source whose world moved under
+    /// the graph, such as a written-back solve: the move is not distance travelled.
+    pub fn rebase_path(&mut self, odometry: Pose3d) {
+        self.last_odometry = Some(odometry);
+    }
+
     /// Feed one odometry keyframe, `odometry` world-to-camera in the odometry world.
     ///
     /// # Errors
