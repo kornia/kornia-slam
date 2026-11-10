@@ -5,7 +5,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::initialization::two_view::TwoViewInitConfig;
-use crate::loop_closure::LoopClosingConfig;
+use crate::loop_closure::{LoopClosingConfig, LoopGraphInformation, LoopGraphSettings};
 use crate::mapping::LocalMappingMode;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
@@ -168,7 +168,7 @@ pub struct MappingConfig {
 /// `vocabulary` is a `.bin` from `convert_orbvoc` or a DBoW2 `ORBvoc.txt`,
 /// selected by extension. A relative path in a file is resolved against that
 /// file's directory.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub enum LoopClosingMode {
@@ -179,6 +179,9 @@ pub enum LoopClosingMode {
     /// corrections wait for inertial initialization.
     Enabled {
         vocabulary: PathBuf,
+        /// The pose graph accepted loops solve; the default is the snapshot `w * I` solve.
+        #[cfg_attr(feature = "serde", serde(default))]
+        graph: LoopGraphSettings,
         #[cfg_attr(feature = "serde", serde(default))]
         execution: LoopClosingExecution,
     },
@@ -189,9 +192,11 @@ pub enum LoopClosingMode {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum LoopClosingExecution {
     /// `Synchronous` with synchronous local mapping, else `Asynchronous`.
-    #[default]
     FollowMapping,
-    /// Solved and written back inside the keyframe that accepted the loop.
+    /// Solved and written back inside the keyframe that accepted the loop. The default: the
+    /// background path accepts fewer loops than this one on the same input, for reasons not yet
+    /// explained, so it stays opt-in.
+    #[default]
     Synchronous,
     /// Solved inline, written back through the asynchronous path `frames`
     /// frames later (at least one): reproducible runs of the background path.
@@ -222,6 +227,13 @@ impl LoopClosingMode {
 
     pub fn is_enabled(&self) -> bool {
         matches!(self, Self::Enabled { .. })
+    }
+
+    pub fn graph(&self) -> Option<LoopGraphSettings> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled { graph, .. } => Some(*graph),
+        }
     }
 }
 
@@ -297,12 +309,26 @@ impl fmt::Display for SystemConfig {
         if let LoopClosingMode::Enabled {
             vocabulary,
             execution,
+            graph,
         } = &orb.loop_closing
         {
-            write!(f, "  loop closing: {}", vocabulary.display())?;
+            let information = match graph.information {
+                LoopGraphInformation::ScalarWeights => "w*I",
+                LoopGraphInformation::Drift { .. } => "drift",
+            };
+            let kept = if graph.persistent {
+                "persistent"
+            } else {
+                "snapshot"
+            };
+            write!(
+                f,
+                "  loop closing: {} (pose graph: {information}, {kept})",
+                vocabulary.display()
+            )?;
             match execution {
-                LoopClosingExecution::FollowMapping => writeln!(f)?,
-                LoopClosingExecution::Synchronous => writeln!(f, ", synchronous")?,
+                LoopClosingExecution::FollowMapping => writeln!(f, ", following mapping")?,
+                LoopClosingExecution::Synchronous => writeln!(f)?,
                 LoopClosingExecution::Deferred { frames } => {
                     writeln!(f, ", deferred by {frames} frames")?
                 }
