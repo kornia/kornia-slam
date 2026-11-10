@@ -50,7 +50,9 @@ pub use verification::{
 pub(crate) use worker::LoopSolver;
 
 #[cfg(test)]
-use closer::{keyframe_poses, optimize_through_graph, snapshot_graph_config, solve_in_graph};
+use closer::{
+    keyframe_poses, optimize_through_graph, snapshot_graph_config, solve_in_graph, sync_graph,
+};
 #[cfg(test)]
 use pose_graph::{max_gravity_alignment_error, pose_graph_cost};
 #[cfg(test)]

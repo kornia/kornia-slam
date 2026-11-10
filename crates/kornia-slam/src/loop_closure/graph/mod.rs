@@ -713,6 +713,11 @@ impl<P> PoseGraph<P> {
             Ok((poses, report)) => {
                 for (node, pose) in self.nodes.iter_mut().zip(poses) {
                     node.pose = pose;
+                    // Nothing measures a forgotten node again, so its solved pose is its odometry
+                    // from now on: a live neighbour's refresh re-measures their edge against it.
+                    if node.keyframe.is_none() {
+                        node.odometry = pose;
+                    }
                 }
                 self.loops_accepted += loops.len() as u64;
                 on_success(self);
