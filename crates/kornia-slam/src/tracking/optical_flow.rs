@@ -2,8 +2,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use kornia_image::Image;
-use kornia_imgproc::optical_flow_pyr_lk::{PyrLKError, PyrLKParams, calc_optical_flow_pyr_lk};
+use kornia_image::{Image, ImageSize};
+use kornia_imgproc::filter::scharr_spatial_gradient_float;
+use kornia_imgproc::optical_flow_pyr_lk::{
+    PyrLKError, PyrLKParams, PyrLKPrecomputed, PyrLKResult, calc_optical_flow_pyr_lk,
+    calc_optical_flow_pyr_lk_with_precomputed,
+};
+use kornia_imgproc::pyramid::pyrdown_f32;
 use thiserror::Error;
 
 /// Stable identity for a feature track.
@@ -307,6 +312,39 @@ impl KltTracker {
         self.track_impl(tracks, Some(initial_pixels), previous, current)
     }
 
+    /// Like [`Self::track`], reusing the pyramid `cache` built for the
+    /// previous call's `current` image when it is this call's `previous`.
+    pub fn track_cached(
+        &self,
+        cache: &mut KltPyramidCache,
+        tracks: &[Track],
+        previous: &Image<u8, 1>,
+        current: &Image<u8, 1>,
+    ) -> Result<Vec<FlowSurvivor>, PyrLKError> {
+        if tracks.is_empty() {
+            return Ok(Vec::new());
+        }
+        check_same_size(previous, current)?;
+        let max_level = self.params.max_level;
+        let (prev_pyr, grad_x_pyr, grad_y_pyr) = match cache.take_for(previous) {
+            Some(cached) => cached.into_parts()?,
+            None => LevelPyramid::build(previous, max_level)?.into_parts()?,
+        };
+        let next = LevelPyramid::build(current, max_level)?;
+        let precomputed = PyrLKPrecomputed {
+            prev_pyr,
+            next_pyr: next.levels,
+            grad_x_pyr,
+            grad_y_pyr,
+        };
+        let survivors = self.track_precomputed(tracks, None, &precomputed, current.size());
+        cache.entry = Some(LevelPyramid {
+            image: next.image,
+            levels: precomputed.next_pyr,
+        });
+        survivors
+    }
+
     fn track_impl(
         &self,
         tracks: &[Track],
@@ -334,9 +372,36 @@ impl KltTracker {
             initial_pixels,
             &params,
         )?;
+        Ok(self.survivors(tracks, &result, current.size()))
+    }
 
-        let width = current.width() as f32;
-        let height = current.height() as f32;
+    fn track_precomputed(
+        &self,
+        tracks: &[Track],
+        initial_pixels: Option<&[[f32; 2]]>,
+        precomputed: &PyrLKPrecomputed,
+        image_size: ImageSize,
+    ) -> Result<Vec<FlowSurvivor>, PyrLKError> {
+        let previous_pixels: Vec<[f32; 2]> = tracks.iter().map(Track::pixel).collect();
+        let mut params = self.params.clone();
+        params.use_initial_flow = initial_pixels.is_some();
+        let result = calc_optical_flow_pyr_lk_with_precomputed(
+            precomputed,
+            &previous_pixels,
+            initial_pixels,
+            &params,
+        )?;
+        Ok(self.survivors(tracks, &result, image_size))
+    }
+
+    fn survivors(
+        &self,
+        tracks: &[Track],
+        result: &PyrLKResult,
+        image_size: ImageSize,
+    ) -> Vec<FlowSurvivor> {
+        let width = image_size.width as f32;
+        let height = image_size.height as f32;
         let mut survivors = Vec::with_capacity(tracks.len());
         for (index, track) in tracks.iter().enumerate() {
             let next_pt = result.next_pts[index];
@@ -355,7 +420,7 @@ impl KltTracker {
                 });
             }
         }
-        Ok(survivors)
+        survivors
     }
 
     fn accepts(
@@ -384,6 +449,93 @@ impl KltTracker {
         let dy = next_pixel[1] - track.pixel[1];
         let max_movement_sq = filter.max_movement_px * filter.max_movement_px;
         dx * dx + dy * dy <= max_movement_sq
+    }
+}
+
+fn check_same_size(previous: &Image<u8, 1>, current: &Image<u8, 1>) -> Result<(), PyrLKError> {
+    if previous.size() != current.size() {
+        return Err(PyrLKError::ImageSizeMismatch {
+            prev_width: previous.width(),
+            prev_height: previous.height(),
+            next_width: current.width(),
+            next_height: current.height(),
+        });
+    }
+    Ok(())
+}
+
+/// One image's LK pyramid, built exactly as `build_lk_precomputed` builds
+/// each side, so a cached pyramid yields bit-identical flow.
+struct LevelPyramid {
+    image: Image<u8, 1>,
+    levels: Vec<Image<f32, 1>>,
+}
+
+type PyramidParts = (Vec<Image<f32, 1>>, Vec<Image<f32, 1>>, Vec<Image<f32, 1>>);
+
+impl LevelPyramid {
+    fn build(image: &Image<u8, 1>, max_level: usize) -> Result<Self, PyrLKError> {
+        let mut levels = Vec::with_capacity(max_level + 1);
+        levels.push(image.cast::<f32>()?);
+        for level in 1..=max_level {
+            let src = &levels[level - 1];
+            let size = ImageSize {
+                width: src.width().div_ceil(2),
+                height: src.height().div_ceil(2),
+            };
+            let mut down = Image::from_size_val(size, 0.0f32)?;
+            pyrdown_f32(src, &mut down)?;
+            levels.push(down);
+        }
+        Ok(Self {
+            image: image.clone(),
+            levels,
+        })
+    }
+
+    /// Splits into `(levels, grad_x, grad_y)`. The gradients are computed
+    /// only here: an image needs them only once it is the previous frame.
+    fn into_parts(self) -> Result<PyramidParts, PyrLKError> {
+        let mut grad_x = Vec::with_capacity(self.levels.len());
+        let mut grad_y = Vec::with_capacity(self.levels.len());
+        for level in &self.levels {
+            let mut ix = Image::from_size_val(level.size(), 0.0f32)?;
+            let mut iy = Image::from_size_val(level.size(), 0.0f32)?;
+            scharr_spatial_gradient_float(level, &mut ix, &mut iy)?;
+            grad_x.push(ix);
+            grad_y.push(iy);
+        }
+        Ok((self.levels, grad_x, grad_y))
+    }
+}
+
+/// The last tracked frame's LK pyramid, kept so the next frame does not
+/// rebuild it as its previous image.
+#[derive(Default)]
+pub struct KltPyramidCache {
+    entry: Option<LevelPyramid>,
+}
+
+impl std::fmt::Debug for KltPyramidCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KltPyramidCache")
+            .field("cached", &self.entry.is_some())
+            .finish()
+    }
+}
+
+impl KltPyramidCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Takes the cached pyramid if it was built from exactly `image`'s
+    /// pixels; a byte compare is cheap next to a pyramid and makes a stale
+    /// cache impossible to use.
+    fn take_for(&mut self, image: &Image<u8, 1>) -> Option<LevelPyramid> {
+        let entry = self.entry.take()?;
+        (entry.image.size() == image.size() && entry.image.as_slice() == image.as_slice())
+            .then_some(entry)
     }
 }
 
@@ -709,6 +861,38 @@ mod tests {
             "expected tracked pixel near (93, 92), got {got:?}"
         );
         assert_eq!(survivors[0].track_id, id);
+    }
+
+    #[test]
+    fn cached_pyramid_tracks_bit_identically() {
+        let frames = [
+            square_image([90, 90]),
+            square_image([93, 92]),
+            square_image([95, 95]),
+            square_image([96, 97]),
+        ];
+        let tracker = KltTracker::default();
+        let mut cache = KltPyramidCache::new();
+        let mut tracks = TrackSet::new();
+        tracks.spawn([90.0, 90.0]);
+        tracks.spawn([129.0, 90.0]);
+
+        // Frames 1->2 hit the cache; 0->2 after it misses and rebuilds.
+        for (prev, next) in [(0, 1), (1, 2), (0, 2), (2, 3)] {
+            let plain = tracker
+                .track(tracks.tracks(), &frames[prev], &frames[next])
+                .unwrap();
+            let cached = tracker
+                .track_cached(&mut cache, tracks.tracks(), &frames[prev], &frames[next])
+                .unwrap();
+            assert_eq!(plain.len(), cached.len());
+            for (a, b) in plain.iter().zip(&cached) {
+                assert_eq!(a.track_id, b.track_id);
+                assert_eq!(a.pixel[0].to_bits(), b.pixel[0].to_bits());
+                assert_eq!(a.pixel[1].to_bits(), b.pixel[1].to_bits());
+                assert_eq!(a.error.to_bits(), b.error.to_bits());
+            }
+        }
     }
 
     #[test]
