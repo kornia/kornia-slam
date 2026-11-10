@@ -270,6 +270,55 @@ mod tests {
     }
 
     #[test]
+    fn matches_the_single_camera_solver_with_noise_and_outliers() {
+        let camera = camera();
+        let truth = Pose3d::new(yaw(2.0), Vec3F64::new(0.05, -0.02, 0.1));
+        let mut observations = Vec::new();
+        let mut seed = 7u64;
+        let mut noise = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f64 / (1u64 << 31) as f64) - 0.5
+        };
+        for i in 0..200 {
+            let p = Vec3F64::new(
+                (i % 20) as f64 * 0.3 - 3.0,
+                (i / 20) as f64 * 0.3 - 1.5,
+                2.0 + (i % 7) as f64,
+            );
+            let world = truth.inverse().transform_point(&p);
+            let pixel = camera.project_to_pixel(&p, 0.1).unwrap();
+            let outlier = i % 4 == 0;
+            let (du, dv) = if outlier {
+                (noise() * 40.0, noise() * 40.0)
+            } else {
+                (noise(), noise())
+            };
+            observations.push(RigObservation {
+                point_world: world,
+                pixel: [pixel.x + du, pixel.y + dv],
+                camera: &camera,
+                camera_from_primary: None,
+            });
+        }
+        let start = Pose3d::new(yaw(5.0), Vec3F64::new(0.1, -0.02, 0.05));
+        let (pose, inliers) = solve_rig_pnp(&observations, &start, &PnpConfig::default()).unwrap();
+        let points: Vec<Vec3F64> = observations.iter().map(|o| o.point_world).collect();
+        let pixels: Vec<kornia_algebra::Vec2F32> = observations
+            .iter()
+            .map(|o| kornia_algebra::Vec2F32::new(o.pixel[0] as f32, o.pixel[1] as f32))
+            .collect();
+        let (mono, mono_inliers) =
+            super::super::pnp::solve_pnp(&points, &pixels, &camera, &start, &PnpConfig::default())
+                .unwrap();
+        assert!(inliers >= 140, "inliers {inliers}");
+        assert_eq!(inliers, mono_inliers);
+        assert!((pose.translation - truth.translation).length() < 0.01);
+        assert!((pose.translation - mono.translation).length() < 1e-3);
+    }
+
+    #[test]
     fn recovers_the_rig_pose_from_both_cameras() {
         let camera = camera();
         // Camera 1 looks 70 deg to the side of the primary, 11 cm away.

@@ -16,8 +16,12 @@ use crate::rig::RigGeometry;
 /// Search band around the epipolar line at octave 0, in pixels (ORB-SLAM3:
 /// chi² 3.84 at one-pixel sigma, so about two pixels).
 const EPIPOLAR_BAND_PX: f64 = 2.0;
-/// Highest accepted Hamming distance (ORB-SLAM3's `TH_LOW`).
-const MAX_HAMMING: u32 = 50;
+/// Highest accepted Hamming distance: ORB-SLAM3's `TH_HIGH`. The two views
+/// differ by the rig's 75 deg and meet at the stretched edges of wide
+/// pinhole images, where `TH_LOW` (50) leaves almost no match; ORB-SLAM3's
+/// fisheye stereo matching has no absolute cap at all. The epipolar band
+/// and the triangulation gates reject what this lets through.
+const MAX_HAMMING: u32 = 100;
 /// Best-to-second Hamming ratio along the line.
 const NN_RATIO: f64 = 0.9;
 /// Largest reprojection error of a triangulated match at octave 0, in pixels.
