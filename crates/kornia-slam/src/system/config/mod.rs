@@ -192,9 +192,11 @@ pub enum LoopClosingMode {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum LoopClosingExecution {
     /// `Synchronous` with synchronous local mapping, else `Asynchronous`.
-    #[default]
     FollowMapping,
-    /// Solved and written back inside the keyframe that accepted the loop.
+    /// Solved and written back inside the keyframe that accepted the loop. The default: the
+    /// background path accepts fewer loops than this one on the same input, for reasons not yet
+    /// explained, so it stays opt-in.
+    #[default]
     Synchronous,
     /// Solved inline, written back through the asynchronous path `frames`
     /// frames later (at least one): reproducible runs of the background path.
@@ -325,8 +327,8 @@ impl fmt::Display for SystemConfig {
                 vocabulary.display()
             )?;
             match execution {
-                LoopClosingExecution::FollowMapping => writeln!(f)?,
-                LoopClosingExecution::Synchronous => writeln!(f, ", synchronous")?,
+                LoopClosingExecution::FollowMapping => writeln!(f, ", following mapping")?,
+                LoopClosingExecution::Synchronous => writeln!(f)?,
                 LoopClosingExecution::Deferred { frames } => {
                     writeln!(f, ", deferred by {frames} frames")?
                 }

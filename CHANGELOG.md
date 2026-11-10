@@ -12,11 +12,13 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 **Loop closing can solve off the tracking thread.** `LoopClosingMode::Enabled`
 gains an optional `execution` (source-breaking for code that builds the variant
-by hand): `FollowMapping`, the default, keeps today's inline solve with
-synchronous local mapping and otherwise solves on a `slam-loop-closing` thread;
-`Synchronous`, `Asynchronous` and `Deferred { frames }` (inline, but written
-back `frames` frames later through the background path, so runs replay) choose
-explicitly. A background result is written back at a frame boundary; keyframes
+by hand): `Synchronous`, the default, keeps today's inline solve whatever the
+mapping execution; `Asynchronous` solves on a `slam-loop-closing` thread,
+`FollowMapping` picks one of the two from the local-mapping execution, and
+`Deferred { frames }` solves inline but writes back `frames` frames later
+through the background path, so runs replay. The background path is opt-in
+because it accepts fewer loops than the inline one on the same input (18-22
+against 47 on the sim recording), which is not explained yet. A background result is written back at a frame boundary; keyframes
 created or refined by bundle adjustment during the solve keep their relative
 pose, and a result from another world frame is solved again. The map then jumps
 once per correction: `SlamSystem::correction_epoch()` advances with each one,

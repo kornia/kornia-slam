@@ -341,6 +341,25 @@ fn vocabulary_path_must_not_be_empty() {
     assert_eq!(config.validate(), Err(ConfigError::EmptyVocabularyPath));
 }
 
+/// Loop closing solves inline unless a configuration asks for the worker, whatever the mapping
+/// execution.
+#[test]
+fn default_loop_closing_execution_is_synchronous() {
+    for mapping in [
+        LocalMappingMode::Synchronous,
+        LocalMappingMode::Asynchronous,
+    ] {
+        assert_eq!(
+            LoopClosingExecution::default().resolve(mapping),
+            LoopClosingExecution::Synchronous
+        );
+    }
+    assert_eq!(
+        LoopClosingExecution::default().resolve(LocalMappingMode::default()),
+        LoopClosingExecution::Synchronous
+    );
+}
+
 #[test]
 fn follow_mapping_resolves_to_the_mapping_execution() {
     use LoopClosingExecution::*;
@@ -711,6 +730,10 @@ mod ron_files {
         };
         assert_eq!(
             execution(&parse(&text("")).unwrap()),
+            LoopClosingExecution::Synchronous
+        );
+        assert_eq!(
+            execution(&parse(&text(", execution: FollowMapping")).unwrap()),
             LoopClosingExecution::FollowMapping
         );
         assert_eq!(
