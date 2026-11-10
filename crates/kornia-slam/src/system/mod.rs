@@ -241,6 +241,28 @@ impl SlamSystem {
         Ok(self.track_frame(frame, left, timestamp_sec))
     }
 
+    /// Like [`Self::process_image`] for one capture of a multi-camera rig:
+    /// `images[c]` comes from rig camera `c` (see [`SensorRig::cameras`]),
+    /// all taken at `timestamp_sec`. Other pipelines reject it.
+    pub fn process_rig(
+        &mut self,
+        timestamp_sec: f64,
+        images: &[&Image<u8, 1>],
+    ) -> Result<TrackingResult, ProcessError> {
+        if !self.rig.is_multi_camera() {
+            return Err(ProcessError::NotARig);
+        }
+        input::validate_rig_images(timestamp_sec, images, &self.rig.cameras)?;
+        let frame = self
+            .frontend
+            .prepare_rig(self.next_frame_idx, images)
+            .map_err(ProcessError::Frontend)?;
+        let Some(&primary) = images.first() else {
+            return Err(ProcessError::NotARig);
+        };
+        Ok(self.track_frame(frame, primary, timestamp_sec))
+    }
+
     /// Takes a prepared frame as the next one and tracks it.
     fn track_frame(
         &mut self,
@@ -284,6 +306,24 @@ impl SlamSystem {
 
     fn report_stereo(&mut self, frame: &Frame) {
         if !self.debug {
+            return;
+        }
+        if frame.is_rig() {
+            let mut depths: Vec<f64> = frame
+                .rig
+                .stereo_points
+                .iter()
+                .flatten()
+                .map(|p| p.z)
+                .collect();
+            depths.sort_by(f64::total_cmp);
+            let median = depths.get(depths.len() / 2).copied().unwrap_or(0.0);
+            let per_camera: Vec<usize> = frame.rig.camera_ranges.iter().map(|r| r.len()).collect();
+            self.dbg(format!(
+                "[overlap] frame={} features={per_camera:?} triangulated={} median_depth={median:.3}m",
+                frame.idx,
+                depths.len()
+            ));
             return;
         }
         let Some(matched) = self.frontend.observation().stereo_matched else {

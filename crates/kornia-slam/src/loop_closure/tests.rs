@@ -43,6 +43,7 @@ fn frame(idx: usize, pose: Pose3d, points: &[[f32; 2]], descriptors: Vec<[u8; 32
         u_right: Vec::new(),
         depth: Vec::new(),
         keypoints_undist: points.to_vec(),
+        rig: Default::default(),
     }
 }
 

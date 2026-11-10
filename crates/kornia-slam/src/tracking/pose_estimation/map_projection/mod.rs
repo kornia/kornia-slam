@@ -706,6 +706,7 @@ mod matching_tests {
             u_right: Vec::new(),
             depth: Vec::new(),
             keypoints_undist: keypoints,
+            rig: Default::default(),
         }
     }
 
