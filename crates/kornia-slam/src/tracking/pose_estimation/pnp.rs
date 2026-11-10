@@ -6,6 +6,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_3d::ransac::RobustKernelKind;
 use kornia_algebra::{Mat3AF32, Vec2F32, Vec3AF32, Vec3F64};
 
+use crate::mapping::visual_information::VisualInformation;
 use crate::pose_conversion::{mat3_to_f32, mat3_to_f64, vec3_to_f32, vec3_to_f64};
 
 /// PnP pose-estimation thresholds.
@@ -34,6 +35,10 @@ pub struct PnpConfig {
     /// nothing — and with `outlier_rounds: 4` the cost is paid four times, twice per frame
     /// (initial PnP, then `refine_with_local_map`).
     pub lm_max_iterations: usize,
+    /// Scales the outlier-round and final-inlier gates by each keypoint's
+    /// octave sigma (ORB-SLAM3's chi2 test on the `invSigma2`-weighted
+    /// error). The kornia-3d LM itself stays unweighted.
+    pub visual_information: VisualInformation,
 }
 
 impl Default for PnpConfig {
@@ -48,6 +53,7 @@ impl Default for PnpConfig {
             robust_scale_sq: 25.0,
             outlier_rounds: 4,
             lm_max_iterations: 50,
+            visual_information: VisualInformation::Unit,
         }
     }
 }
@@ -69,20 +75,32 @@ pub struct PnpDiagnostics {
 ///
 /// Filters correspondences by reprojection error against `pose_init`, runs LM,
 /// then counts final inliers. Returns the refined pose and inlier count.
+///
+/// `octaves` holds each image point's ORB octave; empty means octave 0.
 pub fn solve_pnp(
     points_world_f64: &[Vec3F64],
     points_image: &[Vec2F32],
+    octaves: &[u8],
     camera: &PinholeCamera,
     pose_init: &Pose3d,
     config: &PnpConfig,
 ) -> Option<(Pose3d, usize)> {
-    solve_pnp_with_diagnostics(points_world_f64, points_image, camera, pose_init, config).0
+    solve_pnp_with_diagnostics(
+        points_world_f64,
+        points_image,
+        octaves,
+        camera,
+        pose_init,
+        config,
+    )
+    .0
 }
 
 /// Solves PnP and returns intermediate correspondence counts.
 pub fn solve_pnp_with_diagnostics(
     points_world_f64: &[Vec3F64],
     points_image: &[Vec2F32],
+    octaves: &[u8],
     camera: &PinholeCamera,
     pose_init: &Pose3d,
     config: &PnpConfig,
@@ -163,6 +181,8 @@ pub fn solve_pnp_with_diagnostics(
     // observations outside the final reprojection threshold are permanently
     // removed so a bad intermediate solution cannot compound into the next.
     let final_threshold_sq = config.final_reproj_threshold_px * config.final_reproj_threshold_px;
+    let gate_sq =
+        |i: usize| gate_scale_sq(config.visual_information, octaves, i) * final_threshold_sq;
     let rounds = config.outlier_rounds.max(1);
     let mut active: Vec<usize> = (0..world_inliers.len()).collect();
     let mut last_lm = None;
@@ -205,7 +225,7 @@ pub fn solve_pnp_with_diagnostics(
                         points_image[original_index].x as f64,
                         points_image[original_index].y as f64,
                     )
-                    .is_some_and(|error_sq| error_sq <= final_threshold_sq)
+                    .is_some_and(|error_sq| error_sq <= gate_sq(original_index))
             });
         }
         last_lm = Some(lm);
@@ -219,15 +239,39 @@ pub fn solve_pnp_with_diagnostics(
     diagnostics.converged = lm.converged;
     let pose_new = unnormalize(&lm.rotation, lm.translation);
 
-    let final_inliers = count_reprojection_inliers(
-        &pose_new,
-        points_world_f64,
-        points_image,
-        camera,
-        config.final_reproj_threshold_px,
-    );
+    let final_inliers = if config.visual_information.is_unit() {
+        count_reprojection_inliers(
+            &pose_new,
+            points_world_f64,
+            points_image,
+            camera,
+            config.final_reproj_threshold_px,
+        )
+    } else {
+        (0..points_world_f64.len())
+            .filter(|&i| {
+                camera
+                    .reprojection_error_sq_world(
+                        &pose_new,
+                        &points_world_f64[i],
+                        points_image[i].x as f64,
+                        points_image[i].y as f64,
+                    )
+                    .is_some_and(|error_sq| error_sq <= gate_sq(i))
+            })
+            .count()
+    };
 
     (Some((pose_new, final_inliers)), diagnostics)
+}
+
+/// `sigma²` of point `i`'s octave, the factor its pixel gates scale by.
+fn gate_scale_sq(information: VisualInformation, octaves: &[u8], i: usize) -> f64 {
+    if information.is_unit() {
+        return 1.0;
+    }
+    let sigma = information.sigma_px(octaves.get(i).copied().unwrap_or(0)) as f64;
+    sigma * sigma
 }
 
 /// Count map-point reprojection inliers given a camera pose.
@@ -293,6 +337,38 @@ mod tests {
         (points_world, points_image)
     }
 
+    /// A 6 px error is past the 3 px gate at octave 0 but inside it at
+    /// octave 6 (sigma 2.99 px) once the gates are octave-scaled.
+    #[test]
+    fn octave_scaled_gates_keep_coarse_keypoints() {
+        let camera = test_camera();
+        let truth = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.05, -0.02, 0.1));
+        let (points_world, mut points_image) = synthetic_correspondences(&camera, &truth, 40);
+        let mut octaves = vec![0u8; points_world.len()];
+        for i in (0..points_world.len()).step_by(7) {
+            points_image[i].x += 6.0;
+            octaves[i] = 6;
+        }
+        let inliers = |visual_information| {
+            let config = PnpConfig {
+                visual_information,
+                ..PnpConfig::default()
+            };
+            solve_pnp(
+                &points_world,
+                &points_image,
+                &octaves,
+                &camera,
+                &truth,
+                &config,
+            )
+            .unwrap()
+            .1
+        };
+        assert_eq!(inliers(VisualInformation::Unit), 34);
+        assert_eq!(inliers(VisualInformation::OctaveScaled), 40);
+    }
+
     #[test]
     fn robust_defaults_match_tracking_configuration() {
         let config = PnpConfig::default();
@@ -324,6 +400,7 @@ mod tests {
             solve_pnp(
                 &points_world,
                 &points_image,
+                &[],
                 &camera,
                 &Pose3d::IDENTITY,
                 &cfg,
@@ -357,6 +434,7 @@ mod tests {
         let (pose, _) = solve_pnp(
             &points_world,
             &points_image,
+            &[],
             &camera,
             &Pose3d::IDENTITY,
             &cfg,
@@ -377,6 +455,7 @@ mod tests {
         let (result, diagnostics) = solve_pnp_with_diagnostics(
             &points_world,
             &points_image,
+            &[],
             &camera,
             &Pose3d::IDENTITY,
             &PnpConfig::default(),
@@ -404,6 +483,7 @@ mod tests {
         let (result, diagnostics) = solve_pnp_with_diagnostics(
             &points_world,
             &points_image,
+            &[],
             &camera,
             &Pose3d::IDENTITY,
             &config,
@@ -428,6 +508,7 @@ mod tests {
         let (pose, inliers) = solve_pnp(
             &points_world,
             &points_image,
+            &[],
             &camera,
             &Pose3d::IDENTITY,
             &config,
@@ -457,6 +538,7 @@ mod tests {
         let (result, diagnostics) = solve_pnp_with_diagnostics(
             &points_world,
             &points_image,
+            &[],
             &camera,
             &Pose3d::IDENTITY,
             &config,

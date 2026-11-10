@@ -22,6 +22,7 @@ pub mod map;
 pub(crate) mod robust;
 pub mod stationary;
 pub mod vi_ba_schur;
+pub mod visual_information;
 pub mod wheel_odom;
 
 pub use local_mapping::{KeyframeJob, LocalMapping, LocalMappingMode};

@@ -7,6 +7,7 @@ use kornia_sensors::SensorRig;
 use super::*;
 use crate::mapping::LocalMappingMode;
 use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
+use crate::mapping::visual_information::VisualInformation;
 use crate::system::ConfigError;
 #[cfg(feature = "serde")]
 use crate::system::LoadError;
@@ -463,9 +464,16 @@ mod runtime_settings {
         orb_mut(&mut config).mapping.local_ba = LocalBaConfig {
             active_keyframes: 10,
             stereo_depth_sigma: StereoDepthSigma::Disparity { px: 1.0 },
+            visual_information: VisualInformation::OctaveScaled,
             ..LocalBaConfig::default()
         };
-        let local_ba = config.settings(&selected).local_ba;
+        let settings = config.settings(&selected);
+        assert_eq!(
+            settings.map_projection.pnp.visual_information,
+            VisualInformation::OctaveScaled
+        );
+        let local_ba = settings.local_ba;
+        assert_eq!(local_ba.visual_information, VisualInformation::OctaveScaled);
         assert_eq!(local_ba.active_keyframes, 10);
         let fb = selected.camera.fx * 0.11;
         assert_eq!(

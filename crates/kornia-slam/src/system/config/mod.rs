@@ -8,6 +8,7 @@ use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopClosingConfig;
 use crate::mapping::LocalMappingMode;
 use crate::mapping::vi_ba_schur::ImuHuber;
+use crate::mapping::visual_information::VisualInformation;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
@@ -184,6 +185,9 @@ pub struct LocalBaConfig {
     pub boundary_scales_bias_rows: bool,
     pub imu_huber: ImuHuber,
     pub stereo_depth_sigma: StereoDepthSigma,
+    /// Reprojection weight by keypoint octave, in VI-BA and in the tracking
+    /// PnP gates; with `Disparity` it also scales the stereo depth sigma.
+    pub visual_information: VisualInformation,
 }
 
 impl Default for LocalBaConfig {
@@ -194,6 +198,7 @@ impl Default for LocalBaConfig {
             boundary_scales_bias_rows: true,
             imu_huber: ImuHuber::AllEdges,
             stereo_depth_sigma: StereoDepthSigma::default(),
+            visual_information: VisualInformation::default(),
         }
     }
 }
@@ -354,7 +359,7 @@ impl fmt::Display for SystemConfig {
             writeln!(
                 f,
                 "  local BA: {} active keyframes, boundary IMU scale {} (bias rows {}), \
-                 IMU Huber {:?}, depth sigma {:?}",
+                 IMU Huber {:?}, depth sigma {:?}, visual information {:?}",
                 ba.active_keyframes,
                 ba.boundary_imu_info_scale,
                 if ba.boundary_scales_bias_rows {
@@ -364,6 +369,7 @@ impl fmt::Display for SystemConfig {
                 },
                 ba.imu_huber,
                 ba.stereo_depth_sigma,
+                ba.visual_information,
             )?;
         }
         if let LoopClosingMode::Enabled {

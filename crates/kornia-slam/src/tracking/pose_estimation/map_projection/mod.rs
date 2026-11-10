@@ -35,6 +35,7 @@ use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
 use crate::frame::Frame;
 use crate::mapping::map::{Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
+use crate::mapping::visual_information::VisualInformation;
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 
 use super::Estimate;
@@ -142,6 +143,13 @@ impl Default for MapProjectionConfig {
 }
 
 impl MapProjectionConfig {
+    /// This config with the PnP gates weighted by `information`.
+    pub fn with_visual_information(&self, information: VisualInformation) -> Self {
+        let mut config = self.clone();
+        config.pnp.visual_information = information;
+        config
+    }
+
     /// `search_scale` to pass to `MapProjectionEstimator::estimate_pose` given
     /// how long tracking has been failing.
     ///
@@ -246,6 +254,7 @@ impl MapProjectionEstimator {
                     map.map_points(),
                     &correspondences,
                     &curr_keypoints_undist,
+                    &frame.features.octaves,
                     &grids,
                     pose_init,
                     search_scale,
@@ -451,6 +460,7 @@ impl MapProjectionEstimator {
             map.map_points(),
             &global_matches,
             curr_keypoints_undist,
+            curr_octaves,
             grids,
             pose_init,
             search_scale,
@@ -468,11 +478,13 @@ impl MapProjectionEstimator {
     /// [`Self::estimate_pose`]) so a drifted `pose_init` doesn't starve the
     /// LM solve of correspondences; the tight final-inlier threshold that
     /// actually accepts the solution is unaffected.
+    #[allow(clippy::too_many_arguments)]
     fn solve_pnp(
         &self,
         map_points: &[MapPoint],
         correspondences: &[(usize, usize)],
         keypoints_undist: &[[f32; 2]],
+        octaves: &[u8],
         grids: &[ViewGrid],
         pose_init: &Pose3d,
         search_scale: f32,
@@ -487,8 +499,11 @@ impl MapProjectionEstimator {
             self.config.pnp.clone()
         };
         let primary = grids.first()?;
+        let information = pnp_config.visual_information;
+        let octave_of = |kp_idx: usize| octaves.get(kp_idx).copied().unwrap_or(0);
         let mut points_world = Vec::with_capacity(correspondences.len());
         let mut points_image = Vec::with_capacity(correspondences.len());
+        let mut points_octave = Vec::new();
         for &(mp_idx, kp_idx) in correspondences {
             if kp_idx >= primary.offset + primary.len {
                 continue;
@@ -496,11 +511,15 @@ impl MapProjectionEstimator {
             if let (Some(mp), Some(&kp)) = (map_points.get(mp_idx), keypoints_undist.get(kp_idx)) {
                 points_world.push(mp.position);
                 points_image.push(Vec2F32::new(kp[0], kp[1]));
+                if !information.is_unit() {
+                    points_octave.push(octave_of(kp_idx));
+                }
             }
         }
         let primary_solution = pnp::solve_pnp(
             &points_world,
             &points_image,
+            &points_octave,
             &primary.camera,
             pose_init,
             &pnp_config,
@@ -521,6 +540,7 @@ impl MapProjectionEstimator {
                     pixel: [kp[0] as f64, kp[1] as f64],
                     camera: &view.camera,
                     camera_from_primary: view.camera_from_primary.as_ref(),
+                    sigma_px: information.sigma_px(octave_of(kp_idx)) as f64,
                 })
             })
             .collect();

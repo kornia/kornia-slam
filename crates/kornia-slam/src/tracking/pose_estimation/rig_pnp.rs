@@ -21,6 +21,9 @@ pub struct RigObservation<'a> {
     pub camera: &'a PinholeCamera,
     /// `None` for the primary camera.
     pub camera_from_primary: Option<&'a Pose3d>,
+    /// Pixel standard deviation of the keypoint; residuals and gates are in
+    /// units of it (1 for unit information).
+    pub sigma_px: f64,
 }
 
 impl RigObservation<'_> {
@@ -37,6 +40,7 @@ impl RigObservation<'_> {
         let (_, p_camera) = self.point_in_camera(pose);
         self.camera
             .reprojection_error_sq_cam(&p_camera, self.pixel[0], self.pixel[1])
+            .map(|e| e / (self.sigma_px * self.sigma_px))
     }
 }
 
@@ -163,8 +167,8 @@ fn robust_cost(
 fn residual(observation: &RigObservation<'_>, p_camera: &Vec3F64) -> Option<[f64; 2]> {
     let pixel = observation.camera.project_to_pixel(p_camera, MIN_DEPTH_M)?;
     Some([
-        pixel.x - observation.pixel[0],
-        pixel.y - observation.pixel[1],
+        (pixel.x - observation.pixel[0]) / observation.sigma_px,
+        (pixel.y - observation.pixel[1]) / observation.sigma_px,
     ])
 }
 
@@ -186,7 +190,10 @@ fn normal_equations(
         };
         let w = huber_weight((r[0] * r[0] + r[1] * r[1]).sqrt(), delta);
         let z = p_camera.z.max(MIN_DEPTH_M);
-        let (fx, fy) = (observation.camera.fx, observation.camera.fy);
+        let (fx, fy) = (
+            observation.camera.fx / observation.sigma_px,
+            observation.camera.fy / observation.sigma_px,
+        );
         let j_proj = [
             [fx / z, 0.0, -fx * p_camera.x / (z * z)],
             [0.0, fy / z, -fy * p_camera.y / (z * z)],
@@ -300,6 +307,7 @@ mod tests {
                 pixel: [pixel.x + du, pixel.y + dv],
                 camera: &camera,
                 camera_from_primary: None,
+                sigma_px: 1.0,
             });
         }
         let start = Pose3d::new(yaw(5.0), Vec3F64::new(0.1, -0.02, 0.05));
@@ -309,9 +317,15 @@ mod tests {
             .iter()
             .map(|o| kornia_algebra::Vec2F32::new(o.pixel[0] as f32, o.pixel[1] as f32))
             .collect();
-        let (mono, mono_inliers) =
-            super::super::pnp::solve_pnp(&points, &pixels, &camera, &start, &PnpConfig::default())
-                .unwrap();
+        let (mono, mono_inliers) = super::super::pnp::solve_pnp(
+            &points,
+            &pixels,
+            &[],
+            &camera,
+            &start,
+            &PnpConfig::default(),
+        )
+        .unwrap();
         assert!(inliers >= 140, "inliers {inliers}");
         assert_eq!(inliers, mono_inliers);
         assert!((pose.translation - truth.translation).length() < 0.01);
@@ -354,6 +368,7 @@ mod tests {
                     pixel: [pixel.x, pixel.y],
                     camera: &camera,
                     camera_from_primary: *extrinsic,
+                    sigma_px: 1.0,
                 })
             })
             .collect();

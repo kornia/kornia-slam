@@ -712,6 +712,7 @@ impl SlamSystem {
         let refined = crate::mapping::bundle_adjustment::run_initial_ba(
             &mut self.map.lock().unwrap(),
             &self.rig.camera,
+            self.local_ba.depth_sigma,
         );
         if let Err(error) = refined {
             self.dbg(format!("[init_ba] {error}; keeping the unrefined map"));

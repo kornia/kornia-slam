@@ -254,7 +254,7 @@ fn initial_ba_uses_the_last_inserted_pair_and_keeps_the_older_pose_fixed() {
     let mut map = fixture();
     let before = map.clone();
     assert_eq!(
-        run_initial_ba(&mut map, &camera()).unwrap(),
+        run_initial_ba(&mut map, &camera(), LocalBaParams::default().depth_sigma).unwrap(),
         InitialBaOutcome::Refined
     );
     for id in &KF_IDS[..4] {
@@ -284,7 +284,7 @@ fn skipped_visual_and_inertial_solves_leave_the_map_unchanged() {
         .unwrap();
     let before = map.state_fingerprint_for_test();
     assert_eq!(
-        run_initial_ba(&mut map, &camera()).unwrap(),
+        run_initial_ba(&mut map, &camera(), LocalBaParams::default().depth_sigma).unwrap(),
         InitialBaOutcome::Skipped
     );
     let visual = run_local_ba(map.ba_snapshot(&local_window(&map)), &camera());
@@ -312,7 +312,8 @@ fn refused_initial_ba_writeback_is_an_error_and_leaves_the_map_unchanged() {
         }
     });
     let before = map.state_fingerprint_for_test();
-    let error = run_initial_ba(&mut map, &camera()).unwrap_err();
+    let error =
+        run_initial_ba(&mut map, &camera(), LocalBaParams::default().depth_sigma).unwrap_err();
     assert!(
         matches!(
             error,
@@ -439,12 +440,12 @@ fn stereo_depth_obs_uses_proportional_sigma_with_floor() {
     let relative = LocalBaParams::default().depth_sigma;
 
     // Valid depth: sigma = 0.05 * 10 = 0.5.
-    let (d, s) = stereo_depth_obs(&kf, 0, relative);
+    let (d, s) = stereo_depth_obs(&kf, 0, relative, 1.0);
     assert_eq!(d, Some(10.0));
     assert!((s - 0.5).abs() < 1e-6);
 
     // Sentinel depth: no measurement.
-    let (d1, s1) = stereo_depth_obs(&kf, 1, relative);
+    let (d1, s1) = stereo_depth_obs(&kf, 1, relative, 1.0);
     assert_eq!(d1, None);
     assert!((s1 - 1.0).abs() < 1e-9);
 
@@ -452,7 +453,7 @@ fn stereo_depth_obs_uses_proportional_sigma_with_floor() {
     let mut near = test_frame(1, vec![[0u8; 32]]);
     near.depth = vec![0.1]; // 0.05 * 0.1 = 0.005 < floor
     let kf_near = Keyframe::from_frame(near);
-    let (_, s2) = stereo_depth_obs(&kf_near, 0, relative);
+    let (_, s2) = stereo_depth_obs(&kf_near, 0, relative, 1.0);
     assert!((s2 - STEREO_DEPTH_MIN_SIGMA).abs() < 1e-9);
 }
 
@@ -476,6 +477,13 @@ fn stereo_depth_sigma_models() {
     };
     assert!((disparity.sigma(5.0) - 25.0 / 47.85).abs() < 1e-5);
     assert_eq!(disparity.sigma(0.5), STEREO_DEPTH_MIN_SIGMA);
+    // An octave-2 keypoint (1.44 px) has 1.44 times the disparity noise; a
+    // relative sigma ignores the octave.
+    assert_eq!(disparity.sigma_at(5.0, 1.44), disparity.sigma(5.0) * 1.44);
+    assert_eq!(
+        DepthSigma::Relative(0.05).sigma_at(5.0, 1.44),
+        DepthSigma::Relative(0.05).sigma(5.0)
+    );
 }
 
 #[test]

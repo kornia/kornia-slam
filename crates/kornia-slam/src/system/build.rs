@@ -88,6 +88,7 @@ impl LocalBaConfig {
             boundary_scales_bias_rows: self.boundary_scales_bias_rows,
             imu_huber: self.imu_huber,
             depth_sigma,
+            visual_information: self.visual_information,
         }
     }
 }
@@ -102,7 +103,9 @@ impl SystemConfig {
         let tuning = &orb.tuning;
         SystemSettings {
             two_view_init: tuning.initialization.clone(),
-            map_projection: tuning.map_projection.clone(),
+            map_projection: tuning
+                .map_projection
+                .with_visual_information(orb.mapping.local_ba.visual_information),
             keyframe_policy: orb.keyframes,
             tracking_loss_recovery: tuning.loss_recovery,
             local_mapping: orb.mapping.execution,
