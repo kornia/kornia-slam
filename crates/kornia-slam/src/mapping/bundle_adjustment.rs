@@ -7,7 +7,7 @@ use crate::mapping::map::{
     BaSnapshot, BaUpdate, BaUpdateError, BaWindow, Keyframe, LocalBaStats, Map, ORB_N_LEVELS,
     ORB_SCALE_FACTOR,
 };
-use crate::mapping::vi_ba_schur::ViBaKeyframe;
+use crate::mapping::vi_ba_schur::{RigObservationCamera, ViBaKeyframe};
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
 use kornia_3d::camera::PinholeCamera;
@@ -359,14 +359,16 @@ pub fn run_local_inertial_ba(
         })
         .collect();
 
-    let observations = window.observations(
+    let (observations, observation_views) = window.observations_with_views(
         snapshot
             .keyframes()
             .iter()
             .enumerate()
             .map(|(kf_idx, kf)| (kf_idx, kf, kf_idx < active_start)),
         camera,
+        true,
     );
+    let rig_views = rig_observation_cameras(snapshot.keyframes());
 
     if observations.len() < MIN_OBSERVATIONS {
         return update;
@@ -497,6 +499,8 @@ pub fn run_local_inertial_ba(
             imu_t_bc,
             gravity: gravity_world,
             max_iterations: 50,
+            rig_views: rig_views.clone(),
+            observation_views: observation_views.clone(),
             ..ViBaParams::default()
         },
     ) {
@@ -515,8 +519,13 @@ pub fn run_local_inertial_ba(
         update.keyframes[kf_idx].imu_bias = vi_kf.bias;
     }
 
+    let camera_from_primary = |o: usize| {
+        let k = (*observation_views.get(o)? as usize).checked_sub(1)?;
+        rig_views.get(k).map(|view| view.camera_from_primary)
+    };
     let keep = landmarks_to_write_back(
         &observations,
+        camera_from_primary,
         (&vi_keyframes, &window.positions),
         (&vi_result.keyframes, &vi_result.points),
     );
@@ -546,8 +555,12 @@ pub fn run_local_inertial_ba(
 /// the nearest observer grown more than [`WRITE_BACK_MAX_GROWTH`]-fold and
 /// beyond [`WRITE_BACK_FAR_M`]). States are `(keyframes, landmarks)` before
 /// and after the solve.
+///
+/// `camera_from_primary(o)` is observation `o`'s secondary rig camera
+/// extrinsic, `None` for the primary camera.
 pub(super) fn landmarks_to_write_back(
     observations: &[BaObservation],
+    camera_from_primary: impl Fn(usize) -> Option<Pose3d>,
     before: (&[ViBaKeyframe], &[Vec3F64]),
     after: (&[ViBaKeyframe], &[Vec3F64]),
 ) -> Vec<bool> {
@@ -555,21 +568,27 @@ pub(super) fn landmarks_to_write_back(
     let mut behind = vec![false; n];
     let mut nearest = vec![(f64::INFINITY, f64::INFINITY); n];
     let camera_centre = |pose: &Pose3d| pose.inverse().translation;
-    for obs in observations {
+    for (o, obs) in observations.iter().enumerate() {
         let (Some(kf_before), Some(kf_after)) =
             (before.0.get(obs.pose_idx), after.0.get(obs.pose_idx))
         else {
             continue;
         };
+        let extrinsic = camera_from_primary(o);
+        let in_camera = |pose: &Pose3d| match &extrinsic {
+            Some(t) => t.compose(pose),
+            None => *pose,
+        };
+        let (pose_before, pose_after) = (in_camera(&kf_before.pose), in_camera(&kf_after.pose));
         let (Some(p_before), Some(p_after)) =
             (before.1.get(obs.point_idx), after.1.get(obs.point_idx))
         else {
             continue;
         };
         let j = obs.point_idx;
-        behind[j] |= kf_after.pose.transform_point(p_after).z <= 0.0;
-        let d_before = (*p_before - camera_centre(&kf_before.pose)).length();
-        let d_after = (*p_after - camera_centre(&kf_after.pose)).length();
+        behind[j] |= pose_after.transform_point(p_after).z <= 0.0;
+        let d_before = (*p_before - camera_centre(&pose_before)).length();
+        let d_after = (*p_after - camera_centre(&pose_after)).length();
         nearest[j] = (nearest[j].0.min(d_before), nearest[j].1.min(d_after));
     }
     (0..n)
@@ -583,6 +602,25 @@ pub(super) fn landmarks_to_write_back(
             !behind[j] && d_after.is_finite() && !flung
         })
         .collect()
+}
+
+/// Secondary cameras of the window's rig, in rig order after the primary;
+/// empty outside a rig.
+fn rig_observation_cameras(keyframes: &[Keyframe]) -> Vec<RigObservationCamera> {
+    keyframes
+        .iter()
+        .find_map(|kf| kf.frame.rig.geometry.as_ref().filter(|_| kf.frame.is_rig()))
+        .map(|rig| {
+            rig.views()
+                .iter()
+                .skip(1)
+                .map(|view| RigObservationCamera {
+                    camera: view.camera.clone(),
+                    camera_from_primary: view.camera_from_primary,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Live landmarks a BA window observes, ordered by ascending map index; a
@@ -638,18 +676,36 @@ impl WindowPoints {
     }
 
     /// Reprojection (and stereo depth) observations of the window's landmarks
-    /// from each `(pose_idx, keyframe, fixed)` in order.
+    /// from each `(pose_idx, keyframe, fixed)` in order, by the primary
+    /// camera only: the single-camera solvers cannot model a rig's other
+    /// cameras.
     fn observations<'a>(
         &self,
         poses: impl IntoIterator<Item = (usize, &'a Keyframe, bool)>,
         camera: &PinholeCamera,
     ) -> Vec<BaObservation> {
+        self.observations_with_views(poses, camera, false).0
+    }
+
+    /// Like [`Self::observations`], with every rig camera's observations
+    /// when `all_cameras` is set, and each one's rig camera index.
+    fn observations_with_views<'a>(
+        &self,
+        poses: impl IntoIterator<Item = (usize, &'a Keyframe, bool)>,
+        camera: &PinholeCamera,
+        all_cameras: bool,
+    ) -> (Vec<BaObservation>, Vec<u8>) {
         let mut observations = Vec::new();
+        let mut views = Vec::new();
         for (pose_idx, kf, fixed_pose) in poses {
             for (desc_idx, mp_opt) in kf.map_point_by_desc_idx.iter().enumerate() {
                 let Some(&point_idx) = mp_opt.and_then(|mp_idx| self.local_of.get(&mp_idx)) else {
                     continue;
                 };
+                let view = kf.frame.camera_of(desc_idx);
+                if view != 0 && !all_cameras {
+                    continue;
+                }
                 if let Some(pixel) = kf.frame.undistorted_xy(desc_idx, camera) {
                     let observation = BaObservation {
                         pose_idx,
@@ -659,10 +715,11 @@ impl WindowPoints {
                         ..Default::default()
                     };
                     observations.push(with_stereo_depth(observation, kf, desc_idx));
+                    views.push(view as u8);
                 }
             }
         }
-        observations
+        (observations, views)
     }
 
     fn write_back(&self, optimized: &[Vec3F64], map_points: &mut [Vec3F64]) {

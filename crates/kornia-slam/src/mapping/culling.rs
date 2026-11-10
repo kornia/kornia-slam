@@ -446,7 +446,9 @@ fn is_redundant(map: &Map, kf_idx: usize, config: &KeyframeCullingConfig) -> boo
         live += 1;
         let coarsest =
             feature_octave(keyframe, feature).saturating_add(config.scale_level_tolerance);
-        let seen_by = mp
+        // Distinct keyframes: both cameras of a rig keyframe are one observer.
+        let mut observers: Vec<usize> = Vec::with_capacity(config.min_other_observers);
+        for o in mp
             .observations()
             .iter()
             .filter(|o| o.key.keyframe_idx != kf_idx)
@@ -454,8 +456,15 @@ fn is_redundant(map: &Map, kf_idx: usize, config: &KeyframeCullingConfig) -> boo
                 octave_in(o.key.keyframe_idx, o.key.feature_idx)
                     .is_some_and(|octave| octave <= coarsest)
             })
-            .take(config.min_other_observers)
-            .count();
+        {
+            if observers.len() >= config.min_other_observers {
+                break;
+            }
+            if !observers.contains(&o.key.keyframe_idx) {
+                observers.push(o.key.keyframe_idx);
+            }
+        }
+        let seen_by = observers.len();
         if seen_by >= config.min_other_observers {
             redundant += 1;
         }
