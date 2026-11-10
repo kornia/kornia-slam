@@ -12,6 +12,7 @@ mod config;
 mod datasets;
 mod evaluation;
 mod source;
+mod trajectory;
 mod tui;
 mod utils;
 use config::RunConfig;
@@ -45,6 +46,12 @@ struct Args {
     /// directory for the evaluation CSVs (created if missing; default: current dir)
     #[argh(option, default = "String::from(\".\")")]
     eval_out: String,
+
+    /// write `timestamp_ns tx ty tz qx qy qz qw` per tracked frame to this
+    /// file: the body (IMU) pose in the world when the rig has an IMU, else
+    /// the camera pose (the LaMAria estimate format)
+    #[argh(option)]
+    trajectory_out: Option<String>,
 
     /// spawn a Rerun viewer and stream to it (requires `--features viz`)
     #[argh(switch)]
@@ -132,6 +139,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut system = SlamSystem::build(run.system, source.rig()).map_err(|e| e.to_string())?;
     system.set_debug(args.debug);
     let camera = system.rig().camera.clone();
+    let mut trajectory_out = args
+        .trajectory_out
+        .as_deref()
+        .map(|path| {
+            trajectory::TrajectoryWriter::create(
+                std::path::Path::new(path),
+                system.rig().camera_to_body(),
+            )
+        })
+        .transpose()?;
     if let Some(path) = vocabulary {
         eprintln!(
             "[place-recognition] loaded vocabulary from {}",
@@ -256,6 +273,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("{status_line}");
         }
 
+        if let Some(writer) = trajectory_out.as_mut()
+            && result.status != kornia_slam::TrackingStatus::Skipped
+        {
+            writer.write(timestamp_sec, &result.pose_world_to_cam)?;
+        }
         let traj_pt = trajectory_point_from_pose(&result.pose_world_to_cam);
         trajectory.push(traj_pt);
 
@@ -335,6 +357,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
     );
+    if let Some(writer) = trajectory_out {
+        writer.finish()?;
+    }
     if args.evaluate {
         evaluation::report(
             &est_positions,
