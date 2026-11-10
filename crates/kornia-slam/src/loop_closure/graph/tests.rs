@@ -229,3 +229,42 @@ fn dedup_skips_a_keyframe_inside_an_existing_node() {
     let (keyframes, _, _) = graph.poses_before_after();
     assert_eq!(keyframes, vec![0, 2, 3]);
 }
+
+/// Summed odometry-edge variance along a straight 8 m run, keyframes every `spacing_m`.
+fn chain_variance_m2(config: PoseGraphConfig, spacing_m: f64) -> f64 {
+    let mut graph = PoseGraph::new(PoseGraphConfig {
+        node_spacing: None,
+        loop_max_candidates: 0,
+        ..config
+    });
+    let keyframes = (8.0 / spacing_m).round() as usize;
+    for index in 0..=keyframes {
+        let centre = Vec3F64::new(index as f64 * spacing_m, 0.0, 0.0);
+        let pose = body_to_world(0.0, centre).inverse();
+        graph
+            .add_keyframe(index, index as f64, pose, (), &mut RejectAll)
+            .unwrap();
+    }
+    graph.edges().map(|edge| edge.sigma_m * edge.sigma_m).sum()
+}
+
+/// A random walk composes to `q * path` at any spacing; a floored per-edge sigma does not, so
+/// denser keyframes make a stiffer chain.
+#[test]
+fn random_walk_odometry_composes_independently_of_keyframe_spacing() {
+    let walk = PoseGraphConfig {
+        drift_m_per_m: 0.0,
+        walk_m2_per_m: 0.01,
+        min_sigma_m: 1e-6,
+        ..config()
+    };
+    for spacing in [0.1, 0.2, 0.5] {
+        let variance = chain_variance_m2(walk.clone(), spacing);
+        assert!(
+            (variance - 0.08).abs() < 1e-9,
+            "{spacing} m: {variance} m^2"
+        );
+    }
+    let floored = |spacing| chain_variance_m2(config(), spacing);
+    assert!(floored(0.1) > 4.0 * floored(0.5));
+}

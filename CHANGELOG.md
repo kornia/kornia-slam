@@ -34,19 +34,27 @@ away from landmarks fused onto an earlier visit. An unusable solve now reports
 why (`PgoResult::unusable_reason`, a `PgoFailed` event) instead of a silent
 `applied: false`.
 
-**Loop closing keeps one global pose graph, behind an odometry gate.** A
+**Loop closing gains an odometry gate and an opt-in global pose graph.** A
 verified loop whose correction is more than 3 sigma of the odometry drift
 model (1.9 %/m + 0.10 m, 0.026 deg/m + 1 deg) is now rejected before it reaches
-the pose graph, so repeated structure can no longer bend the trajectory (on a
-sim recording in EuRoC format, ATE 1.55 m ungated → 0.12 m gated; 0.32 m
-without loop closing). Loops then close through `PoseGraph`, which keeps every
-keyframe the map has held across solves: a culled or evicted keyframe stays a
-node, so loops that touch it keep constraining the map instead of failing with
-`MissingLoopKeyframe`. Odometry edges carry the drift model's sigmas and loop
-edges its floors under a Cauchy kernel (`LoopClosingConfig::information`;
-`ScalarWeights` restores the old `w*I` weights). `SlamSystem::map_correction()`
-reports the composed map-from-odometry correction. `PoseGraph<P>`, its
-`LoopVerifier` and the `LoopGate` trait are public for other front ends.
+the pose graph. That refuses a false loop from repeated structure when it
+implies more correction than odometry can have drifted; one inside the bound
+still passes (on a sim recording in EuRoC format, ATE 1.55 m ungated → 0.12 m
+gated; 0.32 m without loop closing). Loops close through `PoseGraph`. By
+default it is the same computation as before, `w*I` on a fresh snapshot of the
+map at each solve. `LoopClosingMode::Enabled { graph }` opts into the rest from
+a configuration file, e.g. `graph: (information: Drift(), persistent: true)`:
+- `persistent` keeps every keyframe the map has held across solves. A culled
+  or evicted keyframe stays a node, so loops that touch it keep constraining
+  the map instead of failing with `MissingLoopKeyframe`.
+- `Drift` makes odometry edges a random walk in path, `sigma = sqrt(q * d)`,
+  so the weighting does not depend on keyframe density. Loop edges get
+  0.10 m / 1 deg under a Cauchy kernel. The kernel bounds what a false loop
+  the gate lets through can do, but does not remove it.
+
+`SlamSystem::map_correction()` reports the composed map-from-odometry
+correction. `PoseGraph<P>`, its `LoopVerifier` and the `LoopGate` trait are
+public for other front ends.
 
 **Stereo-inertial tracking rides through fast motion instead of resetting.**
 Once the IMU has settled, a tracking failure now coasts on the inertial
