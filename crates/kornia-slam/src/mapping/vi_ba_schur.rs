@@ -244,6 +244,10 @@ pub struct ViBaParams {
     /// `rig_views[k - 1]`. Empty `observation_views` means all primary.
     pub rig_views: Vec<RigObservationCamera>,
     pub observation_views: Vec<u8>,
+    /// Pixel standard deviation of each observation's reprojection
+    /// residual (see [`VisualInformation`](crate::mapping::visual_information::VisualInformation)).
+    /// Empty means 1 px for all; the Huber knee then applies to the whitened residual.
+    pub observation_sigma_px: Vec<f32>,
 }
 
 /// IMU edges whose nav residual gets the Huber kernel.
@@ -341,6 +345,7 @@ impl Default for ViBaParams {
             depth_gate_factor: 10.0,
             rig_views: Vec::new(),
             observation_views: Vec::new(),
+            observation_sigma_px: Vec::new(),
         }
     }
 }
@@ -1336,14 +1341,22 @@ pub fn visual_inertial_bundle_adjust(
             let (r_f32, jp_f32, jx_f32) =
                 residual_and_jacobians(&obs_pose, point, obs.pixel, obs_camera);
 
-            let r_raw = SVecF64::<2>::from_fn(|i, _| f64::from(r_f32[i]));
+            let inv_sigma = params
+                .observation_sigma_px
+                .get(o)
+                .map_or(1.0, |&sigma| 1.0 / f64::from(sigma));
+            let r_raw = SVecF64::<2>::from_fn(|i, _| f64::from(r_f32[i]) * inv_sigma);
             let chi2_vis = r_raw.norm_squared();
             *inlier = chi2_vis <= params.huber_reproj_px_sq;
             let (hw_vis, c_vis) = visual_huber(chi2_vis, params.huber_reproj_px_sq);
             cost_vis += c_vis;
             let sqrt_hw_vis = hw_vis.sqrt();
-            let jp = SMatF64::<2, 6>::from_fn(|i, k| f64::from(jp_f32[i * 6 + k]) * sqrt_hw_vis);
-            let jx = SMatF64::<2, 3>::from_fn(|i, k| f64::from(jx_f32[i * 3 + k]) * sqrt_hw_vis);
+            let jp = SMatF64::<2, 6>::from_fn(|i, k| {
+                f64::from(jp_f32[i * 6 + k]) * inv_sigma * sqrt_hw_vis
+            });
+            let jx = SMatF64::<2, 3>::from_fn(|i, k| {
+                f64::from(jx_f32[i * 3 + k]) * inv_sigma * sqrt_hw_vis
+            });
 
             let pli = usize::try_from(kf_local[obs.pose_idx]).ok();
             let xli = usize::try_from(point_local[obs.point_idx]).ok();
@@ -1685,7 +1698,10 @@ pub fn visual_inertial_bundle_adjust(
             let (obs_camera, obs_pose) = views.camera_pose(o, camera, &se3s_trial[obs.pose_idx]);
             let (r_f32, _, _) =
                 residual_and_jacobians(&obs_pose, &xyz_trial[obs.point_idx], obs.pixel, obs_camera);
-            let chi2_vis = (r_f32[0] * r_f32[0] + r_f32[1] * r_f32[1]) as f64;
+            let mut chi2_vis = (r_f32[0] * r_f32[0] + r_f32[1] * r_f32[1]) as f64;
+            if let Some(&sigma) = params.observation_sigma_px.get(o) {
+                chi2_vis /= (sigma as f64).powi(2);
+            }
             new_cost_vis += visual_huber(chi2_vis, params.huber_reproj_px_sq).1;
 
             if let Some(d_meas) = obs.depth_meas.filter(|_| depth_row) {
@@ -2039,6 +2055,89 @@ mod tests {
             }
         }
         (points, observations)
+    }
+
+    /// Half the rows sit 3 px off: at unit information the pose splits the
+    /// difference, at sigma 4 px for those rows it follows the 1 px ones.
+    #[test]
+    fn observation_sigma_whitens_the_reprojection_rows() {
+        let camera = PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let keyframes = [ViBaKeyframe {
+            pose: Pose3d::IDENTITY,
+            velocity: Vec3F64::ZERO,
+            bias: ImuBias::default(),
+            fixed: false,
+        }];
+        let (mut points, mut observations, mut coarse) = (Vec::new(), Vec::new(), Vec::new());
+        for ix in -3i32..=3 {
+            for iy in -3i32..=3 {
+                let p = Vec3F64::new(
+                    ix as f64 * 0.3,
+                    iy as f64 * 0.3,
+                    2.0 + (ix + iy).abs() as f64 * 0.5,
+                );
+                let is_coarse = (ix + iy) % 2 != 0;
+                let shift = if is_coarse { 3.0 } else { 0.0 };
+                observations.push(BaObservation {
+                    pose_idx: 0,
+                    point_idx: points.len(),
+                    pixel: [
+                        (camera.fx * p.x / p.z + camera.cx + shift) as f32,
+                        (camera.fy * p.y / p.z + camera.cy) as f32,
+                    ],
+                    fixed_pose: false,
+                    fixed_point: true,
+                    depth_meas: None,
+                    depth_sigma: 1.0,
+                });
+                points.push(p);
+                coarse.push(is_coarse);
+            }
+        }
+        let fine_error_px = |observation_sigma_px: Vec<f32>| {
+            let params = ViBaParams {
+                observation_sigma_px,
+                ..ViBaParams::default()
+            };
+            let out = visual_inertial_bundle_adjust(
+                &keyframes,
+                &points,
+                &observations,
+                &[],
+                &[],
+                &[],
+                &camera,
+                &params,
+            )
+            .unwrap();
+            let pose = out.keyframes[0].pose;
+            let errors: Vec<f64> = observations
+                .iter()
+                .zip(&coarse)
+                .filter(|(_, c)| !**c)
+                .map(|(o, _)| {
+                    let pc = pose.transform_point(&points[o.point_idx]);
+                    camera.fx * pc.x / pc.z + camera.cx - o.pixel[0] as f64
+                })
+                .collect();
+            (errors.iter().sum::<f64>() / errors.len() as f64).abs()
+        };
+        let unit = fine_error_px(Vec::new());
+        let weighted = fine_error_px(coarse.iter().map(|&c| if c { 4.0 } else { 1.0 }).collect());
+        assert!(unit > 1.0, "unit information error {unit} px");
+        assert!(
+            weighted < 0.25 * unit,
+            "weighted {weighted} px, unit {unit} px"
+        );
     }
 
     /// With KF0 fixed at bias 0, poses held at truth by vision and a rotation

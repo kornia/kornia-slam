@@ -8,6 +8,7 @@ use crate::mapping::map::{
     ORB_SCALE_FACTOR,
 };
 use crate::mapping::vi_ba_schur::{ImuHuber, RigObservationCamera, ViBaKeyframe, ViBaParams};
+use crate::mapping::visual_information::VisualInformation;
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
 use kornia_3d::camera::PinholeCamera;
@@ -38,6 +39,9 @@ pub struct LocalBaParams {
     pub boundary_scales_bias_rows: bool,
     pub imu_huber: ImuHuber,
     pub depth_sigma: DepthSigma,
+    /// Reprojection weighting by keypoint octave. Only VI-BA honours it:
+    /// kornia-3d's visual-only solver has no per-observation weight.
+    pub visual_information: VisualInformation,
 }
 
 impl Default for LocalBaParams {
@@ -48,6 +52,7 @@ impl Default for LocalBaParams {
             boundary_scales_bias_rows: true,
             imu_huber: ImuHuber::AllEdges,
             depth_sigma: DepthSigma::Relative(STEREO_DEPTH_REL_SIGMA),
+            visual_information: VisualInformation::Unit,
         }
     }
 }
@@ -63,12 +68,19 @@ pub enum DepthSigma {
 }
 
 impl DepthSigma {
+    #[cfg(test)]
     fn sigma(self, z: f32) -> f32 {
+        self.sigma_at(z, 1.0)
+    }
+
+    /// The disparity noise scales with the keypoint's pixel sigma
+    /// (ORB-SLAM3's `EdgeStereo` weights `u_r` by the same `invSigma2`).
+    fn sigma_at(self, z: f32, pixel_sigma: f32) -> f32 {
         let sigma = match self {
             Self::Relative(fraction) => fraction * z,
             Self::Disparity {
                 px_over_focal_baseline,
-            } => px_over_focal_baseline * z * z,
+            } => px_over_focal_baseline * pixel_sigma * z * z,
         };
         sigma.max(STEREO_DEPTH_MIN_SIGMA)
     }
@@ -197,6 +209,7 @@ pub enum InitialBaError {
 pub fn run_initial_ba(
     map: &mut Map,
     camera: &PinholeCamera,
+    depth_sigma: DepthSigma,
 ) -> Result<InitialBaOutcome, InitialBaError> {
     let mut update = map.ba_snapshot(&initial_window(map)).into_update();
     let snapshot = &update.snapshot;
@@ -232,7 +245,7 @@ pub fn run_initial_ba(
             .enumerate()
             .map(|(pose_idx, &kf_idx)| (pose_idx, &snapshot.keyframes()[kf_idx], pose_idx == 0)),
         camera,
-        LocalBaParams::default().depth_sigma,
+        depth_sigma,
     );
 
     if observations.len() < MIN_OBSERVATIONS {
@@ -451,7 +464,11 @@ pub fn run_local_inertial_ba_with(
         })
         .collect();
 
-    let (observations, observation_views) = window.observations_with_views(
+    let WindowObservations {
+        observations,
+        views: observation_views,
+        sigma_px: observation_sigma_px,
+    } = window.observations_with_views(
         snapshot
             .keyframes()
             .iter()
@@ -460,6 +477,7 @@ pub fn run_local_inertial_ba_with(
         camera,
         true,
         params.depth_sigma,
+        params.visual_information,
     );
     let rig_views = rig_observation_cameras(snapshot.keyframes());
 
@@ -597,6 +615,7 @@ pub fn run_local_inertial_ba_with(
             imu_huber: params.imu_huber,
             rig_views: rig_views.clone(),
             observation_views: observation_views.clone(),
+            observation_sigma_px,
             ..ViBaParams::default()
         },
     ) {
@@ -719,6 +738,14 @@ fn rig_observation_cameras(keyframes: &[Keyframe]) -> Vec<RigObservationCamera> 
         .unwrap_or_default()
 }
 
+/// Observations of a window with, per observation, its rig camera and its
+/// pixel sigma (empty at unit information).
+struct WindowObservations {
+    observations: Vec<BaObservation>,
+    views: Vec<u8>,
+    sigma_px: Vec<f32>,
+}
+
 /// Live landmarks a BA window observes, ordered by ascending map index; a
 /// landmark's position in `global` is its solver index.
 struct WindowPoints {
@@ -791,21 +818,24 @@ impl WindowPoints {
         camera: &PinholeCamera,
         depth_sigma: DepthSigma,
     ) -> Vec<BaObservation> {
-        self.observations_with_views(poses, camera, false, depth_sigma)
-            .0
+        self.observations_with_views(poses, camera, false, depth_sigma, VisualInformation::Unit)
+            .observations
     }
 
     /// Like [`Self::observations`], with every rig camera's observations
-    /// when `all_cameras` is set, and each one's rig camera index.
+    /// when `all_cameras` is set, each one's rig camera index and, unless
+    /// `information` is unit, its pixel sigma.
     fn observations_with_views<'a>(
         &self,
         poses: impl IntoIterator<Item = (usize, &'a Keyframe, bool)>,
         camera: &PinholeCamera,
         all_cameras: bool,
         depth_sigma: DepthSigma,
-    ) -> (Vec<BaObservation>, Vec<u8>) {
+        information: VisualInformation,
+    ) -> WindowObservations {
         let mut observations = Vec::new();
         let mut views = Vec::new();
+        let mut sigma_px = Vec::new();
         for (pose_idx, kf, fixed_pose) in poses {
             for (desc_idx, mp_opt) in kf.map_point_by_desc_idx.iter().enumerate() {
                 let Some(&point_idx) = mp_opt.and_then(|mp_idx| self.local_of.get(&mp_idx)) else {
@@ -816,6 +846,11 @@ impl WindowPoints {
                     continue;
                 }
                 if let Some(pixel) = kf.frame.undistorted_xy(desc_idx, camera) {
+                    let octave = kf.frame.features.octaves.get(desc_idx).copied();
+                    let pixel_sigma = information.sigma_px(octave.unwrap_or(0));
+                    if !information.is_unit() {
+                        sigma_px.push(pixel_sigma);
+                    }
                     let observation = BaObservation {
                         pose_idx,
                         point_idx,
@@ -823,12 +858,22 @@ impl WindowPoints {
                         fixed_pose,
                         ..Default::default()
                     };
-                    observations.push(with_stereo_depth(observation, kf, desc_idx, depth_sigma));
+                    observations.push(with_stereo_depth(
+                        observation,
+                        kf,
+                        desc_idx,
+                        depth_sigma,
+                        pixel_sigma,
+                    ));
                     views.push(view as u8);
                 }
             }
         }
-        (observations, views)
+        WindowObservations {
+            observations,
+            views,
+            sigma_px,
+        }
     }
 
     fn write_back(&self, optimized: &[Vec3F64], map_points: &mut [Vec3F64]) {
@@ -863,9 +908,10 @@ fn with_stereo_depth(
     kf: &Keyframe,
     desc_idx: usize,
     depth_sigma: DepthSigma,
+    pixel_sigma: f32,
 ) -> BaObservation {
     match kf.frame.stereo_depth(desc_idx) {
-        Some(z) => observation.with_depth(z, depth_sigma.sigma(z)),
+        Some(z) => observation.with_depth(z, depth_sigma.sigma_at(z, pixel_sigma)),
         None => observation,
     }
 }
