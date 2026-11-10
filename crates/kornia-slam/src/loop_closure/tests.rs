@@ -1198,6 +1198,72 @@ fn default_closer_matches_optimize_pose_graph_through_a_run_with_culling() {
     );
 }
 
+/// A map that shares no keyframe with the persistent graph is a new world: the graph starts over
+/// with only the new map's keyframes, none forgotten, and a loop from the old world is dropped.
+#[test]
+fn persistent_graph_starts_over_on_a_new_world() {
+    let gravity = Vec3F64::new(0.0, -9.81, 0.0);
+    let truth = square_lap(gravity.normalize(), 0.0);
+    let lap_map = |first_kf: usize| {
+        let mut map = Map::new();
+        for (index, pose) in square_lap(gravity.normalize(), 0.004)
+            .into_iter()
+            .enumerate()
+        {
+            let keyframe = frame(first_kf + index, pose, &[], Vec::new());
+            map.insert_keyframe(Keyframe::from_frame(keyframe)).unwrap();
+        }
+        map
+    };
+    let loop_from = |first_kf: usize, candidate: usize, query: usize| VerifiedLoopEdge {
+        candidate_to_query: Pose3d::between(&truth[candidate], &truth[query]),
+        ..verified_edge(first_kf + query, first_kf + candidate, 40, 0.875, 1.0, 8)
+    };
+    let config = PgoConfig::default();
+    let information = LoopGraphInformation::drift();
+    let settings = LoopGraphSettings {
+        information,
+        persistent: true,
+    };
+    let inertial = Some(InertialPgoContext {
+        gravity_world: gravity,
+    });
+    let mut graph = PoseGraph::new(snapshot_graph_config(&config, information, inertial));
+    let old_loop = loop_from(0, 1, 23);
+    let (_, new_world) = solve_in_graph(
+        &mut graph,
+        &lap_map(0),
+        std::slice::from_ref(&old_loop),
+        &config,
+        settings,
+        inertial,
+    )
+    .unwrap();
+    assert!(!new_world);
+
+    let reset = lap_map(100);
+    let (result, new_world) = solve_in_graph(
+        &mut graph,
+        &reset,
+        &[old_loop, loop_from(100, 0, 22)],
+        &config,
+        settings,
+        inertial,
+    )
+    .unwrap();
+    assert!(new_world);
+    assert!(result.usable);
+    assert_eq!(result.keyframe_indices, (100..124).collect::<Vec<_>>());
+    assert_eq!(graph.nodes().len(), 24);
+    assert!(graph.nodes().iter().all(|node| node.keyframe.is_some()));
+    let loops: Vec<_> = graph
+        .edges()
+        .filter(|edge| edge.kind == EdgeKind::Loop)
+        .map(|edge| (edge.from, edge.to))
+        .collect();
+    assert_eq!(loops, [(NodeId(0), NodeId(22))]);
+}
+
 /// The first keyframe after a correction chains its path from where the correction put the one
 /// before it, so its random-walk sigma is `sqrt(q * step)`; before, the path ran from that
 /// keyframe's pre-correction pose and took the correction's jump as distance travelled.

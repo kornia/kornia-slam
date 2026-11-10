@@ -2,11 +2,12 @@
 //! fusion, and pose-graph optimization.
 //!
 //! A verified loop passes the [`LoopGate`]s before it may enter the graph: the
-//! odometry gate refuses a correction the drift model cannot explain, which is
-//! what repeated structure produces. Accepted loops close through one
-//! [`PoseGraph`] kept across solves, so keyframes the map culls or evicts stay
-//! as nodes and their loops keep constraining it. [`optimize_pose_graph`] is
-//! the earlier per-solve snapshot optimizer, kept as the `w * I` reference.
+//! odometry gate refuses a correction the drift model cannot explain, as a
+//! false loop from repeated structure often implies. Accepted loops close
+//! through a [`PoseGraph`]: by default a `w * I` snapshot of the map at each
+//! solve, [`optimize_pose_graph`]'s computation; [`LoopGraphSettings`] can keep
+//! it across solves, so keyframes the map culls or evicts stay as nodes and
+//! their loops keep constraining it.
 
 mod closer;
 mod episode;

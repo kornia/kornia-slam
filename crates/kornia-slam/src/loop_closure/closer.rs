@@ -336,8 +336,9 @@ struct LoopAcceptance {
     temporal_gate: TemporalConsistencyGate,
     verified_loops: Vec<VerifiedLoopEdge>,
     verified_loop_pairs: HashSet<(usize, usize)>,
-    /// Every keyframe the map has held since the last reset, kept across solves: a culled or
-    /// evicted keyframe stays a node, so the loops that touch it still constrain the map.
+    /// With [`LoopGraphSettings::persistent`], every keyframe the map has held since the last
+    /// reset, kept across solves: a culled or evicted keyframe stays a node, so the loops that
+    /// touch it still constrain the map. Otherwise the last solve's snapshot.
     graph: PoseGraph<()>,
     /// Verified loops whose edge is in `graph`.
     loops_in_graph: HashSet<(usize, usize)>,
