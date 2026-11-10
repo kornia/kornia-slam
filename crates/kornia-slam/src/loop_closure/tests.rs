@@ -657,7 +657,7 @@ fn loop_closer_applies_map_correction_and_returns_tracking_correction() {
     // Make this synthetic loop strong enough to bring projections within the
     // unchanged fusion gates; the default weight only partially corrects drift.
     config.optimizer.loop_edge_weight = 100.0;
-    config.information = LoopGraphInformation::ScalarWeights;
+    config.graph.information = LoopGraphInformation::ScalarWeights;
     let (mut closer, mut map) = closing_fixture(config, false);
     let before = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
     let anchor = map.get_keyframe(0).unwrap().frame.pose_world_to_cam;
@@ -1055,6 +1055,10 @@ fn persistent_graph_keeps_a_loop_whose_keyframe_was_culled() {
     let (first, second) = (loop_from(1, 23), loop_from(0, 22));
     let config = PgoConfig::default();
     let information = LoopGraphInformation::drift();
+    let settings = LoopGraphSettings {
+        information,
+        persistent: true,
+    };
     let inertial = Some(InertialPgoContext {
         gravity_world: gravity,
     });
@@ -1073,7 +1077,7 @@ fn persistent_graph_keeps_a_loop_whose_keyframe_was_culled() {
         &keyframe_poses(&map),
         std::slice::from_ref(&first),
         &config,
-        information,
+        settings,
         inertial,
     )
     .unwrap();
@@ -1090,7 +1094,7 @@ fn persistent_graph_keeps_a_loop_whose_keyframe_was_culled() {
         &keyframe_poses(&map),
         std::slice::from_ref(&second),
         &config,
-        information,
+        settings,
         inertial,
     )
     .unwrap();
@@ -1105,6 +1109,246 @@ fn persistent_graph_keeps_a_loop_whose_keyframe_was_culled() {
         2
     );
     apply(&mut map, &result);
+}
+
+/// With the gate off and the default configuration, the closer is `optimize_pose_graph` over a run
+/// whose map culls keyframes between loops, bit for bit: the same map after every loop, and the
+/// same refusal once a culled keyframe takes a loop's end with it.
+#[test]
+fn default_closer_matches_optimize_pose_graph_through_a_run_with_culling() {
+    let config = LoopClosingConfig {
+        odometry_gate: LoopOdometryGate::Disabled,
+        ..LoopClosingConfig::default()
+    };
+    let gravity = Vec3F64::new(0.0, -9.81, 0.0);
+    let truth = square_lap(gravity.normalize(), 0.0);
+    let mut map = Map::new();
+    for (index, pose) in square_lap(gravity.normalize(), 0.004)
+        .into_iter()
+        .enumerate()
+    {
+        map.insert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())))
+            .unwrap();
+    }
+    let mut main = map.clone();
+    let (fixture, _) = synthetic_loop_map();
+    let descriptors: Vec<_> = fixture.get_keyframe(0).unwrap().frame.features.descriptors[..]
+        .iter()
+        .map(kornia_bow::orb_slam3::pack_orb_descriptor)
+        .collect();
+    let vocabulary =
+        crate::loop_closure::place_recognition::Vocabulary::train(&descriptors, 1).unwrap();
+    let mut closer = LoopCloser::new(vocabulary, config.clone(), false);
+    let mut verified = Vec::new();
+    let poses = |map: &Map| -> Vec<(usize, Pose3d)> {
+        map.keyframes()
+            .iter()
+            .map(|kf| (kf.frame.idx, kf.frame.pose_world_to_cam))
+            .collect()
+    };
+
+    let steps: [(usize, usize, Option<usize>); 4] = [
+        (0, 20, Some(10)),
+        (2, 22, Some(5)),
+        (1, 21, Some(2)),
+        (3, 23, None),
+    ];
+    let mut applied = Vec::new();
+    for (candidate, query, cull) in steps {
+        let edge = VerifiedLoopEdge {
+            candidate_to_query: Pose3d::between(&truth[candidate], &truth[query]),
+            ..verified_edge(query, candidate, 40, 0.875, 1.0, 8)
+        };
+        let context = LoopClosingContext {
+            pose_world_to_cam: map.keyframes().last().unwrap().frame.pose_world_to_cam,
+            velocity_world: Vec3F64::ZERO,
+            current_keyframe_idx: Some(map.keyframes().last().unwrap().frame.idx),
+            imu_initialized: true,
+            gravity_world: gravity,
+        };
+        let outcome = closer.close_loop_for_test(&mut map, &camera(), edge.clone(), context);
+        verified.push(edge.clone());
+        let inertial = Some(InertialPgoContext {
+            gravity_world: gravity,
+        });
+        let expected = optimize_pose_graph(&main, &verified, &config.optimizer, inertial);
+        if let Ok(result) = &expected
+            && result.usable
+        {
+            main.apply_pose_graph_correction(
+                &result.keyframe_indices,
+                &result.original_poses,
+                &result.optimized_poses,
+            )
+            .unwrap();
+            fuse_verified_loop(&mut main, &camera(), &edge, &config.fusion);
+        }
+        applied.push((
+            outcome.pgo_applied,
+            expected.is_ok_and(|result| result.usable),
+        ));
+        assert_eq!(poses(&map), poses(&main), "after loop {candidate}~{query}");
+        if let Some(kf) = cull {
+            map.remove_keyframe(kf).unwrap();
+            main.remove_keyframe(kf).unwrap();
+        }
+    }
+    assert_eq!(
+        applied,
+        [(true, true), (true, true), (true, true), (false, false)],
+        "the last loop needs keyframe 2, culled after the third"
+    );
+}
+
+/// A map that shares no keyframe with the persistent graph is a new world: the graph starts over
+/// with only the new map's keyframes, none forgotten, and a loop from the old world is dropped.
+#[test]
+fn persistent_graph_starts_over_on_a_new_world() {
+    let gravity = Vec3F64::new(0.0, -9.81, 0.0);
+    let truth = square_lap(gravity.normalize(), 0.0);
+    let lap_map = |first_kf: usize| {
+        let mut map = Map::new();
+        for (index, pose) in square_lap(gravity.normalize(), 0.004)
+            .into_iter()
+            .enumerate()
+        {
+            let keyframe = frame(first_kf + index, pose, &[], Vec::new());
+            map.insert_keyframe(Keyframe::from_frame(keyframe)).unwrap();
+        }
+        map
+    };
+    let loop_from = |first_kf: usize, candidate: usize, query: usize| VerifiedLoopEdge {
+        candidate_to_query: Pose3d::between(&truth[candidate], &truth[query]),
+        ..verified_edge(first_kf + query, first_kf + candidate, 40, 0.875, 1.0, 8)
+    };
+    let config = PgoConfig::default();
+    let information = LoopGraphInformation::drift();
+    let settings = LoopGraphSettings {
+        information,
+        persistent: true,
+    };
+    let inertial = Some(InertialPgoContext {
+        gravity_world: gravity,
+    });
+    let mut graph = PoseGraph::new(snapshot_graph_config(&config, information, inertial));
+    let old_loop = loop_from(0, 1, 23);
+    let (_, new_world) = solve_in_graph(
+        &mut graph,
+        &keyframe_poses(&lap_map(0)),
+        std::slice::from_ref(&old_loop),
+        &config,
+        settings,
+        inertial,
+    )
+    .unwrap();
+    assert!(!new_world);
+
+    let reset = lap_map(100);
+    let (result, new_world) = solve_in_graph(
+        &mut graph,
+        &keyframe_poses(&reset),
+        &[old_loop, loop_from(100, 0, 22)],
+        &config,
+        settings,
+        inertial,
+    )
+    .unwrap();
+    assert!(new_world);
+    assert!(result.usable);
+    assert_eq!(result.keyframe_indices, (100..124).collect::<Vec<_>>());
+    assert_eq!(graph.nodes().len(), 24);
+    assert!(graph.nodes().iter().all(|node| node.keyframe.is_some()));
+    let loops: Vec<_> = graph
+        .edges()
+        .filter(|edge| edge.kind == EdgeKind::Loop)
+        .map(|edge| (edge.from, edge.to))
+        .collect();
+    assert_eq!(loops, [(NodeId(0), NodeId(22))]);
+}
+
+/// The first keyframe after a correction chains its path from where the correction put the one
+/// before it, so its random-walk sigma is `sqrt(q * step)`; before, the path ran from that
+/// keyframe's pre-correction pose and took the correction's jump as distance travelled.
+#[test]
+fn path_after_a_correction_starts_at_the_corrected_keyframe() {
+    let gravity = Vec3F64::new(0.0, -9.81, 0.0);
+    let truth = square_lap(gravity.normalize(), 0.0);
+    let odometry = square_lap(gravity.normalize(), 0.004);
+    let mut map = Map::new();
+    for (index, pose) in odometry.iter().enumerate().take(20) {
+        map.insert_keyframe(Keyframe::from_frame(frame(index, *pose, &[], Vec::new())))
+            .unwrap();
+    }
+    let edge = VerifiedLoopEdge {
+        candidate_to_query: Pose3d::between(&truth[1], &truth[19]),
+        ..verified_edge(19, 1, 40, 0.875, 1.0, 8)
+    };
+    let config = PgoConfig::default();
+    let information = LoopGraphInformation::drift();
+    let settings = LoopGraphSettings {
+        information,
+        persistent: true,
+    };
+    let inertial = Some(InertialPgoContext {
+        gravity_world: gravity,
+    });
+    let mut graph = PoseGraph::new(snapshot_graph_config(&config, information, inertial));
+    let (result, _) = solve_in_graph(
+        &mut graph,
+        &keyframe_poses(&map),
+        &[edge],
+        &config,
+        settings,
+        inertial,
+    )
+    .unwrap();
+    assert!(result.usable);
+    map.apply_pose_graph_correction(
+        &result.keyframe_indices,
+        &result.original_poses,
+        &result.optimized_poses,
+    )
+    .unwrap();
+    let moved = (result.original_poses[19].inverse().translation
+        - result.optimized_poses[19].inverse().translation)
+        .length();
+    assert!(moved > 0.05, "the loop must move keyframe 19: {moved} m");
+    let corrected_19 = map.get_keyframe(19).unwrap().frame.pose_world_to_cam;
+    for (index, pose) in odometry.iter().enumerate().skip(20) {
+        let after_19 = Pose3d::between(&odometry[19], pose).compose(&corrected_19);
+        map.insert_keyframe(Keyframe::from_frame(frame(
+            index,
+            after_19,
+            &[],
+            Vec::new(),
+        )))
+        .unwrap();
+    }
+
+    sync_graph(&mut graph, &keyframe_poses(&map), true).unwrap();
+    let edge = graph
+        .edges()
+        .find(|edge| edge.kind == EdgeKind::Odometry && edge.to == NodeId(20))
+        .unwrap();
+    let LoopGraphInformation::Drift { odometry: walk, .. } = information else {
+        unreachable!()
+    };
+    let centre = |kf| {
+        map.get_keyframe(kf)
+            .unwrap()
+            .frame
+            .pose_world_to_cam
+            .inverse()
+            .translation
+    };
+    let step = (centre(20) - centre(19)).length();
+    let expected = (walk.translation_m2_per_m * step).sqrt();
+    assert_eq!(edge.from, NodeId(19));
+    assert!(
+        (edge.sigma_m - expected).abs() < 1e-9,
+        "sigma {} m, expected {expected} m",
+        edge.sigma_m
+    );
 }
 
 /// A forgotten node's odometry edges are re-measured from its last solved pose: at the seed of the
@@ -1129,13 +1373,24 @@ fn forgotten_node_edges_measure_from_its_solved_pose() {
     };
     let config = PgoConfig::default();
     let information = LoopGraphInformation::drift();
+    let settings = LoopGraphSettings {
+        information,
+        persistent: true,
+    };
     let inertial = Some(InertialPgoContext {
         gravity_world: gravity,
     });
     let mut graph = PoseGraph::new(snapshot_graph_config(&config, information, inertial));
     let solve = |map: &mut Map, graph: &mut PoseGraph<()>, edge: VerifiedLoopEdge| {
-        let (result, _) =
-            solve_in_graph(graph, map, &[edge], &config, information, inertial).unwrap();
+        let (result, _) = solve_in_graph(
+            graph,
+            &keyframe_poses(map),
+            &[edge],
+            &config,
+            settings,
+            inertial,
+        )
+        .unwrap();
         assert!(result.usable);
         map.apply_pose_graph_correction(
             &result.keyframe_indices,
@@ -1151,7 +1406,7 @@ fn forgotten_node_edges_measure_from_its_solved_pose() {
     let forgotten = NodeId(12);
     assert_eq!(graph.nodes()[forgotten.0].keyframe, None);
 
-    sync_graph(&mut graph, &keyframe_poses(&map)).unwrap();
+    sync_graph(&mut graph, &keyframe_poses(&map), true).unwrap();
     let at_forgotten: Vec<_> = graph
         .edges()
         .filter(|edge| {
@@ -1337,7 +1592,7 @@ fn false_loop_is_gated_and_cauchy_bounds_the_map_when_the_gate_is_off() {
 fn background_config() -> LoopClosingConfig {
     let mut config = closing_config();
     config.optimizer.loop_edge_weight = 100.0;
-    config.information = LoopGraphInformation::ScalarWeights;
+    config.graph.information = LoopGraphInformation::ScalarWeights;
     config
 }
 
@@ -1607,7 +1862,7 @@ fn planned_fusion() -> (Map, Vec<FusionOp>, LoopFusionConfig) {
         &map,
         std::slice::from_ref(&edge),
         &config.optimizer,
-        config.information,
+        config.graph.information,
         None,
     )
     .unwrap();
