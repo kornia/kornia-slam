@@ -19,7 +19,10 @@ mod sparse_pgo;
 mod verification;
 
 pub(crate) use closer::{LoopCloser, LoopClosingContext};
-pub use closer::{LoopClosingConfig, LoopClosureEvent, LoopGraphInformation, OdometryRandomWalk};
+pub use closer::{
+    LoopClosingConfig, LoopClosureEvent, LoopGraphInformation, LoopGraphSettings,
+    OdometryRandomWalk,
+};
 pub use episode::{LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker};
 pub use fusion::{LoopFusionConfig, LoopFusionStats, fuse_verified_loop};
 pub use graph::{

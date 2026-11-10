@@ -28,6 +28,7 @@ fn with_loop_closing(mode: LoopClosingMode, sensors: SensorSelection) -> SystemC
 fn loop_closing() -> LoopClosingMode {
     LoopClosingMode::Enabled {
         vocabulary: PathBuf::from("ORBvoc.txt"),
+        graph: Default::default(),
     }
 }
 
@@ -88,7 +89,7 @@ fn display_describes_the_pipeline() {
   tracking
   keyframes: every 3..=8 frames, ref ratio 0.6
   local mapping: synchronous
-  loop closing: ORBvoc.txt
+  loop closing: ORBvoc.txt (pose graph: w*I, snapshot)
 ",
         ),
         (
@@ -270,10 +271,67 @@ fn settings_are_range_checked() {
 }
 
 #[test]
+fn loop_graph_information_is_range_checked() {
+    use crate::loop_closure::OdometryRandomWalk;
+    let with = |information| {
+        with_loop_closing(
+            LoopClosingMode::Enabled {
+                vocabulary: PathBuf::from("ORBvoc.txt"),
+                graph: LoopGraphSettings {
+                    information,
+                    persistent: true,
+                },
+            },
+            sensors(CameraSelection::Stereo, false),
+        )
+    };
+    let drift = |edit: fn(&mut OdometryRandomWalk, &mut [f64; 3])| {
+        let LoopGraphInformation::Drift {
+            mut odometry,
+            loop_sigma_m,
+            loop_sigma_rad,
+            loop_cauchy_scale,
+        } = LoopGraphInformation::drift()
+        else {
+            unreachable!()
+        };
+        let mut loop_values = [loop_sigma_m, loop_sigma_rad, loop_cauchy_scale];
+        edit(&mut odometry, &mut loop_values);
+        let [loop_sigma_m, loop_sigma_rad, loop_cauchy_scale] = loop_values;
+        invalid_setting(&with(LoopGraphInformation::Drift {
+            odometry,
+            loop_sigma_m,
+            loop_sigma_rad,
+            loop_cauchy_scale,
+        }))
+    };
+    let at = |field: &str| Some(format!("pipeline.loop_closing.graph.information.{field}"));
+    assert_eq!(drift(|_, _| {}), None);
+    assert_eq!(with(LoopGraphInformation::ScalarWeights).validate(), Ok(()));
+    assert_eq!(
+        drift(|walk, _| walk.translation_m2_per_m = -1e-3),
+        at("odometry.translation_m2_per_m")
+    );
+    assert_eq!(
+        drift(|walk, _| walk.rotation_rad2_per_m = f64::NAN),
+        at("odometry.rotation_rad2_per_m")
+    );
+    assert_eq!(drift(|walk, _| walk.floor_m = 0.0), at("odometry.floor_m"));
+    assert_eq!(
+        drift(|walk, _| walk.floor_rad = f64::INFINITY),
+        at("odometry.floor_rad")
+    );
+    assert_eq!(drift(|_, values| values[0] = 0.0), at("loop_sigma_m"));
+    assert_eq!(drift(|_, values| values[1] = -1.0), at("loop_sigma_rad"));
+    assert_eq!(drift(|_, values| values[2] = 0.0), at("loop_cauchy_scale"));
+}
+
+#[test]
 fn vocabulary_path_must_not_be_empty() {
     let config = with_loop_closing(
         LoopClosingMode::Enabled {
             vocabulary: PathBuf::new(),
+            graph: Default::default(),
         },
         SensorSelection::default(),
     );
@@ -402,6 +460,7 @@ mod ron_files {
     use std::path::Path;
 
     use super::*;
+    use crate::loop_closure::OdometryRandomWalk;
 
     const EXPLICIT_DEFAULTS: &str = r#"
         (
@@ -560,6 +619,42 @@ mod ron_files {
     }
 
     #[test]
+    fn loop_graph_defaults_to_the_snapshot_and_drift_is_opt_in() {
+        let base = Path::new("/configs");
+        let text = |graph: &str| {
+            format!(
+                "(version: 1, sensors: (cameras: Stereo), pipeline: OrbSlam((loop_closing: Enabled(vocabulary: \"v.txt\"{graph}))))"
+            )
+        };
+        let default = SystemConfig::from_ron_str(&text(""), base).unwrap();
+        assert_eq!(
+            orb(&default).loop_closing.graph(),
+            Some(LoopGraphSettings {
+                information: LoopGraphInformation::ScalarWeights,
+                persistent: false,
+            })
+        );
+        let drift = SystemConfig::from_ron_str(
+            &text(", graph: (information: Drift(loop_cauchy_scale: 2.0), persistent: true)"),
+            base,
+        )
+        .unwrap();
+        let LoopGraphInformation::Drift {
+            odometry,
+            loop_sigma_m,
+            loop_cauchy_scale,
+            ..
+        } = orb(&drift).loop_closing.graph().unwrap().information
+        else {
+            panic!("Drift expected");
+        };
+        assert_eq!(odometry, OdometryRandomWalk::default());
+        assert_eq!(loop_sigma_m, 0.10);
+        assert_eq!(loop_cauchy_scale, 2.0);
+        assert!(orb(&drift).loop_closing.graph().unwrap().persistent);
+    }
+
+    #[test]
     fn file_paths_resolve_against_the_file_directory() {
         let dir = std::env::temp_dir().join(format!("kornia-slam-system-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -590,6 +685,7 @@ mod ron_files {
         let mut config = with_loop_closing(
             LoopClosingMode::Enabled {
                 vocabulary: PathBuf::from("/weights/ORBvoc.bin"),
+                graph: Default::default(),
             },
             sensors(CameraSelection::Stereo, true),
         );

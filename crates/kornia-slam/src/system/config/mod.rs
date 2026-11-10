@@ -5,7 +5,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::initialization::two_view::TwoViewInitConfig;
-use crate::loop_closure::LoopClosingConfig;
+use crate::loop_closure::{LoopClosingConfig, LoopGraphInformation, LoopGraphSettings};
 use crate::mapping::LocalMappingMode;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
@@ -168,7 +168,7 @@ pub struct MappingConfig {
 /// `vocabulary` is a `.bin` from `convert_orbvoc` or a DBoW2 `ORBvoc.txt`,
 /// selected by extension. A relative path in a file is resolved against that
 /// file's directory.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub enum LoopClosingMode {
@@ -177,19 +177,31 @@ pub enum LoopClosingMode {
     Disabled,
     /// Needs metric input: stereo cameras or the IMU. With the IMU selected,
     /// corrections wait for inertial initialization.
-    Enabled { vocabulary: PathBuf },
+    Enabled {
+        vocabulary: PathBuf,
+        /// The pose graph accepted loops solve; the default is the snapshot `w * I` solve.
+        #[cfg_attr(feature = "serde", serde(default))]
+        graph: LoopGraphSettings,
+    },
 }
 
 impl LoopClosingMode {
     pub fn vocabulary(&self) -> Option<&Path> {
         match self {
             Self::Disabled => None,
-            Self::Enabled { vocabulary } => Some(vocabulary),
+            Self::Enabled { vocabulary, .. } => Some(vocabulary),
         }
     }
 
     pub fn is_enabled(&self) -> bool {
         matches!(self, Self::Enabled { .. })
+    }
+
+    pub fn graph(&self) -> Option<LoopGraphSettings> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled { graph, .. } => Some(*graph),
+        }
     }
 }
 
@@ -199,7 +211,7 @@ impl SystemConfig {
     /// from. Absolute paths are kept.
     pub fn resolve_paths(&mut self, base_dir: &Path) {
         let PipelineDefinition::OrbSlam(orb) = &mut self.pipeline;
-        if let LoopClosingMode::Enabled { vocabulary } = &mut orb.loop_closing
+        if let LoopClosingMode::Enabled { vocabulary, .. } = &mut orb.loop_closing
             && vocabulary.is_relative()
         {
             *vocabulary = base_dir.join(&*vocabulary);
@@ -262,8 +274,21 @@ impl fmt::Display for SystemConfig {
             LocalMappingMode::Asynchronous => "asynchronous",
         };
         writeln!(f, "  local mapping: {execution}")?;
-        if let Some(vocabulary) = orb.loop_closing.vocabulary() {
-            writeln!(f, "  loop closing: {}", vocabulary.display())?;
+        if let LoopClosingMode::Enabled { vocabulary, graph } = &orb.loop_closing {
+            let information = match graph.information {
+                LoopGraphInformation::ScalarWeights => "w*I",
+                LoopGraphInformation::Drift { .. } => "drift",
+            };
+            let kept = if graph.persistent {
+                "persistent"
+            } else {
+                "snapshot"
+            };
+            writeln!(
+                f,
+                "  loop closing: {} (pose graph: {information}, {kept})",
+                vocabulary.display()
+            )?;
         }
         Ok(())
     }

@@ -7,8 +7,8 @@ use super::config::{
 };
 use super::validation::ConfigError;
 use crate::initialization::two_view::TwoViewInitConfig;
-use crate::loop_closure::LoopCloser;
 use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabulary};
+use crate::loop_closure::{LoopCloser, LoopClosingConfig};
 use crate::mapping::LocalMappingMode;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
@@ -91,9 +91,13 @@ impl SystemConfig {
         orb.loop_closing
             .vocabulary()
             .map(|path| {
+                let config = LoopClosingConfig {
+                    graph: orb.loop_closing.graph().unwrap_or_default(),
+                    ..orb.tuning.loop_correction.clone()
+                };
                 Ok(LoopCloser::new(
                     load_vocabulary(path)?,
-                    orb.tuning.loop_correction.clone(),
+                    config,
                     rig.imu.is_some(),
                 ))
             })
