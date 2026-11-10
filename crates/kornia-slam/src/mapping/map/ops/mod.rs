@@ -13,8 +13,8 @@ pub use correction::{
     PoseGraphCorrectionError, PoseGraphCorrectionResult,
 };
 pub use mutation::{
-    InsertionResult, LandmarkCompaction, LandmarkSeed, LandmarkTarget, MapInsertion,
-    MapMutationError, MapPointMergeResult, ObservationLink,
+    InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError,
+    MapPointMergeResult, ObservationLink,
 };
 pub use removal::{KeyframeRemoval, KeyframeRemovalError, StillNeighbour, StillSide};
 pub use snapshot::{BaSnapshot, BaUpdate, BaWindow, LocalBaStats};

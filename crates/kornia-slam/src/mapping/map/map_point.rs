@@ -54,9 +54,6 @@ pub struct MapPoint {
     pub n_found: u32,
     /// Logically deleted; still occupies its slot.
     pub culled: bool,
-    /// This landmark's number for the life of the map, in creation order. Its
-    /// index changes when [`crate::mapping::map::Map::compact_landmarks`] runs.
-    pub stable_id: u64,
 }
 
 impl MapPoint {
@@ -80,7 +77,6 @@ impl MapPoint {
             n_visible: 1,
             n_found: 1,
             culled: false,
-            stable_id: 0,
         }
     }
 
