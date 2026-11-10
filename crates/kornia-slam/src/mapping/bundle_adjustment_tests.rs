@@ -110,6 +110,73 @@ fn local_visual_ba_preserves_fixed_entities_and_solves_outside_the_live_map() {
     );
 }
 
+/// Five stereo keyframes 0.2 m apart along x (true poses, keyframes 2-4 seeded
+/// 1 cm off in y), 48 landmarks seen by all, seeded a few cm off.
+fn stereo_fixture(mismatched_px: f32) -> Map {
+    let points: Vec<_> = (0..48)
+        .map(|i| {
+            Vec3F64::new(
+                (i % 8) as f64 * 0.5 - 1.75,
+                (i / 8 % 6) as f64 * 0.4 - 1.0,
+                3.0 + (i % 5) as f64 * 0.8,
+            )
+        })
+        .collect();
+    let mut map = Map::new();
+    for (slot, id) in KF_IDS.into_iter().enumerate() {
+        let mut frame = test_frame(id, vec![[0; 32]; points.len()]);
+        let tx = -0.2 * slot as f64;
+        for (feature, point) in points.iter().enumerate() {
+            frame.features.keypoints_xy[feature] = [
+                (200.0 * (point.x + tx) / point.z + 320.0) as f32,
+                (200.0 * point.y / point.z + 240.0) as f32,
+            ];
+        }
+        frame.depth = points.iter().map(|p| p.z as f32).collect();
+        if slot == KF_IDS.len() - 1 {
+            for feature in [0, 17] {
+                frame.features.keypoints_xy[feature][0] += mismatched_px;
+            }
+        }
+        frame.pose_world_to_cam.translation.x = tx;
+        if slot >= 2 {
+            frame.pose_world_to_cam.translation.y = 0.01;
+        }
+        map.insert_keyframe(Keyframe::from_frame(frame)).unwrap();
+    }
+    for (feature, point) in points.into_iter().enumerate() {
+        let id = map
+            .insert_landmark(LandmarkSeed {
+                position: point + Vec3F64::new(0.02, -0.01, 0.04),
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: KF_IDS[0],
+                    feature_idx: feature,
+                },
+            })
+            .unwrap();
+        for kf in &KF_IDS[1..] {
+            map.link_observation(*kf, feature, id).unwrap();
+        }
+    }
+    map
+}
+
+/// A tracked mismatch reaches a keyframe as an ordinary observation; the
+/// visual-only solve must bound its pull (plain L2 moved this pose 0.36 m).
+#[test]
+fn local_visual_ba_is_robust_to_mismatched_observations() {
+    let mut map = stereo_fixture(60.0);
+    let update = run_local_ba(map.ba_snapshot(&local_window(&map)), &camera());
+    map.apply_ba_update(update).unwrap();
+    let newest = map.get_keyframe(KF_IDS[4]).unwrap().frame.pose_world_to_cam;
+    let error = (newest.translation - Vec3F64::new(-0.8, 0.0, 0.0)).length();
+    assert!(
+        error < 0.05,
+        "two 60 px mismatches moved the pose {error} m"
+    );
+}
+
 #[test]
 fn local_window_holds_active_keyframes_their_landmarks_and_fixed_context() {
     let mut map = Map::new();

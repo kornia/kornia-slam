@@ -8,7 +8,7 @@ use crate::mapping::map::{
     ORB_SCALE_FACTOR,
 };
 use crate::mapping::stationary::StationaryFactor;
-use crate::mapping::vi_ba_schur::{ImuHuber, RigObservationCamera, ViBaKeyframe};
+use crate::mapping::vi_ba_schur::{ImuHuber, RigObservationCamera, ViBaKeyframe, ViBaParams};
 use crate::mapping::wheel_odom::WheelOdomFactor;
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
@@ -346,16 +346,20 @@ pub fn run_local_ba_with(
         return update;
     }
 
-    let ba_result = match bundle_adjust_schur(
-        &poses,
-        &window.positions,
-        &observations,
-        camera,
-        &BaParams::default(),
-    ) {
-        Ok(r) => r,
-        Err(_) => return update,
+    // Tracked matches reach keyframes unfiltered, so a plain L2 solve lets
+    // every mismatch pull the window; same kernel as VI-BA.
+    let vi_defaults = ViBaParams::default();
+    let ba_params = BaParams {
+        robust: RobustKernelKind::Huber,
+        robust_scale_sq: vi_defaults.huber_reproj_px_sq as f32,
+        depth_robust_scale_sq: vi_defaults.huber_depth_sigma_sq as f32,
+        ..BaParams::default()
     };
+    let ba_result =
+        match bundle_adjust_schur(&poses, &window.positions, &observations, camera, &ba_params) {
+            Ok(r) => r,
+            Err(_) => return update,
+        };
 
     for (kf_idx, pose) in ba_result.poses.iter().enumerate() {
         if kf_idx >= active_start {
@@ -417,9 +421,7 @@ pub fn run_local_inertial_ba_with(
 ) -> BaUpdate {
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
-    use crate::mapping::vi_ba_schur::{
-        ImuFactor as ViBaImuFactor, ViBaParams, visual_inertial_bundle_adjust,
-    };
+    use crate::mapping::vi_ba_schur::{ImuFactor as ViBaImuFactor, visual_inertial_bundle_adjust};
 
     const MIN_OBSERVATIONS: usize = 8;
 
