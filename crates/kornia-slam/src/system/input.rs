@@ -12,6 +12,8 @@ pub enum ProcessError {
     EmptyImage,
     #[error("the stereo pipeline needs a right image, use process_stereo")]
     StereoRequired,
+    #[error("the pipeline tracks a multi-camera rig, which needs an image per camera")]
+    RigRequired,
     #[error("the pipeline is monocular, use process_image")]
     MonoPipeline,
     #[error(

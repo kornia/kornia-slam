@@ -418,6 +418,38 @@ mod runtime_settings {
         assert_eq!(close_depth(StereoCloseDepth::Metres(2.5)), Some(2.5));
         assert_eq!(close_depth(StereoCloseDepth::Disabled), None);
     }
+
+    #[test]
+    fn only_the_rig_selection_keeps_the_rig_cameras() {
+        let primary = rig().camera;
+        let view = |primary_from_camera| kornia_sensors::RigCamera {
+            camera: primary.clone(),
+            size: kornia_image::ImageSize {
+                width: 640,
+                height: 480,
+            },
+            primary_from_camera,
+        };
+        let two_cameras = rig().with_rig_cameras(vec![
+            view(Pose3d::IDENTITY),
+            view(Pose3d::new(
+                kornia_algebra::Mat3F64::IDENTITY,
+                kornia_algebra::Vec3F64::new(0.1, 0.0, 0.0),
+            )),
+        ]);
+        let selected = sensors(CameraSelection::Rig, false)
+            .select_rig(two_cameras.clone())
+            .unwrap();
+        assert_eq!(selected.cameras.len(), 2);
+        let mono = sensors(CameraSelection::Mono, false)
+            .select_rig(two_cameras)
+            .unwrap();
+        assert!(mono.cameras.is_empty());
+        assert!(matches!(
+            sensors(CameraSelection::Rig, false).select_rig(rig()),
+            Err(ConfigError::MissingSensor(_))
+        ));
+    }
 }
 
 #[cfg(feature = "serde")]

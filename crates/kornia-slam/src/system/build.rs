@@ -43,8 +43,11 @@ impl SensorSelection {
     /// The source's rig restricted to the selected sensors.
     pub(crate) fn select_rig(&self, mut rig: SensorRig) -> Result<SensorRig, ConfigError> {
         self.validate_rig(&rig)?;
-        if self.cameras == CameraSelection::Mono {
+        if self.cameras != CameraSelection::Stereo {
             rig.stereo_baseline_m = None;
+        }
+        if self.cameras != CameraSelection::Rig {
+            rig.cameras.clear();
         }
         if !self.imu {
             rig.imu = None;

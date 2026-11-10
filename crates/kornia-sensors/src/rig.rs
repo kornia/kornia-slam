@@ -5,6 +5,7 @@ use crate::imu::ImuCalib;
 use crate::wheel::{DifferentialDrive, WheelNoise};
 use kornia_3d::camera::{FisheyeCamera, PinholeCamera};
 use kornia_3d::pose::Pose3d;
+use kornia_image::ImageSize;
 
 /// Camera calibration plus optional stereo, IMU and wheel calibration.
 ///
@@ -27,6 +28,20 @@ pub struct SensorRig {
     pub fisheye: Option<FisheyeCamera>,
     /// `None` for a rig without wheel odometry.
     pub wheels: Option<WheelCalibration>,
+    /// Every camera of a non-rectified multi-camera rig, the primary first;
+    /// empty otherwise. Each one supplies its own images.
+    pub cameras: Vec<RigCamera>,
+}
+
+/// One camera of a multi-camera rig (ORB-SLAM3's non-rectified stereo).
+#[derive(Debug, Clone)]
+pub struct RigCamera {
+    /// Undistorted pinhole model of this camera's images.
+    pub camera: PinholeCamera,
+    pub size: ImageSize,
+    /// `T_PC`: `X_primary = T_PC * X_camera`, where the primary camera is
+    /// [`SensorRig::camera`]. Identity for the primary itself.
+    pub primary_from_camera: Pose3d,
 }
 
 impl SensorRig {
@@ -38,7 +53,20 @@ impl SensorRig {
             imu: None,
             fisheye: None,
             wheels: None,
+            cameras: Vec::new(),
         }
+    }
+
+    /// Declares a multi-camera rig. `cameras[0]` must be the primary camera,
+    /// with an identity `primary_from_camera`.
+    pub fn with_rig_cameras(mut self, cameras: Vec<RigCamera>) -> Self {
+        self.cameras = cameras;
+        self
+    }
+
+    /// Whether the rig has more than one non-rectified camera.
+    pub fn is_multi_camera(&self) -> bool {
+        self.cameras.len() > 1
     }
 
     /// Declares the images as a rectified stereo pair with the given baseline in metres.

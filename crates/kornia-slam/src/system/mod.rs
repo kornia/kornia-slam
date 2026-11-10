@@ -209,6 +209,9 @@ impl SlamSystem {
         if self.rig.stereo_baseline_m.is_some() {
             return Err(ProcessError::StereoRequired);
         }
+        if self.rig.is_multi_camera() {
+            return Err(ProcessError::RigRequired);
+        }
         let frame = self
             .frontend
             .prepare_image(self.next_frame_idx, image)
@@ -225,6 +228,9 @@ impl SlamSystem {
         right: &Image<u8, 1>,
     ) -> Result<TrackingResult, ProcessError> {
         input::validate_stereo_pair(timestamp_sec, left, right)?;
+        if self.rig.is_multi_camera() {
+            return Err(ProcessError::RigRequired);
+        }
         if self.rig.stereo_baseline_m.is_none() {
             return Err(ProcessError::MonoPipeline);
         }
