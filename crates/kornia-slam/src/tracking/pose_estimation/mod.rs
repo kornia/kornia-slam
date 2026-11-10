@@ -2,6 +2,7 @@
 
 pub mod map_projection;
 pub mod pnp;
+pub mod rig_pnp;
 
 use kornia_3d::pose::Pose3d;
 

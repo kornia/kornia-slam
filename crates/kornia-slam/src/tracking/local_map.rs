@@ -123,6 +123,31 @@ pub fn select_local_map_points(
 ///
 /// A projection test only: it says nothing about occlusion, descriptor
 /// distance, or the scale and viewing-angle gates the matcher applies later.
+/// [`landmarks_in_frustum`] of every camera of `frame`'s rig, or of the
+/// single camera outside one.
+pub fn landmarks_in_frame_frustum(
+    map: &Map,
+    candidates: &[usize],
+    camera: &PinholeCamera,
+    pose_world_to_cam: &Pose3d,
+    frame: &crate::Frame,
+) -> HashSet<usize> {
+    let mut visible =
+        landmarks_in_frustum(map, candidates, camera, pose_world_to_cam, frame.image_size);
+    if let Some(rig) = frame.rig.geometry.as_ref().filter(|_| frame.is_rig()) {
+        for view in rig.views().iter().skip(1) {
+            visible.extend(landmarks_in_frustum(
+                map,
+                candidates,
+                &view.camera,
+                &view.pose(pose_world_to_cam),
+                view.size,
+            ));
+        }
+    }
+    visible
+}
+
 pub fn landmarks_in_frustum(
     map: &Map,
     candidates: &[usize],

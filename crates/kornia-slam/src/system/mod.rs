@@ -856,7 +856,6 @@ impl SlamSystem {
         current_image: &Image<u8, 1>,
         timestamp_sec: f64,
     ) -> TrackingResult {
-        let image_size = frame.image_size;
         let pose_before = self.state.pose_world_to_cam;
         let prev_timestamp = self.state.last_frame_timestamp_sec;
 
@@ -977,12 +976,12 @@ impl SlamSystem {
                     current_kf,
                     LocalMapSelectionConfig::default(),
                 );
-                let visible = crate::tracking::local_map::landmarks_in_frustum(
+                let visible = crate::tracking::local_map::landmarks_in_frame_frustum(
                     &map_guard,
                     &local_indices,
                     &self.rig.camera,
                     &candidate_pose,
-                    image_size,
+                    &frame,
                 );
                 map_guard.update_observation_counts(&visible, &matches);
             }

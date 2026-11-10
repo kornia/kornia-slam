@@ -130,8 +130,14 @@ impl FusionSnapshot {
             SnapshotKeyframe {
                 pose: keyframe.frame.pose_world_to_cam,
                 image_size: keyframe.frame.image_size,
+                // Fusion projects with the primary camera: a rig's other
+                // cameras' features take no part.
                 keypoints: features
-                    .map(|feature| keyframe.frame.undistorted_xy(feature, &self.camera))
+                    .map(|feature| {
+                        (keyframe.frame.camera_of(feature) == 0)
+                            .then(|| keyframe.frame.undistorted_xy(feature, &self.camera))
+                            .flatten()
+                    })
                     .collect(),
                 descriptors: keyframe.frame.features.descriptors.clone(),
                 slots: keyframe.map_point_by_desc_idx.clone(),
@@ -540,12 +546,17 @@ fn lands_on(
     else {
         return false;
     };
+    let frame = &keyframe.frame;
+    let (view_camera, pose) = frame.observing(feature, camera, &frame.pose_world_to_cam);
+    let size = frame
+        .secondary_view(feature)
+        .map_or(frame.image_size, |view| view.size);
     reprojects_onto(
-        camera,
-        keyframe.frame.pose_world_to_cam,
-        keyframe.frame.image_size,
+        view_camera,
+        pose,
+        size,
         position,
-        keyframe.frame.undistorted_xy(feature, camera),
+        frame.undistorted_xy(feature, camera),
         config.max_reprojection_error_px,
     )
 }

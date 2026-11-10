@@ -234,6 +234,69 @@ pub struct ViBaParams {
     /// positive: NaN, zero or a negative value is refused
     /// ([`ViBaError::InvalidDepthGateFactor`]).
     pub depth_gate_factor: f64,
+    /// Secondary rig cameras observations may come from. Each observation's
+    /// camera is `observation_views[o]`: 0 for the primary camera, `k` for
+    /// `rig_views[k - 1]`. Empty `observation_views` means all primary.
+    pub rig_views: Vec<RigObservationCamera>,
+    pub observation_views: Vec<u8>,
+}
+
+/// A secondary rig camera: its model and `T_CP` from the primary camera,
+/// whose pose the keyframe state holds (ORB-SLAM3's `EdgeSE3ProjectXYZToBody`).
+#[derive(Debug, Clone)]
+pub struct RigObservationCamera {
+    pub camera: PinholeCamera,
+    pub camera_from_primary: Pose3d,
+}
+
+/// Which camera made each observation; see [`ViBaParams::rig_views`].
+#[derive(Clone, Copy)]
+pub(super) struct ObservationViews<'a> {
+    views: &'a [RigObservationCamera],
+    of: &'a [u8],
+}
+
+impl<'a> ObservationViews<'a> {
+    /// Every observation from the primary camera.
+    #[cfg(test)]
+    pub(super) const PRIMARY: ObservationViews<'static> = ObservationViews {
+        views: &[],
+        of: &[],
+    };
+
+    fn new(params: &'a ViBaParams) -> Self {
+        Self {
+            views: &params.rig_views,
+            of: &params.observation_views,
+        }
+    }
+
+    fn view(&self, o: usize) -> Option<&'a RigObservationCamera> {
+        let k = *self.of.get(o)? as usize;
+        k.checked_sub(1).and_then(|k| self.views.get(k))
+    }
+
+    fn pose(&self, o: usize, pose: &Pose3d) -> Pose3d {
+        match self.view(o) {
+            Some(view) => view.camera_from_primary.compose(pose),
+            None => *pose,
+        }
+    }
+
+    /// The camera and its SE3 pose for observation `o`. The reprojection
+    /// Jacobian built from that pose is the one with respect to the
+    /// primary pose: it depends only on `R_CP R` and the camera-frame point.
+    fn camera_pose(
+        &self,
+        o: usize,
+        primary: &'a PinholeCamera,
+        pose: &SE3F32,
+    ) -> (&'a PinholeCamera, SE3F32) {
+        match self.view(o) {
+            Some(view) => (&view.camera, pose_to_se3(&view.camera_from_primary) * *pose),
+            None => (primary, *pose),
+        }
+    }
 }
 
 impl Default for ViBaParams {
@@ -258,6 +321,8 @@ impl Default for ViBaParams {
             // healthy, per the LM-damping note below).
             accel_bias_prior_weight: 1e2,
             depth_gate_factor: 10.0,
+            rig_views: Vec::new(),
+            observation_views: Vec::new(),
         }
     }
 }
@@ -436,12 +501,13 @@ fn depth_gate(
 /// camera in `before` and not in `after` (camera depth `<= 0`).
 fn cheirality_flips(
     observations: &[BaObservation],
+    views: ObservationViews<'_>,
     before: (&[ViBaKeyframe], &[Vec3F64]),
     after: (&[ViBaKeyframe], &[Vec3F64]),
 ) -> Vec<usize> {
-    let depth = |(kfs, xyz): (&[ViBaKeyframe], &[Vec3F64]), obs: &BaObservation| {
-        kfs[obs.pose_idx]
-            .pose
+    let depth = |(kfs, xyz): (&[ViBaKeyframe], &[Vec3F64]), o: usize, obs: &BaObservation| {
+        views
+            .pose(o, &kfs[obs.pose_idx].pose)
             .transform_point(&xyz[obs.point_idx])
             .z
     };
@@ -449,7 +515,7 @@ fn cheirality_flips(
         .iter()
         .enumerate()
         .filter(|(_, obs)| obs.pose_idx < before.0.len() && obs.point_idx < before.1.len())
-        .filter(|(_, obs)| depth(before, obs) > 0.0 && depth(after, obs) <= 0.0)
+        .filter(|&(o, obs)| depth(before, o, obs) > 0.0 && depth(after, o, obs) <= 0.0)
         .map(|(o, _)| o)
         .collect()
 }
@@ -474,6 +540,7 @@ struct CheiralityOutcome {
 /// mismatched association.
 fn enforce_cheirality(
     observations: &[BaObservation],
+    views: ObservationViews<'_>,
     inlier: &[bool],
     point_local: &[i64],
     before: (&[ViBaKeyframe], &[Vec3F64]),
@@ -481,14 +548,14 @@ fn enforce_cheirality(
     after_xyz: &mut [Vec3F64],
 ) -> CheiralityOutcome {
     let mut points_held = 0;
-    for o in cheirality_flips(observations, before, (after_kfs, after_xyz)) {
+    for o in cheirality_flips(observations, views, before, (after_kfs, after_xyz)) {
         let j = observations[o].point_idx;
         if point_local[j] >= 0 && after_xyz[j] != before.1[j] {
             after_xyz[j] = before.1[j];
             points_held += 1;
         }
     }
-    let refuse = cheirality_flips(observations, before, (after_kfs, after_xyz))
+    let refuse = cheirality_flips(observations, views, before, (after_kfs, after_xyz))
         .into_iter()
         .any(|o| inlier[o]);
     CheiralityOutcome {
@@ -1379,6 +1446,7 @@ pub fn visual_inertial_bundle_adjust(
 
     let n_kf = keyframes.len();
     let n_pts = points.len();
+    let views = ObservationViews::new(params);
 
     // ── Index maps: free keyframes and free points ────────────────────────
     // A keyframe is free if it is not marked fixed AND appears in at least
@@ -1503,10 +1571,11 @@ pub fn visual_inertial_bundle_adjust(
 
         let mut cost_vis = 0.0f64;
 
-        for ((obs, &depth_row), inlier) in observations
+        for (o, ((obs, &depth_row), inlier)) in observations
             .iter()
             .zip(&depth_on)
             .zip(vis_inlier.iter_mut())
+            .enumerate()
         {
             *inlier = false;
             if obs.pose_idx >= n_kf || obs.point_idx >= n_pts {
@@ -1515,8 +1584,10 @@ pub fn visual_inertial_bundle_adjust(
 
             let pose = &se3s[obs.pose_idx];
             let point = &xyz[obs.point_idx];
+            let (obs_camera, obs_pose) = views.camera_pose(o, camera, pose);
             // residual_and_jacobians is f32 internally; cast results to f64.
-            let (r_f32, jp_f32, jx_f32) = residual_and_jacobians(pose, point, obs.pixel, camera);
+            let (r_f32, jp_f32, jx_f32) =
+                residual_and_jacobians(&obs_pose, point, obs.pixel, obs_camera);
 
             let r_raw = [r_f32[0] as f64, r_f32[1] as f64];
             let jp_raw: [f64; 12] = std::array::from_fn(|i| jp_f32[i] as f64);
@@ -1961,6 +2032,7 @@ pub fn visual_inertial_bundle_adjust(
         // does it to an inlier observation counts as a cost increase.
         let cheirality = enforce_cheirality(
             observations,
+            views,
             &vis_inlier,
             &point_local,
             (&kfs, &xyz),
@@ -1979,16 +2051,13 @@ pub fn visual_inertial_bundle_adjust(
 
         // ── 7. Trial cost (visual + IMU) ─────────────────────────────────
         let mut new_cost_vis = 0.0f64;
-        for (obs, &depth_row) in observations.iter().zip(&depth_on) {
+        for (o, (obs, &depth_row)) in observations.iter().zip(&depth_on).enumerate() {
             if obs.pose_idx >= n_kf || obs.point_idx >= n_pts {
                 continue;
             }
-            let (r_f32, _, _) = residual_and_jacobians(
-                &se3s_trial[obs.pose_idx],
-                &xyz_trial[obs.point_idx],
-                obs.pixel,
-                camera,
-            );
+            let (obs_camera, obs_pose) = views.camera_pose(o, camera, &se3s_trial[obs.pose_idx]);
+            let (r_f32, _, _) =
+                residual_and_jacobians(&obs_pose, &xyz_trial[obs.point_idx], obs.pixel, obs_camera);
             let chi2_vis = (r_f32[0] * r_f32[0] + r_f32[1] * r_f32[1]) as f64;
             new_cost_vis += visual_huber(chi2_vis, params.huber_reproj_px_sq).1;
 
@@ -2134,7 +2203,10 @@ pub fn visual_inertial_bundle_adjust(
 
 #[cfg(test)]
 mod tests {
-    use super::{ViBaParams, depth_residual_and_jacobian, imu_weight_and_cost, visual_huber};
+    use super::{
+        ObservationViews, RigObservationCamera, ViBaParams, depth_residual_and_jacobian,
+        imu_weight_and_cost, residual_and_jacobians, visual_huber,
+    };
     use kornia_algebra::{SE3F32, SO3F32, SO3F64, Vec3AF32, Vec3F64};
 
     /// The stereo depth row's analytic Jacobian matches central differences
@@ -2216,6 +2288,61 @@ mod tests {
                 "retract column {k}: {moved} vs {predicted}"
             );
         }
+    }
+
+    /// A secondary rig camera's reprojection Jacobian, built from the
+    /// composed pose `T_CP · T`, is the one with respect to the primary
+    /// pose's right perturbation: `T_CP · (T · exp(δ)) = (T_CP · T) · exp(δ)`.
+    #[test]
+    fn a_rig_observation_differentiates_the_primary_pose() {
+        let camera = kornia_3d::camera::PinholeCamera {
+            fx: 240.0,
+            fy: 240.0,
+            cx: 380.0,
+            cy: 286.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let camera_from_primary = kornia_3d::pose::Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.1, -1.3, -0.05)).matrix(),
+            Vec3F64::new(-0.11, 0.01, 0.02),
+        );
+        let params = ViBaParams {
+            rig_views: vec![RigObservationCamera {
+                camera: camera.clone(),
+                camera_from_primary,
+            }],
+            observation_views: vec![0, 1],
+            ..ViBaParams::default()
+        };
+        let views = ObservationViews::new(&params);
+        let pose = SE3F32 {
+            r: SO3F32::exp(Vec3AF32::new(0.05, -0.2, 0.1)),
+            t: Vec3AF32::new(0.3, -0.1, 0.2),
+        };
+        // In front of camera 1 (about 75 deg off the primary axis).
+        let point = Vec3F64::new(4.0, 0.2, 1.5);
+        let (cam, composed) = views.camera_pose(1, &camera, &pose);
+        let (r0, j_pose, _) = residual_and_jacobians(&composed, &point, [380.0, 286.0], cam);
+        for k in 0..6 {
+            let mut delta = [0.0f32; 6];
+            delta[k] = 1e-3;
+            let (_, moved) = views.camera_pose(1, &camera, &pose.retract(&delta));
+            let (r1, _, _) = residual_and_jacobians(&moved, &point, [380.0, 286.0], cam);
+            for row in 0..2 {
+                let predicted = r0[row] + j_pose[row * 6 + k] * 1e-3;
+                assert!(
+                    (r1[row] - predicted).abs() < 2e-2,
+                    "row {row} column {k}: {} vs {predicted}",
+                    r1[row]
+                );
+            }
+        }
+        let (primary, same) = views.camera_pose(0, &camera, &pose);
+        assert!(std::ptr::eq(primary, &camera));
+        assert_eq!(same.t, pose.t);
     }
 
     /// The IMU edge's cost (used by both the system build and the trial

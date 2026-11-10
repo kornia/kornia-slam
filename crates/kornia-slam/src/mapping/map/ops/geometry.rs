@@ -30,11 +30,11 @@ impl Map {
         n_levels: usize,
     ) {
         let keyframes = &self.keyframes;
-        let centre = |kf_idx: usize| {
+        let centre = |kf_idx: usize, camera: u8| {
             keyframes
                 .iter()
                 .find(|kf| kf.frame.idx == kf_idx)
-                .map(camera_centre)
+                .map(|kf| camera_centre(kf, camera))
         };
         let Some(geometry) = self
             .map_points
@@ -93,12 +93,10 @@ impl Map {
         let mut ids: Vec<usize> = landmark_ids.into_iter().collect();
         ids.sort_unstable();
         ids.dedup();
-        let centres: HashMap<usize, Vec3F64> = self
-            .keyframes
-            .iter()
-            .map(|kf| (kf.frame.idx, camera_centre(kf)))
-            .collect();
-        let centre = |kf_idx: usize| centres.get(&kf_idx).copied();
+        let centres: HashMap<usize, &Keyframe> =
+            self.keyframes.iter().map(|kf| (kf.frame.idx, kf)).collect();
+        let centre =
+            |kf_idx: usize, camera: u8| centres.get(&kf_idx).map(|kf| camera_centre(kf, camera));
         for &idx in &ids {
             let Some(geometry) = self
                 .map_points
@@ -113,8 +111,20 @@ impl Map {
     }
 }
 
-fn camera_centre(keyframe: &Keyframe) -> Vec3F64 {
-    keyframe.frame.pose_world_to_cam.inverse().translation
+/// Centre of rig camera `camera` of the keyframe; the primary camera's outside a rig.
+fn camera_centre(keyframe: &Keyframe, camera: u8) -> Vec3F64 {
+    let pose = &keyframe.frame.pose_world_to_cam;
+    match keyframe
+        .frame
+        .rig
+        .geometry
+        .as_ref()
+        .and_then(|rig| rig.view(camera as usize))
+        .filter(|_| camera > 0)
+    {
+        Some(view) => view.pose(pose).inverse().translation,
+        None => pose.inverse().translation,
+    }
 }
 
 /// A landmark's derived geometry; the viewing direction is `None` when no
@@ -138,7 +148,7 @@ impl LandmarkGeometry {
 /// `None` if the point is culled or its reference keyframe has no centre.
 fn refreshed_geometry(
     mp: &MapPoint,
-    centre: impl Fn(usize) -> Option<Vec3F64>,
+    centre: impl Fn(usize, u8) -> Option<Vec3F64>,
     scale_factor: f64,
     n_levels: usize,
 ) -> Option<LandmarkGeometry> {
@@ -148,8 +158,8 @@ fn refreshed_geometry(
     let position = mp.position;
     let mut normal = Vec3F64::ZERO;
     let mut n = 0usize;
-    for kf_idx in mp.observer_keyframes() {
-        if let Some(cam_center) = centre(kf_idx) {
+    for observation in mp.observations() {
+        if let Some(cam_center) = centre(observation.key.keyframe_idx, observation.camera) {
             let dir = position - cam_center;
             let len = dir.length();
             if len > 1e-9 {
@@ -159,7 +169,12 @@ fn refreshed_geometry(
         }
     }
 
-    let ref_center = centre(mp.keyframe_idx)?;
+    let ref_camera = mp
+        .observations()
+        .iter()
+        .find(|o| o.key.keyframe_idx == mp.keyframe_idx)
+        .map_or(0, |o| o.camera);
+    let ref_center = centre(mp.keyframe_idx, ref_camera)?;
     let dist = (position - ref_center).length();
     let level_scale = scale_factor.powi(mp.reference_octave as i32);
     let max_dist = dist * level_scale;
