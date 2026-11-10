@@ -14,9 +14,9 @@ mod validation;
 
 pub use build::BuildError;
 pub use config::{
-    CameraSelection, FrontendConfig, LoopClosingExecution, LoopClosingMode, MappingConfig,
-    OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION,
-    SensorSelection, StereoCloseDepth, SystemConfig,
+    CameraSelection, FrontendConfig, LocalBaConfig, LoopClosingExecution, LoopClosingMode,
+    MappingConfig, OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition,
+    SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth, StereoDepthSigma, SystemConfig,
 };
 #[cfg(feature = "serde")]
 pub use file::LoadError;
@@ -35,6 +35,7 @@ use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_point
 use crate::tracking::motion::{InertialPrediction, predict_pose};
 use crate::tracking::tracker::{FrameInput, Tracker};
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -50,6 +51,7 @@ use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{
     Correction, LoopCloser, LoopClosingContext, LoopClosingOutcome, LoopClosureEvent, LoopTiming,
 };
+use crate::mapping::bundle_adjustment::LocalBaParams;
 use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
 use crate::mapping::map::{
     InertialAlignmentError, Keyframe, Map, MapInsertion, MapMutationError, MapPoint,
@@ -73,12 +75,15 @@ pub struct SlamSystem {
     stereo_close_depth: Option<f64>,
     debug: bool,
     debug_messages: Vec<String>,
+    // Under debug: when tracking first matched each landmark, by stable id.
+    landmark_first_tracked_sec: HashMap<u64, f64>,
     map: Arc<Mutex<Map>>,
     // Serializes compound map publication and short local-BA snapshot/merge phases.
     map_publication_gate: Option<Arc<Mutex<()>>>,
     // IMU estimates, sample buffer and the inertial-initialization schedule
     inertial: InertialState,
     local_mapping: LocalMapping,
+    local_ba: LocalBaParams,
     // Place recognition for every keyframe, and loop closing when configured.
     loop_closer: Option<LoopCloser>,
     loop_closure_events: Vec<LoopClosureEvent>,
@@ -124,9 +129,11 @@ impl SlamSystem {
             stereo_close_depth: settings.stereo_close_depth_m,
             debug: false,
             debug_messages: Vec::new(),
+            landmark_first_tracked_sec: HashMap::new(),
             map,
             map_publication_gate,
             local_mapping,
+            local_ba: settings.local_ba,
             state: SystemState::new(),
             inertial: InertialState::new(),
             loop_closer,
@@ -304,6 +311,31 @@ impl SlamSystem {
         };
     }
 
+    /// Map reuse: how many of the frame's matches are landmarks tracking
+    /// first matched over 10 s ago.
+    fn report_landmark_age(&mut self, frame_idx: usize, matches: &[(usize, usize)], now_sec: f64) {
+        const OLD_SEC: f64 = 10.0;
+        let map = self.map.lock().unwrap();
+        let mut old = 0;
+        for &(mp_idx, _) in matches {
+            let Some(mp) = map.map_points().get(mp_idx) else {
+                continue;
+            };
+            let first = *self
+                .landmark_first_tracked_sec
+                .entry(mp.stable_id)
+                .or_insert(now_sec);
+            if now_sec - first > OLD_SEC {
+                old += 1;
+            }
+        }
+        drop(map);
+        self.dbg(format!(
+            "[age] frame={frame_idx} matches={} older_10s={old}",
+            matches.len()
+        ));
+    }
+
     fn report_stereo(&mut self, frame: &Frame) {
         if !self.debug {
             return;
@@ -389,6 +421,15 @@ impl SlamSystem {
                 .get_keyframe(ki)
                 .map(|kf| kf.frame.idx)
         })
+    }
+
+    /// `T_cw` of the keyframe numbered `frame_idx`, while the map holds it.
+    pub fn keyframe_pose(&self, frame_idx: usize) -> Option<Pose3d> {
+        self.map
+            .lock()
+            .unwrap()
+            .get_keyframe(frame_idx)
+            .map(|kf| kf.frame.pose_world_to_cam)
     }
 
     /// Returns the number of active (non-culled) map points.
@@ -832,6 +873,7 @@ impl SlamSystem {
             imu_initialized: true,
             imu_t_bc: self.rig.camera_to_body(),
             gravity_world: self.inertial.gravity_world,
+            local_ba: self.local_ba,
         }) {
             self.dbg("[local_mapping] worker is unavailable".into());
         }
@@ -957,6 +999,9 @@ impl SlamSystem {
                 ),
             };
             self.debug_messages.push(msg);
+            if status == TrackingStatus::Tracked {
+                self.report_landmark_age(frame.idx, &matches, timestamp_sec);
+            }
         }
 
         if status == TrackingStatus::Tracked {
@@ -1288,6 +1333,7 @@ impl SlamSystem {
             imu_initialized,
             imu_t_bc: self.rig.camera_to_body(),
             gravity_world: self.inertial.gravity_world,
+            local_ba: self.local_ba,
         }) {
             self.dbg("[local_mapping] worker is unavailable".into());
         }
@@ -1456,6 +1502,7 @@ impl SlamSystem {
                     imu_initialized: true,
                     imu_t_bc: self.rig.camera_to_body(),
                     gravity_world: self.inertial.gravity_world,
+                    local_ba: self.local_ba,
                 }) {
                     self.dbg("[local_mapping] worker is unavailable after PGO".into());
                 }

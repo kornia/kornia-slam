@@ -6,6 +6,7 @@ use kornia_sensors::SensorRig;
 
 use super::*;
 use crate::mapping::LocalMappingMode;
+use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
 use crate::system::ConfigError;
 #[cfg(feature = "serde")]
 use crate::system::LoadError;
@@ -268,6 +269,34 @@ fn settings_are_range_checked() {
     );
     orb_mut(&mut config).loop_closing = LoopClosingMode::Disabled;
     assert_eq!(config.validate(), Ok(()));
+
+    for (local_ba, setting) in [
+        (
+            LocalBaConfig {
+                active_keyframes: 0,
+                ..LocalBaConfig::default()
+            },
+            "mapping.local_ba.active_keyframes",
+        ),
+        (
+            LocalBaConfig {
+                boundary_imu_info_scale: f64::NAN,
+                ..LocalBaConfig::default()
+            },
+            "mapping.local_ba.boundary_imu_info_scale",
+        ),
+        (
+            LocalBaConfig {
+                stereo_depth_sigma: StereoDepthSigma::Disparity { px: 0.0 },
+                ..LocalBaConfig::default()
+            },
+            "mapping.local_ba.stereo_depth_sigma",
+        ),
+    ] {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).mapping.local_ba = local_ba;
+        assert_eq!(invalid_setting(&config).as_deref(), Some(setting));
+    }
 }
 
 #[test]
@@ -419,6 +448,34 @@ mod runtime_settings {
         assert_eq!(close_depth(StereoCloseDepth::Disabled), None);
     }
 
+    /// The default knobs are the solver's constants, bit for bit; a disparity
+    /// sigma resolves against focal length times baseline.
+    #[test]
+    fn local_ba_settings_resolve_against_the_rig() {
+        let selected = sensors(CameraSelection::Stereo, false)
+            .select_rig(stereo_imu_rig())
+            .unwrap();
+        assert_eq!(
+            SystemConfig::default().settings(&selected).local_ba,
+            LocalBaParams::default()
+        );
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).mapping.local_ba = LocalBaConfig {
+            active_keyframes: 10,
+            stereo_depth_sigma: StereoDepthSigma::Disparity { px: 1.0 },
+            ..LocalBaConfig::default()
+        };
+        let local_ba = config.settings(&selected).local_ba;
+        assert_eq!(local_ba.active_keyframes, 10);
+        let fb = selected.camera.fx * 0.11;
+        assert_eq!(
+            local_ba.depth_sigma,
+            DepthSigma::Disparity {
+                px_over_focal_baseline: (1.0 / fb) as f32
+            }
+        );
+    }
+
     #[test]
     fn only_the_rig_selection_keeps_the_rig_cameras() {
         let primary = rig().camera;
@@ -519,6 +576,19 @@ mod ron_files {
         assert_eq!(orb(&config).keyframes.max_frames_between, usize::MAX);
         assert_eq!(orb(&config).keyframes.min_parallax_px, Some(10.0));
         assert_eq!(orb(&config).keyframes.max_interval_sec, Some(0.5));
+
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((mapping: (local_ba: (active_keyframes: 10, imu_huber: BoundaryOnly, stereo_depth_sigma: Disparity(px: 1.0))))))",
+        )
+        .unwrap();
+        let local_ba = orb(&config).mapping.local_ba;
+        assert_eq!(local_ba.active_keyframes, 10);
+        assert_eq!(local_ba.imu_huber, ImuHuber::BoundaryOnly);
+        assert_eq!(
+            local_ba.stereo_depth_sigma,
+            StereoDepthSigma::Disparity { px: 1.0 }
+        );
+        assert!(local_ba.boundary_scales_bias_rows);
     }
 
     /// Tuning is not part of the file format, so a file cannot set it.
@@ -573,6 +643,10 @@ mod ron_files {
             ),
             (
                 "(version: 1, pipeline: OrbSlam((mapping: (window: 3))))",
+                "window",
+            ),
+            (
+                "(version: 1, pipeline: OrbSlam((mapping: (local_ba: (window: 3)))))",
                 "window",
             ),
             (

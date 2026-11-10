@@ -369,14 +369,15 @@ fn stereo_depth_obs_uses_proportional_sigma_with_floor() {
     frame.depth = vec![10.0, -1.0];
     frame.u_right = vec![5.0, -1.0];
     let kf = Keyframe::from_frame(frame);
+    let relative = LocalBaParams::default().depth_sigma;
 
     // Valid depth: sigma = 0.05 * 10 = 0.5.
-    let (d, s) = stereo_depth_obs(&kf, 0);
+    let (d, s) = stereo_depth_obs(&kf, 0, relative);
     assert_eq!(d, Some(10.0));
     assert!((s - 0.5).abs() < 1e-6);
 
     // Sentinel depth: no measurement.
-    let (d1, s1) = stereo_depth_obs(&kf, 1);
+    let (d1, s1) = stereo_depth_obs(&kf, 1, relative);
     assert_eq!(d1, None);
     assert!((s1 - 1.0).abs() < 1e-9);
 
@@ -384,8 +385,30 @@ fn stereo_depth_obs_uses_proportional_sigma_with_floor() {
     let mut near = test_frame(1, vec![[0u8; 32]]);
     near.depth = vec![0.1]; // 0.05 * 0.1 = 0.005 < floor
     let kf_near = Keyframe::from_frame(near);
-    let (_, s2) = stereo_depth_obs(&kf_near, 0);
+    let (_, s2) = stereo_depth_obs(&kf_near, 0, relative);
     assert!((s2 - STEREO_DEPTH_MIN_SIGMA).abs() < 1e-9);
+}
+
+/// The default is the old `STEREO_DEPTH_REL_SIGMA · z` bit for bit, as a
+/// file's `RelativeDepth(0.05)` resolves to it; disparity sigma grows as z².
+#[test]
+fn stereo_depth_sigma_models() {
+    assert_eq!(
+        LocalBaParams::default().depth_sigma,
+        DepthSigma::Relative(0.05_f64 as f32)
+    );
+    for z in [0.3_f32, 2.0, 7.5, 40.0] {
+        assert_eq!(
+            DepthSigma::Relative(STEREO_DEPTH_REL_SIGMA).sigma(z),
+            (STEREO_DEPTH_REL_SIGMA * z).max(STEREO_DEPTH_MIN_SIGMA)
+        );
+    }
+    // EuRoC: f·b = 435 px · 0.11 m; 1 px of disparity at 5 m is 0.52 m.
+    let disparity = DepthSigma::Disparity {
+        px_over_focal_baseline: 1.0 / (435.0 * 0.11),
+    };
+    assert!((disparity.sigma(5.0) - 25.0 / 47.85).abs() < 1e-5);
+    assert_eq!(disparity.sigma(0.5), STEREO_DEPTH_MIN_SIGMA);
 }
 
 #[test]

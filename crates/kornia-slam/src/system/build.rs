@@ -2,14 +2,15 @@ use kornia_imgproc::features::OrbDetector;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    CameraSelection, FrontendConfig, LoopClosingExecution, LoopClosingMode, OrbSlamPipeline,
-    PipelineDefinition, SensorSelection, SystemConfig,
+    CameraSelection, FrontendConfig, LocalBaConfig, LoopClosingExecution, LoopClosingMode,
+    OrbSlamPipeline, PipelineDefinition, SensorSelection, StereoDepthSigma, SystemConfig,
 };
 use super::validation::ConfigError;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabulary};
 use crate::loop_closure::{LoopCloser, LoopSolver};
 use crate::mapping::LocalMappingMode;
+use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
@@ -33,6 +34,7 @@ pub(crate) struct SystemSettings {
     pub keyframe_policy: KeyframePolicy,
     pub tracking_loss_recovery: TrackingLossRecoveryPolicy,
     pub local_mapping: LocalMappingMode,
+    pub local_ba: LocalBaParams,
     /// Near/far depth threshold `mThDepth` (metres). When `Some`, each new
     /// keyframe back-projects its unassociated "close" (`z < threshold`) stereo
     /// keypoints directly into metric map points.
@@ -65,6 +67,31 @@ fn rig_baseline_m(rig: &SensorRig) -> Option<f64> {
         .map(|camera| camera.primary_from_camera.translation.length())
 }
 
+fn stereo_baseline_m(rig: &SensorRig) -> Option<f64> {
+    rig.stereo_baseline_m.or_else(|| rig_baseline_m(rig))
+}
+
+impl LocalBaConfig {
+    /// Solver parameters for a rig whose stereo depth comes from focal length
+    /// times baseline `focal_baseline` (pixel·metres).
+    pub(crate) fn params(&self, focal_baseline: Option<f64>) -> LocalBaParams {
+        let depth_sigma = match self.stereo_depth_sigma {
+            StereoDepthSigma::RelativeDepth(fraction) => DepthSigma::Relative(fraction as f32),
+            // Without a baseline there is no stereo depth to weight.
+            StereoDepthSigma::Disparity { px } => DepthSigma::Disparity {
+                px_over_focal_baseline: focal_baseline.map_or(0.0, |fb| (px / fb) as f32),
+            },
+        };
+        LocalBaParams {
+            active_keyframes: self.active_keyframes,
+            boundary_imu_info_scale: self.boundary_imu_info_scale,
+            boundary_scales_bias_rows: self.boundary_scales_bias_rows,
+            imu_huber: self.imu_huber,
+            depth_sigma,
+        }
+    }
+}
+
 impl SystemConfig {
     /// System settings for a rig returned by [`SensorSelection::select_rig`].
     ///
@@ -79,9 +106,11 @@ impl SystemConfig {
             keyframe_policy: orb.keyframes,
             tracking_loss_recovery: tuning.loss_recovery,
             local_mapping: orb.mapping.execution,
-            stereo_close_depth_m: rig
-                .stereo_baseline_m
-                .or_else(|| rig_baseline_m(rig))
+            local_ba: orb
+                .mapping
+                .local_ba
+                .params(stereo_baseline_m(rig).map(|baseline| rig.camera.fx * baseline)),
+            stereo_close_depth_m: stereo_baseline_m(rig)
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
         }
     }

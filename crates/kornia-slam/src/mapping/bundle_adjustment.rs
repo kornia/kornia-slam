@@ -8,7 +8,7 @@ use crate::mapping::map::{
     ORB_SCALE_FACTOR,
 };
 use crate::mapping::stationary::StationaryFactor;
-use crate::mapping::vi_ba_schur::{RigObservationCamera, ViBaKeyframe};
+use crate::mapping::vi_ba_schur::{ImuHuber, RigObservationCamera, ViBaKeyframe};
 use crate::mapping::wheel_odom::WheelOdomFactor;
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
@@ -26,8 +26,52 @@ pub const STEREO_DEPTH_REL_SIGMA: f32 = 0.05;
 /// points.
 pub const STEREO_DEPTH_MIN_SIGMA: f32 = 0.02;
 
-/// Keyframes a local BA optimizes; older keyframes enter only as fixed poses.
-const MAX_ACTIVE_KFS: usize = 3;
+/// Local BA settings resolved against the rig. The defaults are the
+/// solver's long-standing constants.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LocalBaParams {
+    /// Keyframes a local BA optimizes; older keyframes enter only as fixed poses.
+    pub active_keyframes: usize,
+    /// See [`ViBaParams::boundary_imu_info_scale`](crate::mapping::vi_ba_schur::ViBaParams).
+    pub boundary_imu_info_scale: f64,
+    pub boundary_scales_bias_rows: bool,
+    pub imu_huber: ImuHuber,
+    pub depth_sigma: DepthSigma,
+}
+
+impl Default for LocalBaParams {
+    fn default() -> Self {
+        Self {
+            active_keyframes: 3,
+            boundary_imu_info_scale: 1e-2,
+            boundary_scales_bias_rows: true,
+            imu_huber: ImuHuber::AllEdges,
+            depth_sigma: DepthSigma::Relative(STEREO_DEPTH_REL_SIGMA),
+        }
+    }
+}
+
+/// Standard deviation of a stereo depth measurement `z` (metres), floored at
+/// [`STEREO_DEPTH_MIN_SIGMA`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DepthSigma {
+    /// `fraction · z`.
+    Relative(f32),
+    /// Disparity noise propagated to depth: `z² · px / (f · b)`.
+    Disparity { px_over_focal_baseline: f32 },
+}
+
+impl DepthSigma {
+    fn sigma(self, z: f32) -> f32 {
+        let sigma = match self {
+            Self::Relative(fraction) => fraction * z,
+            Self::Disparity {
+                px_over_focal_baseline,
+            } => px_over_focal_baseline * z * z,
+        };
+        sigma.max(STEREO_DEPTH_MIN_SIGMA)
+    }
+}
 
 /// Write-back guard of [`run_local_inertial_ba`]: an optimized landmark whose
 /// distance from its nearest observer grew by more than this factor...
@@ -59,8 +103,17 @@ pub fn local_window_with_neighbors(
     map: &Map,
     neighbors: impl IntoIterator<Item = (usize, usize)>,
 ) -> BaWindow {
+    local_window_of(map, LocalBaParams::default().active_keyframes, neighbors)
+}
+
+/// [`local_window_with_neighbors`] with `active_keyframes` newest keyframes active.
+pub fn local_window_of(
+    map: &Map,
+    active_keyframes: usize,
+    neighbors: impl IntoIterator<Item = (usize, usize)>,
+) -> BaWindow {
     let keyframes = map.keyframes();
-    let active_start = keyframes.len().saturating_sub(MAX_ACTIVE_KFS);
+    let active_start = keyframes.len().saturating_sub(active_keyframes);
     let active = &keyframes[active_start..];
     let landmark_ids = live_landmarks_of(map, active);
 
@@ -178,6 +231,7 @@ pub fn run_initial_ba(
             .enumerate()
             .map(|(pose_idx, &kf_idx)| (pose_idx, &snapshot.keyframes()[kf_idx], pose_idx == 0)),
         camera,
+        LocalBaParams::default().depth_sigma,
     );
 
     if observations.len() < MIN_OBSERVATIONS {
@@ -246,6 +300,16 @@ pub fn run_initial_ba(
 /// via camera), calls the Schur solver, and returns optimized poses and points.
 /// An early exit returns an unchanged update for the worker to publish normally.
 pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
+    run_local_ba_with(snapshot, camera, &LocalBaParams::default())
+}
+
+/// [`run_local_ba`] with `params`; the snapshot must come from a window of
+/// the same `active_keyframes`.
+pub fn run_local_ba_with(
+    snapshot: BaSnapshot,
+    camera: &PinholeCamera,
+    params: &LocalBaParams,
+) -> BaUpdate {
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
     const MIN_OBSERVATIONS: usize = 8;
@@ -255,7 +319,7 @@ pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
         return update;
     }
 
-    let active_start = n_kfs.saturating_sub(MAX_ACTIVE_KFS);
+    let active_start = n_kfs.saturating_sub(params.active_keyframes);
 
     let window = WindowPoints::collect(snapshot, &snapshot.keyframes()[active_start..], false);
     if window.is_empty() {
@@ -275,6 +339,7 @@ pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
             .enumerate()
             .map(|(kf_idx, kf)| (kf_idx, kf, kf_idx < active_start)),
         camera,
+        params.depth_sigma,
     );
 
     if observations.len() < MIN_OBSERVATIONS {
@@ -328,6 +393,28 @@ pub fn run_local_inertial_ba(
     wheel_factors: &[WheelOdomFactor],
     stationary_factors: &[StationaryFactor],
 ) -> BaUpdate {
+    run_local_inertial_ba_with(
+        snapshot,
+        camera,
+        imu_t_bc,
+        gravity_world,
+        wheel_factors,
+        stationary_factors,
+        &LocalBaParams::default(),
+    )
+}
+
+/// [`run_local_inertial_ba`] with `params`; the snapshot must come from a
+/// window of the same `active_keyframes`.
+pub fn run_local_inertial_ba_with(
+    snapshot: BaSnapshot,
+    camera: &PinholeCamera,
+    imu_t_bc: Option<Pose3d>,
+    gravity_world: Vec3F64,
+    wheel_factors: &[WheelOdomFactor],
+    stationary_factors: &[StationaryFactor],
+    params: &LocalBaParams,
+) -> BaUpdate {
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
     use crate::mapping::vi_ba_schur::{
@@ -341,7 +428,7 @@ pub fn run_local_inertial_ba(
         return update;
     }
 
-    let active_start = n_kfs.saturating_sub(MAX_ACTIVE_KFS);
+    let active_start = n_kfs.saturating_sub(params.active_keyframes);
 
     let window = WindowPoints::collect(snapshot, &snapshot.keyframes()[active_start..], true);
     if window.is_empty() {
@@ -369,6 +456,7 @@ pub fn run_local_inertial_ba(
             .map(|(kf_idx, kf)| (kf_idx, kf, kf_idx < active_start)),
         camera,
         true,
+        params.depth_sigma,
     );
     let rig_views = rig_observation_cameras(snapshot.keyframes());
 
@@ -505,6 +593,9 @@ pub fn run_local_inertial_ba(
             imu_t_bc,
             gravity: gravity_world,
             max_iterations: 50,
+            boundary_imu_info_scale: params.boundary_imu_info_scale,
+            boundary_scales_bias_rows: params.boundary_scales_bias_rows,
+            imu_huber: params.imu_huber,
             rig_views: rig_views.clone(),
             observation_views: observation_views.clone(),
             ..ViBaParams::default()
@@ -699,8 +790,10 @@ impl WindowPoints {
         &self,
         poses: impl IntoIterator<Item = (usize, &'a Keyframe, bool)>,
         camera: &PinholeCamera,
+        depth_sigma: DepthSigma,
     ) -> Vec<BaObservation> {
-        self.observations_with_views(poses, camera, false).0
+        self.observations_with_views(poses, camera, false, depth_sigma)
+            .0
     }
 
     /// Like [`Self::observations`], with every rig camera's observations
@@ -710,6 +803,7 @@ impl WindowPoints {
         poses: impl IntoIterator<Item = (usize, &'a Keyframe, bool)>,
         camera: &PinholeCamera,
         all_cameras: bool,
+        depth_sigma: DepthSigma,
     ) -> (Vec<BaObservation>, Vec<u8>) {
         let mut observations = Vec::new();
         let mut views = Vec::new();
@@ -723,7 +817,7 @@ impl WindowPoints {
                     continue;
                 }
                 if let Some(pixel) = kf.frame.undistorted_xy(desc_idx, camera) {
-                    let (depth_meas, depth_sigma) = stereo_depth_obs(kf, desc_idx);
+                    let (depth_meas, depth_sigma) = stereo_depth_obs(kf, desc_idx, depth_sigma);
                     observations.push(BaObservation {
                         pose_idx,
                         point_idx,
@@ -769,12 +863,9 @@ impl WindowPoints {
 /// Returns `(Some(z), sigma)` when the keyframe's keypoint has a valid stereo
 /// depth (anchoring the BA's metric scale), else `(None, 1.0)` for a pure
 /// reprojection observation.
-fn stereo_depth_obs(kf: &Keyframe, desc_idx: usize) -> (Option<f32>, f32) {
+fn stereo_depth_obs(kf: &Keyframe, desc_idx: usize, depth_sigma: DepthSigma) -> (Option<f32>, f32) {
     match kf.frame.stereo_depth(desc_idx) {
-        Some(z) => (
-            Some(z),
-            (STEREO_DEPTH_REL_SIGMA * z).max(STEREO_DEPTH_MIN_SIGMA),
-        ),
+        Some(z) => (Some(z), depth_sigma.sigma(z)),
         None => (None, 1.0),
     }
 }

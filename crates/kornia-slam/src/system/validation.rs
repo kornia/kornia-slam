@@ -2,9 +2,9 @@ use kornia_imgproc::features::OrbMatchConfig;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    CameraSelection, FrontendConfig, LoopClosingMode, OrbFrontendConfig, OrbSlamPipeline,
-    OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth,
-    SystemConfig,
+    CameraSelection, FrontendConfig, LocalBaConfig, LoopClosingMode, OrbFrontendConfig,
+    OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection,
+    StereoCloseDepth, StereoDepthSigma, SystemConfig,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{LoopClosingConfig, LoopOdometryGate, LoopTemporalConsistency};
@@ -78,6 +78,7 @@ impl OrbSlamPipeline {
             FrontendConfig::Orb(orb) => orb.validate()?,
         }
         validate_keyframes(&self.keyframes, sensors.imu)?;
+        validate_local_ba(&self.mapping.local_ba)?;
         validate_loop_closing(&self.loop_closing, sensors)?;
         validate_tuning(&self.tuning, self.loop_closing.is_enabled())
     }
@@ -131,6 +132,25 @@ fn validate_keyframes(policy: &KeyframePolicy, imu: bool) -> Result<(), ConfigEr
         return Err(ConfigError::UnboundedInertialKeyframes);
     }
     Ok(())
+}
+
+fn validate_local_ba(config: &LocalBaConfig) -> Result<(), ConfigError> {
+    let at = |field| format!("mapping.local_ba.{field}");
+    check(
+        at("active_keyframes"),
+        config.active_keyframes as f64,
+        AT_LEAST_ONE,
+    )?;
+    check(
+        at("boundary_imu_info_scale"),
+        config.boundary_imu_info_scale,
+        NON_NEGATIVE,
+    )?;
+    match config.stereo_depth_sigma {
+        StereoDepthSigma::RelativeDepth(value) | StereoDepthSigma::Disparity { px: value } => {
+            check(at("stereo_depth_sigma"), value, POSITIVE)
+        }
+    }
 }
 
 fn validate_initialization(config: &TwoViewInitConfig) -> Result<(), ConfigError> {
