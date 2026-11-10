@@ -5,6 +5,7 @@ use kornia_3d::pose::Pose3d;
 use crate::frame::Frame;
 use crate::inertial::AlignedTrackingState;
 use crate::initialization::two_view::TwoViewRejectReason;
+use crate::pose_conversion::apply_reference_pose_correction;
 use kornia_algebra::Vec3F64;
 
 /// Status of processing one frame.
@@ -119,6 +120,19 @@ impl SystemState {
         *self.lost_since_sec.get_or_insert(timestamp_sec)
     }
 
+    /// Moves the pose kept for a give-up by a correction that took a reference pose from
+    /// `reference_before` to `reference_after`, as the tracking pose moves with it; otherwise a
+    /// later seed would land in the world before the correction.
+    pub(crate) fn correct_pose_before_loss(
+        &mut self,
+        reference_before: Pose3d,
+        reference_after: Pose3d,
+    ) {
+        if let Some(pose) = self.pose_before_loss.as_mut() {
+            *pose = apply_reference_pose_correction(*pose, reference_before, reference_after);
+        }
+    }
+
     pub(crate) fn mark_tracked(&mut self) {
         self.lost_since_sec = None;
         self.pose_before_loss = None;
@@ -216,6 +230,21 @@ mod tests {
         assert_eq!(state.pose_world_to_cam, at(1.0));
         assert!(state.lost_since_sec.is_none() && state.pose_before_loss.is_none());
         assert!(!state.imu_initialized);
+    }
+
+    /// A correction applied during the grace period (local BA moving the reference keyframe, or
+    /// a loop) moves the kept pose with the tracking pose, so the give-up seed lands in the
+    /// corrected world, not the one before it.
+    #[test]
+    fn a_correction_during_a_loss_moves_the_seed_with_it() {
+        let mut state = SystemState::new();
+        state.mark_lost(10.0, at(1.0));
+        let (reference_before, reference_after) = (at(5.0), at(5.5));
+
+        state.correct_pose_before_loss(reference_before, reference_after);
+        state.reset_after_loss();
+
+        assert!((state.pose_world_to_cam.translation - at(1.5).translation).length() < 1e-12);
     }
 
     #[test]
