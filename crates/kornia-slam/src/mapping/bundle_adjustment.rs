@@ -7,8 +7,13 @@ use crate::mapping::map::{
     BaSnapshot, BaUpdate, BaUpdateError, BaWindow, Keyframe, LocalBaStats, Map, ORB_N_LEVELS,
     ORB_SCALE_FACTOR,
 };
+use crate::mapping::marginalization::{
+    BoundaryPrior, FrozenPoseSigma, MarginalPrior, marginalize_frozen,
+};
 use crate::mapping::stationary::StationaryFactor;
-use crate::mapping::vi_ba_schur::{ImuHuber, RigObservationCamera, ViBaKeyframe, ViBaParams};
+use crate::mapping::vi_ba_schur::{
+    ImuFactor as ViBaImuFactor, ImuHuber, RigObservationCamera, ViBaKeyframe, ViBaParams,
+};
 use crate::mapping::visual_information::VisualInformation;
 use crate::mapping::wheel_odom::WheelOdomFactor;
 use kornia_3d::ba::{BaObservation, BaParams};
@@ -36,6 +41,7 @@ pub struct LocalBaParams {
     /// See [`ViBaParams::boundary_imu_info_scale`](crate::mapping::vi_ba_schur::ViBaParams).
     pub boundary_imu_info_scale: f64,
     pub boundary_scales_bias_rows: bool,
+    pub boundary: BoundaryPrior,
     pub imu_huber: ImuHuber,
     pub depth_sigma: DepthSigma,
     /// Reprojection weighting by keypoint octave. Only VI-BA honours it:
@@ -49,6 +55,7 @@ impl Default for LocalBaParams {
             active_keyframes: 3,
             boundary_imu_info_scale: 1e-2,
             boundary_scales_bias_rows: true,
+            boundary: BoundaryPrior::ScaledEdge,
             imu_huber: ImuHuber::AllEdges,
             depth_sigma: DepthSigma::Relative(STEREO_DEPTH_REL_SIGMA),
             visual_information: VisualInformation::Unit,
@@ -434,7 +441,7 @@ pub fn run_local_inertial_ba_with(
 ) -> BaUpdate {
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
-    use crate::mapping::vi_ba_schur::{ImuFactor as ViBaImuFactor, visual_inertial_bundle_adjust};
+    use crate::mapping::vi_ba_schur::visual_inertial_bundle_adjust;
 
     const MIN_OBSERVATIONS: usize = 8;
 
@@ -601,6 +608,31 @@ pub fn run_local_inertial_ba_with(
     // hitting the default max_iterations=20 cap while still making
     // small, steady progress (final residuals *smaller* than many calls
     // that did converge), not diverging. Give it more room.
+    let mut vi_params = ViBaParams {
+        imu_t_bc,
+        gravity: gravity_world,
+        max_iterations: 50,
+        boundary_imu_info_scale: params.boundary_imu_info_scale,
+        boundary_scales_bias_rows: params.boundary_scales_bias_rows,
+        boundary: params.boundary,
+        imu_huber: params.imu_huber,
+        rig_views: rig_views.clone(),
+        observation_views: observation_views.clone(),
+        observation_sigma_px,
+        ..ViBaParams::default()
+    };
+    let boundary = imu_edges
+        .iter()
+        .find(|e| e.from_idx < active_start && e.to_idx >= active_start);
+    if let (BoundaryPrior::Marginal(sigma), Some(edge)) = (params.boundary, boundary) {
+        vi_params.prior = match carried_prior(snapshot, &vi_keyframes, edge, &vi_params, sigma) {
+            Ok(prior) => Some(prior),
+            Err(reason) => {
+                debug_eprintln!("[vi_ba] PRIOR fallback: {reason}");
+                None
+            }
+        };
+    }
     let vi_result = match visual_inertial_bundle_adjust(
         &vi_keyframes,
         &window.positions,
@@ -609,18 +641,7 @@ pub fn run_local_inertial_ba_with(
         &wheel_edges,
         &stationary_edges,
         camera,
-        &ViBaParams {
-            imu_t_bc,
-            gravity: gravity_world,
-            max_iterations: 50,
-            boundary_imu_info_scale: params.boundary_imu_info_scale,
-            boundary_scales_bias_rows: params.boundary_scales_bias_rows,
-            imu_huber: params.imu_huber,
-            rig_views: rig_views.clone(),
-            observation_views: observation_views.clone(),
-            observation_sigma_px,
-            ..ViBaParams::default()
-        },
+        &vi_params,
     ) {
         Ok(r) => r,
         Err(error) => {
@@ -654,6 +675,16 @@ pub fn run_local_inertial_ba_with(
         );
     }
     window.write_back_where(&vi_result.points, &keep, &mut update.map_points);
+    if let (BoundaryPrior::Marginal(sigma), Some(edge)) = (params.boundary, boundary) {
+        // A solve that fell back starts the chain from its own result.
+        update.next_prior = vi_params.prior.take().or_else(|| {
+            let (from, to) = (edge.from_idx, edge.to_idx);
+            let frozen = &vi_result.keyframes;
+            marginalize_frozen(None, &frozen[from], &frozen[to], edge, &vi_params, sigma)
+                .ok()
+                .map(|prior| stamped(prior, snapshot, to))
+        });
+    }
     update.solve_stats = Some(LocalBaStats {
         initial_cost: vi_result.initial_cost,
         final_cost: vi_result.final_cost,
@@ -666,6 +697,61 @@ pub fn run_local_inertial_ba_with(
         points_rejected,
     });
     update
+}
+
+/// The boundary prior for the window whose boundary IMU edge is `edge`:
+/// the map's prior if it is already on the edge's active keyframe, or moved
+/// onto it by eliminating the edge's frozen keyframe. `Err` says why there
+/// is none, and the solve falls back to the scaled edge.
+fn carried_prior(
+    snapshot: &BaSnapshot,
+    keyframes: &[ViBaKeyframe],
+    edge: &ViBaImuFactor,
+    params: &ViBaParams,
+    sigma: FrozenPoseSigma,
+) -> Result<MarginalPrior, String> {
+    let (from, to) = (edge.from_idx, edge.to_idx);
+    let frame = |slot: usize| snapshot.keyframes()[slot].frame.idx;
+    let stored = snapshot
+        .marginal_prior()
+        .filter(|prior| prior.world_epoch == snapshot.world_epoch())
+        .ok_or("no prior")?;
+    if stored.frame_idx == frame(to) {
+        if stored.is_stale(&keyframes[to]) {
+            return Err(format!("stale on kf {}", stored.frame_idx));
+        }
+        return Ok(stored.clone());
+    }
+    if stored.frame_idx != frame(from) {
+        return Err(format!(
+            "prior on kf {}, boundary {} -> {}",
+            stored.frame_idx,
+            frame(from),
+            frame(to)
+        ));
+    }
+    if stored.is_stale(&keyframes[from]) {
+        return Err(format!("stale on kf {}", stored.frame_idx));
+    }
+    marginalize_frozen(
+        Some(stored),
+        &keyframes[from],
+        &keyframes[to],
+        edge,
+        params,
+        sigma,
+    )
+    .map(|prior| stamped(prior, snapshot, to))
+    .map_err(|e| e.to_string())
+}
+
+/// `prior` as the prior on snapshot slot `slot`, in the snapshot's epoch.
+fn stamped(prior: MarginalPrior, snapshot: &BaSnapshot, slot: usize) -> MarginalPrior {
+    MarginalPrior {
+        frame_idx: snapshot.keyframes()[slot].frame.idx,
+        world_epoch: snapshot.world_epoch(),
+        ..prior
+    }
 }
 
 /// Per window landmark, whether its optimized position may be written back:

@@ -59,6 +59,8 @@ mod keyframe;
 mod map_point;
 mod ops;
 
+use crate::mapping::marginalization::MarginalPrior;
+
 pub use imu_factor::ImuFactor;
 pub use keyframe::Keyframe;
 pub use map_point::{LandmarkObservation, MapPoint, ObservationKey};
@@ -86,6 +88,9 @@ pub struct Map {
     keyframes: Vec<Keyframe>,
     map_points: Vec<MapPoint>,
     imu_factors: Vec<ImuFactor>,
+    /// The local VI-BA's boundary prior, carried from one window to the next;
+    /// valid only in the world epoch it names.
+    marginal_prior: Option<MarginalPrior>,
     // Incremented whenever the map's world coordinate frame changes. Local BA
     // snapshots from an older epoch must never be merged into the new frame.
     world_epoch: u64,

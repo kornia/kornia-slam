@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopClosingConfig;
 use crate::mapping::LocalMappingMode;
+use crate::mapping::marginalization::BoundaryPrior;
 use crate::mapping::vi_ba_schur::ImuHuber;
 use crate::mapping::visual_information::VisualInformation;
 use crate::tracking::pose_estimation::map_projection::{KeyframeObservations, MapProjectionConfig};
@@ -186,6 +187,8 @@ pub struct LocalBaConfig {
     /// Whether that scale also hits the edge's bias random-walk rows
     /// (ORB-SLAM3 leaves them at full weight).
     pub boundary_scales_bias_rows: bool,
+    /// The scaled boundary edge, or a marginal prior in its place.
+    pub boundary: BoundaryPrior,
     pub imu_huber: ImuHuber,
     pub stereo_depth_sigma: StereoDepthSigma,
     /// Reprojection weight by keypoint octave, in VI-BA and in the tracking
@@ -199,6 +202,7 @@ impl Default for LocalBaConfig {
             active_keyframes: 3,
             boundary_imu_info_scale: 1e-2,
             boundary_scales_bias_rows: true,
+            boundary: BoundaryPrior::ScaledEdge,
             imu_huber: ImuHuber::AllEdges,
             stereo_depth_sigma: StereoDepthSigma::default(),
             visual_information: VisualInformation::default(),
@@ -369,7 +373,7 @@ impl fmt::Display for SystemConfig {
             writeln!(
                 f,
                 "  local BA: {} active keyframes, boundary IMU scale {} (bias rows {}), \
-                 IMU Huber {:?}, depth sigma {:?}, visual information {:?}",
+                 boundary {:?}, IMU Huber {:?}, depth sigma {:?}, visual information {:?}",
                 ba.active_keyframes,
                 ba.boundary_imu_info_scale,
                 if ba.boundary_scales_bias_rows {
@@ -377,6 +381,7 @@ impl fmt::Display for SystemConfig {
                 } else {
                     "full"
                 },
+                ba.boundary,
                 ba.imu_huber,
                 ba.stereo_depth_sigma,
                 ba.visual_information,

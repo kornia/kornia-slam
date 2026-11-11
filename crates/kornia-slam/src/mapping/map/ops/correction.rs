@@ -595,8 +595,9 @@ impl Map {
     /// unchanged but valid update is still a successful completion.
     pub fn apply_ba_update(
         &mut self,
-        update: BaUpdate,
+        mut update: BaUpdate,
     ) -> Result<LocalBaMergeResult, BaUpdateError> {
+        let next_prior = update.next_prior.take();
         let snapshot = &update.snapshot;
         if self.world_epoch != snapshot.world_epoch {
             return Err(BaUpdateError::ObsoleteWorldFrame);
@@ -696,6 +697,9 @@ impl Map {
             }) {
                 live.preintegrated = preintegrated.clone();
             }
+        }
+        if next_prior.is_some() {
+            self.marginal_prior = next_prior;
         }
         Ok(result)
     }

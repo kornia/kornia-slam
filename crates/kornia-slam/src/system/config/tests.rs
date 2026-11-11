@@ -7,6 +7,7 @@ use kornia_sensors::SensorRig;
 use super::*;
 use crate::mapping::LocalMappingMode;
 use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
+use crate::mapping::marginalization::{BoundaryPrior, FrozenPoseSigma};
 use crate::mapping::visual_information::VisualInformation;
 use crate::system::ConfigError;
 #[cfg(feature = "serde")]
@@ -285,6 +286,16 @@ fn settings_are_range_checked() {
                 ..LocalBaConfig::default()
             },
             "mapping.local_ba.boundary_imu_info_scale",
+        ),
+        (
+            LocalBaConfig {
+                boundary: BoundaryPrior::Marginal(FrozenPoseSigma {
+                    frozen_pose_sigma_m: 0.0,
+                    ..FrozenPoseSigma::default()
+                }),
+                ..LocalBaConfig::default()
+            },
+            "mapping.local_ba.boundary",
         ),
         (
             LocalBaConfig {
@@ -597,6 +608,21 @@ mod ron_files {
             StereoDepthSigma::Disparity { px: 1.0 }
         );
         assert!(local_ba.boundary_scales_bias_rows);
+        assert_eq!(local_ba.boundary, BoundaryPrior::ScaledEdge);
+
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((mapping: (local_ba: (boundary: Marginal((frozen_pose_sigma_m: 0.002, frozen_pose_sigma_rad: 0.001)))))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).mapping.local_ba.boundary,
+            BoundaryPrior::Marginal(FrozenPoseSigma::default())
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+        assert!(matches!(
+            parse_error("(version: 1, pipeline: OrbSlam((mapping: (local_ba: (boundary: Bogus)))))"),
+            ron::Error::NoSuchEnumVariant { found, .. } if found == "Bogus"
+        ));
     }
 
     /// Tuning is not part of the file format, so a file cannot set it.
