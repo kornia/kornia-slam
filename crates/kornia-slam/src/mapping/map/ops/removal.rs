@@ -268,6 +268,17 @@ impl Map {
         keyframe_idx: usize,
         repair: Option<ImuRepair>,
     ) -> KeyframeRemoval {
+        // The prior's keyframe, or the edge into it, is going away.
+        let prior_touched = self.marginal_prior.as_ref().is_some_and(|prior| {
+            prior.frame_idx == keyframe_idx
+                || self.imu_factors.iter().any(|f| {
+                    (f.prev_kf_idx, f.curr_kf_idx) == (keyframe_idx, prior.frame_idx)
+                        || (f.prev_kf_idx, f.curr_kf_idx) == (prior.frame_idx, keyframe_idx)
+                })
+        });
+        if prior_touched {
+            self.marginal_prior = None;
+        }
         self.keyframes.remove(slot);
 
         let mut removal = KeyframeRemoval {

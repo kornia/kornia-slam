@@ -11,6 +11,7 @@ use crate::loop_closure::{
     LoopClosingConfig, LoopGraphInformation, LoopOdometryGate, LoopTemporalConsistency,
     OdometryRandomWalk,
 };
+use crate::mapping::marginalization::BoundaryPrior;
 use crate::tracking::KeyframePolicy;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
 
@@ -149,6 +150,10 @@ fn validate_local_ba(config: &LocalBaConfig) -> Result<(), ConfigError> {
         config.boundary_imu_info_scale,
         NON_NEGATIVE,
     )?;
+    if let BoundaryPrior::Marginal(sigma) = config.boundary {
+        check(at("boundary"), sigma.frozen_pose_sigma_m, POSITIVE)?;
+        check(at("boundary"), sigma.frozen_pose_sigma_rad, POSITIVE)?;
+    }
     match config.stereo_depth_sigma {
         StereoDepthSigma::RelativeDepth(value) | StereoDepthSigma::Disparity { px: value } => {
             check(at("stereo_depth_sigma"), value, POSITIVE)

@@ -86,6 +86,7 @@ impl LocalBaConfig {
             active_keyframes: self.active_keyframes,
             boundary_imu_info_scale: self.boundary_imu_info_scale,
             boundary_scales_bias_rows: self.boundary_scales_bias_rows,
+            boundary: self.boundary,
             imu_huber: self.imu_huber,
             depth_sigma,
             visual_information: self.visual_information,
