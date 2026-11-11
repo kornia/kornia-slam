@@ -44,6 +44,7 @@ fn keyframe(pose: Pose3d, fixed: bool) -> ViBaKeyframe {
         velocity: Vec3F64::ZERO,
         bias: ImuBias::default(),
         fixed,
+        inertial_fixed: false,
     }
 }
 

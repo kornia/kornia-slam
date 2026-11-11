@@ -28,7 +28,8 @@ use crate::frontend::{FrontendObservation, OrbFrontend};
 use state::{SystemMode, SystemState};
 
 use crate::tracking::{
-    KeyframeEvidence, KeyframePolicy, TrackingLossRecoveryPolicy, median_parallax_px,
+    KeyframeEvidence, KeyframePolicy, KeyframesWhileLost, TrackingLossRecoveryPolicy,
+    median_parallax_px,
 };
 
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
@@ -1067,8 +1068,9 @@ impl SlamSystem {
                 return self.bootstrap_step(frame, timestamp_sec);
             }
             if imu_confident
+                && policy.keyframes_while_lost == KeyframesWhileLost::Enabled
                 && self.keyframe_due_while_lost(timestamp_sec)
-                && self.insert_keyframe(&frame, timestamp_sec, &[])
+                && self.insert_keyframe(&frame, timestamp_sec, &[], true)
             {
                 self.dbg(format!(
                     "[lost] frame={} keyframe inserted at the inertial prediction",
@@ -1223,7 +1225,7 @@ impl SlamSystem {
         if !self.keyframe_due(&evidence, timestamp_sec) {
             return false;
         }
-        self.insert_keyframe(frame, timestamp_sec, matches)
+        self.insert_keyframe(frame, timestamp_sec, matches, false)
     }
 
     /// Publishes `frame` as a keyframe at the current tracking pose and runs
@@ -1233,6 +1235,7 @@ impl SlamSystem {
         frame: &Frame,
         timestamp_sec: f64,
         matches: &[(usize, usize)],
+        while_lost: bool,
     ) -> bool {
         // Guard: reference KF must exist before we can triangulate.
         if let Some(ki) = self.state.current_keyframe_idx {
@@ -1248,6 +1251,7 @@ impl SlamSystem {
             pose_world_to_cam: self.state.pose_world_to_cam,
             ..frame.clone()
         });
+        curr_kf.inserted_while_lost = while_lost;
         // Seed the new keyframe with the IMU-propagated velocity and current bias
         // estimate so that VI-BA starts from a reasonable linearisation point rather
         // than zero, which would produce huge residuals on the newest IMU edge.

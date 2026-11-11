@@ -627,6 +627,7 @@ fn write_back_guard_refuses_landmarks_behind_or_flung() {
         velocity: Vec3F64::ZERO,
         bias: ImuBias::default(),
         fixed: false,
+        inertial_fixed: false,
     };
     let keyframes = [kf(0.0), kf(0.5)];
     let at = |z: f64| Vec3F64::new(0.1, 0.0, z);

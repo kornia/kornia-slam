@@ -49,6 +49,19 @@ pub struct LocalBaParams {
     pub visual_information: VisualInformation,
     /// Bounds a VI-BA result must stay inside to be written back.
     pub state_envelope: StateEnvelope,
+    pub lost_keyframes: LostKeyframes,
+}
+
+/// How VI-BA treats keyframes inserted while tracking was lost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum LostKeyframes {
+    /// Full 15-DOF state, like any other keyframe.
+    #[default]
+    Free,
+    /// Velocity and bias held at the propagated values: with no match to the
+    /// map nothing observes them, and the solve would write back noise.
+    FixedInertial,
 }
 
 impl Default for LocalBaParams {
@@ -62,6 +75,7 @@ impl Default for LocalBaParams {
             depth_sigma: DepthSigma::Relative(STEREO_DEPTH_REL_SIGMA),
             visual_information: VisualInformation::Unit,
             state_envelope: StateEnvelope::Off,
+            lost_keyframes: LostKeyframes::Free,
         }
     }
 }
@@ -471,6 +485,8 @@ pub fn run_local_inertial_ba_with(
             velocity: kf.velocity_world,
             bias: kf.imu_bias,
             fixed: kf_idx < active_start,
+            inertial_fixed: params.lost_keyframes == LostKeyframes::FixedInertial
+                && kf.inserted_while_lost,
         })
         .collect();
 

@@ -148,6 +148,10 @@ pub struct ViBaKeyframe {
     /// If true, pose+velocity+bias are held fixed (gauge anchor; older keyframes
     /// are held fixed ORB-SLAM3‑style — not marginalised).
     pub fixed: bool,
+    /// If true (and not `fixed`), velocity and bias are held at their given
+    /// values and only the pose is optimised: a keyframe with no visual
+    /// constraint leaves them unobservable.
+    pub inertial_fixed: bool,
 }
 
 /// An IMU factor connecting two consecutive keyframes.
@@ -1294,6 +1298,32 @@ fn accumulate_wheel_edges(
     cost
 }
 
+/// Conditions the reduced system on the velocity and bias of every
+/// `inertial_fixed` keyframe: their rows and columns become identity with a
+/// zero right-hand side, so the step leaves them exactly unchanged.
+fn hold_inertial_state(
+    m_mat: &mut Mat<f64>,
+    m_vec: &mut [f64],
+    keyframes: &[ViBaKeyframe],
+    kf_local: &[i64],
+) {
+    const KF_DOF: usize = 15;
+    let dim = m_vec.len();
+    for (kf, &l) in keyframes.iter().zip(kf_local) {
+        if l < 0 || !kf.inertial_fixed {
+            continue;
+        }
+        for d in l as usize * KF_DOF + 6..(l as usize + 1) * KF_DOF {
+            for k in 0..dim {
+                m_mat[(d, k)] = 0.0;
+                m_mat[(k, d)] = 0.0;
+            }
+            m_mat[(d, d)] = 1.0;
+            m_vec[d] = 0.0;
+        }
+    }
+}
+
 /// Normal equations of a 6-row pose-pair residual with `J_j = −J_i`: every
 /// block is `±w JᵀΩJ` and the gradients are `∓w JᵀΩr`, scattered over the
 /// pose DOF (0..6) of each free slot (`l < 0` is a fixed keyframe).
@@ -2023,6 +2053,7 @@ pub fn visual_inertial_bundle_adjust(
             initial_cost = cost_f64;
         }
         let cost = cost_f64 as f32;
+        hold_inertial_state(&mut m_mat, &mut m_vec, keyframes, &kf_local);
 
         // ── 4. LM damping on full 15P system, then Cholesky ──────────────
         // Damping goes on AFTER IMU terms so every diagonal entry sees it.
@@ -2583,6 +2614,7 @@ mod tests {
             velocity: Vec3F64::ZERO,
             bias: ImuBias::default(),
             fixed: false,
+            inertial_fixed: false,
         }];
         let (mut points, mut observations, mut coarse) = (Vec::new(), Vec::new(), Vec::new());
         for ix in -3i32..=3 {
@@ -2682,6 +2714,7 @@ mod tests {
                 velocity: Vec3F64::ZERO,
                 bias: ImuBias::default(),
                 fixed: k == 0,
+                inertial_fixed: false,
             })
             .collect();
         let imu_edges = [

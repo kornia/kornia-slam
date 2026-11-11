@@ -377,6 +377,7 @@ mod tests {
                     velocity: v0 + a * t,
                     bias: ImuBias::default(),
                     fixed: false,
+                    inertial_fixed: false,
                 };
                 let d: [f64; 15] =
                     std::array::from_fn(|i| rng.next() * if i < 6 { 5e-3 } else { 2e-2 });
@@ -518,6 +519,7 @@ mod tests {
                 accel: rng.vec3(1e-1),
             },
             fixed: false,
+            inertial_fixed: false,
         };
         let prior = MarginalPrior {
             frame_idx: 4,

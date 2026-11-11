@@ -651,6 +651,22 @@ mod ron_files {
             StateEnvelope::On(StateEnvelopeLimits::default())
         );
         assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((mapping: (local_ba: (lost_keyframes: FixedInertial)))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).mapping.local_ba.lost_keyframes,
+            LostKeyframes::FixedInertial
+        );
+        assert_eq!(
+            orb(&parse("(version: 1)").unwrap())
+                .mapping
+                .local_ba
+                .lost_keyframes,
+            LostKeyframes::Free
+        );
     }
 
     /// Tuning is not part of the file format, so a file cannot set it.
