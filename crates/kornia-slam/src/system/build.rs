@@ -91,6 +91,7 @@ impl LocalBaConfig {
             depth_sigma,
             visual_information: self.visual_information,
             state_envelope: self.state_envelope,
+            lost_keyframes: self.lost_keyframes,
         }
     }
 }

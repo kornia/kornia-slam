@@ -200,6 +200,16 @@ pub struct TrackingLossRecoveryPolicy {
     /// Seconds between keyframes inserted at the IMU-predicted pose
     /// while coasting.
     pub keyframe_interval_while_lost_sec: f64,
+    /// Whether those keyframes are inserted at all; `Disabled` is for
+    /// attribution runs.
+    pub keyframes_while_lost: KeyframesWhileLost,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KeyframesWhileLost {
+    #[default]
+    Enabled,
+    Disabled,
 }
 
 impl Default for TrackingLossRecoveryPolicy {
@@ -210,6 +220,7 @@ impl Default for TrackingLossRecoveryPolicy {
             timeout_visual_sec: 0.5,
             min_imu_confidence_sec: 2.0,
             keyframe_interval_while_lost_sec: 0.2,
+            keyframes_while_lost: KeyframesWhileLost::Enabled,
         }
     }
 }

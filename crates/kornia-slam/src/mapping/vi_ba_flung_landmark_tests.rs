@@ -73,6 +73,7 @@ fn flung_window() -> (Vec<ViBaKeyframe>, Vec<Vec3F64>, Vec<BaObservation>) {
             velocity: Vec3F64::ZERO,
             bias: ImuBias::default(),
             fixed: k < N_FIXED,
+            inertial_fixed: false,
         })
         .collect();
 
@@ -564,6 +565,7 @@ fn moving_window(outlier: bool) -> (ViBaResult, Vec<Pose3d>, usize) {
             velocity: Vec3F64::ZERO,
             bias: ImuBias::default(),
             fixed: k < 2,
+            inertial_fixed: false,
         })
         .collect();
     let mut observations = Vec::new();
@@ -736,6 +738,7 @@ impl ParkedChain {
                     velocity: Vec3F64::ZERO,
                     bias: ImuBias::default(),
                     fixed: k < N_FIXED,
+                    inertial_fixed: false,
                 }
             })
             .collect();

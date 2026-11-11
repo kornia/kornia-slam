@@ -22,6 +22,7 @@ fn bias_walk_solve(params: &ViBaParams) -> ViBaResult {
             velocity: Vec3F64::ZERO,
             bias: ImuBias::default(),
             fixed: k == 0,
+            inertial_fixed: false,
         })
         .collect();
     let imu_edges = [
@@ -84,6 +85,7 @@ fn level_keyframe(x: f64, speed: f64, fixed: bool) -> ViBaKeyframe {
         velocity: Vec3F64::new(speed, 0.0, 0.0),
         bias: ImuBias::default(),
         fixed,
+        inertial_fixed: false,
     }
 }
 
@@ -224,4 +226,68 @@ fn marginal_prior_holds_the_metric_velocity_against_a_scaled_map() {
         let ratio = kf.velocity.x / SPEED_MPS;
         assert!((ratio - 1.0).abs() < 0.10, "Marginal v {}", kf.velocity.x);
     }
+}
+
+/// A keyframe inserted while lost has no observations, only its IMU edge,
+/// its propagated velocity and a bias 0.01 m/s² off its neighbour's. Free,
+/// the solve rewrites that bias from the one edge; held, velocity and bias
+/// come back bit for bit, and its pose alone keeps the system positive
+/// definite and on the cruise.
+#[test]
+fn an_inertially_fixed_keyframe_keeps_its_velocity_and_bias() {
+    let camera = PinholeCamera {
+        fx: 200.0,
+        fy: 200.0,
+        cx: 320.0,
+        cy: 240.0,
+        k1: 0.0,
+        k2: 0.0,
+        p1: 0.0,
+        p2: 0.0,
+    };
+    let gravity = ViBaParams::default().gravity;
+    let lost = |inertial_fixed: bool| {
+        let mut window: Vec<ViBaKeyframe> = (0..3)
+            .map(|k| level_keyframe(k as f64 * EDGE_S * SPEED_MPS, SPEED_MPS, k == 0))
+            .collect();
+        window[2].bias.accel.y = 0.01;
+        window[2].inertial_fixed = inertial_fixed;
+        window
+    };
+    let imu_edges: Vec<ImuFactor> = (0..2).map(|k| cruise_edge(k, gravity)).collect();
+    let (points, mut observations) = cruise_vision(&lost(false), &camera);
+    observations.retain(|o| o.pose_idx != 2);
+    let solve = |window: &[ViBaKeyframe]| {
+        visual_inertial_bundle_adjust(
+            window,
+            &points,
+            &observations,
+            &imu_edges,
+            &[],
+            &[],
+            &camera,
+            &ViBaParams::default(),
+        )
+    };
+
+    let free = solve(&lost(false)).unwrap();
+    assert!(
+        (free.keyframes[2].bias.accel.y - 0.01).abs() > 1e-3,
+        "free ba_y {}",
+        free.keyframes[2].bias.accel.y
+    );
+
+    let window = lost(true);
+    let held = solve(&window).unwrap();
+    let kf = &held.keyframes[2];
+    assert_eq!(
+        format!("{:?}", (kf.velocity, kf.bias)),
+        format!("{:?}", (window[2].velocity, window[2].bias))
+    );
+    assert!(kf.pose.translation.x.is_finite());
+    assert!(
+        (kf.pose.inverse().translation.x - 2.0 * EDGE_S * SPEED_MPS).abs() < 0.05,
+        "held pose x {}",
+        kf.pose.inverse().translation.x
+    );
 }
