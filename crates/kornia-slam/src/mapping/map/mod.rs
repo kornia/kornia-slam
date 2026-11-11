@@ -67,7 +67,7 @@ pub use ops::{
     BaSnapshot, BaUpdate, BaUpdateError, BaWindow, GraphCorrectionResult, InertialAlignment,
     InertialAlignmentError, KeyframeBaCorrection, KeyframePoseChange, KeyframeVelocity,
     LocalBaMergeResult, LocalBaStats, MapPointMergeResult, PoseGraphCorrectionError,
-    PoseGraphCorrectionResult,
+    PoseGraphCorrectionResult, StateEnvelope, StateEnvelopeLimits,
 };
 pub use ops::{
     InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError, ObservationLink,
