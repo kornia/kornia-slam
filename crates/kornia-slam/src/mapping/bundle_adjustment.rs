@@ -5,7 +5,7 @@
 
 use crate::mapping::map::{
     BaSnapshot, BaUpdate, BaUpdateError, BaWindow, Keyframe, LocalBaStats, Map, ORB_N_LEVELS,
-    ORB_SCALE_FACTOR,
+    ORB_SCALE_FACTOR, StateEnvelope,
 };
 use crate::mapping::marginalization::{
     BoundaryPrior, FrozenPoseSigma, MarginalPrior, marginalize_frozen,
@@ -47,6 +47,8 @@ pub struct LocalBaParams {
     /// Reprojection weighting by keypoint octave. Only VI-BA honours it:
     /// kornia-3d's visual-only solver has no per-observation weight.
     pub visual_information: VisualInformation,
+    /// Bounds a VI-BA result must stay inside to be written back.
+    pub state_envelope: StateEnvelope,
 }
 
 impl Default for LocalBaParams {
@@ -59,6 +61,7 @@ impl Default for LocalBaParams {
             imu_huber: ImuHuber::AllEdges,
             depth_sigma: DepthSigma::Relative(STEREO_DEPTH_REL_SIGMA),
             visual_information: VisualInformation::Unit,
+            state_envelope: StateEnvelope::Off,
         }
     }
 }
@@ -440,6 +443,7 @@ pub fn run_local_inertial_ba_with(
     params: &LocalBaParams,
 ) -> BaUpdate {
     let mut update = snapshot.into_update();
+    update.state_envelope = params.state_envelope;
     let snapshot = &update.snapshot;
     use crate::mapping::vi_ba_schur::visual_inertial_bundle_adjust;
 

@@ -7,6 +7,7 @@ use kornia_sensors::SensorRig;
 use super::*;
 use crate::mapping::LocalMappingMode;
 use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
+use crate::mapping::map::{StateEnvelope, StateEnvelopeLimits};
 use crate::mapping::marginalization::{BoundaryPrior, FrozenPoseSigma};
 use crate::mapping::visual_information::VisualInformation;
 use crate::system::ConfigError;
@@ -296,6 +297,16 @@ fn settings_are_range_checked() {
                 ..LocalBaConfig::default()
             },
             "mapping.local_ba.boundary",
+        ),
+        (
+            LocalBaConfig {
+                state_envelope: StateEnvelope::On(StateEnvelopeLimits {
+                    max_accel_bias: f64::NAN,
+                    ..StateEnvelopeLimits::default()
+                }),
+                ..LocalBaConfig::default()
+            },
+            "mapping.local_ba.state_envelope",
         ),
         (
             LocalBaConfig {
@@ -623,6 +634,23 @@ mod ron_files {
             parse_error("(version: 1, pipeline: OrbSlam((mapping: (local_ba: (boundary: Bogus)))))"),
             ron::Error::NoSuchEnumVariant { found, .. } if found == "Bogus"
         ));
+
+        assert_eq!(
+            orb(&parse("(version: 1)").unwrap())
+                .mapping
+                .local_ba
+                .state_envelope,
+            StateEnvelope::Off
+        );
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((mapping: (local_ba: (state_envelope: On((max_speed_mps: 5.0, max_accel_bias: 0.5, max_gyro_bias: 0.3)))))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).mapping.local_ba.state_envelope,
+            StateEnvelope::On(StateEnvelopeLimits::default())
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
     }
 
     /// Tuning is not part of the file format, so a file cannot set it.

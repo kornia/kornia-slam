@@ -3,6 +3,7 @@
 //! Capture has no window or solver policy: mapping chooses a [`BaWindow`], the
 //! map copies exactly those entities, and correction applies the numeric result.
 
+use super::correction::StateEnvelope;
 use crate::mapping::map::{ImuFactor, Keyframe, Map, MapPoint};
 use crate::mapping::marginalization::MarginalPrior;
 use kornia_3d::pose::Pose3d;
@@ -57,6 +58,8 @@ pub struct BaUpdate {
     /// The boundary prior for the next window; stored only if this update
     /// is applied.
     pub(crate) next_prior: Option<MarginalPrior>,
+    /// Checked by [`Map::apply_ba_update`] before any write.
+    pub(crate) state_envelope: StateEnvelope,
 }
 
 /// What a local solve did, for the caller to log; set by
@@ -162,6 +165,7 @@ impl BaSnapshot {
             snapshot: self,
             solve_stats: None,
             next_prior: None,
+            state_envelope: StateEnvelope::Off,
         }
     }
 }

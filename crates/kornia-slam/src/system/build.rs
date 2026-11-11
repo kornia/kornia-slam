@@ -90,6 +90,7 @@ impl LocalBaConfig {
             imu_huber: self.imu_huber,
             depth_sigma,
             visual_information: self.visual_information,
+            state_envelope: self.state_envelope,
         }
     }
 }

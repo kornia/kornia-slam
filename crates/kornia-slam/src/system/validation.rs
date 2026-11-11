@@ -8,6 +8,7 @@ use super::config::{
 };
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{LoopClosingConfig, LoopOdometryGate, LoopTemporalConsistency};
+use crate::mapping::map::StateEnvelope;
 use crate::mapping::marginalization::BoundaryPrior;
 use crate::tracking::KeyframePolicy;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
@@ -150,6 +151,11 @@ fn validate_local_ba(config: &LocalBaConfig) -> Result<(), ConfigError> {
     if let BoundaryPrior::Marginal(sigma) = config.boundary {
         check(at("boundary"), sigma.frozen_pose_sigma_m, POSITIVE)?;
         check(at("boundary"), sigma.frozen_pose_sigma_rad, POSITIVE)?;
+    }
+    if let StateEnvelope::On(limits) = config.state_envelope {
+        check(at("state_envelope"), limits.max_speed_mps, POSITIVE)?;
+        check(at("state_envelope"), limits.max_accel_bias, POSITIVE)?;
+        check(at("state_envelope"), limits.max_gyro_bias, POSITIVE)?;
     }
     match config.stereo_depth_sigma {
         StereoDepthSigma::RelativeDepth(value) | StereoDepthSigma::Disparity { px: value } => {
