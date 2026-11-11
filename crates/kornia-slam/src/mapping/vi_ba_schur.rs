@@ -2317,9 +2317,18 @@ pub fn visual_inertial_bundle_adjust(
         let fmt = |x: Option<f64>| x.map_or("-".to_string(), |x| format!("{x:.4e}"));
         let sigma_v = p.velocity_mean_and_sigma().map(|(_, s)| s);
         let (bg, ba) = (kfs[i].bias.gyro, kfs[i].bias.accel);
+        // The full vector, world frame: tells a gravity-tilt residual
+        // (horizontal, steady) from a scale one (along the motion).
+        let r_v = |kf: &ViBaKeyframe| {
+            p.velocity_mean_and_sigma()
+                .map_or("-".to_string(), |(mean, _)| {
+                    let r = kf.velocity - mean;
+                    format!("({:.4e},{:.4e},{:.4e})", r.x, r.y, r.z)
+                })
+        };
         debug_eprintln!(
             "[vi_ba] PRIOR kf={}  |r_v| first={} final={}  sigma_v={}  \
-                bg=({:.5},{:.5},{:.5})  ba=({:.4},{:.4},{:.4})",
+                bg=({:.5},{:.5},{:.5})  ba=({:.4},{:.4},{:.4})  r_v first={} final={}",
             p.frame_idx,
             fmt(prior_residual_first),
             fmt(prior_residual_final),
@@ -2330,6 +2339,8 @@ pub fn visual_inertial_bundle_adjust(
             ba.x,
             ba.y,
             ba.z,
+            r_v(&keyframes[i]),
+            r_v(&kfs[i]),
         );
     }
 
