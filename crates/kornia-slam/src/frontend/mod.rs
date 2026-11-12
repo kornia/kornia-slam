@@ -78,6 +78,17 @@ impl OrbFrontend {
         &self.observation
     }
 
+    /// Records a frame tracked by optical flow alone: its tracks stand in
+    /// for keypoints, and nothing was extracted.
+    pub(crate) fn observe_flow(&mut self, tracks_xy: &[[f32; 2]]) {
+        self.observation.keypoints_xy.clear();
+        self.observation.keypoints_xy.extend_from_slice(tracks_xy);
+        self.observation.stereo_matched = None;
+        self.observation.duration = Duration::ZERO;
+        self.observation.orb_per_camera.clear();
+        self.observation.overlap = Duration::ZERO;
+    }
+
     /// Extracts and prepares the features of one validated image, numbering
     /// the frame `idx`. The observation is updated only when preparation
     /// succeeds.
