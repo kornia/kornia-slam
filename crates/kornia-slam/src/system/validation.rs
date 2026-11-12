@@ -102,6 +102,13 @@ impl OrbFrontendConfig {
                 max: *range.end(),
             });
         }
+        if let Some((_, max_iter)) = self.klt_prediction.search() {
+            check(
+                "frontend.klt_prediction.max_iter",
+                max_iter as f64,
+                POSITIVE,
+            )?;
+        }
         if let Some(min_tracks) = self.klt_first.min_tracks() {
             check("frontend.klt_first.min_tracks", min_tracks as f64, POSITIVE)?;
         }

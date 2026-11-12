@@ -27,6 +27,9 @@ struct Args {
     /// frontend design: today (default) or klt-first
     #[argh(option, default = "String::from(\"today\")")]
     mode: String,
+    /// on trusted frames, start LK at the predicted pose over two levels
+    #[argh(switch)]
+    predict: bool,
     /// first traced frame index to replay
     #[argh(option, default = "0")]
     first: usize,
@@ -61,7 +64,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .take(args.count)
         .collect();
     let first = frames.first().ok_or("no traced frame in range")?;
-    let mut pipeline = Pipeline::new(&trace, mode, trace.tracks.get(&first.frame_idx));
+    let mut pipeline = Pipeline::new(
+        &trace,
+        mode,
+        args.predict,
+        trace.tracks.get(&first.frame_idx),
+    );
 
     let mut times = Vec::with_capacity(frames.len());
     let mut stages = std::io::BufWriter::new(std::fs::File::create(args.out.join("stages.csv"))?);

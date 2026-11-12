@@ -15,7 +15,8 @@ use kornia_imgproc::resize::resize_fast_mono;
 use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches};
 use kornia_slam::tracking::TrackingTimings;
 use kornia_slam::tracking::optical_flow::{
-    FlowSurvivor, KltPyramidCache, KltTracker, MapKeypointMatch, TrackSet, snap_unique,
+    FlowPrediction, FlowSurvivor, KltPyramidCache, KltTracker, MapKeypointMatch, TrackSet,
+    snap_unique,
 };
 use kornia_slam::tracking::pose_estimation::pnp::{PnpConfig, solve_pnp};
 
@@ -103,6 +104,8 @@ pub struct StepOutput {
 
 pub struct Pipeline {
     mode: Mode,
+    /// Start LK from the predicted pose on trusted frames (`--predict`).
+    predict: bool,
     detector: OrbDetector,
     stereo: Option<StereoMatchConfig>,
     camera: PinholeCamera,
@@ -154,7 +157,12 @@ struct Features {
 }
 
 impl Pipeline {
-    pub fn new(trace: &Trace, mode: Mode, first_tracks: Option<&Vec<TraceTrack>>) -> Self {
+    pub fn new(
+        trace: &Trace,
+        mode: Mode,
+        predict: bool,
+        first_tracks: Option<&Vec<TraceTrack>>,
+    ) -> Self {
         let primary = &trace.cameras[0];
         let detector = OrbDetector::default();
         let stereo = (trace.n_images() == 2 && trace.cameras.len() == 1).then(|| {
@@ -184,6 +192,7 @@ impl Pipeline {
         }
         Self {
             mode,
+            predict,
             detector,
             stereo,
             camera: primary.camera.clone(),
@@ -204,12 +213,14 @@ impl Pipeline {
     ) -> Result<StepOutput, Box<dyn std::error::Error>> {
         let mut stages = Stages::default();
         let primary = images.first().ok_or("no image")?;
-        let survivors = self.flow(primary, &mut stages);
         let index_of: HashMap<usize, usize> = local
             .iter()
             .enumerate()
             .map(|(i, p)| (p.map_point_idx, i))
             .collect();
+        let initial = (self.predict && frame.trusted_prediction)
+            .then(|| self.predicted_pixels(&frame.candidate_pose, local, &index_of));
+        let survivors = self.flow(primary, initial.as_deref(), &mut stages);
 
         let klt_only = self.mode == Mode::KltFirst && !frame.keyframe && {
             let with_map_point = self
@@ -236,7 +247,43 @@ impl Pipeline {
         Ok(out)
     }
 
-    fn flow(&mut self, current: &Image<u8, 1>, stages: &mut Stages) -> Option<Vec<FlowSurvivor>> {
+    /// The library's motion-predicted start: map point projected at the
+    /// predicted pose plus the track's distortion offset.
+    fn predicted_pixels(
+        &self,
+        pose: &Pose3d,
+        local: &[LocalPoint],
+        index_of: &HashMap<usize, usize>,
+    ) -> Vec<[f32; 2]> {
+        self.tracks
+            .tracks()
+            .iter()
+            .map(|track| {
+                let raw = track.pixel();
+                track
+                    .map_point_idx()
+                    .and_then(|mp| index_of.get(&mp))
+                    .and_then(|&li| {
+                        let p_cam = pose.transform_point(&local[li].position);
+                        self.camera.project_to_pixel(&p_cam, 1e-6)
+                    })
+                    .map_or(raw, |uv| {
+                        let u = self.camera.undistort(raw[0] as f64, raw[1] as f64);
+                        [
+                            (uv.x + raw[0] as f64 - u.x) as f32,
+                            (uv.y + raw[1] as f64 - u.y) as f32,
+                        ]
+                    })
+            })
+            .collect()
+    }
+
+    fn flow(
+        &mut self,
+        current: &Image<u8, 1>,
+        initial: Option<&[[f32; 2]]>,
+        stages: &mut Stages,
+    ) -> Option<Vec<FlowSurvivor>> {
         let previous = self.previous.as_ref()?;
         if self.tracks.is_empty() {
             return None;
@@ -247,6 +294,11 @@ impl Pipeline {
             .track_cached(
                 &mut self.klt_cache,
                 self.tracks.tracks(),
+                initial.map(|initial_pixels| FlowPrediction {
+                    initial_pixels,
+                    max_level: 1,
+                    max_iter: 10,
+                }),
                 previous,
                 current,
                 &mut timings,

@@ -15,9 +15,9 @@ mod validation;
 
 pub use build::BuildError;
 pub use config::{
-    CameraSelection, FrontendConfig, KltFirst, LoopClosingExecution, LoopClosingMode,
-    MappingConfig, OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition,
-    SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth, SystemConfig,
+    CameraSelection, FrontendConfig, KltFirst, KltPrediction, LoopClosingExecution,
+    LoopClosingMode, MappingConfig, OrbFrontendConfig, OrbSlamPipeline, OrbTuning,
+    PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth, SystemConfig,
 };
 #[cfg(feature = "serde")]
 pub use file::LoadError;
@@ -38,7 +38,7 @@ use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_point
 use crate::tracking::motion::{InertialPrediction, predict_pose};
 use crate::tracking::optical_flow::FlowSurvivor;
 use crate::tracking::pose_estimation::Estimate;
-use crate::tracking::tracker::{FrameInput, Tracker};
+use crate::tracking::tracker::{FlowGuess, FrameInput, Tracker};
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -148,6 +148,8 @@ pub struct SlamSystem {
     frame_trace: Option<FrameTrace>,
     // Flow survivors with a map point needed to skip ORB; None: ORB every frame.
     klt_min_tracks: Option<usize>,
+    // Flow search (max_level, max_iter) from a trusted prediction.
+    klt_prediction: Option<(usize, usize)>,
     deferred_extraction: Duration,
     // Number given to the next frame; it becomes the keyframe's id in the map.
     next_frame_idx: usize,
@@ -200,6 +202,7 @@ impl SlamSystem {
             trace_enabled: false,
             frame_trace: None,
             klt_min_tracks: settings.klt_min_tracks,
+            klt_prediction: settings.klt_prediction,
             deferred_extraction: Duration::ZERO,
             next_frame_idx: 0,
         }
@@ -1045,9 +1048,30 @@ impl SlamSystem {
                 self.tracker.tracks(),
             ));
         }
-        let survivors =
-            self.tracker
-                .flow(previous_image, current_image, &mut self.tracking_timings);
+        let survivors = match self.klt_prediction.filter(|_| trusted_prediction) {
+            Some((max_level, max_iter)) => {
+                let map = self.map.lock().unwrap();
+                let guess = FlowGuess {
+                    map: &map,
+                    pose: &candidate_pose,
+                    camera: &self.rig.camera,
+                    max_level,
+                    max_iter,
+                };
+                self.tracker.flow(
+                    previous_image,
+                    current_image,
+                    Some(guess),
+                    &mut self.tracking_timings,
+                )
+            }
+            None => self.tracker.flow(
+                previous_image,
+                current_image,
+                None,
+                &mut self.tracking_timings,
+            ),
+        };
         let estimation = Estimation {
             candidate_pose,
             pose_before,
