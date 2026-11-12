@@ -15,8 +15,8 @@ use kornia_imgproc::resize::resize_fast_mono;
 use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches};
 use kornia_slam::tracking::TrackingTimings;
 use kornia_slam::tracking::optical_flow::{
-    FlowPrediction, FlowSurvivor, KltPyramidCache, KltTracker, MapKeypointMatch, TrackSet,
-    snap_unique,
+    FlowPrediction, FlowSurvivor, KltPyramidCache, KltTracker, LkKernel, MapKeypointMatch,
+    TrackSet, snap_unique,
 };
 use kornia_slam::tracking::pose_estimation::pnp::{PnpConfig, solve_pnp};
 
@@ -90,11 +90,12 @@ fn timed<T>(slot: &mut Duration, f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// ORB budgets: the primary image and every other image.
+/// ORB budgets of the primary and every other image, and the LK kernel.
 #[derive(Clone, Copy)]
 pub struct Keypoints {
     pub primary: usize,
     pub secondary: usize,
+    pub lk_kernel: LkKernel,
 }
 
 pub struct StepOutput {
@@ -214,7 +215,7 @@ impl Pipeline {
             stereo,
             camera: primary.camera.clone(),
             size: primary.size,
-            klt: KltTracker::default(),
+            klt: KltTracker::default().with_kernel(keypoints.lk_kernel),
             klt_cache: KltPyramidCache::new(),
             tracks,
             previous: None,

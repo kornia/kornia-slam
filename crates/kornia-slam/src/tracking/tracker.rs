@@ -17,8 +17,8 @@ use crate::Frame;
 use crate::frame::RigFeatures;
 use crate::mapping::Map;
 use crate::tracking::optical_flow::{
-    FlowPrediction, FlowSurvivor, KltPyramidCache, KltTracker, MapKeypointMatch, Track, TrackId,
-    TrackSet, carry_klt_survivors, snap_unique,
+    FlowPrediction, FlowSurvivor, KltPyramidCache, KltTracker, LkKernel, MapKeypointMatch, Track,
+    TrackId, TrackSet, carry_klt_survivors, snap_unique,
 };
 use crate::tracking::pose_estimation::map_projection::{
     MapProjectionConfig, MapProjectionRejectReason,
@@ -68,6 +68,12 @@ impl Tracker {
             klt_cache: KltPyramidCache::new(),
             track_set: TrackSet::new(),
         }
+    }
+
+    /// Runs optical flow on `kernel`.
+    pub(crate) fn with_lk_kernel(mut self, kernel: LkKernel) -> Self {
+        self.klt_tracker = self.klt_tracker.with_kernel(kernel);
+        self
     }
 
     /// Recovers the pose against one of the candidate keyframes, taking the

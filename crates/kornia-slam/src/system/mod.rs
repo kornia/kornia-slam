@@ -182,7 +182,7 @@ impl SlamSystem {
         let map_publication_gate = local_mapping.publication_gate();
         Self {
             rig,
-            tracker: Tracker::new(settings.map_projection),
+            tracker: Tracker::new(settings.map_projection).with_lk_kernel(settings.klt_kernel),
             two_view_init_config: settings.two_view_init,
             keyframe_policy: settings.keyframe_policy,
             tracking_loss_recovery: settings.tracking_loss_recovery,

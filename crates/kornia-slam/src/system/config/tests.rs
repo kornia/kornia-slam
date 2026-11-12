@@ -10,6 +10,7 @@ use crate::system::ConfigError;
 #[cfg(feature = "serde")]
 use crate::system::LoadError;
 use crate::tracking::KeyframePolicy;
+use crate::tracking::optical_flow::LkKernel;
 
 fn orb_mut(config: &mut SystemConfig) -> &mut OrbSlamPipeline {
     let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
@@ -66,6 +67,7 @@ fn display_describes_the_pipeline() {
             SystemConfig::default(),
             "OrbSlam pipeline (config version 1)
   frontend: ORB, 1000 keypoints
+  klt kernel: fixed-point u8
   klt-first: ORB only when a keyframe is due or fewer than 80 tracks survive
   klt prediction: levels 0..=1, 10 iterations when trusted
   tracking
@@ -77,6 +79,7 @@ fn display_describes_the_pipeline() {
             stereo,
             "OrbSlam pipeline (config version 1)
   frontend: ORB, 1000 keypoints
+  klt kernel: fixed-point u8
   klt-first: ORB only when a keyframe is due or fewer than 80 tracks survive
   klt prediction: levels 0..=1, 10 iterations when trusted
   stereo depth: rectified pair, close within 35 baselines
@@ -89,6 +92,7 @@ fn display_describes_the_pipeline() {
             inertial_loop,
             "OrbSlam pipeline (config version 1)
   frontend: ORB, 1000 keypoints
+  klt kernel: fixed-point u8
   klt-first: ORB only when a keyframe is due or fewer than 80 tracks survive
   klt prediction: levels 0..=1, 10 iterations when trusted
   IMU integration
@@ -102,6 +106,7 @@ fn display_describes_the_pipeline() {
             parallax,
             "OrbSlam pipeline (config version 1)
   frontend: ORB, 1000 keypoints
+  klt kernel: fixed-point u8
   klt-first: ORB only when a keyframe is due or fewer than 80 tracks survive
   klt prediction: levels 0..=1, 10 iterations when trusted
   tracking
@@ -689,6 +694,7 @@ mod ron_files {
             klt_first: KltFirst::Enabled { min_tracks: 120 },
             klt_prediction: KltPrediction::Disabled,
             secondary_n_keypoints: Some(500),
+            klt_kernel: LkKernel::F32,
         });
         settings.keyframes.ref_ratio = 0.75;
         settings.mapping.execution = LocalMappingMode::Synchronous;
@@ -705,6 +711,7 @@ mod ron_files {
                 klt_first: KltFirst::Enabled { min_tracks: 120 },
                 klt_prediction: KltPrediction::Disabled,
                 secondary_n_keypoints: Some(500),
+                klt_kernel: LkKernel::F32,
             })
         );
     }
