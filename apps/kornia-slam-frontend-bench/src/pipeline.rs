@@ -284,13 +284,14 @@ impl Pipeline {
                         let p_cam = pose.transform_point(&local[li].position);
                         self.camera.project_to_pixel(&p_cam, 1e-6)
                     })
-                    .map_or(raw, |uv| {
-                        let u = self.camera.undistort(raw[0] as f64, raw[1] as f64);
-                        [
+                    .and_then(|uv| {
+                        let u = self.camera.undistort(raw[0] as f64, raw[1] as f64)?;
+                        Some([
                             (uv.x + raw[0] as f64 - u.x) as f32,
                             (uv.y + raw[1] as f64 - u.y) as f32,
-                        ]
+                        ])
                     })
+                    .unwrap_or(raw)
             })
             .collect()
     }
@@ -391,8 +392,9 @@ impl Pipeline {
     }
 
     fn undistort(&self, kp: [f32; 2]) -> [f32; 2] {
-        let p = self.camera.undistort(kp[0] as f64, kp[1] as f64);
-        [p.x as f32, p.y as f32]
+        self.camera
+            .undistort(kp[0] as f64, kp[1] as f64)
+            .map_or(kp, |p| [p.x as f32, p.y as f32])
     }
 
     fn full_step(
