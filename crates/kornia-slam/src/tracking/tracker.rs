@@ -13,7 +13,8 @@ use kornia_image::Image;
 use crate::Frame;
 use crate::mapping::Map;
 use crate::tracking::optical_flow::{
-    KltTracker, MapKeypointMatch, Track, TrackSet, carry_klt_survivors, snap_unique,
+    KltPyramidCache, KltTracker, MapKeypointMatch, Track, TrackSet, carry_klt_survivors,
+    snap_unique,
 };
 use crate::tracking::pose_estimation::map_projection::{
     MapProjectionConfig, MapProjectionRejectReason,
@@ -42,6 +43,7 @@ pub(crate) struct FrameInput<'a> {
 pub(crate) struct Tracker {
     estimator: MapProjectionEstimator,
     klt_tracker: KltTracker,
+    klt_cache: KltPyramidCache,
     track_set: TrackSet,
 }
 
@@ -50,6 +52,7 @@ impl Tracker {
         Self {
             estimator: MapProjectionEstimator::new(config),
             klt_tracker: KltTracker::default(),
+            klt_cache: KltPyramidCache::new(),
             track_set: TrackSet::new(),
         }
     }
@@ -114,7 +117,8 @@ impl Tracker {
         } else {
             input.previous_image.and_then(|previous_image| {
                 self.klt_tracker
-                    .track_timed(
+                    .track_cached(
+                        &mut self.klt_cache,
                         self.track_set.tracks(),
                         previous_image,
                         input.current_image,
