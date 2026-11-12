@@ -128,7 +128,12 @@ impl SystemConfig {
                 .params(stereo_baseline_m(rig).map(|baseline| rig.camera.fx * baseline)),
             stereo_close_depth_m: stereo_baseline_m(rig)
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
-            klt_min_tracks: frontend.klt_first.min_tracks(),
+            // A flow-only frame keeps the primary camera alone; on a rig the
+            // other cameras' correspondences are what carry hard segments.
+            klt_min_tracks: frontend
+                .klt_first
+                .min_tracks()
+                .filter(|_| !rig.is_multi_camera()),
             klt_prediction: frontend
                 .klt_prediction
                 .search()
