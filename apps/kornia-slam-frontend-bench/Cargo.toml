@@ -1,0 +1,25 @@
+[package]
+name = "kornia-slam-frontend-bench"
+publish = false
+description = "Replays a kornia-slam --trace-out recording through the visual frontend and times each frame"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "kornia-slam-frontend-bench"
+path = "src/main.rs"
+
+[dependencies]
+argh = "0.1"
+kornia-slam.workspace = true
+kornia-3d.workspace = true
+kornia-algebra.workspace = true
+kornia-image.workspace = true
+kornia-imgproc.workspace = true
+libc = "0.2"
+thiserror = "2"

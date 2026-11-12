@@ -6142,6 +6142,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kornia-slam-frontend-bench"
+version = "0.2.0"
+dependencies = [
+ "argh",
+ "kornia-3d",
+ "kornia-algebra",
+ "kornia-image",
+ "kornia-imgproc",
+ "kornia-slam",
+ "libc",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "kornia-tensor"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
