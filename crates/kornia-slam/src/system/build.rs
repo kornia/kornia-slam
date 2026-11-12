@@ -42,6 +42,9 @@ pub(crate) struct SystemSettings {
     /// Flow survivors with a map point needed to track without ORB; `None`
     /// extracts ORB on every frame.
     pub klt_min_tracks: Option<usize>,
+    /// `(max_level, max_iter)` of the optical-flow search from a trusted
+    /// prediction; `None` keeps the full search.
+    pub klt_prediction: Option<(usize, usize)>,
 }
 
 impl SensorSelection {
@@ -126,6 +129,10 @@ impl SystemConfig {
             stereo_close_depth_m: stereo_baseline_m(rig)
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
             klt_min_tracks: frontend.klt_first.min_tracks(),
+            klt_prediction: frontend
+                .klt_prediction
+                .search()
+                .filter(|_| rig.fisheye.is_none()),
         }
     }
 
