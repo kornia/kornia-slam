@@ -297,9 +297,11 @@ pub(crate) fn refine_pose(
         cy: k.z_axis().y as f64,
         loss,
     };
-    // The generic solver starts from the start rotation's quaternion, which
-    // projects a not-quite-orthonormal prediction back onto SO(3).
-    let rotation = SO3F32::from_matrix(rotation).matrix();
+    // The generic solver starts from the start rotation's unit quaternion,
+    // which projects a not-quite-orthonormal prediction back onto SO(3).
+    // The quaternion of a scaled matrix is not unit: normalize it, or the
+    // scale survives into the result and compounds through the motion model.
+    let rotation = SO3F32::from_quaternion(SO3F32::from_matrix(rotation).q.normalize()).matrix();
     let columns = [rotation.x_axis(), rotation.y_axis(), rotation.z_axis()].map(|c| c.to_array());
     let mut pose = Pose {
         r: std::array::from_fn(|i| std::array::from_fn(|j| columns[j][i] as f64)),
@@ -500,12 +502,16 @@ mod tests {
     #[test]
     fn a_scaled_start_rotation_is_projected_onto_so3_like_the_generic_solver() {
         let (world, image, k, truth) = scene(false);
-        // A prediction that drifted off SO(3): the identity scaled by 1.1.
-        let scaled = Mat3AF32::from_cols(
-            Vec3AF32::new(1.1, 0.0, 0.0),
-            Vec3AF32::new(0.0, 1.1, 0.0),
-            Vec3AF32::new(0.0, 0.0, 1.1),
-        );
+        // A prediction that drifted off SO(3): a rotation scaled by 0.9.
+        let rotation = so3_exp([0.03, -0.01, 0.02]);
+        let col = |j: usize| {
+            Vec3AF32::new(
+                0.9 * rotation[0][j] as f32,
+                0.9 * rotation[1][j] as f32,
+                0.9 * rotation[2][j] as f32,
+            )
+        };
+        let scaled = Mat3AF32::from_cols(col(0), col(1), col(2));
         let refined = refine_pose(&world, &image, &k, &scaled, &Vec3AF32::ZERO, &params()).unwrap();
         let t = refined.translation;
         assert!((t.x as f64 - truth.t[0]).abs() < 1e-4);
