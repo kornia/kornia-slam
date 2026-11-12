@@ -775,8 +775,9 @@ fn undistorted_keypoints(frame: &Frame, camera: &PinholeCamera) -> Vec<[f32; 2]>
             .keypoints_xy
             .iter()
             .map(|kp| {
-                let p = camera.undistort(kp[0] as f64, kp[1] as f64);
-                [p.x as f32, p.y as f32]
+                camera
+                    .undistort(kp[0] as f64, kp[1] as f64)
+                    .map_or(*kp, |p| [p.x as f32, p.y as f32])
             })
             .collect()
     }

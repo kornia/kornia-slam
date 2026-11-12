@@ -6,7 +6,7 @@ mod overlap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kornia_3d::camera::{FisheyeCamera, PinholeCamera};
+use kornia_3d::camera::{CameraModel, FisheyeCamera, PinholeCamera};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec2F64;
 use kornia_image::{Image, ImageError, ImageSize, InterpolationMode};
@@ -309,7 +309,9 @@ impl FisheyeMapping {
 
         for i in 0..n {
             let [u, v] = features.keypoints_xy[i];
-            let bearing = self.fisheye.unproject(&Vec2F64::new(u as f64, v as f64));
+            let Some(bearing) = self.fisheye.unproject(&Vec2F64::new(u as f64, v as f64)) else {
+                continue;
+            };
             if bearing.z <= self.min_bearing_z {
                 continue;
             }

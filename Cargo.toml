@@ -35,3 +35,14 @@ inherits = "release"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Frontend kernels that match and beat OpenCV (kornia-rs #1324, on top of
+# #1303/#1319): branch-only until a kornia-imgproc release carries them.
+[patch.crates-io]
+kornia-3d = { git = "https://github.com/edgarriba/kornia-rs", rev = "6df7860ff2934a1e24df038e1fe5df4e4e617285" }
+kornia-algebra = { git = "https://github.com/edgarriba/kornia-rs", rev = "6df7860ff2934a1e24df038e1fe5df4e4e617285" }
+kornia-bow = { git = "https://github.com/edgarriba/kornia-rs", rev = "6df7860ff2934a1e24df038e1fe5df4e4e617285" }
+kornia-image = { git = "https://github.com/edgarriba/kornia-rs", rev = "6df7860ff2934a1e24df038e1fe5df4e4e617285" }
+kornia-imgproc = { git = "https://github.com/edgarriba/kornia-rs", rev = "6df7860ff2934a1e24df038e1fe5df4e4e617285" }
+kornia-io = { git = "https://github.com/edgarriba/kornia-rs", rev = "6df7860ff2934a1e24df038e1fe5df4e4e617285" }
+kornia-tensor = { git = "https://github.com/edgarriba/kornia-rs", rev = "6df7860ff2934a1e24df038e1fe5df4e4e617285" }

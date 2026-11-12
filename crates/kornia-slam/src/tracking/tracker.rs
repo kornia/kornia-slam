@@ -159,13 +159,14 @@ impl Tracker {
                         let p_cam = guess.pose.transform_point(&mp.position);
                         guess.camera.project_to_pixel(&p_cam, 1e-6)
                     })
-                    .map_or(raw, |uv| {
-                        let undistorted = guess.camera.undistort(raw[0] as f64, raw[1] as f64);
-                        [
+                    .and_then(|uv| {
+                        let undistorted = guess.camera.undistort(raw[0] as f64, raw[1] as f64)?;
+                        Some([
                             (uv.x + raw[0] as f64 - undistorted.x) as f32,
                             (uv.y + raw[1] as f64 - undistorted.y) as f32,
-                        ]
+                        ])
                     })
+                    .unwrap_or(raw)
             })
             .collect()
     }
