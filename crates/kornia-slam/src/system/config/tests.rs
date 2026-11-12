@@ -66,6 +66,7 @@ fn display_describes_the_pipeline() {
             SystemConfig::default(),
             "OrbSlam pipeline (config version 1)
   frontend: ORB, 1000 keypoints
+  klt-first: ORB only when a keyframe is due or fewer than 80 tracks survive
   tracking
   keyframes: every 3..=8 frames, ref ratio 0.6
   local mapping: asynchronous
@@ -75,6 +76,7 @@ fn display_describes_the_pipeline() {
             stereo,
             "OrbSlam pipeline (config version 1)
   frontend: ORB, 1000 keypoints
+  klt-first: ORB only when a keyframe is due or fewer than 80 tracks survive
   stereo depth: rectified pair, close within 35 baselines
   tracking
   keyframes: every 3..=8 frames, ref ratio 0.6
@@ -85,6 +87,7 @@ fn display_describes_the_pipeline() {
             inertial_loop,
             "OrbSlam pipeline (config version 1)
   frontend: ORB, 1000 keypoints
+  klt-first: ORB only when a keyframe is due or fewer than 80 tracks survive
   IMU integration
   tracking
   keyframes: every 3..=8 frames, ref ratio 0.6
@@ -96,6 +99,7 @@ fn display_describes_the_pipeline() {
             parallax,
             "OrbSlam pipeline (config version 1)
   frontend: ORB, 1000 keypoints
+  klt-first: ORB only when a keyframe is due or fewer than 80 tracks survive
   tracking
   keyframes: every 3..=unbounded frames, ref ratio 0.6, parallax 10 px
   local mapping: asynchronous
@@ -678,6 +682,7 @@ mod ron_files {
         settings.frontend = FrontendConfig::Orb(OrbFrontendConfig {
             n_keypoints: 2000,
             stereo_close_depth: StereoCloseDepth::Metres(4.0),
+            klt_first: KltFirst::Enabled { min_tracks: 120 },
         });
         settings.keyframes.ref_ratio = 0.75;
         settings.mapping.execution = LocalMappingMode::Synchronous;
@@ -691,6 +696,7 @@ mod ron_files {
             FrontendConfig::Orb(OrbFrontendConfig {
                 n_keypoints: 2000,
                 stereo_close_depth: StereoCloseDepth::Metres(4.0),
+                klt_first: KltFirst::Enabled { min_tracks: 120 },
             })
         );
     }

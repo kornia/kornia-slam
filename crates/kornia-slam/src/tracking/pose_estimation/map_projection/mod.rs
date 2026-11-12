@@ -367,6 +367,53 @@ impl MapProjectionEstimator {
         try_track_and_refine(ref_correspondences, pose_before_tracking)
     }
 
+    /// Pose of `frame` from `seeded` `(map point, keypoint)` pairs alone:
+    /// the consistency filter against the reference keyframe, then PnP from
+    /// `candidate_pose`. No projection search or local refinement runs, so
+    /// `frame` needs no descriptors of its own. Accepts at `min_inliers`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn estimate_from_seeds(
+        &self,
+        frame: &Frame,
+        candidate_pose: &Pose3d,
+        map: &Map,
+        camera: &PinholeCamera,
+        current_keyframe_idx: Option<usize>,
+        search_scale: f32,
+        seeded: Vec<(usize, usize)>,
+        timings: &mut TrackingTimings,
+    ) -> Result<Estimate, MapProjectionRejectReason> {
+        let pnp = &self.config.pnp;
+        if seeded.len() < pnp.min_correspondences {
+            return Err(MapProjectionRejectReason::LowProjectionMatches);
+        }
+        let current_kf = current_keyframe_idx.and_then(|ki| map.get_keyframe(ki));
+        let keypoints_undist = undistorted_keypoints(frame, camera);
+        let grids = view_grids(frame, &keypoints_undist, camera);
+        let matches = timed(&mut timings.consistency_filter, || {
+            self.geometric_consistency_filter(current_kf, &seeded, frame, &keypoints_undist, camera)
+        });
+        let (pose, inliers) = timed(&mut timings.pnp, || {
+            self.solve_pnp(
+                map.map_points(),
+                &matches,
+                &keypoints_undist,
+                &grids,
+                candidate_pose,
+                search_scale,
+            )
+        })
+        .ok_or(MapProjectionRejectReason::PnpFailed)?;
+        if inliers < pnp.min_inliers {
+            return Err(MapProjectionRejectReason::LowPnpInliers);
+        }
+        Ok(Estimate {
+            pose,
+            inliers,
+            matches,
+        })
+    }
+
     fn eligible_pre_seeded(
         pre_seeded: Option<Vec<(usize, usize)>>,
         min_correspondences: usize,
@@ -583,23 +630,7 @@ impl MapProjectionEstimator {
     ) -> FrameMatches {
         const MIN_MATCHES_BEFORE_WIDE: usize = 20;
 
-        // Use the frame's undistortion cache when filled (the pipeline fills
-        // it once per frame); only frames built outside the pipeline pay the
-        // per-keypoint undistortion here.
-        let keypoints_undist: Vec<[f32; 2]> =
-            if frame.keypoints_undist.len() == frame.features.keypoints_xy.len() {
-                frame.keypoints_undist.clone()
-            } else {
-                frame
-                    .features
-                    .keypoints_xy
-                    .iter()
-                    .map(|kp| {
-                        let p = camera.undistort(kp[0] as f64, kp[1] as f64);
-                        [p.x as f32, p.y as f32]
-                    })
-                    .collect()
-            };
+        let keypoints_undist = undistorted_keypoints(frame, camera);
 
         let grids = view_grids(frame, &keypoints_undist, camera);
 
@@ -729,6 +760,25 @@ impl MapProjectionEstimator {
         }
 
         matches
+    }
+}
+
+/// The frame's undistortion cache when filled (the pipeline fills it once
+/// per frame); only frames built outside the pipeline pay the per-keypoint
+/// undistortion here.
+fn undistorted_keypoints(frame: &Frame, camera: &PinholeCamera) -> Vec<[f32; 2]> {
+    if frame.keypoints_undist.len() == frame.features.keypoints_xy.len() {
+        frame.keypoints_undist.clone()
+    } else {
+        frame
+            .features
+            .keypoints_xy
+            .iter()
+            .map(|kp| {
+                let p = camera.undistort(kp[0] as f64, kp[1] as f64);
+                [p.x as f32, p.y as f32]
+            })
+            .collect()
     }
 }
 

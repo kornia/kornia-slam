@@ -6,15 +6,19 @@
 //! each frame; the tracker reports an estimate or a rejection and keeps the
 //! track set consistent with whichever happened.
 
+use std::collections::HashMap;
+
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-use kornia_image::Image;
+use kornia_image::{Image, ImageSize};
+use kornia_imgproc::features::OrbFeatures;
 
 use crate::Frame;
+use crate::frame::RigFeatures;
 use crate::mapping::Map;
 use crate::tracking::optical_flow::{
-    KltPyramidCache, KltTracker, MapKeypointMatch, Track, TrackSet, carry_klt_survivors,
-    snap_unique,
+    FlowSurvivor, KltPyramidCache, KltTracker, MapKeypointMatch, Track, TrackId, TrackSet,
+    carry_klt_survivors, snap_unique,
 };
 use crate::tracking::pose_estimation::map_projection::{
     MapProjectionConfig, MapProjectionRejectReason,
@@ -26,8 +30,6 @@ use crate::tracking::timings::TrackingTimings;
 /// Everything the tracker needs about the current frame that it does not own.
 pub(crate) struct FrameInput<'a> {
     pub frame: &'a Frame,
-    pub previous_image: Option<&'a Image<u8, 1>>,
-    pub current_image: &'a Image<u8, 1>,
     /// Pose predicted by the motion model, used to seed the projection search.
     pub candidate_pose: Pose3d,
     /// Pose at the end of the previous frame.
@@ -94,8 +96,141 @@ impl Tracker {
         self.track_set = TrackSet::new();
     }
 
+    /// Follows the tracks from `previous` into `current` by optical flow;
+    /// `None` without tracks, a previous image, or a flow solution.
+    pub(crate) fn flow(
+        &mut self,
+        previous: Option<&Image<u8, 1>>,
+        current: &Image<u8, 1>,
+        timings: &mut TrackingTimings,
+    ) -> Option<Vec<FlowSurvivor>> {
+        if self.track_set.is_empty() {
+            return None;
+        }
+        self.klt_tracker
+            .track_cached(
+                &mut self.klt_cache,
+                self.track_set.tracks(),
+                previous?,
+                current,
+                timings,
+            )
+            .ok()
+    }
+
+    /// A frame made of the survivors that carry a map point: each keypoint
+    /// is the survivor's pixel with its map point's descriptor, primary
+    /// camera only. Returns it with the `(map point, keypoint)` seeds, or
+    /// `None` when fewer than `min_tracks` survivors carry a map point.
+    pub(crate) fn flow_frame(
+        &self,
+        idx: usize,
+        survivors: &[FlowSurvivor],
+        map: &Map,
+        image_size: ImageSize,
+        min_tracks: usize,
+    ) -> Option<(Frame, Vec<(usize, usize)>)> {
+        let map_points: HashMap<TrackId, usize> = self
+            .track_set
+            .tracks()
+            .iter()
+            .filter_map(|track| Some((track.id(), track.map_point_idx()?)))
+            .collect();
+        let mut features = OrbFeatures {
+            keypoints_xy: Vec::with_capacity(survivors.len()),
+            orientations: Vec::with_capacity(survivors.len()),
+            descriptors: Vec::with_capacity(survivors.len()),
+            octaves: Vec::with_capacity(survivors.len()),
+        };
+        let mut seeded = Vec::with_capacity(survivors.len());
+        for survivor in survivors {
+            let Some(&mp_idx) = map_points.get(&survivor.track_id) else {
+                continue;
+            };
+            let Some(mp) = map.map_points().get(mp_idx).filter(|mp| !mp.culled) else {
+                continue;
+            };
+            seeded.push((mp_idx, features.keypoints_xy.len()));
+            features.keypoints_xy.push(survivor.pixel);
+            features.orientations.push(0.0);
+            features.descriptors.push(mp.descriptor);
+            features.octaves.push(0);
+        }
+        if seeded.len() < min_tracks {
+            return None;
+        }
+        let n = seeded.len();
+        let frame = Frame {
+            idx,
+            features,
+            pose_world_to_cam: Pose3d::IDENTITY,
+            image_size,
+            keypoint_colors: vec![[0; 3]; n],
+            u_right: Vec::new(),
+            depth: Vec::new(),
+            keypoints_undist: Vec::new(),
+            rig: RigFeatures::default(),
+        };
+        Some((frame, seeded))
+    }
+
+    /// The pose of a [`Self::flow_frame`] from its seeds alone: consistency
+    /// filter and PnP, no projection search or refinement. The track set is
+    /// left untouched; [`Self::accept_flow_only`] commits it.
+    pub(crate) fn estimate_flow_only(
+        &self,
+        input: FrameInput<'_>,
+        seeded: Vec<(usize, usize)>,
+        map: &Map,
+        camera: &PinholeCamera,
+        timings: &mut TrackingTimings,
+    ) -> Result<Estimate, MapProjectionRejectReason> {
+        let search_scale = self
+            .estimator
+            .config()
+            .search_scale_for(input.lost_for_sec, input.trusted_prediction);
+        let estimate = self.estimator.estimate_from_seeds(
+            input.frame,
+            &input.candidate_pose,
+            map,
+            camera,
+            input.current_keyframe_idx,
+            search_scale,
+            seeded,
+            timings,
+        )?;
+        let min_inliers = self.estimator.config().min_inliers_with_prediction;
+        if input.trusted_prediction && estimate.inliers < min_inliers {
+            return Err(MapProjectionRejectReason::LowPnpInliers);
+        }
+        Ok(estimate)
+    }
+
+    /// Advances the tracks onto an accepted flow-only estimate of `frame`.
+    pub(crate) fn accept_flow_only(&mut self, estimate: &Estimate, frame: &Frame) {
+        self.reconcile(&estimate.matches, &frame.features.keypoints_xy);
+    }
+
+    fn reconcile(&mut self, matches: &[(usize, usize)], primary_keypoints: &[[f32; 2]]) {
+        let track_matches: Vec<MapKeypointMatch> = matches
+            .iter()
+            .filter(|&&(_, keypoint_idx)| keypoint_idx < primary_keypoints.len())
+            .map(|&(map_point_idx, keypoint_idx)| MapKeypointMatch {
+                map_point_idx,
+                keypoint_idx,
+            })
+            .collect();
+        if self
+            .track_set
+            .reconcile_from_matches(&track_matches, primary_keypoints)
+            .is_err()
+        {
+            self.track_set = TrackSet::new();
+        }
+    }
+
     /// Estimates this frame's pose against the map, seeding the projection
-    /// search from optical flow where tracks survived.
+    /// search from the flow `klt_survivors` of [`Self::flow`].
     ///
     /// The track set is left consistent either way: reconciled against the
     /// accepted matches on success, advanced onto the flow survivors on
@@ -103,6 +238,7 @@ impl Tracker {
     pub(crate) fn estimate(
         &mut self,
         input: FrameInput<'_>,
+        klt_survivors: Option<Vec<FlowSurvivor>>,
         map: &Map,
         camera: &PinholeCamera,
         timings: &mut TrackingTimings,
@@ -112,21 +248,6 @@ impl Tracker {
             .config()
             .search_scale_for(input.lost_for_sec, input.trusted_prediction);
 
-        let klt_survivors = if self.track_set.is_empty() {
-            None
-        } else {
-            input.previous_image.and_then(|previous_image| {
-                self.klt_tracker
-                    .track_cached(
-                        &mut self.klt_cache,
-                        self.track_set.tracks(),
-                        previous_image,
-                        input.current_image,
-                        timings,
-                    )
-                    .ok()
-            })
-        };
         // Optical flow follows the primary camera only; its keypoints come first.
         let primary_keypoints = &input.frame.features.keypoints_xy[input.frame.camera_range(0)];
         let pre_seeded = klt_survivors
@@ -167,22 +288,7 @@ impl Tracker {
 
         match result {
             Ok(estimate) => {
-                let track_matches: Vec<MapKeypointMatch> = estimate
-                    .matches
-                    .iter()
-                    .filter(|&&(_, keypoint_idx)| keypoint_idx < primary_keypoints.len())
-                    .map(|&(map_point_idx, keypoint_idx)| MapKeypointMatch {
-                        map_point_idx,
-                        keypoint_idx,
-                    })
-                    .collect();
-                if self
-                    .track_set
-                    .reconcile_from_matches(&track_matches, primary_keypoints)
-                    .is_err()
-                {
-                    self.track_set = TrackSet::new();
-                }
+                self.reconcile(&estimate.matches, primary_keypoints);
                 Ok(estimate)
             }
             Err(reason) => {
@@ -190,5 +296,106 @@ impl Tracker {
                 Err(reason)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kornia_algebra::Vec3F64;
+
+    use super::*;
+    use crate::mapping::map::tests::test_frame;
+    use crate::mapping::map::{Keyframe, LandmarkSeed, ObservationKey};
+
+    /// A tracker whose tracks follow `n` map points, each with a distinct
+    /// descriptor, plus one track without a map point.
+    fn tracked_map(n: usize) -> (Tracker, Map) {
+        let descriptors: Vec<[u8; 32]> = (0..n).map(|i| [i as u8; 32]).collect();
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, descriptors)))
+            .unwrap();
+        let mut tracker = Tracker::new(MapProjectionConfig::default());
+        let mut matches = Vec::new();
+        let mut keypoints = Vec::new();
+        for feature in 0..n {
+            let id = map
+                .insert_landmark(LandmarkSeed {
+                    position: Vec3F64::new(0.0, 0.0, 4.0),
+                    color: [0; 3],
+                    reference: ObservationKey {
+                        keyframe_idx: 0,
+                        feature_idx: feature,
+                    },
+                })
+                .unwrap();
+            matches.push(MapKeypointMatch {
+                map_point_idx: id,
+                keypoint_idx: feature,
+            });
+            keypoints.push([10.0 + feature as f32, 20.0]);
+        }
+        tracker
+            .track_set
+            .reconcile_from_matches(&matches, &keypoints)
+            .unwrap();
+        tracker.track_set.spawn([5.0, 5.0]);
+        (tracker, map)
+    }
+
+    fn survivors_of(tracker: &Tracker) -> Vec<FlowSurvivor> {
+        tracker
+            .tracks()
+            .iter()
+            .map(|track| FlowSurvivor {
+                track_id: track.id(),
+                pixel: [track.pixel()[0] + 1.0, track.pixel()[1]],
+                error: 0.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn flow_frame_carries_the_map_point_descriptors() {
+        let (tracker, map) = tracked_map(5);
+        let survivors = survivors_of(&tracker);
+        let size = ImageSize {
+            width: 640,
+            height: 480,
+        };
+
+        let (frame, seeded) = tracker.flow_frame(7, &survivors, &map, size, 5).unwrap();
+
+        assert_eq!(frame.idx, 7);
+        assert_eq!(seeded.len(), 5);
+        assert_eq!(frame.features.keypoints_xy.len(), 5);
+        for &(mp_idx, kp_idx) in &seeded {
+            assert_eq!(
+                frame.features.descriptors[kp_idx],
+                map.map_points()[mp_idx].descriptor
+            );
+            let track = tracker
+                .tracks()
+                .iter()
+                .find(|t| t.map_point_idx() == Some(mp_idx))
+                .unwrap();
+            assert_eq!(
+                frame.features.keypoints_xy[kp_idx],
+                [track.pixel()[0] + 1.0, track.pixel()[1]]
+            );
+        }
+        assert!(!frame.is_rig() && !frame.is_stereo());
+    }
+
+    #[test]
+    fn flow_frame_needs_min_tracks_with_a_map_point() {
+        let (tracker, map) = tracked_map(5);
+        let survivors = survivors_of(&tracker);
+        let size = ImageSize {
+            width: 640,
+            height: 480,
+        };
+
+        // Six survivors, but only five carry a map point.
+        assert!(tracker.flow_frame(0, &survivors, &map, size, 6).is_none());
     }
 }

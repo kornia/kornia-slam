@@ -37,6 +37,9 @@ pub(crate) struct SystemSettings {
     /// keyframe back-projects its unassociated "close" (`z < threshold`) stereo
     /// keypoints directly into metric map points.
     pub stereo_close_depth_m: Option<f64>,
+    /// Flow survivors with a map point needed to track without ORB; `None`
+    /// extracts ORB on every frame.
+    pub klt_min_tracks: Option<usize>,
 }
 
 impl SensorSelection {
@@ -83,6 +86,7 @@ impl SystemConfig {
                 .stereo_baseline_m
                 .or_else(|| rig_baseline_m(rig))
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
+            klt_min_tracks: frontend.klt_first.min_tracks(),
         }
     }
 

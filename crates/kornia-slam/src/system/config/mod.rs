@@ -111,6 +111,38 @@ pub struct OrbFrontendConfig {
     /// Stereo keypoints closer than this are back-projected directly into map
     /// points at each keyframe. Unused without stereo cameras.
     pub stereo_close_depth: StereoCloseDepth,
+    /// Whether frames between keyframes are tracked by optical flow alone,
+    /// extracting ORB only when the flow cannot carry the frame.
+    pub klt_first: KltFirst,
+}
+
+/// Optical-flow-first tracking: a frame is tracked from its flow survivors
+/// alone, without ORB, unless a keyframe is due, the flow-only pose is
+/// refused, or fewer than `min_tracks` survivors carry a map point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum KltFirst {
+    /// ORB on every frame.
+    Disabled,
+    Enabled {
+        min_tracks: usize,
+    },
+}
+
+impl Default for KltFirst {
+    fn default() -> Self {
+        Self::Enabled { min_tracks: 80 }
+    }
+}
+
+impl KltFirst {
+    /// The survivor floor, or `None` when disabled.
+    pub fn min_tracks(self) -> Option<usize> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled { min_tracks } => Some(min_tracks),
+        }
+    }
 }
 
 impl OrbFrontendConfig {
@@ -123,6 +155,7 @@ impl Default for OrbFrontendConfig {
         Self {
             n_keypoints: 1000,
             stereo_close_depth: StereoCloseDepth::default(),
+            klt_first: KltFirst::default(),
         }
     }
 }
@@ -261,6 +294,12 @@ impl fmt::Display for SystemConfig {
         let FrontendConfig::Orb(frontend) = orb.frontend;
         writeln!(f, "OrbSlam pipeline (config version {})", self.version)?;
         writeln!(f, "  frontend: ORB, {} keypoints", frontend.n_keypoints)?;
+        if let Some(min_tracks) = frontend.klt_first.min_tracks() {
+            writeln!(
+                f,
+                "  klt-first: ORB only when a keyframe is due or fewer than {min_tracks} tracks survive"
+            )?;
+        }
         if self.sensors.cameras == CameraSelection::Stereo {
             match frontend.stereo_close_depth {
                 StereoCloseDepth::Baselines(n) => writeln!(

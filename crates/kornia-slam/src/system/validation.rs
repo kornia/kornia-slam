@@ -102,6 +102,9 @@ impl OrbFrontendConfig {
                 max: *range.end(),
             });
         }
+        if let Some(min_tracks) = self.klt_first.min_tracks() {
+            check("frontend.klt_first.min_tracks", min_tracks as f64, POSITIVE)?;
+        }
         match self.stereo_close_depth {
             StereoCloseDepth::Baselines(value) | StereoCloseDepth::Metres(value) => {
                 check("frontend.stereo_close_depth", value, POSITIVE)
