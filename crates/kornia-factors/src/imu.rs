@@ -71,7 +71,7 @@ pub fn body_frame(pose_cw: &Pose3d, t_bc: Option<&Pose3d>) -> (Mat3F64, Vec3F64)
         }
         Some(t_bc) => {
             let r_bc = &t_bc.rotation;
-            let r_bw = mat3_mul(r_bc, r_cw);
+            let r_bw = *r_bc * *r_cw;
             let t_bw = *r_bc * *t_cw + t_bc.translation;
             let twb = -(Mat3F64(*r_bw.transpose()) * t_bw);
             (r_bw, twb)
@@ -105,7 +105,7 @@ pub fn residual_and_jacobians(
     let dp_corrected = pim.delta_position_with_bias(&i.bias);
 
     let dr_t = Mat3F64(*dr_corrected.transpose());
-    let lhs_r = Mat3F64(dr_t.mul_mat3(&mat3_mul(&r_bw_i, &r_wb_j)));
+    let lhs_r = dr_t * (r_bw_i * r_wb_j);
     let r_rot = SO3F64::from_matrix(&lhs_r).log();
 
     let dv_world = *v_j - *v_i - *gravity * dt;
@@ -131,7 +131,7 @@ pub fn residual_and_jacobians(
 
     let jr_inv = SO3F64::right_jacobian(r_rot).inverse();
 
-    let jr_inv_rbwj = mat3_mul(&jr_inv, &r_bw_j);
+    let jr_inv_rbwj = jr_inv * r_bw_j;
     set_block_15x15(&mut j_i, 0, 3, &jr_inv_rbwj);
     // eR = ΔRᵀ · R_bw,i · R_wb,j = lhs_r.
     let er_t = Mat3F64(*lhs_r.transpose());
@@ -139,23 +139,15 @@ pub fn residual_and_jacobians(
         &mut j_i,
         0,
         9,
-        &mat3_neg(mat3_mul(
-            &mat3_mul(&jr_inv, &er_t),
-            &pim.d_rotation_d_bias_gyro,
-        )),
+        &(jr_inv * er_t * pim.d_rotation_d_bias_gyro * -1.0),
     );
-    set_block_15x15(&mut j_j, 0, 3, &mat3_neg(jr_inv_rbwj));
+    set_block_15x15(&mut j_j, 0, 3, &(jr_inv_rbwj * -1.0));
 
-    set_block_15x15(
-        &mut j_i,
-        3,
-        3,
-        &mat3_neg(mat3_mul(&r_bw_i, &SO3F64::hat(dv_world))),
-    );
-    let neg_r_bw_i = mat3_neg(r_bw_i);
+    set_block_15x15(&mut j_i, 3, 3, &(r_bw_i * SO3F64::hat(dv_world) * -1.0));
+    let neg_r_bw_i = r_bw_i * -1.0;
     set_block_15x15(&mut j_i, 3, 6, &neg_r_bw_i);
-    set_block_15x15(&mut j_i, 3, 9, &mat3_neg(pim.d_velocity_d_bias_gyro));
-    set_block_15x15(&mut j_i, 3, 12, &mat3_neg(pim.d_velocity_d_bias_accel));
+    set_block_15x15(&mut j_i, 3, 9, &(pim.d_velocity_d_bias_gyro * -1.0));
+    set_block_15x15(&mut j_i, 3, 12, &(pim.d_velocity_d_bias_accel * -1.0));
     set_block_15x15(&mut j_j, 3, 6, &r_bw_i);
 
     set_block_15x15(&mut j_i, 6, 0, &r_bw_i);
@@ -165,17 +157,17 @@ pub fn residual_and_jacobians(
         &mut j_i,
         6,
         3,
-        &mat3_neg(mat3_mul(&r_bw_i, &SO3F64::hat(dp_omega_world))),
+        &(r_bw_i * SO3F64::hat(dp_omega_world) * -1.0),
     );
-    set_block_15x15(&mut j_i, 6, 6, &mat3_scalar_f64(&r_bw_i, -dt));
-    set_block_15x15(&mut j_i, 6, 9, &mat3_neg(pim.d_position_d_bias_gyro));
-    set_block_15x15(&mut j_i, 6, 12, &mat3_neg(pim.d_position_d_bias_accel));
+    set_block_15x15(&mut j_i, 6, 6, &(r_bw_i * -dt));
+    set_block_15x15(&mut j_i, 6, 9, &(pim.d_position_d_bias_gyro * -1.0));
+    set_block_15x15(&mut j_i, 6, 12, &(pim.d_position_d_bias_accel * -1.0));
     set_block_15x15(&mut j_j, 6, 0, &neg_r_bw_i);
-    set_block_15x15(&mut j_j, 6, 3, &mat3_mul(&r_bw_i, &SO3F64::hat(twb_j)));
+    set_block_15x15(&mut j_j, 6, 3, &(r_bw_i * SO3F64::hat(twb_j)));
 
-    set_block_15x15(&mut j_i, 9, 9, &mat3_neg(Mat3F64::IDENTITY));
+    set_block_15x15(&mut j_i, 9, 9, &(Mat3F64::IDENTITY * -1.0));
     set_block_15x15(&mut j_j, 9, 9, &Mat3F64::IDENTITY);
-    set_block_15x15(&mut j_i, 12, 12, &mat3_neg(Mat3F64::IDENTITY));
+    set_block_15x15(&mut j_i, 12, 12, &(Mat3F64::IDENTITY * -1.0));
     set_block_15x15(&mut j_j, 12, 12, &Mat3F64::IDENTITY);
 
     (residual, j_i, j_j)
@@ -303,21 +295,6 @@ fn set_block_15x15(m: &mut Mat15, row: usize, col: usize, block: &Mat3F64) {
             m[idx15(row + r, col + c)] = cols[c * 3 + r];
         }
     }
-}
-
-#[inline]
-fn mat3_mul(a: &Mat3F64, b: &Mat3F64) -> Mat3F64 {
-    Mat3F64(a.mul_mat3(b))
-}
-
-#[inline]
-fn mat3_neg(a: Mat3F64) -> Mat3F64 {
-    mat3_scalar_f64(&a, -1.0)
-}
-
-#[inline]
-fn mat3_scalar_f64(m: &Mat3F64, s: f64) -> Mat3F64 {
-    Mat3F64(m.mul_scalar(s))
 }
 
 #[cfg(test)]
