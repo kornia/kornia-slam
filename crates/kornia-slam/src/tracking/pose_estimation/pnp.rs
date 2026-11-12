@@ -6,6 +6,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_3d::ransac::RobustKernelKind;
 use kornia_algebra::{Mat3AF32, Vec2F32, Vec3AF32, Vec3F64};
 
+use super::pose_lm::{self, Refined};
 use crate::mapping::visual_information::VisualInformation;
 use crate::pose_conversion::{mat3_to_f32, mat3_to_f64, vec3_to_f32, vec3_to_f64};
 
@@ -194,22 +195,22 @@ pub fn solve_pnp_with_diagnostics(
 
         let active_world: Vec<Vec3AF32> = active.iter().map(|&i| world_inliers[i]).collect();
         let active_image: Vec<Vec2F32> = active.iter().map(|&i| image_inliers[i]).collect();
-        let Ok(lm) = refine_pose_lm(
+        let lm_params = LMRefineParams {
+            robust: config.robust,
+            robust_scale_sq: config.robust_scale_sq,
+            // At least one: zero iterations returns the PRIOR pose unrefined, and
+            // `solve_pnp` would report that as a successful solve with a full inlier
+            // count — tracking that never actually estimates anything, silently.
+            max_iterations: config.lm_max_iterations.max(1),
+            ..LMRefineParams::default()
+        };
+        let Some(lm) = refine(
             &active_world,
             &active_image,
             &k,
             &r_init_f32,
             &t_init_f32,
-            None,
-            &LMRefineParams {
-                robust: config.robust,
-                robust_scale_sq: config.robust_scale_sq,
-                // At least one: zero iterations returns the PRIOR pose unrefined, and
-                // `solve_pnp` would report that as a successful solve with a full inlier
-                // count — tracking that never actually estimates anything, silently.
-                max_iterations: config.lm_max_iterations.max(1),
-                ..LMRefineParams::default()
-            },
+            &lm_params,
         ) else {
             return (None, diagnostics);
         };
@@ -236,7 +237,7 @@ pub fn solve_pnp_with_diagnostics(
 
     // The upstream convergence flag is diagnostic only. Real-data solves can
     // reach the iteration cap while still producing a valid refined pose.
-    diagnostics.converged = lm.converged;
+    diagnostics.converged = Some(lm.converged);
     let pose_new = unnormalize(&lm.rotation, lm.translation);
 
     let final_inliers = if config.visual_information.is_unit() {
@@ -272,6 +273,36 @@ fn gate_scale_sq(information: VisualInformation, octaves: &[u8], i: usize) -> f6
     }
     let sigma = information.sigma_px(octaves.get(i).copied().unwrap_or(0)) as f64;
     sigma * sigma
+}
+
+/// LM pose refinement: the analytic solver for the kernels it implements,
+/// kornia-3d's generic one otherwise.
+fn refine(
+    points_world: &[Vec3AF32],
+    points_image: &[Vec2F32],
+    k: &Mat3AF32,
+    rotation: &Mat3AF32,
+    translation: &Vec3AF32,
+    params: &LMRefineParams,
+) -> Option<Refined> {
+    if pose_lm::supports(params) {
+        return pose_lm::refine_pose(points_world, points_image, k, rotation, translation, params);
+    }
+    let lm = refine_pose_lm(
+        points_world,
+        points_image,
+        k,
+        rotation,
+        translation,
+        None,
+        params,
+    )
+    .ok()?;
+    Some(Refined {
+        rotation: lm.rotation,
+        translation: lm.translation,
+        converged: lm.converged.unwrap_or(false),
+    })
 }
 
 /// Count map-point reprojection inliers given a camera pose.
@@ -391,13 +422,13 @@ mod tests {
         let camera = test_camera();
         let truth = Pose3d::from_rt(Mat3F64::IDENTITY, Vec3F64::new(0.12, -0.08, 0.0));
         let (points_world, points_image) = synthetic_correspondences(&camera, &truth, 60);
-        let err_with = |iters: usize| {
+        let converged_with = |iters: usize| {
             let cfg = PnpConfig {
                 lm_max_iterations: iters,
                 outlier_rounds: 1,
                 ..PnpConfig::default()
             };
-            solve_pnp(
+            solve_pnp_with_diagnostics(
                 &points_world,
                 &points_image,
                 &[],
@@ -405,14 +436,12 @@ mod tests {
                 &Pose3d::IDENTITY,
                 &cfg,
             )
-            .map(|(p, _)| (p.translation - truth.translation).length())
+            .1
+            .converged
         };
-        let tight = err_with(1).expect("1-iteration case must still solve");
-        let loose = err_with(50).expect("50-iteration case must solve");
-        assert!(
-            loose < tight * 0.5,
-            "the budget is not reaching the solver: 1 iter {tight:.4} m vs 50 iter {loose:.4} m"
-        );
+        // One iteration stops at the cap before any tolerance can be met.
+        assert_eq!(converged_with(1), Some(false));
+        assert_eq!(converged_with(50), Some(true));
     }
 
     /// A zero iteration budget must not read as a successful solve.
