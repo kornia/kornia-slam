@@ -12,7 +12,7 @@ mod trace;
 use std::io::Write;
 use std::path::PathBuf;
 
-use pipeline::{Mode, Pipeline};
+use pipeline::{Keypoints, Mode, Pipeline};
 use trace::Trace;
 
 #[derive(argh::FromArgs)]
@@ -30,6 +30,12 @@ struct Args {
     /// on trusted frames, start LK at the predicted pose over two levels
     #[argh(switch)]
     predict: bool,
+    /// ORB keypoints of the primary image, as the system's frontend
+    #[argh(option, default = "1000")]
+    n_keypoints: usize,
+    /// ORB keypoints of every other image (default: --n-keypoints)
+    #[argh(option)]
+    secondary_keypoints: Option<usize>,
     /// first traced frame index to replay
     #[argh(option, default = "0")]
     first: usize,
@@ -64,10 +70,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .take(args.count)
         .collect();
     let first = frames.first().ok_or("no traced frame in range")?;
+    let keypoints = Keypoints {
+        primary: args.n_keypoints,
+        secondary: args.secondary_keypoints.unwrap_or(args.n_keypoints),
+    };
     let mut pipeline = Pipeline::new(
         &trace,
         mode,
         args.predict,
+        keypoints,
         trace.tracks.get(&first.frame_idx),
     );
 
