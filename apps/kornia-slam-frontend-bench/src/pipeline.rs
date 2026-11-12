@@ -90,6 +90,13 @@ fn timed<T>(slot: &mut Duration, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// ORB budgets: the primary image and every other image.
+#[derive(Clone, Copy)]
+pub struct Keypoints {
+    pub primary: usize,
+    pub secondary: usize,
+}
+
 pub struct StepOutput {
     pub stages: Stages,
     pub n_kp: usize,
@@ -107,6 +114,7 @@ pub struct Pipeline {
     /// Start LK from the predicted pose on trusted frames (`--predict`).
     predict: bool,
     detector: OrbDetector,
+    secondary: OrbDetector,
     stereo: Option<StereoMatchConfig>,
     camera: PinholeCamera,
     size: ImageSize,
@@ -161,10 +169,18 @@ impl Pipeline {
         trace: &Trace,
         mode: Mode,
         predict: bool,
+        keypoints: Keypoints,
         first_tracks: Option<&Vec<TraceTrack>>,
     ) -> Self {
         let primary = &trace.cameras[0];
-        let detector = OrbDetector::default();
+        let detector = OrbDetector {
+            n_keypoints: keypoints.primary,
+            ..OrbDetector::default()
+        };
+        let secondary = OrbDetector {
+            n_keypoints: keypoints.secondary,
+            ..OrbDetector::default()
+        };
         let stereo = (trace.n_images() == 2 && trace.cameras.len() == 1).then(|| {
             StereoMatchConfig::new(
                 primary.stereo_baseline_m as f32,
@@ -194,6 +210,7 @@ impl Pipeline {
             mode,
             predict,
             detector,
+            secondary,
             stereo,
             camera: primary.camera.clone(),
             size: primary.size,
@@ -317,7 +334,15 @@ impl Pipeline {
         let per_image: Vec<OrbFeatures> = timed(&mut stages.orb, || {
             images
                 .iter()
-                .map(|image| self.detector.detect_and_extract_u8(image))
+                .enumerate()
+                .map(|(camera, image)| {
+                    let detector = if camera == 0 {
+                        &self.detector
+                    } else {
+                        &self.secondary
+                    };
+                    detector.detect_and_extract_u8(image)
+                })
                 .collect::<Result<_, _>>()
         })?;
         let n_stereo = match (&self.stereo, per_image.as_slice()) {
