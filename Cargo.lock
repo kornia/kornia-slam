@@ -6146,6 +6146,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kornia-slam-frontend-bench"
+version = "0.2.0"
+dependencies = [
+ "argh",
+ "kornia-3d",
+ "kornia-algebra",
+ "kornia-image",
+ "kornia-imgproc",
+ "kornia-slam",
+ "libc",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "kornia-tensor"
 version = "0.2.0"
 source = "git+https://github.com/kornia/kornia-rs?rev=11b4951719d3b702b6ede25d082874fdd23d05c3#11b4951719d3b702b6ede25d082874fdd23d05c3"
