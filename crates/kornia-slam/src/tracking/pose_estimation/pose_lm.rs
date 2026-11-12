@@ -13,7 +13,7 @@
 
 use kornia_3d::pnp::LMRefineParams;
 use kornia_3d::ransac::RobustKernelKind;
-use kornia_algebra::{Mat3AF32, Vec2F32, Vec3AF32};
+use kornia_algebra::{Mat3AF32, SO3F32, Vec2F32, Vec3AF32};
 
 const LAMBDA_FACTOR: f64 = 10.0;
 const LAMBDA_MIN: f64 = 1e-10;
@@ -86,20 +86,44 @@ impl Pose {
         ]
     }
 
-    /// `exp(delta) * self` with `delta = (rho, phi)` applied as
-    /// `p' = Exp(phi) p + rho` in the camera frame.
-    fn left_update(&self, delta: &[f64; 6]) -> Self {
-        let e = so3_exp([delta[3], delta[4], delta[5]]);
+    /// `self * exp(delta)` with `delta = (upsilon, omega)`: kornia's SE3
+    /// `retract`, so the damped steps follow the generic solver's path.
+    fn right_update(&self, delta: &[f64; 6]) -> Self {
+        let (e, v) = se3_exp_parts([delta[3], delta[4], delta[5]]);
+        let vu: [f64; 3] = std::array::from_fn(|i| (0..3).map(|k| v[i][k] * delta[k]).sum());
         let mut r = [[0.0; 3]; 3];
-        let mut t = [0.0; 3];
+        let mut t = self.t;
         for i in 0..3 {
             for j in 0..3 {
-                r[i][j] = (0..3).map(|k| e[i][k] * self.r[k][j]).sum();
+                r[i][j] = (0..3).map(|k| self.r[i][k] * e[k][j]).sum();
             }
-            t[i] = (0..3).map(|k| e[i][k] * self.t[k]).sum::<f64>() + delta[i];
+            t[i] += (0..3).map(|k| self.r[i][k] * vu[k]).sum::<f64>();
         }
         Self { r, t }
     }
+}
+
+/// `(Exp(w), V(w))` of the SE3 exponential, `t = V(w) upsilon`.
+fn se3_exp_parts(w: [f64; 3]) -> ([[f64; 3]; 3], [[f64; 3]; 3]) {
+    let theta2 = w[0] * w[0] + w[1] * w[1] + w[2] * w[2];
+    let (b, c) = if theta2 < 1e-12 {
+        (0.5 - theta2 / 24.0, 1.0 / 6.0 - theta2 / 120.0)
+    } else {
+        let theta = theta2.sqrt();
+        (
+            (1.0 - theta.cos()) / theta2,
+            (theta - theta.sin()) / (theta2 * theta),
+        )
+    };
+    let k = [[0.0, -w[2], w[1]], [w[2], 0.0, -w[0]], [-w[1], w[0], 0.0]];
+    let mut v = [[0.0; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            let kk: f64 = (0..3).map(|l| k[i][l] * k[l][j]).sum();
+            v[i][j] = f64::from(u8::from(i == j)) + b * k[i][j] + c * kk;
+        }
+    }
+    (so3_exp(w), v)
 }
 
 fn so3_exp(w: [f64; 3]) -> [[f64; 3]; 3] {
@@ -160,11 +184,26 @@ impl Problem<'_> {
                 self.fy * y * iz + self.cy - uv[1],
             ];
             let w = self.loss.weight(r[0] * r[0] + r[1] * r[1]);
-            // d(pixel)/d(p_c) times d(p_c)/d(rho, phi) = [I | -[p_c]x].
-            let (a, b) = (self.fx * iz, self.fy * iz);
-            let (c, d) = (-self.fx * x * iz * iz, -self.fy * y * iz * iz);
-            let ju = [a, 0.0, c, c * y, a * z - c * x, -a * y];
-            let jv = [0.0, b, d, d * y - b * z, -d * x, b * x];
+            // d(pixel)/d(p_c) [R | -R [p]x] for p_c = R exp(delta) p + t.
+            let jpi = [
+                [self.fx * iz, 0.0, -self.fx * x * iz * iz],
+                [0.0, self.fy * iz, -self.fy * y * iz * iz],
+            ];
+            let rows = jpi.map(|row| -> [f64; 3] {
+                std::array::from_fn(|k| (0..3).map(|l| row[l] * pose.r[l][k]).sum())
+            });
+            let [px, py, pz] = *p;
+            let jac = rows.map(|a| {
+                [
+                    a[0],
+                    a[1],
+                    a[2],
+                    -(a[1] * pz - a[2] * py),
+                    -(a[2] * px - a[0] * pz),
+                    -(a[0] * py - a[1] * px),
+                ]
+            });
+            let (ju, jv) = (jac[0], jac[1]);
             for i in 0..6 {
                 g[i] += w * (ju[i] * r[0] + jv[i] * r[1]);
                 for j in i..6 {
@@ -258,6 +297,9 @@ pub(crate) fn refine_pose(
         cy: k.z_axis().y as f64,
         loss,
     };
+    // The generic solver starts from the start rotation's quaternion, which
+    // projects a not-quite-orthonormal prediction back onto SO(3).
+    let rotation = SO3F32::from_matrix(rotation).matrix();
     let columns = [rotation.x_axis(), rotation.y_axis(), rotation.z_axis()].map(|c| c.to_array());
     let mut pose = Pose {
         r: std::array::from_fn(|i| std::array::from_fn(|j| columns[j][i] as f64)),
@@ -284,7 +326,7 @@ pub(crate) fn refine_pose(
             converged = true;
             break;
         }
-        let candidate = pose.left_update(&delta);
+        let candidate = pose.right_update(&delta);
         let new_cost = problem.cost(&candidate).unwrap_or(f64::INFINITY);
         let relative_change = if cost > 0.0 {
             (cost - new_cost).abs() / cost
@@ -371,6 +413,55 @@ mod tests {
     }
 
     #[test]
+    fn the_jacobian_matches_central_differences() {
+        let pose = Pose {
+            r: so3_exp([0.3, -0.2, 0.1]),
+            t: [0.2, -0.1, 0.5],
+        };
+        let point = [[0.4, -0.3, 2.0]];
+        let pixel = [[100.0, 80.0]];
+        let problem = Problem {
+            points: &point,
+            pixels: &pixel,
+            fx: 450.0,
+            fy: 440.0,
+            cx: 376.0,
+            cy: 240.0,
+            loss: Loss::L2,
+        };
+        let residual = |pose: &Pose| {
+            let pc = pose.transform(point[0]);
+            [
+                450.0 * pc[0] / pc[2] + 376.0 - pixel[0][0],
+                440.0 * pc[1] / pc[2] + 240.0 - pixel[0][1],
+            ]
+        };
+        let r0 = residual(&pose);
+        let (h, g) = problem.normal_equations(&pose);
+        // With one residual, g = J^T r and H = J^T J; recover J by differences.
+        for k in 0..6 {
+            let mut d = [0.0; 6];
+            d[k] = 1e-6;
+            let plus = residual(&pose.right_update(&d));
+            d[k] = -1e-6;
+            let minus = residual(&pose.right_update(&d));
+            let jk = [(plus[0] - minus[0]) / 2e-6, (plus[1] - minus[1]) / 2e-6];
+            let gk = jk[0] * r0[0] + jk[1] * r0[1];
+            assert!(
+                (gk - g[k]).abs() < 1e-3 * (1.0 + gk.abs()),
+                "g[{k}] {} vs {gk}",
+                g[k]
+            );
+            let hkk = jk[0] * jk[0] + jk[1] * jk[1];
+            assert!(
+                (hkk - h[k][k]).abs() < 1e-3 * (1.0 + hkk),
+                "h[{k}] {} vs {hkk}",
+                h[k][k]
+            );
+        }
+    }
+
+    #[test]
     fn recovers_a_perturbed_pose() {
         let (world, image, k, truth) = scene(false);
         let start = Mat3AF32::IDENTITY;
@@ -403,6 +494,26 @@ mod tests {
             (r.z_axis(), generic.rotation.z_axis()),
         ] {
             assert!((a - b).length() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn a_scaled_start_rotation_is_projected_onto_so3_like_the_generic_solver() {
+        let (world, image, k, truth) = scene(false);
+        // A prediction that drifted off SO(3): the identity scaled by 1.1.
+        let scaled = Mat3AF32::from_cols(
+            Vec3AF32::new(1.1, 0.0, 0.0),
+            Vec3AF32::new(0.0, 1.1, 0.0),
+            Vec3AF32::new(0.0, 0.0, 1.1),
+        );
+        let refined = refine_pose(&world, &image, &k, &scaled, &Vec3AF32::ZERO, &params()).unwrap();
+        let t = refined.translation;
+        assert!((t.x as f64 - truth.t[0]).abs() < 1e-4);
+        assert!((t.y as f64 - truth.t[1]).abs() < 1e-4);
+        assert!((t.z as f64 - truth.t[2]).abs() < 1e-4);
+        let r = refined.rotation;
+        for column in [r.x_axis(), r.y_axis(), r.z_axis()] {
+            assert!((column.length() - 1.0).abs() < 1e-5);
         }
     }
 
