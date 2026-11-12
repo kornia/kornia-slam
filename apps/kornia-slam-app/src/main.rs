@@ -12,6 +12,7 @@ mod config;
 mod datasets;
 mod evaluation;
 mod source;
+mod trace_out;
 mod trajectory;
 mod tui;
 mod utils;
@@ -66,6 +67,20 @@ struct Args {
     /// map-projection reject reasons, keyframe growth and fuse counters
     #[argh(switch)]
     debug: bool,
+
+    /// write per-frame stage timings (timings.csv) and, for frames in
+    /// [trace-from, trace-to), the tracking inputs a frontend benchmark
+    /// replays (frames.csv, tracks.csv, local_map.bin) into this directory
+    #[argh(option)]
+    trace_out: Option<String>,
+
+    /// first source frame index to trace (default 0)
+    #[argh(option, default = "0")]
+    trace_from: usize,
+
+    /// source frame index to stop tracing at (default: never)
+    #[argh(option, default = "usize::MAX")]
+    trace_to: usize,
 }
 
 /// Evaluation switches for loop-closure tuning that configuration files do not
@@ -100,6 +115,31 @@ fn apply_loop_gate_overrides(
         );
     }
     Ok(())
+}
+
+/// ` orb=[..] ov= klt=build/track ps= cf= pnp= lr= kf=` in ms, for `--debug`.
+fn stage_times(
+    frontend: &kornia_slam::FrontendObservation,
+    timings: &kornia_slam::TrackingTimings,
+) -> String {
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let orb: Vec<String> = frontend
+        .orb_per_camera
+        .iter()
+        .map(|d| format!("{:.1}", ms(*d)))
+        .collect();
+    format!(
+        " orb=[{}] ov={:.1} klt={:.1}/{:.1} ps={:.1} cf={:.1} pnp={:.1} lr={:.1} kf={:.1}",
+        orb.join(","),
+        ms(frontend.overlap),
+        ms(timings.klt_build),
+        ms(timings.klt_track),
+        ms(timings.projection_search),
+        ms(timings.consistency_filter),
+        ms(timings.pnp),
+        ms(timings.local_refine),
+        ms(timings.keyframe_insert),
+    )
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -138,6 +178,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(std::path::Path::to_path_buf);
     let mut system = SlamSystem::build(run.system, source.rig()).map_err(|e| e.to_string())?;
     system.set_debug(args.debug);
+    let mut trace_writer = args
+        .trace_out
+        .as_deref()
+        .map(|dir| trace_out::TraceWriter::create(std::path::Path::new(dir)))
+        .transpose()?;
     let camera = system.rig().camera.clone();
     let mut trajectory_out = args
         .trajectory_out
@@ -211,6 +256,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         system.process_imu(&imu_samples);
+        system.set_trace(trace_writer.is_some() && (args.trace_from..args.trace_to).contains(&idx));
         let result = match right_image.as_ref() {
             Some(right) => system.process_stereo(timestamp_sec, &image, right)?,
             None if !rig_images.is_empty() => {
@@ -222,6 +268,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let frame_ms = system.tracking_duration().as_secs_f64() * 1000.0;
         let frontend_ms = system.frontend_observation().duration.as_secs_f64() * 1000.0;
+        if let Some(writer) = trace_writer.as_mut() {
+            writer.write_timings(
+                idx,
+                result.status,
+                system.frontend_observation(),
+                system.tracking_timings(),
+                system.tracking_duration(),
+            )?;
+            if let Some(trace) = system.frame_trace() {
+                writer.write_trace(idx, trace)?;
+                let images: Vec<&kornia_image::Image<u8, 1>> = std::iter::once(&image)
+                    .chain(right_image.as_ref())
+                    .chain(&rig_images)
+                    .collect();
+                writer.write_images(system.rig(), idx, &images)?;
+            }
+        }
         #[cfg(feature = "viz")]
         if let Some(ref rec) = rec {
             log_frame_to_rerun(rec, &image, &system.frontend_observation().keypoints_xy);
@@ -272,10 +335,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for line in &debug_msgs {
                 eprintln!("{line}");
             }
-            let status_line = format!(
+            let mut status_line = format!(
                 "[{idx:>5}] {:?}  kf={:<4} pts={:<5} {frame_ms:>6.1}ms fe={frontend_ms:.1}ms",
                 result.status, keyframe_idx, map_point_count,
             );
+            if args.debug {
+                status_line.push_str(&stage_times(
+                    system.frontend_observation(),
+                    system.tracking_timings(),
+                ));
+            }
             eprintln!("{status_line}");
         }
 
@@ -365,6 +434,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     if let Some(writer) = trajectory_out {
         writer.finish()?;
+    }
+    if let Some(writer) = trace_writer.as_mut() {
+        writer.flush()?;
     }
     if args.evaluate {
         evaluation::report(

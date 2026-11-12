@@ -33,6 +33,10 @@ pub struct FrontendObservation {
     pub stereo_matched: Option<usize>,
     /// Feature extraction and stereo matching time.
     pub duration: Duration,
+    /// ORB extraction time of each image, in input order.
+    pub orb_per_camera: Vec<Duration>,
+    /// Stereo or rig-overlap matching time, its image pyramids included.
+    pub overlap: Duration,
 }
 
 /// ORB extraction plus the rig-specific preparation tracking expects.
@@ -83,7 +87,9 @@ impl OrbFrontend {
         image: &Image<u8, 1>,
     ) -> Result<Frame, ImageError> {
         let start = Instant::now();
-        let features = self.detector.detect_and_extract_u8(image)?;
+        self.observation.orb_per_camera.clear();
+        let features = self.timed_orb(image)?;
+        self.observation.overlap = Duration::ZERO;
         Ok(self.finish_frame(idx, image, features, None, start))
     }
 
@@ -97,11 +103,14 @@ impl OrbFrontend {
         right: &Image<u8, 1>,
     ) -> Result<Frame, ImageError> {
         let start = Instant::now();
-        let features = self.detector.detect_and_extract_u8(left)?;
-        let Some(config) = &self.stereo else {
+        self.observation.orb_per_camera.clear();
+        self.observation.overlap = Duration::ZERO;
+        let features = self.timed_orb(left)?;
+        let Some(config) = self.stereo.clone() else {
             return Ok(self.finish_frame(idx, left, features, None, start));
         };
-        let right_features = self.detector.detect_and_extract_u8(right)?;
+        let right_features = self.timed_orb(right)?;
+        let overlap_start = Instant::now();
         let left_pyramid = self.build_pyramid(left)?;
         let right_pyramid = self.build_pyramid(right)?;
         let matches = compute_stereo_matches(
@@ -109,8 +118,9 @@ impl OrbFrontend {
             &right_pyramid,
             &features,
             &right_features,
-            config,
+            &config,
         );
+        self.observation.overlap = overlap_start.elapsed();
         Ok(self.finish_frame(idx, left, features, Some(matches), start))
     }
 
@@ -137,8 +147,9 @@ impl OrbFrontend {
         };
         let mut camera_ranges = Vec::with_capacity(images.len());
         let mut keypoint_colors = Vec::new();
+        self.observation.orb_per_camera.clear();
         for image in images {
-            let camera_features = self.detector.detect_and_extract_u8(image)?;
+            let camera_features = self.timed_orb(image)?;
             let begin = features.keypoints_xy.len();
             keypoint_colors.extend(sample_colors(image, &camera_features.keypoints_xy));
             features.keypoints_xy.extend(camera_features.keypoints_xy);
@@ -147,7 +158,9 @@ impl OrbFrontend {
             features.octaves.extend(camera_features.octaves);
             camera_ranges.push(begin..features.keypoints_xy.len());
         }
+        let overlap_start = Instant::now();
         let matches = overlap::match_overlap(&features, &camera_ranges, &rig);
+        self.observation.overlap = overlap_start.elapsed();
 
         self.observation.keypoints_xy.clear();
         if let Some(range) = camera_ranges.first() {
@@ -173,6 +186,14 @@ impl OrbFrontend {
                 stereo_points: matches.points,
             },
         })
+    }
+
+    /// ORB on one image, its time appended to `orb_per_camera`.
+    fn timed_orb(&mut self, image: &Image<u8, 1>) -> Result<OrbFeatures, ImageError> {
+        let start = Instant::now();
+        let features = self.detector.detect_and_extract_u8(image)?;
+        self.observation.orb_per_camera.push(start.elapsed());
+        Ok(features)
     }
 
     fn finish_frame(

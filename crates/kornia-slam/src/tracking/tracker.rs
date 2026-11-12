@@ -13,13 +13,14 @@ use kornia_image::Image;
 use crate::Frame;
 use crate::mapping::Map;
 use crate::tracking::optical_flow::{
-    KltTracker, MapKeypointMatch, TrackSet, carry_klt_survivors, snap_unique,
+    KltTracker, MapKeypointMatch, Track, TrackSet, carry_klt_survivors, snap_unique,
 };
 use crate::tracking::pose_estimation::map_projection::{
     MapProjectionConfig, MapProjectionRejectReason,
 };
 use crate::tracking::pose_estimation::{Estimate, MapProjectionEstimator};
 use crate::tracking::relocalization::{Relocalization, RelocalizationConfig, relocalize};
+use crate::tracking::timings::TrackingTimings;
 
 /// Everything the tracker needs about the current frame that it does not own.
 pub(crate) struct FrameInput<'a> {
@@ -79,6 +80,11 @@ impl Tracker {
         found
     }
 
+    /// The optical-flow tracks carried into the next frame.
+    pub(crate) fn tracks(&self) -> &[Track] {
+        self.track_set.tracks()
+    }
+
     /// Drops optical-flow continuity. Used when the map's world frame changes
     /// under the tracks, which invalidates them.
     pub(crate) fn reset_tracks(&mut self) {
@@ -96,6 +102,7 @@ impl Tracker {
         input: FrameInput<'_>,
         map: &Map,
         camera: &PinholeCamera,
+        timings: &mut TrackingTimings,
     ) -> Result<Estimate, MapProjectionRejectReason> {
         let search_scale = self
             .estimator
@@ -107,7 +114,12 @@ impl Tracker {
         } else {
             input.previous_image.and_then(|previous_image| {
                 self.klt_tracker
-                    .track(self.track_set.tracks(), previous_image, input.current_image)
+                    .track_timed(
+                        self.track_set.tracks(),
+                        previous_image,
+                        input.current_image,
+                        timings,
+                    )
                     .ok()
             })
         };
@@ -125,7 +137,7 @@ impl Tracker {
                     .collect()
             });
 
-        let result = self.estimator.estimate_pose(
+        let result = self.estimator.estimate_pose_timed(
             input.frame,
             &input.candidate_pose,
             &input.pose_before,
@@ -134,6 +146,7 @@ impl Tracker {
             input.current_keyframe_idx,
             search_scale,
             pre_seeded,
+            timings,
         );
 
         // With a trusted inertial prediction the threshold drops to

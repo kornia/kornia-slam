@@ -3,8 +3,12 @@
 use std::collections::{HashMap, HashSet};
 
 use kornia_image::Image;
-use kornia_imgproc::optical_flow_pyr_lk::{PyrLKError, PyrLKParams, calc_optical_flow_pyr_lk};
+use kornia_imgproc::optical_flow_pyr_lk::{
+    PyrLKError, PyrLKParams, build_lk_precomputed, calc_optical_flow_pyr_lk_with_precomputed,
+};
 use thiserror::Error;
+
+use crate::tracking::timings::{TrackingTimings, timed};
 
 /// Stable identity for a feature track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -288,7 +292,25 @@ impl KltTracker {
         previous: &Image<u8, 1>,
         current: &Image<u8, 1>,
     ) -> Result<Vec<FlowSurvivor>, PyrLKError> {
-        self.track_impl(tracks, None, previous, current)
+        self.track_impl(
+            tracks,
+            None,
+            previous,
+            current,
+            &mut TrackingTimings::default(),
+        )
+    }
+
+    /// Like [`Self::track`], adding the pyramid build and the flow solve to
+    /// `timings`.
+    pub fn track_timed(
+        &self,
+        tracks: &[Track],
+        previous: &Image<u8, 1>,
+        current: &Image<u8, 1>,
+        timings: &mut TrackingTimings,
+    ) -> Result<Vec<FlowSurvivor>, PyrLKError> {
+        self.track_impl(tracks, None, previous, current, timings)
     }
 
     pub fn track_with_initial(
@@ -304,7 +326,13 @@ impl KltTracker {
                 provided: initial_pixels.len(),
             });
         }
-        self.track_impl(tracks, Some(initial_pixels), previous, current)
+        self.track_impl(
+            tracks,
+            Some(initial_pixels),
+            previous,
+            current,
+            &mut TrackingTimings::default(),
+        )
     }
 
     fn track_impl(
@@ -313,27 +341,30 @@ impl KltTracker {
         initial_pixels: Option<&[[f32; 2]]>,
         previous: &Image<u8, 1>,
         current: &Image<u8, 1>,
+        timings: &mut TrackingTimings,
     ) -> Result<Vec<FlowSurvivor>, PyrLKError> {
         if tracks.is_empty() {
             return Ok(Vec::new());
         }
 
-        let previous_f32 = previous
-            .cast::<f32>()
-            .expect("u8 -> f32 image cast is always representable");
-        let current_f32 = current
-            .cast::<f32>()
-            .expect("u8 -> f32 image cast is always representable");
+        // The same two calls `calc_optical_flow_pyr_lk` makes, split so the
+        // build and the solve are timed apart.
+        let precomputed = timed(&mut timings.klt_build, || {
+            let previous_f32 = previous.cast::<f32>()?;
+            let current_f32 = current.cast::<f32>()?;
+            build_lk_precomputed(&previous_f32, &current_f32, self.params.max_level)
+        })?;
         let previous_pixels: Vec<[f32; 2]> = tracks.iter().map(Track::pixel).collect();
         let mut params = self.params.clone();
         params.use_initial_flow = initial_pixels.is_some();
-        let result = calc_optical_flow_pyr_lk(
-            &previous_f32,
-            &current_f32,
-            &previous_pixels,
-            initial_pixels,
-            &params,
-        )?;
+        let result = timed(&mut timings.klt_track, || {
+            calc_optical_flow_pyr_lk_with_precomputed(
+                &precomputed,
+                &previous_pixels,
+                initial_pixels,
+                &params,
+            )
+        })?;
 
         let width = current.width() as f32;
         let height = current.height() as f32;
@@ -709,6 +740,26 @@ mod tests {
             "expected tracked pixel near (93, 92), got {got:?}"
         );
         assert_eq!(survivors[0].track_id, id);
+    }
+
+    #[test]
+    fn timed_tracking_matches_untimed_bit_for_bit() {
+        let previous = square_image([90, 90]);
+        let current = square_image([93, 92]);
+        let tracker = KltTracker::default();
+        let mut tracks = TrackSet::new();
+        tracks.spawn([90.0, 90.0]);
+        tracks.spawn([129.0, 90.0]);
+
+        let plain = tracker.track(tracks.tracks(), &previous, &current).unwrap();
+        let mut timings = TrackingTimings::default();
+        let timed = tracker
+            .track_timed(tracks.tracks(), &previous, &current, &mut timings)
+            .unwrap();
+
+        assert_eq!(plain, timed);
+        assert!(timings.klt_build > std::time::Duration::ZERO);
+        assert!(timings.klt_track > std::time::Duration::ZERO);
     }
 
     #[test]
