@@ -13,17 +13,14 @@
 //! ```
 //!
 //! with `p = t_wb` the body origin in the world and `ΔR, Δv, Δp` corrected to
-//! first order for the bias at `i`. The 15×15 matrices are row-major.
+//! first order for the bias at `i`.
 
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
+use kornia_algebra::{Mat3F64, Mat9F64, Mat15F64, SO3F64, Vec3F64, Vec15F64};
 use kornia_sensors::imu::PreintegratedImu;
 
 use crate::robust::huber_weight_and_cost;
 use crate::state::NavState;
-
-/// A row-major 15×15 matrix.
-pub type Mat15 = [f64; 225];
 
 /// An IMU constraint between keyframes `from_idx` and `to_idx`, usually
 /// consecutive; any pair works as long as `preintegrated` covers the interval.
@@ -52,9 +49,10 @@ impl ImuFactor {
 /// An IMU factor's information matrix.
 #[derive(Debug, Clone, Copy)]
 pub struct ImuInformation {
-    pub omega: Mat15,
-    /// The 9×9 navigation covariance was singular, so the navigation block
-    /// holds the inverse of its diagonal instead of its full inverse.
+    pub omega: Mat15F64,
+    /// The 9×9 navigation covariance was not positive definite, so the
+    /// navigation block holds the inverse of its diagonal instead of its full
+    /// inverse.
     pub diagonal_fallback: bool,
 }
 
@@ -90,7 +88,7 @@ pub fn residual_and_jacobians(
     pim: &PreintegratedImu,
     gravity: &Vec3F64,
     t_bc: Option<&Pose3d>,
-) -> ([f64; 15], Mat15, Mat15) {
+) -> (Vec15F64, Mat15F64, Mat15F64) {
     let dt = pim.dt;
 
     let (r_bw_i, twb_i) = body_frame(i.pose_cw, t_bc);
@@ -117,58 +115,59 @@ pub fn residual_and_jacobians(
     let r_bg = j.bias.gyro - i.bias.gyro;
     let r_ba = j.bias.accel - i.bias.accel;
 
-    let mut residual = [0.0f64; 15];
-    residual[0..3].copy_from_slice(&[r_rot.x, r_rot.y, r_rot.z]);
-    residual[3..6].copy_from_slice(&[r_vel.x, r_vel.y, r_vel.z]);
-    residual[6..9].copy_from_slice(&[r_pos.x, r_pos.y, r_pos.z]);
-    residual[9..12].copy_from_slice(&[r_bg.x, r_bg.y, r_bg.z]);
-    residual[12..15].copy_from_slice(&[r_ba.x, r_ba.y, r_ba.z]);
+    let mut residual = Vec15F64::zeros();
+    for (k, r) in [r_rot, r_vel, r_pos, r_bg, r_ba].into_iter().enumerate() {
+        residual.fixed_rows_mut::<3>(3 * k).copy_from(&r.into());
+    }
 
     // Under T_cw ← T_cw · Exp([ρ; ω]): R_bw ← R_bw · Exp(ω) and
     // t_wb ← t_wb − ρ + [t_wb]× · ω; velocity and biases are additive.
-    let mut j_i = [0.0f64; 225];
-    let mut j_j = [0.0f64; 225];
+    let mut j_i = Mat15F64::zeros();
+    let mut j_j = Mat15F64::zeros();
 
     let jr_inv = SO3F64::right_jacobian(r_rot).inverse();
 
     let jr_inv_rbwj = jr_inv * r_bw_j;
-    set_block_15x15(&mut j_i, 0, 3, &jr_inv_rbwj);
+    j_i.fixed_view_mut::<3, 3>(0, 3)
+        .copy_from(&jr_inv_rbwj.into());
     // eR = ΔRᵀ · R_bw,i · R_wb,j = lhs_r.
     let er_t = Mat3F64(*lhs_r.transpose());
-    set_block_15x15(
-        &mut j_i,
-        0,
-        9,
-        &(jr_inv * er_t * pim.d_rotation_d_bias_gyro * -1.0),
-    );
-    set_block_15x15(&mut j_j, 0, 3, &(jr_inv_rbwj * -1.0));
+    j_i.fixed_view_mut::<3, 3>(0, 9)
+        .copy_from(&(jr_inv * er_t * pim.d_rotation_d_bias_gyro * -1.0).into());
+    j_j.fixed_view_mut::<3, 3>(0, 3)
+        .copy_from(&(jr_inv_rbwj * -1.0).into());
 
-    set_block_15x15(&mut j_i, 3, 3, &(r_bw_i * SO3F64::hat(dv_world) * -1.0));
+    j_i.fixed_view_mut::<3, 3>(3, 3)
+        .copy_from(&(r_bw_i * SO3F64::hat(dv_world) * -1.0).into());
     let neg_r_bw_i = r_bw_i * -1.0;
-    set_block_15x15(&mut j_i, 3, 6, &neg_r_bw_i);
-    set_block_15x15(&mut j_i, 3, 9, &(pim.d_velocity_d_bias_gyro * -1.0));
-    set_block_15x15(&mut j_i, 3, 12, &(pim.d_velocity_d_bias_accel * -1.0));
-    set_block_15x15(&mut j_j, 3, 6, &r_bw_i);
+    j_i.fixed_view_mut::<3, 3>(3, 6)
+        .copy_from(&neg_r_bw_i.into());
+    j_i.fixed_view_mut::<3, 3>(3, 9)
+        .copy_from(&(pim.d_velocity_d_bias_gyro * -1.0).into());
+    j_i.fixed_view_mut::<3, 3>(3, 12)
+        .copy_from(&(pim.d_velocity_d_bias_accel * -1.0).into());
+    j_j.fixed_view_mut::<3, 3>(3, 6).copy_from(&r_bw_i.into());
 
-    set_block_15x15(&mut j_i, 6, 0, &r_bw_i);
+    j_i.fixed_view_mut::<3, 3>(6, 0).copy_from(&r_bw_i.into());
     // ω_i rotates R_bw,i and moves t_wb,i; together −R_bw,i · [t_wb,j − v_i·Δt − ½g·Δt²]×.
     let dp_omega_world = twb_j - *v_i * dt - *gravity * (0.5 * dt * dt);
-    set_block_15x15(
-        &mut j_i,
-        6,
-        3,
-        &(r_bw_i * SO3F64::hat(dp_omega_world) * -1.0),
-    );
-    set_block_15x15(&mut j_i, 6, 6, &(r_bw_i * -dt));
-    set_block_15x15(&mut j_i, 6, 9, &(pim.d_position_d_bias_gyro * -1.0));
-    set_block_15x15(&mut j_i, 6, 12, &(pim.d_position_d_bias_accel * -1.0));
-    set_block_15x15(&mut j_j, 6, 0, &neg_r_bw_i);
-    set_block_15x15(&mut j_j, 6, 3, &(r_bw_i * SO3F64::hat(twb_j)));
+    j_i.fixed_view_mut::<3, 3>(6, 3)
+        .copy_from(&(r_bw_i * SO3F64::hat(dp_omega_world) * -1.0).into());
+    j_i.fixed_view_mut::<3, 3>(6, 6)
+        .copy_from(&(r_bw_i * -dt).into());
+    j_i.fixed_view_mut::<3, 3>(6, 9)
+        .copy_from(&(pim.d_position_d_bias_gyro * -1.0).into());
+    j_i.fixed_view_mut::<3, 3>(6, 12)
+        .copy_from(&(pim.d_position_d_bias_accel * -1.0).into());
+    j_j.fixed_view_mut::<3, 3>(6, 0)
+        .copy_from(&neg_r_bw_i.into());
+    j_j.fixed_view_mut::<3, 3>(6, 3)
+        .copy_from(&(r_bw_i * SO3F64::hat(twb_j)).into());
 
-    set_block_15x15(&mut j_i, 9, 9, &(Mat3F64::IDENTITY * -1.0));
-    set_block_15x15(&mut j_j, 9, 9, &Mat3F64::IDENTITY);
-    set_block_15x15(&mut j_i, 12, 12, &(Mat3F64::IDENTITY * -1.0));
-    set_block_15x15(&mut j_j, 12, 12, &Mat3F64::IDENTITY);
+    for k in [9, 12] {
+        j_i.fixed_view_mut::<3, 3>(k, k).fill_diagonal(-1.0);
+        j_j.fixed_view_mut::<3, 3>(k, k).fill_diagonal(1.0);
+    }
 
     (residual, j_i, j_j)
 }
@@ -179,45 +178,35 @@ pub fn residual_and_jacobians(
 /// `omega_raw` is block-diagonal between the two (see [`information`]) and
 /// symmetric. The caller scales only the navigation block of omega by the
 /// returned weight.
-pub fn weight_and_cost(res: &[f64; 15], omega_raw: &Mat15, chi2_threshold: f64) -> (f64, f64) {
-    let block_chi2 = |range: std::ops::Range<usize>| {
-        let mut chi2 = 0.0f64;
-        for i in range.clone() {
-            for j in range.clone() {
-                chi2 += res[i] * omega_raw[idx15(i, j)] * res[j];
-            }
-        }
-        chi2
-    };
-    let (hw, nav_cost) = huber_weight_and_cost(block_chi2(0..9), Some(chi2_threshold));
-    (hw, nav_cost + 0.5 * block_chi2(9..15))
+pub fn weight_and_cost(res: &Vec15F64, omega_raw: &Mat15F64, chi2_threshold: f64) -> (f64, f64) {
+    let nav = res.fixed_rows::<9>(0);
+    let bias = res.fixed_rows::<6>(9);
+    let nav_chi2 = nav.dot(&(omega_raw.fixed_view::<9, 9>(0, 0) * nav));
+    let bias_chi2 = bias.dot(&(omega_raw.fixed_view::<6, 6>(9, 9) * bias));
+    let (hw, nav_cost) = huber_weight_and_cost(nav_chi2, Some(chi2_threshold));
+    (hw, nav_cost + 0.5 * bias_chi2)
 }
 
 /// `weight` times the full inverse of the 9×9 navigation covariance (its
-/// diagonal inverse if singular) and the diagonal bias random walk.
+/// diagonal inverse if not positive definite) and the diagonal bias random
+/// walk.
 pub fn information(pim: &PreintegratedImu, weight: f64) -> ImuInformation {
-    let mut omega = [0.0f64; 225];
+    let mut omega = Mat15F64::zeros();
 
     // Preintegration correlates rotation, velocity and position errors (gyro
     // drives all three, accel the last two), so the diagonal alone is wrong.
-    let nav_inverse = invert_9x9_f64(&pim.covariance);
-    if let Some(nav_inv) = &nav_inverse {
-        for r in 0..9 {
-            for c in 0..9 {
-                // `nav_inv` is column-major, like the covariance it inverts.
-                omega[idx15(r, c)] = weight * nav_inv[c * 9 + r];
-            }
-        }
-    } else {
-        for i in 0..9 {
-            let var = pim.covariance[i * 10];
-            omega[idx15(i, i)] = weight * if var > 1e-20 { 1.0 / var } else { 1e6 };
+    let nav_covariance = Mat9F64::from_column_slice(&pim.covariance);
+    let nav_inverse = nav_covariance.cholesky().map(|c| c.inverse());
+    let mut nav = omega.fixed_view_mut::<9, 9>(0, 0);
+    match &nav_inverse {
+        Some(nav_inv) => nav.copy_from(&(nav_inv * weight)),
+        None => {
+            nav.set_diagonal(&nav_covariance.map_diagonal(|var| weight * inverse_variance(var)))
         }
     }
 
     for i in 0..6 {
-        let var = pim.bias_covariance[i * 7];
-        omega[idx15(9 + i, 9 + i)] = weight * if var > 1e-20 { 1.0 / var } else { 1e6 };
+        omega[(9 + i, 9 + i)] = weight * inverse_variance(pim.bias_covariance[i * 7]);
     }
     ImuInformation {
         omega,
@@ -225,76 +214,9 @@ pub fn information(pim: &PreintegratedImu, weight: f64) -> ImuInformation {
     }
 }
 
-/// Inverts a column-major 9×9 matrix by Gauss-Jordan elimination with
-/// partial pivoting.
-fn invert_9x9_f64(cm: &[f64; 81]) -> Option<[f64; 81]> {
-    let mut a = [0.0f64; 81];
-    let mut inv = [0.0f64; 81];
-    for r in 0..9 {
-        for c in 0..9 {
-            a[r * 9 + c] = cm[c * 9 + r];
-        }
-        inv[r * 9 + r] = 1.0;
-    }
-    for col in 0..9 {
-        let mut max_val = a[col * 9 + col].abs();
-        let mut max_row = col;
-        for row in col + 1..9 {
-            let v = a[row * 9 + col].abs();
-            if v > max_val {
-                max_val = v;
-                max_row = row;
-            }
-        }
-        if max_val < 1e-20 {
-            return None;
-        }
-        if max_row != col {
-            for c in 0..9 {
-                a.swap(col * 9 + c, max_row * 9 + c);
-                inv.swap(col * 9 + c, max_row * 9 + c);
-            }
-        }
-        let pivot = a[col * 9 + col];
-        for c in 0..9 {
-            a[col * 9 + c] /= pivot;
-            inv[col * 9 + c] /= pivot;
-        }
-        for row in 0..9 {
-            if row == col {
-                continue;
-            }
-            let factor = a[row * 9 + col];
-            for c in 0..9 {
-                let da = a[col * 9 + c];
-                let di = inv[col * 9 + c];
-                a[row * 9 + c] -= factor * da;
-                inv[row * 9 + c] -= factor * di;
-            }
-        }
-    }
-    let mut result = [0.0f64; 81];
-    for r in 0..9 {
-        for c in 0..9 {
-            result[c * 9 + r] = inv[r * 9 + c];
-        }
-    }
-    Some(result)
-}
-
-#[inline]
-const fn idx15(row: usize, col: usize) -> usize {
-    row * 15 + col
-}
-
-#[inline]
-fn set_block_15x15(m: &mut Mat15, row: usize, col: usize, block: &Mat3F64) {
-    let cols = block.to_cols_array();
-    for c in 0..3 {
-        for r in 0..3 {
-            m[idx15(row + r, col + c)] = cols[c * 3 + r];
-        }
-    }
+/// `1 / var`, or 1e6 for a (near-)zero variance.
+fn inverse_variance(var: f64) -> f64 {
+    if var > 1e-20 { 1.0 / var } else { 1e6 }
 }
 
 #[cfg(test)]
@@ -378,7 +300,7 @@ mod tests {
                 let (up, down) = (shifted(h), shifted(-h));
                 for row in 0..15 {
                     let numeric = (up[row] - down[row]) / (2.0 * h);
-                    let analytic = jacobian[idx15(row, col)];
+                    let analytic = jacobian[(row, col)];
                     // ΔR's bias correction is first order: its Jacobian holds
                     // at the linearization bias, to O(δb_g) away from it.
                     let tol = if (9..12).contains(&col) { 1e-4 } else { 1e-6 };
@@ -401,7 +323,7 @@ mod tests {
         for r in 0..9 {
             for c in 0..9 {
                 let product: f64 = (0..9)
-                    .map(|k| info.omega[idx15(r, k)] * pim.covariance[c * 9 + k])
+                    .map(|k| info.omega[(r, k)] * pim.covariance[c * 9 + k])
                     .sum();
                 let expected = if r == c { 2.0 } else { 0.0 };
                 assert!((product - expected).abs() < 1e-6, "({r}, {c}): {product}");
@@ -414,10 +336,10 @@ mod tests {
     /// 9-14, inside and past the threshold.
     #[test]
     fn cost_gradient_is_the_weighted_gradient() {
-        let mut omega = [0.0f64; 225];
+        let mut omega = Mat15F64::zeros();
         for i in 0..9 {
             for j in 0..9 {
-                omega[i * 15 + j] = if i == j {
+                omega[(i, j)] = if i == j {
                     4.0 + i as f64
                 } else {
                     0.3 / (1.0 + (i as f64 - j as f64).abs())
@@ -425,11 +347,11 @@ mod tests {
             }
         }
         for i in 9..15 {
-            omega[i * 15 + i] = 50.0 + 10.0 * i as f64;
+            omega[(i, i)] = 50.0 + 10.0 * i as f64;
         }
         let k = 16.9;
         for scale in [0.05, 3.0] {
-            let res: [f64; 15] = std::array::from_fn(|i| {
+            let res = Vec15F64::from_fn(|i, _| {
                 scale * (0.4 + 0.1 * i as f64) * if i % 2 == 0 { 1.0 } else { -1.0 }
             });
             let (w, _) = weight_and_cost(&res, &omega, k);
@@ -445,7 +367,7 @@ mod tests {
                 let numeric = (weight_and_cost(&up, &omega, k).1
                     - weight_and_cost(&down, &omega, k).1)
                     / (2.0 * h);
-                let omega_r: f64 = (0..15).map(|m| omega[d * 15 + m] * res[m]).sum();
+                let omega_r = (omega * res)[d];
                 let analytic = if d < 9 { w * omega_r } else { omega_r };
                 assert!(
                     (numeric - analytic).abs() <= 1e-5 * analytic.abs().max(1.0),

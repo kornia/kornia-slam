@@ -5,10 +5,7 @@
 //! check, so these live here until it gains an f64 SE(3).
 
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
-
-/// 6×6 row-major block over the pose tangent `[ρ; ω]`.
-pub type Mat6 = [[f64; 6]; 6];
+use kornia_algebra::{Mat3F64, Mat6F64, SMatF64, SO3F64, Vec3F64, Vec6F64};
 
 /// `r = Log(Δ⁻¹ · T_cb_from⁻¹ · T_cw_i · T_cw_j⁻¹ · T_cb_to)` and its
 /// Jacobian wrt keyframe i's pose, `J_l⁻¹(r) · Ad(A)` with
@@ -21,53 +18,29 @@ pub fn relative_pose_residual(
     t_cb_from: &Pose3d,
     t_cb_to: &Pose3d,
     delta: &Pose3d,
-) -> ([f64; 6], Mat6) {
+) -> (Vec6F64, Mat6F64) {
     let t_bw_i = t_cb_from.inverse().compose(pose_cw_i);
     let t_wb_j = pose_cw_j.inverse().compose(t_cb_to);
     let a = delta.inverse().compose(&t_bw_i);
     let r = log(&a.compose(&t_wb_j));
-    (r, mat6_mul(&left_jacobian_inverse(&r), &adjoint(&a)))
-}
-
-/// `vᵀ M v`.
-pub fn quadratic_form(m: &Mat6, v: &[f64; 6]) -> f64 {
-    (0..6)
-        .map(|a| (0..6).map(|b| v[a] * m[a][b] * v[b]).sum::<f64>())
-        .sum()
-}
-
-fn mat6_mul(a: &Mat6, b: &Mat6) -> Mat6 {
-    let mut out = [[0.0; 6]; 6];
-    for (r, row) in out.iter_mut().enumerate() {
-        for (c, x) in row.iter_mut().enumerate() {
-            *x = (0..6).map(|k| a[r][k] * b[k][c]).sum();
-        }
-    }
-    out
-}
-
-fn set_block(m: &mut Mat6, row: usize, col: usize, block: &Mat3F64) {
-    let cols = block.to_cols_array();
-    for c in 0..3 {
-        for r in 0..3 {
-            m[row + r][col + c] = cols[c * 3 + r];
-        }
-    }
+    (r, left_jacobian_inverse(&r) * adjoint(&a))
 }
 
 /// `[ρ; ω]` with `T = Exp(ρ, ω)`, translation `J_l(ω)·ρ`.
-fn log(t: &Pose3d) -> [f64; 6] {
+fn log(t: &Pose3d) -> Vec6F64 {
     let omega = SO3F64::from_matrix(&t.rotation).log();
     let rho = SO3F64::left_jacobian(omega).inverse() * t.translation;
-    [rho.x, rho.y, rho.z, omega.x, omega.y, omega.z]
+    Vec6F64::new(rho.x, rho.y, rho.z, omega.x, omega.y, omega.z)
 }
 
 /// `Ad(T) = [[R, t^R], [0, R]]` for the `[ρ; ω]` tangent order.
-fn adjoint(t: &Pose3d) -> Mat6 {
-    let mut ad = [[0.0; 6]; 6];
-    set_block(&mut ad, 0, 0, &t.rotation);
-    set_block(&mut ad, 0, 3, &(SO3F64::hat(t.translation) * t.rotation));
-    set_block(&mut ad, 3, 3, &t.rotation);
+fn adjoint(t: &Pose3d) -> Mat6F64 {
+    let r: SMatF64<3, 3> = t.rotation.into();
+    let mut ad = Mat6F64::zeros();
+    ad.fixed_view_mut::<3, 3>(0, 0).copy_from(&r);
+    ad.fixed_view_mut::<3, 3>(0, 3)
+        .copy_from(&(SO3F64::hat(t.translation) * t.rotation).into());
+    ad.fixed_view_mut::<3, 3>(3, 3).copy_from(&r);
     ad
 }
 
@@ -75,15 +48,17 @@ fn adjoint(t: &Pose3d) -> Mat6 {
 /// `J` the SO(3) left Jacobian and `Q` from Barfoot, *State Estimation for
 /// Robotics*, eq. 7.86. The f32 `SE3F32::left_jacobian` is not used: its last
 /// Q coefficient divides `(θ − sin θ)/θ³` by θ⁵ again.
-fn left_jacobian_inverse(xi: &[f64; 6]) -> Mat6 {
+fn left_jacobian_inverse(xi: &Vec6F64) -> Mat6F64 {
     let rho = Vec3F64::new(xi[0], xi[1], xi[2]);
     let omega = Vec3F64::new(xi[3], xi[4], xi[5]);
     let j_inv = SO3F64::left_jacobian(omega).inverse();
     let q = barfoot_q(rho, omega);
-    let mut out = [[0.0; 6]; 6];
-    set_block(&mut out, 0, 0, &j_inv);
-    set_block(&mut out, 0, 3, &(j_inv * q * j_inv * -1.0));
-    set_block(&mut out, 3, 3, &j_inv);
+    let j_inv_block: SMatF64<3, 3> = j_inv.into();
+    let mut out = Mat6F64::zeros();
+    out.fixed_view_mut::<3, 3>(0, 0).copy_from(&j_inv_block);
+    out.fixed_view_mut::<3, 3>(0, 3)
+        .copy_from(&(j_inv * q * j_inv * -1.0).into());
+    out.fixed_view_mut::<3, 3>(3, 3).copy_from(&j_inv_block);
     out
 }
 
@@ -133,16 +108,16 @@ mod tests {
             let pose_j = if k % 2 == 0 {
                 rng.pose(3.0, 1.0)
             } else {
-                pose_i.compose(&exp(&std::array::from_fn(|_| rng.next() * 3e-3)))
+                pose_i.compose(&exp(&Vec6F64::from_fn(|_, _| rng.next() * 3e-3)))
             };
             let res = |a: &Pose3d, b: &Pose3d| relative_pose_residual(a, b, &id, &id, &id);
             let (r, j_i) = res(&pose_i, &pose_j);
             let direct = log(&pose_i.compose(&pose_j.inverse()));
-            for (a, b) in r.iter().zip(direct) {
+            for (a, b) in r.iter().zip(direct.iter()) {
                 assert!((a - b).abs() < 1e-12);
             }
             let ad = adjoint(&pose_i);
-            let expected = mat6_mul(&left_jacobian_inverse(&r), &ad);
+            let expected = left_jacobian_inverse(&r) * ad;
             assert_eq!(j_i, expected);
             for c in 0..6 {
                 let (pi, mi) = (
@@ -156,8 +131,8 @@ mod tests {
                 for row in 0..6 {
                     let num_i = (pi[row] - mi[row]) / (2.0 * EPS);
                     let num_j = (pj[row] - mj[row]) / (2.0 * EPS);
-                    assert!((j_i[row][c] - num_i).abs() <= 1e-6, "i ({row},{c})");
-                    assert!((-j_i[row][c] - num_j).abs() <= 1e-6, "j ({row},{c})");
+                    assert!((j_i[(row, c)] - num_i).abs() <= 1e-6, "i ({row},{c})");
+                    assert!((-j_i[(row, c)] - num_j).abs() <= 1e-6, "j ({row},{c})");
                 }
             }
         }
@@ -172,19 +147,19 @@ mod tests {
         for theta in [5e-3, 9e-3, 0.5, 2.5] {
             let rho = rng.vec3(10.0);
             let axis = rng.vec3(1.0).normalize();
-            let xi = [
+            let xi = Vec6F64::new(
                 rho.x,
                 rho.y,
                 rho.z,
                 axis.x * theta,
                 axis.y * theta,
                 axis.z * theta,
-            ];
+            );
             let t = exp(&xi);
             let j_inv = left_jacobian_inverse(&xi);
             for k in 0..6 {
                 let log_at = |e: f64| {
-                    let mut d = [0.0; 6];
+                    let mut d = Vec6F64::zeros();
                     d[k] = e;
                     log(&exp(&d).compose(&t))
                 };
@@ -192,9 +167,9 @@ mod tests {
                 for row in 0..6 {
                     let num = (p[row] - m[row]) / (2.0 * EPS);
                     assert!(
-                        (j_inv[row][k] - num).abs() <= 1e-6,
+                        (j_inv[(row, k)] - num).abs() <= 1e-6,
                         "θ={theta} ({row},{k}): {} vs {num}",
-                        j_inv[row][k]
+                        j_inv[(row, k)]
                     );
                 }
             }
