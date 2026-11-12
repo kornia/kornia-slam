@@ -12,6 +12,7 @@ use crate::mapping::map::StateEnvelope;
 use crate::mapping::marginalization::BoundaryPrior;
 use crate::mapping::vi_ba_schur::ImuHuber;
 use crate::mapping::visual_information::VisualInformation;
+use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::{KeyframeObservations, MapProjectionConfig};
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
@@ -125,6 +126,8 @@ pub struct OrbFrontendConfig {
     /// cameras, within [`OrbFrontendConfig::N_KEYPOINTS_RANGE`]; `None` uses
     /// `n_keypoints`.
     pub secondary_n_keypoints: Option<usize>,
+    /// The pyramidal LK implementation optical flow runs on.
+    pub klt_kernel: LkKernel,
 }
 
 /// Optical flow from a trusted inertial prediction: each track starts at
@@ -203,6 +206,7 @@ impl Default for OrbFrontendConfig {
             klt_first: KltFirst::default(),
             klt_prediction: KltPrediction::default(),
             secondary_n_keypoints: None,
+            klt_kernel: LkKernel::FixedPointU8,
         }
     }
 }
@@ -419,6 +423,9 @@ impl fmt::Display for SystemConfig {
         let FrontendConfig::Orb(frontend) = orb.frontend;
         writeln!(f, "OrbSlam pipeline (config version {})", self.version)?;
         writeln!(f, "  frontend: ORB, {} keypoints", frontend.n_keypoints)?;
+        if frontend.klt_kernel == LkKernel::FixedPointU8 {
+            writeln!(f, "  klt kernel: fixed-point u8")?;
+        }
         if let Some(n) = frontend.secondary_n_keypoints {
             writeln!(f, "  secondary cameras: {n} keypoints")?;
         }

@@ -11,6 +11,7 @@ use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabular
 use crate::loop_closure::{LoopCloser, LoopClosingConfig, LoopSolver};
 use crate::mapping::LocalMappingMode;
 use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
+use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
@@ -45,6 +46,7 @@ pub(crate) struct SystemSettings {
     /// `(max_level, max_iter)` of the optical-flow search from a trusted
     /// prediction; `None` keeps the full search.
     pub klt_prediction: Option<(usize, usize)>,
+    pub klt_kernel: LkKernel,
 }
 
 impl SensorSelection {
@@ -134,6 +136,7 @@ impl SystemConfig {
                 .klt_first
                 .min_tracks()
                 .filter(|_| !rig.is_multi_camera()),
+            klt_kernel: frontend.klt_kernel,
             klt_prediction: frontend
                 .klt_prediction
                 .search()

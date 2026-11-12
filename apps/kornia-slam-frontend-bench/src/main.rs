@@ -36,6 +36,9 @@ struct Args {
     /// ORB keypoints of every other image (default: --n-keypoints)
     #[argh(option)]
     secondary_keypoints: Option<usize>,
+    /// LK kernel: f32 (default) or u8 (fixed point)
+    #[argh(option, default = "String::from(\"f32\")")]
+    lk_kernel: String,
     /// first traced frame index to replay
     #[argh(option, default = "0")]
     first: usize,
@@ -73,6 +76,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keypoints = Keypoints {
         primary: args.n_keypoints,
         secondary: args.secondary_keypoints.unwrap_or(args.n_keypoints),
+        lk_kernel: match args.lk_kernel.as_str() {
+            "u8" => kornia_slam::tracking::optical_flow::LkKernel::FixedPointU8,
+            "f32" => kornia_slam::tracking::optical_flow::LkKernel::F32,
+            _ => return Err("--lk-kernel must be `f32` or `u8`".into()),
+        },
     };
     let mut pipeline = Pipeline::new(
         &trace,
