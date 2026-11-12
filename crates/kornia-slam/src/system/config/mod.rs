@@ -116,6 +116,10 @@ pub struct OrbFrontendConfig {
     pub klt_first: KltFirst,
     /// Optical-flow search when the inertial prediction is trusted.
     pub klt_prediction: KltPrediction,
+    /// Keypoints per image for the stereo right image and non-primary rig
+    /// cameras, within [`OrbFrontendConfig::N_KEYPOINTS_RANGE`]; `None` uses
+    /// `n_keypoints`.
+    pub secondary_n_keypoints: Option<usize>,
 }
 
 /// Optical flow from a trusted inertial prediction: each track starts at
@@ -192,6 +196,7 @@ impl Default for OrbFrontendConfig {
             stereo_close_depth: StereoCloseDepth::default(),
             klt_first: KltFirst::default(),
             klt_prediction: KltPrediction::default(),
+            secondary_n_keypoints: None,
         }
     }
 }
@@ -330,6 +335,9 @@ impl fmt::Display for SystemConfig {
         let FrontendConfig::Orb(frontend) = orb.frontend;
         writeln!(f, "OrbSlam pipeline (config version {})", self.version)?;
         writeln!(f, "  frontend: ORB, {} keypoints", frontend.n_keypoints)?;
+        if let Some(n) = frontend.secondary_n_keypoints {
+            writeln!(f, "  secondary cameras: {n} keypoints")?;
+        }
         if let Some(min_tracks) = frontend.klt_first.min_tracks() {
             writeln!(
                 f,

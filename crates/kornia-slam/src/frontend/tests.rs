@@ -323,3 +323,40 @@ fn a_rig_frame_splits_features_per_camera_and_keeps_depth_empty() {
         depths.len()
     );
 }
+
+#[test]
+fn secondary_cameras_take_their_own_keypoint_budget() {
+    let camera = pinhole(240.0, 240.0, 188.0, 120.0);
+    let size = ImageSize {
+        width: 376,
+        height: 240,
+    };
+    let view = |primary_from_camera| kornia_sensors::RigCamera {
+        camera: camera.clone(),
+        size,
+        primary_from_camera,
+    };
+    let rig = SensorRig::new(camera.clone()).with_rig_cameras(vec![
+        view(Pose3d::IDENTITY),
+        view(Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            kornia_algebra::Vec3F64::new(0.11, 0.0, 0.0),
+        )),
+    ]);
+    let (left, right) = synthetic_pair(376, 240, 8);
+    let full = OrbFrontend::new(OrbDetector::default(), &rig)
+        .prepare_rig(1, &[&left, &right])
+        .unwrap();
+    // ORB's budget is a per-level target, not a hard cap: compare counts.
+    let capped = OrbFrontend::new(OrbDetector::default(), &rig)
+        .with_secondary_keypoints(100)
+        .prepare_rig(1, &[&left, &right])
+        .unwrap();
+
+    assert_eq!(capped.rig.camera_ranges[0], full.rig.camera_ranges[0]);
+    let (n, n_full) = (
+        capped.rig.camera_ranges[1].len(),
+        full.rig.camera_ranges[1].len(),
+    );
+    assert!(n < n_full / 2, "{n} of {n_full}");
+}

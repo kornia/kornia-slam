@@ -163,7 +163,8 @@ impl SlamSystem {
         config.validate()?;
         let rig = config.sensors.select_rig(rig)?;
         let settings = config.settings(&rig);
-        let frontend = OrbFrontend::new(config.orb_detector(), &rig);
+        let frontend = OrbFrontend::new(config.orb_detector(), &rig)
+            .with_secondary_keypoints(config.secondary_n_keypoints());
         let loop_closer = config.loop_closer(&rig)?;
         Ok(Self::assemble(rig, settings, frontend, loop_closer))
     }

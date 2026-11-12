@@ -42,6 +42,8 @@ pub struct FrontendObservation {
 /// ORB extraction plus the rig-specific preparation tracking expects.
 pub(crate) struct OrbFrontend {
     detector: OrbDetector,
+    /// For the stereo right image and non-primary rig cameras.
+    secondary: OrbDetector,
     stereo: Option<StereoMatchConfig>,
     fisheye: Option<FisheyeMapping>,
     rig: Option<Arc<RigGeometry>>,
@@ -66,12 +68,19 @@ impl OrbFrontend {
             min_bearing_z: MAX_INCIDENCE_DEG.to_radians().cos(),
         });
         Self {
+            secondary: with_keypoints(&detector, detector.n_keypoints),
             detector,
             stereo,
             fisheye,
             rig: RigGeometry::from_rig(rig).map(Arc::new),
             observation: FrontendObservation::default(),
         }
+    }
+
+    /// Extracts `n_keypoints` on every image but the primary.
+    pub(crate) fn with_secondary_keypoints(mut self, n_keypoints: usize) -> Self {
+        self.secondary = with_keypoints(&self.detector, n_keypoints);
+        self
     }
 
     pub(crate) fn observation(&self) -> &FrontendObservation {
@@ -99,7 +108,7 @@ impl OrbFrontend {
     ) -> Result<Frame, ImageError> {
         let start = Instant::now();
         self.observation.orb_per_camera.clear();
-        let features = self.timed_orb(image)?;
+        let features = self.timed_orb(image, false)?;
         self.observation.overlap = Duration::ZERO;
         Ok(self.finish_frame(idx, image, features, None, start))
     }
@@ -116,11 +125,11 @@ impl OrbFrontend {
         let start = Instant::now();
         self.observation.orb_per_camera.clear();
         self.observation.overlap = Duration::ZERO;
-        let features = self.timed_orb(left)?;
+        let features = self.timed_orb(left, false)?;
         let Some(config) = self.stereo.clone() else {
             return Ok(self.finish_frame(idx, left, features, None, start));
         };
-        let right_features = self.timed_orb(right)?;
+        let right_features = self.timed_orb(right, true)?;
         let overlap_start = Instant::now();
         let left_pyramid = self.build_pyramid(left)?;
         let right_pyramid = self.build_pyramid(right)?;
@@ -159,8 +168,8 @@ impl OrbFrontend {
         let mut camera_ranges = Vec::with_capacity(images.len());
         let mut keypoint_colors = Vec::new();
         self.observation.orb_per_camera.clear();
-        for image in images {
-            let camera_features = self.timed_orb(image)?;
+        for (camera, image) in images.iter().enumerate() {
+            let camera_features = self.timed_orb(image, camera > 0)?;
             let begin = features.keypoints_xy.len();
             keypoint_colors.extend(sample_colors(image, &camera_features.keypoints_xy));
             features.keypoints_xy.extend(camera_features.keypoints_xy);
@@ -200,9 +209,18 @@ impl OrbFrontend {
     }
 
     /// ORB on one image, its time appended to `orb_per_camera`.
-    fn timed_orb(&mut self, image: &Image<u8, 1>) -> Result<OrbFeatures, ImageError> {
+    fn timed_orb(
+        &mut self,
+        image: &Image<u8, 1>,
+        secondary: bool,
+    ) -> Result<OrbFeatures, ImageError> {
         let start = Instant::now();
-        let features = self.detector.detect_and_extract_u8(image)?;
+        let detector = if secondary {
+            &self.secondary
+        } else {
+            &self.detector
+        };
+        let features = detector.detect_and_extract_u8(image)?;
         self.observation.orb_per_camera.push(start.elapsed());
         Ok(features)
     }
@@ -310,6 +328,21 @@ impl FisheyeMapping {
         features.orientations = orientations;
         features.descriptors = descriptors;
         features.octaves = octaves;
+    }
+}
+
+/// `detector`'s settings with another keypoint budget (`OrbDetector` is not
+/// `Clone`).
+fn with_keypoints(detector: &OrbDetector, n_keypoints: usize) -> OrbDetector {
+    OrbDetector {
+        n_keypoints,
+        fast_n: detector.fast_n,
+        ini_fast_threshold: detector.ini_fast_threshold,
+        min_fast_threshold: detector.min_fast_threshold,
+        harris_k: detector.harris_k,
+        downscale: detector.downscale,
+        n_scales: detector.n_scales,
+        cell_size: detector.cell_size,
     }
 }
 

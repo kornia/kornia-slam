@@ -688,6 +688,7 @@ mod ron_files {
             stereo_close_depth: StereoCloseDepth::Metres(4.0),
             klt_first: KltFirst::Enabled { min_tracks: 120 },
             klt_prediction: KltPrediction::Disabled,
+            secondary_n_keypoints: Some(500),
         });
         settings.keyframes.ref_ratio = 0.75;
         settings.mapping.execution = LocalMappingMode::Synchronous;
@@ -703,6 +704,7 @@ mod ron_files {
                 stereo_close_depth: StereoCloseDepth::Metres(4.0),
                 klt_first: KltFirst::Enabled { min_tracks: 120 },
                 klt_prediction: KltPrediction::Disabled,
+                secondary_n_keypoints: Some(500),
             })
         );
     }

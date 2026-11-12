@@ -95,12 +95,14 @@ fn validate_tuning(tuning: &OrbTuning, loop_closing: bool) -> Result<(), ConfigE
 impl OrbFrontendConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         let range = Self::N_KEYPOINTS_RANGE;
-        if !range.contains(&self.n_keypoints) {
-            return Err(ConfigError::KeypointsOutOfRange {
-                value: self.n_keypoints,
-                min: *range.start(),
-                max: *range.end(),
-            });
+        for n in std::iter::once(self.n_keypoints).chain(self.secondary_n_keypoints) {
+            if !range.contains(&n) {
+                return Err(ConfigError::KeypointsOutOfRange {
+                    value: n,
+                    min: *range.start(),
+                    max: *range.end(),
+                });
+            }
         }
         if let Some((_, max_iter)) = self.klt_prediction.search() {
             check(

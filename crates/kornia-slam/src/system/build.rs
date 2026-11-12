@@ -97,6 +97,14 @@ impl SystemConfig {
         }
     }
 
+    /// Keypoints for every image but the primary.
+    pub(crate) fn secondary_n_keypoints(&self) -> usize {
+        let FrontendConfig::Orb(frontend) = self.orb().frontend;
+        frontend
+            .secondary_n_keypoints
+            .unwrap_or(frontend.n_keypoints)
+    }
+
     /// Feature extractor settings for the configured frontend.
     pub(crate) fn orb_detector(&self) -> OrbDetector {
         let FrontendConfig::Orb(frontend) = self.orb().frontend;
