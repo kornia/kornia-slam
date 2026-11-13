@@ -23,7 +23,7 @@ use evaluation::associate_gt;
 use kornia_algebra::{SO3F64, Vec3F64};
 use kornia_slam::loop_closure::{LoopOdometryGate, LoopTemporalConsistency};
 use kornia_slam::system::PipelineDefinition;
-use kornia_slam::{LoopClosureEvent, SlamSystem};
+use kornia_slam::{LoopClosureEvent, SkipKind, SlamSystem};
 use source::{FrameItem, OpenedSource};
 use std::time::{Duration, Instant};
 use utils::trajectory_point_from_pose;
@@ -55,6 +55,11 @@ struct Args {
     /// the camera pose (the LaMAria estimate format)
     #[argh(option)]
     trajectory_out: Option<String>,
+
+    /// like --trajectory-out, for the frames skipped while coasting on the
+    /// IMU prediction instead; kept apart so the scored file is unchanged
+    #[argh(option)]
+    trajectory_coasted: Option<String>,
 
     /// like --trajectory-out, written at shutdown with each frame re-anchored
     /// to its reference keyframe's final pose (ORB-SLAM3's SaveTrajectoryEuRoC)
@@ -159,6 +164,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let camera = system.rig().camera.clone();
     let mut trajectory_out = args
         .trajectory_out
+        .as_deref()
+        .map(|path| {
+            trajectory::TrajectoryWriter::create(
+                std::path::Path::new(path),
+                system.rig().camera_to_body(),
+            )
+        })
+        .transpose()?;
+    let mut trajectory_coasted = args
+        .trajectory_coasted
         .as_deref()
         .map(|path| {
             trajectory::TrajectoryWriter::create(
@@ -319,6 +334,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             writer.write(timestamp_sec, &result.pose_world_to_cam)?;
         }
+        if let Some(writer) = trajectory_coasted.as_mut()
+            && is_inertial_coast(system.last_skip())
+        {
+            writer.write(timestamp_sec, &result.pose_world_to_cam)?;
+        }
         if let Some(smoothed) = smoothed.as_mut()
             && result.status != kornia_slam::TrackingStatus::Skipped
             && let Some(reference_kf) = system.current_keyframe_idx()
@@ -414,6 +434,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(writer) = trajectory_out {
         writer.finish()?;
     }
+    if let Some(writer) = trajectory_coasted {
+        writer.finish()?;
+    }
     if let (Some(smoothed), Some(path)) = (smoothed, args.trajectory_smoothed.as_deref()) {
         let writer = trajectory::TrajectoryWriter::create(
             std::path::Path::new(path),
@@ -435,6 +458,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     Ok(())
+}
+
+/// Bootstrap skips hold the pose from before the loss and a visual coast has
+/// no metric motion, so only an inertial coast is a usable estimate.
+fn is_inertial_coast(skip: Option<SkipKind>) -> bool {
+    skip == Some(SkipKind::Coasting { inertial: true })
 }
 
 #[cfg(test)]
@@ -459,5 +488,26 @@ mod cli_tests {
         let args = parse(&["--config", "r.ron", "--evaluate", "--eval-out", "out"]).unwrap();
         assert!(args.evaluate);
         assert_eq!(args.eval_out, "out");
+    }
+
+    #[test]
+    fn only_inertial_coasts_go_to_the_coasted_trajectory() {
+        let args = parse(&["--config", "r.ron", "--trajectory-coasted", "c.tum"]).unwrap();
+        assert_eq!(args.trajectory_coasted.as_deref(), Some("c.tum"));
+        assert!(
+            parse(&["--config", "r.ron"])
+                .unwrap()
+                .trajectory_coasted
+                .is_none()
+        );
+
+        assert!(is_inertial_coast(Some(SkipKind::Coasting {
+            inertial: true
+        })));
+        assert!(!is_inertial_coast(Some(SkipKind::Coasting {
+            inertial: false
+        })));
+        assert!(!is_inertial_coast(Some(SkipKind::Bootstrap)));
+        assert!(!is_inertial_coast(None));
     }
 }
