@@ -12,6 +12,7 @@ mod file;
 mod input;
 mod state;
 mod validation;
+pub mod wheel;
 
 pub use build::BuildError;
 pub use config::{
@@ -99,6 +100,10 @@ pub struct SlamSystem {
     next_frame_idx: usize,
     counters: RunCounters,
     last_skip: Option<SkipKind>,
+    // Wheel-odometry readings and the keyframe edges built from them, when enabled.
+    wheel: Option<wheel::WheelState>,
+    // The keyframe bound and the culling that enforces it first, when set.
+    map_bound: Option<(usize, crate::mapping::culling::KeyframeCullingConfig)>,
 }
 
 impl SlamSystem {
@@ -149,6 +154,98 @@ impl SlamSystem {
             next_frame_idx: 0,
             counters: RunCounters::default(),
             last_skip: None,
+            wheel: None,
+            map_bound: None,
+        }
+    }
+
+    /// Holds the map to `max_keyframes` after each keyframe: redundant keyframes are culled first,
+    /// then the oldest evicted (see [`crate::mapping::culling::bound_keyframes`]). Unbounded until
+    /// called; a bounded map trades loops past the bound for a per-frame cost that stops growing.
+    pub fn set_map_bound(
+        &mut self,
+        max_keyframes: usize,
+        culling: crate::mapping::culling::KeyframeCullingConfig,
+    ) {
+        self.map_bound = Some((max_keyframes, culling));
+    }
+
+    /// Runs inside a frame, which already holds the map publication gate.
+    fn enforce_map_bound(&mut self) {
+        let Some((max_keyframes, culling)) = self.map_bound.clone() else {
+            return;
+        };
+        let report = {
+            let mut map = self.map.lock().unwrap();
+            let wheel_factors = self.wheel.as_mut().map(|w| w.factors_mut());
+            crate::mapping::culling::bound_keyframes(
+                &mut map,
+                max_keyframes,
+                &culling,
+                wheel_factors,
+            )
+        };
+        if report.culled.is_empty() && report.evicted.is_empty() {
+            return;
+        }
+        if let Some(loop_closer) = self.loop_closer.as_mut() {
+            loop_closer.forget_keyframes(report.removed());
+        }
+        self.dbg(format!(
+            "[map_bound] culled={} evicted={} (bound {max_keyframes})",
+            report.culled.len(),
+            report.evicted.len()
+        ));
+    }
+
+    /// Adds wheel odometry to local BA: each keyframe interval the readings cover becomes a
+    /// planar [`crate::mapping::wheel_odom::WheelOdomFactor`]. Off until called, and with no
+    /// effect on a system that is never given readings.
+    pub fn enable_wheel_odometry(&mut self, config: wheel::WheelOdomConfig) {
+        self.wheel = Some(wheel::WheelState::new(config));
+    }
+
+    /// Feeds wheel readings, stamped in nanoseconds on the same origin as the frame timestamps
+    /// (`timestamp_sec * 1e9`). Returns how many were kept; ignored while wheels are off.
+    pub fn process_wheel_odometry(
+        &mut self,
+        samples: impl IntoIterator<Item = wheel::WheelSample>,
+    ) -> usize {
+        self.wheel.as_mut().map_or(0, |w| w.push(samples))
+    }
+
+    /// The base-to-camera transform (`X_cam = t_cb * X_base`) from `stamp_ns` on, for a camera
+    /// whose mount moves (a tilting head). Ignored while wheels are off.
+    pub fn push_camera_mount(
+        &mut self,
+        stamp_ns: u64,
+        t_cb: Pose3d,
+    ) -> Result<(), wheel::WheelError> {
+        match self.wheel.as_mut() {
+            Some(w) => w.push_mount(stamp_ns, t_cb),
+            None => Ok(()),
+        }
+    }
+
+    fn wheel_factors(&self) -> Vec<crate::mapping::wheel_odom::WheelOdomFactor> {
+        self.wheel
+            .as_ref()
+            .map_or_else(Vec::new, |w| w.factors().to_vec())
+    }
+
+    /// Closes the wheel interval ending at keyframe `to_idx`, or queues it until the readings
+    /// cover it. `prev` is the previous keyframe and its timestamp.
+    fn note_wheel_keyframe(&mut self, prev: Option<(usize, f64)>, to_idx: usize, to_sec: f64) {
+        let Some(w) = self.wheel.as_mut() else {
+            return;
+        };
+        let to_ns = |t: f64| (t.max(0.0) * 1e9).round() as u64;
+        let added = w.on_keyframe(prev.map(|(i, t)| (i, to_ns(t))), to_idx, to_ns(to_sec));
+        for (f, path_m) in added {
+            self.dbg(format!(
+                "[wheel] edge {}->{} path={path_m:.3}m",
+                f.from_idx, f.to_idx
+            ));
         }
     }
 
@@ -691,6 +788,9 @@ impl SlamSystem {
                 health.valid_in_both, health.median_depth_older_kf, MIN_VALID_POINTS,
             ));
             self.map.lock().unwrap().clear_active();
+            if let Some(w) = self.wheel.as_mut() {
+                w.reset_map();
+            }
             self.state.reset();
             return self.frame_result(TrackingStatus::Skipped);
         }
@@ -916,6 +1016,7 @@ impl SlamSystem {
             imu_initialized: true,
             imu_t_bc: self.rig.camera_to_body(),
             gravity_world: self.inertial.gravity_world,
+            wheel_factors: self.wheel_factors(),
             local_ba: self.local_ba,
         }) {
             self.dbg("[local_mapping] worker is unavailable".into());
@@ -1306,6 +1407,10 @@ impl SlamSystem {
         }
         let imu_initialized = self.state.imu_initialized;
         let is_stereo = curr_kf.frame.is_stereo();
+        let prev_keyframe = self
+            .state
+            .last_keyframe_idx
+            .zip(self.inertial.last_keyframe_timestamp_sec);
 
         // Neighbours are captured BEFORE publication: growing against a list
         // that already contains the current keyframe would triangulate it
@@ -1359,6 +1464,7 @@ impl SlamSystem {
 
         self.state.current_keyframe_idx = Some(frame.idx);
         self.state.last_keyframe_idx = Some(frame.idx);
+        self.note_wheel_keyframe(prev_keyframe, frame.idx, timestamp_sec);
 
         // Optional mapping work the accepted keyframe earns: grow against the
         // captured neighbours, then forward SearchInNeighbors / Fuse, before
@@ -1383,6 +1489,7 @@ impl SlamSystem {
             imu_initialized,
             imu_t_bc: self.rig.camera_to_body(),
             gravity_world: self.inertial.gravity_world,
+            wheel_factors: self.wheel_factors(),
             local_ba: self.local_ba,
         }) {
             self.dbg("[local_mapping] worker is unavailable".into());
@@ -1392,6 +1499,7 @@ impl SlamSystem {
         self.apply_local_mapping_results();
 
         self.register_place_recognition(frame.idx);
+        self.enforce_map_bound();
 
         true
     }
@@ -1555,6 +1663,7 @@ impl SlamSystem {
                     imu_initialized: true,
                     imu_t_bc: self.rig.camera_to_body(),
                     gravity_world: self.inertial.gravity_world,
+                    wheel_factors: self.wheel_factors(),
                     local_ba: self.local_ba,
                 }) {
                     self.dbg("[local_mapping] worker is unavailable after PGO".into());

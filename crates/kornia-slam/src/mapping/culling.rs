@@ -246,6 +246,44 @@ pub fn cull_redundant_keyframes(
     report
 }
 
+/// What [`bound_keyframes`] removed: the redundant keyframes it culled first, then the oldest it
+/// evicted to reach the bound.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KeyframeBoundReport {
+    pub culled: Vec<usize>,
+    pub evicted: Vec<usize>,
+}
+
+impl KeyframeBoundReport {
+    /// Every keyframe removed, culled then evicted.
+    pub fn removed(&self) -> impl Iterator<Item = usize> + '_ {
+        self.culled.iter().chain(&self.evicted).copied()
+    }
+}
+
+/// Holds the map to `max_keyframes`: redundant keyframes go first
+/// ([`cull_redundant_keyframes`]), and only if that is not enough the oldest
+/// ([`evict_oldest_keyframes`]). A map at or under the bound is left alone.
+/// Wheel edges touching a removed keyframe are composed or dropped with it.
+pub fn bound_keyframes(
+    map: &mut Map,
+    max_keyframes: usize,
+    culling: &KeyframeCullingConfig,
+    mut wheel_factors: Option<&mut Vec<WheelOdomFactor>>,
+) -> KeyframeBoundReport {
+    let mut report = KeyframeBoundReport::default();
+    if map.keyframes().len() <= max_keyframes {
+        return report;
+    }
+    report.culled =
+        cull_redundant_keyframes(map, culling, wheel_factors.as_deref_mut(), None).removed;
+    if map.keyframes().len() > max_keyframes {
+        report.evicted = evict_oldest_keyframes(map, max_keyframes, wheel_factors, None).evicted;
+    }
+    report
+}
+
 /// What [`evict_oldest_keyframes`] did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
