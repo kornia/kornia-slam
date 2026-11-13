@@ -50,6 +50,19 @@ pub struct LocalBaParams {
     /// Bounds a VI-BA result must stay inside to be written back.
     pub state_envelope: StateEnvelope,
     pub lost_keyframes: LostKeyframes,
+    pub visual_kernel: VisualKernel,
+}
+
+/// Robust kernel of the visual-only local BA.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum VisualKernel {
+    /// Plain least squares: every observation pulls at full weight.
+    #[default]
+    L2,
+    /// VI-BA's Huber knees. Tracked matches reach keyframes unfiltered, so
+    /// this bounds the pull of each mismatch.
+    Huber,
 }
 
 /// How VI-BA treats keyframes inserted while tracking was lost.
@@ -76,6 +89,7 @@ impl Default for LocalBaParams {
             visual_information: VisualInformation::Unit,
             state_envelope: StateEnvelope::Off,
             lost_keyframes: LostKeyframes::Free,
+            visual_kernel: VisualKernel::L2,
         }
     }
 }
@@ -383,14 +397,17 @@ pub fn run_local_ba_with(
         return update;
     }
 
-    // Tracked matches reach keyframes unfiltered, so a plain L2 solve lets
-    // every mismatch pull the window; same kernel as VI-BA.
-    let vi_defaults = ViBaParams::default();
-    let ba_params = BaParams {
-        robust: RobustKernelKind::Huber,
-        robust_scale_sq: vi_defaults.huber_reproj_px_sq as f32,
-        depth_robust_scale_sq: vi_defaults.huber_depth_sigma_sq as f32,
-        ..BaParams::default()
+    let ba_params = match params.visual_kernel {
+        VisualKernel::L2 => BaParams::default(),
+        VisualKernel::Huber => {
+            let vi_defaults = ViBaParams::default();
+            BaParams {
+                robust: RobustKernelKind::Huber,
+                robust_scale_sq: vi_defaults.huber_reproj_px_sq as f32,
+                depth_robust_scale_sq: vi_defaults.huber_depth_sigma_sq as f32,
+                ..BaParams::default()
+            }
+        }
     };
     let ba_result =
         match bundle_adjust_schur(&poses, &window.positions, &observations, camera, &ba_params) {

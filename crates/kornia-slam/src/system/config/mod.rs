@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{LoopClosingConfig, LoopGraphInformation, LoopGraphSettings};
 use crate::mapping::LocalMappingMode;
-use crate::mapping::bundle_adjustment::LostKeyframes;
+use crate::mapping::bundle_adjustment::{LostKeyframes, VisualKernel};
 use crate::mapping::map::StateEnvelope;
 use crate::mapping::marginalization::BoundaryPrior;
 use crate::mapping::vi_ba_schur::ImuHuber;
@@ -199,6 +199,8 @@ pub struct LocalBaConfig {
     /// Refuse a VI-BA result whose velocity or bias leaves these bounds.
     pub state_envelope: StateEnvelope,
     pub lost_keyframes: LostKeyframes,
+    /// The visual-only local BA's kernel; VI-BA is always robust.
+    pub visual_kernel: VisualKernel,
 }
 
 impl Default for LocalBaConfig {
@@ -213,6 +215,7 @@ impl Default for LocalBaConfig {
             visual_information: VisualInformation::default(),
             state_envelope: StateEnvelope::Off,
             lost_keyframes: LostKeyframes::Free,
+            visual_kernel: VisualKernel::L2,
         }
     }
 }
@@ -393,7 +396,7 @@ impl fmt::Display for SystemConfig {
                 f,
                 "  local BA: {} active keyframes, boundary IMU scale {} (bias rows {}), \
                  boundary {:?}, IMU Huber {:?}, depth sigma {:?}, visual information {:?}, \
-                 state envelope {:?}, lost keyframes {:?}",
+                 state envelope {:?}, lost keyframes {:?}, visual kernel {:?}",
                 ba.active_keyframes,
                 ba.boundary_imu_info_scale,
                 if ba.boundary_scales_bias_rows {
@@ -407,6 +410,7 @@ impl fmt::Display for SystemConfig {
                 ba.visual_information,
                 ba.state_envelope,
                 ba.lost_keyframes,
+                ba.visual_kernel,
             )?;
         }
         if let LoopClosingMode::Enabled {

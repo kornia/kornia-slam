@@ -167,7 +167,11 @@ fn stereo_fixture(mismatched_px: f32) -> Map {
 #[test]
 fn local_visual_ba_is_robust_to_mismatched_observations() {
     let mut map = stereo_fixture(60.0);
-    let update = run_local_ba(map.ba_snapshot(&local_window(&map)), &camera());
+    let params = LocalBaParams {
+        visual_kernel: VisualKernel::Huber,
+        ..LocalBaParams::default()
+    };
+    let update = run_local_ba_with(map.ba_snapshot(&local_window(&map)), &camera(), &params);
     map.apply_ba_update(update).unwrap();
     let newest = map.get_keyframe(KF_IDS[4]).unwrap().frame.pose_world_to_cam;
     let error = (newest.translation - Vec3F64::new(-0.8, 0.0, 0.0)).length();
