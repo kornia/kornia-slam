@@ -6136,6 +6136,7 @@ dependencies = [
  "rerun",
  "ron 0.12.2",
  "serde",
+ "serde_json",
  "serde_yaml",
  "thiserror 2.0.19",
 ]

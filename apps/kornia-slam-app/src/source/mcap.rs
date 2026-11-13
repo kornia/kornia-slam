@@ -267,6 +267,7 @@ impl FrameSource for McapSource {
             timestamp_sec: prepared.timestamp_sec,
             image: prepared.image,
             right_image: prepared.right_image,
+            rig_images: Vec::new(),
             imu_samples: Vec::new(),
         }))
     }

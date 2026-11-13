@@ -15,9 +15,9 @@ pub mod wheel;
 
 pub use build::BuildError;
 pub use config::{
-    CameraSelection, FrontendConfig, LoopClosingMode, MappingConfig, OrbFrontendConfig,
-    OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection,
-    StereoCloseDepth, SystemConfig,
+    CameraSelection, FrontendConfig, LocalBaConfig, LoopClosingExecution, LoopClosingMode,
+    MappingConfig, OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition,
+    SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth, StereoDepthSigma, SystemConfig,
 };
 #[cfg(feature = "serde")]
 pub use file::LoadError;
@@ -29,13 +29,15 @@ use crate::frontend::{FrontendObservation, OrbFrontend};
 use state::{SystemMode, SystemState};
 
 use crate::tracking::{
-    KeyframeEvidence, KeyframePolicy, TrackingLossRecoveryPolicy, median_parallax_px,
+    KeyframeEvidence, KeyframePolicy, KeyframesWhileLost, TrackingLossRecoveryPolicy,
+    median_parallax_px,
 };
 
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 use crate::tracking::motion::{InertialPrediction, predict_pose};
 use crate::tracking::tracker::{FrameInput, Tracker};
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -48,7 +50,10 @@ use crate::initialization::bootstrap::{
     TooFewStereoPoints, evaluate_bootstrap,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
-use crate::loop_closure::{Correction, LoopCloser, LoopClosingContext, LoopClosureEvent};
+use crate::loop_closure::{
+    Correction, LoopCloser, LoopClosingContext, LoopClosingOutcome, LoopClosureEvent, LoopTiming,
+};
+use crate::mapping::bundle_adjustment::LocalBaParams;
 use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
 use crate::mapping::map::{
     InertialAlignmentError, Keyframe, Map, MapInsertion, MapMutationError, MapPoint,
@@ -72,12 +77,15 @@ pub struct SlamSystem {
     stereo_close_depth: Option<f64>,
     debug: bool,
     debug_messages: Vec<String>,
+    // Under debug: when tracking first matched each landmark, by stable id.
+    landmark_first_tracked_sec: HashMap<usize, f64>,
     map: Arc<Mutex<Map>>,
     // Serializes compound map publication and short local-BA snapshot/merge phases.
     map_publication_gate: Option<Arc<Mutex<()>>>,
     // IMU estimates, sample buffer and the inertial-initialization schedule
     inertial: InertialState,
     local_mapping: LocalMapping,
+    local_ba: LocalBaParams,
     // Place recognition for every keyframe, and loop closing when configured.
     loop_closer: Option<LoopCloser>,
     loop_closure_events: Vec<LoopClosureEvent>,
@@ -125,9 +133,11 @@ impl SlamSystem {
             stereo_close_depth: settings.stereo_close_depth_m,
             debug: false,
             debug_messages: Vec::new(),
+            landmark_first_tracked_sec: HashMap::new(),
             map,
             map_publication_gate,
             local_mapping,
+            local_ba: settings.local_ba,
             state: SystemState::new(),
             inertial: InertialState::new(),
             loop_closer,
@@ -206,6 +216,23 @@ impl SlamSystem {
         )
     }
 
+    /// Advances by one with every loop correction written to the map, so a
+    /// consumer publishing odometry as `T_map * map_correction()` re-anchors
+    /// when it changes; 0 without loop closing or before the first correction.
+    pub fn correction_epoch(&self) -> u64 {
+        self.loop_closer
+            .as_ref()
+            .map_or(0, LoopCloser::correction_epoch)
+    }
+
+    /// Whether a background loop solve is running or waiting for its
+    /// writeback at a frame boundary.
+    pub fn loop_solve_in_flight(&self) -> bool {
+        self.loop_closer
+            .as_ref()
+            .is_some_and(LoopCloser::solve_in_flight)
+    }
+
     /// The system's sensor calibration, restricted to the selected sensors.
     pub fn rig(&self) -> &SensorRig {
         &self.rig
@@ -245,6 +272,9 @@ impl SlamSystem {
         if self.rig.stereo_baseline_m.is_some() {
             return Err(ProcessError::StereoRequired);
         }
+        if self.rig.is_multi_camera() {
+            return Err(ProcessError::RigRequired);
+        }
         let frame = self
             .frontend
             .prepare_image(self.next_frame_idx, image)
@@ -261,6 +291,9 @@ impl SlamSystem {
         right: &Image<u8, 1>,
     ) -> Result<TrackingResult, ProcessError> {
         input::validate_stereo_pair(timestamp_sec, left, right)?;
+        if self.rig.is_multi_camera() {
+            return Err(ProcessError::RigRequired);
+        }
         if self.rig.stereo_baseline_m.is_none() {
             return Err(ProcessError::MonoPipeline);
         }
@@ -269,6 +302,28 @@ impl SlamSystem {
             .prepare_stereo_pair(self.next_frame_idx, left, right)
             .map_err(ProcessError::Frontend)?;
         Ok(self.track_frame(frame, left, timestamp_sec))
+    }
+
+    /// Like [`Self::process_image`] for one capture of a multi-camera rig:
+    /// `images[c]` comes from rig camera `c` (see [`SensorRig::cameras`]),
+    /// all taken at `timestamp_sec`. Other pipelines reject it.
+    pub fn process_rig(
+        &mut self,
+        timestamp_sec: f64,
+        images: &[&Image<u8, 1>],
+    ) -> Result<TrackingResult, ProcessError> {
+        if !self.rig.is_multi_camera() {
+            return Err(ProcessError::NotARig);
+        }
+        input::validate_rig_images(timestamp_sec, images, &self.rig.cameras)?;
+        let frame = self
+            .frontend
+            .prepare_rig(self.next_frame_idx, images)
+            .map_err(ProcessError::Frontend)?;
+        let Some(&primary) = images.first() else {
+            return Err(ProcessError::NotARig);
+        };
+        Ok(self.track_frame(frame, primary, timestamp_sec))
     }
 
     /// Takes a prepared frame as the next one and tracks it.
@@ -312,8 +367,52 @@ impl SlamSystem {
         };
     }
 
+    /// Map reuse: how many of the frame's matches are landmarks tracking
+    /// first matched over 10 s ago.
+    fn report_landmark_age(&mut self, frame_idx: usize, matches: &[(usize, usize)], now_sec: f64) {
+        const OLD_SEC: f64 = 10.0;
+        let map = self.map.lock().unwrap();
+        let mut old = 0;
+        for &(mp_idx, _) in matches {
+            if map.map_points().get(mp_idx).is_none() {
+                continue;
+            }
+            // Landmark slots are append-only until a map reset.
+            let first = *self
+                .landmark_first_tracked_sec
+                .entry(mp_idx)
+                .or_insert(now_sec);
+            if now_sec - first > OLD_SEC {
+                old += 1;
+            }
+        }
+        drop(map);
+        self.dbg(format!(
+            "[age] frame={frame_idx} matches={} older_10s={old}",
+            matches.len()
+        ));
+    }
+
     fn report_stereo(&mut self, frame: &Frame) {
         if !self.debug {
+            return;
+        }
+        if frame.is_rig() {
+            let mut depths: Vec<f64> = frame
+                .rig
+                .stereo_points
+                .iter()
+                .flatten()
+                .map(|p| p.z)
+                .collect();
+            depths.sort_by(f64::total_cmp);
+            let median = depths.get(depths.len() / 2).copied().unwrap_or(0.0);
+            let per_camera: Vec<usize> = frame.rig.camera_ranges.iter().map(|r| r.len()).collect();
+            self.dbg(format!(
+                "[overlap] frame={} features={per_camera:?} triangulated={} median_depth={median:.3}m",
+                frame.idx,
+                depths.len()
+            ));
             return;
         }
         let Some(matched) = self.frontend.observation().stereo_matched else {
@@ -347,6 +446,7 @@ impl SlamSystem {
             .as_ref()
             .map(|gate| gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
         self.apply_local_mapping_results();
+        self.apply_loop_closing_results();
         // Fill the per-frame undistortion cache once; tracking, BA gathering,
         // growth, and fuse all read from it.
         frame.ensure_undistorted(&self.rig.camera);
@@ -378,6 +478,15 @@ impl SlamSystem {
                 .get_keyframe(ki)
                 .map(|kf| kf.frame.idx)
         })
+    }
+
+    /// `T_cw` of the keyframe numbered `frame_idx`, while the map holds it.
+    pub fn keyframe_pose(&self, frame_idx: usize) -> Option<Pose3d> {
+        self.map
+            .lock()
+            .unwrap()
+            .get_keyframe(frame_idx)
+            .map(|kf| kf.frame.pose_world_to_cam)
     }
 
     /// Returns the number of active (non-culled) map points.
@@ -421,6 +530,8 @@ impl SlamSystem {
                 correction.pose_before,
                 correction.pose_after,
             );
+            self.state
+                .correct_pose_before_loss(correction.pose_before, correction.pose_after);
             self.state.velocity_world = correction.velocity_world;
             self.inertial.bias = correction.imu_bias;
         }
@@ -436,7 +547,7 @@ impl SlamSystem {
         // Stereo frames carry metric per-keypoint depth, so we can build a
         // metric map from a single keyframe (ORB-SLAM3's StereoInitialization)
         // instead of waiting for two-view parallax.
-        if curr_frame.is_stereo() {
+        if curr_frame.is_metric() {
             return self.bootstrap_stereo(curr_frame, timestamp_sec);
         }
         self.bootstrap_mono(curr_frame, timestamp_sec)
@@ -663,6 +774,7 @@ impl SlamSystem {
         let refined = crate::mapping::bundle_adjustment::run_initial_ba(
             &mut self.map.lock().unwrap(),
             &self.rig.camera,
+            self.local_ba.depth_sigma,
         );
         if let Err(error) = refined {
             self.dbg(format!("[init_ba] {error}; keeping the unrefined map"));
@@ -764,7 +876,7 @@ impl SlamSystem {
                 .keyframes()
                 .iter()
                 .find(|kf| kf.frame.idx >= start_idx)
-                .map(|kf| kf.frame.is_stereo())
+                .map(|kf| kf.frame.is_metric())
                 .unwrap_or(false);
             let prior_a0 = viba0_accel_bias_prior(is_mono);
             // Drop the solve's map lock before applying its result with a new lock.
@@ -825,6 +937,7 @@ impl SlamSystem {
             imu_t_bc: self.rig.camera_to_body(),
             gravity_world: self.inertial.gravity_world,
             wheel_factors: self.wheel_factors(),
+            local_ba: self.local_ba,
         }) {
             self.dbg("[local_mapping] worker is unavailable".into());
         }
@@ -849,7 +962,6 @@ impl SlamSystem {
         current_image: &Image<u8, 1>,
         timestamp_sec: f64,
     ) -> TrackingResult {
-        let image_size = frame.image_size;
         let pose_before = self.state.pose_world_to_cam;
         let prev_timestamp = self.state.last_frame_timestamp_sec;
 
@@ -951,6 +1063,9 @@ impl SlamSystem {
                 ),
             };
             self.debug_messages.push(msg);
+            if status == TrackingStatus::Tracked {
+                self.report_landmark_age(frame.idx, &matches, timestamp_sec);
+            }
         }
 
         if status == TrackingStatus::Tracked {
@@ -970,12 +1085,12 @@ impl SlamSystem {
                     current_kf,
                     LocalMapSelectionConfig::default(),
                 );
-                let visible = crate::tracking::local_map::landmarks_in_frustum(
+                let visible = crate::tracking::local_map::landmarks_in_frame_frustum(
                     &map_guard,
                     &local_indices,
                     &self.rig.camera,
                     &candidate_pose,
-                    image_size,
+                    &frame,
                 );
                 map_guard.update_observation_counts(&visible, &matches);
             }
@@ -997,7 +1112,7 @@ impl SlamSystem {
         if status == TrackingStatus::Skipped {
             let policy = &self.tracking_loss_recovery;
 
-            let lost_since = *self.state.lost_since_sec.get_or_insert(timestamp_sec);
+            let lost_since = self.state.mark_lost(timestamp_sec, pose_before);
             let recently_lost_for = timestamp_sec - lost_since;
 
             let imu_confident = self.imu_confident(timestamp_sec);
@@ -1011,12 +1126,13 @@ impl SlamSystem {
                     frame.idx, recently_lost_for, map_established,
                 ));
                 self.tracker.reset_tracks();
-                self.state.reset();
+                self.state.reset_after_loss();
                 return self.bootstrap_step(frame, timestamp_sec);
             }
             if imu_confident
+                && policy.keyframes_while_lost == KeyframesWhileLost::Enabled
                 && self.keyframe_due_while_lost(timestamp_sec)
-                && self.insert_keyframe(&frame, timestamp_sec, &[])
+                && self.insert_keyframe(&frame, timestamp_sec, &[], true)
             {
                 self.dbg(format!(
                     "[lost] frame={} keyframe inserted at the inertial prediction",
@@ -1024,7 +1140,7 @@ impl SlamSystem {
                 ));
             }
         } else {
-            self.state.lost_since_sec = None;
+            self.state.mark_tracked();
         }
         self.state.last_frame_timestamp_sec = timestamp_sec;
         // Samples older than the last keyframe can't enter any future window
@@ -1171,7 +1287,7 @@ impl SlamSystem {
         if !self.keyframe_due(&evidence, timestamp_sec) {
             return false;
         }
-        self.insert_keyframe(frame, timestamp_sec, matches)
+        self.insert_keyframe(frame, timestamp_sec, matches, false)
     }
 
     /// Publishes `frame` as a keyframe at the current tracking pose and runs
@@ -1181,6 +1297,7 @@ impl SlamSystem {
         frame: &Frame,
         timestamp_sec: f64,
         matches: &[(usize, usize)],
+        while_lost: bool,
     ) -> bool {
         // Guard: reference KF must exist before we can triangulate.
         if let Some(ki) = self.state.current_keyframe_idx {
@@ -1196,6 +1313,7 @@ impl SlamSystem {
             pose_world_to_cam: self.state.pose_world_to_cam,
             ..frame.clone()
         });
+        curr_kf.inserted_while_lost = while_lost;
         // Seed the new keyframe with the IMU-propagated velocity and current bias
         // estimate so that VI-BA starts from a reasonable linearisation point rather
         // than zero, which would produce huge residuals on the newest IMU edge.
@@ -1288,6 +1406,7 @@ impl SlamSystem {
             imu_t_bc: self.rig.camera_to_body(),
             gravity_world: self.inertial.gravity_world,
             wheel_factors: self.wheel_factors(),
+            local_ba: self.local_ba,
         }) {
             self.dbg("[local_mapping] worker is unavailable".into());
         }
@@ -1373,18 +1492,22 @@ impl SlamSystem {
         self.inertial.schedule.complete(refinement);
     }
 
-    /// Offers a freshly inserted keyframe to loop closing, when enabled, and
-    /// applies whatever the closer reports back.
-    fn register_place_recognition(&mut self, kf_idx: usize) {
-        let Some(loop_closer) = self.loop_closer.as_mut() else {
-            return;
-        };
-        let context = LoopClosingContext {
+    fn loop_closing_context(&self) -> LoopClosingContext {
+        LoopClosingContext {
             pose_world_to_cam: self.state.pose_world_to_cam,
             velocity_world: self.state.velocity_world,
             current_keyframe_idx: self.state.current_keyframe_idx,
             imu_initialized: self.state.imu_initialized,
             gravity_world: self.inertial.gravity_world,
+        }
+    }
+
+    /// Offers a freshly inserted keyframe to loop closing, when enabled, and
+    /// applies whatever the closer reports back.
+    fn register_place_recognition(&mut self, kf_idx: usize) {
+        let context = self.loop_closing_context();
+        let Some(loop_closer) = self.loop_closer.as_mut() else {
+            return;
         };
         let started = Instant::now();
         let outcome = {
@@ -1393,18 +1516,58 @@ impl SlamSystem {
         };
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         let graph_nodes = loop_closer.graph_nodes();
-        if let Some(message) = outcome.debug_message {
-            self.dbg(message);
+        if let Some(message) = &outcome.debug_message {
+            self.dbg(message.clone());
         }
-        if !outcome.events.is_empty() {
+        if !outcome.events.is_empty() || outcome.queued {
             self.dbg(format!(
-                "[loop-time] kf={kf_idx} on_keyframe_ms={elapsed_ms:.1} graph_nodes={graph_nodes}"
+                "[loop-time] kf={kf_idx} on_keyframe_ms={elapsed_ms:.1} graph_nodes={graph_nodes} {}",
+                format_loop_timing(&outcome.timing)
             ));
         }
+        self.adopt_loop_outcome(outcome);
+    }
+
+    /// Writes back a background loop solve that has finished, at the frame
+    /// boundary, and submits the loops accepted meanwhile. Runs after local
+    /// mapping's results, under the publication gate.
+    fn apply_loop_closing_results(&mut self) {
+        let context = self.loop_closing_context();
+        let Some(loop_closer) = self
+            .loop_closer
+            .as_mut()
+            .filter(|closer| closer.runs_in_background())
+        else {
+            return;
+        };
+        let outcome = {
+            let mut map = self.map.lock().unwrap();
+            loop_closer.on_frame(&mut map, &self.rig.camera, context)
+        };
+        let graph_nodes = loop_closer.graph_nodes();
+        if let Some(latency) = outcome.written_back {
+            self.dbg(format!(
+                "[loop-apply] frame={} applied={} latency_ms={:.1} graph_nodes={graph_nodes} {}",
+                self.next_frame_idx - 1,
+                outcome.pgo_applied,
+                latency.as_secs_f64() * 1000.0,
+                format_loop_timing(&outcome.timing)
+            ));
+        }
+        self.adopt_loop_outcome(outcome);
+    }
+
+    /// Takes a loop closer's report into the tracking state: the corrected
+    /// pose and velocity, a fresh start for optical flow and local BA after a
+    /// correction, and the events.
+    fn adopt_loop_outcome(&mut self, outcome: LoopClosingOutcome) {
         for message in outcome.gate_messages {
             self.dbg(message);
         }
         if let Some((corrected_tracking_pose, corrected_velocity)) = outcome.tracking_correction {
+            let tracking_pose = self.state.pose_world_to_cam;
+            self.state
+                .correct_pose_before_loss(tracking_pose, corrected_tracking_pose);
             self.state.pose_world_to_cam = corrected_tracking_pose;
             self.state.velocity_world = corrected_velocity;
         }
@@ -1416,6 +1579,7 @@ impl SlamSystem {
                     imu_t_bc: self.rig.camera_to_body(),
                     gravity_world: self.inertial.gravity_world,
                     wheel_factors: self.wheel_factors(),
+                    local_ba: self.local_ba,
                 }) {
                     self.dbg("[local_mapping] worker is unavailable after PGO".into());
                 }
@@ -1424,6 +1588,28 @@ impl SlamSystem {
         }
         self.loop_closure_events.extend(outcome.events);
     }
+}
+
+fn format_loop_timing(t: &LoopTiming) -> String {
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    format!(
+        "graph_edges={} iterations={} detect_ms={:.1} verify_ms={:.1} solve_ms={:.1} \
+         writeback_ms={:.1} geometry_ms={:.1} fuse_ms={:.1} landmarks_refreshed={} \
+         fuse_capture_ms={:.1} fuse_plan_ms={:.1} fusion_ops={} fusion_stale={}",
+        t.graph_edges,
+        t.iterations,
+        ms(t.detect),
+        ms(t.verify),
+        ms(t.solve),
+        ms(t.writeback),
+        ms(t.geometry),
+        ms(t.fuse),
+        t.landmarks_refreshed,
+        ms(t.fuse_capture),
+        ms(t.fuse_plan),
+        t.fusion_ops,
+        t.fusion_stale,
+    )
 }
 
 /// Largest distance, in metres, between the motion-model pose and a

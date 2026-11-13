@@ -2,24 +2,35 @@
 //! fusion, and pose-graph optimization.
 //!
 //! A verified loop passes the [`LoopGate`]s before it may enter the graph: the
-//! odometry gate refuses a correction the drift model cannot explain, which is
-//! what repeated structure produces. Accepted loops close through one
-//! [`PoseGraph`] kept across solves, so keyframes the map culls or evicts stay
-//! as nodes and their loops keep constraining it. [`optimize_pose_graph`] is
-//! the earlier per-solve snapshot optimizer, kept as the `w * I` reference.
+//! odometry gate refuses a correction the drift model cannot explain, as a
+//! false loop from repeated structure often implies. Accepted loops close
+//! through a [`PoseGraph`]: by default a `w * I` snapshot of the map at each
+//! solve, [`optimize_pose_graph`]'s computation; [`LoopGraphSettings`] can keep
+//! it across solves, so keyframes the map culls or evicts stay as nodes and
+//! their loops keep constraining it.
+//!
+//! A solve can run off the tracking thread ([`crate::LoopClosingExecution`]): it
+//! reads a copy of the keyframe poses and the graph, and its result is written
+//! back at a frame boundary, moving keyframes created during the solve with the
+//! last one it saw, as ORB-SLAM3's `CorrectLoop` and VINS-Fusion's pose graph do.
 
 mod closer;
 mod episode;
 mod fusion;
+mod fusion_plan;
 mod graph;
 mod odometry_gate;
 pub mod place_recognition;
 mod pose_graph;
 mod sparse_pgo;
 mod verification;
+mod worker;
 
-pub(crate) use closer::{LoopCloser, LoopClosingContext};
-pub use closer::{LoopClosingConfig, LoopClosureEvent, LoopGraphInformation};
+pub(crate) use closer::{LoopCloser, LoopClosingContext, LoopClosingOutcome, LoopTiming};
+pub use closer::{
+    LoopClosingConfig, LoopClosureEvent, LoopGraphInformation, LoopGraphSettings,
+    OdometryRandomWalk,
+};
 pub use episode::{LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker};
 pub use fusion::{LoopFusionConfig, LoopFusionStats, fuse_verified_loop};
 pub use graph::{
@@ -40,9 +51,12 @@ pub use sparse_pgo::{
 pub use verification::{
     LoopVerificationConfig, LoopVerificationReject, VerifiedLoopEdge, verify_loop_candidate,
 };
+pub(crate) use worker::LoopSolver;
 
 #[cfg(test)]
-use closer::{optimize_through_graph, snapshot_graph_config, solve_in_graph};
+use closer::{
+    keyframe_poses, optimize_through_graph, snapshot_graph_config, solve_in_graph, sync_graph,
+};
 #[cfg(test)]
 use pose_graph::{max_gravity_alignment_error, pose_graph_cost};
 #[cfg(test)]

@@ -339,6 +339,7 @@ mod tests {
             u_right: vec![5.0],
             depth: vec![2.0], // => is_stereo()
             keypoints_undist: vec![],
+            rig: Default::default(),
         }
     }
 

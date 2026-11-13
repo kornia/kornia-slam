@@ -6,6 +6,9 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 
+use crate::mapping::bundle_adjustment::{
+    LocalBaParams, local_window_of, run_local_ba_with, run_local_inertial_ba_with,
+};
 use crate::mapping::map::{BaSnapshot, BaUpdate, BaUpdateError, LocalBaMergeResult, Map};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -38,24 +41,26 @@ pub struct KeyframeJob {
     pub gravity_world: Vec3F64,
     /// Wheel-odometry edges between keyframes; empty without a wheel feed.
     pub wheel_factors: Vec<super::wheel_odom::WheelOdomFactor>,
+    pub local_ba: LocalBaParams,
 }
 
-fn capture_local_window(map: &Map) -> BaSnapshot {
-    map.ba_snapshot(&super::bundle_adjustment::local_window(map))
+fn capture_local_window(map: &Map, job: &KeyframeJob) -> BaSnapshot {
+    map.ba_snapshot(&local_window_of(map, job.local_ba.active_keyframes, []))
 }
 
 fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJob) -> BaUpdate {
     if job.imu_initialized {
-        super::bundle_adjustment::run_local_inertial_ba(
+        run_local_inertial_ba_with(
             snapshot,
             camera,
             job.imu_t_bc,
             job.gravity_world,
             &job.wheel_factors,
             &[],
+            &job.local_ba,
         )
     } else {
-        super::bundle_adjustment::run_local_ba(snapshot, camera)
+        run_local_ba_with(snapshot, camera, &job.local_ba)
     }
 }
 
@@ -125,6 +130,7 @@ impl LocalMapping {
             } => {
                 let snapshot = capture_local_window(
                     &map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    &job,
                 );
                 let update = solve_snapshot(snapshot, camera, &job);
                 // Cull under the same lock as the merge, so a completed result
@@ -235,6 +241,7 @@ impl LocalMappingHandle {
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         capture_local_window(
                             &map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            &job,
                         )
                     };
 
@@ -318,7 +325,10 @@ mod tests {
     use kornia_3d::camera::PinholeCamera;
     use kornia_algebra::Vec3F64;
 
-    use super::{BaUpdateError, KeyframeJob, LocalMapping, LocalMappingBackend, LocalMappingMode};
+    use super::{
+        BaUpdateError, KeyframeJob, LocalBaParams, LocalMapping, LocalMappingBackend,
+        LocalMappingMode,
+    };
     use crate::mapping::map::{InertialAlignment, KeyframeVelocity, Map};
     use kornia_algebra::SO3F64;
     use kornia_sensors::imu::ImuBias;
@@ -342,6 +352,7 @@ mod tests {
             imu_t_bc: None,
             gravity_world: Vec3F64::ZERO,
             wheel_factors: Vec::new(),
+            local_ba: LocalBaParams::default(),
         }
     }
 
@@ -431,6 +442,7 @@ mod tests {
             u_right: Vec::new(),
             depth: Vec::new(),
             keypoints_undist: Vec::new(),
+            rig: Default::default(),
         }))
         .unwrap();
         let doomed = map

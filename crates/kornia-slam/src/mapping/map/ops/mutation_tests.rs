@@ -108,6 +108,41 @@ fn merge_map_points_redirects_associations_and_deduplicates_observers() {
     }
 }
 
+/// On a consistent map the record-driven merge writes exactly what the full sweep writes.
+#[test]
+fn merge_by_records_matches_the_full_sweep() {
+    let build = || {
+        let mut map = Map::new();
+        for idx in 0..4 {
+            map.insert_keyframe(Keyframe::from_frame(test_frame(
+                idx,
+                vec![[idx as u8; 32], [10 + idx as u8; 32]],
+            )))
+            .unwrap();
+        }
+        let survivor = map.insert_landmark(seed(0, 0, 5.0)).unwrap();
+        map.link_observation(1, 0, survivor).unwrap();
+        let replaced = map.insert_landmark(seed(2, 0, 5.01)).unwrap();
+        map.link_observation(1, 1, replaced).unwrap();
+        map.link_observation(3, 1, replaced).unwrap();
+        (map, survivor, replaced)
+    };
+    let (mut swept, survivor, replaced) = build();
+    let (mut by_records, ..) = build();
+
+    let expected = swept.merge_map_points(survivor, replaced).unwrap();
+    let actual = by_records
+        .merge_map_points_by_records(survivor, replaced)
+        .unwrap();
+
+    assert_eq!(actual, expected);
+    assert_map_consistent(&by_records);
+    assert_eq!(
+        by_records.state_fingerprint_for_test(),
+        swept.state_fingerprint_for_test()
+    );
+}
+
 #[test]
 fn merge_map_points_rejects_invalid_or_culled_inputs() {
     let mut map = Map::new();
@@ -959,146 +994,41 @@ fn ba_update_reports_the_bias_it_would_write() {
     assert_eq!(gz, vec![0.001, 0.3]);
 }
 
-/// One keyframe of `n` features, each holding a landmark at x = its slot.
-fn compaction_map(n: usize) -> Map {
+/// The whole-map refresh reads camera centres from a table built once; it must
+/// leave exactly the state the per-landmark lookup does, bit for bit.
+#[test]
+fn tabulated_geometry_refresh_matches_the_per_landmark_lookup() {
     let mut map = Map::new();
-    let descriptors = (0..n).map(|i| [i as u8; 32]).collect();
-    map.insert_keyframe(Keyframe::from_frame(test_frame(0, descriptors)))
-        .unwrap();
-    for feature_idx in 0..n {
-        map.insert_landmark(LandmarkSeed {
-            position: Vec3F64::new(feature_idx as f64, 0.0, 1.0),
-            color: [0; 3],
-            reference: ObservationKey {
-                keyframe_idx: 0,
-                feature_idx,
-            },
-        })
-        .unwrap();
+    for kf in 0..4 {
+        let pose = Pose3d::new(
+            kornia_algebra::SO3F64::exp(Vec3F64::new(0.01 * kf as f64, -0.02, 0.03)).matrix(),
+            Vec3F64::new(-0.3 * kf as f64, 0.1, 0.05 * kf as f64),
+        );
+        let mut keyframe = Keyframe::from_frame(test_frame_with_pose(kf, vec![[0u8; 32]; 3], pose));
+        keyframe.frame.features.octaves = vec![0, 1, 3];
+        map.insert_keyframe(keyframe).unwrap();
     }
-    map
-}
+    let mut ids = Vec::new();
+    for feature in 0..3 {
+        let id = map
+            .insert_landmark(seed(feature, feature, 4.0 + feature as f64))
+            .unwrap();
+        for kf in (0..4).filter(|&kf| kf != feature) {
+            map.link_observation(kf, feature, id).unwrap();
+        }
+        ids.push(id);
+    }
+    map.remove_landmark(ids[2]).unwrap();
+    let mut looked_up = map.clone();
+    for &id in &ids {
+        looked_up.update_map_point_geometry(id, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+    }
 
-#[test]
-fn compaction_frees_retired_slots_and_keeps_every_link() {
-    let mut map = compaction_map(6);
-    map.remove_landmark(1).unwrap();
-    map.remove_landmark(4).unwrap();
+    let refreshed = map.finalize_landmark_geometry(ids.iter().copied());
 
-    let done = map.compact_landmarks().unwrap();
-
-    assert_eq!((done.slots_before, done.slots_after), (6, 4));
-    assert_eq!(map.num_map_points(), 4);
-    assert_map_consistent(&map);
-    let held: Vec<Option<f64>> = map.keyframes()[0]
-        .map_point_by_desc_idx
-        .iter()
-        .map(|slot| slot.map(|id| map.map_points()[id].position.x))
-        .collect();
-    let want = [Some(0.0), None, Some(2.0), Some(3.0), None, Some(5.0)];
-    assert_eq!(held, want, "each feature still holds its own landmark");
-    let stable: Vec<u64> = map.map_points().iter().map(|mp| mp.stable_id).collect();
-    assert_eq!(stable, [0, 2, 3, 5], "creation order, unchanged");
-}
-
-#[test]
-fn compaction_continues_stable_ids_and_a_clear_restarts_them() {
-    let mut map = compaction_map(3);
-    map.remove_landmark(2).unwrap();
-    map.compact_landmarks().unwrap();
-    let freed = ObservationKey {
-        keyframe_idx: 0,
-        feature_idx: 2,
-    };
-    let id = map
-        .insert_landmark(LandmarkSeed {
-            position: Vec3F64::new(9.0, 0.0, 1.0),
-            color: [0; 3],
-            reference: freed,
-        })
-        .unwrap();
-    assert_eq!(id, 2, "the freed slot");
-    assert_eq!(map.map_points()[id].stable_id, 3, "never its old number");
-
-    map.clear_active();
-    assert_eq!(compaction_map(1).map_points()[0].stable_id, 0);
-}
-
-#[test]
-fn compaction_with_nothing_retired_changes_nothing() {
-    let mut map = compaction_map(3);
-    let update = map.full_ba_snapshot().into_update();
-
-    let done = map.compact_landmarks().unwrap();
-
-    assert_eq!((done.slots_before, done.slots_after), (3, 3));
-    assert!(
-        map.apply_ba_update(update).is_ok(),
-        "ids held nothing stale, so the epoch stands"
-    );
-}
-
-#[test]
-fn compaction_refuses_an_in_flight_ba_snapshot() {
-    let mut map = compaction_map(3);
-    map.remove_landmark(0).unwrap();
-    let update = map.full_ba_snapshot().into_update();
-
-    map.compact_landmarks().unwrap();
-
-    assert!(
-        map.apply_ba_update(update).is_err(),
-        "its ids are the old ones"
-    );
-}
-
-#[test]
-fn compaction_refuses_a_dangling_link_before_its_first_write() {
-    let mut map = compaction_map(3);
-    map.remove_landmark(1).unwrap();
-    map.keyframes[0].map_point_by_desc_idx[1] = Some(1);
-
+    assert_eq!(refreshed, ids.len());
     assert_eq!(
-        map.compact_landmarks().unwrap_err(),
-        MapMutationError::DanglingLandmark {
-            keyframe_idx: 0,
-            feature_idx: 1,
-            landmark: 1
-        }
+        map.state_fingerprint_for_test(),
+        looked_up.state_fingerprint_for_test()
     );
-    assert_eq!(map.num_map_points(), 3, "not one slot moved");
-}
-
-/// Keeps retiring, inserting and compacting, and walks every link each time.
-#[test]
-fn long_compaction_churn_never_leaves_a_dangling_slot() {
-    let n = 40;
-    let mut map = compaction_map(n);
-    for round in 0..500_usize {
-        for feature_idx in (round % 7..n).step_by(5) {
-            if let Some(id) = map.keyframes()[0].map_point(feature_idx) {
-                map.remove_landmark(id).unwrap();
-            }
-        }
-        for feature_idx in 0..n {
-            if map.keyframes()[0].map_point(feature_idx).is_none() {
-                map.insert_landmark(LandmarkSeed {
-                    position: Vec3F64::new(feature_idx as f64, round as f64, 1.0),
-                    color: [0; 3],
-                    reference: ObservationKey {
-                        keyframe_idx: 0,
-                        feature_idx,
-                    },
-                })
-                .unwrap();
-            }
-        }
-        map.compact_landmarks().unwrap();
-        assert_eq!(map.num_map_points(), n, "round {round}");
-        assert_map_consistent(&map);
-        for feature_idx in 0..n {
-            let id = map.keyframes()[0].map_point(feature_idx).unwrap();
-            assert_eq!(map.map_points()[id].position.x, feature_idx as f64);
-        }
-    }
 }

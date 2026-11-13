@@ -119,6 +119,8 @@ fn keyframe_correspondences(
         config.match_config,
     )
     .into_iter()
+    // RANSAC PnP below models the primary camera only.
+    .filter(|&(_, keypoint)| frame.camera_of(keypoint) == 0)
     .filter_map(|(keyframe_desc, keypoint)| {
         let map_point = keyframe.map_point(keyframe_desc)?;
         let point = map.map_points().get(map_point)?;
@@ -257,6 +259,7 @@ mod tests {
             u_right: Vec::new(),
             depth: Vec::new(),
             keypoints_undist: pixels,
+            rig: Default::default(),
         }
     }
 

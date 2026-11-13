@@ -13,7 +13,7 @@ use kornia_image::Image;
 use crate::Frame;
 use crate::mapping::Map;
 use crate::tracking::optical_flow::{
-    KltTracker, MapKeypointMatch, TrackSet, carry_klt_survivors, snap_unique,
+    KltPyramidCache, KltTracker, MapKeypointMatch, TrackSet, carry_klt_survivors, snap_unique,
 };
 use crate::tracking::pose_estimation::map_projection::{
     MapProjectionConfig, MapProjectionRejectReason,
@@ -41,6 +41,7 @@ pub(crate) struct FrameInput<'a> {
 pub(crate) struct Tracker {
     estimator: MapProjectionEstimator,
     klt_tracker: KltTracker,
+    klt_cache: KltPyramidCache,
     track_set: TrackSet,
 }
 
@@ -49,6 +50,7 @@ impl Tracker {
         Self {
             estimator: MapProjectionEstimator::new(config),
             klt_tracker: KltTracker::default(),
+            klt_cache: KltPyramidCache::new(),
             track_set: TrackSet::new(),
         }
     }
@@ -107,20 +109,21 @@ impl Tracker {
         } else {
             input.previous_image.and_then(|previous_image| {
                 self.klt_tracker
-                    .track(self.track_set.tracks(), previous_image, input.current_image)
+                    .track_cached(
+                        &mut self.klt_cache,
+                        self.track_set.tracks(),
+                        previous_image,
+                        input.current_image,
+                    )
                     .ok()
             })
         };
+        // Optical flow follows the primary camera only; its keypoints come first.
+        let primary_keypoints = &input.frame.features.keypoints_xy[input.frame.camera_range(0)];
         let pre_seeded = klt_survivors
             .as_ref()
             .and_then(|survivors| {
-                snap_unique(
-                    &self.track_set,
-                    survivors,
-                    &input.frame.features.keypoints_xy,
-                    3.0,
-                )
-                .ok()
+                snap_unique(&self.track_set, survivors, primary_keypoints, 3.0).ok()
             })
             .map(|matches| {
                 matches
@@ -157,6 +160,7 @@ impl Tracker {
                 let track_matches: Vec<MapKeypointMatch> = estimate
                     .matches
                     .iter()
+                    .filter(|&&(_, keypoint_idx)| keypoint_idx < primary_keypoints.len())
                     .map(|&(map_point_idx, keypoint_idx)| MapKeypointMatch {
                         map_point_idx,
                         keypoint_idx,
@@ -164,7 +168,7 @@ impl Tracker {
                     .collect();
                 if self
                     .track_set
-                    .reconcile_from_matches(&track_matches, &input.frame.features.keypoints_xy)
+                    .reconcile_from_matches(&track_matches, primary_keypoints)
                     .is_err()
                 {
                     self.track_set = TrackSet::new();

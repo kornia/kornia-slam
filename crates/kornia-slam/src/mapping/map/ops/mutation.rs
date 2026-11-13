@@ -9,13 +9,6 @@ use crate::mapping::map::{
 use kornia_algebra::Vec3F64;
 use std::collections::{HashMap, HashSet};
 
-/// What [`Map::compact_landmarks`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LandmarkCompaction {
-    pub slots_before: usize,
-    pub slots_after: usize,
-}
-
 /// Result of replacing a duplicate landmark with a surviving landmark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MapPointMergeResult {
@@ -31,7 +24,6 @@ impl Map {
         self.keyframes.clear();
         self.map_points.clear();
         self.imu_factors.clear();
-        self.next_stable_id = 0;
     }
 
     /// Update `n_visible` and `n_found` counters for map points.
@@ -57,6 +49,26 @@ impl Map {
     /// The point with stronger observation support survives. Associations are
     /// deduplicated so a keyframe references the survivor from at most one slot.
     pub fn merge_map_points(&mut self, first: usize, second: usize) -> Option<MapPointMergeResult> {
+        self.merge_landmarks(first, second, LeftoverSweep::EveryKeyframe)
+    }
+
+    /// [`Self::merge_map_points`] that looks for leftover slots only in the replaced point's
+    /// observing keyframes instead of in every keyframe: the same result on a map whose slots and
+    /// observation records agree, at a cost independent of the map's size.
+    pub fn merge_map_points_by_records(
+        &mut self,
+        first: usize,
+        second: usize,
+    ) -> Option<MapPointMergeResult> {
+        self.merge_landmarks(first, second, LeftoverSweep::Observers)
+    }
+
+    fn merge_landmarks(
+        &mut self,
+        first: usize,
+        second: usize,
+        sweep: LeftoverSweep,
+    ) -> Option<MapPointMergeResult> {
         if first == second {
             return None;
         }
@@ -87,6 +99,13 @@ impl Map {
         // per link would retire the duplicate the moment its last observation
         // went, mid-way through a change that is not yet complete.
         let replaced_observations: Vec<_> = self.map_points[replaced].observations().to_vec();
+        let replaced_observers: HashSet<usize> = match sweep {
+            LeftoverSweep::EveryKeyframe => HashSet::new(),
+            LeftoverSweep::Observers => replaced_observations
+                .iter()
+                .map(|observation| observation.key.keyframe_idx)
+                .collect(),
+        };
         let mut redirected_associations = 0;
         for observation in replaced_observations {
             let key = observation.key;
@@ -96,9 +115,9 @@ impl Map {
             {
                 kf.clear_map_point(key.feature_idx);
             }
-            if self.map_points[survivor].is_observed_by(key.keyframe_idx) {
-                // The survivor already has a feature in this keyframe; keep it
-                // and its descriptor contribution.
+            if self.map_points[survivor].is_observed_in(key.keyframe_idx, observation.camera) {
+                // The survivor already has a feature in this keyframe camera;
+                // keep it and its descriptor contribution.
                 continue;
             }
             self.link_unchecked(key, survivor, observation.descriptor);
@@ -108,6 +127,11 @@ impl Map {
         // Any remaining slot still pointing at the duplicate (a keyframe that
         // held it without a matching record) is cleared too.
         for keyframe in &mut self.keyframes {
+            if sweep == LeftoverSweep::Observers
+                && !replaced_observers.contains(&keyframe.frame.idx)
+            {
+                continue;
+            }
             for slot in 0..keyframe.map_point_by_desc_idx.len() {
                 if keyframe.map_point(slot) == Some(replaced) {
                     keyframe.clear_map_point(slot);
@@ -210,12 +234,6 @@ pub enum MapMutationError {
     InvalidNewLandmark(usize),
     #[error("landmark position is not finite")]
     NonFinitePosition,
-    #[error("feature {feature_idx} of keyframe {keyframe_idx} holds dead landmark {landmark}")]
-    DanglingLandmark {
-        keyframe_idx: usize,
-        feature_idx: usize,
-        landmark: usize,
-    },
     #[error("imu factor connects keyframe {0} to itself")]
     SelfImuFactor(usize),
     #[error("imu factor {prev} -> {curr} already exists")]
@@ -252,73 +270,16 @@ impl Map {
         Ok(())
     }
 
-    /// Removes every retired landmark's slot, and renumbers the rest in order.
-    ///
-    /// Every landmark id held outside the map is invalid afterwards, so call it
-    /// only between frames. The world epoch advances, so an in-flight BA
-    /// snapshot, which holds ids, is refused. [`MapPoint::stable_id`] survives.
-    /// A keyframe holding a dead landmark refuses the whole call before the
-    /// first write. O(slots + associations), and it allocates one id table.
-    pub fn compact_landmarks(&mut self) -> Result<LandmarkCompaction, MapMutationError> {
-        let slots_before = self.map_points.len();
-        for kf in &self.keyframes {
-            for (feature_idx, landmark) in kf.map_point_by_desc_idx.iter().enumerate() {
-                let Some(landmark) = *landmark else { continue };
-                if self.map_points.get(landmark).is_none_or(|mp| mp.culled) {
-                    return Err(MapMutationError::DanglingLandmark {
-                        keyframe_idx: kf.frame.idx,
-                        feature_idx,
-                        landmark,
-                    });
-                }
-            }
-        }
-        let mut next = 0;
-        let new_ids: Vec<usize> = self
-            .map_points
-            .iter()
-            .map(|mp| {
-                let id = next;
-                next += usize::from(!mp.culled);
-                id
-            })
-            .collect();
-        if next == slots_before {
-            return Ok(LandmarkCompaction {
-                slots_before,
-                slots_after: slots_before,
-            });
-        }
-        self.map_points.retain(|mp| !mp.culled);
-        for kf in &mut self.keyframes {
-            for landmark in kf.map_point_by_desc_idx.iter_mut().flatten() {
-                *landmark = new_ids[*landmark];
-            }
-        }
-        self.world_epoch = self.world_epoch.wrapping_add(1);
-        Ok(LandmarkCompaction {
-            slots_before,
-            slots_after: next,
-        })
-    }
-
-    /// Stores a new landmark under the next [`MapPoint::stable_id`].
-    fn push_landmark(&mut self, mut landmark: MapPoint) -> usize {
-        landmark.stable_id = self.next_stable_id;
-        self.next_stable_id += 1;
-        self.map_points.push(landmark);
-        self.map_points.len() - 1
-    }
-
     /// Appends a landmark and establishes its reference observation. Retired
-    /// slots are reused only through [`Map::compact_landmarks`].
+    /// slots are never reused, so existing ids keep their meaning.
     pub fn insert_landmark(&mut self, seed: LandmarkSeed) -> Result<usize, MapMutationError> {
         if !seed.position.length().is_finite() {
             return Err(MapMutationError::NonFinitePosition);
         }
         let (descriptor, octave) = self.feature_data(seed.reference)?;
         self.require_free_feature(seed.reference)?;
-        let idx = self.push_landmark(MapPoint::new(
+        let idx = self.map_points.len();
+        self.map_points.push(MapPoint::new(
             seed.position,
             descriptor,
             octave,
@@ -387,7 +348,7 @@ impl Map {
             .get(landmark_idx)
             .is_some_and(|mp| mp.keyframe_idx == keyframe_idx);
         if let Some(mp) = self.map_points.get_mut(landmark_idx) {
-            mp.remove_observation(keyframe_idx);
+            mp.remove_feature_observation(key);
             if mp.observations().is_empty() {
                 self.retire_landmark(landmark_idx);
             } else {
@@ -449,19 +410,22 @@ impl Map {
             }
             Self::check_detached(kf)?;
         }
-        let feature_count = |this: &Self, key: ObservationKey| -> Option<usize> {
+        // (rig camera, feature count) of a claimed feature's keyframe.
+        let claimed_keyframe = |this: &Self, key: ObservationKey| -> Option<(usize, usize)> {
             keyframes
                 .iter()
                 .find(|kf| kf.frame.idx == key.keyframe_idx)
                 .or_else(|| this.get_keyframe(key.keyframe_idx))
                 .map(|kf| {
-                    kf.frame
-                        .features
-                        .descriptors
-                        .len()
-                        .min(kf.frame.features.keypoints_xy.len())
+                    let features = &kf.frame.features;
+                    (
+                        kf.frame.camera_of(key.feature_idx),
+                        features.descriptors.len().min(features.keypoints_xy.len()),
+                    )
                 })
         };
+        let feature_count =
+            |this: &Self, key: ObservationKey| claimed_keyframe(this, key).map(|(_, n)| n);
 
         // 2. resolve landmark targets; each seed carries an implicit first link.
         let first_new_id = self.map_points.len();
@@ -493,7 +457,8 @@ impl Map {
         // for each landmark/keyframe pair, so an identical repeat is a no-op
         // while a competing target is still a conflict.
         let mut claimed_features: HashMap<ObservationKey, usize> = HashMap::new();
-        let mut claimed_pairs: HashMap<(usize, usize), usize> = HashMap::new();
+        // One feature per (landmark, keyframe, rig camera).
+        let mut claimed_pairs: HashMap<(usize, usize, usize), usize> = HashMap::new();
         let mut accepted: Vec<(ObservationKey, usize)> = Vec::new();
         for &(key, landmark) in &claims {
             let Some(n_features) = feature_count(self, key) else {
@@ -524,7 +489,8 @@ impl Map {
                 }
                 None => {}
             }
-            if let Some(&feature) = claimed_pairs.get(&(landmark, key.keyframe_idx))
+            let camera = claimed_keyframe(self, key).map_or(0, |(camera, _)| camera);
+            if let Some(&feature) = claimed_pairs.get(&(landmark, key.keyframe_idx, camera))
                 && feature != key.feature_idx
             {
                 return Err(MapMutationError::DuplicateObservation {
@@ -533,7 +499,7 @@ impl Map {
                 });
             }
             claimed_features.insert(key, landmark);
-            claimed_pairs.insert((landmark, key.keyframe_idx), key.feature_idx);
+            claimed_pairs.insert((landmark, key.keyframe_idx, camera), key.feature_idx);
             accepted.push((key, landmark));
         }
 
@@ -579,13 +545,15 @@ impl Map {
         let mut landmark_ids = Vec::with_capacity(landmarks.len());
         for seed in &landmarks {
             let (descriptor, octave) = self.feature_data(seed.reference).expect("validated above");
-            landmark_ids.push(self.push_landmark(MapPoint::new(
+            let idx = self.map_points.len();
+            self.map_points.push(MapPoint::new(
                 seed.position,
                 descriptor,
                 octave,
                 seed.color,
                 seed.reference.keyframe_idx,
-            )));
+            ));
+            landmark_ids.push(idx);
         }
 
         // `accepted` is the deduplicated set validation approved, in request
@@ -681,10 +649,11 @@ impl Map {
             }
             None => {}
         }
+        let camera = self.observation_camera(key);
         if self
             .map_points
             .get(landmark_idx)
-            .is_some_and(|mp| mp.is_observed_by(key.keyframe_idx))
+            .is_some_and(|mp| mp.is_observed_in(key.keyframe_idx, camera))
         {
             return Err(MapMutationError::DuplicateObservation {
                 landmark: landmark_idx,
@@ -695,12 +664,19 @@ impl Map {
     }
 
     fn link_unchecked(&mut self, key: ObservationKey, landmark_idx: usize, descriptor: [u8; 32]) {
+        let camera = self.observation_camera(key);
         if let Some(kf) = self.get_keyframe_mut(key.keyframe_idx) {
             kf.associate_map_point(key.feature_idx, landmark_idx);
         }
         if let Some(mp) = self.map_points.get_mut(landmark_idx) {
-            mp.add_observation(key, descriptor);
+            mp.add_observation(key, camera, descriptor);
         }
+    }
+
+    /// Rig camera of an observed feature; 0 outside a rig.
+    pub(in crate::mapping::map) fn observation_camera(&self, key: ObservationKey) -> u8 {
+        self.get_keyframe(key.keyframe_idx)
+            .map_or(0, |kf| kf.frame.camera_of(key.feature_idx) as u8)
     }
 
     /// Smallest `(keyframe_idx, feature_idx)` becomes the reference.
@@ -752,6 +728,13 @@ impl Map {
         }
         self.update_map_point_geometry(landmark_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
     }
+}
+
+/// Where a merge looks for slots that still name the replaced point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeftoverSweep {
+    EveryKeyframe,
+    Observers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

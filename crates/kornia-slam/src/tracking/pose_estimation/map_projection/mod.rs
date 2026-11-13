@@ -26,7 +26,7 @@ use std::collections::HashMap;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::{Pose3d, RansacParams, ransac_fundamental};
-use kornia_algebra::{Vec2F32, Vec2F64};
+use kornia_algebra::{Vec2F32, Vec2F64, Vec3F64};
 use kornia_image::ImageSize;
 use kornia_imgproc::features::hamming_distance;
 
@@ -35,10 +35,38 @@ use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
 use crate::frame::Frame;
 use crate::mapping::map::{Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
+use crate::mapping::visual_information::VisualInformation;
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 
 use super::Estimate;
+use super::rig_pnp::{RigObservation, solve_rig_pnp};
 use keypoint_grid::KeypointGrid;
+
+/// The keypoints of one camera of the current frame, binned for projection
+/// search. A rig frame has one per camera; any other frame has one.
+struct ViewGrid {
+    /// Index of this camera's first keypoint in the frame.
+    offset: usize,
+    len: usize,
+    camera: PinholeCamera,
+    /// `None` for the primary camera, whose pose is the tracked one.
+    camera_from_primary: Option<Pose3d>,
+    image_size: ImageSize,
+    grid: KeypointGrid,
+}
+
+/// Projection matches `(map point, keypoint)`, the undistorted keypoints and
+/// the per-camera grids they were matched in.
+type FrameMatches = (Vec<(usize, usize)>, Vec<[f32; 2]>, Vec<ViewGrid>);
+
+impl ViewGrid {
+    fn pose(&self, pose_world_to_primary: &Pose3d) -> Pose3d {
+        match &self.camera_from_primary {
+            Some(t) => t.compose(pose_world_to_primary),
+            None => *pose_world_to_primary,
+        }
+    }
+}
 
 /// Half-width of the pyramid-octave window for projection matching. ORB-SLAM3
 /// uses `[predicted-1, predicted]` (effectively half-width ~1, biased down);
@@ -88,6 +116,22 @@ pub struct MapProjectionConfig {
     pub min_inliers_with_prediction: usize,
     /// Fundamental-matrix RANSAC inlier threshold in pixels.
     pub geometric_filter_threshold_px: f64,
+    /// Which tracked matches the estimate hands on to the keyframe.
+    pub keyframe_observations: KeyframeObservations,
+}
+
+/// Which matches of an accepted pose become keyframe observations (and
+/// landmark found counts and optical-flow tracks).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum KeyframeObservations {
+    /// Every projection match, outliers of the final PnP gate included.
+    #[default]
+    AllMatches,
+    /// Only matches within the final PnP gate at the accepted pose, as
+    /// ORB-SLAM3 nulls pose-optimization outliers in `TrackLocalMap`; a
+    /// mismatch linked into a keyframe would stay in every later BA.
+    PnpInliers,
 }
 
 impl Default for MapProjectionConfig {
@@ -110,11 +154,19 @@ impl Default for MapProjectionConfig {
             search_widen_per_sec: 1.0,
             min_inliers_with_prediction: 15,
             geometric_filter_threshold_px: 1.0,
+            keyframe_observations: KeyframeObservations::AllMatches,
         }
     }
 }
 
 impl MapProjectionConfig {
+    /// This config with the PnP gates weighted by `information`.
+    pub fn with_visual_information(&self, information: VisualInformation) -> Self {
+        let mut config = self.clone();
+        config.pnp.visual_information = information;
+        config
+    }
+
     /// `search_scale` to pass to `MapProjectionEstimator::estimate_pose` given
     /// how long tracking has been failing.
     ///
@@ -194,7 +246,7 @@ impl MapProjectionEstimator {
         let local_indices =
             select_local_map_points(map, &[], current_kf, LocalMapSelectionConfig::default());
 
-        let (projection_matches, curr_keypoints_undist, grid) = self.match_map_to_frame(
+        let (projection_matches, curr_keypoints_undist, grids) = self.match_map_to_frame(
             map,
             &local_indices,
             frame,
@@ -210,6 +262,7 @@ impl MapProjectionEstimator {
             let correspondences = self.geometric_consistency_filter(
                 current_kf,
                 &correspondences,
+                frame,
                 &curr_keypoints_undist,
                 camera,
             );
@@ -218,7 +271,8 @@ impl MapProjectionEstimator {
                     map.map_points(),
                     &correspondences,
                     &curr_keypoints_undist,
-                    camera,
+                    &frame.features.octaves,
+                    &grids,
                     pose_init,
                     search_scale,
                 )
@@ -234,9 +288,7 @@ impl MapProjectionEstimator {
                 &curr_keypoints_undist,
                 &frame.features.descriptors,
                 &frame.features.octaves,
-                &grid,
-                frame.image_size,
-                camera,
+                &grids,
                 &pose,
                 search_scale,
             ) {
@@ -245,6 +297,16 @@ impl MapProjectionEstimator {
                     pose = local.pose;
                     inliers = local.inliers;
                 }
+            }
+            if self.config.keyframe_observations == KeyframeObservations::PnpInliers {
+                matches = self.inlier_matches(
+                    map.map_points(),
+                    &matches,
+                    &curr_keypoints_undist,
+                    &frame.features.octaves,
+                    &grids,
+                    &pose,
+                );
             }
             Ok(Estimate {
                 pose,
@@ -316,6 +378,7 @@ impl MapProjectionEstimator {
         &self,
         current_kf: Option<&Keyframe>,
         correspondences: &[(usize, usize)],
+        current: &Frame,
         curr_keypoints_undist: &[[f32; 2]],
         camera: &PinholeCamera,
     ) -> Vec<(usize, usize)> {
@@ -338,6 +401,10 @@ impl MapProjectionEstimator {
             let Some(&desc_idx) = mp_to_desc.get(&mp_idx) else {
                 continue;
             };
+            // One fundamental matrix relates only primary-camera views.
+            if current_kf.frame.camera_of(desc_idx) != 0 || current.camera_of(kp_idx) != 0 {
+                continue;
+            }
             let Some(reference) = current_kf.frame.undistorted_xy(desc_idx, camera) else {
                 continue;
             };
@@ -382,9 +449,7 @@ impl MapProjectionEstimator {
         curr_keypoints_undist: &[[f32; 2]],
         curr_descriptors: &[[u8; 32]],
         curr_octaves: &[u8],
-        grid: &KeypointGrid,
-        image_size: ImageSize,
-        camera: &PinholeCamera,
+        grids: &[ViewGrid],
         pose_init: &Pose3d,
         search_scale: f32,
     ) -> Option<Estimate> {
@@ -410,10 +475,8 @@ impl MapProjectionEstimator {
             curr_keypoints_undist,
             curr_descriptors,
             curr_octaves,
-            grid,
-            camera,
+            grids,
             pose_init,
-            image_size,
             local_config,
         );
         if global_matches.len() < min_corr {
@@ -424,7 +487,8 @@ impl MapProjectionEstimator {
             map.map_points(),
             &global_matches,
             curr_keypoints_undist,
-            camera,
+            curr_octaves,
+            grids,
             pose_init,
             search_scale,
         )?;
@@ -435,29 +499,64 @@ impl MapProjectionEstimator {
         })
     }
 
+    /// The matches within the final PnP gate at `pose`, octave-scaled as the
+    /// PnP gates are.
+    fn inlier_matches(
+        &self,
+        map_points: &[MapPoint],
+        matches: &[(usize, usize)],
+        keypoints_undist: &[[f32; 2]],
+        octaves: &[u8],
+        grids: &[ViewGrid],
+        pose: &Pose3d,
+    ) -> Vec<(usize, usize)> {
+        let pnp = &self.config.pnp;
+        let threshold_sq = pnp.final_reproj_threshold_px.powi(2);
+        matches
+            .iter()
+            .copied()
+            .filter(|&(mp_idx, kp_idx)| {
+                let (Some(mp), Some(kp)) = (map_points.get(mp_idx), keypoints_undist.get(kp_idx))
+                else {
+                    return false;
+                };
+                let sigma = pnp
+                    .visual_information
+                    .sigma_px(octaves.get(kp_idx).copied().unwrap_or(0))
+                    as f64;
+                grids
+                    .iter()
+                    .find(|g| (g.offset..g.offset + g.len).contains(&kp_idx))
+                    .and_then(|view| {
+                        view.camera.reprojection_error_sq_world(
+                            &view.pose(pose),
+                            &mp.position,
+                            kp[0] as f64,
+                            kp[1] as f64,
+                        )
+                    })
+                    .is_some_and(|error_sq| error_sq <= threshold_sq * sigma * sigma)
+            })
+            .collect()
+    }
+
     /// Gather 3D-2D correspondences from map points and keypoints, then solve PnP.
     ///
     /// `search_scale` widens the coarse prior-reprojection gate (see
     /// [`Self::estimate_pose`]) so a drifted `pose_init` doesn't starve the
     /// LM solve of correspondences; the tight final-inlier threshold that
     /// actually accepts the solution is unaffected.
+    #[allow(clippy::too_many_arguments)]
     fn solve_pnp(
         &self,
         map_points: &[MapPoint],
         correspondences: &[(usize, usize)],
         keypoints_undist: &[[f32; 2]],
-        camera: &PinholeCamera,
+        octaves: &[u8],
+        grids: &[ViewGrid],
         pose_init: &Pose3d,
         search_scale: f32,
     ) -> Option<(Pose3d, usize)> {
-        let mut points_world = Vec::with_capacity(correspondences.len());
-        let mut points_image = Vec::with_capacity(correspondences.len());
-        for &(mp_idx, kp_idx) in correspondences {
-            if let (Some(mp), Some(&kp)) = (map_points.get(mp_idx), keypoints_undist.get(kp_idx)) {
-                points_world.push(mp.position);
-                points_image.push(Vec2F32::new(kp[0], kp[1]));
-            }
-        }
         let pnp_config = if search_scale > 1.0 {
             PnpConfig {
                 prior_reproj_threshold_px: self.config.pnp.prior_reproj_threshold_px
@@ -467,11 +566,62 @@ impl MapProjectionEstimator {
         } else {
             self.config.pnp.clone()
         };
-        pnp::solve_pnp(&points_world, &points_image, camera, pose_init, &pnp_config)
+        let primary = grids.first()?;
+        let information = pnp_config.visual_information;
+        let octave_of = |kp_idx: usize| octaves.get(kp_idx).copied().unwrap_or(0);
+        let mut points_world = Vec::with_capacity(correspondences.len());
+        let mut points_image = Vec::with_capacity(correspondences.len());
+        let mut points_octave = Vec::new();
+        for &(mp_idx, kp_idx) in correspondences {
+            if kp_idx >= primary.offset + primary.len {
+                continue;
+            }
+            if let (Some(mp), Some(&kp)) = (map_points.get(mp_idx), keypoints_undist.get(kp_idx)) {
+                points_world.push(mp.position);
+                points_image.push(Vec2F32::new(kp[0], kp[1]));
+                if !information.is_unit() {
+                    points_octave.push(octave_of(kp_idx));
+                }
+            }
+        }
+        let primary_solution = pnp::solve_pnp(
+            &points_world,
+            &points_image,
+            &points_octave,
+            &primary.camera,
+            pose_init,
+            &pnp_config,
+        );
+        if grids.len() == 1 {
+            return primary_solution;
+        }
+        let observations: Vec<RigObservation> = correspondences
+            .iter()
+            .filter_map(|&(mp_idx, kp_idx)| {
+                let mp = map_points.get(mp_idx)?;
+                let kp = keypoints_undist.get(kp_idx)?;
+                let view = grids
+                    .iter()
+                    .find(|g| (g.offset..g.offset + g.len).contains(&kp_idx))?;
+                Some(RigObservation {
+                    point_world: mp.position,
+                    pixel: [kp[0] as f64, kp[1] as f64],
+                    camera: &view.camera,
+                    camera_from_primary: view.camera_from_primary.as_ref(),
+                    sigma_px: information.sigma_px(octave_of(kp_idx)) as f64,
+                })
+            })
+            .collect();
+        // The rig solve starts from the primary camera's solution when there
+        // is one: on real data the single-camera solver lands in the better
+        // basin from a drifted prediction.
+        let rig_start = primary_solution.map_or(*pose_init, |(pose, _)| pose);
+        solve_rig_pnp(&observations, &rig_start, &pnp_config)
     }
 
-    /// Undistorts keypoints, builds a spatial grid, and runs projection matching
-    /// with narrow-to-wide fallback over the candidate map-point indices.
+    /// Undistorts keypoints, builds one spatial grid per camera, and runs
+    /// projection matching with narrow-to-wide fallback over the candidate
+    /// map-point indices.
     fn match_map_to_frame(
         &self,
         map: &Map,
@@ -480,8 +630,7 @@ impl MapProjectionEstimator {
         pose: &Pose3d,
         camera: &PinholeCamera,
         search_scale: f32,
-    ) -> (Vec<(usize, usize)>, Vec<[f32; 2]>, KeypointGrid) {
-        const KEYPOINT_GRID_CELL_SIZE: f32 = 64.0;
+    ) -> FrameMatches {
         const MIN_MATCHES_BEFORE_WIDE: usize = 20;
 
         // Use the frame's undistortion cache when filled (the pipeline fills
@@ -502,12 +651,7 @@ impl MapProjectionEstimator {
                     .collect()
             };
 
-        let grid = KeypointGrid::new(
-            &keypoints_undist,
-            frame.image_size.width as f32,
-            frame.image_size.height as f32,
-            KEYPOINT_GRID_CELL_SIZE,
-        );
+        let grids = view_grids(frame, &keypoints_undist, camera);
 
         let config = ProjectionMatchConfig {
             search_radius: self.config.projection.search_radius * search_scale,
@@ -519,10 +663,8 @@ impl MapProjectionEstimator {
             &keypoints_undist,
             &frame.features.descriptors,
             &frame.features.octaves,
-            &grid,
-            camera,
+            &grids,
             pose,
-            frame.image_size,
             config,
         );
 
@@ -533,10 +675,8 @@ impl MapProjectionEstimator {
                 &keypoints_undist,
                 &frame.features.descriptors,
                 &frame.features.octaves,
-                &grid,
-                camera,
+                &grids,
                 pose,
-                frame.image_size,
                 ProjectionMatchConfig {
                     search_radius: config.search_radius * 2.0,
                     ..config
@@ -544,9 +684,11 @@ impl MapProjectionEstimator {
             );
         }
 
-        (matches, keypoints_undist, grid)
+        (matches, keypoints_undist, grids)
     }
 
+    /// Matches each candidate map point to at most one keypoint: the best
+    /// descriptor among the cameras it projects into.
     #[allow(clippy::too_many_arguments)]
     fn match_by_projection(
         &self,
@@ -555,15 +697,19 @@ impl MapProjectionEstimator {
         keypoints_xy: &[[f32; 2]],
         descriptors: &[[u8; 32]],
         octaves: &[u8],
-        grid: &KeypointGrid,
-        camera: &PinholeCamera,
-        pose_world_to_cam: &Pose3d,
-        image_size: ImageSize,
+        grids: &[ViewGrid],
+        pose_world_to_primary: &Pose3d,
         config: ProjectionMatchConfig,
     ) -> Vec<(usize, usize)> {
         let mut matched_kp = vec![false; keypoints_xy.len()];
         let mut matches = Vec::new();
-        let camera_center = pose_world_to_cam.inverse().translation;
+        let poses: Vec<(Pose3d, Vec3F64)> = grids
+            .iter()
+            .map(|g| {
+                let pose = g.pose(pose_world_to_primary);
+                (pose, pose.inverse().translation)
+            })
+            .collect();
 
         for &mp_idx in candidates {
             let Some(mp) = map_points.get(mp_idx) else {
@@ -573,49 +719,56 @@ impl MapProjectionEstimator {
                 continue;
             }
 
-            let p_cam = pose_world_to_cam.transform_point(&mp.position);
-            let Ok(pixel) = camera.project_to_image(&p_cam, config.min_depth, image_size) else {
-                continue;
-            };
-            let u = pixel.x as f32;
-            let v = pixel.y as f32;
-
-            // Scale-invariance gates (ORB-SLAM3, relaxed):
-            //  - distance gate: only match within [0.8*min, 1.2*max]
-            //  - octave gate: candidates must be near the predicted level
-            // Active once the point's scale geometry has been computed.
-            let octave_window = if mp.max_distance > 0.0 {
-                let dist = (mp.position - camera_center).length();
-                if dist < mp.min_distance_invariance() || dist > mp.max_distance_invariance() {
-                    continue;
-                }
-                let level = mp.predict_scale(dist, ORB_SCALE_FACTOR, ORB_N_LEVELS) as i32;
-                let half = OCTAVE_WINDOW_HALF_WIDTH as i32;
-                let lo = (level - half).max(0) as u8;
-                let hi = (level + half).min(ORB_N_LEVELS as i32 - 1) as u8;
-                Some((lo, hi))
-            } else {
-                None
-            };
-
-            let candidates = grid.query_radius(u, v, config.search_radius, keypoints_xy);
             let mut best_dist = u32::MAX;
             let mut best_kp = usize::MAX;
-
-            for kp_idx in candidates {
-                if matched_kp[kp_idx] {
+            for (view, (pose_world_to_cam, camera_center)) in grids.iter().zip(&poses) {
+                let p_cam = pose_world_to_cam.transform_point(&mp.position);
+                let Ok(pixel) =
+                    view.camera
+                        .project_to_image(&p_cam, config.min_depth, view.image_size)
+                else {
                     continue;
-                }
-                if let Some((lo, hi)) = octave_window {
-                    let kp_octave = octaves.get(kp_idx).copied().unwrap_or(0);
-                    if kp_octave < lo || kp_octave > hi {
+                };
+                let u = pixel.x as f32;
+                let v = pixel.y as f32;
+
+                // Scale-invariance gates (ORB-SLAM3, relaxed):
+                //  - distance gate: only match within [0.8*min, 1.2*max]
+                //  - octave gate: candidates must be near the predicted level
+                // Active once the point's scale geometry has been computed.
+                let octave_window = if mp.max_distance > 0.0 {
+                    let dist = (mp.position - *camera_center).length();
+                    if dist < mp.min_distance_invariance() || dist > mp.max_distance_invariance() {
                         continue;
                     }
-                }
-                let dist = hamming_distance(&mp.descriptor, &descriptors[kp_idx]);
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_kp = kp_idx;
+                    let level = mp.predict_scale(dist, ORB_SCALE_FACTOR, ORB_N_LEVELS) as i32;
+                    let half = OCTAVE_WINDOW_HALF_WIDTH as i32;
+                    let lo = (level - half).max(0) as u8;
+                    let hi = (level + half).min(ORB_N_LEVELS as i32 - 1) as u8;
+                    Some((lo, hi))
+                } else {
+                    None
+                };
+
+                let view_keypoints = &keypoints_xy[view.offset..view.offset + view.len];
+                let nearby = view
+                    .grid
+                    .query_radius(u, v, config.search_radius, view_keypoints);
+                for kp_idx in nearby.into_iter().map(|i| i + view.offset) {
+                    if matched_kp[kp_idx] {
+                        continue;
+                    }
+                    if let Some((lo, hi)) = octave_window {
+                        let kp_octave = octaves.get(kp_idx).copied().unwrap_or(0);
+                        if kp_octave < lo || kp_octave > hi {
+                            continue;
+                        }
+                    }
+                    let dist = hamming_distance(&mp.descriptor, &descriptors[kp_idx]);
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_kp = kp_idx;
+                    }
                 }
             }
 
@@ -627,6 +780,56 @@ impl MapProjectionEstimator {
 
         matches
     }
+}
+
+/// One grid per camera of `frame`: per rig camera for a rig frame, else one
+/// over every keypoint with `camera`.
+fn view_grids(
+    frame: &Frame,
+    keypoints_undist: &[[f32; 2]],
+    camera: &PinholeCamera,
+) -> Vec<ViewGrid> {
+    const KEYPOINT_GRID_CELL_SIZE: f32 = 64.0;
+    let grid = |range: std::ops::Range<usize>, size: ImageSize| {
+        KeypointGrid::new(
+            &keypoints_undist[range],
+            size.width as f32,
+            size.height as f32,
+            KEYPOINT_GRID_CELL_SIZE,
+        )
+    };
+    let Some(rig) = frame.rig.geometry.as_ref().filter(|_| frame.is_rig()) else {
+        return vec![ViewGrid {
+            offset: 0,
+            len: keypoints_undist.len(),
+            camera: camera.clone(),
+            camera_from_primary: None,
+            image_size: frame.image_size,
+            grid: grid(0..keypoints_undist.len(), frame.image_size),
+        }];
+    };
+    frame
+        .rig
+        .camera_ranges
+        .iter()
+        .zip(rig.views())
+        .enumerate()
+        .map(|(c, (range, view))| ViewGrid {
+            offset: range.start,
+            len: range.len(),
+            camera: if c == 0 {
+                camera.clone()
+            } else {
+                view.camera.clone()
+            },
+            camera_from_primary: (c > 0).then_some(view.camera_from_primary),
+            image_size: if c == 0 { frame.image_size } else { view.size },
+            grid: grid(
+                range.clone(),
+                if c == 0 { frame.image_size } else { view.size },
+            ),
+        })
+        .collect()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -670,6 +873,20 @@ mod matching_tests {
     use kornia_algebra::{Mat3F64, Vec3F64};
     use kornia_imgproc::features::OrbFeatures;
 
+    fn single_view(grid: KeypointGrid, camera: &PinholeCamera, len: usize) -> ViewGrid {
+        ViewGrid {
+            offset: 0,
+            len,
+            camera: camera.clone(),
+            camera_from_primary: None,
+            image_size: ImageSize {
+                width: 640,
+                height: 480,
+            },
+            grid,
+        }
+    }
+
     fn make_test_estimator() -> MapProjectionEstimator {
         MapProjectionEstimator::new(MapProjectionConfig::default())
     }
@@ -706,6 +923,7 @@ mod matching_tests {
             u_right: Vec::new(),
             depth: Vec::new(),
             keypoints_undist: keypoints,
+            rig: Default::default(),
         }
     }
 
@@ -762,6 +980,7 @@ mod matching_tests {
         let filtered = estimator.geometric_consistency_filter(
             Some(&keyframe),
             &correspondences,
+            &test_frame(current.clone()),
             &current,
             &camera,
         );
@@ -786,13 +1005,20 @@ mod matching_tests {
             estimator.geometric_consistency_filter(
                 Some(&keyframe),
                 &correspondences,
+                &test_frame(current.clone()),
                 &current,
                 &camera,
             ),
             correspondences
         );
         assert_eq!(
-            estimator.geometric_consistency_filter(None, &correspondences, &current, &camera),
+            estimator.geometric_consistency_filter(
+                None,
+                &correspondences,
+                &test_frame(current.clone()),
+                &current,
+                &camera,
+            ),
             correspondences
         );
     }
@@ -839,13 +1065,8 @@ mod matching_tests {
             &keypoints_xy,
             &descriptors,
             &octaves,
-            &grid,
-            &camera,
+            &[single_view(grid, &camera, keypoints_xy.len())],
             &pose,
-            ImageSize {
-                width: 640,
-                height: 480,
-            },
             ProjectionMatchConfig {
                 min_depth: 0.0,
                 search_radius: 15.0,
@@ -855,6 +1076,34 @@ mod matching_tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0], (0, 0));
+    }
+
+    #[test]
+    fn only_matches_within_the_final_gate_are_kept() {
+        let mut estimator = make_test_estimator();
+        let camera = test_camera();
+        let map_points: Vec<MapPoint> = [0.0, 0.5, -0.5]
+            .into_iter()
+            .map(|x| MapPoint::new(Vec3F64::new(x, 0.0, 5.0), [0u8; 32], 0, [0; 3], 0))
+            .collect();
+        // Exact, 2 px off and 20 px off (the last at octave 7: sigma 3.6 px).
+        let keypoints = vec![[320.0f32, 240.0], [342.0, 240.0], [280.0, 240.0]];
+        let octaves = [0u8, 0, 7];
+        let kept = |estimator: &MapProjectionEstimator| {
+            let grid = KeypointGrid::new(&keypoints, 640.0, 480.0, 64.0);
+            estimator.inlier_matches(
+                &map_points,
+                &[(0, 0), (1, 1), (2, 2)],
+                &keypoints,
+                &octaves,
+                &[single_view(grid, &camera, keypoints.len())],
+                &Pose3d::IDENTITY,
+            )
+        };
+        assert_eq!(kept(&estimator), vec![(0, 0), (1, 1)]);
+        estimator.config.pnp.visual_information = VisualInformation::OctaveScaled;
+        // 20 px is still past 3 · 3.6 px.
+        assert_eq!(kept(&estimator), vec![(0, 0), (1, 1)]);
     }
 
     #[test]
@@ -881,13 +1130,8 @@ mod matching_tests {
             &keypoints_xy,
             &descriptors,
             &octaves,
-            &grid,
-            &camera,
+            &[single_view(grid, &camera, keypoints_xy.len())],
             &Pose3d::new(Mat3F64::IDENTITY, Vec3F64::ZERO),
-            ImageSize {
-                width: 640,
-                height: 480,
-            },
             ProjectionMatchConfig {
                 min_depth: 0.0,
                 search_radius: 15.0,
@@ -922,13 +1166,8 @@ mod matching_tests {
             &keypoints_xy,
             &descriptors,
             &octaves,
-            &grid,
-            &camera,
+            &[single_view(grid, &camera, keypoints_xy.len())],
             &Pose3d::new(Mat3F64::IDENTITY, Vec3F64::ZERO),
-            ImageSize {
-                width: 640,
-                height: 480,
-            },
             ProjectionMatchConfig {
                 min_depth: 0.0,
                 search_radius: 15.0,

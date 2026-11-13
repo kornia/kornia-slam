@@ -231,6 +231,101 @@ fn match_by_timestamp(
         .collect()
 }
 
+/// Reads an ASL `imu0/data.csv`: `timestamp_ns, gyro xyz (rad/s), accel xyz (m/s^2)`.
+pub fn read_imu_csv(csv: &Path) -> Result<Vec<ImuSample>, DatasetError> {
+    let file = File::open(csv)?;
+    let reader = BufReader::new(file);
+    let mut samples = Vec::new();
+
+    for (line_idx, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').collect();
+        if cols.len() < 7 {
+            return Err(DatasetError::Parse(format!(
+                "invalid imu sample at line {}: expected 7 columns",
+                line_idx + 1
+            )));
+        }
+
+        let ts_ns = cols[0].trim().parse::<u64>().map_err(|e| {
+            DatasetError::Parse(format!("invalid timestamp at line {}: {e}", line_idx + 1))
+        })?;
+        let gyro = [
+            cols[1].trim().parse::<f64>().map_err(|e| {
+                DatasetError::Parse(format!("invalid gyro x at line {}: {e}", line_idx + 1))
+            })?,
+            cols[2].trim().parse::<f64>().map_err(|e| {
+                DatasetError::Parse(format!("invalid gyro y at line {}: {e}", line_idx + 1))
+            })?,
+            cols[3].trim().parse::<f64>().map_err(|e| {
+                DatasetError::Parse(format!("invalid gyro z at line {}: {e}", line_idx + 1))
+            })?,
+        ];
+        let accel = [
+            cols[4].trim().parse::<f64>().map_err(|e| {
+                DatasetError::Parse(format!("invalid accel x at line {}: {e}", line_idx + 1))
+            })?,
+            cols[5].trim().parse::<f64>().map_err(|e| {
+                DatasetError::Parse(format!("invalid accel y at line {}: {e}", line_idx + 1))
+            })?,
+            cols[6].trim().parse::<f64>().map_err(|e| {
+                DatasetError::Parse(format!("invalid accel z at line {}: {e}", line_idx + 1))
+            })?,
+        ];
+
+        samples.push(ImuSample {
+            timestamp_sec: ts_ns as f64 * 1e-9,
+            gyro,
+            accel,
+        });
+    }
+
+    Ok(samples)
+}
+
+/// Reads an ASL camera `data.csv` (`timestamp_ns, filename`) with images in `data_dir`.
+pub fn read_camera_csv(csv: &Path, data_dir: &Path) -> Result<Vec<DatasetSample>, DatasetError> {
+    if !csv.exists() {
+        return Err(DatasetError::FileNotFound(csv.to_path_buf()));
+    }
+    if !data_dir.exists() {
+        return Err(DatasetError::FileNotFound(data_dir.to_path_buf()));
+    }
+
+    let file = File::open(csv)?;
+    let reader = BufReader::new(file);
+    let mut samples = Vec::new();
+
+    for (line_idx, line) in reader.lines().enumerate() {
+        let line = line?;
+        // Skip header line (starts with '#').
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let mut parts = line.split(',');
+        let ts_str = parts.next().ok_or_else(|| {
+            DatasetError::Parse(format!("missing timestamp at line {}", line_idx + 1))
+        })?;
+        let file_str = parts.next().ok_or_else(|| {
+            DatasetError::Parse(format!("missing filename at line {}", line_idx + 1))
+        })?;
+
+        let timestamp_ns = ts_str.trim().parse::<u64>().map_err(|e| {
+            DatasetError::Parse(format!("invalid timestamp at line {}: {e}", line_idx + 1))
+        })?;
+        let timestamp_sec = timestamp_ns as f64 * 1e-9;
+
+        samples.push(DatasetSample {
+            timestamp_sec,
+            image_path: data_dir.join(file_str.trim()),
+        });
+    }
+    Ok(samples)
+}
+
 /// Reader for the EuRoC MAV dataset (ASL format).
 ///
 /// Expects `<root>/mav0/cam0/data.csv` with nanosecond timestamps and
@@ -301,100 +396,13 @@ impl EurocDataset {
         if !csv.exists() {
             return Ok(Vec::new());
         }
-
-        let file = File::open(&csv)?;
-        let reader = BufReader::new(file);
-        let mut samples = Vec::new();
-
-        for (line_idx, line) in reader.lines().enumerate() {
-            let line = line?;
-            if line.starts_with('#') || line.trim().is_empty() {
-                continue;
-            }
-            let cols: Vec<&str> = line.split(',').collect();
-            if cols.len() < 7 {
-                return Err(DatasetError::Parse(format!(
-                    "invalid imu sample at line {}: expected 7 columns",
-                    line_idx + 1
-                )));
-            }
-
-            let ts_ns = cols[0].trim().parse::<u64>().map_err(|e| {
-                DatasetError::Parse(format!("invalid timestamp at line {}: {e}", line_idx + 1))
-            })?;
-            let gyro = [
-                cols[1].trim().parse::<f64>().map_err(|e| {
-                    DatasetError::Parse(format!("invalid gyro x at line {}: {e}", line_idx + 1))
-                })?,
-                cols[2].trim().parse::<f64>().map_err(|e| {
-                    DatasetError::Parse(format!("invalid gyro y at line {}: {e}", line_idx + 1))
-                })?,
-                cols[3].trim().parse::<f64>().map_err(|e| {
-                    DatasetError::Parse(format!("invalid gyro z at line {}: {e}", line_idx + 1))
-                })?,
-            ];
-            let accel = [
-                cols[4].trim().parse::<f64>().map_err(|e| {
-                    DatasetError::Parse(format!("invalid accel x at line {}: {e}", line_idx + 1))
-                })?,
-                cols[5].trim().parse::<f64>().map_err(|e| {
-                    DatasetError::Parse(format!("invalid accel y at line {}: {e}", line_idx + 1))
-                })?,
-                cols[6].trim().parse::<f64>().map_err(|e| {
-                    DatasetError::Parse(format!("invalid accel z at line {}: {e}", line_idx + 1))
-                })?,
-            ];
-
-            samples.push(ImuSample {
-                timestamp_sec: ts_ns as f64 * 1e-9,
-                gyro,
-                accel,
-            });
-        }
-
-        Ok(samples)
+        read_imu_csv(&csv)
     }
 
     /// Loads the ordered image samples for a given camera (`cam0` / `cam1`).
     fn load_camera_samples(root: &Path, cam: &str) -> Result<Vec<DatasetSample>, DatasetError> {
-        let csv = root.join("mav0").join(cam).join("data.csv");
-        let data_dir = root.join("mav0").join(cam).join("data");
-        if !csv.exists() {
-            return Err(DatasetError::FileNotFound(csv));
-        }
-        if !data_dir.exists() {
-            return Err(DatasetError::FileNotFound(data_dir));
-        }
-
-        let file = File::open(&csv)?;
-        let reader = BufReader::new(file);
-        let mut samples = Vec::new();
-
-        for (line_idx, line) in reader.lines().enumerate() {
-            let line = line?;
-            // Skip header line (starts with '#').
-            if line.starts_with('#') || line.trim().is_empty() {
-                continue;
-            }
-            let mut parts = line.split(',');
-            let ts_str = parts.next().ok_or_else(|| {
-                DatasetError::Parse(format!("missing timestamp at line {}", line_idx + 1))
-            })?;
-            let file_str = parts.next().ok_or_else(|| {
-                DatasetError::Parse(format!("missing filename at line {}", line_idx + 1))
-            })?;
-
-            let timestamp_ns = ts_str.trim().parse::<u64>().map_err(|e| {
-                DatasetError::Parse(format!("invalid timestamp at line {}: {e}", line_idx + 1))
-            })?;
-            let timestamp_sec = timestamp_ns as f64 * 1e-9;
-
-            samples.push(DatasetSample {
-                timestamp_sec,
-                image_path: data_dir.join(file_str.trim()),
-            });
-        }
-        Ok(samples)
+        let dir = root.join("mav0").join(cam);
+        read_camera_csv(&dir.join("data.csv"), &dir.join("data"))
     }
 
     /// Returns ordered left-camera samples.

@@ -8,10 +8,13 @@
 //! A run file names the source (EuRoC, Hilti, MCAP, or a live OAK-D or UVC
 //! camera) and the system to run on it; see `configs/` and [`config`].
 
+mod blackout;
 mod config;
 mod datasets;
 mod evaluation;
+mod map_dump;
 mod source;
+mod trajectory;
 mod tui;
 mod utils;
 use config::RunConfig;
@@ -45,6 +48,27 @@ struct Args {
     /// directory for the evaluation CSVs (created if missing; default: current dir)
     #[argh(option, default = "String::from(\".\")")]
     eval_out: String,
+
+    /// write `timestamp_ns tx ty tz qx qy qz qw` per tracked frame to this
+    /// file: the body (IMU) pose in the world when the rig has an IMU, else
+    /// the camera pose (the LaMAria estimate format)
+    #[argh(option)]
+    trajectory_out: Option<String>,
+
+    /// like --trajectory-out, written at shutdown with each frame re-anchored
+    /// to its reference keyframe's final pose (ORB-SLAM3's SaveTrajectoryEuRoC)
+    #[argh(option)]
+    trajectory_smoothed: Option<String>,
+
+    /// black images from `<start_s>` after the first frame for `<duration_s>`,
+    /// given as `<start_s>:<duration_s>`; frames and IMU are still processed
+    #[argh(option)]
+    blackout: Option<String>,
+
+    /// write the live landmarks at shutdown to this CSV (position, observation
+    /// count, descriptor)
+    #[argh(option)]
+    dump_map: Option<String>,
 
     /// spawn a Rerun viewer and stream to it (requires `--features viz`)
     #[argh(switch)]
@@ -132,6 +156,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut system = SlamSystem::build(run.system, source.rig()).map_err(|e| e.to_string())?;
     system.set_debug(args.debug);
     let camera = system.rig().camera.clone();
+    let mut trajectory_out = args
+        .trajectory_out
+        .as_deref()
+        .map(|path| {
+            trajectory::TrajectoryWriter::create(
+                std::path::Path::new(path),
+                system.rig().camera_to_body(),
+            )
+        })
+        .transpose()?;
+    let mut smoothed = args
+        .trajectory_smoothed
+        .as_ref()
+        .map(|_| trajectory::SmoothedTrajectory::default());
+    let mut blackout = args
+        .blackout
+        .as_deref()
+        .map(blackout::Blackout::parse)
+        .transpose()?;
     if let Some(path) = vocabulary {
         eprintln!(
             "[place-recognition] loaded vocabulary from {}",
@@ -169,7 +212,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut trajectory: Vec<[f32; 3]> = Vec::new();
     let mut processed: usize = 0;
 
-    while let Some(item) = source.next_frame()? {
+    while let Some(mut item) = source.next_frame()? {
+        if let Some(blackout) = blackout.as_mut()
+            && blackout.apply(&mut item)
+            && !tui_active
+        {
+            eprintln!("[blackout] frame={}", item.idx);
+        }
         let now = Instant::now();
         let elapsed = now.duration_since(last_frame_walltime);
 
@@ -184,6 +233,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             timestamp_sec,
             image,
             right_image,
+            rig_images,
             imu_samples,
         } = item;
         #[cfg(feature = "viz")]
@@ -195,6 +245,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         system.process_imu(&imu_samples);
         let result = match right_image.as_ref() {
             Some(right) => system.process_stereo(timestamp_sec, &image, right)?,
+            None if !rig_images.is_empty() => {
+                let images: Vec<&kornia_image::Image<u8, 1>> =
+                    std::iter::once(&image).chain(&rig_images).collect();
+                system.process_rig(timestamp_sec, &images)?
+            }
             None => system.process_image(timestamp_sec, &image)?,
         };
         let frame_ms = system.tracking_duration().as_secs_f64() * 1000.0;
@@ -221,13 +276,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if applied {
                         let correction = system.map_correction().map_from_odometry;
                         let t = correction.translation;
-                        let angle = SO3F64::from_matrix(&correction.rotation).log().length();
+                        let rotation = SO3F64::from_matrix(&correction.rotation);
+                        let [qx, qy, qz, qw] = rotation.to_array();
                         eprintln!(
-                            "[map-correction] map_from_odometry t=({:.3},{:.3},{:.3}) rot_deg={:.2}",
+                            "[map-correction] map_from_odometry t=({:.3},{:.3},{:.3}) rot_deg={:.2} \
+                             epoch={} q=({qx:.9},{qy:.9},{qz:.9},{qw:.9}) t_full=({:.9},{:.9},{:.9})",
                             t.x,
                             t.y,
                             t.z,
-                            angle.to_degrees(),
+                            rotation.log().length().to_degrees(),
+                            system.correction_epoch(),
+                            t.x,
+                            t.y,
+                            t.z,
                         );
                     }
                 }
@@ -250,6 +311,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("{status_line}");
         }
 
+        if let Some(writer) = trajectory_out.as_mut()
+            && result.status != kornia_slam::TrackingStatus::Skipped
+        {
+            writer.write(timestamp_sec, &result.pose_world_to_cam)?;
+        }
+        if let Some(smoothed) = smoothed.as_mut()
+            && result.status != kornia_slam::TrackingStatus::Skipped
+            && let Some(reference_kf) = system.current_keyframe_idx()
+            && let Some(reference_pose) = system.keyframe_pose(reference_kf)
+        {
+            smoothed.record(
+                timestamp_sec,
+                &result.pose_world_to_cam,
+                reference_kf,
+                &reference_pose,
+            );
+        }
         let traj_pt = trajectory_point_from_pose(&result.pose_world_to_cam);
         trajectory.push(traj_pt);
 
@@ -329,6 +407,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
     );
+    if let Some(writer) = trajectory_out {
+        writer.finish()?;
+    }
+    if let (Some(smoothed), Some(path)) = (smoothed, args.trajectory_smoothed.as_deref()) {
+        let writer = trajectory::TrajectoryWriter::create(
+            std::path::Path::new(path),
+            system.rig().camera_to_body(),
+        )?;
+        let unanchored = smoothed.write(writer, |kf| system.keyframe_pose(kf))?;
+        eprintln!("Smoothed trajectory: {unanchored} frame(s) without a surviving keyframe");
+    }
+    if let Some(path) = args.dump_map.as_deref() {
+        system.with_map_points(|map_points| {
+            map_dump::write(std::path::Path::new(path), map_points)
+        })?;
+    }
     if args.evaluate {
         evaluation::report(
             &est_positions,

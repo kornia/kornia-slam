@@ -142,6 +142,8 @@ fn build_reports_a_missing_vocabulary() {
         false,
         LoopClosingMode::Enabled {
             vocabulary: missing.clone(),
+            execution: LoopClosingExecution::default(),
+            graph: Default::default(),
         },
     );
     match SlamSystem::build(enabled, stereo_imu_rig()) {
@@ -164,6 +166,8 @@ fn loop_closing_constructs_only_when_enabled() {
             imu,
             LoopClosingMode::Enabled {
                 vocabulary: vocabulary.0.clone(),
+                execution: LoopClosingExecution::default(),
+                graph: Default::default(),
             },
         );
         SlamSystem::build(config, stereo_imu_rig()).unwrap()

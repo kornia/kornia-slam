@@ -202,14 +202,20 @@ impl sealed::EdgeTerm for InformationEdge {
         residual: &[f32; RESIDUAL_DIM],
         cost: &mut f32,
     ) -> Result<(), SparsePgoError> {
-        let squared = residual.iter().map(|v| v * v).sum::<f32>();
-        *cost += match self.kernel {
-            RobustKernel::None => squared,
-            RobustKernel::Cauchy { scale } => {
-                let c2 = scale * scale;
-                c2 * (squared / c2).ln_1p()
+        match self.kernel {
+            // Per component, as PgoEdge sums: LM stops on a relative cost change near f32's
+            // summation noise, so a different order stops it elsewhere in a flat valley.
+            RobustKernel::None => {
+                for value in residual {
+                    *cost += value * value;
+                }
             }
-        };
+            RobustKernel::Cauchy { scale } => {
+                let squared = residual.iter().map(|v| v * v).sum::<f32>();
+                let c2 = scale * scale;
+                *cost += c2 * (squared / c2).ln_1p();
+            }
+        }
         if !cost.is_finite() {
             return Err(SparsePgoError::InvalidInput(
                 "pose-graph cost must be finite".into(),
