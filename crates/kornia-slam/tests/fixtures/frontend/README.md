@@ -5,8 +5,8 @@ it moved into `SlamSystem` (kornia-slam#149; rustc 1.98.1, kornia-rs 0.2.0). The
 tests in `src/frontend/tests.rs` regenerate the same inputs and must
 reproduce these values exactly.
 
-- `frontend.txt`: ORB features (1000-keypoint budget, which the pyramid
-  overshoots), stereo matches and keypoint colors for a deterministic 376x240
+- `frontend.txt`: ORB features (1000-keypoint budget; 995 kept since kornia-rs
+  #1325 keeps the octree within its budget, as ORB-SLAM3 — it was 1991 before), stereo matches and keypoint colors for a deterministic 376x240
   texture of 4x4 blocks of splitmix-style noise, with the right view shifted by
   8 pixels; rig with `fx = 435` and a 0.11 m baseline.
 - `orientations.txt`: the ORB orientations of that same frame, one per line in
@@ -20,6 +20,10 @@ reproduce these values exactly.
   mapped into the virtual pinhole with the 88° incidence cap. Each point
   carries an index-derived orientation, descriptor and octave, so the hash
   also checks that dropped points take their attributes with them.
+
+`frontend.txt` and `orientations.txt` were re-recorded 2026-11-13 for kornia-rs
+main c2bcce1d (#1325 above; stereo matches 1243 -> 524). The EuRoC comparison that
+goes with it is the #180 gate run on that head.
 
 Regenerate them only together with an end-to-end EuRoC comparison: a change
 that alters these values changes frontend output, including an upstream ORB

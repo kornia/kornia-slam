@@ -452,6 +452,7 @@ impl MapProjectionEstimator {
                 map.map_points(),
                 &matches,
                 &keypoints_undist,
+                &frame.features.octaves,
                 &grids,
                 candidate_pose,
                 search_scale,

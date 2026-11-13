@@ -14,6 +14,7 @@ use crate::system::ConfigError;
 #[cfg(feature = "serde")]
 use crate::system::LoadError;
 use crate::tracking::KeyframePolicy;
+#[cfg(feature = "serde")]
 use crate::tracking::optical_flow::LkKernel;
 
 fn orb_mut(config: &mut SystemConfig) -> &mut OrbSlamPipeline {

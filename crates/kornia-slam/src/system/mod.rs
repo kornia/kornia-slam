@@ -17,10 +17,10 @@ pub mod wheel;
 
 pub use build::BuildError;
 pub use config::{
-    CameraSelection, FrontendConfig, KltFirst, KltPrediction, LocalBaConfig,
-    LoopClosingExecution, LoopClosingMode, MappingConfig, OrbFrontendConfig, OrbSlamPipeline,
-    OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth,
-    StereoDepthSigma, SystemConfig,
+    CameraSelection, FrontendConfig, KltFirst, KltPrediction, LocalBaConfig, LoopClosingExecution,
+    LoopClosingMode, MappingConfig, OrbFrontendConfig, OrbSlamPipeline, OrbTuning,
+    PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth, StereoDepthSigma,
+    SystemConfig,
 };
 pub use counters::{RunCounters, SkipKind};
 #[cfg(feature = "serde")]
@@ -532,10 +532,13 @@ impl SlamSystem {
         self.tracking_duration = tracking_start
             .elapsed()
             .saturating_sub(self.deferred_extraction);
-        if result.status != TrackingStatus::Skipped {
-            self.last_skip = None;
+        // An error leaves the frame uncounted, as before #184 made extraction fallible here.
+        if let Ok(r) = &result {
+            if r.status != TrackingStatus::Skipped {
+                self.last_skip = None;
+            }
+            self.counters.record_frame(r.status, self.last_skip);
         }
-        self.counters.record_frame(result.status, self.last_skip);
         self.retain_previous_image(image, previous_image);
         result
     }
