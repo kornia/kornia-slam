@@ -17,4 +17,5 @@ pub use mutation::{
     MapPointMergeResult, ObservationLink,
 };
 pub use removal::{KeyframeRemoval, KeyframeRemovalError, StillNeighbour, StillSide};
+pub(crate) use snapshot::{BaOutcome, BaSolve};
 pub use snapshot::{BaSnapshot, BaUpdate, BaWindow, LocalBaStats};

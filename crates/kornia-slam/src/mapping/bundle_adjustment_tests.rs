@@ -1,6 +1,6 @@
 use super::*;
 use crate::mapping::map::tests::test_frame;
-use crate::mapping::map::{ImuFactor, LandmarkSeed, MapInsertion, ObservationKey};
+use crate::mapping::map::{BaOutcome, ImuFactor, LandmarkSeed, MapInsertion, ObservationKey};
 use kornia_algebra::{Mat3F64, SO3F64};
 use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 
@@ -705,4 +705,43 @@ fn local_inertial_ba_reports_its_solve() {
             .solve_stats()
             .is_none()
     );
+}
+
+/// The run counters tell an early exit from a solve: a window with fewer
+/// than `MIN_OBSERVATIONS` observations never reaches the solver.
+#[test]
+fn a_window_under_the_observation_minimum_reports_the_solver_did_not_run() {
+    let mut map = Map::new();
+    for id in [10, 20] {
+        map.insert_keyframe(Keyframe::from_frame(test_frame(id, vec![[0; 32]; 2])))
+            .unwrap();
+    }
+    let landmark = map
+        .insert_landmark(LandmarkSeed {
+            position: Vec3F64::new(0.0, 0.0, 5.0),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 10,
+                feature_idx: 0,
+            },
+        })
+        .unwrap();
+    map.link_observation(20, 0, landmark).unwrap();
+
+    let visual = run_local_ba(map.ba_snapshot(&local_window(&map)), &camera());
+    assert_eq!(visual.outcome, BaOutcome::default());
+    assert_eq!(visual.outcome.solve, BaSolve::NotRun);
+    let inertial = run_local_inertial_ba(
+        map.ba_snapshot(&local_window(&map)),
+        &camera(),
+        Some(Pose3d::IDENTITY),
+        Vec3F64::new(0.0, 0.0, -9.81),
+        &[],
+        &[],
+    );
+    assert_eq!(inertial.outcome.solve, BaSolve::NotRun);
+
+    let map = fixture();
+    let solved = run_local_ba(map.ba_snapshot(&local_window(&map)), &camera());
+    assert_eq!(solved.outcome.solve, BaSolve::Solved);
 }

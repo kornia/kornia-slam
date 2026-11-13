@@ -308,6 +308,42 @@ fn frames_are_numbered_in_call_order_and_failures_keep_the_number() {
     }
 }
 
+#[test]
+fn a_fresh_systems_first_frame_is_a_bootstrap_skip() {
+    let mut system = SlamSystem::build(mono(), stereo_imu_rig()).unwrap();
+    assert_eq!(system.last_skip(), None);
+    let result = system.process_image(stamp(0), &textured(0)).unwrap();
+    assert_eq!(result.status, TrackingStatus::Skipped);
+    assert_eq!(system.last_skip(), Some(SkipKind::Bootstrap));
+    let counters = system.run_counters();
+    assert_eq!(counters.frames, 1);
+    assert_eq!(counters.skipped_bootstrap, 1);
+}
+
+#[test]
+fn every_frame_is_counted_as_exactly_one_kind() {
+    let mut system = SlamSystem::build(mono(), stereo_imu_rig()).unwrap();
+    assert!(system.process_image(f64::NAN, &textured(0)).is_err());
+    let frames = 30;
+    for idx in 0..frames {
+        let result = system
+            .process_image(stamp(idx), &textured(idx * 2))
+            .unwrap();
+        assert_eq!(
+            result.status == TrackingStatus::Skipped,
+            system.last_skip().is_some(),
+            "frame {idx}"
+        );
+    }
+    let c = system.run_counters();
+    assert_eq!(c.frames, frames as u64, "a refused input is not a frame");
+    assert_eq!(
+        c.tracked + c.skipped_bootstrap + c.coast_inertial + c.coast_visual,
+        c.frames
+    );
+    assert!(c.keyframes <= c.tracked);
+}
+
 mod keyframe_evidence {
     use super::*;
     use crate::tracking::parallax::tests::{

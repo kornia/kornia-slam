@@ -6,6 +6,7 @@
 
 mod build;
 mod config;
+mod counters;
 #[cfg(feature = "serde")]
 mod file;
 mod input;
@@ -18,6 +19,7 @@ pub use config::{
     MappingConfig, OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition,
     SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth, StereoDepthSigma, SystemConfig,
 };
+pub use counters::{RunCounters, SkipKind};
 #[cfg(feature = "serde")]
 pub use file::LoadError;
 pub use input::ProcessError;
@@ -95,6 +97,8 @@ pub struct SlamSystem {
     tracking_duration: Duration,
     // Number given to the next frame; it becomes the keyframe's id in the map.
     next_frame_idx: usize,
+    counters: RunCounters,
+    last_skip: Option<SkipKind>,
 }
 
 impl SlamSystem {
@@ -143,7 +147,31 @@ impl SlamSystem {
             previous_image: None,
             tracking_duration: Duration::ZERO,
             next_frame_idx: 0,
+            counters: RunCounters::default(),
+            last_skip: None,
         }
+    }
+
+    /// Tallies of frame outcomes and local-mapping work since [`Self::build`].
+    pub fn run_counters(&self) -> RunCounters {
+        let (klt_errors, snap_errors) = self.tracker.flow_error_counts();
+        let mapping = self.local_mapping.counts();
+        RunCounters {
+            klt_errors,
+            snap_errors,
+            ba_failed: mapping.ba_failed,
+            vi_ba_failed: mapping.vi_ba_failed,
+            prior_fallbacks: mapping.prior_fallbacks,
+            ba_updates_rejected: mapping.ba_updates_rejected,
+            ba_solves: mapping.ba_solves,
+            ba_solve_ns: mapping.ba_solve_ns,
+            ..self.counters
+        }
+    }
+
+    /// Why the latest processed frame was skipped; `None` when it was tracked.
+    pub fn last_skip(&self) -> Option<SkipKind> {
+        self.last_skip
     }
 
     pub fn drain_loop_closure_events(&mut self) -> Vec<LoopClosureEvent> {
@@ -284,8 +312,13 @@ impl SlamSystem {
         // Taken out for the call so tracking can borrow it alongside `self`.
         let previous_image = self.previous_image.take();
         let tracking_start = Instant::now();
+        self.last_skip = None;
         let result = self.process_prepared(frame, previous_image.as_ref(), image, timestamp_sec);
         self.tracking_duration = tracking_start.elapsed();
+        if result.status != TrackingStatus::Skipped {
+            self.last_skip = None;
+        }
+        self.counters.record_frame(result.status, self.last_skip);
         self.retain_previous_image(image, previous_image);
         result
     }
@@ -492,10 +525,15 @@ impl SlamSystem {
         // Stereo frames carry metric per-keypoint depth, so we can build a
         // metric map from a single keyframe (ORB-SLAM3's StereoInitialization)
         // instead of waiting for two-view parallax.
-        if curr_frame.is_metric() {
-            return self.bootstrap_stereo(curr_frame, timestamp_sec);
+        let result = if curr_frame.is_metric() {
+            self.bootstrap_stereo(curr_frame, timestamp_sec)
+        } else {
+            self.bootstrap_mono(curr_frame, timestamp_sec)
+        };
+        if result.status == TrackingStatus::Skipped {
+            self.last_skip = Some(SkipKind::Bootstrap);
         }
-        self.bootstrap_mono(curr_frame, timestamp_sec)
+        result
     }
 
     /// Single-frame metric initialization from stereo depth.
@@ -990,6 +1028,9 @@ impl SlamSystem {
                 // reality, making the projection search miss again and
                 // compounding a single bad frame into a full tracking loss.
                 self.state.pose_world_to_cam = candidate_pose;
+                self.last_skip = Some(SkipKind::Coasting {
+                    inertial: predicted_velocity.is_some(),
+                });
                 (TrackingStatus::Skipped, Vec::new(), 0, Some(reason))
             }
         };
@@ -1066,6 +1107,7 @@ impl SlamSystem {
                     "[lost] frame={} giving up after {:.2}s (map_established={}): resetting",
                     frame.idx, recently_lost_for, map_established,
                 ));
+                self.counters.give_ups += 1;
                 self.tracker.reset_tracks();
                 self.state.reset_after_loss();
                 return self.bootstrap_step(frame, timestamp_sec);

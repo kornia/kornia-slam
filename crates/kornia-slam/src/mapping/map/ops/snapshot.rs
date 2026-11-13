@@ -60,6 +60,26 @@ pub struct BaUpdate {
     pub(crate) next_prior: Option<MarginalPrior>,
     /// Checked by [`Map::apply_ba_update`] before any write.
     pub(crate) state_envelope: StateEnvelope,
+    pub(crate) outcome: BaOutcome,
+}
+
+/// Whether the solver ran on an update, for the run counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BaOutcome {
+    pub solve: BaSolve,
+    /// The marginal boundary prior could not be carried; the solve used the
+    /// scaled boundary edge instead.
+    pub prior_fallback: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum BaSolve {
+    /// An early exit (too few keyframes or observations) left the window as captured.
+    #[default]
+    NotRun,
+    Solved,
+    /// The solver returned an error; the window is unchanged.
+    Failed,
 }
 
 /// What a local solve did, for the caller to log; set by
@@ -166,6 +186,7 @@ impl BaSnapshot {
             solve_stats: None,
             next_prior: None,
             state_envelope: StateEnvelope::Off,
+            outcome: BaOutcome::default(),
         }
     }
 }

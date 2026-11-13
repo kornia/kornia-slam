@@ -10,6 +10,17 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**Run counters.** `SlamSystem::run_counters()` returns a `RunCounters` tally
+since build: frames, tracked frames and keyframes, bootstrap skips, inertial
+and visual coasting, give-ups, dropped optical-flow errors, failed visual and
+visual-inertial local BA solves, boundary-prior fallbacks, refused BA merges,
+and BA solve count and time. `SlamSystem::last_skip()` says why the latest
+frame was skipped (`SkipKind::Bootstrap` or `SkipKind::Coasting { inertial }`);
+`TrackingStatus` is unchanged. The CLI prints them as `[summary]` lines after
+the final map line, with p50/p90/p99 of the per-frame tracking and frontend
+times. Local-mapping figures are exact in synchronous mode; in asynchronous
+mode a job still on the worker is not counted yet.
+
 **Loop closing can solve off the tracking thread.** `LoopClosingMode::Enabled`
 gains an optional `execution` (source-breaking for code that builds the variant
 by hand): `Synchronous`, the default, keeps today's inline solve whatever the
