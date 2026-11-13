@@ -59,11 +59,14 @@ fn culling_fixture_with_depth(depth: impl Fn(usize, usize) -> Option<f32>) -> Ma
             Vec3F64::new(-0.1 * slot as f64, 0.01 * (slot % 2) as f64, 0.0),
         );
         let mut frame = test_frame_with_pose(id, vec![[id as u8; 32]; SHARED + OWN], pose);
-        for i in 0..SHARED + OWN {
+        for (i, xy) in frame.features.keypoints_xy[..SHARED + OWN]
+            .iter_mut()
+            .enumerate()
+        {
             let p = camera()
                 .project_to_pixel(&pose.transform_point(&point(i)), 1e-6)
                 .unwrap();
-            frame.features.keypoints_xy[i] = [p.x as f32, p.y as f32];
+            *xy = [p.x as f32, p.y as f32];
         }
         if (0..SHARED + OWN).any(|i| depth(id, i).is_some()) {
             frame.depth = (0..SHARED + OWN)
@@ -537,11 +540,11 @@ fn parked_fixture(n: usize) -> (Map, Vec<usize>) {
     let pose = Pose3d::IDENTITY;
     for &id in &ids {
         let mut frame = test_frame_with_pose(id, vec![[id as u8; 32]; SHARED], pose);
-        for i in 0..SHARED {
+        for (i, xy) in frame.features.keypoints_xy[..SHARED].iter_mut().enumerate() {
             let p = camera()
                 .project_to_pixel(&pose.transform_point(&point(i)), 1e-6)
                 .unwrap();
-            frame.features.keypoints_xy[i] = [p.x as f32, p.y as f32];
+            *xy = [p.x as f32, p.y as f32];
         }
         // Stereo depth: one view point gives no parallax.
         frame.depth = (0..SHARED).map(|i| point(i).z as f32).collect();
