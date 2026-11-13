@@ -18,6 +18,7 @@ kornia-algebra.workspace = true
 kornia-image.workspace = true
 kornia-imgproc.workspace = true
 kornia-bow.workspace = true
+kornia-factors.workspace = true
 kornia-sensors.workspace = true
 # Sparse LLT for pose-graph optimization and dense Cholesky for the reduced
 # camera system in visual-inertial Schur-complement BA.

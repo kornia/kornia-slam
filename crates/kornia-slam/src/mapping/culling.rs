@@ -6,8 +6,8 @@
 //! no second cleanup loop, and the map never calls back into mapping.
 
 use crate::mapping::map::{Keyframe, Map, StillNeighbour, StillSide};
-use crate::mapping::stationary::StationaryFactor;
-use crate::mapping::wheel_odom::WheelOdomFactor;
+use kornia_factors::stationary::StationaryFactor;
+use kornia_factors::wheel_odometry::WheelOdomFactor;
 use std::collections::{HashMap, HashSet};
 
 /// Minimum times a landmark must have been in view before its match rate is
