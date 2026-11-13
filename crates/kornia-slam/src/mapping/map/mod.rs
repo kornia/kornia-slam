@@ -63,6 +63,7 @@ use crate::mapping::marginalization::MarginalPrior;
 pub use imu_factor::ImuFactor;
 pub use keyframe::Keyframe;
 pub use map_point::{LandmarkObservation, MapPoint, ObservationKey};
+pub(crate) use ops::{BaOutcome, BaSolve};
 pub use ops::{
     BaSnapshot, BaUpdate, BaUpdateError, BaWindow, GraphCorrectionResult, InertialAlignment,
     InertialAlignmentError, KeyframeBaCorrection, KeyframePoseChange, KeyframeVelocity,

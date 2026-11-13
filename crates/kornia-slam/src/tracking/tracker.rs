@@ -43,6 +43,9 @@ pub(crate) struct Tracker {
     klt_tracker: KltTracker,
     klt_cache: KltPyramidCache,
     track_set: TrackSet,
+    // Optical-flow failures dropped to "no seeds" instead of failing the frame.
+    klt_errors: u64,
+    snap_errors: u64,
 }
 
 impl Tracker {
@@ -52,7 +55,14 @@ impl Tracker {
             klt_tracker: KltTracker::default(),
             klt_cache: KltPyramidCache::new(),
             track_set: TrackSet::new(),
+            klt_errors: 0,
+            snap_errors: 0,
         }
+    }
+
+    /// Optical-flow tracking and keypoint-snap failures so far, in that order.
+    pub(crate) fn flow_error_counts(&self) -> (u64, u64) {
+        (self.klt_errors, self.snap_errors)
     }
 
     /// Recovers the pose against one of the candidate keyframes, taking the
@@ -108,14 +118,14 @@ impl Tracker {
             None
         } else {
             input.previous_image.and_then(|previous_image| {
-                self.klt_tracker
-                    .track_cached(
-                        &mut self.klt_cache,
-                        self.track_set.tracks(),
-                        previous_image,
-                        input.current_image,
-                    )
-                    .ok()
+                let tracked = self.klt_tracker.track_cached(
+                    &mut self.klt_cache,
+                    self.track_set.tracks(),
+                    previous_image,
+                    input.current_image,
+                );
+                self.klt_errors += u64::from(tracked.is_err());
+                tracked.ok()
             })
         };
         // Optical flow follows the primary camera only; its keypoints come first.
@@ -123,7 +133,9 @@ impl Tracker {
         let pre_seeded = klt_survivors
             .as_ref()
             .and_then(|survivors| {
-                snap_unique(&self.track_set, survivors, primary_keypoints, 3.0).ok()
+                let snapped = snap_unique(&self.track_set, survivors, primary_keypoints, 3.0);
+                self.snap_errors += u64::from(snapped.is_err());
+                snapped.ok()
             })
             .map(|matches| {
                 matches

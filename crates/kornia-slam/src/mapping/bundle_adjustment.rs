@@ -4,8 +4,8 @@
 //! map owns capture and writeback; the local-mapping worker owns scheduling.
 
 use crate::mapping::map::{
-    BaSnapshot, BaUpdate, BaUpdateError, BaWindow, Keyframe, LocalBaStats, Map, ORB_N_LEVELS,
-    ORB_SCALE_FACTOR, StateEnvelope,
+    BaSnapshot, BaSolve, BaUpdate, BaUpdateError, BaWindow, Keyframe, LocalBaStats, Map,
+    ORB_N_LEVELS, ORB_SCALE_FACTOR, StateEnvelope,
 };
 use crate::mapping::marginalization::{
     BoundaryPrior, FrozenPoseSigma, MarginalPrior, marginalize_frozen,
@@ -411,7 +411,10 @@ pub fn run_local_ba_with(
     let ba_result =
         match bundle_adjust_schur(&poses, &window.positions, &observations, camera, &ba_params) {
             Ok(r) => r,
-            Err(_) => return update,
+            Err(_) => {
+                update.outcome.solve = BaSolve::Failed;
+                return update;
+            }
         };
 
     for (kf_idx, pose) in ba_result.poses.iter().enumerate() {
@@ -421,6 +424,7 @@ pub fn run_local_ba_with(
     }
 
     window.write_back(&ba_result.points, &mut update.map_points);
+    update.outcome.solve = BaSolve::Solved;
     update
 }
 
@@ -661,6 +665,7 @@ pub fn run_local_inertial_ba_with(
             Ok(prior) => Some(prior),
             Err(reason) => {
                 debug_eprintln!("[vi_ba] PRIOR fallback: {reason}");
+                update.outcome.prior_fallback = true;
                 None
             }
         };
@@ -678,6 +683,7 @@ pub fn run_local_inertial_ba_with(
         Ok(r) => r,
         Err(error) => {
             debug_eprintln!("[vi_ba] local inertial BA failed, window unchanged: {error}");
+            update.outcome.solve = BaSolve::Failed;
             return update;
         }
     };
@@ -728,6 +734,7 @@ pub fn run_local_inertial_ba_with(
         cheirality_points_held: vi_result.cheirality_points_held,
         points_rejected,
     });
+    update.outcome.solve = BaSolve::Solved;
     update
 }
 

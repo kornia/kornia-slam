@@ -14,6 +14,7 @@ mod datasets;
 mod evaluation;
 mod map_dump;
 mod source;
+mod summary;
 mod trajectory;
 mod tui;
 mod utils;
@@ -211,6 +212,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Vec::new(), Vec::new());
     let mut trajectory: Vec<[f32; 3]> = Vec::new();
     let mut processed: usize = 0;
+    let mut frame_times = summary::FrameTimes::default();
 
     while let Some(mut item) = source.next_frame()? {
         if let Some(blackout) = blackout.as_mut()
@@ -254,6 +256,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let frame_ms = system.tracking_duration().as_secs_f64() * 1000.0;
         let frontend_ms = system.frontend_observation().duration.as_secs_f64() * 1000.0;
+        frame_times.record(frame_ms, frontend_ms);
         #[cfg(feature = "viz")]
         if let Some(ref rec) = rec {
             log_frame_to_rerun(rec, &image, &system.frontend_observation().keypoints_xy);
@@ -407,6 +410,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
     );
+    eprintln!("{}", summary::format(&system.run_counters(), &frame_times));
     if let Some(writer) = trajectory_out {
         writer.finish()?;
     }

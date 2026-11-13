@@ -62,6 +62,7 @@ pub use loop_closure::{LoopClosingConfig, LoopClosureEvent};
 pub use system::LoadError;
 pub use system::{
     BuildError, CameraSelection, ConfigError, LoopClosingExecution, LoopClosingMode, ProcessError,
-    SensorSelection, SlamSystem, SystemConfig, TrackingResult, TrackingStatus,
+    RunCounters, SensorSelection, SkipKind, SlamSystem, SystemConfig, TrackingResult,
+    TrackingStatus,
 };
 pub use tracking::{KeyframePolicy, MapProjectionEstimator};
