@@ -255,10 +255,12 @@ impl MapProjectionEstimator {
             search_scale,
         );
 
-        // Shared logic: try_track → refine_pose → Estimate, or propagate rejection.
+        // Shared logic: try_track → refine_pose → Estimate, or propagate
+        // rejection with the PnP inlier count when that is what failed.
+        type Rejection = (MapProjectionRejectReason, Option<usize>);
         let try_track_and_refine = |correspondences: Vec<(usize, usize)>,
                                     pose_init: &Pose3d|
-         -> Result<Estimate, MapProjectionRejectReason> {
+         -> Result<Estimate, Rejection> {
             let correspondences = self.geometric_consistency_filter(
                 current_kf,
                 &correspondences,
@@ -276,9 +278,9 @@ impl MapProjectionEstimator {
                     pose_init,
                     search_scale,
                 )
-                .ok_or(MapProjectionRejectReason::PnpFailed)?;
+                .ok_or((MapProjectionRejectReason::PnpFailed, None))?;
             if inliers < pnp.min_inliers_early {
-                return Err(MapProjectionRejectReason::LowPnpInliers);
+                return Err((MapProjectionRejectReason::LowPnpInliers, Some(inliers)));
             }
             let mut matches = correspondences;
             if let Some(local) = self.refine_with_local_map(
@@ -322,14 +324,29 @@ impl MapProjectionEstimator {
         }
 
         // PnP from projection matches.
-        let last_reject = if projection_matches.len() >= pnp.min_correspondences {
+        let matched = projection_matches.len();
+        let (last_reject, early_inliers) = if matched >= pnp.min_correspondences {
             match try_track_and_refine(projection_matches, candidate_pose) {
                 Ok(estimate) => return Ok(estimate),
-                Err(reason) => reason,
+                Err(rejection) => rejection,
             }
         } else {
-            MapProjectionRejectReason::LowProjectionMatches
+            (MapProjectionRejectReason::LowProjectionMatches, None)
         };
+        // The fallback's reason replaces this one, so the projection stage is
+        // logged here.
+        match early_inliers {
+            Some(k) => debug_eprintln!(
+                "[proj] frame={} local={} matched={matched} stage={last_reject:?}({k})",
+                frame.idx,
+                local_indices.len()
+            ),
+            None => debug_eprintln!(
+                "[proj] frame={} local={} matched={matched} stage={last_reject:?}",
+                frame.idx,
+                local_indices.len()
+            ),
+        }
 
         // Fallback: match against reference keyframe descriptors.
         let Some(current_kf) = current_kf else {
@@ -363,6 +380,7 @@ impl MapProjectionEstimator {
         }
 
         try_track_and_refine(ref_correspondences, pose_before_tracking)
+            .map_err(|(reason, _)| reason)
     }
 
     fn eligible_pre_seeded(

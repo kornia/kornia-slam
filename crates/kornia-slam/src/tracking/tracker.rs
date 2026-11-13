@@ -161,6 +161,11 @@ impl Tracker {
         let min_inliers = self.estimator.config().min_inliers_with_prediction;
         let result = result.and_then(|estimate| {
             if input.trusted_prediction && estimate.inliers < min_inliers {
+                debug_eprintln!(
+                    "[proj] frame={} trusted_gate inliers={}",
+                    input.frame.idx,
+                    estimate.inliers
+                );
                 Err(MapProjectionRejectReason::LowPnpInliers)
             } else {
                 Ok(estimate)

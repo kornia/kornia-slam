@@ -21,6 +21,14 @@ the final map line, with p50/p90/p99 of the per-frame tracking and frontend
 times. Local-mapping figures are exact in synchronous mode; in asynchronous
 mode a job still on the worker is not counted yet.
 
+**A `[proj]` debug line for rejected projection tracking.** With
+`KORNIA_SLAM_DEBUG` set, a frame whose projection search fails logs
+`[proj] frame=N local=L matched=M stage=S` before the reference-keyframe
+fallback overwrites its reject reason; `S` is `LowProjectionMatches`,
+`PnpFailed` or `LowPnpInliers(k)` with the early PnP inlier count. A pose
+refused by the inertial-prediction inlier gate logs
+`[proj] frame=N trusted_gate inliers=k`. Tracking is unchanged.
+
 **Loop closing can solve off the tracking thread.** `LoopClosingMode::Enabled`
 gains an optional `execution` (source-breaking for code that builds the variant
 by hand): `Synchronous`, the default, keeps today's inline solve whatever the
