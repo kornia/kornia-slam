@@ -81,6 +81,10 @@ struct Args {
     #[cfg(feature = "viz")]
     rerun_stream: bool,
 
+    /// process frames as fast as they come instead of at most 30 per second
+    #[argh(switch)]
+    no_pace: bool,
+
     /// disable the terminal UI (status lines stream to stderr instead)
     #[argh(switch)]
     no_tui: bool,
@@ -239,7 +243,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let now = Instant::now();
         let elapsed = now.duration_since(last_frame_walltime);
 
-        if elapsed < target_dt {
+        if !args.no_pace && elapsed < target_dt {
             std::thread::sleep(target_dt - elapsed);
         }
 
@@ -484,6 +488,8 @@ mod cli_tests {
         assert_eq!(args.config, "configs/euroc.ron");
         assert!(!args.evaluate);
         assert_eq!(args.eval_out, ".");
+        assert!(!args.no_pace);
+        assert!(parse(&["--config", "r.ron", "--no-pace"]).unwrap().no_pace);
 
         let args = parse(&["--config", "r.ron", "--evaluate", "--eval-out", "out"]).unwrap();
         assert!(args.evaluate);
