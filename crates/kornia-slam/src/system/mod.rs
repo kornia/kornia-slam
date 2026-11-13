@@ -11,6 +11,7 @@ mod file;
 mod input;
 mod state;
 mod validation;
+pub mod wheel;
 
 pub use build::BuildError;
 pub use config::{
