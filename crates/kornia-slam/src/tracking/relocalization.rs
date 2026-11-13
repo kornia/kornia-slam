@@ -14,6 +14,7 @@ use kornia_algebra::{Mat3AF32, Vec2F32, Vec3AF32};
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
 use crate::Frame;
+use crate::frame::is_finite_xy;
 use crate::mapping::{Keyframe, Map};
 use crate::pose_conversion::{mat3_to_f64, vec3_to_f32, vec3_to_f64};
 use crate::tracking::pose_estimation::{Estimate, MapProjectionEstimator};
@@ -122,7 +123,11 @@ fn keyframe_correspondences(
     .filter_map(|(keyframe_desc, keypoint)| {
         let map_point = keyframe.map_point(keyframe_desc)?;
         let point = map.map_points().get(map_point)?;
-        (!point.culled).then_some((map_point, keypoint))
+        let undistorted = frame
+            .keypoints_undist
+            .get(keypoint)
+            .is_some_and(is_finite_xy);
+        (undistorted && !point.culled).then_some((map_point, keypoint))
     })
     .collect()
 }
@@ -326,6 +331,21 @@ mod tests {
         .length();
         assert!(rotation_error < 1e-3, "rotation error {rotation_error}");
         assert!((found.estimate.pose.translation - truth.translation).length() < 1e-2);
+    }
+
+    #[test]
+    fn keypoints_without_an_undistorted_pixel_are_not_matched() {
+        let map = mapped_keyframe();
+        let mut query = frame(50, query_pose(), (0..LANDMARKS).map(descriptor).collect());
+        let unusable = 10;
+        for xy in &mut query.keypoints_undist[..unusable] {
+            *xy = [f32::NAN; 2];
+        }
+
+        let found =
+            relocalize_query(&query, &map, &[0], |_| true).expect("the keyframe sees the query");
+
+        assert!(found.estimate.matches.iter().all(|&(_, kp)| kp >= unusable));
     }
 
     #[test]

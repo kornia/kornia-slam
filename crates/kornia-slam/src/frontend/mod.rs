@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use kornia_3d::camera::{FisheyeCamera, PinholeCamera};
+use kornia_3d::camera::{CameraModel, FisheyeCamera, PinholeCamera};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec2F64;
 use kornia_image::{Image, ImageError, ImageSize, InterpolationMode};
@@ -190,10 +190,13 @@ impl FisheyeMapping {
 
         for i in 0..n {
             let [u, v] = features.keypoints_xy[i];
-            let bearing = self.fisheye.unproject(&Vec2F64::new(u as f64, v as f64));
-            if bearing.z <= self.min_bearing_z {
+            let Some(bearing) = self
+                .fisheye
+                .unproject(&Vec2F64::new(u as f64, v as f64))
+                .filter(|bearing| bearing.z > self.min_bearing_z)
+            else {
                 continue;
-            }
+            };
             let xn = bearing.x / bearing.z;
             let yn = bearing.y / bearing.z;
             let pu = self.camera.fx * xn + self.camera.cx;
