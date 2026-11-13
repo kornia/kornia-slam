@@ -12,6 +12,7 @@ use crate::mapping::map::StateEnvelope;
 use crate::mapping::marginalization::BoundaryPrior;
 use crate::mapping::vi_ba_schur::ImuHuber;
 use crate::mapping::visual_information::VisualInformation;
+use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::{KeyframeObservations, MapProjectionConfig};
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
@@ -116,6 +117,80 @@ pub struct OrbFrontendConfig {
     /// Stereo keypoints closer than this are back-projected directly into map
     /// points at each keyframe. Unused without stereo cameras.
     pub stereo_close_depth: StereoCloseDepth,
+    /// Whether frames between keyframes are tracked by optical flow alone,
+    /// extracting ORB only when the flow cannot carry the frame.
+    pub klt_first: KltFirst,
+    /// Optical-flow search when the inertial prediction is trusted.
+    pub klt_prediction: KltPrediction,
+    /// Keypoints per image for the stereo right image and non-primary rig
+    /// cameras, within [`OrbFrontendConfig::N_KEYPOINTS_RANGE`]; `None` uses
+    /// `n_keypoints`.
+    pub secondary_n_keypoints: Option<usize>,
+    /// The pyramidal LK implementation optical flow runs on.
+    pub klt_kernel: LkKernel,
+}
+
+/// Optical flow from a trusted inertial prediction: each track starts at
+/// its map point projected at the predicted pose, and LK searches pyramid
+/// levels `0..=max_level` with `max_iter` iterations each instead of the
+/// full pyramid. Raw fisheye rigs keep the full search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum KltPrediction {
+    Disabled,
+    Enabled { max_level: usize, max_iter: usize },
+}
+
+impl Default for KltPrediction {
+    fn default() -> Self {
+        Self::Enabled {
+            max_level: 1,
+            max_iter: 10,
+        }
+    }
+}
+
+impl KltPrediction {
+    /// `(max_level, max_iter)`, or `None` when disabled.
+    pub fn search(self) -> Option<(usize, usize)> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled {
+                max_level,
+                max_iter,
+            } => Some((max_level, max_iter)),
+        }
+    }
+}
+
+/// Optical-flow-first tracking: a frame is tracked from its flow survivors
+/// alone, without ORB, unless a keyframe is due, the flow-only pose is
+/// refused, or fewer than `min_tracks` survivors carry a map point.
+/// Multi-camera rigs extract ORB on every frame regardless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum KltFirst {
+    /// ORB on every frame.
+    Disabled,
+    Enabled {
+        min_tracks: usize,
+    },
+}
+
+impl Default for KltFirst {
+    fn default() -> Self {
+        Self::Enabled { min_tracks: 80 }
+    }
+}
+
+impl KltFirst {
+    /// The survivor floor, or `None` when disabled.
+    pub fn min_tracks(self) -> Option<usize> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled { min_tracks } => Some(min_tracks),
+        }
+    }
 }
 
 impl OrbFrontendConfig {
@@ -128,6 +203,10 @@ impl Default for OrbFrontendConfig {
         Self {
             n_keypoints: 1000,
             stereo_close_depth: StereoCloseDepth::default(),
+            klt_first: KltFirst::default(),
+            klt_prediction: KltPrediction::default(),
+            secondary_n_keypoints: None,
+            klt_kernel: LkKernel::FixedPointU8,
         }
     }
 }
@@ -344,6 +423,24 @@ impl fmt::Display for SystemConfig {
         let FrontendConfig::Orb(frontend) = orb.frontend;
         writeln!(f, "OrbSlam pipeline (config version {})", self.version)?;
         writeln!(f, "  frontend: ORB, {} keypoints", frontend.n_keypoints)?;
+        if frontend.klt_kernel == LkKernel::FixedPointU8 {
+            writeln!(f, "  klt kernel: fixed-point u8")?;
+        }
+        if let Some(n) = frontend.secondary_n_keypoints {
+            writeln!(f, "  secondary cameras: {n} keypoints")?;
+        }
+        if let Some(min_tracks) = frontend.klt_first.min_tracks() {
+            writeln!(
+                f,
+                "  klt-first: ORB only when a keyframe is due or fewer than {min_tracks} tracks survive"
+            )?;
+        }
+        if let Some((max_level, max_iter)) = frontend.klt_prediction.search() {
+            writeln!(
+                f,
+                "  klt prediction: levels 0..={max_level}, {max_iter} iterations when trusted"
+            )?;
+        }
         if self.sensors.cameras == CameraSelection::Stereo {
             match frontend.stereo_close_depth {
                 StereoCloseDepth::Baselines(n) => writeln!(

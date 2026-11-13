@@ -137,8 +137,9 @@ impl Frame {
             .enumerate()
             .map(|(i, kp)| {
                 let camera = self.secondary_view(i).map_or(camera, |view| &view.camera);
-                let p = camera.undistort(kp[0] as f64, kp[1] as f64);
-                [p.x as f32, p.y as f32]
+                camera
+                    .undistort(kp[0] as f64, kp[1] as f64)
+                    .map_or(*kp, |p| [p.x as f32, p.y as f32])
             })
             .collect();
         self.keypoints_undist = undistorted;
@@ -152,8 +153,9 @@ impl Frame {
             return self.keypoints_undist.get(i).copied();
         }
         self.features.keypoints_xy.get(i).map(|kp| {
-            let p = camera.undistort(kp[0] as f64, kp[1] as f64);
-            [p.x as f32, p.y as f32]
+            camera
+                .undistort(kp[0] as f64, kp[1] as f64)
+                .map_or(*kp, |p| [p.x as f32, p.y as f32])
         })
     }
 

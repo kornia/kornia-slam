@@ -6,7 +6,7 @@ mod overlap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kornia_3d::camera::{FisheyeCamera, PinholeCamera};
+use kornia_3d::camera::{CameraModel, FisheyeCamera, PinholeCamera};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec2F64;
 use kornia_image::{Image, ImageError, ImageSize, InterpolationMode};
@@ -33,11 +33,17 @@ pub struct FrontendObservation {
     pub stereo_matched: Option<usize>,
     /// Feature extraction and stereo matching time.
     pub duration: Duration,
+    /// ORB extraction time of each image, in input order.
+    pub orb_per_camera: Vec<Duration>,
+    /// Stereo or rig-overlap matching time, its image pyramids included.
+    pub overlap: Duration,
 }
 
 /// ORB extraction plus the rig-specific preparation tracking expects.
 pub(crate) struct OrbFrontend {
     detector: OrbDetector,
+    /// For the stereo right image and non-primary rig cameras.
+    secondary: OrbDetector,
     stereo: Option<StereoMatchConfig>,
     fisheye: Option<FisheyeMapping>,
     rig: Option<Arc<RigGeometry>>,
@@ -62,6 +68,7 @@ impl OrbFrontend {
             min_bearing_z: MAX_INCIDENCE_DEG.to_radians().cos(),
         });
         Self {
+            secondary: with_keypoints(&detector, detector.n_keypoints),
             detector,
             stereo,
             fisheye,
@@ -70,8 +77,25 @@ impl OrbFrontend {
         }
     }
 
+    /// Extracts `n_keypoints` on every image but the primary.
+    pub(crate) fn with_secondary_keypoints(mut self, n_keypoints: usize) -> Self {
+        self.secondary = with_keypoints(&self.detector, n_keypoints);
+        self
+    }
+
     pub(crate) fn observation(&self) -> &FrontendObservation {
         &self.observation
+    }
+
+    /// Records a frame tracked by optical flow alone: its tracks stand in
+    /// for keypoints, and nothing was extracted.
+    pub(crate) fn observe_flow(&mut self, tracks_xy: &[[f32; 2]]) {
+        self.observation.keypoints_xy.clear();
+        self.observation.keypoints_xy.extend_from_slice(tracks_xy);
+        self.observation.stereo_matched = None;
+        self.observation.duration = Duration::ZERO;
+        self.observation.orb_per_camera.clear();
+        self.observation.overlap = Duration::ZERO;
     }
 
     /// Extracts and prepares the features of one validated image, numbering
@@ -83,7 +107,9 @@ impl OrbFrontend {
         image: &Image<u8, 1>,
     ) -> Result<Frame, ImageError> {
         let start = Instant::now();
-        let features = self.detector.detect_and_extract_u8(image)?;
+        self.observation.orb_per_camera.clear();
+        let features = self.timed_orb(image, false)?;
+        self.observation.overlap = Duration::ZERO;
         Ok(self.finish_frame(idx, image, features, None, start))
     }
 
@@ -97,11 +123,14 @@ impl OrbFrontend {
         right: &Image<u8, 1>,
     ) -> Result<Frame, ImageError> {
         let start = Instant::now();
-        let features = self.detector.detect_and_extract_u8(left)?;
-        let Some(config) = &self.stereo else {
+        self.observation.orb_per_camera.clear();
+        self.observation.overlap = Duration::ZERO;
+        let features = self.timed_orb(left, false)?;
+        let Some(config) = self.stereo.clone() else {
             return Ok(self.finish_frame(idx, left, features, None, start));
         };
-        let right_features = self.detector.detect_and_extract_u8(right)?;
+        let right_features = self.timed_orb(right, true)?;
+        let overlap_start = Instant::now();
         let left_pyramid = self.build_pyramid(left)?;
         let right_pyramid = self.build_pyramid(right)?;
         let matches = compute_stereo_matches(
@@ -109,8 +138,9 @@ impl OrbFrontend {
             &right_pyramid,
             &features,
             &right_features,
-            config,
+            &config,
         );
+        self.observation.overlap = overlap_start.elapsed();
         Ok(self.finish_frame(idx, left, features, Some(matches), start))
     }
 
@@ -137,8 +167,9 @@ impl OrbFrontend {
         };
         let mut camera_ranges = Vec::with_capacity(images.len());
         let mut keypoint_colors = Vec::new();
-        for image in images {
-            let camera_features = self.detector.detect_and_extract_u8(image)?;
+        self.observation.orb_per_camera.clear();
+        for (camera, image) in images.iter().enumerate() {
+            let camera_features = self.timed_orb(image, camera > 0)?;
             let begin = features.keypoints_xy.len();
             keypoint_colors.extend(sample_colors(image, &camera_features.keypoints_xy));
             features.keypoints_xy.extend(camera_features.keypoints_xy);
@@ -147,7 +178,9 @@ impl OrbFrontend {
             features.octaves.extend(camera_features.octaves);
             camera_ranges.push(begin..features.keypoints_xy.len());
         }
+        let overlap_start = Instant::now();
         let matches = overlap::match_overlap(&features, &camera_ranges, &rig);
+        self.observation.overlap = overlap_start.elapsed();
 
         self.observation.keypoints_xy.clear();
         if let Some(range) = camera_ranges.first() {
@@ -173,6 +206,23 @@ impl OrbFrontend {
                 stereo_points: matches.points,
             },
         })
+    }
+
+    /// ORB on one image, its time appended to `orb_per_camera`.
+    fn timed_orb(
+        &mut self,
+        image: &Image<u8, 1>,
+        secondary: bool,
+    ) -> Result<OrbFeatures, ImageError> {
+        let start = Instant::now();
+        let detector = if secondary {
+            &self.secondary
+        } else {
+            &self.detector
+        };
+        let features = detector.detect_and_extract_u8(image)?;
+        self.observation.orb_per_camera.push(start.elapsed());
+        Ok(features)
     }
 
     fn finish_frame(
@@ -259,7 +309,9 @@ impl FisheyeMapping {
 
         for i in 0..n {
             let [u, v] = features.keypoints_xy[i];
-            let bearing = self.fisheye.unproject(&Vec2F64::new(u as f64, v as f64));
+            let Some(bearing) = self.fisheye.unproject(&Vec2F64::new(u as f64, v as f64)) else {
+                continue;
+            };
             if bearing.z <= self.min_bearing_z {
                 continue;
             }
@@ -278,6 +330,21 @@ impl FisheyeMapping {
         features.orientations = orientations;
         features.descriptors = descriptors;
         features.octaves = octaves;
+    }
+}
+
+/// `detector`'s settings with another keypoint budget (`OrbDetector` is not
+/// `Clone`).
+fn with_keypoints(detector: &OrbDetector, n_keypoints: usize) -> OrbDetector {
+    OrbDetector {
+        n_keypoints,
+        fast_n: detector.fast_n,
+        ini_fast_threshold: detector.ini_fast_threshold,
+        min_fast_threshold: detector.min_fast_threshold,
+        harris_k: detector.harris_k,
+        downscale: detector.downscale,
+        n_scales: detector.n_scales,
+        cell_size: detector.cell_size,
     }
 }
 

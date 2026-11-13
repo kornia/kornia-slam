@@ -11,6 +11,7 @@ use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabular
 use crate::loop_closure::{LoopCloser, LoopClosingConfig, LoopSolver};
 use crate::mapping::LocalMappingMode;
 use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
+use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
@@ -39,6 +40,13 @@ pub(crate) struct SystemSettings {
     /// keyframe back-projects its unassociated "close" (`z < threshold`) stereo
     /// keypoints directly into metric map points.
     pub stereo_close_depth_m: Option<f64>,
+    /// Flow survivors with a map point needed to track without ORB; `None`
+    /// extracts ORB on every frame.
+    pub klt_min_tracks: Option<usize>,
+    /// `(max_level, max_iter)` of the optical-flow search from a trusted
+    /// prediction; `None` keeps the full search.
+    pub klt_prediction: Option<(usize, usize)>,
+    pub klt_kernel: LkKernel,
 }
 
 impl SensorSelection {
@@ -122,7 +130,26 @@ impl SystemConfig {
                 .params(stereo_baseline_m(rig).map(|baseline| rig.camera.fx * baseline)),
             stereo_close_depth_m: stereo_baseline_m(rig)
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
+            // A flow-only frame keeps the primary camera alone; on a rig the
+            // other cameras' correspondences are what carry hard segments.
+            klt_min_tracks: frontend
+                .klt_first
+                .min_tracks()
+                .filter(|_| !rig.is_multi_camera()),
+            klt_kernel: frontend.klt_kernel,
+            klt_prediction: frontend
+                .klt_prediction
+                .search()
+                .filter(|_| rig.fisheye.is_none()),
         }
+    }
+
+    /// Keypoints for every image but the primary.
+    pub(crate) fn secondary_n_keypoints(&self) -> usize {
+        let FrontendConfig::Orb(frontend) = self.orb().frontend;
+        frontend
+            .secondary_n_keypoints
+            .unwrap_or(frontend.n_keypoints)
     }
 
     /// Feature extractor settings for the configured frontend.
