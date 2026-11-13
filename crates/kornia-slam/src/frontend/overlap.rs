@@ -271,7 +271,10 @@ mod tests {
     fn descriptor(seed: u8) -> [u8; 32] {
         let mut d = [0u8; 32];
         for (k, byte) in d.iter_mut().enumerate() {
-            *byte = seed.wrapping_mul(37).wrapping_add(k as u8 * 11) ^ (seed >> 1);
+            *byte = seed
+                .wrapping_mul(37)
+                .wrapping_add((k as u8).wrapping_mul(11))
+                ^ (seed >> 1);
         }
         d
     }
