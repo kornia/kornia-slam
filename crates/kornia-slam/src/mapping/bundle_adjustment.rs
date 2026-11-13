@@ -5,10 +5,16 @@
 
 use crate::mapping::map::{
     BaSnapshot, BaUpdate, BaUpdateError, BaWindow, Keyframe, LocalBaStats, Map, ORB_N_LEVELS,
-    ORB_SCALE_FACTOR,
+    ORB_SCALE_FACTOR, StateEnvelope,
+};
+use crate::mapping::marginalization::{
+    BoundaryPrior, FrozenPoseSigma, MarginalPrior, marginalize_frozen,
 };
 use crate::mapping::stationary::StationaryFactor;
-use crate::mapping::vi_ba_schur::{RigObservationCamera, ViBaKeyframe};
+use crate::mapping::vi_ba_schur::{
+    ImuFactor as ViBaImuFactor, ImuHuber, RigObservationCamera, ViBaKeyframe, ViBaParams,
+};
+use crate::mapping::visual_information::VisualInformation;
 use crate::mapping::wheel_odom::WheelOdomFactor;
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
@@ -26,8 +32,82 @@ pub const STEREO_DEPTH_REL_SIGMA: f32 = 0.05;
 /// points.
 pub const STEREO_DEPTH_MIN_SIGMA: f32 = 0.02;
 
-/// Keyframes a local BA optimizes; older keyframes enter only as fixed poses.
-const MAX_ACTIVE_KFS: usize = 3;
+/// Local BA settings resolved against the rig. The defaults are the
+/// solver's long-standing constants.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LocalBaParams {
+    /// Keyframes a local BA optimizes; older keyframes enter only as fixed poses.
+    pub active_keyframes: usize,
+    /// See [`ViBaParams::boundary_imu_info_scale`](crate::mapping::vi_ba_schur::ViBaParams).
+    pub boundary_imu_info_scale: f64,
+    pub boundary_scales_bias_rows: bool,
+    pub boundary: BoundaryPrior,
+    pub imu_huber: ImuHuber,
+    pub depth_sigma: DepthSigma,
+    /// Reprojection weighting by keypoint octave. Only VI-BA honours it:
+    /// kornia-3d's visual-only solver has no per-observation weight.
+    pub visual_information: VisualInformation,
+    /// Bounds a VI-BA result must stay inside to be written back.
+    pub state_envelope: StateEnvelope,
+    pub lost_keyframes: LostKeyframes,
+}
+
+/// How VI-BA treats keyframes inserted while tracking was lost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum LostKeyframes {
+    /// Full 15-DOF state, like any other keyframe.
+    #[default]
+    Free,
+    /// Velocity and bias held at the propagated values: with no match to the
+    /// map nothing observes them, and the solve would write back noise.
+    FixedInertial,
+}
+
+impl Default for LocalBaParams {
+    fn default() -> Self {
+        Self {
+            active_keyframes: 3,
+            boundary_imu_info_scale: 1e-2,
+            boundary_scales_bias_rows: true,
+            boundary: BoundaryPrior::ScaledEdge,
+            imu_huber: ImuHuber::AllEdges,
+            depth_sigma: DepthSigma::Relative(STEREO_DEPTH_REL_SIGMA),
+            visual_information: VisualInformation::Unit,
+            state_envelope: StateEnvelope::Off,
+            lost_keyframes: LostKeyframes::Free,
+        }
+    }
+}
+
+/// Standard deviation of a stereo depth measurement `z` (metres), floored at
+/// [`STEREO_DEPTH_MIN_SIGMA`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DepthSigma {
+    /// `fraction · z`.
+    Relative(f32),
+    /// Disparity noise propagated to depth: `z² · px / (f · b)`.
+    Disparity { px_over_focal_baseline: f32 },
+}
+
+impl DepthSigma {
+    #[cfg(test)]
+    fn sigma(self, z: f32) -> f32 {
+        self.sigma_at(z, 1.0)
+    }
+
+    /// The disparity noise scales with the keypoint's pixel sigma
+    /// (ORB-SLAM3's `EdgeStereo` weights `u_r` by the same `invSigma2`).
+    fn sigma_at(self, z: f32, pixel_sigma: f32) -> f32 {
+        let sigma = match self {
+            Self::Relative(fraction) => fraction * z,
+            Self::Disparity {
+                px_over_focal_baseline,
+            } => px_over_focal_baseline * pixel_sigma * z * z,
+        };
+        sigma.max(STEREO_DEPTH_MIN_SIGMA)
+    }
+}
 
 /// Write-back guard of [`run_local_inertial_ba`]: an optimized landmark whose
 /// distance from its nearest observer grew by more than this factor...
@@ -59,8 +139,17 @@ pub fn local_window_with_neighbors(
     map: &Map,
     neighbors: impl IntoIterator<Item = (usize, usize)>,
 ) -> BaWindow {
+    local_window_of(map, LocalBaParams::default().active_keyframes, neighbors)
+}
+
+/// [`local_window_with_neighbors`] with `active_keyframes` newest keyframes active.
+pub fn local_window_of(
+    map: &Map,
+    active_keyframes: usize,
+    neighbors: impl IntoIterator<Item = (usize, usize)>,
+) -> BaWindow {
     let keyframes = map.keyframes();
-    let active_start = keyframes.len().saturating_sub(MAX_ACTIVE_KFS);
+    let active_start = keyframes.len().saturating_sub(active_keyframes);
     let active = &keyframes[active_start..];
     let landmark_ids = live_landmarks_of(map, active);
 
@@ -143,6 +232,7 @@ pub enum InitialBaError {
 pub fn run_initial_ba(
     map: &mut Map,
     camera: &PinholeCamera,
+    depth_sigma: DepthSigma,
 ) -> Result<InitialBaOutcome, InitialBaError> {
     let mut update = map.ba_snapshot(&initial_window(map)).into_update();
     let snapshot = &update.snapshot;
@@ -178,6 +268,7 @@ pub fn run_initial_ba(
             .enumerate()
             .map(|(pose_idx, &kf_idx)| (pose_idx, &snapshot.keyframes()[kf_idx], pose_idx == 0)),
         camera,
+        depth_sigma,
     );
 
     if observations.len() < MIN_OBSERVATIONS {
@@ -246,6 +337,16 @@ pub fn run_initial_ba(
 /// via camera), calls the Schur solver, and returns optimized poses and points.
 /// An early exit returns an unchanged update for the worker to publish normally.
 pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
+    run_local_ba_with(snapshot, camera, &LocalBaParams::default())
+}
+
+/// [`run_local_ba`] with `params`; the snapshot must come from a window of
+/// the same `active_keyframes`.
+pub fn run_local_ba_with(
+    snapshot: BaSnapshot,
+    camera: &PinholeCamera,
+    params: &LocalBaParams,
+) -> BaUpdate {
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
     const MIN_OBSERVATIONS: usize = 8;
@@ -255,7 +356,7 @@ pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
         return update;
     }
 
-    let active_start = n_kfs.saturating_sub(MAX_ACTIVE_KFS);
+    let active_start = n_kfs.saturating_sub(params.active_keyframes);
 
     let window = WindowPoints::collect(snapshot, &snapshot.keyframes()[active_start..], false);
     if window.is_empty() {
@@ -275,22 +376,27 @@ pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
             .enumerate()
             .map(|(kf_idx, kf)| (kf_idx, kf, kf_idx < active_start)),
         camera,
+        params.depth_sigma,
     );
 
     if observations.len() < MIN_OBSERVATIONS {
         return update;
     }
 
-    let ba_result = match bundle_adjust_schur(
-        &poses,
-        &window.positions,
-        &observations,
-        camera,
-        &BaParams::default(),
-    ) {
-        Ok(r) => r,
-        Err(_) => return update,
+    // Tracked matches reach keyframes unfiltered, so a plain L2 solve lets
+    // every mismatch pull the window; same kernel as VI-BA.
+    let vi_defaults = ViBaParams::default();
+    let ba_params = BaParams {
+        robust: RobustKernelKind::Huber,
+        robust_scale_sq: vi_defaults.huber_reproj_px_sq as f32,
+        depth_robust_scale_sq: vi_defaults.huber_depth_sigma_sq as f32,
+        ..BaParams::default()
     };
+    let ba_result =
+        match bundle_adjust_schur(&poses, &window.positions, &observations, camera, &ba_params) {
+            Ok(r) => r,
+            Err(_) => return update,
+        };
 
     for (kf_idx, pose) in ba_result.poses.iter().enumerate() {
         if kf_idx >= active_start {
@@ -328,11 +434,32 @@ pub fn run_local_inertial_ba(
     wheel_factors: &[WheelOdomFactor],
     stationary_factors: &[StationaryFactor],
 ) -> BaUpdate {
+    run_local_inertial_ba_with(
+        snapshot,
+        camera,
+        imu_t_bc,
+        gravity_world,
+        wheel_factors,
+        stationary_factors,
+        &LocalBaParams::default(),
+    )
+}
+
+/// [`run_local_inertial_ba`] with `params`; the snapshot must come from a
+/// window of the same `active_keyframes`.
+pub fn run_local_inertial_ba_with(
+    snapshot: BaSnapshot,
+    camera: &PinholeCamera,
+    imu_t_bc: Option<Pose3d>,
+    gravity_world: Vec3F64,
+    wheel_factors: &[WheelOdomFactor],
+    stationary_factors: &[StationaryFactor],
+    params: &LocalBaParams,
+) -> BaUpdate {
     let mut update = snapshot.into_update();
+    update.state_envelope = params.state_envelope;
     let snapshot = &update.snapshot;
-    use crate::mapping::vi_ba_schur::{
-        ImuFactor as ViBaImuFactor, ViBaParams, visual_inertial_bundle_adjust,
-    };
+    use crate::mapping::vi_ba_schur::visual_inertial_bundle_adjust;
 
     const MIN_OBSERVATIONS: usize = 8;
 
@@ -341,7 +468,7 @@ pub fn run_local_inertial_ba(
         return update;
     }
 
-    let active_start = n_kfs.saturating_sub(MAX_ACTIVE_KFS);
+    let active_start = n_kfs.saturating_sub(params.active_keyframes);
 
     let window = WindowPoints::collect(snapshot, &snapshot.keyframes()[active_start..], true);
     if window.is_empty() {
@@ -358,10 +485,16 @@ pub fn run_local_inertial_ba(
             velocity: kf.velocity_world,
             bias: kf.imu_bias,
             fixed: kf_idx < active_start,
+            inertial_fixed: params.lost_keyframes == LostKeyframes::FixedInertial
+                && kf.inserted_while_lost,
         })
         .collect();
 
-    let (observations, observation_views) = window.observations_with_views(
+    let WindowObservations {
+        observations,
+        views: observation_views,
+        sigma_px: observation_sigma_px,
+    } = window.observations_with_views(
         snapshot
             .keyframes()
             .iter()
@@ -369,6 +502,8 @@ pub fn run_local_inertial_ba(
             .map(|(kf_idx, kf)| (kf_idx, kf, kf_idx < active_start)),
         camera,
         true,
+        params.depth_sigma,
+        params.visual_information,
     );
     let rig_views = rig_observation_cameras(snapshot.keyframes());
 
@@ -493,6 +628,31 @@ pub fn run_local_inertial_ba(
     // hitting the default max_iterations=20 cap while still making
     // small, steady progress (final residuals *smaller* than many calls
     // that did converge), not diverging. Give it more room.
+    let mut vi_params = ViBaParams {
+        imu_t_bc,
+        gravity: gravity_world,
+        max_iterations: 50,
+        boundary_imu_info_scale: params.boundary_imu_info_scale,
+        boundary_scales_bias_rows: params.boundary_scales_bias_rows,
+        boundary: params.boundary,
+        imu_huber: params.imu_huber,
+        rig_views: rig_views.clone(),
+        observation_views: observation_views.clone(),
+        observation_sigma_px,
+        ..ViBaParams::default()
+    };
+    let boundary = imu_edges
+        .iter()
+        .find(|e| e.from_idx < active_start && e.to_idx >= active_start);
+    if let (BoundaryPrior::Marginal(sigma), Some(edge)) = (params.boundary, boundary) {
+        vi_params.prior = match carried_prior(snapshot, &vi_keyframes, edge, &vi_params, sigma) {
+            Ok(prior) => Some(prior),
+            Err(reason) => {
+                debug_eprintln!("[vi_ba] PRIOR fallback: {reason}");
+                None
+            }
+        };
+    }
     let vi_result = match visual_inertial_bundle_adjust(
         &vi_keyframes,
         &window.positions,
@@ -501,14 +661,7 @@ pub fn run_local_inertial_ba(
         &wheel_edges,
         &stationary_edges,
         camera,
-        &ViBaParams {
-            imu_t_bc,
-            gravity: gravity_world,
-            max_iterations: 50,
-            rig_views: rig_views.clone(),
-            observation_views: observation_views.clone(),
-            ..ViBaParams::default()
-        },
+        &vi_params,
     ) {
         Ok(r) => r,
         Err(error) => {
@@ -542,6 +695,16 @@ pub fn run_local_inertial_ba(
         );
     }
     window.write_back_where(&vi_result.points, &keep, &mut update.map_points);
+    if let (BoundaryPrior::Marginal(sigma), Some(edge)) = (params.boundary, boundary) {
+        // A solve that fell back starts the chain from its own result.
+        update.next_prior = vi_params.prior.take().or_else(|| {
+            let (from, to) = (edge.from_idx, edge.to_idx);
+            let frozen = &vi_result.keyframes;
+            marginalize_frozen(None, &frozen[from], &frozen[to], edge, &vi_params, sigma)
+                .ok()
+                .map(|prior| stamped(prior, snapshot, to))
+        });
+    }
     update.solve_stats = Some(LocalBaStats {
         initial_cost: vi_result.initial_cost,
         final_cost: vi_result.final_cost,
@@ -554,6 +717,61 @@ pub fn run_local_inertial_ba(
         points_rejected,
     });
     update
+}
+
+/// The boundary prior for the window whose boundary IMU edge is `edge`:
+/// the map's prior if it is already on the edge's active keyframe, or moved
+/// onto it by eliminating the edge's frozen keyframe. `Err` says why there
+/// is none, and the solve falls back to the scaled edge.
+fn carried_prior(
+    snapshot: &BaSnapshot,
+    keyframes: &[ViBaKeyframe],
+    edge: &ViBaImuFactor,
+    params: &ViBaParams,
+    sigma: FrozenPoseSigma,
+) -> Result<MarginalPrior, String> {
+    let (from, to) = (edge.from_idx, edge.to_idx);
+    let frame = |slot: usize| snapshot.keyframes()[slot].frame.idx;
+    let stored = snapshot
+        .marginal_prior()
+        .filter(|prior| prior.world_epoch == snapshot.world_epoch())
+        .ok_or("no prior")?;
+    if stored.frame_idx == frame(to) {
+        if stored.is_stale(&keyframes[to]) {
+            return Err(format!("stale on kf {}", stored.frame_idx));
+        }
+        return Ok(stored.clone());
+    }
+    if stored.frame_idx != frame(from) {
+        return Err(format!(
+            "prior on kf {}, boundary {} -> {}",
+            stored.frame_idx,
+            frame(from),
+            frame(to)
+        ));
+    }
+    if stored.is_stale(&keyframes[from]) {
+        return Err(format!("stale on kf {}", stored.frame_idx));
+    }
+    marginalize_frozen(
+        Some(stored),
+        &keyframes[from],
+        &keyframes[to],
+        edge,
+        params,
+        sigma,
+    )
+    .map(|prior| stamped(prior, snapshot, to))
+    .map_err(|e| e.to_string())
+}
+
+/// `prior` as the prior on snapshot slot `slot`, in the snapshot's epoch.
+fn stamped(prior: MarginalPrior, snapshot: &BaSnapshot, slot: usize) -> MarginalPrior {
+    MarginalPrior {
+        frame_idx: snapshot.keyframes()[slot].frame.idx,
+        world_epoch: snapshot.world_epoch(),
+        ..prior
+    }
 }
 
 /// Per window landmark, whether its optimized position may be written back:
@@ -629,6 +847,14 @@ fn rig_observation_cameras(keyframes: &[Keyframe]) -> Vec<RigObservationCamera> 
         .unwrap_or_default()
 }
 
+/// Observations of a window with, per observation, its rig camera and its
+/// pixel sigma (empty at unit information).
+struct WindowObservations {
+    observations: Vec<BaObservation>,
+    views: Vec<u8>,
+    sigma_px: Vec<f32>,
+}
+
 /// Live landmarks a BA window observes, ordered by ascending map index; a
 /// landmark's position in `global` is its solver index.
 struct WindowPoints {
@@ -699,20 +925,26 @@ impl WindowPoints {
         &self,
         poses: impl IntoIterator<Item = (usize, &'a Keyframe, bool)>,
         camera: &PinholeCamera,
+        depth_sigma: DepthSigma,
     ) -> Vec<BaObservation> {
-        self.observations_with_views(poses, camera, false).0
+        self.observations_with_views(poses, camera, false, depth_sigma, VisualInformation::Unit)
+            .observations
     }
 
     /// Like [`Self::observations`], with every rig camera's observations
-    /// when `all_cameras` is set, and each one's rig camera index.
+    /// when `all_cameras` is set, each one's rig camera index and, unless
+    /// `information` is unit, its pixel sigma.
     fn observations_with_views<'a>(
         &self,
         poses: impl IntoIterator<Item = (usize, &'a Keyframe, bool)>,
         camera: &PinholeCamera,
         all_cameras: bool,
-    ) -> (Vec<BaObservation>, Vec<u8>) {
+        depth_sigma: DepthSigma,
+        information: VisualInformation,
+    ) -> WindowObservations {
         let mut observations = Vec::new();
         let mut views = Vec::new();
+        let mut sigma_px = Vec::new();
         for (pose_idx, kf, fixed_pose) in poses {
             for (desc_idx, mp_opt) in kf.map_point_by_desc_idx.iter().enumerate() {
                 let Some(&point_idx) = mp_opt.and_then(|mp_idx| self.local_of.get(&mp_idx)) else {
@@ -723,7 +955,13 @@ impl WindowPoints {
                     continue;
                 }
                 if let Some(pixel) = kf.frame.undistorted_xy(desc_idx, camera) {
-                    let (depth_meas, depth_sigma) = stereo_depth_obs(kf, desc_idx);
+                    let octave = kf.frame.features.octaves.get(desc_idx).copied();
+                    let pixel_sigma = information.sigma_px(octave.unwrap_or(0));
+                    let (depth_meas, depth_sigma) =
+                        stereo_depth_obs(kf, desc_idx, depth_sigma, pixel_sigma);
+                    if !information.is_unit() {
+                        sigma_px.push(pixel_sigma);
+                    }
                     observations.push(BaObservation {
                         pose_idx,
                         point_idx,
@@ -737,7 +975,11 @@ impl WindowPoints {
                 }
             }
         }
-        (observations, views)
+        WindowObservations {
+            observations,
+            views,
+            sigma_px,
+        }
     }
 
     fn write_back(&self, optimized: &[Vec3F64], map_points: &mut [Vec3F64]) {
@@ -769,12 +1011,14 @@ impl WindowPoints {
 /// Returns `(Some(z), sigma)` when the keyframe's keypoint has a valid stereo
 /// depth (anchoring the BA's metric scale), else `(None, 1.0)` for a pure
 /// reprojection observation.
-fn stereo_depth_obs(kf: &Keyframe, desc_idx: usize) -> (Option<f32>, f32) {
+fn stereo_depth_obs(
+    kf: &Keyframe,
+    desc_idx: usize,
+    depth_sigma: DepthSigma,
+    pixel_sigma: f32,
+) -> (Option<f32>, f32) {
     match kf.frame.stereo_depth(desc_idx) {
-        Some(z) => (
-            Some(z),
-            (STEREO_DEPTH_REL_SIGMA * z).max(STEREO_DEPTH_MIN_SIGMA),
-        ),
+        Some(z) => (Some(z), depth_sigma.sigma_at(z, pixel_sigma)),
         None => (None, 1.0),
     }
 }

@@ -342,7 +342,7 @@ fn set_block(m: &mut Mat6, row: usize, col: usize, block: &Mat3F64) {
 }
 
 /// `[ρ; ω]` with `T = Exp(ρ, ω)`, translation `J_l(ω)·ρ`.
-fn se3_log(t: &Pose3d) -> [f64; 6] {
+pub(super) fn se3_log(t: &Pose3d) -> [f64; 6] {
     let omega = SO3F64::from_matrix(&t.rotation).log();
     let rho = SO3F64::left_jacobian(omega).inverse() * t.translation;
     [rho.x, rho.y, rho.z, omega.x, omega.y, omega.z]

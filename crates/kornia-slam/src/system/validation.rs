@@ -2,15 +2,17 @@ use kornia_imgproc::features::OrbMatchConfig;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    CameraSelection, FrontendConfig, LoopClosingMode, OrbFrontendConfig, OrbSlamPipeline,
-    OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth,
-    SystemConfig,
+    CameraSelection, FrontendConfig, LocalBaConfig, LoopClosingMode, OrbFrontendConfig,
+    OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection,
+    StereoCloseDepth, StereoDepthSigma, SystemConfig,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{
     LoopClosingConfig, LoopGraphInformation, LoopOdometryGate, LoopTemporalConsistency,
     OdometryRandomWalk,
 };
+use crate::mapping::map::StateEnvelope;
+use crate::mapping::marginalization::BoundaryPrior;
 use crate::tracking::KeyframePolicy;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
 
@@ -81,6 +83,7 @@ impl OrbSlamPipeline {
             FrontendConfig::Orb(orb) => orb.validate()?,
         }
         validate_keyframes(&self.keyframes, sensors.imu)?;
+        validate_local_ba(&self.mapping.local_ba)?;
         validate_loop_closing(&self.loop_closing, sensors)?;
         validate_tuning(&self.tuning, self.loop_closing.is_enabled())
     }
@@ -134,6 +137,34 @@ fn validate_keyframes(policy: &KeyframePolicy, imu: bool) -> Result<(), ConfigEr
         return Err(ConfigError::UnboundedInertialKeyframes);
     }
     Ok(())
+}
+
+fn validate_local_ba(config: &LocalBaConfig) -> Result<(), ConfigError> {
+    let at = |field| format!("mapping.local_ba.{field}");
+    check(
+        at("active_keyframes"),
+        config.active_keyframes as f64,
+        AT_LEAST_ONE,
+    )?;
+    check(
+        at("boundary_imu_info_scale"),
+        config.boundary_imu_info_scale,
+        NON_NEGATIVE,
+    )?;
+    if let BoundaryPrior::Marginal(sigma) = config.boundary {
+        check(at("boundary"), sigma.frozen_pose_sigma_m, POSITIVE)?;
+        check(at("boundary"), sigma.frozen_pose_sigma_rad, POSITIVE)?;
+    }
+    if let StateEnvelope::On(limits) = config.state_envelope {
+        check(at("state_envelope"), limits.max_speed_mps, POSITIVE)?;
+        check(at("state_envelope"), limits.max_accel_bias, POSITIVE)?;
+        check(at("state_envelope"), limits.max_gyro_bias, POSITIVE)?;
+    }
+    match config.stereo_depth_sigma {
+        StereoDepthSigma::RelativeDepth(value) | StereoDepthSigma::Disparity { px: value } => {
+            check(at("stereo_depth_sigma"), value, POSITIVE)
+        }
+    }
 }
 
 fn validate_initialization(config: &TwoViewInitConfig) -> Result<(), ConfigError> {

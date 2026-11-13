@@ -35,6 +35,7 @@ use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
 use crate::frame::Frame;
 use crate::mapping::map::{Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
+use crate::mapping::visual_information::VisualInformation;
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 
 use super::Estimate;
@@ -115,6 +116,22 @@ pub struct MapProjectionConfig {
     pub min_inliers_with_prediction: usize,
     /// Fundamental-matrix RANSAC inlier threshold in pixels.
     pub geometric_filter_threshold_px: f64,
+    /// Which tracked matches the estimate hands on to the keyframe.
+    pub keyframe_observations: KeyframeObservations,
+}
+
+/// Which matches of an accepted pose become keyframe observations (and
+/// landmark found counts and optical-flow tracks).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum KeyframeObservations {
+    /// Every projection match, outliers of the final PnP gate included.
+    #[default]
+    AllMatches,
+    /// Only matches within the final PnP gate at the accepted pose, as
+    /// ORB-SLAM3 nulls pose-optimization outliers in `TrackLocalMap`; a
+    /// mismatch linked into a keyframe would stay in every later BA.
+    PnpInliers,
 }
 
 impl Default for MapProjectionConfig {
@@ -137,11 +154,19 @@ impl Default for MapProjectionConfig {
             search_widen_per_sec: 1.0,
             min_inliers_with_prediction: 15,
             geometric_filter_threshold_px: 1.0,
+            keyframe_observations: KeyframeObservations::AllMatches,
         }
     }
 }
 
 impl MapProjectionConfig {
+    /// This config with the PnP gates weighted by `information`.
+    pub fn with_visual_information(&self, information: VisualInformation) -> Self {
+        let mut config = self.clone();
+        config.pnp.visual_information = information;
+        config
+    }
+
     /// `search_scale` to pass to `MapProjectionEstimator::estimate_pose` given
     /// how long tracking has been failing.
     ///
@@ -246,6 +271,7 @@ impl MapProjectionEstimator {
                     map.map_points(),
                     &correspondences,
                     &curr_keypoints_undist,
+                    &frame.features.octaves,
                     &grids,
                     pose_init,
                     search_scale,
@@ -271,6 +297,16 @@ impl MapProjectionEstimator {
                     pose = local.pose;
                     inliers = local.inliers;
                 }
+            }
+            if self.config.keyframe_observations == KeyframeObservations::PnpInliers {
+                matches = self.inlier_matches(
+                    map.map_points(),
+                    &matches,
+                    &curr_keypoints_undist,
+                    &frame.features.octaves,
+                    &grids,
+                    &pose,
+                );
             }
             Ok(Estimate {
                 pose,
@@ -451,6 +487,7 @@ impl MapProjectionEstimator {
             map.map_points(),
             &global_matches,
             curr_keypoints_undist,
+            curr_octaves,
             grids,
             pose_init,
             search_scale,
@@ -462,17 +499,60 @@ impl MapProjectionEstimator {
         })
     }
 
+    /// The matches within the final PnP gate at `pose`, octave-scaled as the
+    /// PnP gates are.
+    fn inlier_matches(
+        &self,
+        map_points: &[MapPoint],
+        matches: &[(usize, usize)],
+        keypoints_undist: &[[f32; 2]],
+        octaves: &[u8],
+        grids: &[ViewGrid],
+        pose: &Pose3d,
+    ) -> Vec<(usize, usize)> {
+        let pnp = &self.config.pnp;
+        let threshold_sq = pnp.final_reproj_threshold_px.powi(2);
+        matches
+            .iter()
+            .copied()
+            .filter(|&(mp_idx, kp_idx)| {
+                let (Some(mp), Some(kp)) = (map_points.get(mp_idx), keypoints_undist.get(kp_idx))
+                else {
+                    return false;
+                };
+                let sigma = pnp
+                    .visual_information
+                    .sigma_px(octaves.get(kp_idx).copied().unwrap_or(0))
+                    as f64;
+                grids
+                    .iter()
+                    .find(|g| (g.offset..g.offset + g.len).contains(&kp_idx))
+                    .and_then(|view| {
+                        view.camera.reprojection_error_sq_world(
+                            &view.pose(pose),
+                            &mp.position,
+                            kp[0] as f64,
+                            kp[1] as f64,
+                        )
+                    })
+                    .is_some_and(|error_sq| error_sq <= threshold_sq * sigma * sigma)
+            })
+            .collect()
+    }
+
     /// Gather 3D-2D correspondences from map points and keypoints, then solve PnP.
     ///
     /// `search_scale` widens the coarse prior-reprojection gate (see
     /// [`Self::estimate_pose`]) so a drifted `pose_init` doesn't starve the
     /// LM solve of correspondences; the tight final-inlier threshold that
     /// actually accepts the solution is unaffected.
+    #[allow(clippy::too_many_arguments)]
     fn solve_pnp(
         &self,
         map_points: &[MapPoint],
         correspondences: &[(usize, usize)],
         keypoints_undist: &[[f32; 2]],
+        octaves: &[u8],
         grids: &[ViewGrid],
         pose_init: &Pose3d,
         search_scale: f32,
@@ -487,8 +567,11 @@ impl MapProjectionEstimator {
             self.config.pnp.clone()
         };
         let primary = grids.first()?;
+        let information = pnp_config.visual_information;
+        let octave_of = |kp_idx: usize| octaves.get(kp_idx).copied().unwrap_or(0);
         let mut points_world = Vec::with_capacity(correspondences.len());
         let mut points_image = Vec::with_capacity(correspondences.len());
+        let mut points_octave = Vec::new();
         for &(mp_idx, kp_idx) in correspondences {
             if kp_idx >= primary.offset + primary.len {
                 continue;
@@ -496,11 +579,15 @@ impl MapProjectionEstimator {
             if let (Some(mp), Some(&kp)) = (map_points.get(mp_idx), keypoints_undist.get(kp_idx)) {
                 points_world.push(mp.position);
                 points_image.push(Vec2F32::new(kp[0], kp[1]));
+                if !information.is_unit() {
+                    points_octave.push(octave_of(kp_idx));
+                }
             }
         }
         let primary_solution = pnp::solve_pnp(
             &points_world,
             &points_image,
+            &points_octave,
             &primary.camera,
             pose_init,
             &pnp_config,
@@ -521,6 +608,7 @@ impl MapProjectionEstimator {
                     pixel: [kp[0] as f64, kp[1] as f64],
                     camera: &view.camera,
                     camera_from_primary: view.camera_from_primary.as_ref(),
+                    sigma_px: information.sigma_px(octave_of(kp_idx)) as f64,
                 })
             })
             .collect();
@@ -988,6 +1076,34 @@ mod matching_tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0], (0, 0));
+    }
+
+    #[test]
+    fn only_matches_within_the_final_gate_are_kept() {
+        let mut estimator = make_test_estimator();
+        let camera = test_camera();
+        let map_points: Vec<MapPoint> = [0.0, 0.5, -0.5]
+            .into_iter()
+            .map(|x| MapPoint::new(Vec3F64::new(x, 0.0, 5.0), [0u8; 32], 0, [0; 3], 0))
+            .collect();
+        // Exact, 2 px off and 20 px off (the last at octave 7: sigma 3.6 px).
+        let keypoints = vec![[320.0f32, 240.0], [342.0, 240.0], [280.0, 240.0]];
+        let octaves = [0u8, 0, 7];
+        let kept = |estimator: &MapProjectionEstimator| {
+            let grid = KeypointGrid::new(&keypoints, 640.0, 480.0, 64.0);
+            estimator.inlier_matches(
+                &map_points,
+                &[(0, 0), (1, 1), (2, 2)],
+                &keypoints,
+                &octaves,
+                &[single_view(grid, &camera, keypoints.len())],
+                &Pose3d::IDENTITY,
+            )
+        };
+        assert_eq!(kept(&estimator), vec![(0, 0), (1, 1)]);
+        estimator.config.pnp.visual_information = VisualInformation::OctaveScaled;
+        // 20 px is still past 3 · 3.6 px.
+        assert_eq!(kept(&estimator), vec![(0, 0), (1, 1)]);
     }
 
     #[test]

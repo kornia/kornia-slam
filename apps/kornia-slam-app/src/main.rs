@@ -8,9 +8,11 @@
 //! A run file names the source (EuRoC, Hilti, MCAP, or a live OAK-D or UVC
 //! camera) and the system to run on it; see `configs/` and [`config`].
 
+mod blackout;
 mod config;
 mod datasets;
 mod evaluation;
+mod map_dump;
 mod source;
 mod trajectory;
 mod tui;
@@ -52,6 +54,21 @@ struct Args {
     /// the camera pose (the LaMAria estimate format)
     #[argh(option)]
     trajectory_out: Option<String>,
+
+    /// like --trajectory-out, written at shutdown with each frame re-anchored
+    /// to its reference keyframe's final pose (ORB-SLAM3's SaveTrajectoryEuRoC)
+    #[argh(option)]
+    trajectory_smoothed: Option<String>,
+
+    /// black images from `<start_s>` after the first frame for `<duration_s>`,
+    /// given as `<start_s>:<duration_s>`; frames and IMU are still processed
+    #[argh(option)]
+    blackout: Option<String>,
+
+    /// write the live landmarks at shutdown to this CSV (position, observation
+    /// count, descriptor)
+    #[argh(option)]
+    dump_map: Option<String>,
 
     /// spawn a Rerun viewer and stream to it (requires `--features viz`)
     #[argh(switch)]
@@ -149,6 +166,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .transpose()?;
+    let mut smoothed = args
+        .trajectory_smoothed
+        .as_ref()
+        .map(|_| trajectory::SmoothedTrajectory::default());
+    let mut blackout = args
+        .blackout
+        .as_deref()
+        .map(blackout::Blackout::parse)
+        .transpose()?;
     if let Some(path) = vocabulary {
         eprintln!(
             "[place-recognition] loaded vocabulary from {}",
@@ -186,7 +212,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut trajectory: Vec<[f32; 3]> = Vec::new();
     let mut processed: usize = 0;
 
-    while let Some(item) = source.next_frame()? {
+    while let Some(mut item) = source.next_frame()? {
+        if let Some(blackout) = blackout.as_mut()
+            && blackout.apply(&mut item)
+            && !tui_active
+        {
+            eprintln!("[blackout] frame={}", item.idx);
+        }
         let now = Instant::now();
         let elapsed = now.duration_since(last_frame_walltime);
 
@@ -284,6 +316,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             writer.write(timestamp_sec, &result.pose_world_to_cam)?;
         }
+        if let Some(smoothed) = smoothed.as_mut()
+            && result.status != kornia_slam::TrackingStatus::Skipped
+            && let Some(reference_kf) = system.current_keyframe_idx()
+            && let Some(reference_pose) = system.keyframe_pose(reference_kf)
+        {
+            smoothed.record(
+                timestamp_sec,
+                &result.pose_world_to_cam,
+                reference_kf,
+                &reference_pose,
+            );
+        }
         let traj_pt = trajectory_point_from_pose(&result.pose_world_to_cam);
         trajectory.push(traj_pt);
 
@@ -365,6 +409,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     if let Some(writer) = trajectory_out {
         writer.finish()?;
+    }
+    if let (Some(smoothed), Some(path)) = (smoothed, args.trajectory_smoothed.as_deref()) {
+        let writer = trajectory::TrajectoryWriter::create(
+            std::path::Path::new(path),
+            system.rig().camera_to_body(),
+        )?;
+        let unanchored = smoothed.write(writer, |kf| system.keyframe_pose(kf))?;
+        eprintln!("Smoothed trajectory: {unanchored} frame(s) without a surviving keyframe");
+    }
+    if let Some(path) = args.dump_map.as_deref() {
+        system.with_map_points(|map_points| {
+            map_dump::write(std::path::Path::new(path), map_points)
+        })?;
     }
     if args.evaluate {
         evaluation::report(

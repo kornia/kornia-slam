@@ -70,6 +70,7 @@ use faer::prelude::Solve;
 use kornia_algebra::{Mat3F64, SE3F32, SO3F64, Vec3F64};
 use thiserror::Error;
 
+use crate::mapping::marginalization::{BoundaryPrior, MarginalPrior, accumulate_prior};
 use crate::mapping::robust::huber_weight_and_cost;
 use crate::mapping::stationary::{
     self, StationaryFactor, StationaryInfo, StationaryResidual, StationaryState,
@@ -147,6 +148,10 @@ pub struct ViBaKeyframe {
     /// If true, pose+velocity+bias are held fixed (gauge anchor; older keyframes
     /// are held fixed ORB-SLAM3‑style — not marginalised).
     pub fixed: bool,
+    /// If true (and not `fixed`), velocity and bias are held at their given
+    /// values and only the pose is optimised: a keyframe with no visual
+    /// constraint leaves them unobservable.
+    pub inertial_fixed: bool,
 }
 
 /// An IMU factor connecting two consecutive keyframes.
@@ -198,6 +203,17 @@ pub struct ViBaParams {
     /// this edge (`Optimizer::LocalInertialBA`, "to avoid accumulating error due
     /// to fixing variables").
     pub boundary_imu_info_scale: f64,
+    /// Whether `boundary_imu_info_scale` also scales the boundary edge's bias
+    /// random-walk rows. ORB-SLAM3 scales `EdgeInertial` only; its
+    /// `EdgeGyroRW`/`EdgeAccRW` keep full information.
+    pub boundary_scales_bias_rows: bool,
+    /// Which IMU edges get the `huber_imu_chi2` kernel.
+    pub imu_huber: ImuHuber,
+    /// With [`BoundaryPrior::Marginal`] and a `prior`, the prior replaces the
+    /// boundary edge, on that edge's free keyframe; without a `prior` the
+    /// solve is the `ScaledEdge` one, bit for bit.
+    pub boundary: BoundaryPrior,
+    pub prior: Option<MarginalPrior>,
     /// Information weight (1/sigma²) of a zero-mean Gaussian prior pulling each
     /// free keyframe's accel bias toward zero, applied every iteration
     /// independent of Huber down-weighting (unlike the IMU-edge terms, this
@@ -239,6 +255,21 @@ pub struct ViBaParams {
     /// `rig_views[k - 1]`. Empty `observation_views` means all primary.
     pub rig_views: Vec<RigObservationCamera>,
     pub observation_views: Vec<u8>,
+    /// Pixel standard deviation of each observation's reprojection
+    /// residual (see [`VisualInformation`](crate::mapping::visual_information::VisualInformation)).
+    /// Empty means 1 px for all; the Huber knee then applies to the whitened residual.
+    pub observation_sigma_px: Vec<f32>,
+}
+
+/// IMU edges whose nav residual gets the Huber kernel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ImuHuber {
+    #[default]
+    AllEdges,
+    /// The boundary edge only, as ORB-SLAM3's `LocalInertialBA` (`i==N-1 || bRecInit`).
+    BoundaryOnly,
+    Off,
 }
 
 /// A secondary rig camera: its model and `T_CP` from the primary camera,
@@ -312,6 +343,10 @@ impl Default for ViBaParams {
             huber_reproj_px_sq: 25.0,
             huber_depth_sigma_sq: 9.0,
             boundary_imu_info_scale: 1e-2,
+            boundary_scales_bias_rows: true,
+            imu_huber: ImuHuber::AllEdges,
+            boundary: BoundaryPrior::ScaledEdge,
+            prior: None,
             // sigma = 0.1 m/s²: comfortably above real MEMS accel-bias
             // magnitude, so it's a floor that only bites once the
             // bias-random-walk edges have been Huber-suppressed or a value
@@ -323,6 +358,7 @@ impl Default for ViBaParams {
             depth_gate_factor: 10.0,
             rig_views: Vec::new(),
             observation_views: Vec::new(),
+            observation_sigma_px: Vec::new(),
         }
     }
 }
@@ -355,6 +391,13 @@ pub struct ViBaResult {
     /// Landmark steps held back (the landmark kept its position for that
     /// step) because they would have moved it behind an observing camera.
     pub cheirality_points_held: usize,
+    /// `Marginal` was asked for, but no prior could replace the boundary edge.
+    pub fallback: bool,
+    /// Distance (m/s) of the prior keyframe's velocity from the prior's mean
+    /// at the start and at the end; `None` without an applied prior or while
+    /// its information is singular.
+    pub prior_residual_first: Option<f64>,
+    pub prior_residual_final: Option<f64>,
 }
 
 /// Upper bound of the depth gate for a measured depth `d`, metres.
@@ -758,7 +801,7 @@ fn body_frame(cam_pose: &Pose3d, t_bc: Option<&Pose3d>) -> (Mat3F64, Vec3F64) {
 ///
 /// State layout (per keyframe): [ρ(6) | v(3) | bg(3) | ba(3)]
 ///   ρ = [upsilon(3), omega(3)] — SE3 tangent, matching ReprojFactor convention
-fn imu_residual_and_jacobians(
+pub(super) fn imu_residual_and_jacobians(
     kf_i: &ViBaKeyframe,
     kf_j: &ViBaKeyframe,
     pim: &PreintegratedImu,
@@ -892,7 +935,7 @@ fn imu_residual_and_jacobians(
 /// Accumulate J_a^T · Ω · J_b into m_mat[row_base:, col_base:] (15×15 block).
 /// If `update_rhs`, also subtract J_a^T · Ω · r from m_vec[row_base:].
 #[allow(clippy::too_many_arguments)]
-fn accum_jt_omega_j(
+pub(super) fn accum_jt_omega_j(
     m_mat: &mut Mat<f64>,
     m_vec: &mut [f64],
     row_base: usize,
@@ -947,7 +990,7 @@ fn accum_jt_omega_j(
 /// Row-major index of `(row, col)` in a 15×15 matrix stored as `[f64; 225]`
 /// (the IMU edge's information, Jacobians and products).
 #[inline]
-const fn idx15(row: usize, col: usize) -> usize {
+pub(super) const fn idx15(row: usize, col: usize) -> usize {
     row * 15 + col
 }
 
@@ -956,7 +999,11 @@ const fn idx15(row: usize, col: usize) -> usize {
 /// walk (9–14) stays quadratic. `omega_raw` is block-diagonal between the two
 /// (see [`imu_information_matrix`]) and symmetric. The caller scales only the
 /// nav block of omega by the returned weight.
-fn imu_weight_and_cost(res: &[f64; 15], omega_raw: &[f64; 225], chi2_threshold: f64) -> (f64, f64) {
+fn imu_weight_and_cost(
+    res: &[f64; 15],
+    omega_raw: &[f64; 225],
+    chi2_threshold: Option<f64>,
+) -> (f64, f64) {
     let block_chi2 = |range: std::ops::Range<usize>| {
         let mut chi2 = 0.0f64;
         for i in range.clone() {
@@ -966,7 +1013,7 @@ fn imu_weight_and_cost(res: &[f64; 15], omega_raw: &[f64; 225], chi2_threshold: 
         }
         chi2
     };
-    let (hw, nav_cost) = huber_weight_and_cost(block_chi2(0..9), Some(chi2_threshold));
+    let (hw, nav_cost) = huber_weight_and_cost(block_chi2(0..9), chi2_threshold);
     (hw, nav_cost + 0.5 * block_chi2(9..15))
 }
 
@@ -975,9 +1022,63 @@ fn visual_huber(chi2: f64, chi2_threshold: f64) -> (f64, f64) {
     huber_weight_and_cost(chi2, Some(chi2_threshold))
 }
 
+/// The edge from a permanently-fixed keyframe into the active window.
+fn is_boundary_edge(edge: &ImuFactor, kf_local: &[i64]) -> bool {
+    kf_local[edge.from_idx] < 0 && kf_local[edge.to_idx] >= 0
+}
+
+/// The information of `edge` as a solve uses it, for the system build and the
+/// trial cost alike. The boundary edge is downweighted so this window's
+/// estimate can't accumulate error onto a value that will never be revisited;
+/// see [`ViBaParams::boundary_imu_info_scale`].
+fn imu_edge_information(edge: &ImuFactor, kf_local: &[i64], params: &ViBaParams) -> [f64; 225] {
+    let mut omega = imu_information_matrix(&edge.preintegrated, params.imu_weight);
+    if is_boundary_edge(edge, kf_local) {
+        let rows = if params.boundary_scales_bias_rows {
+            15
+        } else {
+            9
+        };
+        for r in 0..rows {
+            for c in 0..rows {
+                omega[idx15(r, c)] *= params.boundary_imu_info_scale;
+            }
+        }
+    }
+    omega
+}
+
+/// The nav-residual Huber threshold of `edge`, `None` for a quadratic edge.
+fn imu_huber_chi2(edge: &ImuFactor, kf_local: &[i64], params: &ViBaParams) -> Option<f64> {
+    match params.imu_huber {
+        ImuHuber::AllEdges => Some(params.huber_imu_chi2),
+        ImuHuber::BoundaryOnly => is_boundary_edge(edge, kf_local).then_some(params.huber_imu_chi2),
+        ImuHuber::Off => None,
+    }
+}
+
+/// The keyframe slot a marginal prior replaces the boundary edge on: the
+/// boundary edge's free endpoint, when `Marginal` is asked for with a prior.
+fn prior_slot(params: &ViBaParams, imu_edges: &[ImuFactor], kf_local: &[i64]) -> Option<usize> {
+    if !matches!(params.boundary, BoundaryPrior::Marginal(_)) || params.prior.is_none() {
+        return None;
+    }
+    imu_edges
+        .iter()
+        .find(|edge| is_boundary_edge(edge, kf_local))
+        .map(|edge| edge.to_idx)
+}
+
+/// Distance of `kf`'s velocity from `prior`'s mean, m/s.
+fn prior_velocity_residual(prior: &MarginalPrior, kf: &ViBaKeyframe) -> Option<f64> {
+    prior
+        .velocity_mean_and_sigma()
+        .map(|(mean, _)| (kf.velocity - mean).length())
+}
+
 /// IMU edge information matrix: the full inverse of the 9×9 navigation
 /// covariance (diagonal if it is singular) plus the diagonal bias random walk.
-fn imu_information_matrix(pim: &PreintegratedImu, weight: f64) -> [f64; 225] {
+pub(super) fn imu_information_matrix(pim: &PreintegratedImu, weight: f64) -> [f64; 225] {
     let mut omega = [0.0f64; 225];
 
     // Full 9×9 nav block inverse (pim.covariance is column-major).
@@ -1195,6 +1296,32 @@ fn accumulate_wheel_edges(
         accumulate_pose_pair(m_mat, m_vec, li, lj, &r, &j, info, w);
     }
     cost
+}
+
+/// Conditions the reduced system on the velocity and bias of every
+/// `inertial_fixed` keyframe: their rows and columns become identity with a
+/// zero right-hand side, so the step leaves them exactly unchanged.
+fn hold_inertial_state(
+    m_mat: &mut Mat<f64>,
+    m_vec: &mut [f64],
+    keyframes: &[ViBaKeyframe],
+    kf_local: &[i64],
+) {
+    const KF_DOF: usize = 15;
+    let dim = m_vec.len();
+    for (kf, &l) in keyframes.iter().zip(kf_local) {
+        if l < 0 || !kf.inertial_fixed {
+            continue;
+        }
+        for d in l as usize * KF_DOF + 6..(l as usize + 1) * KF_DOF {
+            for k in 0..dim {
+                m_mat[(d, k)] = 0.0;
+                m_mat[(k, d)] = 0.0;
+            }
+            m_mat[(d, d)] = 1.0;
+            m_vec[d] = 0.0;
+        }
+    }
 }
 
 /// Normal equations of a 6-row pose-pair residual with `J_j = −J_i`: every
@@ -1520,6 +1647,13 @@ pub fn visual_inertial_bundle_adjust(
         }
     }
 
+    let prior_slot = prior_slot(params, imu_edges, &kf_local);
+    let prior = prior_slot.zip(params.prior.as_ref());
+    let fallback = matches!(params.boundary, BoundaryPrior::Marginal(_)) && prior.is_none();
+    // The prior stands in for the boundary edge.
+    let skip_edge = |edge: &ImuFactor| prior.is_some() && is_boundary_edge(edge, &kf_local);
+    let prior_residual_first = prior.and_then(|(i, p)| prior_velocity_residual(p, &keyframes[i]));
+
     // ── Mutable state (f64 throughout — IMU needs the precision) ─────────
     let mut kfs: Vec<ViBaKeyframe> = keyframes.to_vec();
     let mut xyz: Vec<Vec3F64> = points.to_vec();
@@ -1589,9 +1723,15 @@ pub fn visual_inertial_bundle_adjust(
             let (r_f32, jp_f32, jx_f32) =
                 residual_and_jacobians(&obs_pose, point, obs.pixel, obs_camera);
 
-            let r_raw = [r_f32[0] as f64, r_f32[1] as f64];
-            let jp_raw: [f64; 12] = std::array::from_fn(|i| jp_f32[i] as f64);
-            let jx_raw: [f64; 6] = std::array::from_fn(|i| jx_f32[i] as f64);
+            let mut r_raw = [r_f32[0] as f64, r_f32[1] as f64];
+            let mut jp_raw: [f64; 12] = std::array::from_fn(|i| jp_f32[i] as f64);
+            let mut jx_raw: [f64; 6] = std::array::from_fn(|i| jx_f32[i] as f64);
+            if let Some(&sigma) = params.observation_sigma_px.get(o) {
+                let inv_sigma = 1.0 / sigma as f64;
+                r_raw.iter_mut().for_each(|r| *r *= inv_sigma);
+                jp_raw.iter_mut().for_each(|j| *j *= inv_sigma);
+                jx_raw.iter_mut().for_each(|j| *j *= inv_sigma);
+            }
 
             let chi2_vis = r_raw[0] * r_raw[0] + r_raw[1] * r_raw[1];
             *inlier = chi2_vis <= params.huber_reproj_px_sq;
@@ -1773,7 +1913,7 @@ pub fn visual_inertial_bundle_adjust(
             let j = edge.to_idx;
             let li = kf_local[i];
             let lj = kf_local[j];
-            if li < 0 && lj < 0 {
+            if (li < 0 && lj < 0) || skip_edge(edge) {
                 continue;
             }
 
@@ -1785,15 +1925,7 @@ pub fn visual_inertial_bundle_adjust(
                 params.imu_t_bc.as_ref(),
             );
 
-            let mut omega_raw = imu_information_matrix(&edge.preintegrated, params.imu_weight);
-            // Boundary edge (from a permanently-fixed KF into the active window):
-            // downweight so this window's estimate can't accumulate error onto a
-            // value that will never be revisited. See `boundary_imu_info_scale` doc.
-            if li < 0 && lj >= 0 {
-                for x in omega_raw.iter_mut() {
-                    *x *= params.boundary_imu_info_scale;
-                }
-            }
+            let omega_raw = imu_edge_information(edge, &kf_local, params);
             // Huber robustification: down-weight edges whose nav-block Mahalanobis
             // chi2 exceeds the threshold. This handles large residuals from rough
             // post-init velocity estimates without a fixed weight compromise.
@@ -1804,7 +1936,8 @@ pub fn visual_inertial_bundle_adjust(
             // distinct g2o edges). Scaling it by the *nav* residual's outlier-ness
             // was silencing the one thing meant to resist a bad nav window explaining
             // itself away through bias, in exactly the windows where that matters.
-            let (hw, c_imu) = imu_weight_and_cost(&res, &omega_raw, params.huber_imu_chi2);
+            let (hw, c_imu) =
+                imu_weight_and_cost(&res, &omega_raw, imu_huber_chi2(edge, &kf_local, params));
             cost_imu += c_imu;
             let omega: [f64; 225] = {
                 let mut o = omega_raw;
@@ -1831,8 +1964,9 @@ pub fn visual_inertial_bundle_adjust(
                 debug_eprintln!(
                     "[vi_ba] edge {i}→{j}  dt={:.3}s  |r_R|={nr:.4e}  |r_v|={nv:.4e}  \
                         |r_p|={np:.4e}  |r_bg|={nbg:.4e}  |r_ba|={nba:.4e}  \
-                        Ω∈[{om_min:.2e},{om_max:.2e}]  hw={hw:.4}",
+                        Ω∈[{om_min:.2e},{om_max:.2e}]  hw={hw:.4}  boundary={}",
                     edge.preintegrated.dt,
+                    is_boundary_edge(edge, &kf_local),
                 );
             }
 
@@ -1885,6 +2019,16 @@ pub fn visual_inertial_bundle_adjust(
             }
         }
 
+        let cost_prior = prior.map_or(0.0, |(i, p)| {
+            accumulate_prior(
+                &mut m_mat,
+                &mut m_vec,
+                kf_local[i] as usize * KF_DOF,
+                p,
+                &kfs[i],
+            )
+        });
+
         let cost_wheel = accumulate_wheel_edges(
             &mut m_mat,
             &mut m_vec,
@@ -1903,11 +2047,13 @@ pub fn visual_inertial_bundle_adjust(
             &stationary_info,
         );
 
-        let cost_f64 = cost_vis + cost_imu + cost_bias_prior + cost_wheel + cost_stationary;
+        let cost_f64 =
+            cost_vis + cost_imu + cost_bias_prior + cost_prior + cost_wheel + cost_stationary;
         if initial_cost == f64::MAX {
             initial_cost = cost_f64;
         }
         let cost = cost_f64 as f32;
+        hold_inertial_state(&mut m_mat, &mut m_vec, keyframes, &kf_local);
 
         // ── 4. LM damping on full 15P system, then Cholesky ──────────────
         // Damping goes on AFTER IMU terms so every diagonal entry sees it.
@@ -2058,7 +2204,10 @@ pub fn visual_inertial_bundle_adjust(
             let (obs_camera, obs_pose) = views.camera_pose(o, camera, &se3s_trial[obs.pose_idx]);
             let (r_f32, _, _) =
                 residual_and_jacobians(&obs_pose, &xyz_trial[obs.point_idx], obs.pixel, obs_camera);
-            let chi2_vis = (r_f32[0] * r_f32[0] + r_f32[1] * r_f32[1]) as f64;
+            let mut chi2_vis = (r_f32[0] * r_f32[0] + r_f32[1] * r_f32[1]) as f64;
+            if let Some(&sigma) = params.observation_sigma_px.get(o) {
+                chi2_vis /= (sigma as f64).powi(2);
+            }
             new_cost_vis += visual_huber(chi2_vis, params.huber_reproj_px_sq).1;
 
             if let Some(d_meas) = obs.depth_meas.filter(|_| depth_row) {
@@ -2076,7 +2225,7 @@ pub fn visual_inertial_bundle_adjust(
         for edge in imu_edges {
             let i = edge.from_idx;
             let j = edge.to_idx;
-            if kf_local[i] < 0 && kf_local[j] < 0 {
+            if (kf_local[i] < 0 && kf_local[j] < 0) || skip_edge(edge) {
                 continue;
             }
             let (res, _, _) = imu_residual_and_jacobians(
@@ -2086,13 +2235,9 @@ pub fn visual_inertial_bundle_adjust(
                 &params.gravity,
                 params.imu_t_bc.as_ref(),
             );
-            let mut omega_raw = imu_information_matrix(&edge.preintegrated, params.imu_weight);
-            if kf_local[i] < 0 && kf_local[j] >= 0 {
-                for x in omega_raw.iter_mut() {
-                    *x *= params.boundary_imu_info_scale;
-                }
-            }
-            new_cost_imu += imu_weight_and_cost(&res, &omega_raw, params.huber_imu_chi2).1;
+            let omega_raw = imu_edge_information(edge, &kf_local, params);
+            new_cost_imu +=
+                imu_weight_and_cost(&res, &omega_raw, imu_huber_chi2(edge, &kf_local, params)).1;
         }
         let mut new_cost_bias_prior = 0.0f64;
         if params.accel_bias_prior_weight > 0.0 {
@@ -2105,12 +2250,14 @@ pub fn visual_inertial_bundle_adjust(
                 new_cost_bias_prior += 0.5 * w * (ba.x * ba.x + ba.y * ba.y + ba.z * ba.z);
             }
         }
+        let new_cost_prior = prior.map_or(0.0, |(i, p)| p.cost(&kfs_trial[i]));
         let new_cost_wheel = wheel_cost(&kfs_trial, &kf_local, wheel_edges, &wheel_info);
         let new_cost_stationary =
             stationary_cost(&kfs_trial, &kf_local, stationary_edges, &stationary_info);
         let new_cost = (new_cost_vis
             + new_cost_imu
             + new_cost_bias_prior
+            + new_cost_prior
             + new_cost_wheel
             + new_cost_stationary) as f32;
 
@@ -2142,7 +2289,7 @@ pub fn visual_inertial_bundle_adjust(
     for edge in imu_edges {
         let i = edge.from_idx;
         let j = edge.to_idx;
-        if kf_local[i] < 0 && kf_local[j] < 0 {
+        if (kf_local[i] < 0 && kf_local[j] < 0) || skip_edge(edge) {
             continue;
         }
         let (res, _, _) = imu_residual_and_jacobians(
@@ -2162,6 +2309,38 @@ pub fn visual_inertial_bundle_adjust(
                 |r_p|={np:.4e}  |r_bg|={nbg:.4e}  |r_ba|={nba:.4e}  \
                 (iters={iters_done} conv={converged})",
             edge.preintegrated.dt,
+        );
+    }
+
+    let prior_residual_final = prior.and_then(|(i, p)| prior_velocity_residual(p, &kfs[i]));
+    if let Some((i, p)) = prior {
+        let fmt = |x: Option<f64>| x.map_or("-".to_string(), |x| format!("{x:.4e}"));
+        let sigma_v = p.velocity_mean_and_sigma().map(|(_, s)| s);
+        let (bg, ba) = (kfs[i].bias.gyro, kfs[i].bias.accel);
+        // The full vector, world frame: tells a gravity-tilt residual
+        // (horizontal, steady) from a scale one (along the motion).
+        let r_v = |kf: &ViBaKeyframe| {
+            p.velocity_mean_and_sigma()
+                .map_or("-".to_string(), |(mean, _)| {
+                    let r = kf.velocity - mean;
+                    format!("({:.4e},{:.4e},{:.4e})", r.x, r.y, r.z)
+                })
+        };
+        debug_eprintln!(
+            "[vi_ba] PRIOR kf={}  |r_v| first={} final={}  sigma_v={}  \
+                bg=({:.5},{:.5},{:.5})  ba=({:.4},{:.4},{:.4})  r_v first={} final={}",
+            p.frame_idx,
+            fmt(prior_residual_first),
+            fmt(prior_residual_final),
+            fmt(sigma_v),
+            bg.x,
+            bg.y,
+            bg.z,
+            ba.x,
+            ba.y,
+            ba.z,
+            r_v(&keyframes[i]),
+            r_v(&kfs[i]),
         );
     }
 
@@ -2198,16 +2377,23 @@ pub fn visual_inertial_bundle_adjust(
         points_reseeded,
         cheirality_rejections,
         cheirality_points_held,
+        fallback,
+        prior_residual_first,
+        prior_residual_final,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ObservationViews, RigObservationCamera, ViBaParams, depth_residual_and_jacobian,
-        imu_weight_and_cost, residual_and_jacobians, visual_huber,
+        BaObservation, ImuFactor, ImuHuber, ObservationViews, PinholeCamera, Pose3d,
+        PreintegratedImu, RigObservationCamera, ViBaKeyframe, ViBaParams,
+        depth_residual_and_jacobian, idx15, imu_edge_information, imu_huber_chi2,
+        imu_information_matrix, imu_weight_and_cost, residual_and_jacobians, visual_huber,
+        visual_inertial_bundle_adjust,
     };
     use kornia_algebra::{SE3F32, SO3F32, SO3F64, Vec3AF32, Vec3F64};
+    use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement};
 
     /// The stereo depth row's analytic Jacobian matches central differences
     /// of the predicted depth under the solver's right perturbation
@@ -2345,6 +2531,286 @@ mod tests {
         assert_eq!(same.t, pose.t);
     }
 
+    /// Keyframes 0.2 s apart at the spin rate, with bias walk and noise as
+    /// `sim.ron` configures them. Gravity lies on the spin axis, so the accel
+    /// reading is constant and an axial gyro mismatch only touches `r_R`.
+    const SPIN_RATE: f64 = 0.6;
+    pub(super) const EDGE_S: f64 = 0.2;
+    const IMU_HZ: f64 = 200.0;
+    pub(super) const AXIAL_MISMATCH_RAD: f64 = 8e-4;
+
+    pub(super) fn spin_calib() -> ImuCalib {
+        ImuCalib {
+            gyro_noise: 1.2e-4,
+            accel_noise: 1.9e-3,
+            gyro_bias_noise: 2e-6,
+            accel_bias_noise: 4e-5,
+        }
+    }
+
+    /// `T_cw` of a camera spinning in place about its own y axis.
+    pub(super) fn spin_pose(t: f64) -> Pose3d {
+        let r_wb = SO3F64::exp(Vec3F64::new(0.0, SPIN_RATE * t, 0.0));
+        Pose3d::new(r_wb.inverse().matrix(), Vec3F64::ZERO)
+    }
+
+    pub(super) fn spin_edge(k: usize, mismatch_rad: f64, gravity: Vec3F64) -> ImuFactor {
+        let bias = ImuBias::default();
+        let mut preintegrated = PreintegratedImu::new(bias, spin_calib());
+        let n = (EDGE_S * IMU_HZ).round() as usize;
+        let sample = ImuMeasurement {
+            timestamp: 0.0,
+            gyro: Vec3F64::new(0.0, SPIN_RATE + mismatch_rad / EDGE_S, 0.0),
+            accel: gravity * -1.0,
+        };
+        for _ in 0..n {
+            preintegrated.integrate(&sample, EDGE_S / n as f64);
+        }
+        ImuFactor {
+            from_idx: k,
+            to_idx: k + 1,
+            preintegrated,
+        }
+    }
+
+    /// Fixed landmarks in front of every free keyframe, enough to hold the
+    /// poses at truth against the mismatched rotation edges.
+    pub(super) fn spin_vision(
+        keyframes: &[ViBaKeyframe],
+        camera: &PinholeCamera,
+    ) -> (Vec<Vec3F64>, Vec<BaObservation>) {
+        let (mut points, mut observations) = (Vec::new(), Vec::new());
+        for (pose_idx, kf) in keyframes.iter().enumerate().skip(1) {
+            let t_wc = kf.pose.inverse();
+            for ix in -3..=3 {
+                for iy in -3..=3 {
+                    // Near and far together separate rotation from translation.
+                    let z = if (ix + iy) % 2 == 0 { 1.5 } else { 15.0 };
+                    let p_cam = Vec3F64::new(ix as f64 * 0.2 * z, iy as f64 * 0.2 * z, z);
+                    observations.push(BaObservation {
+                        pose_idx,
+                        point_idx: points.len(),
+                        pixel: [
+                            (camera.fx * p_cam.x / z + camera.cx) as f32,
+                            (camera.fy * p_cam.y / z + camera.cy) as f32,
+                        ],
+                        fixed_pose: false,
+                        fixed_point: true,
+                        depth_meas: None,
+                        depth_sigma: 1.0,
+                    });
+                    points.push(t_wc.transform_point(&p_cam));
+                }
+            }
+        }
+        (points, observations)
+    }
+
+    /// Half the rows sit 3 px off: at unit information the pose splits the
+    /// difference, at sigma 4 px for those rows it follows the 1 px ones.
+    #[test]
+    fn observation_sigma_whitens_the_reprojection_rows() {
+        let camera = PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let keyframes = [ViBaKeyframe {
+            pose: Pose3d::IDENTITY,
+            velocity: Vec3F64::ZERO,
+            bias: ImuBias::default(),
+            fixed: false,
+            inertial_fixed: false,
+        }];
+        let (mut points, mut observations, mut coarse) = (Vec::new(), Vec::new(), Vec::new());
+        for ix in -3i32..=3 {
+            for iy in -3i32..=3 {
+                let p = Vec3F64::new(
+                    ix as f64 * 0.3,
+                    iy as f64 * 0.3,
+                    2.0 + (ix + iy).abs() as f64 * 0.5,
+                );
+                let is_coarse = (ix + iy) % 2 != 0;
+                let shift = if is_coarse { 3.0 } else { 0.0 };
+                observations.push(BaObservation {
+                    pose_idx: 0,
+                    point_idx: points.len(),
+                    pixel: [
+                        (camera.fx * p.x / p.z + camera.cx + shift) as f32,
+                        (camera.fy * p.y / p.z + camera.cy) as f32,
+                    ],
+                    fixed_pose: false,
+                    fixed_point: true,
+                    depth_meas: None,
+                    depth_sigma: 1.0,
+                });
+                points.push(p);
+                coarse.push(is_coarse);
+            }
+        }
+        let fine_error_px = |observation_sigma_px: Vec<f32>| {
+            let params = ViBaParams {
+                observation_sigma_px,
+                ..ViBaParams::default()
+            };
+            let out = visual_inertial_bundle_adjust(
+                &keyframes,
+                &points,
+                &observations,
+                &[],
+                &[],
+                &[],
+                &camera,
+                &params,
+            )
+            .unwrap();
+            let pose = out.keyframes[0].pose;
+            let errors: Vec<f64> = observations
+                .iter()
+                .zip(&coarse)
+                .filter(|(_, c)| !**c)
+                .map(|(o, _)| {
+                    let pc = pose.transform_point(&points[o.point_idx]);
+                    camera.fx * pc.x / pc.z + camera.cx - o.pixel[0] as f64
+                })
+                .collect();
+            (errors.iter().sum::<f64>() / errors.len() as f64).abs()
+        };
+        let unit = fine_error_px(Vec::new());
+        let weighted = fine_error_px(coarse.iter().map(|&c| if c { 4.0 } else { 1.0 }).collect());
+        assert!(unit > 1.0, "unit information error {unit} px");
+        assert!(
+            weighted < 0.25 * unit,
+            "weighted {weighted} px, unit {unit} px"
+        );
+    }
+
+    /// With KF0 fixed at bias 0, poses held at truth by vision and a rotation
+    /// mismatch inside the window that only a gyro bias could explain, the
+    /// random walk must hold: one solve may not move the bias by more than
+    /// about two walk sigmas. It is the only restraint on gyro bias; there is
+    /// no prior, as there is for accel bias.
+    ///
+    /// With `boundary_scales_bias_rows` set, the default, it is 2.3 sigmas
+    /// (2026-11-07). Huber caps the pull here; unrobustified it was 5.7.
+    #[test]
+    fn boundary_edge_keeps_the_bias_walk_at_full_strength() {
+        let params = ViBaParams {
+            boundary_scales_bias_rows: false,
+            ..ViBaParams::default()
+        };
+        // Narrow lens: stiff enough to pin the poses, the mismatch stays
+        // inside the reprojection Huber threshold.
+        let camera = PinholeCamera {
+            fx: 4000.0,
+            fy: 4000.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let truth: Vec<Pose3d> = (0..4).map(|k| spin_pose(k as f64 * EDGE_S)).collect();
+        let keyframes: Vec<ViBaKeyframe> = truth
+            .iter()
+            .enumerate()
+            .map(|(k, pose)| ViBaKeyframe {
+                pose: *pose,
+                velocity: Vec3F64::ZERO,
+                bias: ImuBias::default(),
+                fixed: k == 0,
+                inertial_fixed: false,
+            })
+            .collect();
+        let imu_edges = [
+            spin_edge(0, 0.0, params.gravity),
+            spin_edge(1, AXIAL_MISMATCH_RAD, params.gravity),
+            spin_edge(2, AXIAL_MISMATCH_RAD, params.gravity),
+        ];
+        let (points, observations) = spin_vision(&keyframes, &camera);
+        let out = visual_inertial_bundle_adjust(
+            &keyframes,
+            &points,
+            &observations,
+            &imu_edges,
+            &[],
+            &[],
+            &camera,
+            &params,
+        )
+        .unwrap();
+
+        let walk_sigma = imu_edges[0].preintegrated.bias_covariance[0].sqrt();
+        let step = out.keyframes[1..]
+            .iter()
+            .map(|kf| kf.bias.gyro.y.abs())
+            .fold(0.0, f64::max);
+        for (kf, pose) in out.keyframes.iter().zip(&truth) {
+            let rotation_err =
+                SO3F64::from_matrix(&kf.pose.rotation).inverse().matrix() * pose.rotation;
+            let rotation_err = SO3F64::from_matrix(&rotation_err).log().length();
+            assert!(rotation_err < 2e-4, "pose moved {rotation_err} rad");
+        }
+        assert!(
+            step <= 2.0 * walk_sigma,
+            "bias step {step:.3e} rad/s is {:.1} walk sigmas ({walk_sigma:.3e})",
+            step / walk_sigma
+        );
+    }
+
+    /// A boundary edge's nav block is scaled, its bias block too unless
+    /// `boundary_scales_bias_rows` is unset, and an edge inside the window is
+    /// left alone.
+    #[test]
+    fn boundary_scale_reaches_the_bias_walk_only_when_asked() {
+        for scales_bias in [true, false] {
+            let params = ViBaParams {
+                boundary_scales_bias_rows: scales_bias,
+                ..ViBaParams::default()
+            };
+            let edge = spin_edge(0, 0.0, params.gravity);
+            let raw = imu_information_matrix(&edge.preintegrated, params.imu_weight);
+            let boundary = imu_edge_information(&edge, &[-1, 0], &params);
+            for r in 0..15 {
+                for c in 0..15 {
+                    let scale = if (r < 9 && c < 9) || (scales_bias && r >= 9 && c >= 9) {
+                        params.boundary_imu_info_scale
+                    } else {
+                        1.0
+                    };
+                    assert_eq!(boundary[idx15(r, c)], raw[idx15(r, c)] * scale, "{r},{c}");
+                }
+            }
+            assert_eq!(imu_edge_information(&edge, &[0, 1], &params), raw);
+        }
+    }
+
+    /// `BoundaryOnly` robustifies the boundary edge alone; `Off` none.
+    #[test]
+    fn imu_huber_selects_the_robustified_edges() {
+        let edge = spin_edge(0, 0.0, ViBaParams::default().gravity);
+        let chi2 = |imu_huber, kf_local: &[i64]| {
+            let params = ViBaParams {
+                imu_huber,
+                ..ViBaParams::default()
+            };
+            imu_huber_chi2(&edge, kf_local, &params)
+        };
+        let k = Some(ViBaParams::default().huber_imu_chi2);
+        for kf_local in [[-1, 0], [0, 1]] {
+            assert_eq!(chi2(ImuHuber::AllEdges, &kf_local), k);
+            assert_eq!(chi2(ImuHuber::Off, &kf_local), None);
+        }
+        assert_eq!(chi2(ImuHuber::BoundaryOnly, &[-1, 0]), k);
+        assert_eq!(chi2(ImuHuber::BoundaryOnly, &[0, 1]), None);
+    }
+
     /// The IMU edge's cost (used by both the system build and the trial
     /// step) has the gradient the normal equations use: `w Ω r` on the
     /// Huber-robustified nav rows 0-8, `Ω r` on the quadratic bias rows
@@ -2368,7 +2834,7 @@ mod tests {
         for i in 9..15 {
             omega[i * 15 + i] = 50.0 + 10.0 * i as f64;
         }
-        let k = ViBaParams::default().huber_imu_chi2;
+        let k = Some(ViBaParams::default().huber_imu_chi2);
         for scale in [0.05, 3.0] {
             let res: [f64; 15] = std::array::from_fn(|i| {
                 scale * (0.4 + 0.1 * i as f64) * if i % 2 == 0 { 1.0 } else { -1.0 }
@@ -2417,3 +2883,7 @@ mod stationary_tests;
 #[cfg(test)]
 #[path = "vi_ba_flung_landmark_tests.rs"]
 mod flung_landmark_tests;
+
+#[cfg(test)]
+#[path = "vi_ba_prior_tests.rs"]
+mod prior_tests;

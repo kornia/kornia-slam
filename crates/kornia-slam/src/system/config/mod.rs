@@ -7,7 +7,12 @@ use std::path::{Path, PathBuf};
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{LoopClosingConfig, LoopGraphInformation, LoopGraphSettings};
 use crate::mapping::LocalMappingMode;
-use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
+use crate::mapping::bundle_adjustment::LostKeyframes;
+use crate::mapping::map::StateEnvelope;
+use crate::mapping::marginalization::BoundaryPrior;
+use crate::mapping::vi_ba_schur::ImuHuber;
+use crate::mapping::visual_information::VisualInformation;
+use crate::tracking::pose_estimation::map_projection::{KeyframeObservations, MapProjectionConfig};
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
 /// Schema version of [`SystemConfig`] this crate reads and writes.
@@ -156,13 +161,76 @@ impl StereoCloseDepth {
 }
 
 /// Local mapping (keyframe insertion, culling and local BA / VI-BA).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct MappingConfig {
     /// `Synchronous` maps on the tracking thread before each frame returns,
     /// which makes runs replay identically.
     pub execution: LocalMappingMode,
+    pub local_ba: LocalBaConfig,
+    /// Which tracked matches a new keyframe links; ORB-SLAM3 keeps only the
+    /// pose inliers.
+    pub keyframe_observations: KeyframeObservations,
+}
+
+/// The local BA / VI-BA window and its error model. The defaults are the
+/// behaviour before these settings existed; the alternatives are
+/// ORB-SLAM3's choices, kept selectable for ablation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct LocalBaConfig {
+    /// Newest keyframes optimized; older ones enter as fixed context.
+    /// ORB-SLAM3's `LocalInertialBA` uses 10.
+    pub active_keyframes: usize,
+    /// Information scale of the IMU edge from the fixed past into the window.
+    pub boundary_imu_info_scale: f64,
+    /// Whether that scale also hits the edge's bias random-walk rows
+    /// (ORB-SLAM3 leaves them at full weight).
+    pub boundary_scales_bias_rows: bool,
+    /// The scaled boundary edge, or a marginal prior in its place.
+    pub boundary: BoundaryPrior,
+    pub imu_huber: ImuHuber,
+    pub stereo_depth_sigma: StereoDepthSigma,
+    /// Reprojection weight by keypoint octave, in VI-BA and in the tracking
+    /// PnP gates; with `Disparity` it also scales the stereo depth sigma.
+    pub visual_information: VisualInformation,
+    /// Refuse a VI-BA result whose velocity or bias leaves these bounds.
+    pub state_envelope: StateEnvelope,
+    pub lost_keyframes: LostKeyframes,
+}
+
+impl Default for LocalBaConfig {
+    fn default() -> Self {
+        Self {
+            active_keyframes: 3,
+            boundary_imu_info_scale: 1e-2,
+            boundary_scales_bias_rows: true,
+            boundary: BoundaryPrior::ScaledEdge,
+            imu_huber: ImuHuber::AllEdges,
+            stereo_depth_sigma: StereoDepthSigma::default(),
+            visual_information: VisualInformation::default(),
+            state_envelope: StateEnvelope::Off,
+            lost_keyframes: LostKeyframes::Free,
+        }
+    }
+}
+
+/// Standard deviation of a stereo depth measurement in BA.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum StereoDepthSigma {
+    /// A fraction of the measured depth.
+    RelativeDepth(f64),
+    /// Disparity noise of `px` pixels propagated to depth, `z² · px / (f · b)`.
+    Disparity { px: f64 },
+}
+
+impl Default for StereoDepthSigma {
+    fn default() -> Self {
+        Self::RelativeDepth(0.05)
+    }
 }
 
 /// Loop closing: place recognition over every keyframe, and verification,
@@ -312,6 +380,35 @@ impl fmt::Display for SystemConfig {
             LocalMappingMode::Asynchronous => "asynchronous",
         };
         writeln!(f, "  local mapping: {execution}")?;
+        if orb.mapping.keyframe_observations != KeyframeObservations::default() {
+            writeln!(
+                f,
+                "  keyframe observations: {:?}",
+                orb.mapping.keyframe_observations
+            )?;
+        }
+        let ba = &orb.mapping.local_ba;
+        if *ba != LocalBaConfig::default() {
+            writeln!(
+                f,
+                "  local BA: {} active keyframes, boundary IMU scale {} (bias rows {}), \
+                 boundary {:?}, IMU Huber {:?}, depth sigma {:?}, visual information {:?}, \
+                 state envelope {:?}, lost keyframes {:?}",
+                ba.active_keyframes,
+                ba.boundary_imu_info_scale,
+                if ba.boundary_scales_bias_rows {
+                    "scaled"
+                } else {
+                    "full"
+                },
+                ba.boundary,
+                ba.imu_huber,
+                ba.stereo_depth_sigma,
+                ba.visual_information,
+                ba.state_envelope,
+                ba.lost_keyframes,
+            )?;
+        }
         if let LoopClosingMode::Enabled {
             vocabulary,
             execution,
