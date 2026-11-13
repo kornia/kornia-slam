@@ -10,6 +10,83 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**Run counters.** `SlamSystem::run_counters()` returns a `RunCounters` tally
+since build: frames, tracked frames and keyframes, bootstrap skips, inertial
+and visual coasting, give-ups, dropped optical-flow errors, failed visual and
+visual-inertial local BA solves, boundary-prior fallbacks, refused BA merges,
+and BA solve count and time. `SlamSystem::last_skip()` says why the latest
+frame was skipped (`SkipKind::Bootstrap` or `SkipKind::Coasting { inertial }`);
+`TrackingStatus` is unchanged. The CLI prints them as `[summary]` lines after
+the final map line, with p50/p90/p99 of the per-frame tracking and frontend
+times. Local-mapping figures are exact in synchronous mode; in asynchronous
+mode a job still on the worker is not counted yet.
+
+**A `[proj]` debug line for rejected projection tracking.** With
+`KORNIA_SLAM_DEBUG` set, a frame whose projection search fails logs
+`[proj] frame=N local=L matched=M stage=S` before the reference-keyframe
+fallback overwrites its reject reason; `S` is `LowProjectionMatches`,
+`PnpFailed` or `LowPnpInliers(k)` with the early PnP inlier count. A pose
+refused by the inertial-prediction inlier gate logs
+`[proj] frame=N trusted_gate inliers=k`. Tracking is unchanged.
+
+**`--trajectory-coasted <path>`.** The CLI writes the frames skipped while
+coasting on the IMU prediction to a second file in the `--trajectory-out`
+layout, so coasted poses can be measured without changing the scored file.
+Bootstrap skips, which hold the pose from before the loss, and visual coasts
+are not written.
+
+**`--no-pace`.** The CLI normally sleeps so frames arrive at most 30 per
+second; `--no-pace` processes them as fast as they come, for timing runs.
+With synchronous local mapping the output is unchanged.
+
+**Loop closing can solve off the tracking thread.** `LoopClosingMode::Enabled`
+gains an optional `execution` (source-breaking for code that builds the variant
+by hand): `Synchronous`, the default, keeps today's inline solve whatever the
+mapping execution; `Asynchronous` solves on a `slam-loop-closing` thread,
+`FollowMapping` picks one of the two from the local-mapping execution, and
+`Deferred { frames }` solves inline but writes back `frames` frames later
+through the background path, so runs replay. The background path is opt-in
+because it accepts fewer loops than the inline one on the same input (18-22
+against 47 on the sim recording), which is not explained yet. A background result is written back at a frame boundary; keyframes
+created or refined by bundle adjustment during the solve keep their relative
+pose, and a result from another world frame is solved again. The map then jumps
+once per correction: `SlamSystem::correction_epoch()` advances with each one,
+so consumers publishing odometry as `T_map * map_correction()` can re-anchor,
+and `loop_solve_in_flight()` reports a pending solve. The landmark geometry
+refresh after a correction no longer scans the keyframe list per observer.
+In the background modes the loop's landmark fusion is searched on the worker,
+on a copy of both loop neighbourhoods moved by the solve, and the writeback
+only re-checks and applies the links and merges it found
+(`Map::merge_map_points_by_records` merges without sweeping every keyframe).
+The tracking pose and the map correction then follow the correction most of
+the camera's local landmarks take rather than the reference keyframe's alone,
+so odometry stays continuous when a later solve moves the reference keyframe
+away from landmarks fused onto an earlier visit. An unusable solve now reports
+why (`PgoResult::unusable_reason`, a `PgoFailed` event) instead of a silent
+`applied: false`.
+
+**Loop closing gains an odometry gate and an opt-in global pose graph.** A
+verified loop whose correction is more than 3 sigma of the odometry drift
+model (1.9 %/m + 0.10 m, 0.026 deg/m + 1 deg) is now rejected before it reaches
+the pose graph. That refuses a false loop from repeated structure when it
+implies more correction than odometry can have drifted; one inside the bound
+still passes (on a sim recording in EuRoC format, ATE 1.55 m ungated → 0.12 m
+gated; 0.32 m without loop closing). Loops close through `PoseGraph`. By
+default it is the same computation as before, `w*I` on a fresh snapshot of the
+map at each solve. `LoopClosingMode::Enabled { graph }` opts into the rest from
+a configuration file, e.g. `graph: (information: Drift(), persistent: true)`:
+- `persistent` keeps every keyframe the map has held across solves. A culled
+  or evicted keyframe stays a node, so loops that touch it keep constraining
+  the map instead of failing with `MissingLoopKeyframe`.
+- `Drift` makes odometry edges a random walk in path, `sigma = sqrt(q * d)`,
+  so the weighting does not depend on keyframe density. Loop edges get
+  0.10 m / 1 deg under a Cauchy kernel. The kernel bounds what a false loop
+  the gate lets through can do, but does not remove it.
+
+`SlamSystem::map_correction()` reports the composed map-from-odometry
+correction. `PoseGraph<P>`, its `LoopVerifier` and the `LoopGate` trait are
+public for other front ends.
+
 **Stereo-inertial tracking rides through fast motion instead of resetting.**
 Once the IMU has settled, a tracking failure now coasts on the inertial
 prediction for up to 5 s (was 1 s, ORB-SLAM3's `time_recently_lost`), keeps

@@ -1,6 +1,6 @@
 use super::*;
 use crate::mapping::map::tests::test_frame;
-use crate::mapping::map::{ImuFactor, LandmarkSeed, MapInsertion, ObservationKey};
+use crate::mapping::map::{BaOutcome, ImuFactor, LandmarkSeed, MapInsertion, ObservationKey};
 use kornia_algebra::{Mat3F64, SO3F64};
 use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 
@@ -110,6 +110,77 @@ fn local_visual_ba_preserves_fixed_entities_and_solves_outside_the_live_map() {
     );
 }
 
+/// Five stereo keyframes 0.2 m apart along x (true poses, keyframes 2-4 seeded
+/// 1 cm off in y), 48 landmarks seen by all, seeded a few cm off.
+fn stereo_fixture(mismatched_px: f32) -> Map {
+    let points: Vec<_> = (0..48)
+        .map(|i| {
+            Vec3F64::new(
+                (i % 8) as f64 * 0.5 - 1.75,
+                (i / 8 % 6) as f64 * 0.4 - 1.0,
+                3.0 + (i % 5) as f64 * 0.8,
+            )
+        })
+        .collect();
+    let mut map = Map::new();
+    for (slot, id) in KF_IDS.into_iter().enumerate() {
+        let mut frame = test_frame(id, vec![[0; 32]; points.len()]);
+        let tx = -0.2 * slot as f64;
+        for (feature, point) in points.iter().enumerate() {
+            frame.features.keypoints_xy[feature] = [
+                (200.0 * (point.x + tx) / point.z + 320.0) as f32,
+                (200.0 * point.y / point.z + 240.0) as f32,
+            ];
+        }
+        frame.depth = points.iter().map(|p| p.z as f32).collect();
+        if slot == KF_IDS.len() - 1 {
+            for feature in [0, 17] {
+                frame.features.keypoints_xy[feature][0] += mismatched_px;
+            }
+        }
+        frame.pose_world_to_cam.translation.x = tx;
+        if slot >= 2 {
+            frame.pose_world_to_cam.translation.y = 0.01;
+        }
+        map.insert_keyframe(Keyframe::from_frame(frame)).unwrap();
+    }
+    for (feature, point) in points.into_iter().enumerate() {
+        let id = map
+            .insert_landmark(LandmarkSeed {
+                position: point + Vec3F64::new(0.02, -0.01, 0.04),
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: KF_IDS[0],
+                    feature_idx: feature,
+                },
+            })
+            .unwrap();
+        for kf in &KF_IDS[1..] {
+            map.link_observation(*kf, feature, id).unwrap();
+        }
+    }
+    map
+}
+
+/// A tracked mismatch reaches a keyframe as an ordinary observation; the
+/// visual-only solve must bound its pull (plain L2 moved this pose 0.36 m).
+#[test]
+fn local_visual_ba_is_robust_to_mismatched_observations() {
+    let mut map = stereo_fixture(60.0);
+    let params = LocalBaParams {
+        visual_kernel: VisualKernel::Huber,
+        ..LocalBaParams::default()
+    };
+    let update = run_local_ba_with(map.ba_snapshot(&local_window(&map)), &camera(), &params);
+    map.apply_ba_update(update).unwrap();
+    let newest = map.get_keyframe(KF_IDS[4]).unwrap().frame.pose_world_to_cam;
+    let error = (newest.translation - Vec3F64::new(-0.8, 0.0, 0.0)).length();
+    assert!(
+        error < 0.05,
+        "two 60 px mismatches moved the pose {error} m"
+    );
+}
+
 #[test]
 fn local_window_holds_active_keyframes_their_landmarks_and_fixed_context() {
     let mut map = Map::new();
@@ -187,7 +258,7 @@ fn initial_ba_uses_the_last_inserted_pair_and_keeps_the_older_pose_fixed() {
     let mut map = fixture();
     let before = map.clone();
     assert_eq!(
-        run_initial_ba(&mut map, &camera()).unwrap(),
+        run_initial_ba(&mut map, &camera(), LocalBaParams::default().depth_sigma).unwrap(),
         InitialBaOutcome::Refined
     );
     for id in &KF_IDS[..4] {
@@ -217,7 +288,7 @@ fn skipped_visual_and_inertial_solves_leave_the_map_unchanged() {
         .unwrap();
     let before = map.state_fingerprint_for_test();
     assert_eq!(
-        run_initial_ba(&mut map, &camera()).unwrap(),
+        run_initial_ba(&mut map, &camera(), LocalBaParams::default().depth_sigma).unwrap(),
         InitialBaOutcome::Skipped
     );
     let visual = run_local_ba(map.ba_snapshot(&local_window(&map)), &camera());
@@ -245,7 +316,8 @@ fn refused_initial_ba_writeback_is_an_error_and_leaves_the_map_unchanged() {
         }
     });
     let before = map.state_fingerprint_for_test();
-    let error = run_initial_ba(&mut map, &camera()).unwrap_err();
+    let error =
+        run_initial_ba(&mut map, &camera(), LocalBaParams::default().depth_sigma).unwrap_err();
     assert!(
         matches!(
             error,
@@ -369,14 +441,15 @@ fn stereo_depth_obs_uses_proportional_sigma_with_floor() {
     frame.depth = vec![10.0, -1.0];
     frame.u_right = vec![5.0, -1.0];
     let kf = Keyframe::from_frame(frame);
+    let relative = LocalBaParams::default().depth_sigma;
 
     // Valid depth: sigma = 0.05 * 10 = 0.5.
-    let (d, s) = stereo_depth_obs(&kf, 0);
+    let (d, s) = stereo_depth_obs(&kf, 0, relative, 1.0);
     assert_eq!(d, Some(10.0));
     assert!((s - 0.5).abs() < 1e-6);
 
     // Sentinel depth: no measurement.
-    let (d1, s1) = stereo_depth_obs(&kf, 1);
+    let (d1, s1) = stereo_depth_obs(&kf, 1, relative, 1.0);
     assert_eq!(d1, None);
     assert!((s1 - 1.0).abs() < 1e-9);
 
@@ -384,8 +457,37 @@ fn stereo_depth_obs_uses_proportional_sigma_with_floor() {
     let mut near = test_frame(1, vec![[0u8; 32]]);
     near.depth = vec![0.1]; // 0.05 * 0.1 = 0.005 < floor
     let kf_near = Keyframe::from_frame(near);
-    let (_, s2) = stereo_depth_obs(&kf_near, 0);
+    let (_, s2) = stereo_depth_obs(&kf_near, 0, relative, 1.0);
     assert!((s2 - STEREO_DEPTH_MIN_SIGMA).abs() < 1e-9);
+}
+
+/// The default is the old `STEREO_DEPTH_REL_SIGMA · z` bit for bit, as a
+/// file's `RelativeDepth(0.05)` resolves to it; disparity sigma grows as z².
+#[test]
+fn stereo_depth_sigma_models() {
+    assert_eq!(
+        LocalBaParams::default().depth_sigma,
+        DepthSigma::Relative(0.05_f64 as f32)
+    );
+    for z in [0.3_f32, 2.0, 7.5, 40.0] {
+        assert_eq!(
+            DepthSigma::Relative(STEREO_DEPTH_REL_SIGMA).sigma(z),
+            (STEREO_DEPTH_REL_SIGMA * z).max(STEREO_DEPTH_MIN_SIGMA)
+        );
+    }
+    // EuRoC: f·b = 435 px · 0.11 m; 1 px of disparity at 5 m is 0.52 m.
+    let disparity = DepthSigma::Disparity {
+        px_over_focal_baseline: 1.0 / (435.0 * 0.11),
+    };
+    assert!((disparity.sigma(5.0) - 25.0 / 47.85).abs() < 1e-5);
+    assert_eq!(disparity.sigma(0.5), STEREO_DEPTH_MIN_SIGMA);
+    // An octave-2 keypoint (1.44 px) has 1.44 times the disparity noise; a
+    // relative sigma ignores the octave.
+    assert_eq!(disparity.sigma_at(5.0, 1.44), disparity.sigma(5.0) * 1.44);
+    assert_eq!(
+        DepthSigma::Relative(0.05).sigma_at(5.0, 1.44),
+        DepthSigma::Relative(0.05).sigma(5.0)
+    );
 }
 
 #[test]
@@ -529,6 +631,7 @@ fn write_back_guard_refuses_landmarks_behind_or_flung() {
         velocity: Vec3F64::ZERO,
         bias: ImuBias::default(),
         fixed: false,
+        inertial_fixed: false,
     };
     let keyframes = [kf(0.0), kf(0.5)];
     let at = |z: f64| Vec3F64::new(0.1, 0.0, z);
@@ -556,7 +659,12 @@ fn write_back_guard_refuses_landmarks_behind_or_flung() {
             })
         })
         .collect();
-    let keep = landmarks_to_write_back(&observations, (&keyframes, &before), (&keyframes, &after));
+    let keep = landmarks_to_write_back(
+        &observations,
+        |_| None,
+        (&keyframes, &before),
+        (&keyframes, &after),
+    );
     let want: Vec<bool> = cases.iter().map(|c| c.2).collect();
     assert_eq!(keep, want);
 
@@ -567,7 +675,12 @@ fn write_back_guard_refuses_landmarks_behind_or_flung() {
         Vec3F64::ZERO,
     );
     observations.retain(|o| o.point_idx == 0);
-    let keep = landmarks_to_write_back(&observations, (&keyframes, &before), (&moved, &before));
+    let keep = landmarks_to_write_back(
+        &observations,
+        |_| None,
+        (&keyframes, &before),
+        (&moved, &before),
+    );
     assert_eq!(keep, [false, true, true, true, true, true]);
 }
 
@@ -592,4 +705,43 @@ fn local_inertial_ba_reports_its_solve() {
             .solve_stats()
             .is_none()
     );
+}
+
+/// The run counters tell an early exit from a solve: a window with fewer
+/// than `MIN_OBSERVATIONS` observations never reaches the solver.
+#[test]
+fn a_window_under_the_observation_minimum_reports_the_solver_did_not_run() {
+    let mut map = Map::new();
+    for id in [10, 20] {
+        map.insert_keyframe(Keyframe::from_frame(test_frame(id, vec![[0; 32]; 2])))
+            .unwrap();
+    }
+    let landmark = map
+        .insert_landmark(LandmarkSeed {
+            position: Vec3F64::new(0.0, 0.0, 5.0),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 10,
+                feature_idx: 0,
+            },
+        })
+        .unwrap();
+    map.link_observation(20, 0, landmark).unwrap();
+
+    let visual = run_local_ba(map.ba_snapshot(&local_window(&map)), &camera());
+    assert_eq!(visual.outcome, BaOutcome::default());
+    assert_eq!(visual.outcome.solve, BaSolve::NotRun);
+    let inertial = run_local_inertial_ba(
+        map.ba_snapshot(&local_window(&map)),
+        &camera(),
+        Some(Pose3d::IDENTITY),
+        Vec3F64::new(0.0, 0.0, -9.81),
+        &[],
+        &[],
+    );
+    assert_eq!(inertial.outcome.solve, BaSolve::NotRun);
+
+    let map = fixture();
+    let solved = run_local_ba(map.ba_snapshot(&local_window(&map)), &camera());
+    assert_eq!(solved.outcome.solve, BaSolve::Solved);
 }

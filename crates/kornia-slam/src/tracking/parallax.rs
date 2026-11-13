@@ -27,12 +27,16 @@ pub fn median_parallax_px(
     let rotation_cur_from_kf = current_pose_world_to_cam
         .compose(&keyframe.frame.pose_world_to_cam.inverse())
         .rotation;
+    // Rotation compensation holds between primary-camera views only.
     let pairs = matches.iter().filter_map(|&(mp_idx, feature)| {
+        if current.camera_of(feature) != 0 {
+            return None;
+        }
         let mp = map.map_points().get(mp_idx).filter(|mp| !mp.culled)?;
         let kf_feature = mp
             .observations()
             .iter()
-            .find(|o| o.key.keyframe_idx == keyframe_idx)?
+            .find(|o| o.key.keyframe_idx == keyframe_idx && o.camera == 0)?
             .key
             .feature_idx;
         Some((

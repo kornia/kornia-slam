@@ -108,6 +108,41 @@ fn merge_map_points_redirects_associations_and_deduplicates_observers() {
     }
 }
 
+/// On a consistent map the record-driven merge writes exactly what the full sweep writes.
+#[test]
+fn merge_by_records_matches_the_full_sweep() {
+    let build = || {
+        let mut map = Map::new();
+        for idx in 0..4 {
+            map.insert_keyframe(Keyframe::from_frame(test_frame(
+                idx,
+                vec![[idx as u8; 32], [10 + idx as u8; 32]],
+            )))
+            .unwrap();
+        }
+        let survivor = map.insert_landmark(seed(0, 0, 5.0)).unwrap();
+        map.link_observation(1, 0, survivor).unwrap();
+        let replaced = map.insert_landmark(seed(2, 0, 5.01)).unwrap();
+        map.link_observation(1, 1, replaced).unwrap();
+        map.link_observation(3, 1, replaced).unwrap();
+        (map, survivor, replaced)
+    };
+    let (mut swept, survivor, replaced) = build();
+    let (mut by_records, ..) = build();
+
+    let expected = swept.merge_map_points(survivor, replaced).unwrap();
+    let actual = by_records
+        .merge_map_points_by_records(survivor, replaced)
+        .unwrap();
+
+    assert_eq!(actual, expected);
+    assert_map_consistent(&by_records);
+    assert_eq!(
+        by_records.state_fingerprint_for_test(),
+        swept.state_fingerprint_for_test()
+    );
+}
+
 #[test]
 fn merge_map_points_rejects_invalid_or_culled_inputs() {
     let mut map = Map::new();
@@ -957,4 +992,43 @@ fn ba_update_reports_the_bias_it_would_write() {
     update.keyframes[1].imu_bias.gyro.z = 0.3;
     let gz: Vec<f64> = update.keyframe_biases().map(|b| b.gyro.z).collect();
     assert_eq!(gz, vec![0.001, 0.3]);
+}
+
+/// The whole-map refresh reads camera centres from a table built once; it must
+/// leave exactly the state the per-landmark lookup does, bit for bit.
+#[test]
+fn tabulated_geometry_refresh_matches_the_per_landmark_lookup() {
+    let mut map = Map::new();
+    for kf in 0..4 {
+        let pose = Pose3d::new(
+            kornia_algebra::SO3F64::exp(Vec3F64::new(0.01 * kf as f64, -0.02, 0.03)).matrix(),
+            Vec3F64::new(-0.3 * kf as f64, 0.1, 0.05 * kf as f64),
+        );
+        let mut keyframe = Keyframe::from_frame(test_frame_with_pose(kf, vec![[0u8; 32]; 3], pose));
+        keyframe.frame.features.octaves = vec![0, 1, 3];
+        map.insert_keyframe(keyframe).unwrap();
+    }
+    let mut ids = Vec::new();
+    for feature in 0..3 {
+        let id = map
+            .insert_landmark(seed(feature, feature, 4.0 + feature as f64))
+            .unwrap();
+        for kf in (0..4).filter(|&kf| kf != feature) {
+            map.link_observation(kf, feature, id).unwrap();
+        }
+        ids.push(id);
+    }
+    map.remove_landmark(ids[2]).unwrap();
+    let mut looked_up = map.clone();
+    for &id in &ids {
+        looked_up.update_map_point_geometry(id, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+    }
+
+    let refreshed = map.finalize_landmark_geometry(ids.iter().copied());
+
+    assert_eq!(refreshed, ids.len());
+    assert_eq!(
+        map.state_fingerprint_for_test(),
+        looked_up.state_fingerprint_for_test()
+    );
 }

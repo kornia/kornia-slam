@@ -8,17 +8,23 @@
 //! A run file names the source (EuRoC, Hilti, MCAP, or a live OAK-D or UVC
 //! camera) and the system to run on it; see `configs/` and [`config`].
 
+mod blackout;
 mod config;
 mod datasets;
 mod evaluation;
+mod map_dump;
 mod source;
+mod summary;
+mod trace_out;
+mod trajectory;
 mod tui;
 mod utils;
 use config::RunConfig;
 use evaluation::associate_gt;
-use kornia_algebra::Vec3F64;
+use kornia_algebra::{SO3F64, Vec3F64};
+use kornia_slam::loop_closure::{LoopOdometryGate, LoopTemporalConsistency};
 use kornia_slam::system::PipelineDefinition;
-use kornia_slam::{LoopClosureEvent, SlamSystem};
+use kornia_slam::{LoopClosureEvent, SkipKind, SlamSystem};
 use source::{FrameItem, OpenedSource};
 use std::time::{Duration, Instant};
 use utils::trajectory_point_from_pose;
@@ -45,10 +51,40 @@ struct Args {
     #[argh(option, default = "String::from(\".\")")]
     eval_out: String,
 
+    /// write `timestamp_ns tx ty tz qx qy qz qw` per tracked frame to this
+    /// file: the body (IMU) pose in the world when the rig has an IMU, else
+    /// the camera pose (the LaMAria estimate format)
+    #[argh(option)]
+    trajectory_out: Option<String>,
+
+    /// like --trajectory-out, for the frames skipped while coasting on the
+    /// IMU prediction instead; kept apart so the scored file is unchanged
+    #[argh(option)]
+    trajectory_coasted: Option<String>,
+
+    /// like --trajectory-out, written at shutdown with each frame re-anchored
+    /// to its reference keyframe's final pose (ORB-SLAM3's SaveTrajectoryEuRoC)
+    #[argh(option)]
+    trajectory_smoothed: Option<String>,
+
+    /// black images from `<start_s>` after the first frame for `<duration_s>`,
+    /// given as `<start_s>:<duration_s>`; frames and IMU are still processed
+    #[argh(option)]
+    blackout: Option<String>,
+
+    /// write the live landmarks at shutdown to this CSV (position, observation
+    /// count, descriptor)
+    #[argh(option)]
+    dump_map: Option<String>,
+
     /// spawn a Rerun viewer and stream to it (requires `--features viz`)
     #[argh(switch)]
     #[cfg(feature = "viz")]
     rerun_stream: bool,
+
+    /// process frames as fast as they come instead of at most 30 per second
+    #[argh(switch)]
+    no_pace: bool,
 
     /// disable the terminal UI (status lines stream to stderr instead)
     #[argh(switch)]
@@ -58,6 +94,79 @@ struct Args {
     /// map-projection reject reasons, keyframe growth and fuse counters
     #[argh(switch)]
     debug: bool,
+
+    /// write per-frame stage timings (timings.csv) and, for frames in
+    /// [trace-from, trace-to), the tracking inputs a frontend benchmark
+    /// replays (frames.csv, tracks.csv, local_map.bin) into this directory
+    #[argh(option)]
+    trace_out: Option<String>,
+
+    /// first source frame index to trace (default 0)
+    #[argh(option, default = "0")]
+    trace_from: usize,
+
+    /// source frame index to stop tracing at (default: never)
+    #[argh(option, default = "usize::MAX")]
+    trace_to: usize,
+}
+
+/// Evaluation switches for loop-closure tuning that configuration files do not
+/// expose: `KORNIA_SLAM_LOOP_GATE=off` disables the odometry gate, and
+/// `KORNIA_SLAM_LOOP_TEMPORAL=<n>` requires `n` agreeing detections before the
+/// first loop in a place.
+fn apply_loop_gate_overrides(
+    pipeline: &mut PipelineDefinition,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let PipelineDefinition::OrbSlam(orb) = pipeline;
+    let loop_correction = &mut orb.tuning.loop_correction;
+    if let Some(value) = std::env::var_os("KORNIA_SLAM_LOOP_GATE") {
+        match value.to_str() {
+            Some("off") => loop_correction.odometry_gate = LoopOdometryGate::Disabled,
+            Some("on") => {}
+            _ => return Err("KORNIA_SLAM_LOOP_GATE must be `on` or `off`".into()),
+        }
+    }
+    if let Some(value) = std::env::var_os("KORNIA_SLAM_LOOP_TEMPORAL") {
+        let min_detections: usize = value
+            .to_str()
+            .and_then(|text| text.parse().ok())
+            .ok_or("KORNIA_SLAM_LOOP_TEMPORAL must be a detection count")?;
+        loop_correction.temporal_consistency = LoopTemporalConsistency::enabled(min_detections);
+    }
+    if std::env::var_os("KORNIA_SLAM_LOOP_GATE").is_some()
+        || std::env::var_os("KORNIA_SLAM_LOOP_TEMPORAL").is_some()
+    {
+        eprintln!(
+            "  loop gate: {:?}; temporal: {:?}",
+            loop_correction.odometry_gate, loop_correction.temporal_consistency
+        );
+    }
+    Ok(())
+}
+
+/// ` orb=[..] ov= klt=build/track ps= cf= pnp= lr= kf=` in ms, for `--debug`.
+fn stage_times(
+    frontend: &kornia_slam::FrontendObservation,
+    timings: &kornia_slam::TrackingTimings,
+) -> String {
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let orb: Vec<String> = frontend
+        .orb_per_camera
+        .iter()
+        .map(|d| format!("{:.1}", ms(*d)))
+        .collect();
+    format!(
+        " orb=[{}] ov={:.1} klt={:.1}/{:.1} ps={:.1} cf={:.1} pnp={:.1} lr={:.1} kf={:.1}",
+        orb.join(","),
+        ms(frontend.overlap),
+        ms(timings.klt_build),
+        ms(timings.klt_track),
+        ms(timings.projection_search),
+        ms(timings.consistency_filter),
+        ms(timings.pnp),
+        ms(timings.local_refine),
+        ms(timings.keyframe_insert),
+    )
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -68,7 +177,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "viz"))]
     let tui_active = !args.no_tui;
 
-    let run = RunConfig::from_ron_file(&args.config)?;
+    let mut run = RunConfig::from_ron_file(&args.config)?;
+    apply_loop_gate_overrides(&mut run.system.pipeline)?;
     if !tui_active {
         eprint!("{}", run.system);
     }
@@ -95,7 +205,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(std::path::Path::to_path_buf);
     let mut system = SlamSystem::build(run.system, source.rig()).map_err(|e| e.to_string())?;
     system.set_debug(args.debug);
+    let mut trace_writer = args
+        .trace_out
+        .as_deref()
+        .map(|dir| trace_out::TraceWriter::create(std::path::Path::new(dir)))
+        .transpose()?;
     let camera = system.rig().camera.clone();
+    let mut trajectory_out = args
+        .trajectory_out
+        .as_deref()
+        .map(|path| {
+            trajectory::TrajectoryWriter::create(
+                std::path::Path::new(path),
+                system.rig().camera_to_body(),
+            )
+        })
+        .transpose()?;
+    let mut trajectory_coasted = args
+        .trajectory_coasted
+        .as_deref()
+        .map(|path| {
+            trajectory::TrajectoryWriter::create(
+                std::path::Path::new(path),
+                system.rig().camera_to_body(),
+            )
+        })
+        .transpose()?;
+    let mut smoothed = args
+        .trajectory_smoothed
+        .as_ref()
+        .map(|_| trajectory::SmoothedTrajectory::default());
+    let mut blackout = args
+        .blackout
+        .as_deref()
+        .map(blackout::Blackout::parse)
+        .transpose()?;
     if let Some(path) = vocabulary {
         eprintln!(
             "[place-recognition] loaded vocabulary from {}",
@@ -132,12 +276,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Vec::new(), Vec::new());
     let mut trajectory: Vec<[f32; 3]> = Vec::new();
     let mut processed: usize = 0;
+    let mut frame_times = summary::FrameTimes::default();
 
-    while let Some(item) = source.next_frame()? {
+    while let Some(mut item) = source.next_frame()? {
+        if let Some(blackout) = blackout.as_mut()
+            && blackout.apply(&mut item)
+            && !tui_active
+        {
+            eprintln!("[blackout] frame={}", item.idx);
+        }
         let now = Instant::now();
         let elapsed = now.duration_since(last_frame_walltime);
 
-        if elapsed < target_dt {
+        if !args.no_pace && elapsed < target_dt {
             std::thread::sleep(target_dt - elapsed);
         }
 
@@ -148,6 +299,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             timestamp_sec,
             image,
             right_image,
+            rig_images,
             imu_samples,
         } = item;
         #[cfg(feature = "viz")]
@@ -157,12 +309,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         system.process_imu(&imu_samples);
+        system.set_trace(trace_writer.is_some() && (args.trace_from..args.trace_to).contains(&idx));
         let result = match right_image.as_ref() {
             Some(right) => system.process_stereo(timestamp_sec, &image, right)?,
+            None if !rig_images.is_empty() => {
+                let images: Vec<&kornia_image::Image<u8, 1>> =
+                    std::iter::once(&image).chain(&rig_images).collect();
+                system.process_rig(timestamp_sec, &images)?
+            }
             None => system.process_image(timestamp_sec, &image)?,
         };
         let frame_ms = system.tracking_duration().as_secs_f64() * 1000.0;
         let frontend_ms = system.frontend_observation().duration.as_secs_f64() * 1000.0;
+        frame_times.record(frame_ms, frontend_ms);
+        if let Some(writer) = trace_writer.as_mut() {
+            writer.write_timings(
+                idx,
+                result.status,
+                system.frontend_observation(),
+                system.tracking_timings(),
+                system.tracking_duration(),
+            )?;
+            if let Some(trace) = system.frame_trace() {
+                writer.write_trace(idx, trace)?;
+                let images: Vec<&kornia_image::Image<u8, 1>> = std::iter::once(&image)
+                    .chain(right_image.as_ref())
+                    .chain(&rig_images)
+                    .collect();
+                writer.write_images(system.rig(), idx, &images)?;
+            }
+        }
         #[cfg(feature = "viz")]
         if let Some(ref rec) = rec {
             log_frame_to_rerun(rec, &image, &system.frontend_observation().keypoints_xy);
@@ -174,13 +350,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         for event in system.drain_loop_closure_events() {
             match event {
-                LoopClosureEvent::Accepted { edge, applied } => eprintln!(
-                    "[loop-closure] accepted kf={} ~ kf={} inliers={} rmse={:.2}px applied={applied}",
-                    edge.query_kf_idx,
-                    edge.candidate_kf_idx,
-                    edge.inliers,
-                    edge.reprojection_rmse_px,
-                ),
+                LoopClosureEvent::Accepted { edge, applied } => {
+                    eprintln!(
+                        "[loop-closure] accepted kf={} ~ kf={} inliers={} rmse={:.2}px applied={applied}",
+                        edge.query_kf_idx,
+                        edge.candidate_kf_idx,
+                        edge.inliers,
+                        edge.reprojection_rmse_px,
+                    );
+                    if applied {
+                        let correction = system.map_correction().map_from_odometry;
+                        let t = correction.translation;
+                        let rotation = SO3F64::from_matrix(&correction.rotation);
+                        let [qx, qy, qz, qw] = rotation.to_array();
+                        eprintln!(
+                            "[map-correction] map_from_odometry t=({:.3},{:.3},{:.3}) rot_deg={:.2} \
+                             epoch={} q=({qx:.9},{qy:.9},{qz:.9},{qw:.9}) t_full=({:.9},{:.9},{:.9})",
+                            t.x,
+                            t.y,
+                            t.z,
+                            rotation.log().length().to_degrees(),
+                            system.correction_epoch(),
+                            t.x,
+                            t.y,
+                            t.z,
+                        );
+                    }
+                }
                 LoopClosureEvent::PgoFailed {
                     query_kf_idx,
                     candidate_kf_idx,
@@ -193,13 +389,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for line in &debug_msgs {
                 eprintln!("{line}");
             }
-            let status_line = format!(
+            let mut status_line = format!(
                 "[{idx:>5}] {:?}  kf={:<4} pts={:<5} {frame_ms:>6.1}ms fe={frontend_ms:.1}ms",
                 result.status, keyframe_idx, map_point_count,
             );
+            if args.debug {
+                status_line.push_str(&stage_times(
+                    system.frontend_observation(),
+                    system.tracking_timings(),
+                ));
+            }
             eprintln!("{status_line}");
         }
 
+        if let Some(writer) = trajectory_out.as_mut()
+            && result.status != kornia_slam::TrackingStatus::Skipped
+        {
+            writer.write(timestamp_sec, &result.pose_world_to_cam)?;
+        }
+        if let Some(writer) = trajectory_coasted.as_mut()
+            && is_inertial_coast(system.last_skip())
+        {
+            writer.write(timestamp_sec, &result.pose_world_to_cam)?;
+        }
+        if let Some(smoothed) = smoothed.as_mut()
+            && result.status != kornia_slam::TrackingStatus::Skipped
+            && let Some(reference_kf) = system.current_keyframe_idx()
+            && let Some(reference_pose) = system.keyframe_pose(reference_kf)
+        {
+            smoothed.record(
+                timestamp_sec,
+                &result.pose_world_to_cam,
+                reference_kf,
+                &reference_pose,
+            );
+        }
         let traj_pt = trajectory_point_from_pose(&result.pose_world_to_cam);
         trajectory.push(traj_pt);
 
@@ -279,6 +503,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
     );
+    eprintln!("{}", summary::format(&system.run_counters(), &frame_times));
+    if let Some(writer) = trajectory_out {
+        writer.finish()?;
+    }
+    if let Some(writer) = trajectory_coasted {
+        writer.finish()?;
+    }
+    if let (Some(smoothed), Some(path)) = (smoothed, args.trajectory_smoothed.as_deref()) {
+        let writer = trajectory::TrajectoryWriter::create(
+            std::path::Path::new(path),
+            system.rig().camera_to_body(),
+        )?;
+        let unanchored = smoothed.write(writer, |kf| system.keyframe_pose(kf))?;
+        eprintln!("Smoothed trajectory: {unanchored} frame(s) without a surviving keyframe");
+    }
+    if let Some(path) = args.dump_map.as_deref() {
+        system.with_map_points(|map_points| {
+            map_dump::write(std::path::Path::new(path), map_points)
+        })?;
+    }
+    if let Some(writer) = trace_writer.as_mut() {
+        writer.flush()?;
+    }
     if args.evaluate {
         evaluation::report(
             &est_positions,
@@ -287,6 +534,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     Ok(())
+}
+
+/// Bootstrap skips hold the pose from before the loss and a visual coast has
+/// no metric motion, so only an inertial coast is a usable estimate.
+fn is_inertial_coast(skip: Option<SkipKind>) -> bool {
+    skip == Some(SkipKind::Coasting { inertial: true })
 }
 
 #[cfg(test)]
@@ -307,9 +560,32 @@ mod cli_tests {
         assert_eq!(args.config, "configs/euroc.ron");
         assert!(!args.evaluate);
         assert_eq!(args.eval_out, ".");
+        assert!(!args.no_pace);
+        assert!(parse(&["--config", "r.ron", "--no-pace"]).unwrap().no_pace);
 
         let args = parse(&["--config", "r.ron", "--evaluate", "--eval-out", "out"]).unwrap();
         assert!(args.evaluate);
         assert_eq!(args.eval_out, "out");
+    }
+
+    #[test]
+    fn only_inertial_coasts_go_to_the_coasted_trajectory() {
+        let args = parse(&["--config", "r.ron", "--trajectory-coasted", "c.tum"]).unwrap();
+        assert_eq!(args.trajectory_coasted.as_deref(), Some("c.tum"));
+        assert!(
+            parse(&["--config", "r.ron"])
+                .unwrap()
+                .trajectory_coasted
+                .is_none()
+        );
+
+        assert!(is_inertial_coast(Some(SkipKind::Coasting {
+            inertial: true
+        })));
+        assert!(!is_inertial_coast(Some(SkipKind::Coasting {
+            inertial: false
+        })));
+        assert!(!is_inertial_coast(Some(SkipKind::Bootstrap)));
+        assert!(!is_inertial_coast(None));
     }
 }

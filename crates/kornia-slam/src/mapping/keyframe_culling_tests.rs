@@ -878,3 +878,45 @@ fn eviction_slides_the_window_and_every_chain_starts_at_the_new_oldest() {
     assert_eq!(factors[0].from_idx, IDS[2]);
     assert_map_consistent(&map);
 }
+
+#[test]
+fn the_bound_leaves_a_map_at_or_under_it_alone() {
+    let mut map = culling_fixture();
+    let report = bound_keyframes(&mut map, IDS.len(), &enabled(), None);
+    assert!(report.culled.is_empty() && report.evicted.is_empty());
+    assert_eq!(ids(&map), IDS.to_vec());
+}
+
+#[test]
+fn the_bound_culls_redundant_keyframes_before_evicting_any() {
+    let mut map = culling_fixture();
+    let culled_alone = {
+        let mut m = culling_fixture();
+        cull_redundant_keyframes(&mut m, &enabled(), None, None).removed
+    };
+    assert!(
+        !culled_alone.is_empty(),
+        "the fixture has redundant keyframes"
+    );
+    let bound = IDS.len() - culled_alone.len();
+    let report = bound_keyframes(&mut map, bound, &enabled(), None);
+    assert_eq!(report.culled, culled_alone);
+    assert!(report.evicted.is_empty(), "culling alone reached the bound");
+    assert_eq!(map.keyframes().len(), bound);
+    assert_map_consistent(&map);
+}
+
+#[test]
+fn past_what_culling_frees_the_oldest_are_evicted_down_to_the_bound() {
+    let mut map = culling_fixture();
+    let report = bound_keyframes(&mut map, 2, &enabled(), None);
+    assert_eq!(map.keyframes().len(), 2);
+    assert!(!report.evicted.is_empty());
+    let newest = *IDS.last().unwrap();
+    assert!(ids(&map).contains(&newest), "the newest keyframe stays");
+    assert!(
+        report.removed().all(|k| !ids(&map).contains(&k)),
+        "every reported keyframe is gone"
+    );
+    assert_map_consistent(&map);
+}

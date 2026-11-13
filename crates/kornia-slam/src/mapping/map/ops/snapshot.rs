@@ -3,7 +3,9 @@
 //! Capture has no window or solver policy: mapping chooses a [`BaWindow`], the
 //! map copies exactly those entities, and correction applies the numeric result.
 
+use super::correction::StateEnvelope;
 use crate::mapping::map::{ImuFactor, Keyframe, Map, MapPoint};
+use crate::mapping::marginalization::MarginalPrior;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::{ImuBias, PreintegratedImu};
@@ -30,6 +32,7 @@ pub struct BaSnapshot {
     pub(super) map_points: Vec<MapPoint>,
     pub(super) imu_factors: Vec<ImuFactor>,
     pub(super) world_epoch: u64,
+    pub(super) marginal_prior: Option<MarginalPrior>,
 }
 
 /// Estimated quantities for a captured keyframe; identity stays in the snapshot.
@@ -52,6 +55,31 @@ pub struct BaUpdate {
     pub(crate) imu_preintegrations: Vec<PreintegratedImu>,
     pub(crate) snapshot: BaSnapshot,
     pub(crate) solve_stats: Option<LocalBaStats>,
+    /// The boundary prior for the next window; stored only if this update
+    /// is applied.
+    pub(crate) next_prior: Option<MarginalPrior>,
+    /// Checked by [`Map::apply_ba_update`] before any write.
+    pub(crate) state_envelope: StateEnvelope,
+    pub(crate) outcome: BaOutcome,
+}
+
+/// Whether the solver ran on an update, for the run counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BaOutcome {
+    pub solve: BaSolve,
+    /// The marginal boundary prior could not be carried; the solve used the
+    /// scaled boundary edge instead.
+    pub prior_fallback: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum BaSolve {
+    /// An early exit (too few keyframes or observations) left the window as captured.
+    #[default]
+    NotRun,
+    Solved,
+    /// The solver returned an error; the window is unchanged.
+    Failed,
 }
 
 /// What a local solve did, for the caller to log; set by
@@ -126,6 +154,15 @@ impl BaSnapshot {
         &self.imu_factors
     }
 
+    /// The map's boundary prior, if it belongs to this snapshot's world epoch.
+    pub fn marginal_prior(&self) -> Option<&MarginalPrior> {
+        self.marginal_prior.as_ref()
+    }
+
+    pub(crate) fn world_epoch(&self) -> u64 {
+        self.world_epoch
+    }
+
     /// Starts an unchanged numeric result, including the original IMU edges.
     /// Solvers replace estimates in this result without changing their inputs.
     pub(crate) fn into_update(self) -> BaUpdate {
@@ -147,6 +184,9 @@ impl BaSnapshot {
                 .collect(),
             snapshot: self,
             solve_stats: None,
+            next_prior: None,
+            state_envelope: StateEnvelope::Off,
+            outcome: BaOutcome::default(),
         }
     }
 }
@@ -186,6 +226,10 @@ impl Map {
             map_points,
             imu_factors,
             world_epoch: self.world_epoch,
+            marginal_prior: self
+                .marginal_prior
+                .clone()
+                .filter(|prior| prior.world_epoch == self.world_epoch),
         }
     }
 

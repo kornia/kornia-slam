@@ -12,12 +12,16 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::{SO3F64, Vec3F64};
 use kornia_sensors::imu::ImuBias;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 /// Geometry changed by an accepted global pose-graph correction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PoseGraphCorrectionResult {
     pub keyframes_corrected: usize,
     pub map_points_corrected: usize,
+    /// Landmarks whose derived geometry was refreshed, and the time that took.
+    pub landmarks_refreshed: usize,
+    pub geometry_refresh: Duration,
 }
 
 /// Refusal to apply a pose-graph result to the live map.
@@ -33,6 +37,8 @@ pub enum PoseGraphCorrectionError {
     NonFiniteCorrection,
     #[error("map point references a keyframe outside the pose graph")]
     MissingReferenceKeyframe,
+    #[error("pose graph solve belongs to an obsolete world frame")]
+    ObsoleteWorldFrame,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -76,6 +82,61 @@ pub enum BaUpdateError {
         prev_kf_idx: usize,
         curr_kf_idx: usize,
     },
+    #[error("bundle adjustment moved keyframe {keyframe_idx} outside the state envelope: {what}")]
+    StateOutOfEnvelope { keyframe_idx: usize, what: String },
+}
+
+/// Bounds on the inertial state a BA update may write. A window with no
+/// visual hold on a keyframe (after a tracking loss) can return any velocity
+/// or bias, and the tracker adopts it every frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum StateEnvelope {
+    #[default]
+    Off,
+    /// Drop the whole update when an optimized keyframe leaves these bounds.
+    On(StateEnvelopeLimits),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct StateEnvelopeLimits {
+    /// |v| in m/s.
+    pub max_speed_mps: f64,
+    /// |b_a| in m/s².
+    pub max_accel_bias: f64,
+    /// |b_g| in rad/s.
+    pub max_gyro_bias: f64,
+}
+
+impl Default for StateEnvelopeLimits {
+    fn default() -> Self {
+        // EuRoC ground truth stays under 0.2 m/s² and 0.08 rad/s.
+        Self {
+            max_speed_mps: 5.0,
+            max_accel_bias: 0.5,
+            max_gyro_bias: 0.3,
+        }
+    }
+}
+
+impl StateEnvelopeLimits {
+    /// Why `state` is outside the limits, or `None` if it is inside.
+    fn violation(&self, state: &KeyframeBaState) -> Option<String> {
+        let speed = state.velocity_world.length();
+        let accel = state.imu_bias.accel.length();
+        let gyro = state.imu_bias.gyro.length();
+        if speed > self.max_speed_mps {
+            Some(format!("|v|={speed:.3e} m/s"))
+        } else if accel > self.max_accel_bias {
+            Some(format!("|ba|={accel:.3e} m/s^2"))
+        } else if gyro > self.max_gyro_bias {
+            Some(format!("|bg|={gyro:.3e} rad/s"))
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -218,15 +279,167 @@ impl Map {
             }
         }
         let map_points_corrected = changed_points.len();
+        let refresh_started = Instant::now();
         let observers_moved = self.landmarks_observed_by(&moved_keyframes);
-        self.finalize_landmark_geometry(changed_points.into_iter().chain(observers_moved));
+        let landmarks_refreshed =
+            self.finalize_landmark_geometry(changed_points.into_iter().chain(observers_moved));
 
         Ok(PoseGraphCorrectionResult {
             keyframes_corrected,
             map_points_corrected,
+            landmarks_refreshed,
+            geometry_refresh: refresh_started.elapsed(),
         })
     }
+}
 
+/// A keyframe's live pose before and after a pose-graph writeback, world-to-camera.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeyframePoseChange {
+    pub kf_idx: usize,
+    pub before: Pose3d,
+    pub after: Pose3d,
+}
+
+/// What [`Map::apply_graph_correction`] wrote.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GraphCorrectionResult {
+    /// Every live keyframe, in map order.
+    pub keyframes: Vec<KeyframePoseChange>,
+    pub map_points_corrected: usize,
+    /// Landmarks whose derived geometry was refreshed, and the time that took.
+    pub landmarks_refreshed: usize,
+    pub geometry_refresh: Duration,
+}
+
+impl Map {
+    /// Writes a pose-graph solve made from an earlier snapshot of this map: `snapshot` the
+    /// world-to-camera poses it read and `solved` the ones it found, per keyframe in
+    /// `keyframe_indices`, at the map's `world_epoch` then.
+    ///
+    /// Each keyframe moves by its world correction `C = solved^-1 * snapshot`. One still at its
+    /// snapshot pose takes the solved pose exactly; one bundle adjustment moved since keeps that
+    /// refinement (`T' = T * C^-1`); one created during the solve takes the correction of the
+    /// last snapshot keyframe, as ORB-SLAM3 propagates keyframes inserted during the solve and
+    /// VINS-Fusion applies its drift to every later keyframe. Velocities rotate with their
+    /// keyframe, and landmarks move with their reference keyframe; snapshot keyframes the map
+    /// has since dropped are skipped.
+    ///
+    /// # Errors
+    /// The map changed world since the snapshot, the inputs disagree in length or are not
+    /// finite, or a landmark's reference keyframe is not in the map. Nothing is written then.
+    pub fn apply_graph_correction(
+        &mut self,
+        world_epoch: u64,
+        keyframe_indices: &[usize],
+        snapshot: &[Pose3d],
+        solved: &[Pose3d],
+    ) -> Result<GraphCorrectionResult, PoseGraphCorrectionError> {
+        if self.world_epoch != world_epoch {
+            return Err(PoseGraphCorrectionError::ObsoleteWorldFrame);
+        }
+        if keyframe_indices.is_empty()
+            || snapshot.len() != keyframe_indices.len()
+            || solved.len() != keyframe_indices.len()
+        {
+            return Err(PoseGraphCorrectionError::LengthMismatch);
+        }
+        if !solved.iter().all(finite_pose) {
+            return Err(PoseGraphCorrectionError::NonFinitePose);
+        }
+        let corrections: Vec<Pose3d> = snapshot
+            .iter()
+            .zip(solved)
+            .map(|(before, after)| after.inverse().compose(before))
+            .collect();
+        let node_by_keyframe: HashMap<usize, usize> = keyframe_indices
+            .iter()
+            .enumerate()
+            .map(|(node, &idx)| (idx, node))
+            .collect();
+        let frontier = corrections[corrections.len() - 1];
+
+        let mut changes = Vec::with_capacity(self.keyframes.len());
+        let mut keyframe_corrections = HashMap::with_capacity(self.keyframes.len());
+        let mut velocities = Vec::with_capacity(self.keyframes.len());
+        for keyframe in &self.keyframes {
+            let idx = keyframe.frame.idx;
+            let before = keyframe.frame.pose_world_to_cam;
+            let (after, correction) = match node_by_keyframe.get(&idx) {
+                Some(&node) if before == snapshot[node] => (solved[node], corrections[node]),
+                Some(&node) => (
+                    before.compose(&corrections[node].inverse()),
+                    corrections[node],
+                ),
+                None => (before.compose(&frontier.inverse()), frontier),
+            };
+            if !finite_pose(&correction) || !finite_pose(&after) {
+                return Err(PoseGraphCorrectionError::NonFiniteCorrection);
+            }
+            let velocity = correction.rotation * keyframe.velocity_world;
+            if !finite_vec3(velocity) {
+                return Err(PoseGraphCorrectionError::NonFiniteCorrection);
+            }
+            changes.push(KeyframePoseChange {
+                kf_idx: idx,
+                before,
+                after,
+            });
+            keyframe_corrections.insert(idx, correction);
+            velocities.push(velocity);
+        }
+        let mut positions = Vec::with_capacity(self.map_points.len());
+        for point in &self.map_points {
+            if point.culled {
+                positions.push(None);
+                continue;
+            }
+            let correction = keyframe_corrections
+                .get(&point.keyframe_idx)
+                .ok_or(PoseGraphCorrectionError::MissingReferenceKeyframe)?;
+            let corrected = correction.transform_point(&point.position);
+            if !finite_vec3(corrected) {
+                return Err(PoseGraphCorrectionError::NonFiniteCorrection);
+            }
+            positions.push(Some(corrected));
+        }
+
+        self.world_epoch = self.world_epoch.wrapping_add(1);
+        for ((keyframe, change), velocity) in
+            self.keyframes.iter_mut().zip(&changes).zip(velocities)
+        {
+            keyframe.frame.pose_world_to_cam = change.after;
+            keyframe.velocity_world = velocity;
+        }
+        let mut changed_points = Vec::new();
+        for (idx, (point, corrected)) in self.map_points.iter_mut().zip(positions).enumerate() {
+            if let Some(corrected) = corrected
+                && corrected != point.position
+            {
+                point.position = corrected;
+                changed_points.push(idx);
+            }
+        }
+        let map_points_corrected = changed_points.len();
+        let moved_keyframes: HashSet<usize> = changes
+            .iter()
+            .filter(|change| change.before != change.after)
+            .map(|change| change.kf_idx)
+            .collect();
+        let refresh_started = Instant::now();
+        let observers_moved = self.landmarks_observed_by(&moved_keyframes);
+        let landmarks_refreshed =
+            self.finalize_landmark_geometry(changed_points.into_iter().chain(observers_moved));
+        Ok(GraphCorrectionResult {
+            keyframes: changes,
+            map_points_corrected,
+            landmarks_refreshed,
+            geometry_refresh: refresh_started.elapsed(),
+        })
+    }
+}
+
+impl Map {
     /// Applies a validated inertial alignment: scales and rotates the world,
     /// then writes each keyframe's velocity and bias.
     ///
@@ -437,8 +650,9 @@ impl Map {
     /// unchanged but valid update is still a successful completion.
     pub fn apply_ba_update(
         &mut self,
-        update: BaUpdate,
+        mut update: BaUpdate,
     ) -> Result<LocalBaMergeResult, BaUpdateError> {
+        let next_prior = update.next_prior.take();
         let snapshot = &update.snapshot;
         if self.world_epoch != snapshot.world_epoch {
             return Err(BaUpdateError::ObsoleteWorldFrame);
@@ -459,6 +673,23 @@ impl Map {
                 return Err(BaUpdateError::NonFiniteKeyframe {
                     keyframe_idx: captured.frame.idx,
                 });
+            }
+        }
+        if let StateEnvelope::On(limits) = update.state_envelope {
+            for (captured, optimized) in snapshot.keyframes.iter().zip(&update.keyframes) {
+                if !keyframe_ba_state_changed(captured, optimized) {
+                    continue;
+                }
+                if let Some(what) = limits.violation(optimized) {
+                    debug_eprintln!(
+                        "[vi_ba] REJECT kf={} {what}: update dropped",
+                        captured.frame.idx
+                    );
+                    return Err(BaUpdateError::StateOutOfEnvelope {
+                        keyframe_idx: captured.frame.idx,
+                        what,
+                    });
+                }
             }
         }
         for (&landmark_idx, &position) in snapshot.landmark_ids.iter().zip(&update.map_points) {
@@ -539,6 +770,9 @@ impl Map {
                 live.preintegrated = preintegrated.clone();
             }
         }
+        if next_prior.is_some() {
+            self.marginal_prior = next_prior;
+        }
         Ok(result)
     }
 }
@@ -614,6 +848,10 @@ fn keyframe_ba_state_changed(
         || before.imu_bias.gyro != after.imu_bias.gyro
         || before.imu_bias.accel != after.imu_bias.accel
 }
+
+#[cfg(test)]
+#[path = "graph_correction_tests.rs"]
+mod graph_correction_tests;
 
 #[cfg(test)]
 mod tests {
@@ -939,6 +1177,64 @@ mod ba_tests {
         tests::{test_frame, test_frame_with_pose},
     };
     use kornia_algebra::SO3F64;
+
+    /// An update writing accel bias `accel_x` on the only keyframe, checked
+    /// against `envelope`; `Ok` carries the bias the map holds afterwards.
+    fn apply_with_accel_bias(envelope: StateEnvelope, accel_x: f64) -> Result<f64, BaUpdateError> {
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])))
+            .unwrap();
+        let mut update = map.full_ba_snapshot().into_update();
+        update.state_envelope = envelope;
+        update.keyframes[0].imu_bias.accel.x = accel_x;
+        update.keyframes[0].velocity_world.x = 1.0;
+        map.apply_ba_update(update)?;
+        Ok(map.get_keyframe(0).unwrap().imu_bias.accel.x)
+    }
+
+    /// The envelope drops a result whose accel bias left it and writes one
+    /// inside it; `Off` writes both.
+    #[test]
+    fn the_state_envelope_refuses_an_out_of_bounds_bias() {
+        let on = StateEnvelope::On(StateEnvelopeLimits::default());
+        assert!(matches!(
+            apply_with_accel_bias(on, 0.6),
+            Err(BaUpdateError::StateOutOfEnvelope {
+                keyframe_idx: 0,
+                ..
+            })
+        ));
+        assert_eq!(apply_with_accel_bias(on, 0.4), Ok(0.4));
+        assert_eq!(apply_with_accel_bias(StateEnvelope::Off, 0.6), Ok(0.6));
+        assert_eq!(apply_with_accel_bias(StateEnvelope::Off, 0.4), Ok(0.4));
+    }
+
+    /// A refused update leaves the keyframe as it was, and so does a speed or
+    /// gyro bias over its limit.
+    #[test]
+    fn a_refused_update_writes_nothing() {
+        let on = StateEnvelope::On(StateEnvelopeLimits::default());
+        for set in [
+            (|s: &mut KeyframeBaState| s.velocity_world.y = 6.0) as fn(&mut KeyframeBaState),
+            |s| s.imu_bias.gyro.z = -0.31,
+        ] {
+            let mut map = Map::new();
+            map.insert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])))
+                .unwrap();
+            let mut update = map.full_ba_snapshot().into_update();
+            update.state_envelope = on;
+            update.keyframes[0].pose_world_to_cam.translation.x = 1.0;
+            set(&mut update.keyframes[0]);
+            assert!(matches!(
+                map.apply_ba_update(update),
+                Err(BaUpdateError::StateOutOfEnvelope { .. })
+            ));
+            let kf = map.get_keyframe(0).unwrap();
+            assert_eq!(kf.frame.pose_world_to_cam.translation.x, 0.0);
+            assert_eq!(kf.velocity_world, Vec3F64::ZERO);
+            assert_eq!(kf.imu_bias.gyro, Vec3F64::ZERO);
+        }
+    }
 
     /// Moving a landmark's reference camera changes the distance bounds and
     /// viewing direction derived from that camera centre, even though the

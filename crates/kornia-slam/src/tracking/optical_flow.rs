@@ -2,9 +2,16 @@
 
 use std::collections::{HashMap, HashSet};
 
-use kornia_image::Image;
-use kornia_imgproc::optical_flow_pyr_lk::{PyrLKError, PyrLKParams, calc_optical_flow_pyr_lk};
+use kornia_image::{Image, ImageSize};
+use kornia_imgproc::filter::scharr_spatial_gradient_float;
+use kornia_imgproc::optical_flow_pyr_lk::{
+    LkPyramidU8, PyrLKError, PyrLKParams, PyrLKPrecomputed, PyrLKResult, PyrLkU8Error,
+    build_lk_precomputed, calc_optical_flow_pyr_lk_u8, calc_optical_flow_pyr_lk_with_precomputed,
+};
+use kornia_imgproc::pyramid::pyrdown_f32;
 use thiserror::Error;
+
+use crate::tracking::timings::{TrackingTimings, timed};
 
 /// Stable identity for a feature track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -253,11 +260,44 @@ impl Default for SurvivorFilterConfig {
     }
 }
 
+/// A start pixel per track and a shallower search, for a frame whose motion
+/// is predicted well.
+#[derive(Debug, Clone, Copy)]
+pub struct FlowPrediction<'a> {
+    /// Raw pixel where each track is expected, in track order.
+    pub initial_pixels: &'a [[f32; 2]],
+    /// Deepest pyramid level searched; capped at the tracker's own.
+    pub max_level: usize,
+    /// Gauss-Newton iterations per level.
+    pub max_iter: usize,
+}
+
 /// Stateless numerical KLT executor.
 #[derive(Debug, Clone)]
 pub struct KltTracker {
     params: PyrLKParams,
     survivor_filter: SurvivorFilterConfig,
+    kernel: LkKernel,
+}
+
+/// The pyramidal LK implementation behind [`KltTracker::track_cached`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum LkKernel {
+    /// kornia-imgproc's f32 LK on f32 pyramids and Scharr gradients.
+    #[default]
+    F32,
+    /// OpenCV's scheme: u8 pyramid, i16 Scharr, Q14 fixed-point windows.
+    FixedPointU8,
+}
+
+/// A failed flow solve, from either kernel.
+#[derive(Debug, Error)]
+pub enum FlowError {
+    #[error(transparent)]
+    F32(#[from] PyrLKError),
+    #[error(transparent)]
+    FixedPoint(#[from] PyrLkU8Error),
 }
 
 impl Default for KltTracker {
@@ -271,7 +311,14 @@ impl KltTracker {
         Self {
             params,
             survivor_filter,
+            kernel: LkKernel::default(),
         }
+    }
+
+    /// Tracks with `kernel` in [`Self::track_cached`].
+    pub fn with_kernel(mut self, kernel: LkKernel) -> Self {
+        self.kernel = kernel;
+        self
     }
 
     pub fn params(&self) -> &PyrLKParams {
@@ -288,7 +335,25 @@ impl KltTracker {
         previous: &Image<u8, 1>,
         current: &Image<u8, 1>,
     ) -> Result<Vec<FlowSurvivor>, PyrLKError> {
-        self.track_impl(tracks, None, previous, current)
+        self.track_impl(
+            tracks,
+            None,
+            previous,
+            current,
+            &mut TrackingTimings::default(),
+        )
+    }
+
+    /// Like [`Self::track`], adding the pyramid build and the flow solve to
+    /// `timings`.
+    pub fn track_timed(
+        &self,
+        tracks: &[Track],
+        previous: &Image<u8, 1>,
+        current: &Image<u8, 1>,
+        timings: &mut TrackingTimings,
+    ) -> Result<Vec<FlowSurvivor>, PyrLKError> {
+        self.track_impl(tracks, None, previous, current, timings)
     }
 
     pub fn track_with_initial(
@@ -304,7 +369,13 @@ impl KltTracker {
                 provided: initial_pixels.len(),
             });
         }
-        self.track_impl(tracks, Some(initial_pixels), previous, current)
+        self.track_impl(
+            tracks,
+            Some(initial_pixels),
+            previous,
+            current,
+            &mut TrackingTimings::default(),
+        )
     }
 
     fn track_impl(
@@ -313,30 +384,181 @@ impl KltTracker {
         initial_pixels: Option<&[[f32; 2]]>,
         previous: &Image<u8, 1>,
         current: &Image<u8, 1>,
+        timings: &mut TrackingTimings,
     ) -> Result<Vec<FlowSurvivor>, PyrLKError> {
         if tracks.is_empty() {
             return Ok(Vec::new());
         }
 
-        let previous_f32 = previous
-            .cast::<f32>()
-            .expect("u8 -> f32 image cast is always representable");
-        let current_f32 = current
-            .cast::<f32>()
-            .expect("u8 -> f32 image cast is always representable");
-        let previous_pixels: Vec<[f32; 2]> = tracks.iter().map(Track::pixel).collect();
-        let mut params = self.params.clone();
-        params.use_initial_flow = initial_pixels.is_some();
-        let result = calc_optical_flow_pyr_lk(
-            &previous_f32,
-            &current_f32,
-            &previous_pixels,
+        // The same two calls `calc_optical_flow_pyr_lk` makes, split so the
+        // build and the solve are timed apart.
+        let precomputed = timed(&mut timings.klt_build, || {
+            let previous_f32 = previous.cast::<f32>()?;
+            let current_f32 = current.cast::<f32>()?;
+            build_lk_precomputed(&previous_f32, &current_f32, self.params.max_level)
+        })?;
+        self.solve(
+            tracks,
             initial_pixels,
-            &params,
-        )?;
+            &precomputed,
+            &self.params,
+            current.size(),
+            timings,
+        )
+    }
 
-        let width = current.width() as f32;
-        let height = current.height() as f32;
+    /// Like [`Self::track_timed`], reusing the pyramid `cache` built for the
+    /// previous call's `current` image when it is this call's `previous`.
+    /// The flow is bit-identical to [`Self::track`]: the same kornia-imgproc
+    /// calls run on the same inputs.
+    ///
+    /// With a `prediction`, LK starts each track at its predicted pixel and
+    /// searches only the prediction's levels of the same pyramid.
+    pub fn track_cached(
+        &self,
+        cache: &mut KltPyramidCache,
+        tracks: &[Track],
+        prediction: Option<FlowPrediction<'_>>,
+        previous: &Image<u8, 1>,
+        current: &Image<u8, 1>,
+        timings: &mut TrackingTimings,
+    ) -> Result<Vec<FlowSurvivor>, FlowError> {
+        if tracks.is_empty() {
+            return Ok(Vec::new());
+        }
+        check_same_size(previous, current)?;
+        if self.kernel == LkKernel::FixedPointU8 {
+            return self.track_cached_u8(cache, tracks, prediction, previous, current, timings);
+        }
+        let max_level = self.params.max_level;
+        let (mut precomputed, next_image) = timed(&mut timings.klt_build, || {
+            let (prev_pyr, grad_x_pyr, grad_y_pyr) = match cache.take_for(previous) {
+                Some(cached) => cached.into_parts()?,
+                None => LevelPyramid::build(previous, max_level)?.into_parts()?,
+            };
+            let next = LevelPyramid::build(current, max_level)?;
+            let precomputed = PyrLKPrecomputed {
+                prev_pyr,
+                next_pyr: next.levels,
+                grad_x_pyr,
+                grad_y_pyr,
+            };
+            Ok::<_, PyrLKError>((precomputed, next.image))
+        })?;
+        let survivors = match prediction {
+            None => self.solve(
+                tracks,
+                None,
+                &precomputed,
+                &self.params,
+                current.size(),
+                timings,
+            ),
+            Some(prediction) => {
+                let levels = prediction.max_level.min(max_level) + 1;
+                let params = PyrLKParams {
+                    max_level: levels - 1,
+                    max_iter: prediction.max_iter,
+                    ..self.params.clone()
+                };
+                // The coarse levels stay in the cache for the next frame.
+                let mut next_tail = precomputed.next_pyr.split_off(levels);
+                precomputed.prev_pyr.truncate(levels);
+                precomputed.grad_x_pyr.truncate(levels);
+                precomputed.grad_y_pyr.truncate(levels);
+                let survivors = self.solve(
+                    tracks,
+                    Some(prediction.initial_pixels),
+                    &precomputed,
+                    &params,
+                    current.size(),
+                    timings,
+                );
+                precomputed.next_pyr.append(&mut next_tail);
+                survivors
+            }
+        };
+        cache.entry = Some(LevelPyramid {
+            image: next_image,
+            levels: precomputed.next_pyr,
+        });
+        Ok(survivors?)
+    }
+
+    /// [`Self::track_cached`] on the fixed-point kernel. The current frame's
+    /// pyramid is built with derivatives so it serves as the next previous;
+    /// the two pyramids are recycled.
+    fn track_cached_u8(
+        &self,
+        cache: &mut KltPyramidCache,
+        tracks: &[Track],
+        prediction: Option<FlowPrediction<'_>>,
+        previous: &Image<u8, 1>,
+        current: &Image<u8, 1>,
+        timings: &mut TrackingTimings,
+    ) -> Result<Vec<FlowSurvivor>, FlowError> {
+        let (win, max_level) = (self.params.win_size, self.params.max_level);
+        let (prev_pyr, next_pyr) = timed(&mut timings.klt_build, || {
+            let prev_pyr = match cache.take_u8_for(previous) {
+                Some(cached) => cached,
+                None => LkPyramidU8::new(previous, win, max_level, true)?,
+            };
+            let next_pyr = match cache.u8_spare.take() {
+                Some(mut spare) => {
+                    spare.rebuild(current, win, max_level, true)?;
+                    spare
+                }
+                None => LkPyramidU8::new(current, win, max_level, true)?,
+            };
+            Ok::<_, PyrLkU8Error>((prev_pyr, next_pyr))
+        })?;
+        let mut params = self.params.clone();
+        if let Some(prediction) = &prediction {
+            params.max_level = prediction.max_level.min(max_level);
+            params.max_iter = prediction.max_iter;
+        }
+        params.use_initial_flow = prediction.is_some();
+        let previous_pixels: Vec<[f32; 2]> = tracks.iter().map(Track::pixel).collect();
+        let initial = prediction.map(|p| p.initial_pixels);
+        let result = timed(&mut timings.klt_track, || {
+            calc_optical_flow_pyr_lk_u8(&prev_pyr, &next_pyr, &previous_pixels, initial, &params)
+        });
+        cache.u8_spare = Some(prev_pyr);
+        cache.u8_entry = Some((current.clone(), next_pyr));
+        Ok(self.survivors(tracks, &result?, current.size()))
+    }
+
+    fn solve(
+        &self,
+        tracks: &[Track],
+        initial_pixels: Option<&[[f32; 2]]>,
+        precomputed: &PyrLKPrecomputed,
+        params: &PyrLKParams,
+        image_size: ImageSize,
+        timings: &mut TrackingTimings,
+    ) -> Result<Vec<FlowSurvivor>, PyrLKError> {
+        let previous_pixels: Vec<[f32; 2]> = tracks.iter().map(Track::pixel).collect();
+        let mut params = params.clone();
+        params.use_initial_flow = initial_pixels.is_some();
+        let result = timed(&mut timings.klt_track, || {
+            calc_optical_flow_pyr_lk_with_precomputed(
+                precomputed,
+                &previous_pixels,
+                initial_pixels,
+                &params,
+            )
+        })?;
+        Ok(self.survivors(tracks, &result, image_size))
+    }
+
+    fn survivors(
+        &self,
+        tracks: &[Track],
+        result: &PyrLKResult,
+        image_size: ImageSize,
+    ) -> Vec<FlowSurvivor> {
+        let width = image_size.width as f32;
+        let height = image_size.height as f32;
         let mut survivors = Vec::with_capacity(tracks.len());
         for (index, track) in tracks.iter().enumerate() {
             let next_pt = result.next_pts[index];
@@ -355,7 +577,7 @@ impl KltTracker {
                 });
             }
         }
-        Ok(survivors)
+        survivors
     }
 
     fn accepts(
@@ -384,6 +606,107 @@ impl KltTracker {
         let dy = next_pixel[1] - track.pixel[1];
         let max_movement_sq = filter.max_movement_px * filter.max_movement_px;
         dx * dx + dy * dy <= max_movement_sq
+    }
+}
+
+fn check_same_size(previous: &Image<u8, 1>, current: &Image<u8, 1>) -> Result<(), PyrLKError> {
+    if previous.size() != current.size() {
+        return Err(PyrLKError::ImageSizeMismatch {
+            prev_width: previous.width(),
+            prev_height: previous.height(),
+            next_width: current.width(),
+            next_height: current.height(),
+        });
+    }
+    Ok(())
+}
+
+/// One image's LK pyramid, built exactly as `build_lk_precomputed` builds
+/// each side, so a cached pyramid yields bit-identical flow.
+struct LevelPyramid {
+    image: Image<u8, 1>,
+    levels: Vec<Image<f32, 1>>,
+}
+
+type PyramidParts = (Vec<Image<f32, 1>>, Vec<Image<f32, 1>>, Vec<Image<f32, 1>>);
+
+impl LevelPyramid {
+    fn build(image: &Image<u8, 1>, max_level: usize) -> Result<Self, PyrLKError> {
+        let mut levels = Vec::with_capacity(max_level + 1);
+        levels.push(image.cast::<f32>()?);
+        for level in 1..=max_level {
+            let src = &levels[level - 1];
+            let size = ImageSize {
+                width: src.width().div_ceil(2),
+                height: src.height().div_ceil(2),
+            };
+            let mut down = Image::from_size_val(size, 0.0f32)?;
+            pyrdown_f32(src, &mut down)?;
+            levels.push(down);
+        }
+        Ok(Self {
+            image: image.clone(),
+            levels,
+        })
+    }
+
+    /// Splits into `(levels, grad_x, grad_y)`. The gradients are computed
+    /// only here: an image needs them only once it is the previous frame.
+    fn into_parts(self) -> Result<PyramidParts, PyrLKError> {
+        let mut grad_x = Vec::with_capacity(self.levels.len());
+        let mut grad_y = Vec::with_capacity(self.levels.len());
+        for level in &self.levels {
+            let mut ix = Image::from_size_val(level.size(), 0.0f32)?;
+            let mut iy = Image::from_size_val(level.size(), 0.0f32)?;
+            scharr_spatial_gradient_float(level, &mut ix, &mut iy)?;
+            grad_x.push(ix);
+            grad_y.push(iy);
+        }
+        Ok((self.levels, grad_x, grad_y))
+    }
+}
+
+/// The last tracked frame's LK pyramid, kept so the next frame does not
+/// rebuild it as its previous image.
+#[derive(Default)]
+pub struct KltPyramidCache {
+    entry: Option<LevelPyramid>,
+    u8_entry: Option<(Image<u8, 1>, LkPyramidU8)>,
+    u8_spare: Option<LkPyramidU8>,
+}
+
+impl std::fmt::Debug for KltPyramidCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KltPyramidCache")
+            .field("cached", &self.entry.is_some())
+            .finish()
+    }
+}
+
+impl KltPyramidCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Takes the cached pyramid if it was built from exactly `image`'s
+    /// pixels; a byte compare is cheap next to a pyramid and makes a stale
+    /// cache impossible to use.
+    fn take_for(&mut self, image: &Image<u8, 1>) -> Option<LevelPyramid> {
+        let entry = self.entry.take()?;
+        (entry.image.size() == image.size() && entry.image.as_slice() == image.as_slice())
+            .then_some(entry)
+    }
+
+    /// Like [`Self::take_for`] for the fixed-point kernel's pyramid; a stale
+    /// one is kept as the spare to rebuild into.
+    fn take_u8_for(&mut self, image: &Image<u8, 1>) -> Option<LkPyramidU8> {
+        let (source, pyramid) = self.u8_entry.take()?;
+        if source.size() == image.size() && source.as_slice() == image.as_slice() {
+            Some(pyramid)
+        } else {
+            self.u8_spare = Some(pyramid);
+            None
+        }
     }
 }
 
@@ -709,6 +1032,174 @@ mod tests {
             "expected tracked pixel near (93, 92), got {got:?}"
         );
         assert_eq!(survivors[0].track_id, id);
+    }
+
+    #[test]
+    fn cached_pyramid_tracks_bit_identically() {
+        let frames = [
+            square_image([90, 90]),
+            square_image([93, 92]),
+            square_image([95, 95]),
+            square_image([96, 97]),
+        ];
+        let tracker = KltTracker::default();
+        let mut cache = KltPyramidCache::new();
+        let mut timings = TrackingTimings::default();
+        let mut tracks = TrackSet::new();
+        tracks.spawn([90.0, 90.0]);
+        tracks.spawn([129.0, 90.0]);
+
+        // Frames 1->2 hit the cache; 0->2 after it misses and rebuilds.
+        for (prev, next) in [(0, 1), (1, 2), (0, 2), (2, 3)] {
+            let plain = tracker
+                .track(tracks.tracks(), &frames[prev], &frames[next])
+                .unwrap();
+            let cached = tracker
+                .track_cached(
+                    &mut cache,
+                    tracks.tracks(),
+                    None,
+                    &frames[prev],
+                    &frames[next],
+                    &mut timings,
+                )
+                .unwrap();
+            assert_eq!(plain.len(), cached.len());
+            for (a, b) in plain.iter().zip(&cached) {
+                assert_eq!(a.track_id, b.track_id);
+                assert_eq!(a.pixel[0].to_bits(), b.pixel[0].to_bits());
+                assert_eq!(a.pixel[1].to_bits(), b.pixel[1].to_bits());
+                assert_eq!(a.error.to_bits(), b.error.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn predicted_flow_lands_on_the_motion_and_keeps_the_cache_whole() {
+        let frames = [
+            square_image([90, 90]),
+            square_image([93, 92]),
+            square_image([95, 95]),
+        ];
+        let tracker = KltTracker::default();
+        let mut cache = KltPyramidCache::new();
+        let mut timings = TrackingTimings::default();
+        let mut tracks = TrackSet::new();
+        tracks.spawn([90.0, 90.0]);
+        tracks.spawn([129.0, 90.0]);
+
+        let initial = [[93.0, 92.0], [132.0, 92.0]];
+        let prediction = FlowPrediction {
+            initial_pixels: &initial,
+            max_level: 1,
+            max_iter: 10,
+        };
+        let predicted = tracker
+            .track_cached(
+                &mut cache,
+                tracks.tracks(),
+                Some(prediction),
+                &frames[0],
+                &frames[1],
+                &mut timings,
+            )
+            .unwrap();
+        let plain = tracker
+            .track(tracks.tracks(), &frames[0], &frames[1])
+            .unwrap();
+        assert_eq!(predicted.len(), plain.len());
+        for (a, b) in predicted.iter().zip(&plain) {
+            assert!((a.pixel[0] - b.pixel[0]).abs() < 0.05);
+            assert!((a.pixel[1] - b.pixel[1]).abs() < 0.05);
+        }
+
+        // The cached pyramid of frame 1 still has every level: a full
+        // search from it matches an uncached one bit for bit.
+        let cached = tracker
+            .track_cached(
+                &mut cache,
+                tracks.tracks(),
+                None,
+                &frames[1],
+                &frames[2],
+                &mut timings,
+            )
+            .unwrap();
+        let uncached = tracker
+            .track(tracks.tracks(), &frames[1], &frames[2])
+            .unwrap();
+        assert_eq!(cached, uncached);
+    }
+
+    #[test]
+    fn fixed_point_kernel_agrees_with_f32_and_caches_exactly() {
+        let frames = [
+            square_image([90, 90]),
+            square_image([93, 92]),
+            square_image([95, 95]),
+        ];
+        let f32_tracker = KltTracker::default();
+        let u8_tracker = KltTracker::default().with_kernel(LkKernel::FixedPointU8);
+        let mut tracks = TrackSet::new();
+        tracks.spawn([90.0, 90.0]);
+        tracks.spawn([129.0, 90.0]);
+        let mut timings = TrackingTimings::default();
+
+        let mut cache = KltPyramidCache::new();
+        let mut cached = Vec::new();
+        for (prev, next) in [(0, 1), (1, 2)] {
+            let fixed = u8_tracker
+                .track_cached(
+                    &mut cache,
+                    tracks.tracks(),
+                    None,
+                    &frames[prev],
+                    &frames[next],
+                    &mut timings,
+                )
+                .unwrap();
+            let float = f32_tracker
+                .track(tracks.tracks(), &frames[prev], &frames[next])
+                .unwrap();
+            assert_eq!(fixed.len(), float.len());
+            for (a, b) in fixed.iter().zip(&float) {
+                assert!((a.pixel[0] - b.pixel[0]).abs() < 0.1);
+                assert!((a.pixel[1] - b.pixel[1]).abs() < 0.1);
+            }
+            cached.push(fixed);
+        }
+        // Frame 1 -> 2 above reused frame 1's pyramid; a cold cache agrees.
+        let cold = u8_tracker
+            .track_cached(
+                &mut KltPyramidCache::new(),
+                tracks.tracks(),
+                None,
+                &frames[1],
+                &frames[2],
+                &mut timings,
+            )
+            .unwrap();
+        assert_eq!(cold, cached[1]);
+    }
+
+    #[test]
+    fn timed_tracking_matches_untimed_bit_for_bit() {
+        let previous = square_image([90, 90]);
+        let current = square_image([93, 92]);
+        let tracker = KltTracker::default();
+        let mut tracks = TrackSet::new();
+        tracks.spawn([90.0, 90.0]);
+        tracks.spawn([129.0, 90.0]);
+
+        let plain = tracker.track(tracks.tracks(), &previous, &current).unwrap();
+        let mut timings = TrackingTimings::default();
+        let timed = tracker
+            .track_timed(tracks.tracks(), &previous, &current, &mut timings)
+            .unwrap();
+
+        assert_eq!(plain, timed);
+        assert!(timings.klt_build > std::time::Duration::ZERO);
+        assert!(timings.klt_track > std::time::Duration::ZERO);
     }
 
     #[test]

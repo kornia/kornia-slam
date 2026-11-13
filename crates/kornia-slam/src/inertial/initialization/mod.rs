@@ -49,9 +49,10 @@ fn rotation_from_to(from: Vec3F64, to: Vec3F64) -> SO3F64 {
     ]))
 }
 
-/// A keyframe window is monocular unless its first keyframe carries stereo data.
+/// A keyframe window is monocular unless its first keyframe carries metric
+/// depth (stereo, or a rig's overlap points).
 fn window_is_mono(kfs: &[&Keyframe]) -> bool {
-    !kfs.first().map(|kf| kf.frame.is_stereo()).unwrap_or(false)
+    !kfs.first().map(|kf| kf.frame.is_metric()).unwrap_or(false)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

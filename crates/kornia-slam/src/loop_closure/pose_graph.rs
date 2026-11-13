@@ -49,6 +49,46 @@ pub struct PgoResult {
     pub optimized_poses: Vec<Pose3d>,
     pub iterations: usize,
     pub usable: bool,
+    /// Why the solve is not usable, set exactly when `usable` is false.
+    pub unusable_reason: Option<String>,
+}
+
+/// Why a finished solve must not be written back, or `None` when it may: it converged, its costs
+/// are finite, gravity kept its direction (within 1e-4 rad), the cost fell and the new loop's
+/// residual did not grow.
+pub(super) fn unusable_reason(
+    converged: bool,
+    iterations: usize,
+    (cost_before, cost_after): (f64, f64),
+    (loop_before, loop_after): (f64, f64),
+    gravity_error_rad: Option<f64>,
+) -> Option<String> {
+    let mut reasons = Vec::new();
+    if !converged {
+        reasons.push(format!("not converged after {iterations} iterations"));
+    }
+    if ![cost_before, cost_after, loop_before, loop_after]
+        .into_iter()
+        .all(f64::is_finite)
+    {
+        reasons.push("non-finite cost or loop residual".to_string());
+    }
+    if let Some(error) = gravity_error_rad
+        && !(error.is_finite() && error <= 1e-4)
+    {
+        reasons.push(format!("gravity moved by {error:.2e} rad"));
+    }
+    if cost_after >= cost_before {
+        reasons.push(format!(
+            "cost did not fall ({cost_before:.4e} -> {cost_after:.4e})"
+        ));
+    }
+    if loop_after > loop_before {
+        reasons.push(format!(
+            "loop residual grew ({loop_before:.4} -> {loop_after:.4})"
+        ));
+    }
+    (!reasons.is_empty()).then(|| format!("unusable solve: {}", reasons.join("; ")))
 }
 
 /// Pose-graph construction or solve failure.
@@ -136,29 +176,20 @@ pub fn optimize_pose_graph(
     let max_gravity_alignment_error_rad = inertial.map(|context| {
         max_gravity_alignment_error(&original_poses, &optimized_poses, context.gravity_world)
     });
-    let metrics_finite = [
-        initial_cost,
-        final_cost,
-        new_loop_residual_before,
-        new_loop_residual_after,
-    ]
-    .into_iter()
-    .all(f64::is_finite);
-    let inertial_metrics_finite = max_gravity_alignment_error_rad.is_none_or(f64::is_finite);
-    let gravity_preserved = max_gravity_alignment_error_rad.is_none_or(|error| error <= 1e-4);
-    let usable = result.converged
-        && metrics_finite
-        && inertial_metrics_finite
-        && gravity_preserved
-        && final_cost < initial_cost
-        && new_loop_residual_after <= new_loop_residual_before;
-
+    let unusable_reason = unusable_reason(
+        result.converged,
+        result.iterations,
+        (initial_cost, final_cost),
+        (new_loop_residual_before, new_loop_residual_after),
+        max_gravity_alignment_error_rad,
+    );
     Ok(PgoResult {
         keyframe_indices,
         original_poses,
         optimized_poses,
         iterations: result.iterations,
-        usable,
+        usable: unusable_reason.is_none(),
+        unusable_reason,
     })
 }
 

@@ -1,9 +1,10 @@
-//! Frame sources: offline datasets (EuRoC, Hilti, TUM-VI, MCAP recordings) and live
+//! Frame sources: offline datasets (EuRoC, Hilti, LaMAria, TUM-VI, MCAP recordings) and live
 //! cameras (OAK-D, UVC) behind one [`FrameSource`] trait. Each source module
 //! also owns the run-file settings it is opened from.
 
 pub mod euroc;
 pub mod hilti;
+pub mod lamaria;
 pub mod mcap;
 pub mod oakd;
 pub mod tumvi;
@@ -22,6 +23,7 @@ use kornia_slam::{CameraSelection, SensorSelection};
 
 use euroc::EurocConfig;
 use hilti::HiltiConfig;
+use lamaria::LamariaConfig;
 use mcap::McapConfig;
 use oakd::OakdConfig;
 use tumvi::TumViConfig;
@@ -37,6 +39,9 @@ pub struct FrameItem {
     pub image: Image<u8, 1>,
     /// Rectified right view, when the source provides a stereo pair.
     pub right_image: Option<Image<u8, 1>>,
+    /// Images of the other rig cameras, in rig order after `image` (the
+    /// primary), when the source yields a multi-camera rig.
+    pub rig_images: Vec<Image<u8, 1>>,
     /// IMU samples between the previous yielded camera frame and this one.
     pub imu_samples: Vec<ImuMeasurement>,
 }
@@ -99,6 +104,7 @@ pub struct OpenedSource {
 pub enum SourceConfig {
     Euroc(EurocConfig),
     Hilti(HiltiConfig),
+    Lamaria(LamariaConfig),
     Mcap(McapConfig),
     Oakd(OakdConfig),
     TumVi(TumViConfig),
@@ -113,6 +119,7 @@ impl SourceConfig {
         match self {
             Self::Euroc(_) => Ok(()),
             Self::Hilti(hilti) => hilti.validate(sensors),
+            Self::Lamaria(lamaria) => lamaria.validate(sensors),
             Self::Mcap(mcap) => mcap.validate(sensors),
             Self::Oakd(oakd) => oakd.validate(sensors),
             Self::TumVi(tumvi) => tumvi.validate(sensors),
@@ -125,6 +132,7 @@ impl SourceConfig {
         match self {
             Self::Euroc(euroc) => euroc.resolve_paths(base_dir),
             Self::Hilti(hilti) => hilti.resolve_paths(base_dir),
+            Self::Lamaria(lamaria) => lamaria.resolve_paths(base_dir),
             Self::Mcap(mcap) => mcap.resolve_paths(base_dir),
             Self::Oakd(oakd) => oakd.resolve_paths(base_dir),
             Self::TumVi(tumvi) => tumvi.resolve_paths(base_dir),
@@ -138,6 +146,7 @@ impl SourceConfig {
         match self {
             Self::Euroc(euroc) => euroc.open(stereo),
             Self::Hilti(hilti) => hilti.open(sensors.imu),
+            Self::Lamaria(lamaria) => lamaria.open(sensors),
             Self::Mcap(mcap) => mcap.open(stereo),
             Self::Oakd(oakd) => oakd.open(stereo),
             Self::TumVi(tumvi) => tumvi.open(sensors.imu),

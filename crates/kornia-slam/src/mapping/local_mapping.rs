@@ -1,12 +1,19 @@
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 
-use crate::mapping::map::{BaSnapshot, BaUpdate, BaUpdateError, LocalBaMergeResult, Map};
+use crate::mapping::bundle_adjustment::{
+    LocalBaParams, local_window_of, run_local_ba_with, run_local_inertial_ba_with,
+};
+use crate::mapping::map::{
+    BaOutcome, BaSnapshot, BaSolve, BaUpdate, BaUpdateError, LocalBaMergeResult, Map,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -36,29 +43,112 @@ pub struct KeyframeJob {
     pub imu_initialized: bool,
     pub imu_t_bc: Option<Pose3d>,
     pub gravity_world: Vec3F64,
+    /// Wheel-odometry edges between keyframes; empty without a wheel feed.
+    pub wheel_factors: Vec<super::wheel_odom::WheelOdomFactor>,
+    pub local_ba: LocalBaParams,
 }
 
-fn capture_local_window(map: &Map) -> BaSnapshot {
-    map.ba_snapshot(&super::bundle_adjustment::local_window(map))
+fn capture_local_window(map: &Map, job: &KeyframeJob) -> BaSnapshot {
+    map.ba_snapshot(&local_window_of(map, job.local_ba.active_keyframes, []))
 }
 
 fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJob) -> BaUpdate {
     if job.imu_initialized {
-        super::bundle_adjustment::run_local_inertial_ba(
+        run_local_inertial_ba_with(
             snapshot,
             camera,
             job.imu_t_bc,
             job.gravity_world,
+            &job.wheel_factors,
             &[],
-            &[],
+            &job.local_ba,
         )
     } else {
-        super::bundle_adjustment::run_local_ba(snapshot, camera)
+        run_local_ba_with(snapshot, camera, &job.local_ba)
     }
+}
+
+/// Local-BA tallies since the worker started; see `RunCounters` for the meaning.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LocalMappingCounts {
+    pub ba_failed: u64,
+    pub vi_ba_failed: u64,
+    pub prior_fallbacks: u64,
+    pub ba_updates_rejected: u64,
+    pub ba_solves: u64,
+    pub ba_solve_ns: u64,
+}
+
+// Atomics because the asynchronous worker writes them while tracking reads.
+#[derive(Default)]
+struct LocalMappingCounters {
+    ba_failed: AtomicU64,
+    vi_ba_failed: AtomicU64,
+    prior_fallbacks: AtomicU64,
+    ba_updates_rejected: AtomicU64,
+    ba_solves: AtomicU64,
+    ba_solve_ns: AtomicU64,
+}
+
+impl LocalMappingCounters {
+    fn record_solve(&self, job: &KeyframeJob, outcome: BaOutcome, started: Instant) {
+        let add = |counter: &AtomicU64, n: u64| counter.fetch_add(n, Ordering::Relaxed);
+        if outcome.prior_fallback {
+            add(&self.prior_fallbacks, 1);
+        }
+        if outcome.solve == BaSolve::NotRun {
+            return;
+        }
+        add(&self.ba_solves, 1);
+        let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        add(&self.ba_solve_ns, elapsed_ns);
+        if outcome.solve == BaSolve::Failed {
+            add(
+                if job.imu_initialized {
+                    &self.vi_ba_failed
+                } else {
+                    &self.ba_failed
+                },
+                1,
+            );
+        }
+    }
+
+    fn record_merge<T>(&self, merged: &Result<T, BaUpdateError>) {
+        if merged.is_err() {
+            self.ba_updates_rejected.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn counts(&self) -> LocalMappingCounts {
+        let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        LocalMappingCounts {
+            ba_failed: read(&self.ba_failed),
+            vi_ba_failed: read(&self.vi_ba_failed),
+            prior_fallbacks: read(&self.prior_fallbacks),
+            ba_updates_rejected: read(&self.ba_updates_rejected),
+            ba_solves: read(&self.ba_solves),
+            ba_solve_ns: read(&self.ba_solve_ns),
+        }
+    }
+}
+
+/// Solves `job`'s window and records what the solve did.
+fn solve_counted(
+    snapshot: BaSnapshot,
+    camera: &PinholeCamera,
+    job: &KeyframeJob,
+    counters: &LocalMappingCounters,
+) -> BaUpdate {
+    let started = Instant::now();
+    let update = solve_snapshot(snapshot, camera, job);
+    counters.record_solve(job, update.outcome, started);
+    update
 }
 
 pub struct LocalMapping {
     backend: LocalMappingBackend,
+    counters: Arc<LocalMappingCounters>,
 }
 
 enum LocalMappingBackend {
@@ -87,6 +177,7 @@ fn merge_and_cull(map: &mut Map, update: BaUpdate) -> Result<LocalBaMergeResult,
 
 impl LocalMapping {
     pub fn new(mode: LocalMappingMode, map: Arc<Mutex<Map>>, camera: PinholeCamera) -> Self {
+        let counters = Arc::new(LocalMappingCounters::default());
         let backend = match mode {
             LocalMappingMode::Synchronous => LocalMappingBackend::Synchronous {
                 map,
@@ -95,14 +186,25 @@ impl LocalMapping {
             },
             LocalMappingMode::Asynchronous => {
                 let publication_gate = Arc::new(Mutex::new(()));
-                let handle = LocalMappingHandle::spawn(map, Arc::clone(&publication_gate), camera);
+                let handle = LocalMappingHandle::spawn(
+                    map,
+                    Arc::clone(&publication_gate),
+                    camera,
+                    Arc::clone(&counters),
+                );
                 LocalMappingBackend::Asynchronous {
                     handle,
                     publication_gate,
                 }
             }
         };
-        Self { backend }
+        Self { backend, counters }
+    }
+
+    /// Local-BA tallies so far. In asynchronous mode a job still on the
+    /// worker is not counted yet.
+    pub(crate) fn counts(&self) -> LocalMappingCounts {
+        self.counters.counts()
     }
 
     pub fn publication_gate(&self) -> Option<Arc<Mutex<()>>> {
@@ -123,8 +225,9 @@ impl LocalMapping {
             } => {
                 let snapshot = capture_local_window(
                     &map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    &job,
                 );
-                let update = solve_snapshot(snapshot, camera, &job);
+                let update = solve_counted(snapshot, camera, &job, &self.counters);
                 // Cull under the same lock as the merge, so a completed result
                 // is never observable before cleanup. A rejected snapshot culls
                 // nothing.
@@ -132,6 +235,7 @@ impl LocalMapping {
                     &mut map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
                     update,
                 );
+                self.counters.record_merge(&merged);
                 if let Ok(result) = merged {
                     results
                         .lock()
@@ -196,6 +300,7 @@ impl LocalMappingHandle {
         map: Arc<Mutex<Map>>,
         publication_gate: Arc<Mutex<()>>,
         camera: PinholeCamera,
+        counters: Arc<LocalMappingCounters>,
     ) -> Self {
         let pending = Arc::new(PendingJob::default());
         let worker_pending = Arc::clone(&pending);
@@ -233,10 +338,11 @@ impl LocalMappingHandle {
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         capture_local_window(
                             &map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            &job,
                         )
                     };
 
-                    let update = solve_snapshot(snapshot, &camera, &job);
+                    let update = solve_counted(snapshot, &camera, &job, &counters);
 
                     // Merge is short and cannot interleave with keyframe publication
                     // or a world-frame transformation. Epoch mismatch rejects stale BA.
@@ -248,6 +354,7 @@ impl LocalMappingHandle {
                             &mut map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
                             update,
                         );
+                        counters.record_merge(&merged);
                         merged.is_ok_and(|result| result_sender.send(result).is_err())
                     };
                     if should_stop {
@@ -316,7 +423,10 @@ mod tests {
     use kornia_3d::camera::PinholeCamera;
     use kornia_algebra::Vec3F64;
 
-    use super::{BaUpdateError, KeyframeJob, LocalMapping, LocalMappingBackend, LocalMappingMode};
+    use super::{
+        BaUpdateError, KeyframeJob, LocalBaParams, LocalMapping, LocalMappingBackend,
+        LocalMappingMode,
+    };
     use crate::mapping::map::{InertialAlignment, KeyframeVelocity, Map};
     use kornia_algebra::SO3F64;
     use kornia_sensors::imu::ImuBias;
@@ -339,6 +449,8 @@ mod tests {
             imu_initialized: false,
             imu_t_bc: None,
             gravity_world: Vec3F64::ZERO,
+            wheel_factors: Vec::new(),
+            local_ba: LocalBaParams::default(),
         }
     }
 
@@ -428,6 +540,7 @@ mod tests {
             u_right: Vec::new(),
             depth: Vec::new(),
             keypoints_undist: Vec::new(),
+            rig: Default::default(),
         }))
         .unwrap();
         let doomed = map

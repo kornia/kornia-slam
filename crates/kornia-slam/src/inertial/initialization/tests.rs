@@ -68,6 +68,7 @@ fn synth_frame(idx: usize, pose_world_to_cam: Pose3d) -> Frame {
         u_right: vec![],
         depth: vec![], // empty => is_stereo() == false => monocular path
         keypoints_undist: vec![],
+        rig: Default::default(),
     }
 }
 

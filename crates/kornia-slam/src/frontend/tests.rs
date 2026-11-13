@@ -269,3 +269,94 @@ fn fisheye_observation_keeps_raw_image_keypoints() {
     assert!(observed.len() > frame.features.keypoints_xy.len());
     assert!(frontend.observation().stereo_matched.is_none());
 }
+
+#[test]
+fn a_rig_frame_splits_features_per_camera_and_keeps_depth_empty() {
+    let camera = pinhole(240.0, 240.0, 188.0, 120.0);
+    let size = ImageSize {
+        width: 376,
+        height: 240,
+    };
+    let view = |primary_from_camera| kornia_sensors::RigCamera {
+        camera: camera.clone(),
+        size,
+        primary_from_camera,
+    };
+    // A pure 11 cm sideways baseline: the synthetic pair's 8 px shift.
+    let rig = SensorRig::new(camera.clone()).with_rig_cameras(vec![
+        view(Pose3d::IDENTITY),
+        view(Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            kornia_algebra::Vec3F64::new(0.11, 0.0, 0.0),
+        )),
+    ]);
+    let mut frontend = OrbFrontend::new(OrbDetector::default(), &rig);
+    let (left, right) = synthetic_pair(376, 240, 8);
+    let frame = frontend.prepare_rig(1, &[&left, &right]).unwrap();
+
+    assert!(frame.is_rig());
+    assert!(frame.depth.is_empty() && frame.u_right.is_empty());
+    let ranges = &frame.rig.camera_ranges;
+    assert_eq!(ranges.len(), 2);
+    assert_eq!(ranges[0].start, 0);
+    assert_eq!(ranges[1].end, frame.features.keypoints_xy.len());
+    assert_eq!(frame.rig.stereo_points.len(), ranges[0].len());
+    assert_eq!(frame.camera_of(ranges[1].start), 1);
+    let matched = frame.rig.stereo_points.iter().flatten().count();
+    assert!(matched > 20, "only {matched} overlap points");
+    let mut depths = Vec::new();
+    for (i, point) in frame.rig.stereo_points.iter().enumerate() {
+        let (Some(point), Some(j)) = (point, frame.rig.left_to_right[i]) else {
+            continue;
+        };
+        assert!(ranges[1].contains(&j));
+        depths.push(point.z);
+    }
+    // bf / d = 240 * 0.11 / 8; coarse-octave keypoints are a pixel or two off.
+    depths.sort_by(f64::total_cmp);
+    let median = depths[depths.len() / 2];
+    assert!((median - 3.3).abs() < 0.2, "median depth {median}");
+    let close = depths.iter().filter(|z| (**z - 3.3).abs() < 0.66).count();
+    assert!(
+        close * 10 >= depths.len() * 8,
+        "{close} of {} near 3.3 m",
+        depths.len()
+    );
+}
+
+#[test]
+fn secondary_cameras_take_their_own_keypoint_budget() {
+    let camera = pinhole(240.0, 240.0, 188.0, 120.0);
+    let size = ImageSize {
+        width: 376,
+        height: 240,
+    };
+    let view = |primary_from_camera| kornia_sensors::RigCamera {
+        camera: camera.clone(),
+        size,
+        primary_from_camera,
+    };
+    let rig = SensorRig::new(camera.clone()).with_rig_cameras(vec![
+        view(Pose3d::IDENTITY),
+        view(Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            kornia_algebra::Vec3F64::new(0.11, 0.0, 0.0),
+        )),
+    ]);
+    let (left, right) = synthetic_pair(376, 240, 8);
+    let full = OrbFrontend::new(OrbDetector::default(), &rig)
+        .prepare_rig(1, &[&left, &right])
+        .unwrap();
+    // ORB's budget is a per-level target, not a hard cap: compare counts.
+    let capped = OrbFrontend::new(OrbDetector::default(), &rig)
+        .with_secondary_keypoints(100)
+        .prepare_rig(1, &[&left, &right])
+        .unwrap();
+
+    assert_eq!(capped.rig.camera_ranges[0], full.rig.camera_ranges[0]);
+    let (n, n_full) = (
+        capped.rig.camera_ranges[1].len(),
+        full.rig.camera_ranges[1].len(),
+    );
+    assert!(n < n_full / 2, "{n} of {n_full}");
+}

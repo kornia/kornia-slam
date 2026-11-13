@@ -8,7 +8,7 @@
 //! | Group | Examples |
 //! |---|---|
 //! | `mutation` | `insert_keyframe`, `insert_landmark`, `link_observation`, `apply_insertion`, `merge_map_points` |
-//! | `correction` | `apply_pose_graph_correction`, `apply_inertial_alignment`, `apply_ba_update` |
+//! | `correction` | `apply_pose_graph_correction`, `apply_graph_correction`, `apply_inertial_alignment`, `apply_ba_update` |
 //! | `geometry` | derived landmark geometry and the refresh set each correction owes |
 //! | `removal` | `remove_keyframe` — the IMU chain through it is merged, never cut |
 //! | `queries` | `covisible_keyframes`, `covisible_keyframes_min_weight` — thresholds belong to consumers |
@@ -58,13 +58,17 @@ mod keyframe;
 mod map_point;
 mod ops;
 
+use crate::mapping::marginalization::MarginalPrior;
+
 pub use imu_factor::ImuFactor;
 pub use keyframe::Keyframe;
 pub use map_point::{LandmarkObservation, MapPoint, ObservationKey};
+pub(crate) use ops::{BaOutcome, BaSolve};
 pub use ops::{
-    BaSnapshot, BaUpdate, BaUpdateError, BaWindow, InertialAlignment, InertialAlignmentError,
-    KeyframeBaCorrection, KeyframeVelocity, LocalBaMergeResult, LocalBaStats, MapPointMergeResult,
-    PoseGraphCorrectionError, PoseGraphCorrectionResult,
+    BaSnapshot, BaUpdate, BaUpdateError, BaWindow, GraphCorrectionResult, InertialAlignment,
+    InertialAlignmentError, KeyframeBaCorrection, KeyframePoseChange, KeyframeVelocity,
+    LocalBaMergeResult, LocalBaStats, MapPointMergeResult, PoseGraphCorrectionError,
+    PoseGraphCorrectionResult, StateEnvelope, StateEnvelopeLimits,
 };
 pub use ops::{
     InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError, ObservationLink,
@@ -83,6 +87,9 @@ pub struct Map {
     keyframes: Vec<Keyframe>,
     map_points: Vec<MapPoint>,
     imu_factors: Vec<ImuFactor>,
+    /// The local VI-BA's boundary prior, carried from one window to the next;
+    /// valid only in the world epoch it names.
+    marginal_prior: Option<MarginalPrior>,
     // Incremented whenever the map's world coordinate frame changes. Local BA
     // snapshots from an older epoch must never be merged into the new frame.
     world_epoch: u64,
@@ -111,13 +118,13 @@ impl Map {
 
     /// Returns the keyframe with frame index `idx`, if present.
     pub fn get_keyframe(&self, idx: usize) -> Option<&Keyframe> {
-        self.keyframes.iter().find(|kf| kf.frame.idx == idx)
+        keyframe_slot(&self.keyframes, idx).map(|slot| &self.keyframes[slot])
     }
 
     /// Mutable access to one stored keyframe, for numeric writeback. Private
     /// for the same reason as [`Map::keyframes_mut`].
     fn get_keyframe_mut(&mut self, idx: usize) -> Option<&mut Keyframe> {
-        self.keyframes.iter_mut().find(|kf| kf.frame.idx == idx)
+        keyframe_slot(&self.keyframes, idx).map(|slot| &mut self.keyframes[slot])
     }
 
     /// Returns all map points.
@@ -146,6 +153,12 @@ impl Map {
         self.map_points.iter().filter(|mp| !mp.culled).count()
     }
 
+    /// Advances whenever the map's world frame changes; a result computed from an older epoch
+    /// belongs to another world.
+    pub(crate) fn world_epoch(&self) -> u64 {
+        self.world_epoch
+    }
+
     /// Returns all keyframe-to-keyframe IMU factors in insertion order.
     pub fn imu_factors(&self) -> &[ImuFactor] {
         &self.imu_factors
@@ -154,3 +167,17 @@ impl Map {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// Slot of the keyframe with frame index `idx` (ids are unique). Keyframes
+/// are appended in frame order, so a binary search finds it in O(log n); the
+/// linear scan runs only for an absent id or an out-of-order list. Lookups by
+/// id run per landmark observer, and a parked map gives every landmark one
+/// observer per keyframe, so a linear find made keyframe insertion quadratic
+/// in the keyframe count.
+fn keyframe_slot(keyframes: &[Keyframe], idx: usize) -> Option<usize> {
+    let slot = keyframes.partition_point(|kf| kf.frame.idx < idx);
+    if keyframes.get(slot).is_some_and(|kf| kf.frame.idx == idx) {
+        return Some(slot);
+    }
+    keyframes.iter().position(|kf| kf.frame.idx == idx)
+}
