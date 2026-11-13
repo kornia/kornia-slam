@@ -29,6 +29,12 @@ fallback overwrites its reject reason; `S` is `LowProjectionMatches`,
 refused by the inertial-prediction inlier gate logs
 `[proj] frame=N trusted_gate inliers=k`. Tracking is unchanged.
 
+**`--trajectory-coasted <path>`.** The CLI writes the frames skipped while
+coasting on the IMU prediction to a second file in the `--trajectory-out`
+layout, so coasted poses can be measured without changing the scored file.
+Bootstrap skips, which hold the pose from before the loss, and visual coasts
+are not written.
+
 **Loop closing can solve off the tracking thread.** `LoopClosingMode::Enabled`
 gains an optional `execution` (source-breaking for code that builds the variant
 by hand): `Synchronous`, the default, keeps today's inline solve whatever the
