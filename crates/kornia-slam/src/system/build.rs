@@ -8,7 +8,7 @@ use super::config::{
 use super::validation::ConfigError;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabulary};
-use crate::loop_closure::{LoopCloser, LoopSolver};
+use crate::loop_closure::{LoopCloser, LoopClosingConfig, LoopSolver};
 use crate::mapping::LocalMappingMode;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
@@ -103,6 +103,7 @@ impl SystemConfig {
         let LoopClosingMode::Enabled {
             vocabulary,
             execution,
+            graph,
         } = &orb.loop_closing
         else {
             return Ok(None);
@@ -114,11 +115,11 @@ impl SystemConfig {
                 LoopSolver::Synchronous
             }
         };
-        let closer = LoopCloser::new(
-            load_vocabulary(vocabulary)?,
-            orb.tuning.loop_correction.clone(),
-            rig.imu.is_some(),
-        );
+        let config = LoopClosingConfig {
+            graph: *graph,
+            ..orb.tuning.loop_correction.clone()
+        };
+        let closer = LoopCloser::new(load_vocabulary(vocabulary)?, config, rig.imu.is_some());
         Ok(Some(closer.with_solver(solver)))
     }
 

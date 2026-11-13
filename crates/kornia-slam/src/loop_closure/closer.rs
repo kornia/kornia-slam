@@ -40,29 +40,104 @@ pub struct LoopClosingConfig {
     pub odometry_gate: LoopOdometryGate,
     pub temporal_consistency: LoopTemporalConsistency,
     pub optimizer: PgoConfig,
+    /// Set from [`LoopClosingMode::Enabled`] when the system is built.
+    ///
+    /// [`LoopClosingMode::Enabled`]: crate::system::LoopClosingMode::Enabled
+    pub graph: LoopGraphSettings,
+}
+
+/// How accepted loops are solved. The default is [`optimize_pose_graph`]'s computation: `w * I`
+/// on a fresh snapshot of the map at every solve.
+///
+/// [`optimize_pose_graph`]: crate::loop_closure::optimize_pose_graph
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct LoopGraphSettings {
     pub information: LoopGraphInformation,
+    /// Keep the graph across solves, so a keyframe the map culls or evicts stays a node and the
+    /// loops that touch it keep constraining the map. `false` builds the graph from the map's
+    /// keyframes at each solve and refuses a loop whose keyframe left the map.
+    pub persistent: bool,
 }
 
 /// The information odometry and loop edges carry in the pose graph.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum LoopGraphInformation {
     /// `w * I` from [`PgoConfig`]: the scalar weights of [`optimize_pose_graph`].
     ///
     /// [`optimize_pose_graph`]: crate::loop_closure::optimize_pose_graph
+    #[default]
     ScalarWeights,
-    /// Odometry edges at the drift model's per-metre sigmas over their own path, loop edges at
-    /// its floors (the verified pose's own noise) under a Cauchy kernel in whitened units.
+    /// Odometry edges a random walk in path; loop edges at the verified pose's own noise
+    /// (`loop_sigma_m`, `loop_sigma_rad`) under a Cauchy kernel at `loop_cauchy_scale` sigmas.
+    /// Omitted fields take [`LoopGraphInformation::drift`]'s values.
     Drift {
-        drift: DriftModel,
+        #[cfg_attr(feature = "serde", serde(default))]
+        odometry: OdometryRandomWalk,
+        #[cfg_attr(feature = "serde", serde(default = "default_loop_sigma_m"))]
+        loop_sigma_m: f64,
+        #[cfg_attr(feature = "serde", serde(default = "default_loop_sigma_rad"))]
+        loop_sigma_rad: f64,
+        #[cfg_attr(feature = "serde", serde(default = "default_loop_cauchy_scale"))]
         loop_cauchy_scale: f64,
     },
 }
 
-impl Default for LoopGraphInformation {
-    fn default() -> Self {
+#[cfg(feature = "serde")]
+fn default_loop_sigma_m() -> f64 {
+    DriftModel::default().translation_floor_m
+}
+
+#[cfg(feature = "serde")]
+fn default_loop_sigma_rad() -> f64 {
+    DriftModel::default().yaw_floor_rad
+}
+
+#[cfg(feature = "serde")]
+fn default_loop_cauchy_scale() -> f64 {
+    3.0
+}
+
+impl LoopGraphInformation {
+    /// `Drift` with the default random walk, the [`DriftModel`] floors as the loop noise, and
+    /// Cauchy at 3 sigma.
+    pub fn drift() -> Self {
+        let floors = DriftModel::default();
         Self::Drift {
-            drift: DriftModel::default(),
+            odometry: OdometryRandomWalk::default(),
+            loop_sigma_m: floors.translation_floor_m,
+            loop_sigma_rad: floors.yaw_floor_rad,
             loop_cauchy_scale: 3.0,
+        }
+    }
+}
+
+/// Odometry noise between keyframes as a random walk in path: `sigma = sqrt(rate * path)`, so a
+/// chain of odometry edges has the same sigma whatever the keyframe spacing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct OdometryRandomWalk {
+    pub translation_m2_per_m: f64,
+    /// Applied to every rotation axis; only yaw moves on a gravity manifold.
+    pub rotation_rad2_per_m: f64,
+    /// Conditioning floors for edges that barely move; small, because a per-edge floor
+    /// compounds along the chain like density-dependent noise.
+    pub floor_m: f64,
+    pub floor_rad: f64,
+}
+
+impl Default for OdometryRandomWalk {
+    /// The worst EuRoC Machine Hall rates with loop closing off: translation from MH_04's
+    /// relative-displacement error over 5-40 m, yaw from MH_02's revisit drift.
+    fn default() -> Self {
+        Self {
+            translation_m2_per_m: 0.0145,
+            rotation_rad2_per_m: 2.7e-6,
+            floor_m: 0.001,
+            floor_rad: 1e-4,
         }
     }
 }
@@ -300,6 +375,38 @@ impl LoopCloser {
         self.acceptance.verified_loops.len()
     }
 
+    /// What the closer does with a loop the episode tracker made ready.
+    pub(crate) fn close_loop_for_test(
+        &mut self,
+        map: &mut Map,
+        camera: &PinholeCamera,
+        representative: VerifiedLoopEdge,
+        context: LoopClosingContext,
+    ) -> LoopClosingOutcome {
+        let mut outcome = LoopClosingOutcome::default();
+        self.acceptance
+            .close_loop(map, camera, representative, context, &mut outcome);
+        outcome
+    }
+
+    /// What the closer does with a loop the episode tracker made ready, inline or queued.
+    pub(crate) fn handle_accepted_for_test(
+        &mut self,
+        map: &mut Map,
+        camera: &PinholeCamera,
+        representative: VerifiedLoopEdge,
+        context: LoopClosingContext,
+    ) -> LoopClosingOutcome {
+        let mut outcome = LoopClosingOutcome::default();
+        self.acceptance
+            .handle_accepted(map, camera, representative, context, &mut outcome);
+        outcome
+    }
+
+    pub(crate) fn queued_for_test(&self) -> usize {
+        self.acceptance.queued.len()
+    }
+
     pub(crate) fn mark_verified_for_test(&mut self, a: usize, b: usize) {
         self.acceptance
             .verified_loop_pairs
@@ -317,8 +424,9 @@ struct LoopAcceptance {
     temporal_gate: TemporalConsistencyGate,
     verified_loops: Vec<VerifiedLoopEdge>,
     verified_loop_pairs: HashSet<(usize, usize)>,
-    /// Every keyframe the map has held since the last reset, kept across solves: a culled or
-    /// evicted keyframe stays a node, so the loops that touch it still constrain the map.
+    /// With [`LoopGraphSettings::persistent`], every keyframe the map has held since the last
+    /// reset, kept across solves: a culled or evicted keyframe stays a node, so the loops that
+    /// touch it still constrain the map. Otherwise the last solve's snapshot.
     graph: PoseGraph<()>,
     /// Verified loops whose edge is in `graph`.
     loops_in_graph: HashSet<(usize, usize)>,
@@ -348,7 +456,7 @@ impl LoopAcceptance {
             TemporalConsistencyGate::new(config.temporal_consistency, config.episode);
         let graph = PoseGraph::new(snapshot_graph_config(
             &config.optimizer,
-            config.information,
+            config.graph.information,
             None,
         ));
         Self {
@@ -387,22 +495,7 @@ impl LoopAcceptance {
         if let Some(representative) =
             self.accept(map, camera, kf_idx, candidates, context, &mut outcome)
         {
-            if self.solver.is_synchronous() {
-                let job = self.solve_job(
-                    map,
-                    self.pending_loops(Some(&representative)),
-                    context,
-                    None,
-                );
-                let solved = job.run();
-                self.apply_synchronous(map, camera, solved, &representative, context, &mut outcome);
-                self.record(representative);
-            } else {
-                self.record(representative.clone());
-                self.queued.push(representative);
-                outcome.queued = true;
-                self.submit_queued(map, camera, context, &mut outcome);
-            }
+            self.handle_accepted(map, camera, representative, context, &mut outcome);
         }
         let timing = &mut outcome.timing;
         timing.graph_edges = self.graph.edges().count();
@@ -488,15 +581,65 @@ impl LoopAcceptance {
         self.verified_loops.push(edge);
     }
 
-    /// Every verified loop not yet in the graph, then `newest` when it is not recorded yet.
+    /// Closes `representative` inline, or queues it for the worker.
+    fn handle_accepted(
+        &mut self,
+        map: &mut Map,
+        camera: &PinholeCamera,
+        representative: VerifiedLoopEdge,
+        context: LoopClosingContext,
+        outcome: &mut LoopClosingOutcome,
+    ) {
+        if self.solver.is_synchronous() {
+            self.close_loop(map, camera, representative, context, outcome);
+        } else if self.stopped {
+            // No solve will run: report the loop now rather than queue it forever.
+            outcome.events.push(LoopClosureEvent::Accepted {
+                edge: representative.clone(),
+                applied: false,
+            });
+            self.record(representative);
+        } else {
+            self.record(representative.clone());
+            self.queued.push(representative);
+            outcome.queued = true;
+            self.submit_queued(map, camera, context, outcome);
+        }
+    }
+
+    /// Solves the graph with `representative` and every pending loop inline, corrects the map
+    /// when the solve is usable, and records the loop either way.
+    fn close_loop(
+        &mut self,
+        map: &mut Map,
+        camera: &PinholeCamera,
+        representative: VerifiedLoopEdge,
+        context: LoopClosingContext,
+        outcome: &mut LoopClosingOutcome,
+    ) {
+        let job = self.solve_job(
+            map,
+            self.pending_loops(Some(&representative)),
+            context,
+            None,
+        );
+        let solved = job.run();
+        self.apply_synchronous(map, camera, solved, &representative, context, outcome);
+        self.record(representative);
+    }
+
+    /// Every verified loop not yet in the graph, then `newest` when it is not recorded yet. A
+    /// snapshot graph holds none, so it takes them all.
     fn pending_loops(&self, newest: Option<&VerifiedLoopEdge>) -> Vec<VerifiedLoopEdge> {
+        let persistent = self.config.graph.persistent;
         self.verified_loops
             .iter()
             .filter(|edge| {
-                !self.loops_in_graph.contains(&normalized_loop_pair(
-                    edge.query_kf_idx,
-                    edge.candidate_kf_idx,
-                ))
+                !persistent
+                    || !self.loops_in_graph.contains(&normalized_loop_pair(
+                        edge.query_kf_idx,
+                        edge.candidate_kf_idx,
+                    ))
             })
             .chain(newest)
             .cloned()
@@ -519,7 +662,7 @@ impl LoopAcceptance {
             loops,
             graph: self.graph.clone(),
             optimizer: self.config.optimizer.clone(),
-            information: self.config.information,
+            settings: self.config.graph,
             inertial: context.imu_initialized.then_some(InertialPgoContext {
                 gravity_world: context.gravity_world,
             }),
@@ -951,12 +1094,16 @@ pub(super) fn optimize_through_graph(
     inertial: Option<InertialPgoContext>,
 ) -> Result<PgoResult, PgoError> {
     let mut graph = PoseGraph::new(snapshot_graph_config(config, information, inertial));
+    let settings = LoopGraphSettings {
+        information,
+        persistent: false,
+    };
     solve_in_graph(
         &mut graph,
         &keyframe_poses(map),
         verified_loops,
         config,
-        information,
+        settings,
         inertial,
     )
     .map(|(result, _)| result)
@@ -971,16 +1118,20 @@ pub(super) fn keyframe_poses(map: &Map) -> Vec<(usize, Pose3d)> {
 }
 
 /// Syncs `graph` to the map's `keyframes` (map order, world-to-camera), adds `loops` (the last
-/// is the new one) and solves. Earlier loops whose keyframes the graph never held are dropped;
-/// `true` when the map is a new world and the graph started over.
+/// is the new one) and solves; `true` when the map is a new world and the graph started over. A
+/// persistent graph drops earlier loops whose keyframes it never held; a snapshot refuses any
+/// loop whose keyframe is not in the map, as [`optimize_pose_graph`] does.
+///
+/// [`optimize_pose_graph`]: crate::loop_closure::optimize_pose_graph
 pub(super) fn solve_in_graph(
     graph: &mut PoseGraph<()>,
     keyframes: &[(usize, Pose3d)],
     loops: &[VerifiedLoopEdge],
     config: &PgoConfig,
-    information: LoopGraphInformation,
+    settings: LoopGraphSettings,
     inertial: Option<InertialPgoContext>,
 ) -> Result<(PgoResult, bool), PgoError> {
+    let information = settings.information;
     let solver = |error: PoseGraphError| PgoError::Solver(error.to_string());
     if keyframes.len() < 2 {
         return Err(PgoError::TooFewKeyframes);
@@ -988,21 +1139,27 @@ pub(super) fn solve_in_graph(
     let Some((new_loop, earlier)) = loops.split_last() else {
         return Err(PgoError::MissingLoopKeyframe);
     };
-    let new_world = sync_graph(graph, keyframes).map_err(solver)?;
+    let new_world = sync_graph(graph, keyframes, settings.persistent).map_err(solver)?;
     graph.set_manifold(snapshot_graph_config(config, information, inertial).manifold);
     let (sigma_m, sigma_rad) = match information {
         LoopGraphInformation::ScalarWeights => {
             let sigma = 1.0 / f64::from(config.loop_edge_weight);
             (sigma, sigma)
         }
-        LoopGraphInformation::Drift { drift, .. } => {
-            (drift.translation_floor_m, drift.yaw_floor_rad)
-        }
+        LoopGraphInformation::Drift {
+            loop_sigma_m,
+            loop_sigma_rad,
+            ..
+        } => (loop_sigma_m, loop_sigma_rad),
     };
     let known = |kf: usize| graph.node_of_keyframe(kf).is_some();
+    let held = |edge: &VerifiedLoopEdge| known(edge.query_kf_idx) && known(edge.candidate_kf_idx);
+    if !settings.persistent && !earlier.iter().all(held) {
+        return Err(PgoError::MissingLoopKeyframe);
+    }
     let loops: Vec<_> = earlier
         .iter()
-        .filter(|edge| known(edge.query_kf_idx) && known(edge.candidate_kf_idx))
+        .filter(|edge| held(edge))
         .chain(std::iter::once(new_loop))
         .map(|edge| {
             let measurement = LoopMeasurement {
@@ -1041,15 +1198,17 @@ pub(super) fn solve_in_graph(
 
 /// Makes `graph`'s live keyframes the map's, in map order, at the map's poses: keyframes the map
 /// dropped are forgotten where the graph last placed them, new ones are appended. A map sharing
-/// no keyframe with the graph is a new world, and the graph starts over (`true`).
-fn sync_graph(
+/// no keyframe with the graph is a new world, and the graph starts over (`true`); a graph that
+/// does not persist starts over every time.
+pub(super) fn sync_graph(
     graph: &mut PoseGraph<()>,
     keyframes: &[(usize, Pose3d)],
+    persistent: bool,
 ) -> Result<bool, PoseGraphError> {
     let in_map: HashSet<usize> = keyframes.iter().map(|&(kf, _)| kf).collect();
     let (live, _, _) = graph.poses_before_after();
     let new_world = !live.is_empty() && !live.iter().any(|kf| in_map.contains(kf));
-    if new_world {
+    if new_world || !persistent {
         graph.reset();
     } else {
         for &kf in live.iter().filter(|kf| !in_map.contains(kf)) {
@@ -1060,6 +1219,13 @@ fn sync_graph(
             let pose = graph.nodes()[node.0].pose;
             graph.refresh_odometry(kf, pose)?;
             graph.forget_keyframe(kf);
+        }
+        let last_held = keyframes
+            .iter()
+            .rev()
+            .find(|&&(kf, _)| graph.node_of_keyframe(kf).is_some());
+        if let Some(&(_, pose)) = last_held {
+            graph.rebase_path(pose);
         }
     }
     for &(kf, pose) in keyframes {
@@ -1079,25 +1245,26 @@ fn sync_graph(
     Ok(new_world)
 }
 
-/// Every keyframe a node. Scalar weights put `sigma = 1 / w = 1` on odometry edges; the drift
-/// model has no per-radian term, and its odometry sigmas keep the graph's floors.
+/// Every keyframe a node. Scalar weights put `sigma = 1 / w = 1` on odometry edges; `Drift` makes
+/// them its random walk, with no linear or per-radian term.
 pub(super) fn snapshot_graph_config(
     config: &PgoConfig,
     information: LoopGraphInformation,
     inertial: Option<InertialPgoContext>,
 ) -> PoseGraphConfig {
     let defaults = PoseGraphConfig::default();
-    let (drift_m_per_m, drift_rad_per_m, min_sigma_m, min_sigma_rad, loop_cauchy_scale) =
+    let (walk_m2_per_m, walk_rad2_per_m, min_sigma_m, min_sigma_rad, loop_cauchy_scale) =
         match information {
             LoopGraphInformation::ScalarWeights => (0.0, 0.0, 1.0, 1.0, None),
             LoopGraphInformation::Drift {
-                drift,
+                odometry,
                 loop_cauchy_scale,
+                ..
             } => (
-                drift.translation_per_m,
-                drift.yaw_per_m_rad,
-                defaults.min_sigma_m,
-                defaults.min_sigma_rad,
+                odometry.translation_m2_per_m,
+                odometry.rotation_rad2_per_m,
+                odometry.floor_m,
+                odometry.floor_rad,
                 Some(loop_cauchy_scale),
             ),
         };
@@ -1106,9 +1273,11 @@ pub(super) fn snapshot_graph_config(
             GraphManifold::Gravity(context.gravity_world)
         }),
         node_spacing: None,
-        drift_m_per_m,
+        drift_m_per_m: 0.0,
         drift_rad_per_rad: 0.0,
-        drift_rad_per_m,
+        drift_rad_per_m: 0.0,
+        walk_m2_per_m,
+        walk_rad2_per_m,
         min_sigma_m,
         min_sigma_rad,
         loop_max_candidates: 0,

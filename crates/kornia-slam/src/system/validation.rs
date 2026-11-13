@@ -7,7 +7,10 @@ use super::config::{
     SystemConfig,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
-use crate::loop_closure::{LoopClosingConfig, LoopOdometryGate, LoopTemporalConsistency};
+use crate::loop_closure::{
+    LoopClosingConfig, LoopGraphInformation, LoopOdometryGate, LoopTemporalConsistency,
+    OdometryRandomWalk,
+};
 use crate::tracking::KeyframePolicy;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
 
@@ -262,7 +265,39 @@ fn validate_loop_closing(
     if mode.is_enabled() && !metric {
         return Err(ConfigError::LoopClosingWithoutMetricScale);
     }
-    Ok(())
+    match mode.graph().map(|graph| graph.information) {
+        Some(LoopGraphInformation::Drift {
+            odometry,
+            loop_sigma_m,
+            loop_sigma_rad,
+            loop_cauchy_scale,
+        }) => {
+            validate_drift_information(&odometry, [loop_sigma_m, loop_sigma_rad, loop_cauchy_scale])
+        }
+        Some(LoopGraphInformation::ScalarWeights) | None => Ok(()),
+    }
+}
+
+fn validate_drift_information(
+    odometry: &OdometryRandomWalk,
+    [loop_sigma_m, loop_sigma_rad, loop_cauchy_scale]: [f64; 3],
+) -> Result<(), ConfigError> {
+    let at = |field| format!("pipeline.loop_closing.graph.information.{field}");
+    check(
+        at("odometry.translation_m2_per_m"),
+        odometry.translation_m2_per_m,
+        NON_NEGATIVE,
+    )?;
+    check(
+        at("odometry.rotation_rad2_per_m"),
+        odometry.rotation_rad2_per_m,
+        NON_NEGATIVE,
+    )?;
+    check(at("odometry.floor_m"), odometry.floor_m, POSITIVE)?;
+    check(at("odometry.floor_rad"), odometry.floor_rad, POSITIVE)?;
+    check(at("loop_sigma_m"), loop_sigma_m, POSITIVE)?;
+    check(at("loop_sigma_rad"), loop_sigma_rad, POSITIVE)?;
+    check(at("loop_cauchy_scale"), loop_cauchy_scale, POSITIVE)
 }
 
 fn validate_correction(config: &LoopClosingConfig) -> Result<(), ConfigError> {

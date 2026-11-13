@@ -78,6 +78,11 @@ pub struct PoseGraphConfig {
     pub drift_m_per_m: f64,
     pub drift_rad_per_rad: f64,
     pub drift_rad_per_m: f64,
+    /// Random-walk odometry noise, variance per metre travelled (m^2/m, rad^2/m), added in
+    /// quadrature to the linear terms. Unlike them, it composes along a chain of edges to the same
+    /// sigma whatever the node spacing.
+    pub walk_m2_per_m: f64,
+    pub walk_rad2_per_m: f64,
     /// Floors on an odometry edge's sigmas, so a zero-length edge is not infinitely certain.
     pub min_sigma_m: f64,
     pub min_sigma_rad: f64,
@@ -104,6 +109,8 @@ impl Default for PoseGraphConfig {
             drift_m_per_m: 0.02,
             drift_rad_per_rad: 0.03,
             drift_rad_per_m: 0.005,
+            walk_m2_per_m: 0.0,
+            walk_rad2_per_m: 0.0,
             min_sigma_m: 0.01,
             min_sigma_rad: 0.002,
             loop_gate_sigmas: 3.0,
@@ -374,6 +381,12 @@ impl<P> PoseGraph<P> {
         Ok(())
     }
 
+    /// The next keyframe's path is measured from `odometry`, for a source whose world moved under
+    /// the graph, such as a written-back solve: the move is not distance travelled.
+    pub fn rebase_path(&mut self, odometry: Pose3d) {
+        self.last_odometry = Some(odometry);
+    }
+
     /// Feed one odometry keyframe, `odometry` world-to-camera in the odometry world.
     ///
     /// # Errors
@@ -626,9 +639,12 @@ impl<P> PoseGraph<P> {
         let relative = odometry
             .compose(&anchor.odometry_ref.inverse())
             .compose(&anchor.offset);
-        let sigma_m = (self.config.drift_m_per_m * anchor.path_m).max(self.config.min_sigma_m);
+        let sigma_m = (self.config.drift_m_per_m * anchor.path_m)
+            .hypot((self.config.walk_m2_per_m * anchor.path_m).sqrt())
+            .max(self.config.min_sigma_m);
         let sigma_rad = (self.config.drift_rad_per_rad * anchor.turn_rad
             + self.config.drift_rad_per_m * anchor.path_m)
+            .hypot((self.config.walk_rad2_per_m * anchor.path_m).sqrt())
             .max(self.config.min_sigma_rad);
         (relative, sigma_m, sigma_rad)
     }
@@ -713,6 +729,11 @@ impl<P> PoseGraph<P> {
             Ok((poses, report)) => {
                 for (node, pose) in self.nodes.iter_mut().zip(poses) {
                     node.pose = pose;
+                    // Nothing measures a forgotten node again, so its solved pose is its odometry
+                    // from now on: a live neighbour's refresh re-measures their edge against it.
+                    if node.keyframe.is_none() {
+                        node.odometry = pose;
+                    }
                 }
                 self.loops_accepted += loops.len() as u64;
                 on_success(self);
