@@ -44,6 +44,8 @@ pub struct KeyframeJob {
     pub imu_t_bc: Option<Pose3d>,
     pub gravity_world: Vec3F64,
     pub local_ba: LocalBaParams,
+    /// Wheel-odometry edges between keyframes; empty without a wheel feed.
+    pub wheel_factors: Vec<super::wheel_odom::WheelOdomFactor>,
 }
 
 fn capture_local_window(map: &Map, job: &KeyframeJob) -> BaSnapshot {
@@ -57,7 +59,7 @@ fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJo
             camera,
             job.imu_t_bc,
             job.gravity_world,
-            &[],
+            &job.wheel_factors,
             &[],
             &job.local_ba,
         )
@@ -448,6 +450,7 @@ mod tests {
             imu_t_bc: None,
             gravity_world: Vec3F64::ZERO,
             local_ba: LocalBaParams::default(),
+            wheel_factors: Vec::new(),
         }
     }
 
