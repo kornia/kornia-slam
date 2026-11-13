@@ -4,13 +4,16 @@
 //!
 //! Ported from cu-kornia-vio's `wheel` module (the XLeRobot tracker), so a SLAM system and that
 //! tracker integrate the same readings the same way.
+#![allow(
+    dead_code,
+    reason = "the parked gate, the motion prior and the coverage report are the next SlamSystem steps"
+)]
 
 use std::collections::VecDeque;
 
+use crate::mapping::wheel_odom::{WheelOdomFactor, WheelOdomMeasurement};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
-use crate::mapping::wheel_odom::{WheelOdomFactor, WheelOdomMeasurement};
-
 
 /// A wheel-odometry configuration or mount that cannot be used.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

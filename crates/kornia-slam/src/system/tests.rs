@@ -393,3 +393,87 @@ mod keyframe_evidence {
         assert!(!system.keyframe_due(&parked, 1e6), "no bound unless set");
     }
 }
+
+mod wheels {
+    use super::*;
+    use crate::system::wheel::{WheelError, WheelOdomConfig, WheelSample};
+    use kornia_algebra::Mat3F64;
+
+    fn system() -> SlamSystem {
+        SlamSystem::build(
+            config(CameraSelection::Stereo, false, LoopClosingMode::Disabled),
+            stereo_imu_rig(),
+        )
+        .expect("builds")
+    }
+
+    fn straight(seconds: u64) -> Vec<WheelSample> {
+        (0..=seconds * 50)
+            .map(|i| WheelSample {
+                stamp_ns: i * 20_000_000,
+                x: i as f64 * 0.002,
+                y: 0.0,
+                theta: 0.0,
+            })
+            .collect()
+    }
+
+    fn enabled() -> SlamSystem {
+        let mut s = system();
+        s.enable_wheel_odometry(
+            WheelOdomConfig::new(Pose3d::IDENTITY, 0.05, 0.01).expect("valid config"),
+        );
+        s
+    }
+
+    #[test]
+    fn without_wheels_nothing_is_kept_and_jobs_carry_no_factors() {
+        let mut s = system();
+        assert_eq!(s.process_wheel_odometry(straight(1)), 0);
+        assert!(s.push_camera_mount(0, Pose3d::IDENTITY).is_ok());
+        s.note_wheel_keyframe(Some((0, 0.0)), 5, 1.0);
+        assert!(s.wheel_factors().is_empty());
+    }
+
+    #[test]
+    fn a_covered_keyframe_interval_becomes_one_edge_between_those_keyframes() {
+        let mut s = enabled();
+        assert!(s.process_wheel_odometry(straight(2)) > 0);
+        s.note_wheel_keyframe(None, 0, 0.0);
+        s.note_wheel_keyframe(Some((0, 0.0)), 5, 1.0);
+        let factors = s.wheel_factors();
+        assert_eq!(factors.len(), 1);
+        assert_eq!((factors[0].from_idx, factors[0].to_idx), (0, 5));
+    }
+
+    #[test]
+    fn an_interval_past_the_newest_reading_waits_for_the_readings() {
+        let mut s = enabled();
+        s.process_wheel_odometry(straight(1));
+        s.note_wheel_keyframe(Some((0, 0.5)), 9, 3.0);
+        assert!(s.wheel_factors().is_empty(), "not covered yet");
+        s.process_wheel_odometry((51..=200).map(|i| WheelSample {
+            stamp_ns: i * 20_000_000,
+            x: i as f64 * 0.002,
+            y: 0.0,
+            theta: 0.0,
+        }));
+        s.note_wheel_keyframe(Some((9, 3.0)), 12, 3.5);
+        let ends: Vec<_> = s
+            .wheel_factors()
+            .iter()
+            .map(|f| (f.from_idx, f.to_idx))
+            .collect();
+        assert!(ends.contains(&(0, 9)), "the waiting edge landed: {ends:?}");
+    }
+
+    #[test]
+    fn a_non_rigid_mount_is_refused() {
+        let mut s = enabled();
+        let skew = Pose3d::new(Mat3F64::IDENTITY * 2.0, Vec3F64::ZERO);
+        assert!(matches!(
+            s.push_camera_mount(0, skew),
+            Err(WheelError::MountNotRigid { .. })
+        ));
+    }
+}
