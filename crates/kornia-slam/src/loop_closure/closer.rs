@@ -223,6 +223,14 @@ pub(crate) struct LoopCloser {
 }
 
 impl LoopCloser {
+    /// Drops keyframes the map no longer holds from place recognition. The pose graph forgets
+    /// them on its own (`sync_graph`); the database would keep scoring them.
+    pub(crate) fn forget_keyframes(&mut self, removed: impl IntoIterator<Item = usize>) {
+        for kf_idx in removed {
+            self.kf_database.erase(kf_idx);
+        }
+    }
+
     /// `require_imu_initialized` holds correction back until inertial
     /// initialization.
     pub(crate) fn new(

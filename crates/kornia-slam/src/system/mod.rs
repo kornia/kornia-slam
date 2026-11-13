@@ -98,6 +98,8 @@ pub struct SlamSystem {
     next_frame_idx: usize,
     // Wheel-odometry readings and the keyframe edges built from them, when enabled.
     wheel: Option<wheel::WheelState>,
+    // The keyframe bound and the culling that enforces it first, when set.
+    map_bound: Option<(usize, crate::mapping::culling::KeyframeCullingConfig)>,
 }
 
 impl SlamSystem {
@@ -147,7 +149,47 @@ impl SlamSystem {
             tracking_duration: Duration::ZERO,
             next_frame_idx: 0,
             wheel: None,
+            map_bound: None,
         }
+    }
+
+    /// Holds the map to `max_keyframes` after each keyframe: redundant keyframes are culled first,
+    /// then the oldest evicted (see [`crate::mapping::culling::bound_keyframes`]). Unbounded until
+    /// called; a bounded map trades loops past the bound for a per-frame cost that stops growing.
+    pub fn set_map_bound(
+        &mut self,
+        max_keyframes: usize,
+        culling: crate::mapping::culling::KeyframeCullingConfig,
+    ) {
+        self.map_bound = Some((max_keyframes, culling));
+    }
+
+    /// Runs inside a frame, which already holds the map publication gate.
+    fn enforce_map_bound(&mut self) {
+        let Some((max_keyframes, culling)) = self.map_bound.clone() else {
+            return;
+        };
+        let report = {
+            let mut map = self.map.lock().unwrap();
+            let wheel_factors = self.wheel.as_mut().map(|w| w.factors_mut());
+            crate::mapping::culling::bound_keyframes(
+                &mut map,
+                max_keyframes,
+                &culling,
+                wheel_factors,
+            )
+        };
+        if report.culled.is_empty() && report.evicted.is_empty() {
+            return;
+        }
+        if let Some(loop_closer) = self.loop_closer.as_mut() {
+            loop_closer.forget_keyframes(report.removed());
+        }
+        self.dbg(format!(
+            "[map_bound] culled={} evicted={} (bound {max_keyframes})",
+            report.culled.len(),
+            report.evicted.len()
+        ));
     }
 
     /// Adds wheel odometry to local BA: each keyframe interval the readings cover becomes a
@@ -1415,6 +1457,7 @@ impl SlamSystem {
         self.apply_local_mapping_results();
 
         self.register_place_recognition(frame.idx);
+        self.enforce_map_bound();
 
         true
     }
