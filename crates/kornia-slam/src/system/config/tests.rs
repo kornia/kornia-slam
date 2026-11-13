@@ -746,6 +746,21 @@ mod ron_files {
                 .lost_keyframes,
             LostKeyframes::Free
         );
+
+        let config =
+            parse("(version: 1, pipeline: OrbSlam((mapping: (local_ba: (visual_kernel: Huber)))))")
+                .unwrap();
+        assert_eq!(
+            orb(&config).mapping.local_ba.visual_kernel,
+            VisualKernel::Huber
+        );
+        assert_eq!(
+            orb(&parse("(version: 1)").unwrap())
+                .mapping
+                .local_ba
+                .visual_kernel,
+            VisualKernel::L2
+        );
     }
 
     /// Tuning is not part of the file format, so a file cannot set it.
