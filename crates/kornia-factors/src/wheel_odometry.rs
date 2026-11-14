@@ -331,7 +331,8 @@ mod tests {
         factor(rng, t_cb_from, t_cb_to)
     }
 
-    /// Near a solution the residual is small and `barfoot_q` takes its series.
+    /// Near a solution the residual is small and the SE(3) log and Jacobian take
+    /// their small-angle series.
     #[test]
     fn jacobians_match_central_differences_near_the_solution() {
         let mut rng = Lcg(11);
