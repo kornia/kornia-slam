@@ -331,7 +331,10 @@ fn inertial_ba_repropagates_active_edges_and_preserves_new_live_edges() {
 #[test]
 fn failed_inertial_solve_still_returns_repropagated_measurements() {
     let mut map = fixture();
-    map.edit_keyframes_for_test(|_, kf| kf.imu_bias.accel.x = 0.05);
+    map.edit_keyframes_for_test(|_, kf| {
+        kf.imu_bias.accel.x = 0.05;
+        kf.frame.ensure_undistorted(&camera());
+    });
     map.apply_insertion(MapInsertion {
         imu_factors: vec![imu_edge(KF_IDS[1], KF_IDS[2])],
         ..Default::default()

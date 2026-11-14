@@ -25,7 +25,7 @@ mod keypoint_grid;
 use std::collections::HashMap;
 
 use kornia_3d::camera::PinholeCamera;
-use kornia_3d::pose::{Pose3d, RansacParams, ransac_fundamental};
+use kornia_3d::pose::{Pose3d, RansacParams, ransac_fundamental_8point};
 use kornia_algebra::{Vec2F32, Vec2F64};
 use kornia_image::ImageSize;
 use kornia_imgproc::features::hamming_distance;
@@ -33,7 +33,7 @@ use kornia_imgproc::features::hamming_distance;
 use super::pnp::{self, PnpConfig};
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
-use crate::frame::Frame;
+use crate::frame::{Frame, is_finite_xy, undistort_keypoint};
 use crate::mapping::map::{Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 
@@ -204,9 +204,11 @@ impl MapProjectionEstimator {
         );
 
         // Shared logic: try_track → refine_pose → Estimate, or propagate rejection.
-        let try_track_and_refine = |correspondences: Vec<(usize, usize)>,
+        let try_track_and_refine = |mut correspondences: Vec<(usize, usize)>,
                                     pose_init: &Pose3d|
          -> Result<Estimate, MapProjectionRejectReason> {
+            correspondences
+                .retain(|&(_, kp_idx)| curr_keypoints_undist.get(kp_idx).is_some_and(is_finite_xy));
             let correspondences = self.geometric_consistency_filter(
                 current_kf,
                 &correspondences,
@@ -356,7 +358,8 @@ impl MapProjectionEstimator {
             threshold: self.config.geometric_filter_threshold_px,
             ..RansacParams::default()
         };
-        let Ok(result) = ransac_fundamental(&reference_points, &current_points, &params) else {
+        let Ok(result) = ransac_fundamental_8point(&reference_points, &current_points, &params)
+        else {
             return correspondences.to_vec();
         };
 
@@ -495,10 +498,7 @@ impl MapProjectionEstimator {
                     .features
                     .keypoints_xy
                     .iter()
-                    .map(|kp| {
-                        let p = camera.undistort(kp[0] as f64, kp[1] as f64);
-                        [p.x as f32, p.y as f32]
-                    })
+                    .map(|kp| undistort_keypoint(camera, kp))
                     .collect()
             };
 
@@ -855,6 +855,45 @@ mod matching_tests {
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0], (0, 0));
+    }
+
+    #[test]
+    fn a_keypoint_without_an_undistorted_pixel_is_never_matched() {
+        let estimator = make_test_estimator();
+        let camera = test_camera();
+        let descriptor = [0u8; 32];
+        // Projects to (10, 10), in the grid cell a NaN keypoint falls into.
+        let map_points = vec![MapPoint::new(
+            Vec3F64::new(-7.75, -5.75, 5.0),
+            descriptor,
+            0,
+            [0; 3],
+            0,
+        )];
+        let keypoints_xy = vec![[f32::NAN; 2], [12.0, 11.0]];
+        let grid = KeypointGrid::new(&keypoints_xy, 640.0, 480.0, 64.0);
+
+        let matches = estimator.match_by_projection(
+            &map_points,
+            &[0],
+            &keypoints_xy,
+            &[descriptor; 2],
+            &[0, 0],
+            &grid,
+            &camera,
+            &Pose3d::new(Mat3F64::IDENTITY, Vec3F64::ZERO),
+            ImageSize {
+                width: 640,
+                height: 480,
+            },
+            ProjectionMatchConfig {
+                min_depth: 0.0,
+                search_radius: 15.0,
+                max_hamming: 50,
+            },
+        );
+
+        assert_eq!(matches, vec![(0, 1)]);
     }
 
     #[test]
