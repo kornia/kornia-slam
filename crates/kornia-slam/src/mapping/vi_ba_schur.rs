@@ -67,7 +67,7 @@
 
 use faer::Mat;
 use faer::prelude::Solve;
-use kornia_algebra::{Mat6F64, Mat15F64, SE3F32, Vec3F64, Vec6F64, Vec15F64};
+use kornia_algebra::{Mat6F64, Mat15F64, SE3F32, SMatF64, SVecF64, Vec3F64, Vec6F64, Vec15F64};
 use thiserror::Error;
 
 use crate::pose_conversion::{pose_to_se3, se3_to_pose, vec3_to_f32};
@@ -499,10 +499,10 @@ fn enforce_cheirality(
 /// out along the ray by whatever round-off left there. Damping bounds the
 /// step, not the depth: λ falls to its floor on accepted steps, so a
 /// depth-free landmark still drifts along its ray across windows.
-fn damp_point_blocks(c_blocks: &mut [[f64; 9]], lambda: f64) {
+fn damp_point_blocks(c_blocks: &mut [SMatF64<3, 3>], lambda: f64) {
     for cb in c_blocks {
         for d in 0..3 {
-            cb[d * 4] += lambda * cb[d * 4].max(MIN_DAMPING_FLOOR);
+            cb[(d, d)] += lambda * cb[(d, d)].max(MIN_DAMPING_FLOOR);
         }
     }
 }
@@ -667,17 +667,9 @@ fn accum_jt_omega_j(
     update_rhs: bool,
 ) {
     let j_a_t = j_a.transpose();
-    let h = j_a_t * (omega * j_b);
-    for i in 0..15 {
-        for j in 0..15 {
-            m_mat[(row_base + i, col_base + j)] += h[(i, j)];
-        }
-    }
+    add_block(m_mat, row_base, col_base, &(j_a_t * (omega * j_b)));
     if update_rhs {
-        let g = j_a_t * (omega * res);
-        for i in 0..15 {
-            m_vec[row_base + i] -= g[i];
-        }
+        sub_from(m_vec, row_base, &(j_a_t * (omega * res)));
     }
 }
 
@@ -707,40 +699,88 @@ fn imu_information_matrix(pim: &PreintegratedImu, weight: f64) -> Mat15F64 {
     info.omega
 }
 
-/// f64 version of invert_3x3 (the existing one uses f32).
-fn invert_3x3_f64(m: &[f64; 9]) -> Option<[f64; 9]> {
-    let det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6])
-        + m[2] * (m[3] * m[7] - m[4] * m[6]);
-    if det.abs() < 1e-20 {
+/// Inverse of a point block, refused as singular below `|det| < 1e-20`
+/// rather than only at an exact zero.
+fn invert_point_block(c: &SMatF64<3, 3>) -> Option<SMatF64<3, 3>> {
+    if c.determinant().abs() < 1e-20 {
         return None;
     }
-    let inv = 1.0 / det;
-    Some([
-        (m[4] * m[8] - m[5] * m[7]) * inv,
-        (m[2] * m[7] - m[1] * m[8]) * inv,
-        (m[1] * m[5] - m[2] * m[4]) * inv,
-        (m[5] * m[6] - m[3] * m[8]) * inv,
-        (m[0] * m[8] - m[2] * m[6]) * inv,
-        (m[2] * m[3] - m[0] * m[5]) * inv,
-        (m[3] * m[7] - m[4] * m[6]) * inv,
-        (m[1] * m[6] - m[0] * m[7]) * inv,
-        (m[0] * m[4] - m[1] * m[3]) * inv,
-    ])
+    c.try_inverse()
 }
 
-/// f64 version of matmul_6x3_3x3.
-fn matmul_6x3_3x3_f64(a: &[f64; 18], b: &[f64; 9]) -> [f64; 18] {
-    let mut out = [0.0f64; 18];
-    for i in 0..6 {
-        for k in 0..3 {
-            let mut s = 0.0f64;
-            for r in 0..3 {
-                s += a[i * 3 + r] * b[r * 3 + k];
-            }
-            out[i * 3 + k] = s;
+/// Adds `block` into `m_mat` with its top-left entry at (`row0`, `col0`).
+fn add_block<const R: usize, const C: usize>(
+    m_mat: &mut Mat<f64>,
+    row0: usize,
+    col0: usize,
+    block: &SMatF64<R, C>,
+) {
+    for c in 0..C {
+        for r in 0..R {
+            m_mat[(row0 + r, col0 + c)] += block[(r, c)];
         }
     }
-    out
+}
+
+/// Subtracts `v` from `m_vec[base..]`.
+fn sub_from<const N: usize>(m_vec: &mut [f64], base: usize, v: &SVecF64<N>) {
+    for (m, x) in m_vec[base..base + N].iter_mut().zip(v.iter()) {
+        *m -= x;
+    }
+}
+
+/// Norms of the rotation, velocity, position, gyro-bias and accel-bias
+/// parts of an IMU residual.
+fn imu_residual_norms(res: &Vec15F64) -> [f64; 5] {
+    std::array::from_fn(|k| res.fixed_rows::<3>(3 * k).norm())
+}
+
+/// The visual (reprojection and depth) part of the Schur system: 6×6 pose
+/// blocks A and gradients per free keyframe, 3×3 point blocks C and gradients
+/// per free point, and the 6×3 couplings B grouped by free point.
+struct VisualBlocks {
+    a: Vec<Mat6F64>,
+    g_pose: Vec<Vec6F64>,
+    c: Vec<SMatF64<3, 3>>,
+    g_point: Vec<SVecF64<3>>,
+    b_by_point: Vec<Vec<(usize, SMatF64<6, 3>)>>,
+}
+
+impl VisualBlocks {
+    fn new(n_free_kf: usize, n_free_pts: usize) -> Self {
+        Self {
+            a: vec![Mat6F64::zeros(); n_free_kf],
+            g_pose: vec![Vec6F64::zeros(); n_free_kf],
+            c: vec![SMatF64::zeros(); n_free_pts],
+            g_point: vec![SVecF64::zeros(); n_free_pts],
+            b_by_point: vec![Vec::new(); n_free_pts],
+        }
+    }
+
+    /// Adds `M` whitened residual rows of one observation, for the free
+    /// keyframe slot `pose` and free point slot `point`.
+    fn add_rows<const M: usize>(
+        &mut self,
+        pose: Option<usize>,
+        point: Option<usize>,
+        j_pose: &SMatF64<M, 6>,
+        j_point: &SMatF64<M, 3>,
+        r: &SVecF64<M>,
+    ) {
+        let j_pose_t = j_pose.transpose();
+        let j_point_t = j_point.transpose();
+        if let Some(p) = pose {
+            self.a[p] += j_pose_t * j_pose;
+            self.g_pose[p] -= j_pose_t * r;
+        }
+        if let Some(x) = point {
+            self.c[x] += j_point_t * j_point;
+            self.g_point[x] -= j_point_t * r;
+        }
+        if let (Some(p), Some(x)) = (pose, point) {
+            self.b_by_point[x].push((p, j_pose_t * j_point));
+        }
+    }
 }
 
 /// Validates the wheel edges and returns each one's information matrix.
@@ -1144,22 +1184,10 @@ pub fn visual_inertial_bundle_adjust(
         let is_first_iter = iters_done == 1;
 
         // ── 1. Schur blocks for visual residuals ─────────────────────────
-        // These are exactly the a_blocks / c_blocks / b_by_point / g_pose /
-        // g_point from bundle_adjust_schur_with_priors, but a_blocks are
-        // 6×6 (pose only) and we scatter them into the 15×15 keyframe slot
-        // when building m_mat.
-
-        // a_blocks[k]: 6×6 visual Hessian for free keyframe k (pose DOF only).
-        let mut a_blocks = vec![[0.0f64; 36]; n_free_kf];
-        // c_blocks[j]: 3×3 point Hessian block.
-        let mut c_blocks = vec![[0.0f64; 9]; n_free_pts];
-        // g_pose[k]: 6-vector RHS for free keyframe k (pose DOF).
-        let mut g_pose = vec![[0.0f64; 6]; n_free_kf];
-        // g_point[j]: 3-vector RHS for free point j.
-        let mut g_point = vec![[0.0f64; 3]; n_free_pts];
-        // B cross-terms grouped by free point index.
-        let mut b_by_point: Vec<Vec<(usize, [f64; 18])>> = vec![Vec::new(); n_free_pts];
-
+        // The blocks of bundle_adjust_schur_with_priors, but A is 6×6 (pose
+        // only) and is scattered into the 15×15 keyframe slot when building
+        // m_mat.
+        let mut vis = VisualBlocks::new(n_free_kf, n_free_pts);
         let mut cost_vis = 0.0f64;
 
         for ((obs, &depth_row), inlier) in observations
@@ -1177,62 +1205,18 @@ pub fn visual_inertial_bundle_adjust(
             // residual_and_jacobians is f32 internally; cast results to f64.
             let (r_f32, jp_f32, jx_f32) = residual_and_jacobians(pose, point, obs.pixel, camera);
 
-            let r_raw = [r_f32[0] as f64, r_f32[1] as f64];
-            let jp_raw: [f64; 12] = std::array::from_fn(|i| jp_f32[i] as f64);
-            let jx_raw: [f64; 6] = std::array::from_fn(|i| jx_f32[i] as f64);
-
-            let chi2_vis = r_raw[0] * r_raw[0] + r_raw[1] * r_raw[1];
+            let r_raw = SVecF64::<2>::from_fn(|i, _| f64::from(r_f32[i]));
+            let chi2_vis = r_raw.norm_squared();
             *inlier = chi2_vis <= params.huber_reproj_px_sq;
             let (hw_vis, c_vis) = visual_huber(chi2_vis, params.huber_reproj_px_sq);
             cost_vis += c_vis;
             let sqrt_hw_vis = hw_vis.sqrt();
-            let r = [r_raw[0] * sqrt_hw_vis, r_raw[1] * sqrt_hw_vis];
-            let jp: [f64; 12] = std::array::from_fn(|i| jp_raw[i] * sqrt_hw_vis);
-            let jx: [f64; 6] = std::array::from_fn(|i| jx_raw[i] * sqrt_hw_vis);
+            let jp = SMatF64::<2, 6>::from_fn(|i, k| f64::from(jp_f32[i * 6 + k]) * sqrt_hw_vis);
+            let jx = SMatF64::<2, 3>::from_fn(|i, k| f64::from(jx_f32[i * 3 + k]) * sqrt_hw_vis);
 
-            let pli = kf_local[obs.pose_idx];
-            let xli = point_local[obs.point_idx];
-
-            // Accumulate A block (6×6).
-            if pli >= 0 {
-                let p = pli as usize;
-                let ab = &mut a_blocks[p];
-                for i in 0..6 {
-                    for k in 0..6 {
-                        ab[i * 6 + k] += jp[i] * jp[k] + jp[6 + i] * jp[6 + k];
-                    }
-                }
-                let gp = &mut g_pose[p];
-                for i in 0..6 {
-                    gp[i] -= jp[i] * r[0] + jp[6 + i] * r[1];
-                }
-            }
-
-            // Accumulate C block (3×3).
-            if xli >= 0 {
-                let x = xli as usize;
-                let cb = &mut c_blocks[x];
-                for i in 0..3 {
-                    for k in 0..3 {
-                        cb[i * 3 + k] += jx[i] * jx[k] + jx[3 + i] * jx[3 + k];
-                    }
-                }
-                let gx = &mut g_point[x];
-                for i in 0..3 {
-                    gx[i] -= jx[i] * r[0] + jx[3 + i] * r[1];
-                }
-            }
-
-            // Accumulate B block (6×3) for Schur.
-            if pli >= 0 && xli >= 0 {
-                let mut b = [0.0f64; 18];
-                for i in 0..6 {
-                    for k in 0..3 {
-                        b[i * 3 + k] += jp[i] * jx[k] + jp[6 + i] * jx[3 + k];
-                    }
-                }
-                b_by_point[xli as usize].push((pli as usize, b));
-            }
+            let pli = usize::try_from(kf_local[obs.pose_idx]).ok();
+            let xli = usize::try_from(point_local[obs.point_idx]).ok();
+            vis.add_rows(pli, xli, &jp, &jx, &(r_raw * sqrt_hw_vis));
 
             // Depth residual (stereo metric anchor) — see
             // depth_residual_and_jacobian for why this matters here.
@@ -1244,45 +1228,10 @@ pub fn visual_inertial_bundle_adjust(
                 let (hw_depth, c_depth) = visual_huber(chi2_depth, params.huber_depth_sigma_sq);
                 cost_vis += c_depth;
                 let sqrt_hw_depth = hw_depth.sqrt();
-                let r_z = r_z_raw * sqrt_hw_depth;
-                let jpd: [f64; 6] = std::array::from_fn(|i| jpd_raw[i] * sqrt_hw_depth);
-                let jxd: [f64; 3] = std::array::from_fn(|i| jxd_raw[i] * sqrt_hw_depth);
-
-                if pli >= 0 {
-                    let p = pli as usize;
-                    let ab = &mut a_blocks[p];
-                    for i in 0..6 {
-                        for k in 0..6 {
-                            ab[i * 6 + k] += jpd[i] * jpd[k];
-                        }
-                    }
-                    let gp = &mut g_pose[p];
-                    for i in 0..6 {
-                        gp[i] -= jpd[i] * r_z;
-                    }
-                }
-                if xli >= 0 {
-                    let x = xli as usize;
-                    let cb = &mut c_blocks[x];
-                    for i in 0..3 {
-                        for k in 0..3 {
-                            cb[i * 3 + k] += jxd[i] * jxd[k];
-                        }
-                    }
-                    let gx = &mut g_point[x];
-                    for i in 0..3 {
-                        gx[i] -= jxd[i] * r_z;
-                    }
-                }
-                if pli >= 0 && xli >= 0 {
-                    let mut b = [0.0f64; 18];
-                    for i in 0..6 {
-                        for k in 0..3 {
-                            b[i * 3 + k] += jpd[i] * jxd[k];
-                        }
-                    }
-                    b_by_point[xli as usize].push((pli as usize, b));
-                }
+                let jpd = SMatF64::<1, 6>::from_row_slice(&jpd_raw) * sqrt_hw_depth;
+                let jxd = SMatF64::<1, 3>::from_row_slice(&jxd_raw) * sqrt_hw_depth;
+                let r_z = SVecF64::<1>::new(r_z_raw * sqrt_hw_depth);
+                vis.add_rows(pli, xli, &jpd, &jxd, &r_z);
             }
         }
 
@@ -1294,59 +1243,33 @@ pub fn visual_inertial_bundle_adjust(
         let mut m_vec = vec![0.0f64; dim];
 
         // Scatter A blocks into the upper-left 6×6 of each 15×15 slot.
-        for (k, ab) in a_blocks.iter().enumerate() {
+        for (k, (ab, gp)) in vis.a.iter().zip(&vis.g_pose).enumerate() {
             let base = k * KF_DOF;
-            for i in 0..6 {
-                for j in 0..6 {
-                    m_mat[(base + i, base + j)] = ab[i * 6 + j];
-                }
-            }
-            m_vec[base..(6 + base)].copy_from_slice(&g_pose[k]);
+            add_block(&mut m_mat, base, base, ab);
+            m_vec[base..(6 + base)].copy_from_slice(gp.as_slice());
         }
 
         // Schur point elimination: M -= B C⁻¹ Bᵀ,  m -= B C⁻¹ g_point.
         // Point back-substitution only needs the first 6 elements of each
         // keyframe's delta (pose DOF), so the B blocks are 6×3 as before.
 
-        damp_point_blocks(&mut c_blocks, lambda);
-        let c_inv: Vec<Option<[f64; 9]>> = c_blocks.iter().map(invert_3x3_f64).collect();
+        damp_point_blocks(&mut vis.c, lambda);
+        let c_inv: Vec<Option<SMatF64<3, 3>>> = vis.c.iter().map(invert_point_block).collect();
 
-        for (j, b_for_j) in b_by_point.iter().enumerate() {
-            let Some(ci) = c_inv[j] else {
+        for ((b_for_j, ci), g_point) in vis.b_by_point.iter().zip(&c_inv).zip(&vis.g_point) {
+            let Some(ci) = ci else {
                 continue;
             };
+            let bc: Vec<(usize, SMatF64<6, 3>)> =
+                b_for_j.iter().map(|(i_loc, b)| (*i_loc, b * ci)).collect();
 
-            // Pre-multiply: BC_inv[i] = B[i,j] · C⁻¹  (6×3).
-            let bc: Vec<(usize, [f64; 18])> = b_for_j
-                .iter()
-                .map(|(i_loc, b)| (*i_loc, matmul_6x3_3x3_f64(b, &ci)))
-                .collect();
-
-            // RHS correction: m[i] -= BC_inv[i] · g_point[j].
             for (i_loc, bc_block) in &bc {
-                let base = i_loc * KF_DOF;
-                for r in 0..6 {
-                    let mut s = 0.0f64;
-                    for k in 0..3 {
-                        s += bc_block[r * 3 + k] * g_point[j][k];
-                    }
-                    m_vec[base + r] -= s;
-                }
+                sub_from(&mut m_vec, i_loc * KF_DOF, &(bc_block * g_point));
             }
-            // LHS correction: M[i1,i2] -= BC_inv[i1] · B[i2,j]ᵀ.
             for (i1_loc, bc1) in &bc {
-                for (i2_loc, b2) in b_for_j.iter() {
-                    let row0 = i1_loc * KF_DOF;
-                    let col0 = i2_loc * KF_DOF;
-                    for r in 0..6 {
-                        for c in 0..6 {
-                            let mut s = 0.0f64;
-                            for k in 0..3 {
-                                s += bc1[r * 3 + k] * b2[c * 3 + k];
-                            }
-                            m_mat[(row0 + r, col0 + c)] -= s;
-                        }
-                    }
+                for (i2_loc, b2) in b_for_j {
+                    let s = bc1 * b2.transpose();
+                    add_block(&mut m_mat, i1_loc * KF_DOF, i2_loc * KF_DOF, &-s);
                 }
             }
         }
@@ -1402,11 +1325,7 @@ pub fn visual_inertial_bundle_adjust(
             };
 
             if is_first_iter {
-                let nr = (res[0] * res[0] + res[1] * res[1] + res[2] * res[2]).sqrt();
-                let nv = (res[3] * res[3] + res[4] * res[4] + res[5] * res[5]).sqrt();
-                let np = (res[6] * res[6] + res[7] * res[7] + res[8] * res[8]).sqrt();
-                let nbg = (res[9] * res[9] + res[10] * res[10] + res[11] * res[11]).sqrt();
-                let nba = (res[12] * res[12] + res[13] * res[13] + res[14] * res[14]).sqrt();
+                let [nr, nv, np, nbg, nba] = imu_residual_norms(&res);
                 let om_min = omega_raw
                     .iter()
                     .cloned()
@@ -1541,30 +1460,24 @@ pub fn visual_inertial_bundle_adjust(
         let d_full: Vec<f64> = (0..dim).map(|i| d_full_col[(i, 0)]).collect();
 
         // ── 5. Point back-substitution (uses pose-DOF slice only) ────────
-        let mut d_point = vec![[0.0f64; 3]; n_free_pts];
-        for (j, b_for_j) in b_by_point.iter().enumerate() {
-            let Some(ci) = c_inv[j] else {
+        let mut d_point = vec![SVecF64::<3>::zeros(); n_free_pts];
+        for (((b_for_j, ci), g_point), dx) in vis
+            .b_by_point
+            .iter()
+            .zip(&c_inv)
+            .zip(&vis.g_point)
+            .zip(&mut d_point)
+        {
+            let Some(ci) = ci else {
                 continue;
             };
-            let mut rhs = g_point[j];
+            let mut rhs = *g_point;
             for (i_loc, b_block) in b_for_j {
-                // Only the first 6 elements of d_full for this keyframe (pose).
                 let base = i_loc * KF_DOF;
-                let dp6: [f64; 6] = std::array::from_fn(|k| d_full[base + k]);
-                // rhs -= B[i,j]ᵀ · δ_pose[i]  (B is 6×3, so Bᵀ is 3×6).
-                for c in 0..3 {
-                    let mut s = 0.0f64;
-                    for r in 0..6 {
-                        s += b_block[r * 3 + c] * dp6[r];
-                    }
-                    rhs[c] -= s;
-                }
+                let d_pose = Vec6F64::from_column_slice(&d_full[base..base + 6]);
+                rhs -= b_block.transpose() * d_pose;
             }
-            // δ_x = C⁻¹ · rhs.
-            for r in 0..3 {
-                d_point[j][r] =
-                    ci[r * 3] * rhs[0] + ci[r * 3 + 1] * rhs[1] + ci[r * 3 + 2] * rhs[2];
-            }
+            *dx = ci * rhs;
         }
 
         // ── 6. Trial retraction ───────────────────────────────────────────
@@ -1739,11 +1652,7 @@ pub fn visual_inertial_bundle_adjust(
             &params.gravity,
             params.imu_t_bc.as_ref(),
         );
-        let nr = (res[0] * res[0] + res[1] * res[1] + res[2] * res[2]).sqrt();
-        let nv = (res[3] * res[3] + res[4] * res[4] + res[5] * res[5]).sqrt();
-        let np = (res[6] * res[6] + res[7] * res[7] + res[8] * res[8]).sqrt();
-        let nbg = (res[9] * res[9] + res[10] * res[10] + res[11] * res[11]).sqrt();
-        let nba = (res[12] * res[12] + res[13] * res[13] + res[14] * res[14]).sqrt();
+        let [nr, nv, np, nbg, nba] = imu_residual_norms(&res);
         debug_eprintln!(
             "[vi_ba] FINAL edge {i}→{j}  dt={:.3}s  |r_R|={nr:.4e}  |r_v|={nv:.4e}  \
                 |r_p|={np:.4e}  |r_bg|={nbg:.4e}  |r_ba|={nba:.4e}  \
