@@ -67,18 +67,9 @@ impl StereoCalib {
                 k6: c.distortion[7],
             },
         };
-        // Row-major [r00,r01,r02, r10,r11,r12, r20,r21,r22] → columns.
-        let m = &self.r_left_to_right;
-        let r = Mat3F64::from_cols(
-            Vec3F64::new(m[0], m[3], m[6]),
-            Vec3F64::new(m[1], m[4], m[7]),
-            Vec3F64::new(m[2], m[5], m[8]),
-        );
-        let t = Vec3F64::new(
-            self.t_left_to_right_m[0],
-            self.t_left_to_right_m[1],
-            self.t_left_to_right_m[2],
-        );
+        // Read as column-major, a row-major array is the transpose.
+        let r = Mat3F64::from_cols_array(&self.r_left_to_right).transpose();
+        let t = Vec3F64::from_array(self.t_left_to_right_m);
         StereoRectifier::from_calib(&calib(&self.left), &calib(&self.right), r, t)
     }
 }

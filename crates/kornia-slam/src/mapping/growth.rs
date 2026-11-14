@@ -15,7 +15,7 @@ use crate::mapping::map::{
 use crate::stereo::unproject_stereo;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::{Pose3d, TriangulationConfig, triangulate_matched_points};
-use kornia_algebra::{Mat3F64, Vec2F64, Vec3F64};
+use kornia_algebra::{Mat3F64, SO3F64, Vec2F64, Vec3F64};
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use std::collections::HashSet;
 
@@ -110,12 +110,7 @@ pub fn pair_growth_request(
         // reject everything anyway.
         return None;
     }
-    let t = rel.translation;
-    let t_skew = Mat3F64::from_cols(
-        Vec3F64::new(0.0, t.z, -t.y),
-        Vec3F64::new(-t.z, 0.0, t.x),
-        Vec3F64::new(t.y, -t.x, 0.0),
-    );
+    let t_skew = SO3F64::hat(rel.translation);
     let k_inv = Mat3F64::from_cols(
         Vec3F64::new(1.0 / camera.fx, 0.0, 0.0),
         Vec3F64::new(0.0, 1.0 / camera.fy, 0.0),
@@ -326,9 +321,6 @@ pub fn neighbor_fusion_links(
                 continue;
             }
             let p_cam = nb_kf.frame.pose_world_to_cam.transform_point(&mp.position);
-            if p_cam.z <= 0.0 {
-                continue;
-            }
             let Ok(pixel) = camera.project_to_image(&p_cam, 0.0, nb_kf.frame.image_size) else {
                 continue;
             };

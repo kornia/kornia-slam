@@ -210,7 +210,7 @@ impl WheelOdomFactor {
     /// Whether both base-to-camera extrinsics are finite.
     pub fn extrinsics_finite(&self) -> bool {
         [&self.t_cb_from, &self.t_cb_to].iter().all(|t| {
-            t.rotation.to_cols_array().iter().all(|v| v.is_finite())
+            t.rotation.is_finite()
                 && [t.translation.x, t.translation.y, t.translation.z]
                     .iter()
                     .all(|v| v.is_finite())

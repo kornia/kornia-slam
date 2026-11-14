@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat3F64, Vec3F64};
+use kornia_algebra::Vec3F64;
 use kornia_io::png::read_image_png_mono8;
 use kornia_sensors::SensorRig;
 use kornia_sensors::imu::ImuMeasurement;
@@ -211,7 +211,7 @@ impl EurocSource {
             // rectifying rotation (p_rect = R_rect · p_cam0), so
             // T_B,rect = T_BS · R_rectᵀ; the translation is unchanged.
             Some(rect) => {
-                let r_rect_t = Mat3F64(*rect.left_rectifying_rotation().transpose());
+                let r_rect_t = rect.left_rectifying_rotation().transpose();
                 Some(Pose3d::from_rt(rotation * r_rect_t, translation))
             }
             None => Some(Pose3d::from_rt(rotation, translation)),

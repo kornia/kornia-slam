@@ -125,16 +125,7 @@ impl Map {
         {
             return Err(PoseGraphCorrectionError::StaleSnapshot);
         }
-        if poses_after.iter().any(|pose| {
-            !pose.translation.x.is_finite()
-                || !pose.translation.y.is_finite()
-                || !pose.translation.z.is_finite()
-                || pose
-                    .rotation
-                    .to_cols_array()
-                    .into_iter()
-                    .any(|value| !value.is_finite())
-        }) {
+        if poses_after.iter().any(|pose| !finite_pose(pose)) {
             return Err(PoseGraphCorrectionError::NonFinitePose);
         }
 
@@ -556,12 +547,8 @@ fn finite_vec3(v: Vec3F64) -> bool {
     v.x.is_finite() && v.y.is_finite() && v.z.is_finite()
 }
 
-fn finite_mat3(m: &kornia_algebra::Mat3F64) -> bool {
-    m.to_cols_array().into_iter().all(f64::is_finite)
-}
-
 fn finite_pose(pose: &Pose3d) -> bool {
-    finite_vec3(pose.translation) && finite_mat3(&pose.rotation)
+    finite_vec3(pose.translation) && pose.rotation.is_finite()
 }
 
 fn finite_bias(bias: &ImuBias) -> bool {
@@ -588,7 +575,7 @@ fn valid_rotation(rotation: &SO3F64) -> bool {
 pub(super) fn valid_preintegration(preintegrated: &kornia_sensors::imu::PreintegratedImu) -> bool {
     preintegrated.dt.is_finite()
         && preintegrated.dt >= 0.0
-        && finite_mat3(&preintegrated.delta_rotation)
+        && preintegrated.delta_rotation.is_finite()
         && finite_vec3(preintegrated.delta_velocity)
         && finite_vec3(preintegrated.delta_position)
         && finite_bias(&preintegrated.bias)
@@ -598,11 +585,11 @@ pub(super) fn valid_preintegration(preintegrated: &kornia_sensors::imu::Preinteg
         && preintegrated.calib.accel_bias_noise.is_finite()
         && preintegrated.covariance.iter().all(|v| v.is_finite())
         && preintegrated.bias_covariance.iter().all(|v| v.is_finite())
-        && finite_mat3(&preintegrated.d_rotation_d_bias_gyro)
-        && finite_mat3(&preintegrated.d_velocity_d_bias_gyro)
-        && finite_mat3(&preintegrated.d_velocity_d_bias_accel)
-        && finite_mat3(&preintegrated.d_position_d_bias_gyro)
-        && finite_mat3(&preintegrated.d_position_d_bias_accel)
+        && preintegrated.d_rotation_d_bias_gyro.is_finite()
+        && preintegrated.d_velocity_d_bias_gyro.is_finite()
+        && preintegrated.d_velocity_d_bias_accel.is_finite()
+        && preintegrated.d_position_d_bias_gyro.is_finite()
+        && preintegrated.d_position_d_bias_accel.is_finite()
 }
 
 fn keyframe_ba_state_changed(

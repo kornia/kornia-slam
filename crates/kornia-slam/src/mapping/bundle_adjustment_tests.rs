@@ -367,7 +367,11 @@ fn failed_inertial_solve_still_returns_repropagated_measurements() {
     assert_eq!(map.imu_factors()[0].preintegrated.bias.accel.x, 0.05);
 }
 #[test]
-fn stereo_depth_obs_uses_proportional_sigma_with_floor() {
+fn stereo_depth_uses_proportional_sigma_with_floor() {
+    let stereo_depth_obs = |kf: &Keyframe, desc_idx: usize| {
+        let observation = with_stereo_depth(BaObservation::default(), kf, desc_idx);
+        (observation.depth_meas, observation.depth_sigma)
+    };
     let mut frame = test_frame(0, vec![[0u8; 32], [1u8; 32]]);
     frame.depth = vec![10.0, -1.0];
     frame.u_right = vec![5.0, -1.0];

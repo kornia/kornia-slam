@@ -3,11 +3,11 @@ use std::collections::HashSet;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pnp::{PnPMethod, RansacParams, solve_pnp_ransac};
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat3AF32, Vec2F32, Vec3AF32};
+use kornia_algebra::{Vec2F32, Vec3AF32};
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
 use crate::mapping::map::Map;
-use crate::pose_conversion::{mat3_to_f64, vec3_to_f32, vec3_to_f64};
+use crate::pose_conversion::{mat3_to_f32, mat3_to_f64, vec3_to_f32, vec3_to_f64};
 
 /// Acceptance thresholds for geometric loop verification.
 #[derive(Debug, Clone)]
@@ -141,11 +141,7 @@ pub fn verify_loop_candidate(
     config: &LoopVerificationConfig,
 ) -> Result<VerifiedLoopEdge, LoopVerificationReject> {
     let input = verification_input(map, camera, query_kf_idx, candidate_kf_idx, config)?;
-    let intrinsics = Mat3AF32::from_cols(
-        Vec3AF32::new(camera.fx as f32, 0.0, 0.0),
-        Vec3AF32::new(0.0, camera.fy as f32, 0.0),
-        Vec3AF32::new(camera.cx as f32, camera.cy as f32, 1.0),
-    );
+    let intrinsics = mat3_to_f32(camera.intrinsic_matrix());
     let result = solve_pnp_ransac(
         &input.world_points,
         &input.image_points,
