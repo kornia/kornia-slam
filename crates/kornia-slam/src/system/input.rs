@@ -1,7 +1,9 @@
 //! Validation of the input to [`SlamSystem::process_image`](super::SlamSystem::process_image)
 //! and [`SlamSystem::process_stereo`](super::SlamSystem::process_stereo).
 
-use kornia_image::{Image, ImageError, ImageSize};
+use kornia_image::{Image, ImageSize};
+
+use crate::frontend::FrontendError;
 
 /// A frame the system cannot process. The system state is unchanged.
 #[derive(Debug, thiserror::Error)]
@@ -19,8 +21,8 @@ pub enum ProcessError {
         right.width, right.height, left.width, left.height
     )]
     StereoSizeMismatch { left: ImageSize, right: ImageSize },
-    #[error("feature extraction failed: {0}")]
-    Frontend(#[source] ImageError),
+    #[error(transparent)]
+    Frontend(FrontendError),
 }
 
 /// Checks one image before any system state is touched.

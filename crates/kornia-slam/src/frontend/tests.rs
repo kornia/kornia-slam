@@ -129,7 +129,7 @@ fn stereo_frontend() -> OrbFrontend {
         n_keypoints: 1000,
         ..OrbDetector::default()
     };
-    OrbFrontend::new(detector, &rig)
+    OrbFrontend::new(detector, &rig).unwrap()
 }
 
 #[test]
@@ -262,7 +262,7 @@ fn fisheye_observation_keeps_raw_image_keypoints() {
     let fisheye = hilti_fisheye();
     let rig = SensorRig::new(pinhole(fisheye.fx, fisheye.fy, fisheye.cx, fisheye.cy))
         .with_fisheye(fisheye);
-    let mut frontend = OrbFrontend::new(OrbDetector::default(), &rig);
+    let mut frontend = OrbFrontend::new(OrbDetector::default(), &rig).unwrap();
     let frame = frontend.prepare_image(3, &image).unwrap();
 
     let observed = &frontend.observation().keypoints_xy;

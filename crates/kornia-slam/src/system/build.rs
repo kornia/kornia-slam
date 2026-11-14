@@ -1,3 +1,4 @@
+use kornia_3d::stereo::StereoMatchError;
 use kornia_imgproc::features::OrbDetector;
 use kornia_sensors::SensorRig;
 
@@ -21,6 +22,8 @@ pub enum BuildError {
     Config(#[from] ConfigError),
     #[error(transparent)]
     Vocabulary(#[from] VocabularyLoadError),
+    #[error(transparent)]
+    StereoMatcher(#[from] StereoMatchError),
 }
 
 /// Settings a [`SlamSystem`](crate::SlamSystem) is assembled from, resolved
