@@ -1466,8 +1466,10 @@ mod validation_tests {
             ("negative duration", |p| p.dt = -0.1),
             ("bias", |p| p.bias.gyro.y = f64::NAN),
             ("calibration", |p| p.calib.accel_noise = f64::NAN),
-            ("covariance", |p| p.covariance[80] = f64::NAN),
-            ("bias covariance", |p| p.bias_covariance[35] = f64::INFINITY),
+            ("covariance", |p| p.covariance[(8, 8)] = f64::NAN),
+            ("bias covariance", |p| {
+                p.bias_covariance[(5, 5)] = f64::INFINITY
+            }),
             ("gyro-bias rotation jacobian", |p| {
                 let mut cols = p.d_rotation_d_bias_gyro.to_cols_array();
                 cols[8] = f64::NAN;

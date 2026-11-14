@@ -519,8 +519,8 @@ fn inertial_ba_repropagation_keeps_the_elided_bias_walk() {
     let walk = |density: f64| density * density * (3600.0 + 0.1);
     let calib = repropagated.calib;
     for i in 0..3 {
-        let g = repropagated.bias_covariance[i * 7];
-        let a = repropagated.bias_covariance[(i + 3) * 7];
+        let g = repropagated.bias_covariance[(i, i)];
+        let a = repropagated.bias_covariance[(i + 3, i + 3)];
         assert!((g - walk(calib.gyro_bias_noise)).abs() < 1e-3 * g, "{g}");
         assert!((a - walk(calib.accel_bias_noise)).abs() < 1e-3 * a, "{a}");
     }
