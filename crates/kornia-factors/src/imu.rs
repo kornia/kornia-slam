@@ -60,21 +60,8 @@ pub struct ImuInformation {
 /// extrinsic `T_bc` (`X_body = T_bc · X_cam`) when given: `R_bw` rotates
 /// world vectors into the body frame, `t_wb` is the body origin in the world.
 pub fn body_frame(pose_cw: &Pose3d, t_bc: Option<&Pose3d>) -> (Mat3F64, Vec3F64) {
-    let r_cw = &pose_cw.rotation;
-    let t_cw = &pose_cw.translation;
-    match t_bc {
-        None => {
-            let twb = -(Mat3F64(*r_cw.transpose()) * *t_cw);
-            (*r_cw, twb)
-        }
-        Some(t_bc) => {
-            let r_bc = &t_bc.rotation;
-            let r_bw = *r_bc * *r_cw;
-            let t_bw = *r_bc * *t_cw + t_bc.translation;
-            let twb = -(Mat3F64(*r_bw.transpose()) * t_bw);
-            (r_bw, twb)
-        }
-    }
+    let pose_bw = t_bc.map_or(*pose_cw, |t_bc| t_bc.compose(pose_cw));
+    (pose_bw.rotation, pose_bw.inverse().translation)
 }
 
 /// The residual `[r_R, r_v, r_p, r_bg, r_ba]` between states `i` and `j`
@@ -93,7 +80,7 @@ pub fn residual_and_jacobians(
 
     let (r_bw_i, twb_i) = body_frame(i.pose_cw, t_bc);
     let (r_bw_j, twb_j) = body_frame(j.pose_cw, t_bc);
-    let r_wb_j = Mat3F64(*r_bw_j.transpose());
+    let r_wb_j = r_bw_j.transpose();
 
     let v_i = &i.velocity;
     let v_j = &j.velocity;
@@ -102,7 +89,7 @@ pub fn residual_and_jacobians(
     let dv_corrected = pim.delta_velocity_with_bias(&i.bias);
     let dp_corrected = pim.delta_position_with_bias(&i.bias);
 
-    let dr_t = Mat3F64(*dr_corrected.transpose());
+    let dr_t = dr_corrected.transpose();
     let lhs_r = dr_t * (r_bw_i * r_wb_j);
     let r_rot = SO3F64::from_matrix(&lhs_r).log();
 
@@ -131,7 +118,7 @@ pub fn residual_and_jacobians(
     j_i.fixed_view_mut::<3, 3>(0, 3)
         .copy_from(&jr_inv_rbwj.into());
     // eR = ΔRᵀ · R_bw,i · R_wb,j = lhs_r.
-    let er_t = Mat3F64(*lhs_r.transpose());
+    let er_t = lhs_r.transpose();
     j_i.fixed_view_mut::<3, 3>(0, 9)
         .copy_from(&(jr_inv * er_t * pim.d_rotation_d_bias_gyro * -1.0).into());
     j_j.fixed_view_mut::<3, 3>(0, 3)

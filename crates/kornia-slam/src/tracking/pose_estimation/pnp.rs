@@ -133,11 +133,7 @@ pub fn solve_pnp_with_diagnostics(
     let scale = 1.0 / depths[mid].max(1e-9);
 
     // Build f32 arrays for LM solver.
-    let k = Mat3AF32::from_cols(
-        Vec3AF32::new(camera.fx as f32, 0.0, 0.0),
-        Vec3AF32::new(0.0, camera.fy as f32, 0.0),
-        Vec3AF32::new(camera.cx as f32, camera.cy as f32, 1.0),
-    );
+    let k = mat3_to_f32(camera.intrinsic_matrix());
     let mut world_inliers = Vec::with_capacity(prior_inlier_indices.len());
     let mut image_inliers = Vec::with_capacity(prior_inlier_indices.len());
     for &i in &prior_inlier_indices {

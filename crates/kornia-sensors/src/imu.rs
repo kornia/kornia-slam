@@ -174,7 +174,7 @@ impl PreintegratedImu {
     pub fn delta_rotation_with_bias(&self, bias: &ImuBias) -> Mat3F64 {
         let dbg = bias.gyro - self.bias.gyro;
         let correction = SO3F64::exp(self.d_rotation_d_bias_gyro * dbg).matrix();
-        Mat3F64(self.delta_rotation.mul_mat3(&correction))
+        self.delta_rotation * correction
     }
 
     /// Δv re-expressed at a new bias estimate (first order).
@@ -233,11 +233,11 @@ impl PreintegratedImu {
         // back to so(3) (tangent space at identity) relative to the new ΔR.
         // For Lie groups, pullback is multiplication by the inverse, which for
         // rotation matrices is the transpose.
-        let d_rot_t = Mat3F64(*d_rot.transpose());
-        let dr_accel_hat = Mat3F64(self.delta_rotation.mul_mat3(&accel_hat));
-        let neg_dr_ah_dt = mat3_scalar(&dr_accel_hat, -dt);
-        let neg_dr_ah_half_dt2 = mat3_scalar(&dr_accel_hat, -0.5 * dt * dt);
-        let i_dt = mat3_scalar(&Mat3F64::IDENTITY, dt);
+        let d_rot_t = d_rot.transpose();
+        let dr_accel_hat = self.delta_rotation * accel_hat;
+        let neg_dr_ah_dt = dr_accel_hat * -dt;
+        let neg_dr_ah_half_dt2 = dr_accel_hat * (-0.5 * dt * dt);
+        let i_dt = Mat3F64::IDENTITY * dt;
 
         let a = block3x3_to_9x9([
             [d_rot_t, Mat3F64::ZERO, Mat3F64::ZERO],
@@ -250,9 +250,9 @@ impl PreintegratedImu {
         //     [ J_r·dt   0     ]     gyro noise enters rotation via right Jacobian
         // B = [ 0        ΔR·dt ]     accel noise enters velocity
         //     [ 0        ½·ΔR·dt² ]  accel noise enters position
-        let jr_dt = mat3_scalar(&jr, dt);
-        let dr_dt = mat3_scalar(&self.delta_rotation, dt);
-        let dr_half_dt2 = mat3_scalar(&self.delta_rotation, 0.5 * dt * dt);
+        let jr_dt = jr * dt;
+        let dr_dt = self.delta_rotation * dt;
+        let dr_half_dt2 = self.delta_rotation * (0.5 * dt * dt);
 
         let b = block3x2_to_9x6([
             [jr_dt, Mat3F64::ZERO],
@@ -316,7 +316,7 @@ impl PreintegratedImu {
 
         // 3. Rotation: compose on the manifold SO(3), then normalize to
         // prevent floating-point drift away from SO(3) over long windows.
-        self.delta_rotation = normalize_rotation(&Mat3F64(self.delta_rotation.mul_mat3(&d_rot)));
+        self.delta_rotation = normalize_rotation(&(self.delta_rotation * d_rot));
 
         self.dt += dt;
     }
@@ -340,7 +340,7 @@ impl PreintegratedImu {
         let dt = self.dt;
 
         // Predicted rotation: R_{k+1} = R_k · ΔR
-        let r_k1 = Mat3F64(r_k.mul_mat3(&self.delta_rotation));
+        let r_k1 = *r_k * self.delta_rotation;
 
         // Predicted velocity: v_{k+1} = v_k + g·dt + R_k · Δv
         let r_k_dv = *r_k * self.delta_velocity;
@@ -380,11 +380,6 @@ fn normalize_rotation(r: &Mat3F64) -> Mat3F64 {
 
 // --- Matrix helpers ---
 // These operate on flat column-major arrays to avoid pulling in a full linear algebra crate.
-
-/// Scalar multiply a Mat3F64.
-fn mat3_scalar(m: &Mat3F64, s: f64) -> Mat3F64 {
-    Mat3F64(m.mul_scalar(s))
-}
 
 /// Column-major index for any matrix with 9 rows (9×9 and 9×6 alike).
 #[inline]

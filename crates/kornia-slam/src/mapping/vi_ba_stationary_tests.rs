@@ -1,5 +1,5 @@
 use super::*;
-use kornia_algebra::{Mat3F64, SO3F64};
+use kornia_algebra::{Mat3F64, SE3F64, SO3F64};
 use kornia_factors::stationary::{StationaryFactor, StationaryGyro};
 use kornia_sensors::imu::{ImuCalib, ImuMeasurement};
 
@@ -44,12 +44,11 @@ impl Lcg {
 }
 
 fn se3_exp(xi: &[f64]) -> Pose3d {
-    let rho = Vec3F64::new(xi[0], xi[1], xi[2]);
-    let omega = Vec3F64::new(xi[3], xi[4], xi[5]);
-    Pose3d::new(
-        SO3F64::exp(omega).matrix(),
-        SO3F64::left_jacobian(omega) * rho,
-    )
+    let e = SE3F64::exp(
+        Vec3F64::new(xi[0], xi[1], xi[2]),
+        Vec3F64::new(xi[3], xi[4], xi[5]),
+    );
+    Pose3d::new(e.r.matrix(), e.t)
 }
 
 /// Applies a 15-DOF tangent step the way the solver does (pose

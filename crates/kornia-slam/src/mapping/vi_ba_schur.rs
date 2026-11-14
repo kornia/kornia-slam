@@ -359,8 +359,7 @@ fn reseed_walked_landmarks(
             let pose = &keyframes[observations[o].pose_idx].pose;
             let p_cam = pose.transform_point(&points[j]);
             (
-                pose.inverse()
-                    .transform_point(&(p_cam * (d as f64 / p_cam.z))),
+                pose.untransform_point(&(p_cam * (d as f64 / p_cam.z))),
                 p_cam.z,
             )
         };

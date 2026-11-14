@@ -38,7 +38,7 @@ fn rotation_deg(a: &Pose3d, b: &Pose3d) -> f64 {
 fn point_at(pose: &Pose3d, u: f64, v: f64, z: f64) -> Vec3F64 {
     let cam = camera();
     let pc = Vec3F64::new((u - cam.cx) / cam.fx * z, (v - cam.cy) / cam.fy * z, z);
-    pose.inverse().transform_point(&pc)
+    pose.untransform_point(&pc)
 }
 
 fn pixel(pose: &Pose3d, p: &Vec3F64) -> [f32; 2] {
@@ -408,7 +408,7 @@ fn damping_makes_a_rank_two_point_block_invertible() {
     // Rotated off the axes, so every diagonal entry is non-zero.
     let rot = SO3F64::exp(Vec3F64::new(0.3, -0.5, 0.2)).matrix();
     let d = Mat3F64::from_cols_array(&[a, 0.0, 0.0, 0.0, a, 0.0, 0.0, 0.0, 0.0]);
-    let full = Mat3F64(rot.mul_mat3(&d.mul_mat3(&rot.transpose())));
+    let full = rot * (d * rot.transpose());
     let cols = full.to_cols_array();
     let mut c = [[
         cols[0], cols[3], cols[6], cols[1], cols[4], cols[7], cols[2], cols[5], cols[8],
@@ -703,10 +703,7 @@ impl ParkedChain {
         let parked = parked_pose();
         let truth_poses: Vec<Pose3d> = (0..N_KF)
             .map(|k| {
-                let centre =
-                    parked
-                        .inverse()
-                        .transform_point(&Vec3F64::new(k as f64 * step_m, 0.0, 0.0));
+                let centre = parked.untransform_point(&Vec3F64::new(k as f64 * step_m, 0.0, 0.0));
                 Pose3d::new(parked.rotation, -(parked.rotation * centre))
             })
             .collect();

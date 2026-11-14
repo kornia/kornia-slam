@@ -647,16 +647,14 @@ impl WindowPoints {
                     continue;
                 };
                 if let Some(pixel) = kf.frame.undistorted_xy(desc_idx, camera) {
-                    let (depth_meas, depth_sigma) = stereo_depth_obs(kf, desc_idx);
-                    observations.push(BaObservation {
+                    let observation = BaObservation {
                         pose_idx,
                         point_idx,
                         pixel,
                         fixed_pose,
-                        fixed_point: false,
-                        depth_meas,
-                        depth_sigma,
-                    });
+                        ..Default::default()
+                    };
+                    observations.push(with_stereo_depth(observation, kf, desc_idx));
                 }
             }
         }
@@ -687,18 +685,15 @@ impl WindowPoints {
     }
 }
 
-/// Depth measurement + sigma for a BA observation at `desc_idx` of `kf`.
-///
-/// Returns `(Some(z), sigma)` when the keyframe's keypoint has a valid stereo
-/// depth (anchoring the BA's metric scale), else `(None, 1.0)` for a pure
-/// reprojection observation.
-fn stereo_depth_obs(kf: &Keyframe, desc_idx: usize) -> (Option<f32>, f32) {
+/// `observation` with the stereo depth of `kf`'s keypoint `desc_idx` attached when
+/// it has one, anchoring the BA's metric scale; otherwise a pure reprojection
+/// observation.
+fn with_stereo_depth(observation: BaObservation, kf: &Keyframe, desc_idx: usize) -> BaObservation {
     match kf.frame.stereo_depth(desc_idx) {
-        Some(z) => (
-            Some(z),
-            (STEREO_DEPTH_REL_SIGMA * z).max(STEREO_DEPTH_MIN_SIGMA),
-        ),
-        None => (None, 1.0),
+        Some(z) => {
+            observation.with_depth(z, (STEREO_DEPTH_REL_SIGMA * z).max(STEREO_DEPTH_MIN_SIGMA))
+        }
+        None => observation,
     }
 }
 

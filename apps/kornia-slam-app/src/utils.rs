@@ -37,15 +37,9 @@ pub fn log_frame_to_rerun(
     .ok();
     rec.log(
         "image/keypoints",
-        &rerun::Points2D::new(keypoints_xy_to_rerun_points(keypoints_xy)).with_radii([1.5]),
+        &rerun::Points2D::new(keypoints_xy.iter().copied()).with_radii([1.5]),
     )
     .ok();
-}
-
-/// Convert feature keypoints to the point format expected by Rerun.
-#[cfg(feature = "viz")]
-pub fn keypoints_xy_to_rerun_points(keypoints_xy: &[[f32; 2]]) -> Vec<[f32; 2]> {
-    keypoints_xy.to_vec()
 }
 
 /// Log the estimated trajectory as a growing 3D line strip.
@@ -181,13 +175,6 @@ fn quat_xyzw_from_matrix(r: &Mat3F64) -> (f64, f64, f64, f64) {
 mod tests {
     use super::*;
     use kornia_algebra::{Mat3F64, Vec3F64};
-
-    #[cfg(feature = "viz")]
-    #[test]
-    fn keypoints_xy_to_rerun_points_preserves_xy_order() {
-        let rerun_points = keypoints_xy_to_rerun_points(&[[10.0, 20.0], [30.5, 40.5]]);
-        assert_eq!(rerun_points, vec![[10.0, 20.0], [30.5, 40.5]]);
-    }
 
     #[test]
     fn trajectory_point_from_pose_uses_camera_to_world_translation() {

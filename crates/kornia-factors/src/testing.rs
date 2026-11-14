@@ -1,7 +1,7 @@
 //! Test helpers shared by the factor modules.
 
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{SO3F64, Vec3F64, Vec6F64};
+use kornia_algebra::{SE3F64, SO3F64, Vec3F64, Vec6F64};
 
 /// Deterministic uniform samples in [-1, 1).
 pub(crate) struct Lcg(pub(crate) u64);
@@ -26,12 +26,11 @@ impl Lcg {
 
 /// `Exp(ρ, ω)`, translation `J_l(ω)·ρ`.
 pub(crate) fn exp(xi: &Vec6F64) -> Pose3d {
-    let rho = Vec3F64::new(xi[0], xi[1], xi[2]);
-    let omega = Vec3F64::new(xi[3], xi[4], xi[5]);
-    Pose3d::new(
-        SO3F64::exp(omega).matrix(),
-        SO3F64::left_jacobian(omega) * rho,
-    )
+    let e = SE3F64::exp(
+        Vec3F64::new(xi[0], xi[1], xi[2]),
+        Vec3F64::new(xi[3], xi[4], xi[5]),
+    );
+    Pose3d::new(e.r.matrix(), e.t)
 }
 
 /// `pose · Exp(eps · e_k)`.
