@@ -20,8 +20,9 @@
 //! The measurement is the planar motion `kornia_sensors` preintegrates
 //! ([`kornia_sensors::wheel::WheelPreintegration`]).
 
-use crate::se3::{Mat6, quadratic_form, relative_pose_residual};
+use crate::se3::relative_pose_residual;
 use kornia_3d::pose::Pose3d;
+use kornia_algebra::{Mat6F64, SMatF64, Vec6F64};
 use kornia_sensors::wheel::PlanarMotion;
 
 /// Wheel-odometry motion of the base between two keyframes.
@@ -83,7 +84,7 @@ impl WheelOdomMeasurement {
     ///
     /// `None` if `delta` or the covariance is not finite, the covariance is
     /// not symmetric positive definite, or a sigma is not finite and positive.
-    pub fn information(&self) -> Option<Mat6> {
+    pub fn information(&self) -> Option<Mat6F64> {
         let positive = |x: f64| x.is_finite() && x > 0.0;
         if !(positive(self.z_sigma) && positive(self.tilt_sigma)) {
             return None;
@@ -92,19 +93,18 @@ impl WheelOdomMeasurement {
         if !(self.motion.delta.iter().all(|v| v.is_finite()) && cov.is_finite()) {
             return None;
         }
-        // Row-major, c[row][col].
-        let c = cov.transpose().to_cols_array_2d();
+        let c: SMatF64<3, 3> = cov.into();
         // det > 0 alone passes diag(-a, -a, a), whose negative information
         // makes LM grow the residual. Sylvester needs symmetry, so check it.
         for i in 0..3 {
             for j in (i + 1)..3 {
-                let tol = 1e-9 * (c[i][i] * c[j][j]).abs().sqrt();
-                if (c[i][j] - c[j][i]).abs() > tol {
+                let tol = 1e-9 * (c[(i, i)] * c[(j, j)]).abs().sqrt();
+                if (c[(i, j)] - c[(j, i)]).abs() > tol {
                     return None;
                 }
             }
         }
-        if !(c[0][0] > 0.0 && c[0][0] * c[1][1] - c[0][1] * c[1][0] > 0.0) {
+        if !(c[(0, 0)] > 0.0 && c[(0, 0)] * c[(1, 1)] - c[(0, 1)] * c[(1, 0)] > 0.0) {
             return None;
         }
         let det = cov.determinant();
@@ -114,19 +114,19 @@ impl WheelOdomMeasurement {
         // J⁻¹ = blockdiag(R(dθ), 1) rotates a base-j residual back into the
         // base-i axes the covariance is written in.
         let j_inv = self.delta_pose().rotation;
-        let planar = (j_inv.transpose() * cov.inverse() * j_inv).to_cols_array();
+        let planar: SMatF64<3, 3> = (j_inv.transpose() * cov.inverse() * j_inv).into();
         // delta rows (x, y, θ) sit at tangent indices (0, 1, 5).
         const AXES: [usize; 3] = [0, 1, 5];
-        let mut info = [[0.0; 6]; 6];
+        let mut info = Mat6F64::zeros();
         for (col, &ci) in AXES.iter().enumerate() {
             for (row, &ri) in AXES.iter().enumerate() {
-                info[ri][ci] = planar[col * 3 + row];
+                info[(ri, ci)] = planar[(row, col)];
             }
         }
-        info[2][2] = 1.0 / (self.z_sigma * self.z_sigma);
+        info[(2, 2)] = 1.0 / (self.z_sigma * self.z_sigma);
         let tilt_info = 1.0 / (self.tilt_sigma * self.tilt_sigma);
-        info[3][3] = tilt_info;
-        info[4][4] = tilt_info;
+        info[(3, 3)] = tilt_info;
+        info[(4, 4)] = tilt_info;
         Some(info)
     }
 }
@@ -249,7 +249,7 @@ pub fn residual_and_jacobian(
     pose_cw_i: &Pose3d,
     pose_cw_j: &Pose3d,
     factor: &WheelOdomFactor,
-) -> ([f64; 6], Mat6) {
+) -> (Vec6F64, Mat6F64) {
     relative_pose_residual(
         pose_cw_i,
         pose_cw_j,
@@ -261,8 +261,8 @@ pub fn residual_and_jacobian(
 
 /// The robust weight and the Huber cost `½ρ(rᵀΩr)` of one residual
 /// ([`crate::robust`]).
-pub fn robust_weight_and_cost(r: &[f64; 6], info: &Mat6, huber_chi2: Option<f64>) -> (f64, f64) {
-    crate::robust::huber_weight_and_cost(quadratic_form(info, r), huber_chi2)
+pub fn robust_weight_and_cost(r: &Vec6F64, info: &Mat6F64, huber_chi2: Option<f64>) -> (f64, f64) {
+    crate::robust::huber_weight_and_cost(r.dot(&(info * r)), huber_chi2)
 }
 
 #[cfg(test)]
@@ -303,12 +303,13 @@ mod tests {
             let d_i = |e| residual_and_jacobian(&perturbed(pose_i, k, e), pose_j, f).0;
             let d_j = |e| residual_and_jacobian(pose_i, &perturbed(pose_j, k, e), f).0;
             let (pi, mi, pj, mj) = (d_i(EPS), d_i(-EPS), d_j(EPS), d_j(-EPS));
-            for (row, analytic) in j_i.iter().enumerate() {
+            for row in 0..6 {
+                let analytic = j_i[(row, k)];
                 let num_i = (pi[row] - mi[row]) / (2.0 * EPS);
                 let num_j = (pj[row] - mj[row]) / (2.0 * EPS);
                 worst = worst
-                    .max((analytic[k] - num_i).abs())
-                    .max((-analytic[k] - num_j).abs());
+                    .max((analytic - num_i).abs())
+                    .max((-analytic - num_j).abs());
             }
         }
         worst
@@ -330,7 +331,8 @@ mod tests {
         factor(rng, t_cb_from, t_cb_to)
     }
 
-    /// Near a solution the residual is small and `barfoot_q` takes its series.
+    /// Near a solution the residual is small and the SE(3) log and Jacobian take
+    /// their small-angle series.
     #[test]
     fn jacobians_match_central_differences_near_the_solution() {
         let mut rng = Lcg(11);
@@ -339,11 +341,11 @@ mod tests {
             let pose_i = rng.pose(3.0, 1.2);
             // T_wb_j = T_wb_i · ΔT · small, solved for T_cw_j.
             let t_wb_i = pose_i.inverse().compose(&f.t_cb_from);
-            let small = exp(&std::array::from_fn(|_| rng.next() * 1e-3));
+            let small = exp(&Vec6F64::from_fn(|_, _| rng.next() * 1e-3));
             let t_wb_j = t_wb_i.compose(&f.measurement.delta_pose()).compose(&small);
             let pose_j = f.t_cb_to.compose(&t_wb_j.inverse());
             let (r, _) = residual_and_jacobian(&pose_i, &pose_j, &f);
-            assert!(r[3..].iter().map(|x| x * x).sum::<f64>() < 1e-4);
+            assert!(r.fixed_rows::<3>(3).norm_squared() < 1e-4);
             let err = jacobian_error(&pose_i, &pose_j, &f);
             assert!(err <= 1e-6, "small residual: {err:e}");
         }
@@ -371,12 +373,12 @@ mod tests {
         );
         let info = m.information().unwrap();
         let det = 4e-4 * 1e-4 - 1e-8;
-        assert!((info[0][0] - 1e-4 / det).abs() < 1e-6);
-        assert!((info[0][1] + 1e-4 / det).abs() < 1e-6);
-        assert!((info[5][5] - 100.0).abs() < 1e-9);
-        assert_eq!(info[2][2], 1e4);
-        assert_eq!(info[3][3], 1e4);
-        assert_eq!(info[0][5], 0.0);
+        assert!((info[(0, 0)] - 1e-4 / det).abs() < 1e-6);
+        assert!((info[(0, 1)] + 1e-4 / det).abs() < 1e-6);
+        assert!((info[(5, 5)] - 100.0).abs() < 1e-9);
+        assert_eq!(info[(2, 2)], 1e4);
+        assert_eq!(info[(3, 3)], 1e4);
+        assert_eq!(info[(0, 5)], 0.0);
         m.motion.covariance.z_axis.z = 0.0;
         assert!(m.information().is_none());
         m.motion.covariance.z_axis.z = 1e-2;
@@ -436,7 +438,7 @@ mod tests {
                 )
                 .delta_pose();
                 let (r, _) = residual_and_jacobian(&Pose3d::IDENTITY, &truth.inverse(), &factor);
-                let chi2 = quadratic_form(&info, &r);
+                let chi2 = r.dot(&(info * r));
                 let dz_v = Vec3F64::new(dz[0], dz[1], dz[2]);
                 let expected = dz_v.dot(sigma_inv * dz_v);
                 assert!(
@@ -507,7 +509,7 @@ mod tests {
         )
         .information()
         .unwrap();
-        let r = [4.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let r = Vec6F64::new(4.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(robust_weight_and_cost(&r, &info, None), (1.0, 8.0));
         assert_eq!(robust_weight_and_cost(&r, &info, Some(25.0)), (1.0, 8.0));
         // ½ρ(16) with k = 4: √64 − 2.
@@ -523,7 +525,7 @@ mod tests {
         let mut rng = Lcg(11);
         let info = random_factor(&mut rng).measurement.information().unwrap();
         for scale in [1e-3, 0.05, 1.0] {
-            let r: [f64; 6] = std::array::from_fn(|_| rng.next() * scale);
+            let r = Vec6F64::from_fn(|_, _| rng.next() * scale);
             for k in [None, Some(12.59), Some(1e-3)] {
                 let (w, _) = robust_weight_and_cost(&r, &info, k);
                 for a in 0..6 {
@@ -534,7 +536,7 @@ mod tests {
                     let numeric = (robust_weight_and_cost(&rp, &info, k).1
                         - robust_weight_and_cost(&rm, &info, k).1)
                         / (2.0 * h);
-                    let analytic = w * (0..6).map(|b| info[a][b] * r[b]).sum::<f64>();
+                    let analytic = w * (info * r)[a];
                     assert!(
                         (numeric - analytic).abs() <= 1e-5 * analytic.abs().max(1.0),
                         "scale {scale} k {k:?} row {a}: {numeric} vs {analytic}"
