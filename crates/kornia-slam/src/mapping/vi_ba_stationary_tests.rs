@@ -98,8 +98,8 @@ fn factor(gyro: bool, huber: Option<f64>) -> StationaryFactor {
 fn stacked(edge: &StationaryFactor, kfs: &[ViBaKeyframe]) -> (Vec<f64>, Vec<f64>) {
     let info = edge.information();
     let e = stationary_eval(edge, &info, &kfs[0], &kfs[1]);
-    let mut r: Vec<f64> = e.pose.to_vec();
-    let mut w: Vec<f64> = (0..6).map(|k| e.weight * info.pose[k][k]).collect();
+    let mut r: Vec<f64> = e.pose.iter().copied().collect();
+    let mut w: Vec<f64> = (0..6).map(|k| e.weight * info.pose[(k, k)]).collect();
     for v in [e.velocity_i, e.velocity_j] {
         r.extend([v.x, v.y, v.z]);
         w.extend([e.weight * info.velocity; 3]);

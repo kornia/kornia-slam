@@ -33,10 +33,10 @@
 //! were stationary.
 
 use crate::robust::huber_weight_and_cost;
-use crate::se3::{Mat6, quadratic_form, relative_pose_residual};
+use crate::se3::relative_pose_residual;
 use crate::state::NavState;
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::Vec3F64;
+use kornia_algebra::{Mat6F64, Vec3F64, Vec6F64};
 use kornia_sensors::imu::ImuCalib;
 
 /// The mean raw gyro rate measured while the rig was still.
@@ -187,11 +187,7 @@ impl StationaryFactor {
     pub fn information(&self) -> StationaryInfo {
         let t = 1.0 / (self.translation_sigma_m * self.translation_sigma_m);
         let r = 1.0 / (self.rotation_sigma_rad * self.rotation_sigma_rad);
-        let mut pose = [[0.0; 6]; 6];
-        for k in 0..3 {
-            pose[k][k] = t;
-            pose[k + 3][k + 3] = r;
-        }
+        let pose = Mat6F64::from_diagonal(&Vec6F64::new(t, t, t, r, r, r));
         let walk = |density: f64| 1.0 / (density * density * self.span_s);
         let gyro_bias_walk_var =
             self.calib.gyro_bias_noise * self.calib.gyro_bias_noise * self.span_s;
@@ -211,7 +207,7 @@ impl StationaryFactor {
 /// Per-block information of a [`StationaryFactor`]; every block is diagonal.
 #[derive(Debug, Clone, Copy)]
 pub struct StationaryInfo {
-    pub pose: Mat6,
+    pub pose: Mat6F64,
     /// Per axis, for each of `v_i` and `v_j`.
     pub velocity: f64,
     pub gyro_bias: f64,
@@ -226,8 +222,8 @@ pub struct StationaryInfo {
 /// bias walk, `−I/2` on each gyro bias for the mean-gyro row.
 #[derive(Debug, Clone, Copy)]
 pub struct StationaryResidual {
-    pub pose: [f64; 6],
-    pub pose_jacobian_i: Mat6,
+    pub pose: Vec6F64,
+    pub pose_jacobian_i: Mat6F64,
     pub velocity_i: Vec3F64,
     pub velocity_j: Vec3F64,
     pub gyro_bias: Vec3F64,
@@ -261,7 +257,7 @@ pub fn residual(
         .gyro_mean
         .map(|(mean, _)| mean - (i.bias.gyro + j.bias.gyro) * 0.5);
 
-    let chi2_nav = quadratic_form(&info.pose, &pose)
+    let chi2_nav = pose.dot(&(info.pose * pose))
         + info.velocity * (i.velocity.dot(i.velocity) + j.velocity.dot(j.velocity));
     let (weight, nav_cost) = huber_weight_and_cost(chi2_nav, factor.huber_chi2);
     let chi2_bias = info.gyro_bias * gyro_bias.dot(gyro_bias)
@@ -444,9 +440,9 @@ mod tests {
     fn information_follows_the_noise_model() {
         let f = with_gyro(StationaryFactor::new(0, 1, 120.0, calib()), [0.0; 3], 100.0);
         let info = f.information();
-        assert_eq!(info.pose[0][0], 1.0 / (0.002 * 0.002));
-        assert_eq!(info.pose[5][5], 1.0 / (0.002 * 0.002));
-        assert_eq!(info.pose[0][1], 0.0);
+        assert_eq!(info.pose[(0, 0)], 1.0 / (0.002 * 0.002));
+        assert_eq!(info.pose[(5, 5)], 1.0 / (0.002 * 0.002));
+        assert_eq!(info.pose[(0, 1)], 0.0);
         assert_eq!(info.velocity, 1.0 / (0.01 * 0.01));
         assert!((info.gyro_bias - 1.0 / (2e-5 * 2e-5 * 120.0)).abs() < 1e-6 * info.gyro_bias);
         assert!((info.accel_bias - 1.0 / (3e-3 * 3e-3 * 120.0)).abs() < 1e-9 * info.accel_bias);

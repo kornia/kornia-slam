@@ -67,13 +67,12 @@
 
 use faer::Mat;
 use faer::prelude::Solve;
-use kornia_algebra::{SE3F32, Vec3F64};
+use kornia_algebra::{Mat6F64, Mat15F64, SE3F32, Vec3F64, Vec6F64, Vec15F64};
 use thiserror::Error;
 
 use crate::pose_conversion::{pose_to_se3, se3_to_pose, vec3_to_f32};
-use kornia_factors::imu::{self, ImuFactor, Mat15};
+use kornia_factors::imu::{self, ImuFactor};
 use kornia_factors::robust::huber_weight_and_cost;
-use kornia_factors::se3::Mat6;
 use kornia_factors::state::NavState;
 use kornia_factors::stationary::{self, StationaryFactor, StationaryInfo, StationaryResidual};
 use kornia_factors::wheel_odometry::{self, WheelOdomFactor};
@@ -662,58 +661,25 @@ fn accum_jt_omega_j(
     m_vec: &mut [f64],
     row_base: usize,
     col_base: usize,
-    j_a: &Mat15,
-    j_b: &Mat15,
-    omega: &Mat15,
-    res: &[f64; 15],
+    j_a: &Mat15F64,
+    j_b: &Mat15F64,
+    omega: &Mat15F64,
+    res: &Vec15F64,
     update_rhs: bool,
 ) {
-    // omega_jb[r,c] = Σ_k omega[r,k] · j_b[k,c]
-    let mut omega_jb = [0.0f64; 225];
-    for r in 0..15 {
-        for c in 0..15 {
-            let mut s = 0.0f64;
-            for k in 0..15 {
-                s += omega[idx15(r, k)] * j_b[idx15(k, c)];
-            }
-            omega_jb[idx15(r, c)] = s;
-        }
-    }
-
-    // H[row_base+i, col_base+j] += Σ_k j_a[k,i] · omega_jb[k,j]
+    let j_a_t = j_a.transpose();
+    let h = j_a_t * (omega * j_b);
     for i in 0..15 {
         for j in 0..15 {
-            let mut s = 0.0f64;
-            for k in 0..15 {
-                s += j_a[idx15(k, i)] * omega_jb[idx15(k, j)];
-            }
-            m_mat[(row_base + i, col_base + j)] += s;
+            m_mat[(row_base + i, col_base + j)] += h[(i, j)];
         }
     }
-
-    // g[row_base+i] -= Σ_k j_a[k,i] · (Σ_m omega[k,m] · res[m])
     if update_rhs {
-        let mut omega_r = [0.0f64; 15];
-        for k in 0..15 {
-            for m in 0..15 {
-                omega_r[k] += omega[idx15(k, m)] * res[m];
-            }
-        }
+        let g = j_a_t * (omega * res);
         for i in 0..15 {
-            let mut s = 0.0f64;
-            for k in 0..15 {
-                s += j_a[idx15(k, i)] * omega_r[k];
-            }
-            m_vec[row_base + i] -= s;
+            m_vec[row_base + i] -= g[i];
         }
     }
-}
-
-/// Row-major index of `(row, col)` in a 15×15 matrix stored as `[f64; 225]`
-/// (the IMU edge's information, Jacobians and products).
-#[inline]
-const fn idx15(row: usize, col: usize) -> usize {
-    row * 15 + col
 }
 
 /// Huber weight and cost `½ρ(chi2)` of a reprojection or depth residual.
@@ -724,7 +690,7 @@ fn visual_huber(chi2: f64, chi2_threshold: f64) -> (f64, f64) {
 /// [`imu::information`], warning when the navigation covariance is singular:
 /// the first time always (it is a fault in the IMU input, not chatter), the
 /// rest only under KORNIA_SLAM_DEBUG, as it can recur every solve.
-fn imu_information_matrix(pim: &PreintegratedImu, weight: f64) -> Mat15 {
+fn imu_information_matrix(pim: &PreintegratedImu, weight: f64) -> Mat15F64 {
     let info = imu::information(pim, weight);
     if info.diagonal_fallback {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -779,7 +745,7 @@ fn matmul_6x3_3x3_f64(a: &[f64; 18], b: &[f64; 9]) -> [f64; 18] {
 }
 
 /// Validates the wheel edges and returns each one's information matrix.
-fn wheel_information(edges: &[WheelOdomFactor], n_kf: usize) -> Result<Vec<Mat6>, ViBaError> {
+fn wheel_information(edges: &[WheelOdomFactor], n_kf: usize) -> Result<Vec<Mat6F64>, ViBaError> {
     edges
         .iter()
         .enumerate()
@@ -818,7 +784,7 @@ fn accumulate_wheel_edges(
     kfs: &[ViBaKeyframe],
     kf_local: &[i64],
     edges: &[WheelOdomFactor],
-    infos: &[Mat6],
+    infos: &[Mat6F64],
 ) -> f64 {
     let mut cost = 0.0;
     for (edge, info) in edges.iter().zip(infos) {
@@ -847,23 +813,16 @@ fn accumulate_pose_pair(
     m_vec: &mut [f64],
     li: i64,
     lj: i64,
-    r: &[f64; 6],
-    j: &Mat6,
-    info: &Mat6,
+    r: &Vec6F64,
+    j: &Mat6F64,
+    info: &Mat6F64,
     w: f64,
 ) {
     const KF_DOF: usize = 15;
     // JᵀΩ, with the robust weight folded in.
-    let mut jt_omega = [[0.0f64; 6]; 6];
-    for (a, row) in jt_omega.iter_mut().enumerate() {
-        for (b, x) in row.iter_mut().enumerate() {
-            *x = w * (0..6).map(|k| j[k][a] * info[k][b]).sum::<f64>();
-        }
-    }
-    let h: Mat6 = std::array::from_fn(|a| {
-        std::array::from_fn(|b| (0..6).map(|k| jt_omega[a][k] * j[k][b]).sum())
-    });
-    let g: [f64; 6] = std::array::from_fn(|a| (0..6).map(|k| jt_omega[a][k] * r[k]).sum());
+    let jt_omega = (j.transpose() * info) * w;
+    let h = jt_omega * j;
+    let g = jt_omega * r;
 
     let slots = [(li, 1.0), (lj, -1.0)];
     for &(l_row, s_row) in &slots {
@@ -881,7 +840,7 @@ fn accumulate_pose_pair(
             let col0 = l_col as usize * KF_DOF;
             for a in 0..6 {
                 for b in 0..6 {
-                    m_mat[(row0 + a, col0 + b)] += s_row * s_col * h[a][b];
+                    m_mat[(row0 + a, col0 + b)] += s_row * s_col * h[(a, b)];
                 }
             }
         }
@@ -893,7 +852,7 @@ fn wheel_cost(
     kfs: &[ViBaKeyframe],
     kf_local: &[i64],
     edges: &[WheelOdomFactor],
-    infos: &[Mat6],
+    infos: &[Mat6F64],
 ) -> f64 {
     edges
         .iter()
@@ -1436,13 +1395,10 @@ pub fn visual_inertial_bundle_adjust(
             // itself away through bias, in exactly the windows where that matters.
             let (hw, c_imu) = imu::weight_and_cost(&res, &omega_raw, params.huber_imu_chi2);
             cost_imu += c_imu;
-            let omega: Mat15 = {
+            let omega: Mat15F64 = {
                 let mut o = omega_raw;
-                for r in 0..9 {
-                    for c in 0..9 {
-                        o[idx15(r, c)] *= hw;
-                    }
-                }
+                let mut nav = o.fixed_view_mut::<9, 9>(0, 0);
+                nav *= hw;
                 o
             };
 

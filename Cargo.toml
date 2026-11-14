@@ -21,13 +21,13 @@ kornia-factors = { path = "crates/kornia-factors", version = "0.2.0" }
 kornia-sensors = { path = "crates/kornia-sensors", version = "0.2.0" }
 kornia-slam = { path = "crates/kornia-slam", version = "0.2.0" }
 
-kornia-3d = { git = "https://github.com/kornia/kornia-rs", rev = "c2bcce1d77b23464b7e3d2e5d0ee12460a8fc4b2", version = "0.2.0" }
-kornia-algebra = { git = "https://github.com/kornia/kornia-rs", rev = "c2bcce1d77b23464b7e3d2e5d0ee12460a8fc4b2", version = "0.2.0" }
-kornia-bow = { git = "https://github.com/kornia/kornia-rs", rev = "c2bcce1d77b23464b7e3d2e5d0ee12460a8fc4b2", version = "0.2.0" }
-kornia-image = { git = "https://github.com/kornia/kornia-rs", rev = "c2bcce1d77b23464b7e3d2e5d0ee12460a8fc4b2", version = "0.2.0" }
-kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", rev = "c2bcce1d77b23464b7e3d2e5d0ee12460a8fc4b2", version = "0.2.0" }
-kornia-io = { git = "https://github.com/kornia/kornia-rs", rev = "c2bcce1d77b23464b7e3d2e5d0ee12460a8fc4b2", version = "0.2.0" }
-kornia-tensor = { git = "https://github.com/kornia/kornia-rs", rev = "c2bcce1d77b23464b7e3d2e5d0ee12460a8fc4b2", version = "0.2.0" }
+kornia-3d = { git = "https://github.com/kornia/kornia-rs", rev = "8091be2cbce69da8eb37e5d5cb4f8b0180d02088", version = "0.2.0" }
+kornia-algebra = { git = "https://github.com/kornia/kornia-rs", rev = "8091be2cbce69da8eb37e5d5cb4f8b0180d02088", version = "0.2.0" }
+kornia-bow = { git = "https://github.com/kornia/kornia-rs", rev = "8091be2cbce69da8eb37e5d5cb4f8b0180d02088", version = "0.2.0" }
+kornia-image = { git = "https://github.com/kornia/kornia-rs", rev = "8091be2cbce69da8eb37e5d5cb4f8b0180d02088", version = "0.2.0" }
+kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", rev = "8091be2cbce69da8eb37e5d5cb4f8b0180d02088", version = "0.2.0" }
+kornia-io = { git = "https://github.com/kornia/kornia-rs", rev = "8091be2cbce69da8eb37e5d5cb4f8b0180d02088", version = "0.2.0" }
+kornia-tensor = { git = "https://github.com/kornia/kornia-rs", rev = "8091be2cbce69da8eb37e5d5cb4f8b0180d02088", version = "0.2.0" }
 
 # Release binaries only (binary_release.yml). Kept out of `release` so local
 # benchmark builds stay fast and comparable with earlier runs.
