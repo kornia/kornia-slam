@@ -397,32 +397,28 @@ fn cheirality_refuses_steps_that_turn_landmarks_behind_the_camera() {
 fn damping_makes_a_rank_two_point_block_invertible() {
     // J has rows perpendicular to the ray (0, 0, 1): C = JᵀJ = diag(a, a, 0).
     let a = 400.0f64.powi(2);
-    let mut c = [[a, 0.0, 0.0, 0.0, a, 0.0, 0.0, 0.0, 0.0]];
-    assert!(invert_3x3_f64(&c[0]).is_none());
+    let diag = SVecF64::<3>::new(a, a, 0.0);
+    let mut c = [SMatF64::<3, 3>::from_diagonal(&diag)];
+    assert!(invert_point_block(&c[0]).is_none());
     let lambda = 1e-2;
     damp_point_blocks(&mut c, lambda);
-    let inv = invert_3x3_f64(&c[0]).expect("damped C inverts");
-    assert!((inv[0] - 1.0 / (a * (1.0 + lambda))).abs() < 1e-15);
-    assert!((inv[8] - 1.0 / (lambda * MIN_DAMPING_FLOOR)).abs() < 1e-3 * inv[8]);
+    let inv = invert_point_block(&c[0]).expect("damped C inverts");
+    assert!((inv[(0, 0)] - 1.0 / (a * (1.0 + lambda))).abs() < 1e-15);
+    assert!((inv[(2, 2)] - 1.0 / (lambda * MIN_DAMPING_FLOOR)).abs() < 1e-3 * inv[(2, 2)]);
 
     // Rotated off the axes, so every diagonal entry is non-zero.
     let rot = SO3F64::exp(Vec3F64::new(0.3, -0.5, 0.2)).matrix();
     let d = Mat3F64::from_cols_array(&[a, 0.0, 0.0, 0.0, a, 0.0, 0.0, 0.0, 0.0]);
     let full = rot * (d * rot.transpose());
-    let cols = full.to_cols_array();
-    let mut c = [[
-        cols[0], cols[3], cols[6], cols[1], cols[4], cols[7], cols[2], cols[5], cols[8],
-    ]];
+    let mut c = [SMatF64::<3, 3>::from_column_slice(&full.to_cols_array())];
     let ray = rot * Vec3F64::new(0.0, 0.0, 1.0);
-    let min_diag = (0..3).map(|d| c[0][d * 4]).fold(f64::INFINITY, f64::min);
+    let min_diag = c[0].diagonal().min();
     damp_point_blocks(&mut c, lambda);
-    let inv = invert_3x3_f64(&c[0]).expect("damped C inverts");
+    let inv = invert_point_block(&c[0]).expect("damped C inverts");
     // C is PSD, so the damped block's smallest eigenvalue is at least
     // λ·min diag(C): the step along the ray is bounded by its inverse.
-    let v = [ray.x, ray.y, ray.z];
-    let along: f64 = (0..3)
-        .map(|r| (0..3).map(|k| v[r] * inv[r * 3 + k] * v[k]).sum::<f64>())
-        .sum();
+    let v = SVecF64::<3>::new(ray.x, ray.y, ray.z);
+    let along = v.dot(&(inv * v));
     assert!(
         along > 0.0 && along <= 1.0 / (lambda * min_diag) * (1.0 + 1e-9),
         "{along} vs {}",
