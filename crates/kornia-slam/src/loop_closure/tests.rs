@@ -794,11 +794,13 @@ fn optimize_pose_graph_output_is_bit_identical_to_b1be250() {
         }),
     )
     .unwrap();
-    // Captured at b1be250, before the solver took information-weighted and robust edges.
-    assert_eq!((se3.iterations, se3.usable), (9, true));
+    // Captured at b1be250, before the solver took information-weighted and robust edges, and
+    // re-captured once the SE(3) conversions kept unit quaternions (b1be250: 9 SE(3) iterations;
+    // poses moved by at most 2.2e-4, f32 LM noise on this lap).
+    assert_eq!((se3.iterations, se3.usable), (22, true));
     assert_eq!((inertial.iterations, inertial.usable), (6, true));
-    assert_eq!(pgo_result_fingerprint(&se3), 0xc41d_4b73_a9e1_94a0);
-    assert_eq!(pgo_result_fingerprint(&inertial), 0xd892_637a_5121_1385);
+    assert_eq!(pgo_result_fingerprint(&se3), 0xa4ac_a7f5_0777_b24e);
+    assert_eq!(pgo_result_fingerprint(&inertial), 0x934d_608c_260c_d0b9);
 }
 
 /// The closer's PoseGraph path with `w * I` information takes the snapshot optimizer's LM path,

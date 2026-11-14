@@ -10,6 +10,8 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::PreintegratedImu;
 
+use crate::pose_conversion::rigid;
+
 /// Preintegration prepared by the system, which owns bias and sample buffering.
 pub(crate) struct InertialPrediction<'a> {
     pub preintegrated: &'a PreintegratedImu,
@@ -47,9 +49,11 @@ pub(crate) fn predict_pose(
 
 /// Applies the last inter-frame motion again.
 fn predict_pose_visual(pose_before: Pose3d, visual_velocity: Option<Pose3d>) -> Pose3d {
-    visual_velocity
-        .map(|v| v.compose(&pose_before))
-        .unwrap_or(pose_before)
+    rigid(
+        visual_velocity
+            .map(|v| v.compose(&pose_before))
+            .unwrap_or(pose_before),
+    )
 }
 
 /// Propagates the camera pose and body velocity through one preintegrated IMU
@@ -74,7 +78,7 @@ fn predict_pose_imu(
         Some(t_bc) => pred_body_to_world.compose(t_bc),
         None => pred_body_to_world,
     };
-    (pred_cam_to_world.inverse(), v_j)
+    (rigid(pred_cam_to_world.inverse()), v_j)
 }
 
 fn body_to_world(pose_w2c: &Pose3d, camera_to_body: Option<Pose3d>) -> Pose3d {
@@ -227,5 +231,29 @@ mod tests {
 
         assert_pose_close(pose, pose_before);
         assert_eq!(velocity, Some(Vec3F64::ZERO));
+    }
+
+    /// Both models return a rotation even from a scaled `pose_before`.
+    #[test]
+    fn predictions_from_a_scaled_pose_are_rigid() {
+        let pose_before = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.1, -0.2, 0.3)).matrix() * 1.001,
+            Vec3F64::new(0.4, 0.3, -0.2),
+        );
+        let velocity = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.0, 0.01, 0.0)).matrix(),
+            Vec3F64::new(0.02, 0.0, 0.0),
+        );
+        let preintegrated = preintegration(0.05);
+        let inertial = InertialPrediction {
+            preintegrated: &preintegrated,
+            camera_to_body: None,
+            gravity_world: Vec3F64::new(0.0, 0.0, -9.81),
+        };
+        let (visual, _) = predict_pose(pose_before, Some(velocity), Vec3F64::ZERO, None);
+        let (imu, _) = predict_pose(pose_before, None, Vec3F64::ZERO, Some(inertial));
+        for pose in [visual, imu] {
+            assert!(crate::pose_conversion::rotation_defect(&pose.rotation) < 1e-12);
+        }
     }
 }

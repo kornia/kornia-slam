@@ -168,6 +168,25 @@ fn a_keyframe_moved_during_the_solve_keeps_its_refinement() {
     );
 }
 
+/// A keyframe moved during the solve to a scaled rotation is stored rigid: the correction
+/// composes with its transpose inverse, which would carry the scale on.
+#[test]
+fn a_scaled_moved_keyframe_is_stored_rigid() {
+    let mut map = three_keyframe_map();
+    let (ids, before, after) = snapshot_and_solve(&map);
+    let refinement = pose([0.01, -0.005, 0.0], [0.02, 0.0, -0.01]).compose(&before[1]);
+    map.set_keyframe_pose_for_test(
+        1,
+        Pose3d::new(refinement.rotation * 1.001, refinement.translation),
+    );
+
+    map.apply_graph_correction(map.world_epoch, &ids, &before, &after)
+        .unwrap();
+
+    let corrected = map.get_keyframe(1).unwrap().frame.pose_world_to_cam;
+    assert!(crate::pose_conversion::rotation_defect(&corrected.rotation) < 1e-12);
+}
+
 /// (d) A solve from another world is refused without a write, and an accepted writeback makes a
 /// bundle adjustment captured before it stale.
 #[test]

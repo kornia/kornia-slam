@@ -11,6 +11,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 
 use super::pnp::PnpConfig;
+use crate::pose_conversion::rigid;
 
 /// One match: a world point and the undistorted pixel that camera `camera`
 /// observed it at, with that camera's `T_CP`.
@@ -107,7 +108,8 @@ fn refine(
     huber_delta: f64,
     max_iterations: usize,
 ) -> Option<Pose3d> {
-    let mut pose = *start;
+    // A scaled start keeps its scale: every step left-multiplies a rotation.
+    let mut pose = rigid(*start);
     let mut cost = robust_cost(observations, active, &pose, huber_delta);
     let mut lambda = 1e-3;
     for _ in 0..max_iterations {
@@ -276,10 +278,11 @@ mod tests {
         SO3F64::exp(Vec3F64::new(0.0, deg.to_radians(), 0.0)).matrix()
     }
 
-    #[test]
-    fn matches_the_single_camera_solver_with_noise_and_outliers() {
-        let camera = camera();
-        let truth = Pose3d::new(yaw(2.0), Vec3F64::new(0.05, -0.02, 0.1));
+    /// 200 matches of `truth`, one in four a 20 px outlier, the rest within 0.5 px.
+    fn noisy_observations<'a>(
+        camera: &'a PinholeCamera,
+        truth: &Pose3d,
+    ) -> Vec<RigObservation<'a>> {
         let mut observations = Vec::new();
         let mut seed = 7u64;
         let mut noise = || {
@@ -305,11 +308,19 @@ mod tests {
             observations.push(RigObservation {
                 point_world: world,
                 pixel: [pixel.x + du, pixel.y + dv],
-                camera: &camera,
+                camera,
                 camera_from_primary: None,
                 sigma_px: 1.0,
             });
         }
+        observations
+    }
+
+    #[test]
+    fn matches_the_single_camera_solver_with_noise_and_outliers() {
+        let camera = camera();
+        let truth = Pose3d::new(yaw(2.0), Vec3F64::new(0.05, -0.02, 0.1));
+        let observations = noisy_observations(&camera, &truth);
         let start = Pose3d::new(yaw(5.0), Vec3F64::new(0.1, -0.02, 0.05));
         let (pose, inliers) = solve_rig_pnp(&observations, &start, &PnpConfig::default()).unwrap();
         let points: Vec<Vec3F64> = observations.iter().map(|o| o.point_world).collect();
@@ -330,6 +341,20 @@ mod tests {
         assert_eq!(inliers, mono_inliers);
         assert!((pose.translation - truth.translation).length() < 0.01);
         assert!((pose.translation - mono.translation).length() < 1e-3);
+    }
+
+    #[test]
+    fn a_scaled_start_gives_a_rigid_pose() {
+        let camera = camera();
+        let truth = Pose3d::new(yaw(2.0), Vec3F64::new(0.05, -0.02, 0.1));
+        let observations = noisy_observations(&camera, &truth);
+        let start = Pose3d::new(yaw(5.0), Vec3F64::new(0.1, -0.02, 0.05));
+        let scaled_start = Pose3d::new(start.rotation * 1.001, start.translation);
+        let config = PnpConfig::default();
+        let (_, inliers) = solve_rig_pnp(&observations, &start, &config).unwrap();
+        let (pose, scaled_inliers) = solve_rig_pnp(&observations, &scaled_start, &config).unwrap();
+        assert!(crate::pose_conversion::rotation_defect(&pose.rotation) < 1e-12);
+        assert_eq!(scaled_inliers, inliers);
     }
 
     #[test]
