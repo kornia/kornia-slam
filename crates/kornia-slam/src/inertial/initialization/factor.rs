@@ -16,7 +16,7 @@
 
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::optim::{Factor, FactorError, FactorResult, LinearizationResult};
-use kornia_algebra::{DMatF64, DVecF64, Mat3F64, SO3F64, Vec3F64};
+use kornia_algebra::{DMatF64, DVecF64, Mat3F64, Mat9F64, SO3F64, Vec3F64};
 use kornia_factors::imu::body_frame;
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, PreintegratedImu};
 
@@ -344,8 +344,8 @@ fn set_col3(jac: &mut DMatF64, row0: usize, col0: usize, v: Vec3F64) {
 /// and only falls back to unweighted (identity) in the rare case the
 /// covariance is numerically non-PSD. Revisit if that fallback ever triggers
 /// in practice).
-fn sqrt_information_9x9(cov_col_major: &[f64; 81]) -> DMatF64 {
-    let cov = DMatF64::from_column_slice(9, 9, cov_col_major);
+fn sqrt_information_9x9(cov: &Mat9F64) -> DMatF64 {
+    let cov = DMatF64::from_column_slice(9, 9, cov.as_slice());
     let cov_sym = (cov.clone() + cov.transpose()) * 0.5;
     let info = cov_sym
         .try_inverse()

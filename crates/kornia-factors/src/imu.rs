@@ -16,7 +16,7 @@
 //! first order for the bias at `i`.
 
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat3F64, Mat9F64, Mat15F64, SO3F64, Vec3F64, Vec15F64};
+use kornia_algebra::{Mat3F64, Mat15F64, SO3F64, Vec3F64, Vec15F64};
 use kornia_sensors::imu::PreintegratedImu;
 
 use crate::robust::huber_weight_and_cost;
@@ -182,7 +182,7 @@ pub fn information(pim: &PreintegratedImu, weight: f64) -> ImuInformation {
 
     // Preintegration correlates rotation, velocity and position errors (gyro
     // drives all three, accel the last two), so the diagonal alone is wrong.
-    let nav_covariance = Mat9F64::from_column_slice(&pim.covariance);
+    let nav_covariance = pim.covariance;
     let nav_inverse = nav_covariance.cholesky().map(|c| c.inverse());
     let mut nav = omega.fixed_view_mut::<9, 9>(0, 0);
     match &nav_inverse {
@@ -193,7 +193,7 @@ pub fn information(pim: &PreintegratedImu, weight: f64) -> ImuInformation {
     }
 
     for i in 0..6 {
-        omega[(9 + i, 9 + i)] = weight * inverse_variance(pim.bias_covariance[i * 7]);
+        omega[(9 + i, 9 + i)] = weight * inverse_variance(pim.bias_covariance[(i, i)]);
     }
     ImuInformation {
         omega,
@@ -310,7 +310,7 @@ mod tests {
         for r in 0..9 {
             for c in 0..9 {
                 let product: f64 = (0..9)
-                    .map(|k| info.omega[(r, k)] * pim.covariance[c * 9 + k])
+                    .map(|k| info.omega[(r, k)] * pim.covariance[(k, c)])
                     .sum();
                 let expected = if r == c { 2.0 } else { 0.0 };
                 assert!((product - expected).abs() < 1e-6, "({r}, {c}): {product}");

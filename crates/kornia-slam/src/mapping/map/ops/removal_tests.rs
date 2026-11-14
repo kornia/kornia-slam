@@ -290,7 +290,7 @@ fn a_snapshot_captured_before_the_removal_still_merges_without_resurrecting_it()
 }
 
 fn gyro_walk(preintegrated: &PreintegratedImu) -> f64 {
-    preintegrated.bias_covariance[0]
+    preintegrated.bias_covariance[(0, 0)]
 }
 
 /// A merge re-preintegrates from the samples, which alone give back only the
@@ -380,7 +380,9 @@ fn a_still_boundary_keyframe_moves_its_imu_edge_onto_the_still_neighbour() {
         let widened = calib().gyro_bias_noise.powi(2) * 50.0;
         assert!((gyro_walk(a) - gyro_walk(b) - widened).abs() < 1e-6 * widened);
         let accel = calib().accel_bias_noise.powi(2) * 50.0;
-        assert!((a.bias_covariance[35] - b.bias_covariance[35] - accel).abs() < 1e-6 * accel);
+        assert!(
+            (a.bias_covariance[(5, 5)] - b.bias_covariance[(5, 5)] - accel).abs() < 1e-6 * accel
+        );
     }
 }
 
