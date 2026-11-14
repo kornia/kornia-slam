@@ -1,6 +1,18 @@
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3AF32, Mat3F64, SE3F32, SO3F32, Vec3AF32, Vec3F64};
 
+/// Largest [`rotation_defect`] a pose rotation may carry and still count as rigid.
+pub(crate) const RIGID_TOLERANCE: f64 = 1e-6;
+
+/// `max|RᵀR - I|`, infinite when `r` has a non-finite entry.
+pub(crate) fn rotation_defect(r: &Mat3F64) -> f64 {
+    let residual = (r.transpose() * *r - Mat3F64::IDENTITY).to_cols_array();
+    if !residual.iter().all(|v| v.is_finite()) {
+        return f64::INFINITY;
+    }
+    residual.iter().fold(0.0f64, |acc, v| acc.max(v.abs()))
+}
+
 pub(crate) fn pose_to_se3(pose: &Pose3d) -> SE3F32 {
     SE3F32::new(
         SO3F32::from_matrix(&mat3_to_f32(pose.rotation)),
@@ -63,5 +75,18 @@ mod tests {
         let v32 = vec3_to_f32(v);
         assert_eq!(v32.to_array(), [v.x as f32, v.y as f32, v.z as f32]);
         assert_eq!(vec3_to_f64(v32).to_array(), v32.to_array().map(f64::from));
+    }
+
+    #[test]
+    fn rotation_defect_is_zero_for_a_rotation_and_grows_with_scale() {
+        assert_eq!(rotation_defect(&Mat3F64::IDENTITY), 0.0);
+        let r = kornia_algebra::SO3F64::exp(Vec3F64::new(0.3, -0.2, 0.5)).matrix();
+        assert!(rotation_defect(&r) < 1e-15);
+        // (1.001)^2 - 1 on the diagonal.
+        let scaled = rotation_defect(&(r * 1.001));
+        assert!((scaled - 2.001e-3).abs() < 1e-9, "{scaled}");
+        let mut broken = r;
+        broken.x_axis.x = f64::NAN;
+        assert_eq!(rotation_defect(&broken), f64::INFINITY);
     }
 }

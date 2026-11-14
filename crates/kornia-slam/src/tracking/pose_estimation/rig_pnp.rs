@@ -36,7 +36,7 @@ impl RigObservation<'_> {
         (p_primary, p_camera)
     }
 
-    fn error_sq(&self, pose: &Pose3d) -> Option<f64> {
+    pub(super) fn error_sq(&self, pose: &Pose3d) -> Option<f64> {
         let (_, p_camera) = self.point_in_camera(pose);
         self.camera
             .reprojection_error_sq_cam(&p_camera, self.pixel[0], self.pixel[1])

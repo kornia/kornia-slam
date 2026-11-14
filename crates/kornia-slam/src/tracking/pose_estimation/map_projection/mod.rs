@@ -36,6 +36,7 @@ use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 use crate::frame::{Frame, is_finite_xy, undistort_keypoint};
 use crate::mapping::map::{Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
 use crate::mapping::visual_information::VisualInformation;
+use crate::pose_conversion::rotation_defect;
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 use crate::tracking::timings::{TrackingTimings, timed};
 
@@ -290,7 +291,8 @@ impl MapProjectionEstimator {
         // rejection with the PnP inlier count when that is what failed.
         type Rejection = (MapProjectionRejectReason, Option<usize>);
         let mut try_track_and_refine = |mut correspondences: Vec<(usize, usize)>,
-                                        pose_init: &Pose3d|
+                                        pose_init: &Pose3d,
+                                        stage: &'static str|
          -> Result<Estimate, Rejection> {
             correspondences
                 .retain(|&(_, kp_idx)| curr_keypoints_undist.get(kp_idx).is_some_and(is_finite_xy));
@@ -312,6 +314,8 @@ impl MapProjectionEstimator {
                     &grids,
                     pose_init,
                     search_scale,
+                    frame.idx,
+                    stage,
                 )
             })
             .ok_or((MapProjectionRejectReason::PnpFailed, None))?;
@@ -330,6 +334,7 @@ impl MapProjectionEstimator {
                     &grids,
                     &pose,
                     search_scale,
+                    frame.idx,
                 )
             }) {
                 matches = local.matches;
@@ -356,7 +361,7 @@ impl MapProjectionEstimator {
         };
 
         if let Some(seeded) = Self::eligible_pre_seeded(pre_seeded, pnp.min_correspondences)
-            && let Ok(estimate) = try_track_and_refine(seeded, candidate_pose)
+            && let Ok(estimate) = try_track_and_refine(seeded, candidate_pose, "seeded")
         {
             return Ok(estimate);
         }
@@ -364,7 +369,7 @@ impl MapProjectionEstimator {
         // PnP from projection matches.
         let matched = projection_matches.len();
         let (last_reject, early_inliers) = if matched >= pnp.min_correspondences {
-            match try_track_and_refine(projection_matches, candidate_pose) {
+            match try_track_and_refine(projection_matches, candidate_pose, "projection") {
                 Ok(estimate) => return Ok(estimate),
                 Err(rejection) => rejection,
             }
@@ -419,7 +424,7 @@ impl MapProjectionEstimator {
             return Err(MapProjectionRejectReason::LowReferenceCorrespondences);
         }
 
-        try_track_and_refine(ref_correspondences, pose_before_tracking)
+        try_track_and_refine(ref_correspondences, pose_before_tracking, "reference")
             .map_err(|(reason, _)| reason)
     }
 
@@ -458,6 +463,8 @@ impl MapProjectionEstimator {
                 &grids,
                 candidate_pose,
                 search_scale,
+                frame.idx,
+                "flow",
             )
         })
         .ok_or(MapProjectionRejectReason::PnpFailed)?;
@@ -559,6 +566,7 @@ impl MapProjectionEstimator {
         grids: &[ViewGrid],
         pose_init: &Pose3d,
         search_scale: f32,
+        frame_idx: usize,
     ) -> Option<Estimate> {
         let current_kf = current_kf_idx.and_then(|ki| map.get_keyframe(ki));
         let local_indices = select_local_map_points(
@@ -598,6 +606,8 @@ impl MapProjectionEstimator {
             grids,
             pose_init,
             search_scale,
+            frame_idx,
+            "local",
         )?;
         Some(Estimate {
             pose: new_pose,
@@ -663,6 +673,8 @@ impl MapProjectionEstimator {
         grids: &[ViewGrid],
         pose_init: &Pose3d,
         search_scale: f32,
+        frame_idx: usize,
+        stage: &'static str,
     ) -> Option<(Pose3d, usize)> {
         let pnp_config = if search_scale > 1.0 {
             PnpConfig {
@@ -691,7 +703,7 @@ impl MapProjectionEstimator {
                 }
             }
         }
-        let primary_solution = pnp::solve_pnp(
+        let (primary_solution, diagnostics) = pnp::solve_pnp_with_diagnostics(
             &points_world,
             &points_image,
             &points_octave,
@@ -700,6 +712,30 @@ impl MapProjectionEstimator {
             &pnp_config,
         );
         if grids.len() == 1 {
+            if primary_solution.is_none() && crate::debug_enabled() {
+                let distances_px = points_world
+                    .iter()
+                    .zip(&points_image)
+                    .filter_map(|(pw, px)| {
+                        primary.camera.reprojection_error_sq_world(
+                            pose_init,
+                            pw,
+                            px.x as f64,
+                            px.y as f64,
+                        )
+                    })
+                    .map(f64::sqrt)
+                    .collect();
+                log_failed_pnp(
+                    frame_idx,
+                    stage,
+                    &diagnostics,
+                    [0, 0],
+                    distances_px,
+                    &pnp_config,
+                    pose_init,
+                );
+            }
             return primary_solution;
         }
         let observations: Vec<RigObservation> = correspondences
@@ -723,7 +759,26 @@ impl MapProjectionEstimator {
         // is one: on real data the single-camera solver lands in the better
         // basin from a drifted prediction.
         let rig_start = primary_solution.map_or(*pose_init, |(pose, _)| pose);
-        solve_rig_pnp(&observations, &rig_start, &pnp_config)
+        let solution = solve_rig_pnp(&observations, &rig_start, &pnp_config);
+        if solution.is_none() && crate::debug_enabled() {
+            let distances_px: Vec<f64> = observations
+                .iter()
+                .filter_map(|o| o.error_sq(pose_init))
+                .map(f64::sqrt)
+                .collect();
+            let gate_px = pnp_config.prior_reproj_threshold_px;
+            let rig_prior_survivors = distances_px.iter().filter(|&&d| d <= gate_px).count();
+            log_failed_pnp(
+                frame_idx,
+                stage,
+                &diagnostics,
+                [observations.len(), rig_prior_survivors],
+                distances_px,
+                &pnp_config,
+                pose_init,
+            );
+        }
+        solution
     }
 
     /// Undistorts keypoints, builds one spatial grid per camera, and runs
@@ -876,6 +931,35 @@ impl MapProjectionEstimator {
 /// The frame's undistortion cache when filled (the pipeline fills it once
 /// per frame); only frames built outside the pipeline pay the per-keypoint
 /// undistortion here.
+/// The `[pnp]` line for a solve that returned no pose: the primary solve's
+/// counts, `[rig observations, rig observations inside the prior gate]`, and
+/// the median reprojection distance at `pose_init`.
+fn log_failed_pnp(
+    frame_idx: usize,
+    stage: &str,
+    diagnostics: &pnp::PnpDiagnostics,
+    [rig_obs, rig_prior_survivors]: [usize; 2],
+    mut distances_px: Vec<f64>,
+    config: &PnpConfig,
+    pose_init: &Pose3d,
+) {
+    distances_px.sort_by(f64::total_cmp);
+    let med_px = distances_px
+        .get(distances_px.len() / 2)
+        .copied()
+        .unwrap_or(f64::NAN);
+    eprintln!(
+        "[pnp] frame={frame_idx} stage={stage} failed input={} prior_survivors={} last_active={} \
+         rig_obs={rig_obs} rig_prior_survivors={rig_prior_survivors} med_px={med_px:.1} \
+         gate_px={:.0} init_defect={:.1e}",
+        diagnostics.input,
+        diagnostics.prior_survivors,
+        diagnostics.last_round_active,
+        config.prior_reproj_threshold_px,
+        rotation_defect(&pose_init.rotation),
+    );
+}
+
 fn undistorted_keypoints(frame: &Frame, camera: &PinholeCamera) -> Vec<[f32; 2]> {
     if frame.keypoints_undist.len() == frame.features.keypoints_xy.len() {
         frame.keypoints_undist.clone()

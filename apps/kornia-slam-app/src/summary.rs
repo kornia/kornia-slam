@@ -22,7 +22,8 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
     format!(
         "[summary] frames={} tracked={} keyframes={} skipped_bootstrap={} coast_inertial={} \
          coast_visual={} give_ups={} klt_errors={} snap_errors={} ba_failed={} vi_ba_failed={} \
-         prior_fallbacks={} ba_updates_rejected={} ba_solves={} ba_solve_ms={:.1}\n\
+         prior_fallbacks={} ba_updates_rejected={} ba_solves={} ba_solve_ms={:.1} \
+         nonrigid_poses={} nonrigid_keyframes={}\n\
          [summary] frame_ms {}\n\
          [summary] frontend_ms {}",
         c.frames,
@@ -40,6 +41,8 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
         c.ba_updates_rejected,
         c.ba_solves,
         c.ba_solve_ns as f64 / 1e6,
+        c.nonrigid_poses,
+        c.nonrigid_keyframes,
         format_percentiles(&times.frame_ms),
         format_percentiles(&times.frontend_ms),
     )
@@ -73,5 +76,20 @@ mod tests {
         assert_eq!(nearest_rank(&sorted, 99.0), 99.0);
         assert_eq!(nearest_rank(&[7.0], 99.0), 7.0);
         assert_eq!(nearest_rank(&[], 50.0), 0.0);
+    }
+
+    #[test]
+    fn first_line_ends_with_the_rigidity_counters() {
+        // `RunCounters` is non-exhaustive, so fields are set one by one.
+        let mut counters = RunCounters::default();
+        counters.ba_solve_ns = 2_500_000;
+        counters.nonrigid_poses = 3;
+        counters.nonrigid_keyframes = 1;
+        let text = format(&counters, &FrameTimes::default());
+        let first = text.lines().next().unwrap();
+        assert!(
+            first.ends_with("ba_solve_ms=2.5 nonrigid_poses=3 nonrigid_keyframes=1"),
+            "{first}"
+        );
     }
 }

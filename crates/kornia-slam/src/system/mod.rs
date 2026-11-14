@@ -67,7 +67,7 @@ use crate::mapping::map::{
     InertialAlignmentError, Keyframe, Map, MapInsertion, MapMutationError, MapPoint,
 };
 use crate::mapping::{KeyframeJob, LocalMapping};
-use crate::pose_conversion::apply_reference_pose_correction;
+use crate::pose_conversion::{RIGID_TOLERANCE, apply_reference_pose_correction, rotation_defect};
 use build::SystemSettings;
 use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
@@ -538,6 +538,9 @@ impl SlamSystem {
                 self.last_skip = None;
             }
             self.counters.record_frame(r.status, self.last_skip);
+            if rotation_defect(&r.pose_world_to_cam.rotation) > RIGID_TOLERANCE {
+                self.counters.nonrigid_poses += 1;
+            }
         }
         self.retain_previous_image(image, previous_image);
         result
@@ -736,6 +739,11 @@ impl SlamSystem {
         };
 
         for result in self.local_mapping.drain_results() {
+            for correction in &result.keyframe_corrections {
+                if self.note_pose("ba_keyframe", correction.kf_idx, &correction.pose_after) {
+                    self.counters.nonrigid_keyframes += 1;
+                }
+            }
             let Some(correction) = result
                 .keyframe_corrections
                 .iter()
@@ -749,6 +757,12 @@ impl SlamSystem {
                 correction.pose_before,
                 correction.pose_after,
             );
+            let pose = self.state.pose_world_to_cam;
+            self.note_pose(
+                "ba_correction",
+                self.next_frame_idx.saturating_sub(1),
+                &pose,
+            );
             self.state.velocity_world = correction.velocity_world;
             self.inertial.bias = correction.imu_bias;
         }
@@ -758,6 +772,16 @@ impl SlamSystem {
         if self.debug {
             self.debug_messages.push(msg);
         }
+    }
+
+    /// Logs a `[rigid]` line when `pose` is not rigid; returns whether it is not.
+    fn note_pose(&mut self, site: &'static str, idx: usize, pose: &Pose3d) -> bool {
+        let defect = rotation_defect(&pose.rotation);
+        let nonrigid = defect > RIGID_TOLERANCE;
+        if nonrigid {
+            self.dbg(format!("[rigid] site={site} idx={idx} defect={defect:.1e}"));
+        }
+        nonrigid
     }
 
     fn bootstrap_step(&mut self, curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
@@ -814,7 +838,9 @@ impl SlamSystem {
         };
 
         self.dbg(format!(
-            "[bootstrap_stereo] frame={curr_idx} metric map created with {added} points",
+            "[bootstrap_stereo] frame={curr_idx} metric map created with {added} points \
+             pose_defect={:.1e}",
+            rotation_defect(&self.state.pose_world_to_cam.rotation),
         ));
 
         self.state.velocity = None;
@@ -902,6 +928,7 @@ impl SlamSystem {
         let prev_pose_world_to_cam = curr_frame.pose_world_to_cam;
         self.state.pose_world_to_cam = estimated_pose;
         curr_frame.pose_world_to_cam = estimated_pose;
+        self.note_pose("bootstrap", curr_frame.idx, &estimated_pose);
 
         // Promote to Keyframes
         let prev_idx = prev_bootstrap_frame.idx;
@@ -942,6 +969,8 @@ impl SlamSystem {
         if let Some(kf) = self.map.lock().unwrap().get_keyframe(curr_idx) {
             self.state.pose_world_to_cam = kf.frame.pose_world_to_cam;
         }
+        let pose = self.state.pose_world_to_cam;
+        self.note_pose("bootstrap", curr_idx, &pose);
 
         if let Some(prev_ts) = self.inertial.bootstrap_timestamp_sec {
             if let Some(edge) = self.inertial.keyframe_edge(
@@ -1144,6 +1173,8 @@ impl SlamSystem {
             start_kf_idx,
         )?;
         self.state.adopt_inertial_initialization(applied.aligned);
+        let pose = self.state.pose_world_to_cam;
+        self.note_pose("imu_init", self.next_frame_idx.saturating_sub(1), &pose);
         Ok(applied)
     }
 
@@ -1184,6 +1215,7 @@ impl SlamSystem {
         current_image: &Image<u8, 1>,
         timestamp_sec: f64,
     ) -> Result<TrackingResult, ProcessError> {
+        let frame_idx = source.idx();
         let pose_before = self.state.pose_world_to_cam;
         let prev_timestamp = self.state.last_frame_timestamp_sec;
 
@@ -1308,6 +1340,7 @@ impl SlamSystem {
         let (mut status, matches, tracked_inliers, reject_reason) = match result {
             Ok(estimate) => {
                 self.state.pose_world_to_cam = estimate.pose;
+                self.note_pose("tracked", frame_idx, &estimate.pose);
 
                 // When IMU-initialized, velocity_world was already updated by IMU
                 // preintegration (predict_pose_imu → pred_vel) before PnP ran; don't
@@ -1336,6 +1369,7 @@ impl SlamSystem {
                 // reality, making the projection search miss again and
                 // compounding a single bad frame into a full tracking loss.
                 self.state.pose_world_to_cam = candidate_pose;
+                self.note_pose("coast", frame_idx, &candidate_pose);
                 self.last_skip = Some(SkipKind::Coasting {
                     inertial: predicted_velocity.is_some(),
                 });
@@ -1615,6 +1649,7 @@ impl SlamSystem {
             frame.idx, found.keyframe_idx, found.estimate.inliers
         ));
         self.state.pose_world_to_cam = found.estimate.pose;
+        self.note_pose("reloc", frame.idx, &found.estimate.pose);
         self.state.current_keyframe_idx = Some(found.keyframe_idx);
         self.state.velocity = None;
         true
@@ -1921,6 +1956,11 @@ impl SlamSystem {
         }
         if let Some((corrected_tracking_pose, corrected_velocity)) = outcome.tracking_correction {
             self.state.pose_world_to_cam = corrected_tracking_pose;
+            self.note_pose(
+                "loop",
+                self.next_frame_idx.saturating_sub(1),
+                &corrected_tracking_pose,
+            );
             self.state.velocity_world = corrected_velocity;
         }
         if outcome.pgo_applied {

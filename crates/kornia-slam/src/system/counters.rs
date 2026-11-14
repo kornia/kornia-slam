@@ -47,6 +47,10 @@ pub struct RunCounters {
     pub ba_solves: u64,
     /// Wall time of those solves, in nanoseconds.
     pub ba_solve_ns: u64,
+    /// Frames whose reported pose rotation is off a rotation by more than 1e-6.
+    pub nonrigid_poses: u64,
+    /// Local BA keyframe corrections whose corrected rotation is off a rotation by more than 1e-6.
+    pub nonrigid_keyframes: u64,
 }
 
 impl RunCounters {
