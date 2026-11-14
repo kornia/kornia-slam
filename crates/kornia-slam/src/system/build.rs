@@ -122,7 +122,10 @@ impl SystemConfig {
                     .with_visual_information(orb.mapping.local_ba.visual_information)
             },
             keyframe_policy: orb.keyframes,
-            tracking_loss_recovery: tuning.loss_recovery,
+            tracking_loss_recovery: TrackingLossRecoveryPolicy {
+                keyframes_while_lost: orb.tracking_loss.keyframes_while_lost,
+                ..tuning.loss_recovery
+            },
             local_mapping: orb.mapping.execution,
             local_ba: orb
                 .mapping

@@ -462,3 +462,39 @@ fn recovers_scale_bias_gravity_from_synthetic_trajectory() {
         );
     }
 }
+
+/// Anchors carry no IMU edge, so the initialization window skips them: a
+/// map with one gives the solve it gives without it.
+#[test]
+fn an_anchor_leaves_the_initialization_unchanged() {
+    let r_arb = SO3F64::exp(Vec3F64::new(0.3, -0.5, 0.2)).matrix();
+    let initializer = ImuInitializer::new(ImuInitConfig {
+        min_keyframes: 10,
+        min_time_sec: 1.0,
+        min_motion: 0.1,
+    });
+    let solve = |map: &Map| {
+        initializer
+            .try_initialize(
+                map,
+                Some(Pose3d::IDENTITY),
+                ImuBias::default(),
+                0,
+                1e2,
+                1e10,
+                false,
+            )
+            .expect("VIBA0 solves the synthetic window")
+    };
+    let map = synth_map(1.0, r_arb);
+    let mut with_anchor = map.clone();
+    let mut anchor = Keyframe::from_frame(synth_frame(1000, Pose3d::IDENTITY));
+    anchor.anchor = true;
+    anchor.velocity_world = Vec3F64::new(40.0, 0.0, 0.0);
+    with_anchor.insert_keyframe(anchor).unwrap();
+    assert!(initializer.ready(&with_anchor, Some(0)) == initializer.ready(&map, Some(0)));
+    assert_eq!(
+        format!("{:?}", solve(&with_anchor)),
+        format!("{:?}", solve(&map))
+    );
+}

@@ -49,6 +49,12 @@ fn rotation_from_to(from: Vec3F64, to: Vec3F64) -> SO3F64 {
     ]))
 }
 
+/// Whether `kf` belongs to the initialization window from `start_idx`.
+/// Anchors never do: no IMU edge reaches them.
+fn in_window(kf: &Keyframe, start_idx: usize) -> bool {
+    kf.frame.idx >= start_idx && !kf.anchor
+}
+
 /// A keyframe window is monocular unless its first keyframe carries metric
 /// depth (stereo, or a rig's overlap points).
 fn window_is_mono(kfs: &[&Keyframe]) -> bool {
@@ -97,7 +103,7 @@ impl ImuInitializer {
         let kfs: Vec<&Keyframe> = map
             .keyframes()
             .iter()
-            .filter(|kf| kf.frame.idx >= start_idx)
+            .filter(|kf| in_window(kf, start_idx))
             .collect();
         if kfs.len() < self.config.min_keyframes {
             return false;
@@ -181,7 +187,7 @@ impl ImuInitializer {
         let keyframe_velocities: Vec<KeyframeVelocity> = map
             .keyframes()
             .iter()
-            .filter(|kf| kf.frame.idx >= start_idx)
+            .filter(|kf| in_window(kf, start_idx))
             .zip(init.velocities_world)
             .map(|(kf, velocity_world)| KeyframeVelocity {
                 keyframe_idx: kf.frame.idx,
@@ -205,7 +211,7 @@ impl ImuInitializer {
         Ok(map
             .keyframes()
             .iter()
-            .rfind(|kf| kf.frame.idx >= start_idx)
+            .rfind(|kf| in_window(kf, start_idx))
             .map(|last_kf| AlignedTrackingState {
                 pose_world_to_cam: last_kf.frame.pose_world_to_cam,
                 velocity_world: last_kf.velocity_world,

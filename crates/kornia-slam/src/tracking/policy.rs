@@ -206,10 +206,14 @@ pub struct TrackingLossRecoveryPolicy {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum KeyframesWhileLost {
     #[default]
     Enabled,
     Disabled,
+    /// Inserted as anchors: held fixed in every BA, with no IMU edge, so a
+    /// pose nothing observed never becomes an optimised state.
+    Anchor,
 }
 
 impl Default for TrackingLossRecoveryPolicy {

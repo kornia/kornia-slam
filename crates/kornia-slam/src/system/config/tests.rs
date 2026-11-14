@@ -1003,4 +1003,24 @@ mod ron_files {
             })
         );
     }
+
+    #[test]
+    fn tracking_loss_selects_anchors_and_defaults_to_lost_keyframes() {
+        use crate::tracking::KeyframesWhileLost;
+        assert_eq!(
+            orb(&parse("(version: 1)").unwrap())
+                .tracking_loss
+                .keyframes_while_lost,
+            KeyframesWhileLost::Enabled
+        );
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((tracking_loss: (keyframes_while_lost: Anchor))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).tracking_loss.keyframes_while_lost,
+            KeyframesWhileLost::Anchor
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+    }
 }

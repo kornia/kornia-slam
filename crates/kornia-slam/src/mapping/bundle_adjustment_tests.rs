@@ -759,3 +759,111 @@ fn a_window_under_the_observation_minimum_reports_the_solver_did_not_run() {
     let solved = run_local_ba(map.ba_snapshot(&local_window(&map)), &camera());
     assert_eq!(solved.outcome.solve, BaSolve::Solved);
 }
+
+#[test]
+fn active_start_counts_only_keyframes_that_are_not_anchors() {
+    let mut map = fixture();
+    let keyframes = map.keyframes();
+    assert_eq!(active_start(keyframes, 3), 2);
+    assert_eq!(active_start(keyframes, 0), 5);
+    assert_eq!(active_start(keyframes, 9), 0);
+
+    map.edit_keyframes_for_test(|slot, kf| kf.anchor = slot >= 3);
+    let keyframes = map.keyframes();
+    assert_eq!(active_start(keyframes, 1), 2);
+    assert_eq!(active_start(keyframes, 3), 0);
+    map.edit_keyframes_for_test(|slot, kf| kf.anchor = slot == 2);
+    assert_eq!(active_start(map.keyframes(), 2), 3);
+    assert_eq!(active_start(map.keyframes(), 3), 1);
+}
+
+/// An anchor is never active: it enters the window only as fixed context of
+/// the landmarks the active keyframes observe, and its own landmarks stay out.
+#[test]
+fn anchors_enter_the_local_window_only_as_context() {
+    let mut map = Map::new();
+    for id in [50, 40, 30, 20, 10] {
+        map.insert_keyframe(Keyframe::from_frame(test_frame(id, vec![[0; 32]; 2])))
+            .unwrap();
+    }
+    map.edit_keyframes_for_test(|_, kf| kf.anchor = [30, 10].contains(&kf.frame.idx));
+    let seed = |keyframe_idx| LandmarkSeed {
+        position: Vec3F64::new(0.0, 0.0, 5.0),
+        color: [0; 3],
+        reference: ObservationKey {
+            keyframe_idx,
+            feature_idx: 0,
+        },
+    };
+    let shared = map.insert_landmark(seed(30)).unwrap();
+    map.link_observation(20, 1, shared).unwrap();
+    map.insert_landmark(seed(10)).unwrap();
+
+    let window = local_window(&map);
+    // Active: 20, 40, 50 (the three newest non-anchors). 30 shares a landmark
+    // with 20; 10 observes only its own.
+    assert_eq!(window.keyframe_slots, vec![0, 1, 2, 3]);
+    assert_eq!(window.landmark_ids, vec![shared]);
+}
+
+/// A window [tracked, anchor, anchor, tracked] behind fixed context, the
+/// tracked pair bridged by one IMU edge, solves and leaves both anchors bit
+/// for bit as they were.
+#[test]
+fn anchors_inside_the_window_stay_fixed_through_both_solves() {
+    let mut map = fixture();
+    map.edit_keyframes_for_test(|slot, kf| {
+        kf.anchor = slot == 2 || slot == 3;
+        kf.velocity_world = Vec3F64::new(0.1 * slot as f64, 0.0, 0.0);
+        kf.imu_bias.accel.x = 0.01 * slot as f64;
+    });
+    map.apply_insertion(MapInsertion {
+        imu_factors: vec![imu_edge(KF_IDS[1], KF_IDS[4])],
+        ..Default::default()
+    })
+    .unwrap();
+    let params = LocalBaParams {
+        active_keyframes: 2,
+        ..LocalBaParams::default()
+    };
+    let window = local_window_of(&map, params.active_keyframes, []);
+    assert_eq!(window.keyframe_slots, vec![0, 1, 2, 3, 4]);
+    let anchors = |map: &Map| {
+        KF_IDS[2..4]
+            .iter()
+            .map(|id| format!("{:?}", map.get_keyframe(*id).unwrap()))
+            .collect::<Vec<_>>()
+    };
+    let before = anchors(&map);
+
+    let visual = run_local_ba_with(map.ba_snapshot(&window), &camera(), &params);
+    let mut solved = map.clone();
+    let result = solved.apply_ba_update(visual).unwrap();
+    assert!(!result.keyframe_corrections.is_empty());
+    assert!(
+        result
+            .keyframe_corrections
+            .iter()
+            .all(|c| [KF_IDS[1], KF_IDS[4]].contains(&c.kf_idx))
+    );
+    assert_eq!(anchors(&solved), before);
+
+    let inertial = run_local_inertial_ba_with(
+        map.ba_snapshot(&window),
+        &camera(),
+        None,
+        Vec3F64::ZERO,
+        &[],
+        &[],
+        &params,
+    );
+    assert!(inertial.solve_stats().is_some(), "the solver ran");
+    let result = map.apply_ba_update(inertial).unwrap();
+    assert!(
+        result
+            .keyframe_corrections
+            .iter()
+            .all(|c| [KF_IDS[1], KF_IDS[4]].contains(&c.kf_idx))
+    );
+    assert_eq!(anchors(&map), before);
+}

@@ -517,3 +517,145 @@ mod wheels {
         ));
     }
 }
+
+mod anchors {
+    use super::*;
+    use crate::tracking::parallax::tests::{frame_seeing_points, map_with_keyframe_at};
+    use kornia_sensors::imu::ImuBias;
+
+    const ACCEL_X: f64 = 0.3;
+
+    /// A monocular-inertial system tracking against keyframe 0 (inserted at
+    /// t = 0), with an initialized IMU and 2 s of constant-acceleration
+    /// samples buffered.
+    fn system() -> SlamSystem {
+        let mut config = config(CameraSelection::Mono, true, LoopClosingMode::Disabled);
+        let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+        orb.tracking_loss.keyframes_while_lost = KeyframesWhileLost::Anchor;
+        let rig = SensorRig::new(camera()).with_imu(Pose3d::IDENTITY);
+        let mut system = SlamSystem::build(config, rig).unwrap();
+        *system.map.lock().unwrap() = map_with_keyframe_at(Pose3d::IDENTITY);
+        system.state.current_keyframe_idx = Some(0);
+        system.state.last_keyframe_idx = Some(0);
+        system.state.imu_initialized = true;
+        system.inertial.last_keyframe_timestamp_sec = Some(0.0);
+        system.inertial.gravity_world = Vec3F64::ZERO;
+        let samples: Vec<ImuMeasurement> = (0..=400)
+            .map(|i| ImuMeasurement {
+                timestamp: i as f64 * 0.005,
+                gyro: Vec3F64::ZERO,
+                accel: Vec3F64::new(ACCEL_X, 0.0, 0.0),
+            })
+            .collect();
+        system.process_imu(&samples);
+        system
+    }
+
+    fn frame(idx: usize) -> Frame {
+        frame_seeing_points(idx, Pose3d::IDENTITY, &[])
+    }
+
+    #[test]
+    fn the_config_selects_anchors_and_defaults_to_lost_keyframes() {
+        assert_eq!(
+            TrackingLossRecoveryPolicy::default().keyframes_while_lost,
+            KeyframesWhileLost::Enabled
+        );
+        assert_eq!(
+            system().tracking_loss_recovery.keyframes_while_lost,
+            KeyframesWhileLost::Anchor
+        );
+    }
+
+    #[test]
+    fn an_anchor_stays_out_of_the_imu_chain_and_the_next_keyframe_bridges_it() {
+        let mut system = system();
+        assert!(system.insert_keyframe(&frame(4), 0.2, &[], KeyframeRole::Anchor));
+        {
+            let map = system.map.lock().unwrap();
+            let anchor = map.get_keyframe(4).unwrap();
+            assert!(anchor.anchor && anchor.inserted_while_lost);
+            assert!(map.imu_factors().is_empty());
+        }
+        assert_eq!(system.state.current_keyframe_idx, Some(4));
+        assert_eq!(system.state.last_keyframe_idx, Some(0));
+        assert_eq!(system.inertial.last_keyframe_timestamp_sec, Some(0.0));
+        assert_eq!(system.state.last_anchor_timestamp_sec, Some(0.2));
+
+        assert!(system.insert_keyframe(&frame(8), 0.4, &[], KeyframeRole::Tracked));
+        let map = system.map.lock().unwrap();
+        let [edge] = map.imu_factors() else {
+            panic!("one edge, got {}", map.imu_factors().len());
+        };
+        assert_eq!((edge.prev_kf_idx, edge.curr_kf_idx), (0, 8));
+        assert_eq!((edge.t0, edge.t1), (0.0, 0.4));
+        assert!(!map.get_keyframe(8).unwrap().anchor);
+        assert_eq!(system.state.last_keyframe_idx, Some(8));
+    }
+
+    #[test]
+    fn anchors_are_spaced_from_the_newest_anchor_and_tracking_clears_it() {
+        let mut system = system();
+        assert!(system.keyframe_due_while_lost(0.2));
+        assert!(system.insert_keyframe(&frame(4), 0.2, &[], KeyframeRole::Anchor));
+        assert!(!system.keyframe_due_while_lost(0.3));
+        assert!(system.keyframe_due_while_lost(0.4));
+        system.state.mark_tracked();
+        assert_eq!(system.state.last_anchor_timestamp_sec, None);
+        system.state.last_anchor_timestamp_sec = Some(1.0);
+        system.state.reset();
+        assert_eq!(system.state.last_anchor_timestamp_sec, None);
+    }
+
+    /// Against an anchor the velocity keeps propagating through the loss
+    /// (`v + a k dt`) and the bias is the last tracked keyframe's, whatever
+    /// the anchor carries.
+    #[test]
+    fn an_anchor_reference_keeps_the_propagated_velocity_and_the_tracked_bias() {
+        let mut system = system();
+        let tracked_bias = ImuBias::default();
+        system
+            .map
+            .lock()
+            .unwrap()
+            .edit_keyframes_for_test(|_, kf| kf.imu_bias = tracked_bias);
+        system.state.velocity_world = Vec3F64::new(1.0, 0.0, 0.0);
+        assert!(system.insert_keyframe(&frame(4), 0.2, &[], KeyframeRole::Anchor));
+        system.map.lock().unwrap().edit_keyframes_for_test(|_, kf| {
+            if kf.anchor {
+                kf.velocity_world = Vec3F64::new(-5.0, 0.0, 0.0);
+                kf.imu_bias.accel = Vec3F64::new(1.0, 0.0, 0.0);
+            }
+        });
+        system.inertial.bias.accel = Vec3F64::new(2.0, 0.0, 0.0);
+
+        let dt = 0.05;
+        let k = 10;
+        let mut pose = Pose3d::IDENTITY;
+        for i in 0..k {
+            system.refresh_reference_inertial_state();
+            let (t0, t1) = (0.2 + i as f64 * dt, 0.2 + (i + 1) as f64 * dt);
+            let (preintegrated, _) =
+                system
+                    .inertial
+                    .preintegrate_window(system.rig.imu_noise(), t0, t1);
+            let (next, velocity) = predict_pose(
+                pose,
+                None,
+                system.state.velocity_world,
+                Some(InertialPrediction {
+                    preintegrated: &preintegrated,
+                    camera_to_body: system.rig.camera_to_body(),
+                    gravity_world: system.inertial.gravity_world,
+                }),
+            );
+            pose = next;
+            system.state.velocity_world = velocity.unwrap();
+        }
+        assert_eq!(system.inertial.bias.accel, tracked_bias.accel);
+        let expected = 1.0 + ACCEL_X * k as f64 * dt;
+        let v = system.state.velocity_world;
+        assert!((v.x - expected).abs() < 1e-9, "{v:?} vs {expected}");
+        assert!(v.y.abs() < 1e-12 && v.z.abs() < 1e-12);
+    }
+}

@@ -14,7 +14,7 @@ use crate::mapping::vi_ba_schur::ImuHuber;
 use crate::mapping::visual_information::VisualInformation;
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::{KeyframeObservations, MapProjectionConfig};
-use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
+use crate::tracking::{KeyframePolicy, KeyframesWhileLost, TrackingLossRecoveryPolicy};
 
 /// Schema version of [`SystemConfig`] this crate reads and writes.
 pub const SYSTEM_CONFIG_VERSION: u32 = 1;
@@ -90,6 +90,7 @@ pub struct OrbSlamPipeline {
     pub keyframes: KeyframePolicy,
     pub mapping: MappingConfig,
     pub loop_closing: LoopClosingMode,
+    pub tracking_loss: TrackingLossConfig,
     /// Algorithm tuning, set from Rust only: configuration files always use the
     /// defaults.
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -237,6 +238,15 @@ impl StereoCloseDepth {
             Self::Disabled => None,
         }
     }
+}
+
+/// What the system does while tracking is lost.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct TrackingLossConfig {
+    /// How frames coasted on the IMU extend the map.
+    pub keyframes_while_lost: KeyframesWhileLost,
 }
 
 /// Local mapping (keyframe insertion, culling and local BA / VI-BA).

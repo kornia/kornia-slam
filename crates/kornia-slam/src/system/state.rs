@@ -57,6 +57,9 @@ pub(crate) struct SystemState {
     /// Pose at the end of the last frame tracked before `lost_since_sec`: the
     /// last one with visual support.
     pub pose_before_loss: Option<Pose3d>,
+    /// Timestamp (sec) of the newest anchor of the current loss; spaces
+    /// anchors, which leave the last keyframe timestamp alone.
+    pub last_anchor_timestamp_sec: Option<f64>,
     /// Consecutive descriptor-starved two-view attempts against the stored
     /// bootstrap reference.
     pub bootstrap_low_match_rejections: usize,
@@ -85,6 +88,7 @@ impl SystemState {
             last_keyframe_idx: None,
             lost_since_sec: None,
             pose_before_loss: None,
+            last_anchor_timestamp_sec: None,
             bootstrap_low_match_rejections: 0,
             bootstrap_frame: None,
             imu_initialized: false,
@@ -101,6 +105,7 @@ impl SystemState {
         self.velocity = None;
         self.lost_since_sec = None;
         self.pose_before_loss = None;
+        self.last_anchor_timestamp_sec = None;
         self.bootstrap_low_match_rejections = 0;
         self.bootstrap_frame = None;
         // The new map starts at an unknown monocular scale, so the metric
@@ -122,6 +127,7 @@ impl SystemState {
     pub(crate) fn mark_tracked(&mut self) {
         self.lost_since_sec = None;
         self.pose_before_loss = None;
+        self.last_anchor_timestamp_sec = None;
     }
 
     /// [`Self::reset`] after giving up on a loss, with the new map to be seeded

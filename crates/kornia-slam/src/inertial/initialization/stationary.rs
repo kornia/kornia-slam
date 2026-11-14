@@ -40,7 +40,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuMeasurement};
 
-use super::{ImuInitResult, ImuInitializer, window_is_mono};
+use super::{ImuInitResult, ImuInitializer, in_window, window_is_mono};
 use crate::mapping::map::{Keyframe, Map};
 
 /// Mean and spread of a window of raw IMU samples, in the IMU (body) frame.
@@ -204,7 +204,7 @@ impl ImuInitializer {
         let mut keyframes: Vec<&Keyframe> = map
             .keyframes()
             .iter()
-            .filter(|kf| kf.frame.idx >= start_idx)
+            .filter(|kf| in_window(kf, start_idx))
             .collect();
         keyframes.sort_by_key(|kf| kf.frame.idx);
         let Some(newest) = keyframes.last() else {

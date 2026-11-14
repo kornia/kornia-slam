@@ -20,7 +20,7 @@ pub use config::{
     CameraSelection, FrontendConfig, KltFirst, KltPrediction, LocalBaConfig, LoopClosingExecution,
     LoopClosingMode, MappingConfig, OrbFrontendConfig, OrbSlamPipeline, OrbTuning,
     PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth, StereoDepthSigma,
-    SystemConfig,
+    SystemConfig, TrackingLossConfig,
 };
 pub use counters::{RunCounters, SkipKind};
 #[cfg(feature = "serde")]
@@ -110,6 +110,17 @@ struct Estimation {
     pose_before: Pose3d,
     lost_for_sec: f64,
     trusted_prediction: bool,
+}
+
+/// What a new keyframe is to the map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyframeRole {
+    Tracked,
+    /// Inserted at the inertial prediction while lost, as a full BA state.
+    Lost,
+    /// Inserted at the inertial prediction while lost and held fixed
+    /// ([`KeyframesWhileLost::Anchor`]).
+    Anchor,
 }
 
 /// What tracking a deferred frame from its flow survivors alone gave.
@@ -1208,6 +1219,33 @@ impl SlamSystem {
         ));
     }
 
+    /// Local BA updates keyframe state asynchronously, so the cached IMU
+    /// state is refreshed from the reference keyframe. An anchor is never
+    /// optimised: its velocity is the stale seed, so the propagated one stays,
+    /// with the last tracked keyframe's bias.
+    fn refresh_reference_inertial_state(&mut self) {
+        let Some(kf_idx) = self.state.current_keyframe_idx else {
+            return;
+        };
+        let map = self.map.lock().unwrap();
+        match map.get_keyframe(kf_idx) {
+            Some(kf) if kf.anchor => {
+                if let Some(tracked) = self
+                    .state
+                    .last_keyframe_idx
+                    .and_then(|ki| map.get_keyframe(ki))
+                {
+                    self.inertial.bias = tracked.imu_bias;
+                }
+            }
+            Some(kf) => {
+                self.state.velocity_world = kf.velocity_world;
+                self.inertial.bias = kf.imu_bias;
+            }
+            None => {}
+        }
+    }
+
     fn tracking_step(
         &mut self,
         source: FrameSource<'_>,
@@ -1219,13 +1257,7 @@ impl SlamSystem {
         let pose_before = self.state.pose_world_to_cam;
         let prev_timestamp = self.state.last_frame_timestamp_sec;
 
-        // Local BA updates keyframe state asynchronously, so refresh cached IMU state.
-        if let Some(kf_idx) = self.state.current_keyframe_idx
-            && let Some(kf) = self.map.lock().unwrap().get_keyframe(kf_idx)
-        {
-            self.state.velocity_world = kf.velocity_world;
-            self.inertial.bias = kf.imu_bias;
-        }
+        self.refresh_reference_inertial_state();
 
         // Preintegration is prepared here: the system owns bias and the sample
         // buffer. The motion model chooses between it and the visual model.
@@ -1463,15 +1495,23 @@ impl SlamSystem {
                 self.state.reset_after_loss();
                 return Ok(self.bootstrap_step(frame, timestamp_sec));
             }
+            let role = match policy.keyframes_while_lost {
+                KeyframesWhileLost::Enabled => Some(KeyframeRole::Lost),
+                KeyframesWhileLost::Anchor => Some(KeyframeRole::Anchor),
+                KeyframesWhileLost::Disabled => None,
+            };
             if imu_confident
-                && policy.keyframes_while_lost == KeyframesWhileLost::Enabled
+                && let Some(role) = role
                 && self.keyframe_due_while_lost(timestamp_sec)
-                && self.insert_keyframe(&frame, timestamp_sec, &[], true)
+                && self.insert_keyframe(&frame, timestamp_sec, &[], role)
             {
-                self.dbg(format!(
-                    "[lost] frame={} keyframe inserted at the inertial prediction",
-                    frame.idx
-                ));
+                let idx = frame.idx;
+                self.dbg(match role {
+                    KeyframeRole::Anchor => {
+                        format!("[anchor] frame={idx} inserted at the inertial prediction")
+                    }
+                    _ => format!("[lost] frame={idx} keyframe inserted at the inertial prediction"),
+                });
             }
         } else {
             self.state.mark_tracked();
@@ -1660,9 +1700,14 @@ impl SlamSystem {
     /// creates landmarks from its depth; a monocular one through triangulation
     /// against its neighbours at the inertial poses.
     fn keyframe_due_while_lost(&self, timestamp_sec: f64) -> bool {
-        self.inertial
-            .last_keyframe_timestamp_sec
-            .is_some_and(|t| self.tracking_loss_recovery.keyframe_due(timestamp_sec - t))
+        [
+            self.inertial.last_keyframe_timestamp_sec,
+            self.state.last_anchor_timestamp_sec,
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(f64::max)
+        .is_some_and(|t| self.tracking_loss_recovery.keyframe_due(timestamp_sec - t))
     }
 
     fn try_insert_keyframe(
@@ -1676,17 +1721,17 @@ impl SlamSystem {
         if !self.keyframe_due(&evidence, timestamp_sec) {
             return false;
         }
-        self.insert_keyframe(frame, timestamp_sec, matches, false)
+        self.insert_keyframe(frame, timestamp_sec, matches, KeyframeRole::Tracked)
     }
 
     /// Publishes `frame` as a keyframe at the current tracking pose and runs
-    /// the mapping work it earns.
+    /// the mapping work it earns; an anchor earns growth only.
     fn insert_keyframe(
         &mut self,
         frame: &Frame,
         timestamp_sec: f64,
         matches: &[(usize, usize)],
-        while_lost: bool,
+        role: KeyframeRole,
     ) -> bool {
         // Guard: reference KF must exist before we can triangulate.
         if let Some(ki) = self.state.current_keyframe_idx {
@@ -1702,7 +1747,9 @@ impl SlamSystem {
             pose_world_to_cam: self.state.pose_world_to_cam,
             ..frame.clone()
         });
-        curr_kf.inserted_while_lost = while_lost;
+        let anchor = role == KeyframeRole::Anchor;
+        curr_kf.inserted_while_lost = role != KeyframeRole::Tracked;
+        curr_kf.anchor = anchor;
         // Seed the new keyframe with the IMU-propagated velocity and current bias
         // estimate so that VI-BA starts from a reasonable linearisation point rather
         // than zero, which would produce huge residuals on the newest IMU edge.
@@ -1728,7 +1775,7 @@ impl SlamSystem {
             self.state.last_keyframe_idx,
             self.inertial.last_keyframe_timestamp_sec,
         ) {
-            (Some(prev_kf_idx), Some(prev_ts)) => self.inertial.keyframe_edge(
+            (Some(prev_kf_idx), Some(prev_ts)) if !anchor => self.inertial.keyframe_edge(
                 self.rig.imu_noise(),
                 prev_kf_idx,
                 frame.idx,
@@ -1765,11 +1812,16 @@ impl SlamSystem {
             ));
         }
 
-        self.inertial.last_keyframe_timestamp_sec = Some(timestamp_sec);
-
         self.state.current_keyframe_idx = Some(frame.idx);
-        self.state.last_keyframe_idx = Some(frame.idx);
-        self.note_wheel_keyframe(prev_keyframe, frame.idx, timestamp_sec);
+        if anchor {
+            // The IMU chain, its sample buffer and the next keyframe's edge
+            // stay at the last tracked keyframe.
+            self.state.last_anchor_timestamp_sec = Some(timestamp_sec);
+        } else {
+            self.inertial.last_keyframe_timestamp_sec = Some(timestamp_sec);
+            self.state.last_keyframe_idx = Some(frame.idx);
+            self.note_wheel_keyframe(prev_keyframe, frame.idx, timestamp_sec);
+        }
 
         // Optional mapping work the accepted keyframe earns: grow against the
         // captured neighbours, then forward SearchInNeighbors / Fuse, before
@@ -1783,6 +1835,10 @@ impl SlamSystem {
             &self.two_view_init_config.triangulation_config,
         );
         self.report_growth(frame.idx, &growth);
+        if anchor {
+            self.enforce_map_bound();
+            return true;
+        }
 
         // Refinement can rotate/scale the world and update gravity. Do it before
         // constructing the BA request so the job and its future snapshot agree.

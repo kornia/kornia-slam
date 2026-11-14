@@ -17,6 +17,9 @@ pub struct Keyframe {
     /// Inserted at the inertial prediction while tracking was lost, with no
     /// match to the map.
     pub inserted_while_lost: bool,
+    /// Held fixed in every BA and left out of the IMU chain: a lost pose
+    /// that only gives tracking new landmarks to recover on.
+    pub anchor: bool,
 }
 
 impl Keyframe {
@@ -29,6 +32,7 @@ impl Keyframe {
             velocity_world: Vec3F64::ZERO,
             imu_bias: ImuBias::default(),
             inserted_while_lost: false,
+            anchor: false,
         }
     }
 

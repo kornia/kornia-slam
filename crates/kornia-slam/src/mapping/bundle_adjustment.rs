@@ -136,8 +136,9 @@ const WRITE_BACK_FAR_M: f64 = 50.0;
 /// observes those landmarks and the IMU neighbours of the active keyframes.
 ///
 /// Mirrors ORB-SLAM3's `LocalBundleAdjustment` selection. Fixed keyframes
-/// always precede the active ones in slot order, because the active keyframes
-/// are the newest.
+/// precede the active ones in slot order, because the active keyframes are
+/// the newest; anchors are the exception, never active and in the window only
+/// as fixed context.
 pub fn local_window(map: &Map) -> BaWindow {
     local_window_with_neighbors(map, [])
 }
@@ -163,9 +164,12 @@ pub fn local_window_of(
     neighbors: impl IntoIterator<Item = (usize, usize)>,
 ) -> BaWindow {
     let keyframes = map.keyframes();
-    let active_start = keyframes.len().saturating_sub(active_keyframes);
-    let active = &keyframes[active_start..];
-    let landmark_ids = live_landmarks_of(map, active);
+    let active_start = active_start(keyframes, active_keyframes);
+    let active: Vec<&Keyframe> = keyframes[active_start..]
+        .iter()
+        .filter(|kf| !kf.anchor)
+        .collect();
+    let landmark_ids = live_landmarks_of(map, active.iter().copied());
 
     let active_ids: HashSet<usize> = active.iter().map(|kf| kf.frame.idx).collect();
     let mut context: HashSet<usize> = landmark_ids
@@ -186,7 +190,9 @@ pub fn local_window_of(
     let keyframe_slots = keyframes
         .iter()
         .enumerate()
-        .filter(|(slot, kf)| *slot >= active_start || context.contains(&kf.frame.idx))
+        .filter(|(slot, kf)| {
+            (*slot >= active_start && !kf.anchor) || context.contains(&kf.frame.idx)
+        })
         .map(|(slot, _)| slot)
         .collect();
     BaWindow {
@@ -205,10 +211,29 @@ fn initial_window(map: &Map) -> BaWindow {
     }
 }
 
-/// Live landmark ids observed by `keyframes`, ascending.
-fn live_landmarks_of(map: &Map, keyframes: &[Keyframe]) -> Vec<usize> {
-    let mut ids: Vec<usize> = keyframes
+/// Slot of the `active`-th newest keyframe that is not an anchor, or 0 if
+/// there are fewer: the active part of a window starts there, and the
+/// anchors inside it stay fixed.
+pub(crate) fn active_start(keyframes: &[Keyframe], active: usize) -> usize {
+    let Some(nth) = active.checked_sub(1) else {
+        return keyframes.len();
+    };
+    keyframes
         .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, kf)| !kf.anchor)
+        .nth(nth)
+        .map_or(0, |(slot, _)| slot)
+}
+
+/// Live landmark ids observed by `keyframes`, ascending.
+fn live_landmarks_of<'a>(
+    map: &Map,
+    keyframes: impl IntoIterator<Item = &'a Keyframe>,
+) -> Vec<usize> {
+    let mut ids: Vec<usize> = keyframes
+        .into_iter()
         .flat_map(|kf| kf.map_point_by_desc_idx.iter().flatten().copied())
         .filter(|&id| map.map_points().get(id).is_some_and(|mp| !mp.culled))
         .collect();
@@ -370,9 +395,12 @@ pub fn run_local_ba_with(
         return update;
     }
 
-    let active_start = n_kfs.saturating_sub(params.active_keyframes);
+    let active_start = active_start(snapshot.keyframes(), params.active_keyframes);
+    let active = snapshot.keyframes()[active_start..]
+        .iter()
+        .filter(|kf| !kf.anchor);
 
-    let window = WindowPoints::collect(snapshot, &snapshot.keyframes()[active_start..], false);
+    let window = WindowPoints::collect(snapshot, active, false);
     if window.is_empty() {
         return update;
     }
@@ -388,7 +416,7 @@ pub fn run_local_ba_with(
             .keyframes()
             .iter()
             .enumerate()
-            .map(|(kf_idx, kf)| (kf_idx, kf, kf_idx < active_start)),
+            .map(|(kf_idx, kf)| (kf_idx, kf, kf_idx < active_start || kf.anchor)),
         camera,
         params.depth_sigma,
     );
@@ -419,7 +447,7 @@ pub fn run_local_ba_with(
         };
 
     for (kf_idx, pose) in ba_result.poses.iter().enumerate() {
-        if kf_idx >= active_start {
+        if kf_idx >= active_start && !snapshot.keyframes()[kf_idx].anchor {
             update.keyframes[kf_idx].pose_world_to_cam = rigid(*pose);
         }
     }
@@ -489,9 +517,12 @@ pub fn run_local_inertial_ba_with(
         return update;
     }
 
-    let active_start = n_kfs.saturating_sub(params.active_keyframes);
+    let active_start = active_start(snapshot.keyframes(), params.active_keyframes);
+    let active = snapshot.keyframes()[active_start..]
+        .iter()
+        .filter(|kf| !kf.anchor);
 
-    let window = WindowPoints::collect(snapshot, &snapshot.keyframes()[active_start..], true);
+    let window = WindowPoints::collect(snapshot, active, true);
     if window.is_empty() {
         return update;
     }
@@ -505,7 +536,7 @@ pub fn run_local_inertial_ba_with(
             pose: kf.frame.pose_world_to_cam,
             velocity: kf.velocity_world,
             bias: kf.imu_bias,
-            fixed: kf_idx < active_start,
+            fixed: kf_idx < active_start || kf.anchor,
             inertial_fixed: params.lost_keyframes == LostKeyframes::FixedInertial
                 && kf.inserted_while_lost,
         })
@@ -520,7 +551,7 @@ pub fn run_local_inertial_ba_with(
             .keyframes()
             .iter()
             .enumerate()
-            .map(|(kf_idx, kf)| (kf_idx, kf, kf_idx < active_start)),
+            .map(|(kf_idx, kf)| (kf_idx, kf, kf_idx < active_start || kf.anchor)),
         camera,
         true,
         params.depth_sigma,
@@ -690,7 +721,7 @@ pub fn run_local_inertial_ba_with(
     };
 
     // Write back optimised poses, velocities, and biases for active keyframes.
-    for kf_idx in active_start..n_kfs {
+    for kf_idx in (active_start..n_kfs).filter(|&slot| !snapshot.keyframes()[slot].anchor) {
         let vi_kf = &vi_result.keyframes[kf_idx];
         update.keyframes[kf_idx].pose_world_to_cam = vi_kf.pose;
         update.keyframes[kf_idx].velocity_world = vi_kf.velocity;

@@ -10,7 +10,7 @@ use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias};
 
 use super::factor::{InertialInitFactor, KfConst, WeightedZeroPrior};
-use super::{ImuInitResult, ImuInitializer, rotation_from_to, window_is_mono};
+use super::{ImuInitResult, ImuInitializer, in_window, rotation_from_to, window_is_mono};
 use crate::mapping::map::{Keyframe, Map};
 
 /// Pack a `Vec3F64` into the `Vec<f32>` value layout `kornia_algebra::optim`
@@ -202,7 +202,7 @@ impl ImuInitializer {
         let mut keyframes: Vec<&Keyframe> = map
             .keyframes()
             .iter()
-            .filter(|kf| kf.frame.idx >= start_idx)
+            .filter(|kf| in_window(kf, start_idx))
             .collect();
         keyframes.sort_by_key(|kf| kf.frame.idx);
         let n = keyframes.len();
