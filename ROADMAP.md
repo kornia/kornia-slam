@@ -15,6 +15,27 @@ Themes derived from ongoing studies of industrial and egocentric deployments. Th
 - LaMAria / egocentric evaluation — https://github.com/kornia/kornia-slam/issues/78
 - Multi‑camera + IMU — https://github.com/kornia/kornia-slam/issues/138
 
+## Now — egocentric accuracy on LaMAria
+
+We are working toward top results on the [LaMAria](https://github.com/cvg/lamaria) egocentric benchmark ([#78](https://github.com/kornia/kornia-slam/issues/78)), using the Aria rig and IMU and no GPS. The work is sequenced by where the benchmark score is lost: each change states its theory and predictions first, ships behind a config knob that defaults to the old behaviour, and is compared window by window against ORB-SLAM3 in the same harness.
+
+Losses and recovery:
+- [x] Keep every pose rigid at the source; rotation scale crept in through repeated pose corrections
+- [x] Lost-mode keyframes as fixed anchors (knob)
+- [x] Keep gravity, bias and velocity through a tracking loss, so a re-seeded map shares the old world frame (knob)
+- [x] Reject tracked poses that disagree with the gyro prediction (knob)
+- [ ] Global PnP relocalisation while lost; a re-seeded map with its own local window
+
+Scale and drift while tracking:
+- [ ] Longer visual-inertial BA window, and keyframes no longer dragged away from the map by BA
+- [ ] Per-frame velocity state and a pose-inertial solve per frame
+- [ ] IMU bias and noise model, compared across ORB-SLAM3, Basalt and other references
+- [ ] Offline global visual-inertial BA
+
+Field of view and speed:
+- [ ] Raw Aria fisheye cameras instead of the pinhole crop
+- [ ] ORB only on keyframes with KLT in between, on every rig camera
+
 ## Next — complete the SLAM stack
 
 - [ ] GPU acceleration of the per-frame hot paths (feature extraction, matching, KLT
