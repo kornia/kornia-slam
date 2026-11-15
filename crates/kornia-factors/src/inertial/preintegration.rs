@@ -19,8 +19,8 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, Mat15F64, SO3F64, Vec3F64, Vec15F64};
 use kornia_sensors::imu::PreintegratedImu;
 
+use crate::inertial::NavState;
 use crate::robust::huber_weight_and_cost;
-use crate::state::NavState;
 
 /// An IMU constraint between keyframes `from_idx` and `to_idx`, usually
 /// consecutive; any pair works as long as `preintegrated` covers the interval.

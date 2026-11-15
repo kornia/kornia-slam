@@ -6,7 +6,7 @@
 //! no second cleanup loop, and the map never calls back into mapping.
 
 use crate::mapping::map::{Keyframe, Map, StillNeighbour, StillSide};
-use kornia_factors::stationary::StationaryFactor;
+use kornia_factors::inertial::stationary::StationaryFactor;
 use kornia_factors::wheel_odometry::WheelOdomFactor;
 use std::collections::{HashMap, HashSet};
 

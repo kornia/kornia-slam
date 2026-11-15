@@ -14,8 +14,8 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::ransac::RobustKernelKind;
 use kornia_algebra::Vec3F64;
-use kornia_factors::imu;
-use kornia_factors::stationary::StationaryFactor;
+use kornia_factors::inertial::preintegration;
+use kornia_factors::inertial::stationary::StationaryFactor;
 use kornia_factors::wheel_odometry::WheelOdomFactor;
 use std::collections::{HashMap, HashSet};
 
@@ -413,7 +413,7 @@ pub fn run_local_inertial_ba(
     }
 
     // Build IMU edges; include only edges where at least one endpoint is active.
-    let imu_edges: Vec<imu::ImuFactor> = snapshot
+    let imu_edges: Vec<preintegration::ImuFactor> = snapshot
         .imu_factors()
         .iter()
         .zip(&update.imu_preintegrations)
@@ -423,7 +423,11 @@ pub fn run_local_inertial_ba(
             if from < active_start && to < active_start {
                 return None;
             }
-            Some(imu::ImuFactor::new(from, to, preintegrated.clone()))
+            Some(preintegration::ImuFactor::new(
+                from,
+                to,
+                preintegrated.clone(),
+            ))
         })
         .collect();
 

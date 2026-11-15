@@ -1,5 +1,6 @@
-//! The f64 SE(3) residual the pose-pair factors share, over the tangent
-//! `[ρ; ω]` with `T = Exp(ρ, ω)` perturbed on the right, `T ← T · Exp(ξ)`.
+//! The SE(3) relative-pose residual the wheel and stationary factors share,
+//! over the tangent `[ρ; ω]` with `T = Exp(ρ, ω)` perturbed on the right,
+//! `T ← T · Exp(ξ)`.
 
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat6F64, SE3F64, SO3F64, Vec6F64};
@@ -8,8 +9,8 @@ use kornia_algebra::{Mat6F64, SE3F64, SO3F64, Vec6F64};
 /// Jacobian wrt keyframe i's pose, `J_l⁻¹(r) · Ad(A)` with
 /// `A = Δ⁻¹ · T_cb_from⁻¹ · T_cw_i`; keyframe j's is the negation. With
 /// identity extrinsics and delta it is the zero-relative-pose residual
-/// `Log(T_cw_i · T_cw_j⁻¹)` of [`crate::stationary`].
-pub fn relative_pose_residual(
+/// `Log(T_cw_i · T_cw_j⁻¹)` of [`crate::inertial::stationary`].
+pub fn residual_and_jacobian(
     pose_cw_i: &Pose3d,
     pose_cw_j: &Pose3d,
     t_cb_from: &Pose3d,
@@ -50,7 +51,7 @@ mod tests {
             } else {
                 pose_i.compose(&exp(&Vec6F64::from_fn(|_, _| rng.next() * 3e-3)))
             };
-            let res = |a: &Pose3d, b: &Pose3d| relative_pose_residual(a, b, &id, &id, &id);
+            let res = |a: &Pose3d, b: &Pose3d| residual_and_jacobian(a, b, &id, &id, &id);
             let (r, j_i) = res(&pose_i, &pose_j);
             let (rho, omega) = to_se3(&pose_i.compose(&pose_j.inverse())).log();
             let direct = [rho.x, rho.y, rho.z, omega.x, omega.y, omega.z];
