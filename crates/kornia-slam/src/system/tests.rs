@@ -659,3 +659,231 @@ mod anchors {
         assert!(v.y.abs() < 1e-12 && v.z.abs() < 1e-12);
     }
 }
+
+mod recovery_after_loss {
+    use super::*;
+    use crate::tracking::parallax::tests::frame_seeing_points;
+
+    /// World-to-camera pose of a camera centred at `(x, 0, 0)`.
+    fn centred_at(x: f64) -> Pose3d {
+        Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            Vec3F64::new(-x, 0.0, 0.0),
+        )
+    }
+
+    /// A stereo-inertial system with anchors and the inertial state kept
+    /// across a give-up, tracked to keyframe 40 at t = 10 s, lost
+    /// from t = 10 s at `centred_at(1.0)` and coasted to `centred_at(coast_x)`.
+    fn lost_metric_system(coast_x: f64) -> SlamSystem {
+        let mut config = config(CameraSelection::Stereo, true, LoopClosingMode::Disabled);
+        let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+        orb.tracking_loss.keyframes_while_lost = KeyframesWhileLost::Anchor;
+        orb.tracking_loss.reseed.keep_inertial = true;
+        orb.tracking_loss.reseed.min_seed_points = 10;
+        let mut system = SlamSystem::build(config, stereo_imu_rig()).unwrap();
+        system.state.mode = SystemMode::Tracking;
+        system.state.imu_initialized = true;
+        system.state.imu_init_timestamp_sec = Some(2.0);
+        system.state.last_keyframe_idx = Some(40);
+        system.state.current_keyframe_idx = Some(40);
+        system.inertial.last_keyframe_timestamp_sec = Some(10.0);
+        system.state.mark_lost(10.0, centred_at(1.0));
+        system.state.pose_world_to_cam = centred_at(coast_x);
+        system.state.velocity_world = Vec3F64::new(1.2, 0.0, 0.0);
+        system
+    }
+
+    fn stereo_frame(idx: usize) -> Frame {
+        let mut frame = frame_seeing_points(idx, Pose3d::IDENTITY, &[]);
+        frame.depth = vec![2.0; frame.features.keypoints_xy.len().max(1)];
+        frame
+    }
+
+    #[test]
+    fn a_plausible_coast_seeds_the_next_segment_there_and_keeps_the_inertial_state() {
+        let mut system = lost_metric_system(7.0);
+
+        system.give_up(&stereo_frame(140), 5.0);
+
+        let state = &system.state;
+        assert!(state.reseeding(), "the IMU stays initialized");
+        assert_eq!(state.imu_init_timestamp_sec, Some(2.0));
+        assert_eq!(state.pose_world_to_cam, centred_at(7.0));
+        assert_eq!(state.velocity_world, Vec3F64::new(1.2, 0.0, 0.0));
+        assert_eq!(
+            state.bridge_anchor,
+            Some(BridgeAnchor {
+                kf_idx: 40,
+                timestamp_sec: 10.0
+            })
+        );
+    }
+
+    #[test]
+    fn a_runaway_coast_seeds_at_the_last_tracked_pose_at_rest_without_a_bridge() {
+        let mut system = lost_metric_system(-8.1e57);
+
+        system.give_up(&stereo_frame(140), 5.0);
+
+        let state = &system.state;
+        assert!(state.reseeding());
+        assert_eq!(state.pose_world_to_cam, centred_at(1.0));
+        assert_eq!(state.velocity_world, Vec3F64::ZERO);
+        assert_eq!(state.bridge_anchor, None);
+    }
+
+    /// A coast whose average over the gap looks like walking but whose last
+    /// 10 s ran away is no seed either.
+    #[test]
+    fn a_runaway_over_the_window_overrides_a_plausible_gap_average() {
+        let mut system = lost_metric_system(7.0);
+        system.runaway.record(3.0, Vec3F64::ZERO);
+        system.runaway.record(13.0, Vec3F64::new(60.0, 0.0, 0.0));
+
+        system.give_up(&stereo_frame(140), 5.0);
+
+        assert_eq!(system.state.pose_world_to_cam, centred_at(1.0));
+        assert_eq!(system.state.bridge_anchor, None);
+        assert!(!system.runaway.runaway(), "the runaway history is dropped");
+    }
+
+    #[test]
+    fn a_monocular_frame_or_the_knob_off_starts_over_as_before() {
+        let mut mono_frame = lost_metric_system(7.0);
+        mono_frame.give_up(&frame_seeing_points(140, Pose3d::IDENTITY, &[]), 5.0);
+        assert!(!mono_frame.state.imu_initialized);
+        assert_eq!(mono_frame.state.pose_world_to_cam, centred_at(1.0));
+
+        let mut off = lost_metric_system(7.0);
+        off.recovery.keep_inertial = false;
+        off.give_up(&stereo_frame(140), 5.0);
+        assert!(!off.state.imu_initialized);
+    }
+
+    /// The bridge is the IMU edge from the anchor to the new keyframe with
+    /// its covariance scaled by `bridge_covariance_scale`.
+    #[test]
+    fn the_bridge_edge_spans_the_gap_with_an_inflated_covariance() {
+        let mut system = lost_metric_system(7.0);
+        let samples: Vec<ImuMeasurement> = (0..=1000)
+            .map(|i| ImuMeasurement {
+                timestamp: 10.0 + i as f64 * 0.005,
+                gyro: Vec3F64::new(0.0, 0.01, 0.0),
+                accel: Vec3F64::new(0.0, 0.0, 9.81),
+            })
+            .collect();
+        system.inertial.latest_image_timestamp_sec = Some(15.0);
+        system.process_imu(&samples);
+        {
+            let mut map = system.map.lock().unwrap();
+            for (idx, x) in [(40, 1.0), (141, 7.0)] {
+                map.insert_keyframe(Keyframe::from_frame(frame_seeing_points(
+                    idx,
+                    centred_at(x),
+                    &[],
+                )))
+                .unwrap();
+            }
+        }
+        let anchor = BridgeAnchor {
+            kf_idx: 40,
+            timestamp_sec: 10.0,
+        };
+
+        system.publish_bridge(anchor, 141, 15.0);
+
+        let plain = system
+            .inertial
+            .keyframe_edge(system.rig.imu_noise(), 40, 141, 10.0, 15.0)
+            .unwrap();
+        let map = system.map.lock().unwrap();
+        let [bridge] = map.imu_factors() else {
+            panic!("one bridge edge, got {}", map.imu_factors().len());
+        };
+        assert_eq!((bridge.prev_kf_idx, bridge.curr_kf_idx), (40, 141));
+        let scale = system.recovery.bridge_covariance_scale;
+        crate::system::recovery::tests::assert_scaled(
+            &plain.preintegrated.covariance,
+            &bridge.preintegrated.covariance,
+            scale,
+        );
+        let replayed = bridge.repreintegrate(bridge.preintegrated.bias);
+        assert_eq!(replayed.covariance, bridge.preintegrated.covariance);
+    }
+
+    /// A system re-seeding after a plausible give-up at t = 15 s, with level
+    /// static IMU samples buffered to t = 16 s.
+    fn reseeding_system() -> SlamSystem {
+        let mut system = lost_metric_system(7.0);
+        system.give_up(&stereo_frame(140), 5.0);
+        system.state.last_frame_timestamp_sec = 15.0;
+        system.inertial.latest_image_timestamp_sec = Some(15.0);
+        let samples: Vec<ImuMeasurement> = (0..=200)
+            .map(|i| ImuMeasurement {
+                timestamp: 15.0 + i as f64 * 0.005,
+                gyro: Vec3F64::ZERO,
+                accel: Vec3F64::new(0.0, 0.0, 9.81),
+            })
+            .collect();
+        system.process_imu(&samples);
+        system
+    }
+
+    #[test]
+    fn a_stalled_reseed_coasts_on_the_kept_inertial_state() {
+        let mut system = reseeding_system();
+
+        system.coast_while_reseeding(141, 15.05);
+
+        let centre = recovery::camera_centre(&system.state.pose_world_to_cam);
+        assert!((centre.x - (7.0 + 1.2 * 0.05)).abs() < 1e-6, "{centre:?}");
+        assert_eq!(system.state.last_frame_timestamp_sec, 15.05);
+        assert!(system.state.bridge_anchor.is_some());
+    }
+
+    #[test]
+    fn a_runaway_while_reseeding_holds_the_pose_at_rest_and_drops_the_bridge() {
+        let mut system = reseeding_system();
+        system.runaway.record(14.0, Vec3F64::new(-100.0, 0.0, 0.0));
+
+        system.coast_while_reseeding(141, 15.05);
+
+        assert_eq!(system.state.pose_world_to_cam, centred_at(7.0));
+        assert_eq!(system.state.velocity_world, Vec3F64::ZERO);
+        assert_eq!(system.state.bridge_anchor, None);
+    }
+
+    #[test]
+    fn a_bridge_older_than_max_bridge_sec_is_dropped() {
+        let mut system = lost_metric_system(7.0);
+        system.give_up(&stereo_frame(140), 5.0);
+        assert!(system.live_bridge_anchor(19.9).is_some());
+        assert!(system.live_bridge_anchor(20.1).is_none());
+        assert!(system.state.bridge_anchor.is_none());
+    }
+
+    #[test]
+    fn the_inertial_state_is_kept_only_when_asked() {
+        assert!(!RecoveryConfig::default().keep_inertial);
+        assert_eq!(RecoveryConfig::default().min_seed_points, MIN_STEREO_POINTS);
+    }
+
+    /// The first loss of a re-seeded segment gets its first anchor within
+    /// `keyframe_interval_while_lost_sec` of the seed keyframe: the old
+    /// segment's anchor spacing does not carry over.
+    #[test]
+    fn the_first_anchor_after_a_kept_give_up_comes_within_the_lost_interval() {
+        let mut system = lost_metric_system(7.0);
+        system.state.last_anchor_timestamp_sec = Some(14.9);
+        assert!(system.give_up(&stereo_frame(140), 5.0));
+        assert_eq!(system.state.last_anchor_timestamp_sec, None);
+        system.finish_bootstrap(141, 15.0);
+        assert!(system.state.imu_initialized);
+        let interval = system
+            .tracking_loss_recovery
+            .keyframe_interval_while_lost_sec;
+        assert!(!system.keyframe_due_while_lost(15.0 + interval / 2.0));
+        assert!(system.keyframe_due_while_lost(15.0 + interval * 1.01));
+    }
+}

@@ -10,6 +10,7 @@ mod counters;
 #[cfg(feature = "serde")]
 mod file;
 mod input;
+mod recovery;
 mod state;
 mod trace;
 mod validation;
@@ -26,6 +27,7 @@ pub use counters::{RunCounters, SkipKind};
 #[cfg(feature = "serde")]
 pub use file::LoadError;
 pub use input::ProcessError;
+pub use recovery::RecoveryConfig;
 pub use state::{TrackingResult, TrackingStatus};
 pub use trace::{FrameTrace, TraceMapPoint, TraceTrack};
 pub use validation::ConfigError;
@@ -70,9 +72,11 @@ use crate::mapping::{KeyframeJob, LocalMapping};
 use crate::pose_conversion::{RIGID_TOLERANCE, apply_reference_pose_correction, rotation_defect};
 use build::SystemSettings;
 use kornia_3d::pose::Pose3d;
+use kornia_algebra::Vec3F64;
 use kornia_image::Image;
 use kornia_sensors::SensorRig;
 use kornia_sensors::imu::ImuMeasurement;
+use recovery::{BridgeAnchor, RunawayDetector};
 
 /// The images of one capture, kept until its features are extracted.
 #[derive(Clone, Copy)]
@@ -143,6 +147,8 @@ pub struct SlamSystem {
     two_view_init_config: TwoViewInitConfig,
     keyframe_policy: KeyframePolicy,
     tracking_loss_recovery: TrackingLossRecoveryPolicy,
+    recovery: RecoveryConfig,
+    runaway: RunawayDetector,
     // mThDepth (metres): back-project close stereo points at each keyframe when set
     stereo_close_depth: Option<f64>,
     debug: bool,
@@ -213,6 +219,11 @@ impl SlamSystem {
             two_view_init_config: settings.two_view_init,
             keyframe_policy: settings.keyframe_policy,
             tracking_loss_recovery: settings.tracking_loss_recovery,
+            recovery: settings.recovery,
+            runaway: RunawayDetector::new(
+                settings.recovery.runaway_window_sec,
+                settings.recovery.max_coast_speed_mps,
+            ),
             stereo_close_depth: settings.stereo_close_depth_m,
             debug: false,
             debug_messages: Vec::new(),
@@ -800,6 +811,9 @@ impl SlamSystem {
         // metric map from a single keyframe (ORB-SLAM3's StereoInitialization)
         // instead of waiting for two-view parallax.
         let result = if curr_frame.is_metric() {
+            if self.state.reseeding() {
+                self.coast_while_reseeding(curr_frame.idx, timestamp_sec);
+            }
             self.bootstrap_stereo(curr_frame, timestamp_sec)
         } else {
             self.bootstrap_mono(curr_frame, timestamp_sec)
@@ -810,30 +824,65 @@ impl SlamSystem {
         result
     }
 
+    /// Carries the pose over a frame of a stalled re-seed on the kept inertial
+    /// state, so the segment starts where the camera is; a runaway holds it
+    /// at rest instead, and drops the bridge.
+    fn coast_while_reseeding(&mut self, frame_idx: usize, timestamp_sec: f64) {
+        let pose_before = self.state.pose_world_to_cam;
+        let prev_timestamp = self.state.last_frame_timestamp_sec;
+        let (coasted, _) = self.predict_frame_pose(pose_before, prev_timestamp, timestamp_sec);
+        self.state.last_frame_timestamp_sec = timestamp_sec;
+        self.runaway
+            .record(timestamp_sec, recovery::camera_centre(&coasted));
+        if !self.runaway.runaway() {
+            self.state.pose_world_to_cam = coasted;
+            return;
+        }
+        self.dbg(format!(
+            "[recover] frame={frame_idx} runaway at {:.1} m/s while re-seeding: held at rest",
+            self.runaway.speed_mps().unwrap_or(f64::NAN)
+        ));
+        self.runaway.clear();
+        self.state.velocity_world = Vec3F64::ZERO;
+        self.state.bridge_anchor = None;
+    }
+
     /// Single-frame metric initialization from stereo depth.
     fn bootstrap_stereo(&mut self, mut curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
         // The map will start at this frame or a later one, so older samples
         // can never enter an edge; a failed attempt (too few stereo points,
         // as in the dark) must not keep them, or the buffer grows for as
-        // long as bootstrap keeps failing.
-        self.prune_imu_before(timestamp_sec);
+        // long as bootstrap keeps failing. A pending bridge keeps its own.
+        let bridge_anchor = self.live_bridge_anchor(timestamp_sec);
+        self.prune_imu_before(bridge_anchor.map_or(timestamp_sec, |anchor| anchor.timestamp_sec));
         // Build the new map in the current odometry frame (identity at start,
         // or the recovery pose after a tracking loss).
         curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
         let curr_idx = curr_frame.idx;
+        let mut keyframe = Keyframe::from_frame(curr_frame);
+        if self.state.reseeding() {
+            keyframe.velocity_world = self.state.velocity_world;
+            keyframe.imu_bias = self.inertial.bias;
+        }
 
-        let insertion =
-            match bootstrap::stereo_initial_map(Keyframe::from_frame(curr_frame), &self.rig.camera)
-            {
-                Ok(insertion) => insertion,
-                Err(TooFewStereoPoints { found }) => {
-                    self.dbg(format!(
-                        "[bootstrap_stereo] frame={curr_idx} skip: only {found} stereo points \
-                     (need >= {MIN_STEREO_POINTS})"
-                    ));
-                    return self.frame_result(TrackingStatus::Skipped);
-                }
-            };
+        // A kept inertial state only needs a few points to start the segment;
+        // keyframes at the inertial poses grow it.
+        let min_points = if self.state.reseeding() {
+            self.recovery.min_seed_points
+        } else {
+            MIN_STEREO_POINTS
+        };
+        let insertion = match bootstrap::stereo_initial_map(keyframe, &self.rig.camera, min_points)
+        {
+            Ok(insertion) => insertion,
+            Err(TooFewStereoPoints { found }) => {
+                self.dbg(format!(
+                    "[bootstrap_stereo] frame={curr_idx} skip: only {found} stereo points \
+                     (need >= {min_points})"
+                ));
+                return self.frame_result(TrackingStatus::Skipped);
+            }
+        };
 
         // The keyframe and its seeds are published together; tracker state is
         // adopted below only once that succeeded.
@@ -853,6 +902,10 @@ impl SlamSystem {
              pose_defect={:.1e}",
             rotation_defect(&self.state.pose_world_to_cam.rotation),
         ));
+        if let Some(anchor) = bridge_anchor {
+            self.publish_bridge(anchor, curr_idx, timestamp_sec);
+        }
+        self.state.bridge_anchor = None;
 
         self.state.velocity = None;
         // The map is already metric (stereo baseline), but gravity, velocities,
@@ -1050,10 +1103,13 @@ impl SlamSystem {
     /// Leaves bootstrap with `kf_idx` as the reference keyframe. Inertial
     /// initialization follows when the camera-to-body extrinsic is known, since
     /// it relates IMU deltas to camera poses; otherwise tracking is visual-only.
+    /// A segment re-seeded with the inertial state kept tracks inertially at once.
     fn finish_bootstrap(&mut self, kf_idx: usize, timestamp_sec: f64) {
         self.state.current_keyframe_idx = Some(kf_idx);
         self.state.last_keyframe_idx = Some(kf_idx);
-        self.state.mode = if self.rig.camera_to_body().is_some() {
+        self.state.mode = if self.state.imu_initialized {
+            SystemMode::Tracking
+        } else if self.rig.camera_to_body().is_some() {
             self.inertial.schedule.start(kf_idx, timestamp_sec);
             SystemMode::ImuInit
         } else {
@@ -1259,28 +1315,8 @@ impl SlamSystem {
 
         self.refresh_reference_inertial_state();
 
-        // Preintegration is prepared here: the system owns bias and the sample
-        // buffer. The motion model chooses between it and the visual model.
-        let preintegrated = (self.state.imu_initialized && prev_timestamp > 0.0).then(|| {
-            self.inertial
-                .preintegrate_window(self.rig.imu_noise(), prev_timestamp, timestamp_sec)
-                .0
-        });
-        let (candidate_pose, predicted_velocity) = predict_pose(
-            pose_before,
-            self.state.velocity,
-            self.state.velocity_world,
-            preintegrated
-                .as_ref()
-                .map(|preintegrated| InertialPrediction {
-                    preintegrated,
-                    camera_to_body: self.rig.camera_to_body(),
-                    gravity_world: self.inertial.gravity_world,
-                }),
-        );
-        if let Some(velocity_world) = predicted_velocity {
-            self.state.velocity_world = velocity_world; // propagate for next frame
-        }
+        let (candidate_pose, predicted_velocity) =
+            self.predict_frame_pose(pose_before, prev_timestamp, timestamp_sec);
 
         let currently_lost_for = self
             .state
@@ -1474,6 +1510,12 @@ impl SlamSystem {
             trace.tracked = status != TrackingStatus::Skipped;
             trace.keyframe = status == TrackingStatus::KeyframeAccepted;
         }
+        if self.recovery.keep_inertial {
+            self.runaway.record(
+                timestamp_sec,
+                recovery::camera_centre(&self.state.pose_world_to_cam),
+            );
+        }
         if status == TrackingStatus::Skipped {
             let policy = &self.tracking_loss_recovery;
 
@@ -1492,7 +1534,10 @@ impl SlamSystem {
                 ));
                 self.counters.give_ups += 1;
                 self.tracker.reset_tracks();
-                self.state.reset_after_loss();
+                if self.give_up(&frame, recently_lost_for) {
+                    // This frame's coast is already in the seed.
+                    self.state.last_frame_timestamp_sec = timestamp_sec;
+                }
                 return Ok(self.bootstrap_step(frame, timestamp_sec));
             }
             let role = match policy.keyframes_while_lost {
@@ -1500,9 +1545,15 @@ impl SlamSystem {
                 KeyframesWhileLost::Anchor => Some(KeyframeRole::Anchor),
                 KeyframesWhileLost::Disabled => None,
             };
-            if imu_confident
+            let due = imu_confident && self.keyframe_due_while_lost(timestamp_sec);
+            if due && role.is_some() && self.recovery.keep_inertial && self.runaway.runaway() {
+                self.dbg(format!(
+                    "[lost] frame={} runaway at {:.1} m/s: no keyframe at the coasted pose",
+                    frame.idx,
+                    self.runaway.speed_mps().unwrap_or(f64::NAN)
+                ));
+            } else if due
                 && let Some(role) = role
-                && self.keyframe_due_while_lost(timestamp_sec)
                 && self.insert_keyframe(&frame, timestamp_sec, &[], role)
             {
                 let idx = frame.idx;
@@ -1579,6 +1630,40 @@ impl SlamSystem {
         FlowOnly::Tracked(Box::new(frame), estimate)
     }
 
+    /// The motion model's pose at `timestamp_sec` from `pose_before` at
+    /// `prev_timestamp`, advancing the world velocity when the IMU predicted;
+    /// that velocity is returned with it.
+    fn predict_frame_pose(
+        &mut self,
+        pose_before: Pose3d,
+        prev_timestamp: f64,
+        timestamp_sec: f64,
+    ) -> (Pose3d, Option<Vec3F64>) {
+        // Preintegration is prepared here: the system owns bias and the sample
+        // buffer. The motion model chooses between it and the visual model.
+        let preintegrated = (self.state.imu_initialized && prev_timestamp > 0.0).then(|| {
+            self.inertial
+                .preintegrate_window(self.rig.imu_noise(), prev_timestamp, timestamp_sec)
+                .0
+        });
+        let (candidate_pose, predicted_velocity) = predict_pose(
+            pose_before,
+            self.state.velocity,
+            self.state.velocity_world,
+            preintegrated
+                .as_ref()
+                .map(|preintegrated| InertialPrediction {
+                    preintegrated,
+                    camera_to_body: self.rig.camera_to_body(),
+                    gravity_world: self.inertial.gravity_world,
+                }),
+        );
+        if let Some(velocity_world) = predicted_velocity {
+            self.state.velocity_world = velocity_world; // propagate for next frame
+        }
+        (candidate_pose, predicted_velocity)
+    }
+
     /// What the keyframe policy is shown for `frame`: the parallax is taken
     /// against the last keyframe at the tracked pose `state.pose_world_to_cam`,
     /// not at the frame's own (pre-tracking) pose.
@@ -1642,6 +1727,100 @@ impl SlamSystem {
                 .state
                 .imu_init_timestamp_sec
                 .is_some_and(|t0| timestamp_sec - t0 >= min_confidence_sec)
+    }
+
+    /// Ends the segment tracking was lost in. A metric, inertially initialized
+    /// map keeps its inertial state, and the next segment starts at the coasted
+    /// pose when the coast `lost_for_sec` long is plausible (by its average and
+    /// over the runaway window), with an IMU bridge from the last keyframe;
+    /// otherwise at the last tracked pose, at rest. Returns whether the
+    /// inertial state was kept.
+    fn give_up(&mut self, frame: &Frame, lost_for_sec: f64) -> bool {
+        let keep = self.recovery.keep_inertial && self.state.imu_initialized && frame.is_metric();
+        if !keep {
+            self.runaway.clear();
+            self.state.reset_after_loss();
+            return false;
+        }
+        let coasted = self.state.pose_world_to_cam;
+        let before = self.state.pose_before_loss.unwrap_or(coasted);
+        let plausible = !self.runaway.runaway()
+            && recovery::coast_is_plausible(
+                &before,
+                &coasted,
+                lost_for_sec,
+                self.recovery.max_coast_speed_mps,
+            );
+        if !plausible {
+            self.runaway.clear();
+        }
+        let (seed, velocity_world, anchor) = if plausible {
+            let anchor = self
+                .state
+                .last_keyframe_idx
+                .zip(self.inertial.last_keyframe_timestamp_sec)
+                .map(|(kf_idx, timestamp_sec)| BridgeAnchor {
+                    kf_idx,
+                    timestamp_sec,
+                });
+            (coasted, self.state.velocity_world, anchor)
+        } else {
+            (before, Vec3F64::ZERO, None)
+        };
+        let travelled =
+            (recovery::camera_centre(&coasted) - recovery::camera_centre(&before)).length();
+        self.dbg(format!(
+            "[recover] frame={} inertial state kept; seed at the {} pose (coast {travelled:.2} m in {lost_for_sec:.2} s), bridge from {:?}",
+            frame.idx,
+            if plausible { "coasted" } else { "last tracked" },
+            anchor.map(|anchor| anchor.kf_idx),
+        ));
+        self.state
+            .reset_after_loss_keeping_inertial(seed, velocity_world, anchor);
+        true
+    }
+
+    /// The pending bridge anchor, dropped once the gap outgrows
+    /// `max_bridge_sec`: preintegration over a longer coast says nothing.
+    fn live_bridge_anchor(&mut self, timestamp_sec: f64) -> Option<BridgeAnchor> {
+        let max_gap = self.recovery.max_bridge_sec;
+        if self
+            .state
+            .bridge_anchor
+            .is_some_and(|anchor| timestamp_sec - anchor.timestamp_sec > max_gap)
+        {
+            self.state.bridge_anchor = None;
+        }
+        self.state.bridge_anchor
+    }
+
+    /// Publishes the IMU edge from the last keyframe before a give-up to the
+    /// next segment's first, with the covariance inflated for the coast.
+    fn publish_bridge(&mut self, anchor: BridgeAnchor, kf_idx: usize, timestamp_sec: f64) {
+        let noise =
+            recovery::inflated_noise(self.rig.imu_noise(), self.recovery.bridge_covariance_scale);
+        let Some(edge) = self.inertial.keyframe_edge(
+            noise,
+            anchor.kf_idx,
+            kf_idx,
+            anchor.timestamp_sec,
+            timestamp_sec,
+        ) else {
+            return;
+        };
+        let published = self.map.lock().unwrap().apply_insertion(MapInsertion {
+            imu_factors: vec![edge],
+            ..Default::default()
+        });
+        let message = match published {
+            Ok(_) => format!(
+                "[recover] frame={kf_idx} bridged from kf={} over {:.2}s",
+                anchor.kf_idx,
+                timestamp_sec - anchor.timestamp_sec
+            ),
+            Err(error) => format!("[recover] frame={kf_idx} bridge rejected: {error}"),
+        };
+        self.dbg(message);
     }
 
     /// Recovers the pose against the map from place-recognition candidates

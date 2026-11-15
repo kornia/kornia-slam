@@ -16,6 +16,8 @@ use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::{KeyframeObservations, MapProjectionConfig};
 use crate::tracking::{KeyframePolicy, KeyframesWhileLost, TrackingLossRecoveryPolicy};
 
+use super::recovery::RecoveryConfig;
+
 /// Schema version of [`SystemConfig`] this crate reads and writes.
 pub const SYSTEM_CONFIG_VERSION: u32 = 1;
 
@@ -247,6 +249,8 @@ impl StereoCloseDepth {
 pub struct TrackingLossConfig {
     /// How frames coasted on the IMU extend the map.
     pub keyframes_while_lost: KeyframesWhileLost,
+    /// How the map is re-seeded after a give-up.
+    pub reseed: RecoveryConfig,
 }
 
 /// Local mapping (keyframe insertion, culling and local BA / VI-BA).

@@ -30,7 +30,8 @@ use kornia_algebra::Vec3F64;
 /// viable current frame (mirrors ORB-SLAM3's `MonocularInitialization`).
 pub(crate) const MIN_KEYPOINTS_FOR_BOOTSTRAP: usize = 100;
 
-/// Fewest stereo points a single keyframe needs to seed a metric map.
+/// Fewest stereo points a single keyframe needs to seed a metric map from a
+/// cold start.
 pub(crate) const MIN_STEREO_POINTS: usize = 50;
 
 /// Fewest landmarks with positive depth in both bootstrap keyframes for the
@@ -98,12 +99,14 @@ pub(crate) struct TooFewStereoPoints {
 }
 
 /// The initial map from a single stereo keyframe: every keypoint with valid
-/// depth becomes a metric landmark (ORB-SLAM3's `StereoInitialization`).
+/// depth becomes a metric landmark (ORB-SLAM3's `StereoInitialization`), if
+/// there are at least `min_points` of them.
 ///
 /// `camera` must be the rectified camera the depths were computed against.
 pub(crate) fn stereo_initial_map(
     keyframe: Keyframe,
     camera: &PinholeCamera,
+    min_points: usize,
 ) -> Result<MapInsertion, TooFewStereoPoints> {
     let (landmarks, observations) = if keyframe.frame.is_rig() {
         rig_seeds(&keyframe.frame, f64::INFINITY, &[])
@@ -113,7 +116,7 @@ pub(crate) fn stereo_initial_map(
             Vec::new(),
         )
     };
-    if landmarks.len() < MIN_STEREO_POINTS {
+    if landmarks.len() < min_points {
         return Err(TooFewStereoPoints {
             found: landmarks.len(),
         });
@@ -428,12 +431,20 @@ mod tests {
     #[test]
     fn a_stereo_frame_needs_enough_valid_depths_to_seed_a_map() {
         let too_few = stereo_frame(1, MIN_STEREO_POINTS - 1);
-        let error = stereo_initial_map(Keyframe::from_frame(too_few), &camera()).unwrap_err();
+        let error = stereo_initial_map(
+            Keyframe::from_frame(too_few.clone()),
+            &camera(),
+            MIN_STEREO_POINTS,
+        )
+        .unwrap_err();
         assert_eq!(error.found, MIN_STEREO_POINTS - 1);
+        let reseeded = stereo_initial_map(Keyframe::from_frame(too_few), &camera(), 10).unwrap();
+        assert_eq!(reseeded.landmarks.len(), MIN_STEREO_POINTS - 1);
 
         let insertion = stereo_initial_map(
             Keyframe::from_frame(stereo_frame(1, MIN_STEREO_POINTS)),
             &camera(),
+            MIN_STEREO_POINTS,
         )
         .unwrap();
         assert_eq!(insertion.keyframes.len(), 1);

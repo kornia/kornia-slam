@@ -5,6 +5,7 @@ use super::config::{
     CameraSelection, FrontendConfig, LocalBaConfig, LoopClosingExecution, LoopClosingMode,
     OrbSlamPipeline, PipelineDefinition, SensorSelection, StereoDepthSigma, SystemConfig,
 };
+use super::recovery::RecoveryConfig;
 use super::validation::ConfigError;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabulary};
@@ -34,6 +35,7 @@ pub(crate) struct SystemSettings {
     pub map_projection: MapProjectionConfig,
     pub keyframe_policy: KeyframePolicy,
     pub tracking_loss_recovery: TrackingLossRecoveryPolicy,
+    pub recovery: RecoveryConfig,
     pub local_mapping: LocalMappingMode,
     pub local_ba: LocalBaParams,
     /// Near/far depth threshold `mThDepth` (metres). When `Some`, each new
@@ -126,6 +128,7 @@ impl SystemConfig {
                 keyframes_while_lost: orb.tracking_loss.keyframes_while_lost,
                 ..tuning.loss_recovery
             },
+            recovery: orb.tracking_loss.reseed,
             local_mapping: orb.mapping.execution,
             local_ba: orb
                 .mapping

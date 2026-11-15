@@ -1022,5 +1022,23 @@ mod ron_files {
             KeyframesWhileLost::Anchor
         );
         assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((tracking_loss: (keyframes_while_lost: Anchor, reseed: (keep_inertial: true, min_seed_points: 10)))))",
+        )
+        .unwrap();
+        let reseed = orb(&config).tracking_loss.reseed;
+        assert!(reseed.keep_inertial);
+        assert_eq!(reseed.min_seed_points, 10);
+        assert_eq!(
+            reseed.max_coast_speed_mps,
+            crate::system::RecoveryConfig::default().max_coast_speed_mps
+        );
+        assert!(
+            !orb(&parse("(version: 1)").unwrap())
+                .tracking_loss
+                .reseed
+                .keep_inertial
+        );
     }
 }
