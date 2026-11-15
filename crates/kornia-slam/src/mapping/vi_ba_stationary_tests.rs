@@ -1,8 +1,8 @@
 use super::*;
+use kornia_3d::ransac::{HuberKernel, RobustKernel};
 use kornia_algebra::{Mat3F64, SE3F64, SO3F64};
 use kornia_factors::inertial::stationary::{StationaryFactor, StationaryGyro};
 use kornia_sensors::imu::{ImuCalib, ImuMeasurement};
-use kornia_3d::ransac::{HuberKernel, RobustKernel};
 
 fn camera() -> PinholeCamera {
     PinholeCamera {
