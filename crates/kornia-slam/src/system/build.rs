@@ -97,6 +97,7 @@ impl LocalBaConfig {
         LocalBaParams {
             active_keyframes: self.active_keyframes,
             boundary_imu_info_scale: self.boundary_imu_info_scale,
+            max_iterations: self.max_iterations,
             boundary_scales_bias_rows: self.boundary_scales_bias_rows,
             boundary: self.boundary,
             imu_huber: self.imu_huber,

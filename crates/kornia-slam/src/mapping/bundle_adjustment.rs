@@ -42,6 +42,8 @@ pub struct LocalBaParams {
     pub active_keyframes: usize,
     /// See [`ViBaParams::boundary_imu_info_scale`](crate::mapping::vi_ba_schur::ViBaParams).
     pub boundary_imu_info_scale: f64,
+    /// Iteration cap of one VI-BA solve.
+    pub max_iterations: usize,
     pub boundary_scales_bias_rows: bool,
     pub boundary: BoundaryPrior,
     pub imu_huber: ImuHuber,
@@ -84,6 +86,7 @@ impl Default for LocalBaParams {
         Self {
             active_keyframes: 3,
             boundary_imu_info_scale: 1e-2,
+            max_iterations: 50,
             boundary_scales_bias_rows: true,
             boundary: BoundaryPrior::ScaledEdge,
             imu_huber: ImuHuber::AllEdges,
@@ -681,7 +684,7 @@ pub fn run_local_inertial_ba_with(
     let mut vi_params = ViBaParams {
         imu_t_bc,
         gravity: gravity_world,
-        max_iterations: 50,
+        max_iterations: params.max_iterations,
         boundary_imu_info_scale: params.boundary_imu_info_scale,
         boundary_scales_bias_rows: params.boundary_scales_bias_rows,
         boundary: params.boundary,

@@ -721,6 +721,25 @@ fn local_inertial_ba_reports_its_solve() {
     );
 }
 
+/// `max_iterations` caps the VI-BA solve.
+#[test]
+fn local_inertial_ba_honours_its_iteration_cap() {
+    let map = fixture();
+    let update = run_local_inertial_ba_with(
+        map.ba_snapshot(&local_window(&map)),
+        &camera(),
+        None,
+        Vec3F64::ZERO,
+        &[],
+        &[],
+        &LocalBaParams {
+            max_iterations: 1,
+            ..LocalBaParams::default()
+        },
+    );
+    assert_eq!(update.solve_stats().expect("the solver ran").iterations, 1);
+}
+
 /// The run counters tell an early exit from a solve: a window with fewer
 /// than `MIN_OBSERVATIONS` observations never reaches the solver.
 #[test]

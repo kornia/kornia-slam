@@ -340,6 +340,13 @@ fn settings_are_range_checked() {
         ),
         (
             LocalBaConfig {
+                max_iterations: 0,
+                ..LocalBaConfig::default()
+            },
+            "mapping.local_ba.max_iterations",
+        ),
+        (
+            LocalBaConfig {
                 boundary: BoundaryPrior::Marginal(FrozenPoseSigma {
                     frozen_pose_sigma_m: 0.0,
                     ..FrozenPoseSigma::default()
@@ -609,9 +616,11 @@ mod runtime_settings {
             SystemConfig::default().settings(&selected).local_ba,
             LocalBaParams::default()
         );
+        assert_eq!(LocalBaParams::default().max_iterations, 50);
         let mut config = SystemConfig::default();
         orb_mut(&mut config).mapping.local_ba = LocalBaConfig {
             active_keyframes: 10,
+            max_iterations: 10,
             stereo_depth_sigma: StereoDepthSigma::Disparity { px: 1.0 },
             visual_information: VisualInformation::OctaveScaled,
             ..LocalBaConfig::default()
@@ -624,6 +633,7 @@ mod runtime_settings {
         let local_ba = settings.local_ba;
         assert_eq!(local_ba.visual_information, VisualInformation::OctaveScaled);
         assert_eq!(local_ba.active_keyframes, 10);
+        assert_eq!(local_ba.max_iterations, 10);
         let fb = selected.camera.fx * 0.11;
         assert_eq!(
             local_ba.depth_sigma,
@@ -748,6 +758,13 @@ mod ron_files {
         );
         assert!(local_ba.boundary_scales_bias_rows);
         assert_eq!(local_ba.boundary, BoundaryPrior::ScaledEdge);
+        assert_eq!(local_ba.max_iterations, 50);
+
+        let config =
+            parse("(version: 1, pipeline: OrbSlam((mapping: (local_ba: (max_iterations: 10)))))")
+                .unwrap();
+        assert_eq!(orb(&config).mapping.local_ba.max_iterations, 10);
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
 
         let config = parse(
             "(version: 1, pipeline: OrbSlam((mapping: (local_ba: (boundary: Marginal((frozen_pose_sigma_m: 0.002, frozen_pose_sigma_rad: 0.001)))))))",

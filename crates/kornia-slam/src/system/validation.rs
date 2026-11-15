@@ -215,6 +215,11 @@ fn validate_local_ba(config: &LocalBaConfig) -> Result<(), ConfigError> {
         config.boundary_imu_info_scale,
         NON_NEGATIVE,
     )?;
+    check(
+        at("max_iterations"),
+        config.max_iterations as f64,
+        AT_LEAST_ONE,
+    )?;
     if let BoundaryPrior::Marginal(sigma) = config.boundary {
         check(at("boundary"), sigma.frozen_pose_sigma_m, POSITIVE)?;
         check(at("boundary"), sigma.frozen_pose_sigma_rad, POSITIVE)?;

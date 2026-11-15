@@ -283,6 +283,9 @@ pub struct LocalBaConfig {
     pub active_keyframes: usize,
     /// Information scale of the IMU edge from the fixed past into the window.
     pub boundary_imu_info_scale: f64,
+    /// Levenberg-Marquardt iteration cap of one VI-BA solve. ORB-SLAM3's
+    /// `LocalInertialBA` runs 10.
+    pub max_iterations: usize,
     /// Whether that scale also hits the edge's bias random-walk rows
     /// (ORB-SLAM3 leaves them at full weight).
     pub boundary_scales_bias_rows: bool,
@@ -305,6 +308,7 @@ impl Default for LocalBaConfig {
         Self {
             active_keyframes: 3,
             boundary_imu_info_scale: 1e-2,
+            max_iterations: 50,
             boundary_scales_bias_rows: true,
             boundary: BoundaryPrior::ScaledEdge,
             imu_huber: ImuHuber::AllEdges,
