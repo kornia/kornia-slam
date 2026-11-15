@@ -86,6 +86,26 @@ The window size is already a knob, `mapping.local_ba.active_keyframes`. It defau
 3. **More compute if possible:** a second machine or cloud runners, so more than 3 LaMAria runs can go at once.
 4. **Then the recovery side:** G19 global PnP while lost, and G28 a seed with its own local map. Recovery work only pays off once tracking drift is under control.
 
+## Speed: the LK pyramid
+
+These findings come from reading the code only; none of them is measured in the full pipeline.
+
+**Already in place** (`tracking/optical_flow.rs`, `KltPyramidCache`):
+- Each frame's pyramid is kept and reused as the next frame's previous pyramid. A byte compare guards against a stale pyramid. So each frame builds one pyramid, not two.
+- The Scharr gradients are computed once per image, only when it becomes the previous frame.
+- With an IMU prediction, LK starts at the predicted pixel and searches only the fine levels.
+
+**Still open, largest first:**
+1. **Make the u8 fixed-point kernel the default.** `LkKernel::FixedPointU8` (u8 pyramid, i16 Scharr, Q14 windows, OpenCV's scheme) already exists. The default is still `F32`, which every frame casts the full image u8→f32 and runs an f32 pyrdown and an f32 Scharr. The earlier frontend plan predicted about 1.2 ms to build the u8 pyramid. The output changes slightly, so this needs an experiment card with an accuracy check. It is the first one to try, because it is a single knob.
+2. **Compute gradients only where tracks are.** Scharr runs over the whole image at every level. With about 300 tracks and a 21×21 window, that is about 10 % of the L0 pixels, so gradients computed lazily per window would save most of the cost.
+3. **Build coarse levels only when needed.** With a good IMU prediction, LK uses only levels 0–1, but levels 2–3 are still built for the cache. The saving is small: those levels hold about 1/16 of L0's area.
+4. **Stop building duplicate pyramids:**
+   - The stereo path builds two extra resize pyramids that duplicate ORB's own pyramid (`frontend/mod.rs`).
+   - The ORB pyramid (scale 1.2) and the LK pyramid (scale 2) cannot share levels. Running ORB only on keyframes, with KLT in between (the KLT-first design), works on mono but lost tracked share on the rig.
+5. **Rig cameras:** KLT runs only on the primary camera today. Adding the other cameras adds pyramids, which makes 1 and 2 matter more.
+
+**Priority:** low for the LaMAria score. The median tracking time per frame on R_11 is 8.4–8.6 ms, while VI-BA costs 85–250 ms per solve. This work matters for the Orin and for the rig.
+
 ## How we work
 
 - Follow the `slam-experiment` skill (`.claude/skills/slam-experiment/SKILL.md`):
