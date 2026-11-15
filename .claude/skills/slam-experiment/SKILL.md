@@ -8,9 +8,9 @@ description: Use before and after any SLAM/VIO change or experiment in kornia-sl
 **Rule: write the theory and the predictions before any SLAM change.** A better number is not a fix. We do not yet know for certain where the benchmark gaps are, so every experiment must also say which gap it tests.
 
 Where the files go (paths relative to the repo root unless your team agrees on another place):
-- **Gap ledger:** `docs/experiments/gap-ledger.md`. Create it if missing, in the format below.
-- **One plan per change:** `docs/experiments/<topic>-plan.md`.
-- **Results:** `docs/experiments/<topic>-results.md`.
+- **Gap ledger:** `experiments/gap-ledger.md`. Create it if missing, in the format below.
+- **One plan per change:** `experiments/<topic>-plan.md`.
+- **Results:** `experiments/<topic>-results.md`.
 
 ## 1. Before code: the experiment card
 
