@@ -164,6 +164,11 @@ Each one changes output, so each needs its own experiment card.
 
 **Priority of the pyramid speed items:** low for the LaMAria score. The forward-backward check and the point selection above are accuracy changes, not speed changes, so this does not apply to them. The median tracking time per frame on R_11 is 8.4–8.6 ms, while VI-BA costs 85–250 ms per solve. This work matters for the Orin and for the rig.
 
+## Related work outside this sprint
+
+- [#196](https://github.com/kornia/kornia-slam/issues/196) adds range odometry (2D lidar, depth, 3D lidar) as loose factors in the hybrid estimator, with its own benchmarks. LaMAria uses camera and IMU only, so #196 does not affect the score here. It does share the estimator and the global pose graph with this branch.
+  - The factor API (#175 / #185) is the meeting point. Keep changes to the estimator's factor interface compatible with it.
+
 ## How we work
 
 - Follow the `slam-experiment` skill (`.claude/skills/slam-experiment/SKILL.md`):
