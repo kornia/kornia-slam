@@ -16,6 +16,35 @@ This note is for whoever picks up the LaMAria accuracy work on this branch (PR #
 - **Sim3:** the fit passes on 3_18, 1_19 and 5_11 and fails on 2_11 and R_11.
 - **Noise:** our pipeline is deterministic, so the noise is measured by shifting the IMU time offset by ±50 µs. One run per sequence is never enough to judge a change.
 
+## The current leader: SLAM Dunk
+
+SLAM Dunk, by Jacob Van Meter and Ayush Paul (code: https://github.com/jacobvm04/slam-dunk, AGPL-3.0), is at the top of the [leaderboard](https://www.lamaria.ethz.ch/leaderboard), level with Aria's SLAM. Its "+Retrieval" variant, an unofficial derivative, scores above Aria on Medium, Long and Low light. The findings below come from reading the repo on 2026-11-15; we have not run it.
+
+| | Short | Medium | Long | Low light | Moving platform |
+|---|---|---|---|---|---|
+| Aria's SLAM | 90.7 | 78.5 | 70.9 | 84.2 | 55.0 |
+| SLAM Dunk+Retrieval | 90.1 | 80.1 | 74.5 | 87.1 | 52.4 |
+| SLAM Dunk | 89.6 | 78.9 | 71.1 | 85.4 | 52.3 |
+
+**Features:** classical only; we found no learned features in the repo.
+- **Frame-to-frame tracking:** Basalt's patch optical flow (vendored from Basalt), with detection at half resolution.
+- **Keyframe features:** OpenCV SIFT turned into RootSIFT. They use 900 features per image and a very low contrast threshold (0.006). Keyframe pairs are matched with an essential-matrix RANSAC.
+- **Loop closure (+Retrieval):** VLAD over the RootSIFT descriptors, with 48 words, power and L2 normalisation and IDF weighting. There is no vocabulary tree.
+- **Low light:** the camera gain metadata is read, and dark-adapted SIFT is available as an option.
+
+**What gives the score.** The README says it is the estimator, not the features:
+- **Offline global bundle adjustment** on Basalt's square-root solver. By their account, this alone reaches about 69 on the training set, the level of strong public entries.
+- **Two terms that standard VIO leaves out** take the training score from 69.1 to 82.4:
+  - camera calibration that drifts over time (`temporal_camera`);
+  - gyroscope intrinsic calibration (`gyro_response`).
+- **Further model terms:** accelerometer, clock, thermal and a final refinement pass. Each one has an ablation config in `configs/`.
+- **How it runs:** an offline pipeline (Python and C++, 8 cores, 8 GB) packaged as a Docker container. The leaderboard lists 62 FPS for the base entry.
+
+**What this means for us.**
+- A good classical frontend combined with offline global VI-BA (gap A7) and calibration states (A8) is enough to reach the top. Tuning the online estimator alone will not get there.
+- AGPL-3.0 means we can study the ideas but must not copy code into kornia, which is Apache-licensed.
+- Their 82.4 is a training-set number. Their test-set result is the leaderboard row above.
+
 ## What is on this branch
 
 Every change sits behind a RON knob that defaults to the old behaviour. With the knobs off, the output is byte-identical to the base.
@@ -71,6 +100,13 @@ The window size is already a knob, `mapping.local_ba.active_keyframes`. It defau
 
 ## Recommended way forward
 
+0. **Consider offline global VI-BA with calibration states first.** SLAM Dunk (above) shows this is the main lever:
+   - global BA over the whole recording;
+   - camera calibration that drifts over time;
+   - gyro intrinsics;
+   - clock and thermal terms.
+
+   This is gaps A7 and A8. It can run on top of our current online trajectory, so it does not wait on the online fixes below. Measure their ablation ladder (`configs/ladder_*.json`) on the training split before choosing the order.
 1. **Port ORB-SLAM3's estimator settings in one step, then bisect.** It scores 72.9 in the same harness, so it is the closest working reference. Change everything we know differs, together:
    - VI-BA window of 10 (or 25), with ORB-SLAM3's handling of bias between consecutive keyframes and at the window boundary;
    - its robust kernels, applied only where ORB-SLAM3 applies them (it uses Huber only on the boundary edge, not on every IMU edge);
