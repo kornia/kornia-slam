@@ -49,7 +49,7 @@ Sensors each source can provide:
 
 `Oakd` requires `--features oakd` and `Uvc` requires `--features uvc`; a run file naming them in a build without the feature fails with a message saying which. The default build needs no extra system dependencies.
 
-Command-line options are only about evaluation and display: `--evaluate` and `--eval-out DIR` (sources with ground truth: EuRoC, Hilti, TUM-VI), and the visualizer flags below.
+Command-line options are only about evaluation and display: `--evaluate` and `--eval-out DIR` (sources with ground truth: EuRoC, Hilti, TUM-VI), `--trajectory-out FILE` (the per-frame estimate in TUM format, `timestamp_ns tx ty tz qx qy qz qw`, as world_from_imu when the IMU is used, for external benchmark tools), and the visualizer flags below.
 
 ## EuRoC dataset
 

@@ -12,15 +12,17 @@ mod config;
 mod datasets;
 mod evaluation;
 mod source;
+mod trajectory;
 mod tui;
 mod utils;
 use config::RunConfig;
 use evaluation::associate_gt;
 use kornia_algebra::Vec3F64;
 use kornia_slam::system::PipelineDefinition;
-use kornia_slam::{LoopClosureEvent, SlamSystem};
+use kornia_slam::{LoopClosureEvent, SlamSystem, TrackingStatus};
 use source::{FrameItem, OpenedSource};
 use std::time::{Duration, Instant};
+use trajectory::{StampedPose, world_from_sensor};
 use utils::trajectory_point_from_pose;
 
 #[cfg(feature = "viz")]
@@ -44,6 +46,12 @@ struct Args {
     /// directory for the evaluation CSVs (created if missing; default: current dir)
     #[argh(option, default = "String::from(\".\")")]
     eval_out: String,
+
+    /// write the per-frame estimate to this file in TUM format
+    /// (`timestamp_ns tx ty tz qx qy qz qw`): world_from_imu when the IMU is
+    /// used, else world_from_camera; frames the tracker skipped are left out
+    #[argh(option)]
+    trajectory_out: Option<String>,
 
     /// spawn a Rerun viewer and stream to it (requires `--features viz`)
     #[argh(switch)]
@@ -96,6 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut system = SlamSystem::build(run.system, source.rig()).map_err(|e| e.to_string())?;
     system.set_debug(args.debug);
     let camera = system.rig().camera.clone();
+    let camera_to_body = system.rig().camera_to_body();
     if let Some(path) = vocabulary {
         eprintln!(
             "[place-recognition] loaded vocabulary from {}",
@@ -131,6 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut est_positions, mut gt_positions): (Vec<Vec3F64>, Vec<Vec3F64>) =
         (Vec::new(), Vec::new());
     let mut trajectory: Vec<[f32; 3]> = Vec::new();
+    let mut estimates: Vec<StampedPose> = Vec::new();
     let mut processed: usize = 0;
 
     while let Some(item) = source.next_frame()? {
@@ -202,6 +212,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let traj_pt = trajectory_point_from_pose(&result.pose_world_to_cam);
         trajectory.push(traj_pt);
+        if args.trajectory_out.is_some() && result.status != TrackingStatus::Skipped {
+            estimates.push(StampedPose {
+                timestamp_sec,
+                world_from_sensor: world_from_sensor(
+                    &result.pose_world_to_cam,
+                    camera_to_body.as_ref(),
+                ),
+            });
+        }
 
         // Evaluation pairs each estimate with the nearest ground-truth pose.
         if args.evaluate
@@ -279,6 +298,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
     );
+    if let Some(path) = &args.trajectory_out {
+        trajectory::write_tum(std::path::Path::new(path), &estimates)?;
+        let frame = if camera_to_body.is_some() {
+            "imu"
+        } else {
+            "camera"
+        };
+        eprintln!(
+            "Trajectory: {} poses ({frame} frame) -> {path}",
+            estimates.len()
+        );
+    }
     if args.evaluate {
         evaluation::report(
             &est_positions,
@@ -311,5 +342,9 @@ mod cli_tests {
         let args = parse(&["--config", "r.ron", "--evaluate", "--eval-out", "out"]).unwrap();
         assert!(args.evaluate);
         assert_eq!(args.eval_out, "out");
+        assert!(args.trajectory_out.is_none());
+
+        let args = parse(&["--config", "r.ron", "--trajectory-out", "est.txt"]).unwrap();
+        assert_eq!(args.trajectory_out.as_deref(), Some("est.txt"));
     }
 }
