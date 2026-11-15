@@ -21,13 +21,16 @@ kornia-factors = { path = "crates/kornia-factors", version = "0.2.0" }
 kornia-sensors = { path = "crates/kornia-sensors", version = "0.2.0" }
 kornia-slam = { path = "crates/kornia-slam", version = "0.2.0" }
 
-kornia-3d = { git = "https://github.com/kornia/kornia-rs", rev = "8091be2cbce69da8eb37e5d5cb4f8b0180d02088", version = "0.2.0" }
-kornia-algebra = { git = "https://github.com/kornia/kornia-rs", rev = "8091be2cbce69da8eb37e5d5cb4f8b0180d02088", version = "0.2.0" }
-kornia-bow = { git = "https://github.com/kornia/kornia-rs", rev = "8091be2cbce69da8eb37e5d5cb4f8b0180d02088", version = "0.2.0" }
-kornia-image = { git = "https://github.com/kornia/kornia-rs", rev = "8091be2cbce69da8eb37e5d5cb4f8b0180d02088", version = "0.2.0" }
-kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", rev = "8091be2cbce69da8eb37e5d5cb4f8b0180d02088", version = "0.2.0" }
-kornia-io = { git = "https://github.com/kornia/kornia-rs", rev = "8091be2cbce69da8eb37e5d5cb4f8b0180d02088", version = "0.2.0" }
-kornia-tensor = { git = "https://github.com/kornia/kornia-rs", rev = "8091be2cbce69da8eb37e5d5cb4f8b0180d02088", version = "0.2.0" }
+# TODO(cursor): switch kornia-* crates to the next published kornia-rs release
+# once it includes RobustKernel::rho (kornia-rs#1360). For now pin to the
+# merge commit to consume that API.
+kornia-3d = { git = "https://github.com/kornia/kornia-rs", rev = "11b4951719d3b702b6ede25d082874fdd23d05c3", version = "0.2.0" }
+kornia-algebra = { git = "https://github.com/kornia/kornia-rs", rev = "11b4951719d3b702b6ede25d082874fdd23d05c3", version = "0.2.0" }
+kornia-bow = { git = "https://github.com/kornia/kornia-rs", rev = "11b4951719d3b702b6ede25d082874fdd23d05c3", version = "0.2.0" }
+kornia-image = { git = "https://github.com/kornia/kornia-rs", rev = "11b4951719d3b702b6ede25d082874fdd23d05c3", version = "0.2.0" }
+kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", rev = "11b4951719d3b702b6ede25d082874fdd23d05c3", version = "0.2.0" }
+kornia-io = { git = "https://github.com/kornia/kornia-rs", rev = "11b4951719d3b702b6ede25d082874fdd23d05c3", version = "0.2.0" }
+    kornia-tensor = { git = "https://github.com/kornia/kornia-rs", rev = "11b4951719d3b702b6ede25d082874fdd23d05c3", version = "0.2.0" }
 
 # Release binaries only (binary_release.yml). Kept out of `release` so local
 # benchmark builds stay fast and comparable with earlier runs.
