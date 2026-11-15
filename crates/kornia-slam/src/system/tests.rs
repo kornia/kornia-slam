@@ -85,6 +85,7 @@ impl Drop for SavedVocabulary {
 /// configuration can name it.
 fn saved_vocabulary(name: &str) -> SavedVocabulary {
     let features = OrbFrontend::new(mono().orb_detector(), &SensorRig::new(camera()))
+        .unwrap()
         .prepare_image(0, &textured(0))
         .unwrap()
         .features;
@@ -124,6 +125,16 @@ fn build_rejects_sensors_the_rig_lacks() {
         Err(BuildError::Config(ConfigError::MissingSensor(
             "stereo cameras"
         )))
+    ));
+}
+
+#[test]
+fn build_rejects_a_stereo_rig_without_a_positive_baseline() {
+    let stereo = config(CameraSelection::Stereo, false, LoopClosingMode::Disabled);
+    let rig = SensorRig::new(camera()).with_stereo_baseline(0.0);
+    assert!(matches!(
+        SlamSystem::build(stereo, rig),
+        Err(BuildError::StereoMatcher(_))
     ));
 }
 

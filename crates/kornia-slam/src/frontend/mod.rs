@@ -5,6 +5,10 @@ use std::time::{Duration, Instant};
 
 use kornia_3d::camera::{CameraModel, FisheyeCamera, PinholeCamera};
 use kornia_3d::pose::Pose3d;
+use kornia_3d::stereo::{
+    SadRefine, StereoDescriptors, StereoKeypoints, StereoMatchConfig, StereoMatchError,
+    StereoMatcher, StereoMatches, SubPixelFit,
+};
 use kornia_algebra::Vec2F64;
 use kornia_image::{Image, ImageError, ImageSize, InterpolationMode};
 use kornia_imgproc::features::{OrbDetector, OrbFeatures};
@@ -12,11 +16,19 @@ use kornia_imgproc::resize::resize_fast_mono;
 use kornia_sensors::SensorRig;
 
 use crate::Frame;
-use crate::stereo::{StereoMatchConfig, StereoMatches, compute_stereo_matches};
 
 /// Fisheye keypoints beyond this incidence angle are dropped: a pinhole cannot
 /// represent rays at or past 90°, and precision degrades well before that.
 const MAX_INCIDENCE_DEG: f64 = 88.0;
+
+/// Why a frame's features could not be prepared.
+#[derive(Debug, thiserror::Error)]
+pub enum FrontendError {
+    #[error("feature extraction failed: {0}")]
+    Extraction(#[from] ImageError),
+    #[error("stereo matching failed: {0}")]
+    StereoMatching(#[from] StereoMatchError),
+}
 
 /// The latest frame's frontend output, for overlays and timing.
 #[derive(Debug, Clone, Default)]
@@ -33,7 +45,7 @@ pub struct FrontendObservation {
 /// ORB extraction plus the rig-specific preparation tracking expects.
 pub(crate) struct OrbFrontend {
     detector: OrbDetector,
-    stereo: Option<StereoMatchConfig>,
+    stereo: Option<StereoMatcher>,
     fisheye: Option<FisheyeMapping>,
     observation: FrontendObservation,
 }
@@ -41,26 +53,22 @@ pub(crate) struct OrbFrontend {
 impl OrbFrontend {
     /// A rig with a stereo baseline enables matching against the right image;
     /// `rig` must already be restricted to the selected sensors.
-    pub(crate) fn new(detector: OrbDetector, rig: &SensorRig) -> Self {
-        let stereo = rig.stereo_baseline_m.map(|baseline| {
-            StereoMatchConfig::new(
-                baseline as f32,
-                rig.camera.fx as f32,
-                detector.downscale,
-                detector.n_scales,
-            )
-        });
+    pub(crate) fn new(detector: OrbDetector, rig: &SensorRig) -> Result<Self, StereoMatchError> {
+        let stereo = rig
+            .stereo_baseline_m
+            .map(|baseline| stereo_matcher(&detector, rig.camera.fx as f32, baseline as f32))
+            .transpose()?;
         let fisheye = rig.fisheye.clone().map(|fisheye| FisheyeMapping {
             fisheye,
             camera: rig.camera.clone(),
             min_bearing_z: MAX_INCIDENCE_DEG.to_radians().cos(),
         });
-        Self {
+        Ok(Self {
             detector,
             stereo,
             fisheye,
             observation: FrontendObservation::default(),
-        }
+        })
     }
 
     pub(crate) fn observation(&self) -> &FrontendObservation {
@@ -74,7 +82,7 @@ impl OrbFrontend {
         &mut self,
         idx: usize,
         image: &Image<u8, 1>,
-    ) -> Result<Frame, ImageError> {
+    ) -> Result<Frame, FrontendError> {
         let start = Instant::now();
         let features = self.detector.detect_and_extract_u8(image)?;
         Ok(self.finish_frame(idx, image, features, None, start))
@@ -88,22 +96,23 @@ impl OrbFrontend {
         idx: usize,
         left: &Image<u8, 1>,
         right: &Image<u8, 1>,
-    ) -> Result<Frame, ImageError> {
+    ) -> Result<Frame, FrontendError> {
         let start = Instant::now();
         let features = self.detector.detect_and_extract_u8(left)?;
-        let Some(config) = &self.stereo else {
+        let Some(matcher) = &self.stereo else {
             return Ok(self.finish_frame(idx, left, features, None, start));
         };
         let right_features = self.detector.detect_and_extract_u8(right)?;
         let left_pyramid = self.build_pyramid(left)?;
         let right_pyramid = self.build_pyramid(right)?;
-        let matches = compute_stereo_matches(
+        let mut matches = StereoMatches::default();
+        matcher.match_into(
             &left_pyramid,
             &right_pyramid,
-            &features,
-            &right_features,
-            config,
-        );
+            &stereo_keypoints(&features),
+            &stereo_keypoints(&right_features),
+            &mut matches,
+        )?;
         Ok(self.finish_frame(idx, left, features, Some(matches), start))
     }
 
@@ -116,7 +125,7 @@ impl OrbFrontend {
         start: Instant,
     ) -> Frame {
         let stereo_matched = stereo.as_ref().map(StereoMatches::num_matched);
-        let StereoMatches { u_right, depth } = stereo.unwrap_or_default();
+        let StereoMatches { u_right, depth, .. } = stereo.unwrap_or_default();
 
         self.observation.keypoints_xy.clear();
         self.observation
@@ -165,6 +174,36 @@ impl OrbFrontend {
             pyramid.push(dst);
         }
         Ok(pyramid)
+    }
+}
+
+/// ORB-SLAM3's `Frame::ComputeStereoMatches` settings for the detector's
+/// pyramid, with its parabola sub-pixel fit.
+fn stereo_matcher(
+    detector: &OrbDetector,
+    fx: f32,
+    baseline: f32,
+) -> Result<StereoMatcher, StereoMatchError> {
+    let mut config = StereoMatchConfig::new(fx, baseline);
+    config.scale_factor = detector.downscale;
+    config.n_levels = detector.n_scales;
+    config.sad = Some(SadRefine {
+        fit: SubPixelFit::Parabola,
+        // Plain SAD: centring (ORB-SLAM3) shifts EuRoC results and is not yet evaluated.
+        centred: false,
+        ..SadRefine::default()
+    });
+    StereoMatcher::new(config)
+}
+
+fn stereo_keypoints(features: &OrbFeatures) -> StereoKeypoints<'_> {
+    StereoKeypoints {
+        xy: &features.keypoints_xy,
+        octaves: Some(&features.octaves),
+        descriptors: StereoDescriptors::Binary {
+            data: features.descriptors.as_flattened(),
+            bytes: 32,
+        },
     }
 }
 

@@ -12,7 +12,6 @@ use crate::mapping::map::{
     LandmarkSeed, LandmarkTarget, Map, MapInsertion, ORB_SCALE_FACTOR, ObservationKey,
     ObservationLink,
 };
-use crate::stereo::unproject_stereo;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::{Pose3d, TriangulationConfig, triangulate_matched_points};
 use kornia_algebra::{Mat3F64, SO3F64, Vec2F64, Vec3F64};
@@ -37,7 +36,7 @@ pub fn stereo_seeds(
     mthdepth: f64,
     claimed: &[Option<usize>],
 ) -> Vec<LandmarkSeed> {
-    let cam_points = unproject_stereo(frame, camera);
+    let cam_points = frame.unproject_stereo(camera);
     if cam_points.is_empty() {
         return Vec::new();
     }
