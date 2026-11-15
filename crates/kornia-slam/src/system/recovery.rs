@@ -4,8 +4,12 @@
 use std::collections::VecDeque;
 
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::Vec3F64;
+use kornia_algebra::{Mat3F64, Vec3F64};
 use kornia_sensors::imu::ImuCalib;
+
+use crate::inertial::ImuWindowStats;
+use crate::inertial::initialization::rotation_from_to;
+use crate::pose_conversion::rigid;
 
 /// What survives a give-up of a metric, inertially initialized map.
 ///
@@ -33,6 +37,10 @@ pub struct RecoveryConfig {
     /// kept; a cold start needs 50. The LaMAria rig overlap gives a median
     /// 1-5 on lost frames.
     pub min_seed_points: usize,
+    /// Largest angle, degrees, between the mean measured specific force and
+    /// world up at a give-up before the seed is levelled: about 3 deg is
+    /// walking noise, and 10 deg leaks 1.7 m/s^2 into the coast.
+    pub max_tilt_deg: f64,
 }
 
 impl Default for RecoveryConfig {
@@ -44,6 +52,7 @@ impl Default for RecoveryConfig {
             bridge_covariance_scale: 100.0,
             max_bridge_sec: 10.0,
             min_seed_points: 50,
+            max_tilt_deg: 10.0,
         }
     }
 }
@@ -151,6 +160,99 @@ pub(crate) fn camera_centre(pose_world_to_cam: &Pose3d) -> Vec3F64 {
     pose_world_to_cam.inverse().translation
 }
 
+/// The attitude of `attitude` at the camera centre of `position`: a held
+/// re-seed keeps the gyro's attitude but not the coast's translation.
+pub(crate) fn held_at(attitude: &Pose3d, position: &Pose3d) -> Pose3d {
+    let rotation = attitude.rotation;
+    rigid(Pose3d::new(rotation, -(rotation * camera_centre(position))))
+}
+
+/// Seconds of specific force the tilt check averages: one sample is a
+/// footstep, 2 s of walking averages it out (VINS `initFirstIMUPose` averages
+/// its window too).
+const TILT_WINDOW_SEC: f64 = 2.0;
+
+/// The mean bias-corrected specific force over the last
+/// [`TILT_WINDOW_SEC`], rotated to the world frame by the attitude of each
+/// frame it was measured in. At rest it points up, against gravity; an
+/// attitude error shows as the angle between them.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TiltMonitor {
+    /// Per frame: stamp, world specific force summed over its samples, and
+    /// how many samples.
+    frames: VecDeque<(f64, Vec3F64, usize)>,
+}
+
+impl TiltMonitor {
+    /// Adds one frame's IMU window, measured in the body at `body_to_world`.
+    pub(crate) fn record(
+        &mut self,
+        timestamp_sec: f64,
+        stats: &ImuWindowStats,
+        accel_bias: Vec3F64,
+        body_to_world: &Mat3F64,
+    ) {
+        let force_world = *body_to_world * (stats.mean_accel - accel_bias);
+        self.frames.push_back((
+            timestamp_sec,
+            force_world * stats.samples as f64,
+            stats.samples,
+        ));
+        while self
+            .frames
+            .front()
+            .is_some_and(|&(t, _, _)| t < timestamp_sec - TILT_WINDOW_SEC)
+        {
+            self.frames.pop_front();
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.frames.clear();
+    }
+
+    /// The measured up direction over the window, or `None` when empty.
+    pub(crate) fn measured_up(&self) -> Option<Vec3F64> {
+        let (sum, n) = self
+            .frames
+            .iter()
+            .fold((Vec3F64::ZERO, 0usize), |(sum, n), &(_, f, k)| {
+                (sum + f, n + k)
+            });
+        (n > 0 && sum.length() > 0.0).then(|| sum.normalize())
+    }
+}
+
+/// Angle, degrees, between `measured_up` and world up (against
+/// `gravity_world`).
+pub(crate) fn tilt_deg(measured_up: Vec3F64, gravity_world: Vec3F64) -> f64 {
+    let up = -gravity_world.normalize();
+    measured_up
+        .normalize()
+        .dot(up)
+        .clamp(-1.0, 1.0)
+        .acos()
+        .to_degrees()
+}
+
+/// `pose_world_to_cam` turned so that `measured_up` becomes world up, about
+/// its own camera centre; the smallest such turn, so the heading stays. A
+/// re-alignment of the whole world about the origin instead moves a far
+/// keyframe by metres.
+pub(crate) fn leveled(
+    pose_world_to_cam: &Pose3d,
+    measured_up: Vec3F64,
+    gravity_world: Vec3F64,
+) -> Pose3d {
+    let correction = rotation_from_to(measured_up, -gravity_world).matrix();
+    let cam_to_world = pose_world_to_cam.inverse();
+    let rotation = (correction * cam_to_world.rotation).transpose();
+    rigid(Pose3d::new(
+        rotation,
+        -(rotation * cam_to_world.translation),
+    ))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -230,6 +332,112 @@ pub(crate) mod tests {
         detector.record(0.0, Vec3F64::new(-1e6, 0.0, 0.0));
         walk(&mut detector, 1.0, 20.0, 1.0);
         assert!(!detector.runaway(), "the jump at t=0 left the window");
+    }
+
+    /// World gravity as the inertial initialization leaves it: along +Y.
+    fn gravity() -> Vec3F64 {
+        Vec3F64::new(0.0, 9.81, 0.0)
+    }
+
+    /// A second of samples reading the specific force `accel` in the body.
+    fn still_window(accel: Vec3F64) -> ImuWindowStats {
+        let samples: Vec<ImuMeasurement> = (0..=200)
+            .map(|i| ImuMeasurement {
+                timestamp: i as f64 * 0.005,
+                gyro: Vec3F64::ZERO,
+                accel,
+            })
+            .collect();
+        ImuWindowStats::from_samples(&samples).unwrap()
+    }
+
+    fn rotation(axis_angle: Vec3F64) -> Mat3F64 {
+        kornia_algebra::SO3F64::exp(axis_angle).matrix()
+    }
+
+    #[test]
+    fn a_level_still_window_reads_no_tilt_and_a_tilted_attitude_reads_its_angle() {
+        // At rest the body measures the negative of gravity.
+        let window = still_window(-gravity());
+        let mut level = TiltMonitor::default();
+        level.record(1.0, &window, Vec3F64::ZERO, &Mat3F64::IDENTITY);
+        let tilt = tilt_deg(level.measured_up().unwrap(), gravity());
+        assert!(tilt < 1e-6, "{tilt}");
+
+        let mut tilted = TiltMonitor::default();
+        let attitude = rotation(Vec3F64::new(0.0, 0.0, 15f64.to_radians()));
+        tilted.record(1.0, &window, Vec3F64::ZERO, &attitude);
+        let tilt = tilt_deg(tilted.measured_up().unwrap(), gravity());
+        assert!((tilt - 15.0).abs() < 0.5, "{tilt}");
+    }
+
+    #[test]
+    fn the_tilt_check_subtracts_the_accel_bias_and_forgets_old_frames() {
+        let bias = Vec3F64::new(0.3, 0.0, 0.0);
+        let mut monitor = TiltMonitor::default();
+        monitor.record(
+            1.0,
+            &still_window(-gravity() + bias),
+            bias,
+            &Mat3F64::IDENTITY,
+        );
+        assert!(tilt_deg(monitor.measured_up().unwrap(), gravity()) < 1e-6);
+
+        let attitude = rotation(Vec3F64::new(30f64.to_radians(), 0.0, 0.0));
+        monitor.record(10.0, &still_window(-gravity()), Vec3F64::ZERO, &attitude);
+        let tilt = tilt_deg(monitor.measured_up().unwrap(), gravity());
+        assert!(
+            (tilt - 30.0).abs() < 1e-6,
+            "the frame at 1 s left the window: {tilt}"
+        );
+        monitor.clear();
+        assert!(monitor.measured_up().is_none());
+    }
+
+    /// Heading of a camera-to-world rotation: the azimuth of its optical
+    /// axis in the plane normal to gravity (+Y), degrees.
+    fn heading_deg(cam_to_world: &Mat3F64) -> f64 {
+        let forward = *cam_to_world * Vec3F64::new(0.0, 0.0, 1.0);
+        forward.x.atan2(forward.z).to_degrees()
+    }
+
+    #[test]
+    fn leveled_removes_the_tilt_about_the_camera_centre_and_keeps_the_heading() {
+        let truth_cam_to_world = rotation(Vec3F64::new(0.0, 40f64.to_radians(), 0.0));
+        // 15 deg of attitude error about a horizontal axis between x and z.
+        let axis = Vec3F64::new(1.0, 0.0, 1.0).normalize();
+        let error = rotation(axis * 15f64.to_radians());
+        let estimate_cam_to_world = error * truth_cam_to_world;
+        let centre = Vec3F64::new(120.0, -3.0, 85.0);
+        let pose = Pose3d::new(
+            estimate_cam_to_world.transpose(),
+            -(estimate_cam_to_world.transpose() * centre),
+        );
+        // What the tilt check measures through the erroneous attitude.
+        let measured_up = error * (-gravity()).normalize();
+        assert!((tilt_deg(measured_up, gravity()) - 15.0).abs() < 1e-6);
+
+        let level = leveled(&pose, measured_up, gravity());
+
+        let level_cam_to_world = level.inverse().rotation;
+        let up_after = level_cam_to_world * (truth_cam_to_world.transpose() * (-gravity()));
+        let tilt = tilt_deg(up_after, gravity());
+        assert!(tilt < 0.5, "{tilt}");
+        assert!((camera_centre(&level) - centre).length() < 1e-9);
+        let heading = heading_deg(&level_cam_to_world) - heading_deg(&truth_cam_to_world);
+        assert!(heading.abs() < 1.0, "{heading}");
+    }
+
+    #[test]
+    fn a_held_pose_takes_one_attitude_and_the_other_position() {
+        let attitude = Pose3d::new(
+            rotation(Vec3F64::new(0.1, 0.4, -0.2)),
+            Vec3F64::new(5.0, 6.0, 7.0),
+        );
+        let position = centred_at(3.0);
+        let held = held_at(&attitude, &position);
+        assert_eq!(held.rotation, rigid(attitude).rotation);
+        assert!((camera_centre(&held) - Vec3F64::new(3.0, 0.0, 0.0)).length() < 1e-12);
     }
 
     #[test]

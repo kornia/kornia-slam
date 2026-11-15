@@ -81,7 +81,7 @@ fn predict_pose_imu(
     (rigid(pred_cam_to_world.inverse()), v_j)
 }
 
-fn body_to_world(pose_w2c: &Pose3d, camera_to_body: Option<Pose3d>) -> Pose3d {
+pub(crate) fn body_to_world(pose_w2c: &Pose3d, camera_to_body: Option<Pose3d>) -> Pose3d {
     let cam_to_world = pose_w2c.inverse();
     match &camera_to_body {
         Some(t_bc) => cam_to_world.compose(&t_bc.inverse()),

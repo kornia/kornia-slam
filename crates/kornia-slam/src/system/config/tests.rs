@@ -238,6 +238,16 @@ fn invalid_setting(config: &SystemConfig) -> Option<String> {
 }
 
 #[test]
+fn the_reseed_tilt_limit_must_be_positive() {
+    let mut config = SystemConfig::default();
+    orb_mut(&mut config).tracking_loss.reseed.max_tilt_deg = 0.0;
+    assert_eq!(
+        invalid_setting(&config).as_deref(),
+        Some("tracking_loss.reseed.max_tilt_deg")
+    );
+}
+
+#[test]
 fn settings_are_range_checked() {
     let mut config = SystemConfig::default();
     let orb = orb_mut(&mut config);
@@ -1039,6 +1049,30 @@ mod ron_files {
                 .tracking_loss
                 .reseed
                 .keep_inertial
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+    }
+
+    #[test]
+    fn the_reseed_defaults_are_todays_behaviour_and_round_trip() {
+        let defaults = crate::system::RecoveryConfig::default();
+        assert!(!defaults.keep_inertial);
+        assert_eq!(defaults.min_seed_points, 50);
+        assert_eq!(defaults.max_tilt_deg, 10.0);
+        assert_eq!(defaults.max_coast_speed_mps, 4.0);
+        assert_eq!(defaults.runaway_window_sec, 10.0);
+        assert_eq!(defaults.max_bridge_sec, 10.0);
+        assert_eq!(defaults.bridge_covariance_scale, 100.0);
+
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((tracking_loss: (reseed: (keep_inertial: true, min_seed_points: 10, max_tilt_deg: 7.5)))))",
+        )
+        .unwrap();
+        let reseed = orb(&config).tracking_loss.reseed;
+        assert_eq!(reseed.max_tilt_deg, 7.5);
+        assert_eq!(
+            orb(&parse(&ron(&config)).unwrap()).tracking_loss.reseed,
+            reseed
         );
     }
 }

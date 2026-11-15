@@ -42,7 +42,7 @@ use crate::tracking::{
 
 use crate::tracking::TrackingTimings;
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
-use crate::tracking::motion::{InertialPrediction, predict_pose};
+use crate::tracking::motion::{InertialPrediction, body_to_world, predict_pose};
 use crate::tracking::optical_flow::FlowSurvivor;
 use crate::tracking::pose_estimation::Estimate;
 use crate::tracking::tracker::{FlowGuess, FrameInput, Tracker};
@@ -67,6 +67,7 @@ use crate::mapping::bundle_adjustment::LocalBaParams;
 use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
 use crate::mapping::map::{
     InertialAlignmentError, Keyframe, Map, MapInsertion, MapMutationError, MapPoint,
+    StateEnvelopeLimits,
 };
 use crate::mapping::{KeyframeJob, LocalMapping};
 use crate::pose_conversion::{RIGID_TOLERANCE, apply_reference_pose_correction, rotation_defect};
@@ -76,7 +77,7 @@ use kornia_algebra::Vec3F64;
 use kornia_image::Image;
 use kornia_sensors::SensorRig;
 use kornia_sensors::imu::ImuMeasurement;
-use recovery::{BridgeAnchor, RunawayDetector};
+use recovery::{BridgeAnchor, RunawayDetector, TiltMonitor};
 
 /// The images of one capture, kept until its features are extracted.
 #[derive(Clone, Copy)]
@@ -149,6 +150,13 @@ pub struct SlamSystem {
     tracking_loss_recovery: TrackingLossRecoveryPolicy,
     recovery: RecoveryConfig,
     runaway: RunawayDetector,
+    tilt: TiltMonitor,
+    /// The current re-seed holds its translation at the last tracked
+    /// position; the attitude still follows the gyro.
+    reseed_held: bool,
+    /// Start of the current re-seed's IMU-only stretch: the bridge anchor, or
+    /// the give-up when there is none.
+    reseed_coast_from_sec: f64,
     // mThDepth (metres): back-project close stereo points at each keyframe when set
     stereo_close_depth: Option<f64>,
     debug: bool,
@@ -224,6 +232,9 @@ impl SlamSystem {
                 settings.recovery.runaway_window_sec,
                 settings.recovery.max_coast_speed_mps,
             ),
+            tilt: TiltMonitor::default(),
+            reseed_held: false,
+            reseed_coast_from_sec: 0.0,
             stereo_close_depth: settings.stereo_close_depth_m,
             debug: false,
             debug_messages: Vec::new(),
@@ -811,10 +822,15 @@ impl SlamSystem {
         // metric map from a single keyframe (ORB-SLAM3's StereoInitialization)
         // instead of waiting for two-view parallax.
         let result = if curr_frame.is_metric() {
-            if self.state.reseeding() {
+            let reseeding = self.state.reseeding();
+            if reseeding {
                 self.coast_while_reseeding(curr_frame.idx, timestamp_sec);
             }
-            self.bootstrap_stereo(curr_frame, timestamp_sec)
+            let result = self.bootstrap_stereo(curr_frame, timestamp_sec);
+            if reseeding && result.status == TrackingStatus::Skipped {
+                self.counters.reseed_stall_frames += 1;
+            }
+            result
         } else {
             self.bootstrap_mono(curr_frame, timestamp_sec)
         };
@@ -825,26 +841,55 @@ impl SlamSystem {
     }
 
     /// Carries the pose over a frame of a stalled re-seed on the kept inertial
-    /// state, so the segment starts where the camera is; a runaway holds it
-    /// at rest instead, and drops the bridge.
+    /// state, so the segment starts where the camera is. A runaway, or a
+    /// stall past `max_bridge_sec`, holds the translation at rest instead and
+    /// drops the bridge; the attitude keeps following the gyro either way.
     fn coast_while_reseeding(&mut self, frame_idx: usize, timestamp_sec: f64) {
         let pose_before = self.state.pose_world_to_cam;
         let prev_timestamp = self.state.last_frame_timestamp_sec;
         let (coasted, _) = self.predict_frame_pose(pose_before, prev_timestamp, timestamp_sec);
+        self.record_tilt(&coasted, prev_timestamp, timestamp_sec);
         self.state.last_frame_timestamp_sec = timestamp_sec;
-        self.runaway
-            .record(timestamp_sec, recovery::camera_centre(&coasted));
-        if !self.runaway.runaway() {
-            self.state.pose_world_to_cam = coasted;
+        if !self.reseed_held {
+            self.runaway
+                .record(timestamp_sec, recovery::camera_centre(&coasted));
+            let starved = timestamp_sec - self.reseed_coast_from_sec > self.recovery.max_bridge_sec;
+            if !self.runaway.runaway() && !starved {
+                self.state.pose_world_to_cam = coasted;
+                return;
+            }
+            self.dbg(if starved {
+                format!(
+                    "[recover] frame={frame_idx} re-seed starved past {:.1}s: translation held",
+                    self.recovery.max_bridge_sec
+                )
+            } else {
+                format!(
+                    "[recover] frame={frame_idx} runaway at {:.1} m/s while re-seeding: held at rest",
+                    self.runaway.speed_mps().unwrap_or(f64::NAN)
+                )
+            });
+            self.runaway.clear();
+            self.reseed_held = true;
+            self.counters.reseeds_held += 1;
+            self.state.bridge_anchor = None;
+        }
+        self.state.velocity_world = Vec3F64::ZERO;
+        self.state.pose_world_to_cam = recovery::held_at(&coasted, &pose_before);
+    }
+
+    /// Adds the IMU window `[t0, t1]` of a frame at `pose_world_to_cam` to the
+    /// tilt check; only while the inertial state may be kept.
+    fn record_tilt(&mut self, pose_world_to_cam: &Pose3d, t0: f64, t1: f64) {
+        if !(self.recovery.keep_inertial && self.state.imu_initialized && t0 > 0.0) {
             return;
         }
-        self.dbg(format!(
-            "[recover] frame={frame_idx} runaway at {:.1} m/s while re-seeding: held at rest",
-            self.runaway.speed_mps().unwrap_or(f64::NAN)
-        ));
-        self.runaway.clear();
-        self.state.velocity_world = Vec3F64::ZERO;
-        self.state.bridge_anchor = None;
+        let Some(stats) = self.inertial.window_stats(t0, t1) else {
+            return;
+        };
+        let body = body_to_world(pose_world_to_cam, self.rig.camera_to_body());
+        self.tilt
+            .record(t1, &stats, self.inertial.bias.accel, &body.rotation);
     }
 
     /// Single-frame metric initialization from stereo depth.
@@ -1515,6 +1560,8 @@ impl SlamSystem {
                 timestamp_sec,
                 recovery::camera_centre(&self.state.pose_world_to_cam),
             );
+            let pose = self.state.pose_world_to_cam;
+            self.record_tilt(&pose, prev_timestamp, timestamp_sec);
         }
         if status == TrackingStatus::Skipped {
             let policy = &self.tracking_loss_recovery;
@@ -1733,8 +1780,10 @@ impl SlamSystem {
     /// map keeps its inertial state, and the next segment starts at the coasted
     /// pose when the coast `lost_for_sec` long is plausible (by its average and
     /// over the runaway window), with an IMU bridge from the last keyframe;
-    /// otherwise at the last tracked pose, at rest. Returns whether the
-    /// inertial state was kept.
+    /// otherwise at the last tracked position, at rest. Either way the seed
+    /// takes the gyro's attitude, levelled when the measured specific force
+    /// is tilted past `max_tilt_deg`. Returns whether the inertial state was
+    /// kept.
     fn give_up(&mut self, frame: &Frame, lost_for_sec: f64) -> bool {
         let keep = self.recovery.keep_inertial && self.state.imu_initialized && frame.is_metric();
         if !keep {
@@ -1742,6 +1791,7 @@ impl SlamSystem {
             self.state.reset_after_loss();
             return false;
         }
+        let give_up_sec = self.state.lost_since_sec.unwrap_or(0.0) + lost_for_sec;
         let coasted = self.state.pose_world_to_cam;
         let before = self.state.pose_before_loss.unwrap_or(coasted);
         let plausible = !self.runaway.runaway()
@@ -1754,7 +1804,9 @@ impl SlamSystem {
         if !plausible {
             self.runaway.clear();
         }
-        let (seed, velocity_world, anchor) = if plausible {
+        // The attitude is the gyro's in both cases: only the translation of
+        // an implausible coast is untrusted.
+        let (mut seed, mut velocity_world, mut anchor) = if plausible {
             let anchor = self
                 .state
                 .last_keyframe_idx
@@ -1765,16 +1817,53 @@ impl SlamSystem {
                 });
             (coasted, self.state.velocity_world, anchor)
         } else {
-            (before, Vec3F64::ZERO, None)
+            (recovery::held_at(&coasted, &before), Vec3F64::ZERO, None)
         };
+        let gravity_world = self.inertial.gravity_world;
+        let measured_up = self.tilt.measured_up();
+        let tilt = measured_up.map_or(f64::NAN, |up| recovery::tilt_deg(up, gravity_world));
+        let relevel = tilt > self.recovery.max_tilt_deg;
+        if let Some(up) = measured_up.filter(|_| relevel) {
+            seed = recovery::leveled(&seed, up, gravity_world);
+            velocity_world = Vec3F64::ZERO;
+            anchor = None;
+            self.tilt.clear();
+            self.counters.tilt_relevels += 1;
+        }
+        let limits = StateEnvelopeLimits::default();
+        let bias = &mut self.inertial.bias;
+        let mut bias_reset = Vec::new();
+        if bias.accel.length() > limits.max_accel_bias {
+            bias_reset.push(format!("ba={:.3}", bias.accel.length()));
+            bias.accel = Vec3F64::ZERO;
+        }
+        if bias.gyro.length() > limits.max_gyro_bias {
+            bias_reset.push(format!("bg={:.3}", bias.gyro.length()));
+            bias.gyro = Vec3F64::ZERO;
+        }
+        self.counters.bias_resets += bias_reset.len() as u64;
         let travelled =
             (recovery::camera_centre(&coasted) - recovery::camera_centre(&before)).length();
         self.dbg(format!(
-            "[recover] frame={} inertial state kept; seed at the {} pose (coast {travelled:.2} m in {lost_for_sec:.2} s), bridge from {:?}",
+            "[recover] frame={} inertial state kept; seed at the {} pose (coast {travelled:.2} m in {lost_for_sec:.2} s), bridge from {:?} tilt={tilt:.1}{}{}",
             frame.idx,
             if plausible { "coasted" } else { "last tracked" },
             anchor.map(|anchor| anchor.kf_idx),
+            if relevel { " levelled" } else { "" },
+            if bias_reset.is_empty() {
+                String::new()
+            } else {
+                format!(" bias reset {}", bias_reset.join(" "))
+            },
         ));
+        self.counters.reseeds += 1;
+        self.reseed_held = !plausible;
+        if self.reseed_held {
+            self.counters.reseeds_held += 1;
+        }
+        self.reseed_coast_from_sec = anchor.map_or(give_up_sec, |anchor| anchor.timestamp_sec);
+        // No refinement re-aligns the world after a re-seed.
+        self.inertial.schedule.close();
         self.state
             .reset_after_loss_keeping_inertial(seed, velocity_world, anchor);
         true

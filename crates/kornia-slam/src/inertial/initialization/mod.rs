@@ -22,7 +22,7 @@ use crate::mapping::map::{
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Rotation that takes unit vector `from` to unit vector `to`.
-fn rotation_from_to(from: Vec3F64, to: Vec3F64) -> SO3F64 {
+pub(crate) fn rotation_from_to(from: Vec3F64, to: Vec3F64) -> SO3F64 {
     let from = from.normalize();
     let to = to.normalize();
     let dot = from.dot(to).clamp(-1.0, 1.0);

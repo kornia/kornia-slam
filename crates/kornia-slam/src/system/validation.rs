@@ -113,7 +113,8 @@ fn validate_recovery(recovery: &RecoveryConfig) -> Result<(), ConfigError> {
         at("min_seed_points"),
         recovery.min_seed_points as f64,
         AT_LEAST_ONE,
-    )
+    )?;
+    check(at("max_tilt_deg"), recovery.max_tilt_deg, POSITIVE)
 }
 
 fn validate_tuning(tuning: &OrbTuning, loop_closing: bool) -> Result<(), ConfigError> {

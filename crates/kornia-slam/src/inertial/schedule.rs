@@ -86,6 +86,13 @@ impl InertialInitSchedule {
         }
     }
 
+    /// Spends both refinements: after a give-up that kept the inertial state,
+    /// a refinement would re-align the whole world about the origin again.
+    pub(crate) fn close(&mut self) {
+        self.viba1_done = true;
+        self.viba2_done = true;
+    }
+
     /// Marks a refinement as spent, whether or not its solve was accepted.
     pub(crate) fn complete(&mut self, refinement: Refinement) {
         match refinement {
@@ -145,6 +152,17 @@ mod tests {
 
         assert_eq!(mono, 1e10);
         assert_eq!(stereo, 1e5);
+    }
+
+    #[test]
+    fn a_closed_schedule_runs_no_refinement() {
+        let mut schedule = InertialInitSchedule::default();
+        schedule.start(7, 100.0);
+        assert_eq!(schedule.due_refinement(105.1), Some(Refinement::Viba1));
+        schedule.close();
+        for t in [105.1, 115.1, 120.0, 149.0] {
+            assert_eq!(schedule.due_refinement(t), None, "t={t}");
+        }
     }
 
     /// VIBA1 waits for 5 s of window and VIBA2 for 15 s after VIBA1; each

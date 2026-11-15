@@ -116,6 +116,16 @@ impl InertialState {
         (pre, samples)
     }
 
+    /// Mean and spread of the buffered samples in the inclusive window
+    /// `[t0, t1]`, or `None` for fewer than two.
+    pub(crate) fn window_stats(&self, t0: f64, t1: f64) -> Option<ImuWindowStats> {
+        ImuWindowStats::from_samples(
+            self.pending_samples
+                .iter()
+                .filter(|m| m.timestamp >= t0 && m.timestamp <= t1),
+        )
+    }
+
     /// The IMU edge between two keyframes, carrying its raw samples for later
     /// repropagation, or `None` when the window holds no time.
     pub(crate) fn keyframe_edge(

@@ -886,4 +886,149 @@ mod recovery_after_loss {
         assert!(!system.keyframe_due_while_lost(15.0 + interval / 2.0));
         assert!(system.keyframe_due_while_lost(15.0 + interval * 1.01));
     }
+    /// World-to-camera pose with camera-to-world rotation `exp(axis_angle)`
+    /// and centre `centre`.
+    fn turned_at(axis_angle: Vec3F64, centre: Vec3F64) -> Pose3d {
+        let cam_to_world = kornia_algebra::SO3F64::exp(axis_angle).matrix();
+        Pose3d::new(
+            cam_to_world.transpose(),
+            -(cam_to_world.transpose() * centre),
+        )
+    }
+
+    #[test]
+    fn an_implausible_coast_seeds_the_last_tracked_position_with_the_propagated_attitude() {
+        let mut system = lost_metric_system(1.0);
+        let coasted = turned_at(Vec3F64::new(0.0, 0.7, 0.1), Vec3F64::new(300.0, 0.0, 0.0));
+        system.state.pose_world_to_cam = coasted;
+
+        assert!(system.give_up(&stereo_frame(140), 5.0));
+
+        let seed = system.state.pose_world_to_cam;
+        assert!((recovery::camera_centre(&seed) - Vec3F64::new(1.0, 0.0, 0.0)).length() < 1e-9);
+        assert!(rotation_defect(&seed.rotation) < 1e-9);
+        let turn = (seed.rotation - coasted.rotation).to_cols_array();
+        assert!(turn.iter().all(|d| d.abs() < 1e-12), "{turn:?}");
+        assert_eq!(system.state.velocity_world, Vec3F64::ZERO);
+        assert_eq!(system.state.bridge_anchor, None);
+        assert_eq!(
+            (system.counters.reseeds, system.counters.reseeds_held),
+            (1, 1)
+        );
+    }
+
+    /// A re-seeding system whose buffered samples turn at `gyro` rad/s, held
+    /// by a runaway at its first stalled frame.
+    fn held_reseeding_system(gyro: Vec3F64) -> SlamSystem {
+        let mut system = lost_metric_system(7.0);
+        system.give_up(&stereo_frame(140), 5.0);
+        system.state.last_frame_timestamp_sec = 15.0;
+        system.inertial.latest_image_timestamp_sec = Some(15.0);
+        let samples: Vec<ImuMeasurement> = (0..=400)
+            .map(|i| ImuMeasurement {
+                timestamp: 15.0 + i as f64 * 0.005,
+                gyro,
+                accel: Vec3F64::new(0.0, 0.0, 9.81),
+            })
+            .collect();
+        system.process_imu(&samples);
+        system.runaway.record(14.0, Vec3F64::new(-100.0, 0.0, 0.0));
+        system
+    }
+
+    #[test]
+    fn a_held_reseed_keeps_integrating_the_attitude() {
+        let mut system = held_reseeding_system(Vec3F64::new(0.0, 0.5, 0.0));
+
+        system.coast_while_reseeding(141, 15.1);
+        system.coast_while_reseeding(142, 15.5);
+
+        let pose = system.state.pose_world_to_cam;
+        let centre = recovery::camera_centre(&pose);
+        assert!(
+            (centre - Vec3F64::new(7.0, 0.0, 0.0)).length() < 1e-9,
+            "{centre:?}"
+        );
+        assert_eq!(system.state.velocity_world, Vec3F64::ZERO);
+        // 0.5 rad/s over 0.5 s about the body (and camera) y axis.
+        let turned = kornia_algebra::SO3F64::from_matrix(&pose.rotation.transpose())
+            .log()
+            .length();
+        assert!((turned - 0.25).abs() < 1e-3, "{turned}");
+        assert_eq!(system.counters.reseeds_held, 1, "counted once per re-seed");
+    }
+
+    #[test]
+    fn a_reseed_starved_past_the_bridge_holds_its_translation() {
+        let mut system = reseeding_system();
+        system.coast_while_reseeding(141, 15.05);
+        assert!(!system.reseed_held);
+        system.state.last_frame_timestamp_sec = 20.05;
+        system.inertial.latest_image_timestamp_sec = Some(20.1);
+        system.coast_while_reseeding(242, 20.1);
+        assert!(system.reseed_held, "the bridge from t = 10 s outgrew 10 s");
+        assert_eq!(system.state.bridge_anchor, None);
+        assert_eq!(system.state.velocity_world, Vec3F64::ZERO);
+    }
+
+    #[test]
+    fn a_tilted_seed_is_levelled_about_its_centre_at_rest_without_a_bridge() {
+        let mut system = lost_metric_system(7.0);
+        let gravity = system.inertial.gravity_world;
+        let samples: Vec<ImuMeasurement> = (0..=200)
+            .map(|i| ImuMeasurement {
+                timestamp: 13.0 + i as f64 * 0.01,
+                gyro: Vec3F64::ZERO,
+                accel: -gravity,
+            })
+            .collect();
+        let stats = crate::inertial::ImuWindowStats::from_samples(&samples).unwrap();
+        // The body reads level, but the kept attitude is 20 deg off.
+        let tilted = kornia_algebra::SO3F64::exp(Vec3F64::new(20f64.to_radians(), 0.0, 0.0));
+        system
+            .tilt
+            .record(15.0, &stats, Vec3F64::ZERO, &tilted.matrix());
+
+        assert!(system.give_up(&stereo_frame(140), 5.0));
+
+        let seed = system.state.pose_world_to_cam;
+        assert!((recovery::camera_centre(&seed) - Vec3F64::new(7.0, 0.0, 0.0)).length() < 1e-9);
+        let turned = kornia_algebra::SO3F64::from_matrix(&seed.rotation)
+            .log()
+            .length();
+        assert!((turned - 20f64.to_radians()).abs() < 1e-6, "{turned}");
+        assert_eq!(system.state.velocity_world, Vec3F64::ZERO);
+        assert_eq!(system.state.bridge_anchor, None);
+        assert_eq!(system.counters.tilt_relevels, 1);
+    }
+
+    #[test]
+    fn a_bias_outside_the_envelope_is_zeroed_at_a_reseed() {
+        let mut system = lost_metric_system(7.0);
+        system.inertial.bias.accel = Vec3F64::new(0.8, 0.0, 0.0);
+        system.inertial.bias.gyro = Vec3F64::new(0.01, 0.0, 0.0);
+
+        system.give_up(&stereo_frame(140), 5.0);
+
+        assert_eq!(system.inertial.bias.accel, Vec3F64::ZERO);
+        assert_eq!(system.inertial.bias.gyro, Vec3F64::new(0.01, 0.0, 0.0));
+        assert_eq!(system.counters.bias_resets, 1);
+    }
+
+    #[test]
+    fn a_kept_reseed_spends_the_refinements_of_the_first_map() {
+        let mut system = lost_metric_system(7.0);
+        system.inertial.schedule.start(0, 9.0);
+        assert!(system.inertial.schedule.due_refinement(14.5).is_some());
+
+        system.give_up(&stereo_frame(140), 5.0);
+
+        for t in [15.0, 25.0, 40.0] {
+            assert!(
+                system.inertial.schedule.due_refinement(t).is_none(),
+                "t={t}"
+            );
+        }
+        assert_eq!(system.counters.reseeds, 1);
+    }
 }

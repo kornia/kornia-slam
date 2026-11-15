@@ -51,6 +51,17 @@ pub struct RunCounters {
     pub nonrigid_poses: u64,
     /// Local BA keyframe corrections whose corrected rotation is off a rotation by more than 1e-6.
     pub nonrigid_keyframes: u64,
+    /// Give-ups that kept the inertial state and re-seeded in the same world.
+    pub reseeds: u64,
+    /// Of those, re-seeds whose translation was held at the last tracked
+    /// position: an implausible coast, a runaway, or a stall past the bridge.
+    pub reseeds_held: u64,
+    /// Re-seeds levelled because the measured specific force was tilted.
+    pub tilt_relevels: u64,
+    /// Bias components zeroed at a re-seed for leaving the state envelope.
+    pub bias_resets: u64,
+    /// Frames skipped while re-seeding with the inertial state kept.
+    pub reseed_stall_frames: u64,
 }
 
 impl RunCounters {
