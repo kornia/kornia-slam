@@ -8,6 +8,7 @@ pub mod optical_flow;
 pub(crate) mod parallax;
 mod policy;
 pub mod pose_estimation;
+pub mod pose_gate;
 pub mod relocalization;
 pub mod timings;
 pub(crate) mod tracker;

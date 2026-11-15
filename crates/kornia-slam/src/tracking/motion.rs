@@ -89,9 +89,29 @@ pub(crate) fn body_to_world(pose_w2c: &Pose3d, camera_to_body: Option<Pose3d>) -
     }
 }
 
+/// Camera centre in the world frame, for speed checks.
+pub(crate) fn camera_centre(pose_world_to_cam: &Pose3d) -> Vec3F64 {
+    pose_world_to_cam.inverse().translation
+}
+
+/// Whether moving the camera centre from `before` to `after` in `gap_sec`
+/// stays under `max_speed_mps` on average. A non-finite pose never does.
+pub(crate) fn coast_is_plausible(
+    before: &Pose3d,
+    after: &Pose3d,
+    gap_sec: f64,
+    max_speed_mps: f64,
+) -> bool {
+    let travelled = (after.inverse().translation - before.inverse().translation).length();
+    if !travelled.is_finite() {
+        return false;
+    }
+    gap_sec <= 0.0 || travelled / gap_sec <= max_speed_mps
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{InertialPrediction, predict_pose};
+    use super::{InertialPrediction, coast_is_plausible, predict_pose};
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::{SO3F64, Vec3F64};
     use kornia_sensors::imu::{ImuBias, ImuCalib, PreintegratedImu};
@@ -231,6 +251,28 @@ mod tests {
 
         assert_pose_close(pose, pose_before);
         assert_eq!(velocity, Some(Vec3F64::ZERO));
+    }
+
+    /// World-to-camera pose of a camera centred at `(x, 0, 0)`.
+    fn centred_at(x: f64) -> Pose3d {
+        let mut pose = Pose3d::IDENTITY;
+        pose.translation = Vec3F64::new(-x, 0.0, 0.0);
+        pose
+    }
+
+    #[test]
+    fn a_walking_coast_is_plausible_and_a_runaway_is_not() {
+        let before = centred_at(0.0);
+        assert!(coast_is_plausible(&before, &centred_at(7.0), 5.0, 4.0));
+        assert!(coast_is_plausible(&before, &centred_at(20.0), 5.0, 4.0));
+        assert!(!coast_is_plausible(&before, &centred_at(20.5), 5.0, 4.0));
+        assert!(!coast_is_plausible(&before, &centred_at(-8.1e57), 5.0, 4.0));
+        assert!(!coast_is_plausible(
+            &before,
+            &centred_at(f64::NAN),
+            5.0,
+            4.0
+        ));
     }
 
     /// Both models return a rotation even from a scaled `pose_before`.

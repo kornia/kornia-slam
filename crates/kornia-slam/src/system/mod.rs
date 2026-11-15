@@ -45,7 +45,8 @@ use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_point
 use crate::tracking::motion::{InertialPrediction, body_to_world, predict_pose};
 use crate::tracking::optical_flow::FlowSurvivor;
 use crate::tracking::pose_estimation::Estimate;
-use crate::tracking::tracker::{FlowGuess, FrameInput, Tracker};
+use crate::tracking::pose_gate::{GateReference, GateVerdict};
+use crate::tracking::tracker::{FlowGuess, FrameInput, GateReading, Tracker};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -115,6 +116,7 @@ struct Estimation {
     pose_before: Pose3d,
     lost_for_sec: f64,
     trusted_prediction: bool,
+    gate: Option<GateReference>,
 }
 
 /// What a new keyframe is to the map.
@@ -1368,6 +1370,23 @@ impl SlamSystem {
             .lost_since_sec
             .map_or(0.0, |t0| timestamp_sec - t0);
         let trusted_prediction = self.imu_confident(timestamp_sec);
+        // The outer prediction: a KeyframeDue flow pose shadows
+        // `candidate_pose` below and must not become the reference.
+        let gate = (trusted_prediction
+            && predicted_velocity.is_some()
+            && (self.debug || self.tracker.pose_gate().is_enabled()))
+        .then(|| {
+            let dt_sec = timestamp_sec - prev_timestamp;
+            GateReference {
+                prediction: candidate_pose,
+                dt_sec,
+                lost: self
+                    .state
+                    .pose_before_loss
+                    .filter(|_| self.state.lost_since_sec.is_some())
+                    .map(|before_loss| (before_loss, currently_lost_for + dt_sec)),
+            }
+        });
         if self.trace_enabled {
             let map = self.map.lock().unwrap();
             self.frame_trace = Some(FrameTrace::begin(
@@ -1411,6 +1430,7 @@ impl SlamSystem {
             pose_before,
             lost_for_sec: currently_lost_for,
             trusted_prediction,
+            gate,
         };
         let flow_only = match &source {
             FrameSource::Deferred(pending) => self.track_flow_only(
@@ -1439,6 +1459,7 @@ impl SlamSystem {
                         current_keyframe_idx: self.state.current_keyframe_idx,
                         lost_for_sec: currently_lost_for,
                         trusted_prediction,
+                        gate,
                     },
                     survivors,
                     &map,
@@ -1489,6 +1510,12 @@ impl SlamSystem {
                 (TrackingStatus::Skipped, Vec::new(), 0, Some(reason))
             }
         };
+        if self.debug
+            && let Some(gate) = &gate
+            && let Some(reading) = self.tracker.last_gap()
+        {
+            self.report_pose_gap(frame.idx, gate, &reading);
+        }
         if self.debug {
             let msg = match reject_reason {
                 Some(reason) => format!("[track] frame={} reject: {:?}", frame.idx, reason),
@@ -1623,6 +1650,31 @@ impl SlamSystem {
         Ok(self.frame_result(status))
     }
 
+    /// One `[predgap]` line: the accepted pose against the inertial prediction.
+    fn report_pose_gap(&mut self, idx: usize, gate: &GateReference, reading: &GateReading) {
+        let GateReading {
+            gap,
+            inliers,
+            matches,
+            verdict,
+        } = reading;
+        let verdict = match verdict {
+            None => "off",
+            Some(GateVerdict::Accepted) => "ok",
+            Some(GateVerdict::RotationGap) => "rot",
+            Some(GateVerdict::TranslationGap) => "trans",
+        };
+        let lost = match gap.recover_mps {
+            Some(speed) => format!("1 recover_mps={speed:.3}"),
+            None => "0".into(),
+        };
+        self.dbg(format!(
+            "[predgap] frame={idx} dt={:.4} rot={:.3} trans={:.4} step={:.4} step_rot={:.3} \
+             inl={inliers} m={matches} lost={lost} trusted=1 verdict={verdict}",
+            gate.dt_sec, gap.rot_deg, gap.trans_m, gap.step_m, gap.step_rot_deg,
+        ));
+    }
+
     /// Tracks a deferred frame from its flow survivors alone when they carry
     /// it and no keyframe is due; ORB then never runs for this frame.
     fn track_flow_only(
@@ -1653,6 +1705,7 @@ impl SlamSystem {
                 current_keyframe_idx: self.state.current_keyframe_idx,
                 lost_for_sec: estimation.lost_for_sec,
                 trusted_prediction: estimation.trusted_prediction,
+                gate: estimation.gate,
             },
             seeded,
             &map,

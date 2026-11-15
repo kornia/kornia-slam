@@ -24,6 +24,7 @@ use crate::tracking::pose_estimation::map_projection::{
     MapProjectionConfig, MapProjectionRejectReason,
 };
 use crate::tracking::pose_estimation::{Estimate, MapProjectionEstimator};
+use crate::tracking::pose_gate::{GateReference, GateVerdict, PoseGap, PoseGate};
 use crate::tracking::relocalization::{Relocalization, RelocalizationConfig, relocalize};
 use crate::tracking::timings::TrackingTimings;
 
@@ -40,6 +41,19 @@ pub(crate) struct FrameInput<'a> {
     /// Whether `candidate_pose` is an inertial prediction trustworthy enough
     /// to veto a weakly supported visual estimate.
     pub trusted_prediction: bool,
+    /// What an accepted pose is measured against; `None` without a trusted
+    /// inertial prediction.
+    pub gate: Option<GateReference>,
+}
+
+/// A tracked pose measured against its [`GateReference`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GateReading {
+    pub gap: PoseGap,
+    pub inliers: usize,
+    pub matches: usize,
+    /// `None` when the gate is disabled.
+    pub verdict: Option<GateVerdict>,
 }
 
 /// A predicted pose to start optical flow from, and the shallower search a
@@ -61,6 +75,8 @@ pub(crate) struct Tracker {
     // Optical-flow failures dropped to "no seeds" instead of failing the frame.
     klt_errors: u64,
     snap_errors: u64,
+    pose_gate: PoseGate,
+    last_gap: Option<GateReading>,
 }
 
 impl Tracker {
@@ -72,7 +88,18 @@ impl Tracker {
             track_set: TrackSet::new(),
             klt_errors: 0,
             snap_errors: 0,
+            pose_gate: PoseGate::Disabled,
+            last_gap: None,
         }
+    }
+
+    pub(crate) fn pose_gate(&self) -> &PoseGate {
+        &self.pose_gate
+    }
+
+    /// The measurement of the latest estimate that passed the inlier bar.
+    pub(crate) fn last_gap(&self) -> Option<GateReading> {
+        self.last_gap
     }
 
     /// Optical-flow tracking and keypoint-snap failures so far, in that order.
@@ -247,7 +274,7 @@ impl Tracker {
     /// filter and PnP, no projection search or refinement. The track set is
     /// left untouched; [`Self::accept_flow_only`] commits it.
     pub(crate) fn estimate_flow_only(
-        &self,
+        &mut self,
         input: FrameInput<'_>,
         seeded: Vec<(usize, usize)>,
         map: &Map,
@@ -267,10 +294,41 @@ impl Tracker {
             search_scale,
             seeded,
             timings,
-        )?;
+        );
+        self.last_gap = None;
+        estimate.and_then(|estimate| self.accept(&input, estimate))
+    }
+
+    /// Today's inlier bar, then the measurement against the gate reference.
+    fn accept(
+        &mut self,
+        input: &FrameInput<'_>,
+        estimate: Estimate,
+    ) -> Result<Estimate, MapProjectionRejectReason> {
+        // With a trusted inertial prediction the threshold drops to
+        // ORB-SLAM3's inertial value; a solution below it is too weakly
+        // supported to override the prediction and would teleport the pose.
         let min_inliers = self.estimator.config().min_inliers_with_prediction;
         if input.trusted_prediction && estimate.inliers < min_inliers {
+            debug_eprintln!(
+                "[proj] frame={} trusted_gate inliers={}",
+                input.frame.idx,
+                estimate.inliers
+            );
             return Err(MapProjectionRejectReason::LowPnpInliers);
+        }
+        if let Some(reference) = &input.gate {
+            let gap = PoseGap::measure(reference, &input.pose_before, &estimate.pose);
+            let verdict = self
+                .pose_gate
+                .is_enabled()
+                .then(|| self.pose_gate.judge(reference, &gap, &estimate.pose));
+            self.last_gap = Some(GateReading {
+                gap,
+                inliers: estimate.inliers,
+                matches: estimate.matches.len(),
+                verdict,
+            });
         }
         Ok(estimate)
     }
@@ -345,22 +403,8 @@ impl Tracker {
             timings,
         );
 
-        // With a trusted inertial prediction the threshold drops to
-        // ORB-SLAM3's inertial value; a solution below it is too weakly
-        // supported to override the prediction and would teleport the pose.
-        let min_inliers = self.estimator.config().min_inliers_with_prediction;
-        let result = result.and_then(|estimate| {
-            if input.trusted_prediction && estimate.inliers < min_inliers {
-                debug_eprintln!(
-                    "[proj] frame={} trusted_gate inliers={}",
-                    input.frame.idx,
-                    estimate.inliers
-                );
-                Err(MapProjectionRejectReason::LowPnpInliers)
-            } else {
-                Ok(estimate)
-            }
-        });
+        self.last_gap = None;
+        let result = result.and_then(|estimate| self.accept(&input, estimate));
 
         match result {
             Ok(estimate) => {

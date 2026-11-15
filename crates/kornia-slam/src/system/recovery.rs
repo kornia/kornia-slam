@@ -10,6 +10,7 @@ use kornia_sensors::imu::ImuCalib;
 use crate::inertial::ImuWindowStats;
 use crate::inertial::initialization::rotation_from_to;
 use crate::pose_conversion::rigid;
+pub(crate) use crate::tracking::motion::{camera_centre, coast_is_plausible};
 
 /// What survives a give-up of a metric, inertially initialized map.
 ///
@@ -62,21 +63,6 @@ impl Default for RecoveryConfig {
 pub(crate) struct BridgeAnchor {
     pub kf_idx: usize,
     pub timestamp_sec: f64,
-}
-
-/// Whether moving the camera centre from `before` to `after` in `gap_sec`
-/// stays under `max_speed_mps` on average. A non-finite pose never does.
-pub(crate) fn coast_is_plausible(
-    before: &Pose3d,
-    after: &Pose3d,
-    gap_sec: f64,
-    max_speed_mps: f64,
-) -> bool {
-    let travelled = (after.inverse().translation - before.inverse().translation).length();
-    if !travelled.is_finite() {
-        return false;
-    }
-    gap_sec <= 0.0 || travelled / gap_sec <= max_speed_mps
 }
 
 /// `noise` with every density scaled so the preintegrated covariance, and the
@@ -153,11 +139,6 @@ impl RunawayDetector {
         self.speed_mps()
             .is_some_and(|speed| speed > self.max_speed_mps)
     }
-}
-
-/// Camera centre in the world frame, for speed checks.
-pub(crate) fn camera_centre(pose_world_to_cam: &Pose3d) -> Vec3F64 {
-    pose_world_to_cam.inverse().translation
 }
 
 /// The attitude of `attitude` at the camera centre of `position`: a held
@@ -263,21 +244,6 @@ pub(crate) mod tests {
         let mut pose = Pose3d::IDENTITY;
         pose.translation = Vec3F64::new(-x, 0.0, 0.0);
         pose
-    }
-
-    #[test]
-    fn a_walking_coast_is_plausible_and_a_runaway_is_not() {
-        let before = centred_at(0.0);
-        assert!(coast_is_plausible(&before, &centred_at(7.0), 5.0, 4.0));
-        assert!(coast_is_plausible(&before, &centred_at(20.0), 5.0, 4.0));
-        assert!(!coast_is_plausible(&before, &centred_at(20.5), 5.0, 4.0));
-        assert!(!coast_is_plausible(&before, &centred_at(-8.1e57), 5.0, 4.0));
-        assert!(!coast_is_plausible(
-            &before,
-            &centred_at(f64::NAN),
-            5.0,
-            4.0
-        ));
     }
 
     /// `scaled == scale * base`, to rounding relative to the largest entry.
