@@ -1,0 +1,14 @@
+// LaMAria sequence converted to the EuRoC layout with scripts/lamaria_to_euroc.py:
+// monocular cam0 with the Aria IMU, joint pose-inertial tracking and a
+// 10-keyframe VI-BA (R_01_easy: 0.81 m ATE). Synchronous mapping replays identically.
+(
+    source: Euroc(( data: "../data/lamaria/R_01_easy" )),
+    system: (
+        version: 1,
+        sensors: ( cameras: Mono, imu: true ),
+        pipeline: OrbSlam((
+            tracking: ( joint_inertial: true ),
+            mapping: ( execution: Synchronous, local_ba_keyframes: 10 ),
+        )),
+    ),
+)

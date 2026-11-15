@@ -1,0 +1,10 @@
+// LaMAria sequence converted to the EuRoC layout with scripts/lamaria_to_euroc.py:
+// monocular cam0 only.
+(
+    source: Euroc(( data: "../data/lamaria/R_01_easy" )),
+    system: (
+        version: 1,
+        sensors: ( cameras: Mono, imu: false ),
+        pipeline: OrbSlam(( mapping: ( execution: Synchronous ) )),
+    ),
+)
