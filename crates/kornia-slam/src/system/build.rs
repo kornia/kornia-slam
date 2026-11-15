@@ -31,6 +31,7 @@ pub(crate) struct SystemSettings {
     pub keyframe_policy: KeyframePolicy,
     pub tracking_loss_recovery: TrackingLossRecoveryPolicy,
     pub local_mapping: LocalMappingMode,
+    pub joint_inertial_tracking: bool,
     /// Near/far depth threshold `mThDepth` (metres). When `Some`, each new
     /// keyframe back-projects its unassociated "close" (`z < threshold`) stereo
     /// keypoints directly into metric map points.
@@ -65,6 +66,7 @@ impl SystemConfig {
             keyframe_policy: orb.keyframes,
             tracking_loss_recovery: tuning.loss_recovery,
             local_mapping: orb.mapping.execution,
+            joint_inertial_tracking: orb.tracking.joint_inertial,
             stereo_close_depth_m: rig
                 .stereo_baseline_m
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),

@@ -16,7 +16,7 @@ pub use build::BuildError;
 pub use config::{
     CameraSelection, FrontendConfig, LoopClosingMode, MappingConfig, OrbFrontendConfig,
     OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection,
-    StereoCloseDepth, SystemConfig,
+    StereoCloseDepth, SystemConfig, TrackingConfig,
 };
 #[cfg(feature = "serde")]
 pub use file::LoadError;
@@ -32,8 +32,15 @@ use crate::tracking::{
 };
 
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
-use crate::tracking::motion::{InertialPrediction, predict_pose};
-use crate::tracking::tracker::{FrameInput, Tracker};
+use crate::tracking::motion::{AnchorOrigin, InertialAnchor, InertialPrediction, predict_pose};
+use crate::tracking::pose_estimation::Estimate;
+use crate::tracking::pose_estimation::map_projection::MapProjectionRejectReason;
+use crate::tracking::pose_estimation::pose_inertial::{
+    FrameNavState, NavPrior, PoseInertialProblem,
+};
+use crate::tracking::tracker::{
+    FrameInput, InertialAttempt, InertialEstimate, InertialInput, Tracker,
+};
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -60,6 +67,66 @@ use kornia_image::Image;
 use kornia_sensors::SensorRig;
 use kornia_sensors::imu::ImuMeasurement;
 
+/// What both tracking paths read about the frame being tracked.
+struct TrackingContext<'a> {
+    previous_image: Option<&'a Image<u8, 1>>,
+    current_image: &'a Image<u8, 1>,
+    timestamp_sec: f64,
+    /// Pose at the end of the previous frame.
+    pose_before: Pose3d,
+    /// How long tracking has been failing.
+    lost_for_sec: f64,
+}
+
+/// A tracking path's result: the pose its search started from, and the
+/// estimate or why there is none.
+struct FrameTracking {
+    candidate_pose: Pose3d,
+    outcome: Result<Estimate, MapProjectionRejectReason>,
+}
+
+/// One `--debug` line per inertial tracking attempt: which anchor, what each
+/// solve kept, how far the prediction and the solution moved, and the IMU
+/// edge's χ² at the solution.
+fn inertial_debug_line(
+    frame_idx: usize,
+    context: &TrackingContext<'_>,
+    anchor: &InertialAnchor<'_>,
+    predicted: &FrameNavState,
+    result: &Result<InertialEstimate, MapProjectionRejectReason>,
+    attempt: InertialAttempt,
+) -> String {
+    let centre = |pose: &Pose3d| pose.inverse().translation;
+    let anchor_kind = match anchor.origin {
+        AnchorOrigin::Keyframe(_) => "kf",
+        AnchorOrigin::PreviousFrame(_) => "prev",
+    };
+    let fallback = attempt.fallback.map_or_else(
+        || "-".to_string(),
+        |counts| format!("{}/{}", counts.inliers, counts.observations),
+    );
+    let predicted_step = (centre(&predicted.pose_cw) - centre(&context.pose_before)).length();
+    let head = format!(
+        "[inertial] frame={frame_idx} anchor={anchor_kind} dt={:.3} local={}/{} fallback={fallback} \
+         pred_step={predicted_step:.3} v_pred={:.3}",
+        anchor.preintegrated.dt,
+        attempt.local.inliers,
+        attempt.local.observations,
+        predicted.velocity.length(),
+    );
+    match result {
+        Ok(solved) => format!(
+            "{head} ok sol_vs_pred={:.3} v_sol={:.3} |ba|={:.4} |bg|={:.5} imu_chi2={:.1}",
+            (centre(&solved.state.pose_cw) - centre(&predicted.pose_cw)).length(),
+            solved.state.velocity.length(),
+            solved.state.bias.accel.length(),
+            solved.state.bias.gyro.length(),
+            solved.imu_chi2,
+        ),
+        Err(reason) => format!("{head} reject={reason:?}"),
+    }
+}
+
 /// Top-level ORB-SLAM system: orchestrates tracking, mapping, and state transitions.
 pub struct SlamSystem {
     rig: SensorRig,
@@ -69,6 +136,7 @@ pub struct SlamSystem {
     tracking_loss_recovery: TrackingLossRecoveryPolicy,
     // mThDepth (metres): back-project close stereo points at each keyframe when set
     stereo_close_depth: Option<f64>,
+    joint_inertial_tracking: bool,
     debug: bool,
     debug_messages: Vec<String>,
     map: Arc<Mutex<Map>>,
@@ -120,6 +188,7 @@ impl SlamSystem {
             keyframe_policy: settings.keyframe_policy,
             tracking_loss_recovery: settings.tracking_loss_recovery,
             stereo_close_depth: settings.stereo_close_depth_m,
+            joint_inertial_tracking: settings.joint_inertial_tracking,
             debug: false,
             debug_messages: Vec::new(),
             map,
@@ -357,6 +426,7 @@ impl SlamSystem {
             );
             self.state.velocity_world = correction.velocity_world;
             self.inertial.bias = correction.imu_bias;
+            self.state.inertial_prior = None;
         }
     }
 
@@ -782,93 +852,39 @@ impl SlamSystem {
         let image_size = frame.image_size;
         let pose_before = self.state.pose_world_to_cam;
         let prev_timestamp = self.state.last_frame_timestamp_sec;
-
-        // Local BA updates keyframe state asynchronously, so refresh cached IMU state.
-        if let Some(kf_idx) = self.state.current_keyframe_idx
-            && let Some(kf) = self.map.lock().unwrap().get_keyframe(kf_idx)
-        {
-            self.state.velocity_world = kf.velocity_world;
-            self.inertial.bias = kf.imu_bias;
-        }
-
-        // Preintegration is prepared here: the system owns bias and the sample
-        // buffer. The motion model chooses between it and the visual model.
-        let preintegrated = (self.state.imu_initialized && prev_timestamp > 0.0).then(|| {
-            self.inertial
-                .preintegrate_window(self.rig.imu_noise(), prev_timestamp, timestamp_sec)
-                .0
-        });
-        let (candidate_pose, predicted_velocity) = predict_pose(
-            pose_before,
-            self.state.velocity,
-            self.state.velocity_world,
-            preintegrated
-                .as_ref()
-                .map(|preintegrated| InertialPrediction {
-                    preintegrated,
-                    camera_to_body: self.rig.camera_to_body(),
-                    gravity_world: self.inertial.gravity_world,
-                }),
-        );
-        if let Some(velocity_world) = predicted_velocity {
-            self.state.velocity_world = velocity_world; // propagate for next frame
-        }
-
-        let currently_lost_for = self
+        let lost_for_sec = self
             .state
             .lost_since_sec
             .map_or(0.0, |t0| timestamp_sec - t0);
-        let result = {
-            let map = self.map.lock().unwrap();
-            self.tracker.estimate(
-                FrameInput {
-                    frame: &frame,
-                    previous_image,
-                    current_image,
-                    candidate_pose,
-                    pose_before,
-                    current_keyframe_idx: self.state.current_keyframe_idx,
-                    lost_for_sec: currently_lost_for,
-                    trusted_prediction: self.imu_confident(timestamp_sec),
-                },
-                &map,
-                &self.rig.camera,
-            )
+        let context = TrackingContext {
+            previous_image,
+            current_image,
+            timestamp_sec,
+            pose_before,
+            lost_for_sec,
         };
 
-        let (mut status, matches, tracked_inliers, reject_reason) = match result {
-            Ok(estimate) => {
-                self.state.pose_world_to_cam = estimate.pose;
-
-                // When IMU-initialized, velocity_world was already updated by IMU
-                // preintegration (predict_pose_imu → pred_vel) before PnP ran; don't
-                // overwrite it with a visual finite-difference, since at 30 fps the
-                // inter-frame displacement is noise-dominated during low-translation
-                // segments, which would collapse velocity to zero and permanently
-                // freeze the IMU pose prediction.
-                if !self.state.imu_initialized {
-                    self.state.velocity = Some(Pose3d::between(&pose_before, &estimate.pose));
-                }
-
-                (
-                    TrackingStatus::Tracked,
-                    estimate.matches,
-                    estimate.inliers,
-                    None,
-                )
-            }
-            Err(reason) => {
-                // Carry the predicted pose forward instead of freezing at
-                // pose_before. state.velocity_world was already advanced by
-                // predict_pose_imu above regardless of visual outcome, so
-                // anchoring the next frame's prediction on a stale position
-                // would desync position/rotation from velocity: every
-                // subsequent frame's candidate pose would drift further from
-                // reality, making the projection search miss again and
-                // compounding a single bad frame into a full tracking loss.
-                self.state.pose_world_to_cam = candidate_pose;
-                (TrackingStatus::Skipped, Vec::new(), 0, Some(reason))
-            }
+        // Taken out so the anchor can borrow it while tracking mutates the state.
+        let prior = self.state.inertial_prior.take();
+        let FrameTracking {
+            candidate_pose,
+            outcome,
+        } = match self
+            .joint_inertial_tracking
+            .then(|| self.inertial_anchor(prior.as_ref(), prev_timestamp, timestamp_sec))
+            .flatten()
+        {
+            Some(anchor) => self.track_inertial(&frame, &context, anchor),
+            None => self.track_visual(&frame, &context, prev_timestamp),
+        };
+        let (mut status, matches, tracked_inliers, reject_reason) = match outcome {
+            Ok(estimate) => (
+                TrackingStatus::Tracked,
+                estimate.matches,
+                estimate.inliers,
+                None,
+            ),
+            Err(reason) => (TrackingStatus::Skipped, Vec::new(), 0, Some(reason)),
         };
         if self.debug {
             let msg = match reject_reason {
@@ -963,6 +979,216 @@ impl SlamSystem {
             self.prune_imu_before(kf_ts.min(timestamp_sec));
         }
         self.frame_result(status)
+    }
+
+    /// Where this frame's IMU edge starts: the previous frame under the prior
+    /// its solve left, else the last keyframe at its bundle-adjusted state
+    /// (ORB-SLAM3 re-anchors there whenever local mapping changed the map).
+    /// `None` until the IMU is initialized.
+    fn inertial_anchor<'a>(
+        &self,
+        prior: Option<&'a NavPrior>,
+        prev_timestamp: f64,
+        timestamp_sec: f64,
+    ) -> Option<InertialAnchor<'a>> {
+        if !self.state.imu_initialized {
+            return None;
+        }
+        let noise = self.rig.imu_noise();
+        if let Some(prior) = prior
+            && prev_timestamp > 0.0
+        {
+            let preintegrated = self.inertial.preintegrate_at(
+                noise,
+                prior.mean.bias,
+                prev_timestamp,
+                timestamp_sec,
+            );
+            if preintegrated.dt > 0.0 {
+                return Some(InertialAnchor {
+                    origin: AnchorOrigin::PreviousFrame(prior),
+                    preintegrated,
+                });
+            }
+        }
+        let keyframe_idx = self.state.last_keyframe_idx?;
+        let keyframe_timestamp = self.inertial.last_keyframe_timestamp_sec?;
+        let keyframe = {
+            let map = self.map.lock().unwrap();
+            let keyframe = map.get_keyframe(keyframe_idx)?;
+            FrameNavState {
+                pose_cw: keyframe.frame.pose_world_to_cam,
+                velocity: keyframe.velocity_world,
+                bias: keyframe.imu_bias,
+            }
+        };
+        let preintegrated =
+            self.inertial
+                .preintegrate_at(noise, keyframe.bias, keyframe_timestamp, timestamp_sec);
+        (preintegrated.dt > 0.0).then_some(InertialAnchor {
+            origin: AnchorOrigin::Keyframe(keyframe),
+            preintegrated,
+        })
+    }
+
+    /// Tracks with pose, velocity and bias solved jointly against the map and
+    /// the IMU edge from `anchor`. A rejected frame coasts on the prediction.
+    fn track_inertial(
+        &mut self,
+        frame: &Frame,
+        context: &TrackingContext<'_>,
+        anchor: InertialAnchor<'_>,
+    ) -> FrameTracking {
+        let camera_to_body = self.rig.camera_to_body();
+        let gravity_world = self.inertial.gravity_world;
+        let predicted = anchor.predict(gravity_world, camera_to_body);
+        let trusted_prediction = self.imu_confident(context.timestamp_sec);
+        let (result, attempt) = {
+            let map = self.map.lock().unwrap();
+            let inertial = InertialInput {
+                problem: PoseInertialProblem {
+                    anchor: anchor.as_anchor(),
+                    preintegrated: &anchor.preintegrated,
+                    gravity_world,
+                    camera_to_body,
+                    camera: &self.rig.camera,
+                },
+                predicted,
+            };
+            self.tracker.estimate_inertial(
+                FrameInput {
+                    frame,
+                    previous_image: context.previous_image,
+                    current_image: context.current_image,
+                    candidate_pose: predicted.pose_cw,
+                    pose_before: context.pose_before,
+                    current_keyframe_idx: self.state.current_keyframe_idx,
+                    lost_for_sec: context.lost_for_sec,
+                    trusted_prediction,
+                },
+                &inertial,
+                &map,
+                &self.rig.camera,
+            )
+        };
+        if self.debug {
+            let line =
+                inertial_debug_line(frame.idx, context, &anchor, &predicted, &result, attempt);
+            self.debug_messages.push(line);
+        }
+
+        let outcome = match result {
+            Ok(solved) => {
+                self.state.pose_world_to_cam = solved.state.pose_cw;
+                self.state.velocity_world = solved.state.velocity;
+                self.inertial.bias = solved.state.bias;
+                self.state.inertial_prior = solved.prior;
+                Ok(solved.estimate)
+            }
+            Err(reason) => {
+                self.state.pose_world_to_cam = predicted.pose_cw;
+                self.state.velocity_world = predicted.velocity;
+                Err(reason)
+            }
+        };
+        FrameTracking {
+            candidate_pose: predicted.pose_cw,
+            outcome,
+        }
+    }
+
+    /// Tracks from the motion-model prediction with a visual-only pose solve:
+    /// before the IMU is initialized, or when no IMU edge can be formed.
+    fn track_visual(
+        &mut self,
+        frame: &Frame,
+        context: &TrackingContext<'_>,
+        prev_timestamp: f64,
+    ) -> FrameTracking {
+        let pose_before = context.pose_before;
+        let timestamp_sec = context.timestamp_sec;
+
+        // Local BA updates keyframe state asynchronously, so refresh cached IMU state.
+        if let Some(kf_idx) = self.state.current_keyframe_idx
+            && let Some(kf) = self.map.lock().unwrap().get_keyframe(kf_idx)
+        {
+            self.state.velocity_world = kf.velocity_world;
+            self.inertial.bias = kf.imu_bias;
+        }
+
+        // Preintegration is prepared here: the system owns bias and the sample
+        // buffer. The motion model chooses between it and the visual model.
+        let preintegrated = (self.state.imu_initialized && prev_timestamp > 0.0).then(|| {
+            self.inertial
+                .preintegrate_window(self.rig.imu_noise(), prev_timestamp, timestamp_sec)
+                .0
+        });
+        let (candidate_pose, predicted_velocity) = predict_pose(
+            pose_before,
+            self.state.velocity,
+            self.state.velocity_world,
+            preintegrated
+                .as_ref()
+                .map(|preintegrated| InertialPrediction {
+                    preintegrated,
+                    camera_to_body: self.rig.camera_to_body(),
+                    gravity_world: self.inertial.gravity_world,
+                }),
+        );
+        if let Some(velocity_world) = predicted_velocity {
+            self.state.velocity_world = velocity_world; // propagate for next frame
+        }
+
+        let result = {
+            let map = self.map.lock().unwrap();
+            self.tracker.estimate(
+                FrameInput {
+                    frame,
+                    previous_image: context.previous_image,
+                    current_image: context.current_image,
+                    candidate_pose,
+                    pose_before,
+                    current_keyframe_idx: self.state.current_keyframe_idx,
+                    lost_for_sec: context.lost_for_sec,
+                    trusted_prediction: self.imu_confident(timestamp_sec),
+                },
+                &map,
+                &self.rig.camera,
+            )
+        };
+
+        let outcome = match result {
+            Ok(estimate) => {
+                self.state.pose_world_to_cam = estimate.pose;
+
+                // When IMU-initialized, velocity_world was already updated by IMU
+                // preintegration (predict_pose_imu → pred_vel) before PnP ran; don't
+                // overwrite it with a visual finite-difference, since at 30 fps the
+                // inter-frame displacement is noise-dominated during low-translation
+                // segments, which would collapse velocity to zero and permanently
+                // freeze the IMU pose prediction.
+                if !self.state.imu_initialized {
+                    self.state.velocity = Some(Pose3d::between(&pose_before, &estimate.pose));
+                }
+                Ok(estimate)
+            }
+            Err(reason) => {
+                // Carry the predicted pose forward instead of freezing at
+                // pose_before. state.velocity_world was already advanced by
+                // predict_pose_imu above regardless of visual outcome, so
+                // anchoring the next frame's prediction on a stale position
+                // would desync position/rotation from velocity: every
+                // subsequent frame's candidate pose would drift further from
+                // reality, making the projection search miss again and
+                // compounding a single bad frame into a full tracking loss.
+                self.state.pose_world_to_cam = candidate_pose;
+                Err(reason)
+            }
+        };
+        FrameTracking {
+            candidate_pose,
+            outcome,
+        }
     }
 
     /// What the keyframe policy is shown for `frame`: the parallax is taken
@@ -1077,6 +1303,7 @@ impl SlamSystem {
         self.state.pose_world_to_cam = found.estimate.pose;
         self.state.current_keyframe_idx = Some(found.keyframe_idx);
         self.state.velocity = None;
+        self.state.inertial_prior = None;
         true
     }
 
@@ -1320,6 +1547,7 @@ impl SlamSystem {
         if let Some((corrected_tracking_pose, corrected_velocity)) = outcome.tracking_correction {
             self.state.pose_world_to_cam = corrected_tracking_pose;
             self.state.velocity_world = corrected_velocity;
+            self.state.inertial_prior = None;
         }
         if outcome.pgo_applied {
             self.tracker.reset_tracks();

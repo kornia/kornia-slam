@@ -5,6 +5,7 @@ use kornia_3d::pose::Pose3d;
 use crate::frame::Frame;
 use crate::inertial::AlignedTrackingState;
 use crate::initialization::two_view::TwoViewRejectReason;
+use crate::tracking::pose_estimation::pose_inertial::NavPrior;
 use kornia_algebra::Vec3F64;
 
 /// Status of processing one frame.
@@ -39,6 +40,11 @@ pub(crate) struct SystemState {
     pub last_frame_timestamp_sec: f64,
     /// Whether visual-inertial initialization succeeded (gates IMU pose prediction).
     pub imu_initialized: bool,
+    /// The last frame's state and information from its inertial solve, which
+    /// the next frame's solve starts from. `None` re-anchors the next frame on
+    /// the last keyframe: after a rejected frame, or once anything outside
+    /// tracking (local BA, loop closure, relocalization, a reset) moved the state.
+    pub inertial_prior: Option<NavPrior>,
     /// Timestamp (sec) at which inertial initialization completed. IMU-only
     /// pose prediction isn't trustworthy yet for a short window after this,
     /// so a tracking loss shortly after init is treated as fully lost rather
@@ -84,6 +90,7 @@ impl SystemState {
             bootstrap_low_match_rejections: 0,
             bootstrap_frame: None,
             imu_initialized: false,
+            inertial_prior: None,
             imu_init_timestamp_sec: None,
             last_frame_timestamp_sec: 0.0,
             mode: SystemMode::Bootstrap,
@@ -101,6 +108,7 @@ impl SystemState {
         // The new map starts at an unknown monocular scale, so the metric
         // IMU state no longer applies until inertial init runs again.
         self.imu_initialized = false;
+        self.inertial_prior = None;
         self.imu_init_timestamp_sec = None;
         self.velocity_world = Vec3F64::ZERO;
     }
@@ -128,6 +136,7 @@ impl SystemState {
             self.pose_world_to_cam = aligned.pose_world_to_cam;
         }
         self.velocity = None;
+        self.inertial_prior = None;
         self.imu_initialized = true;
     }
 }

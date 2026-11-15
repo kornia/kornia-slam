@@ -10,12 +10,60 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::PreintegratedImu;
 
+use crate::tracking::pose_estimation::pose_inertial::{Anchor, FrameNavState, NavPrior};
+
 /// Preintegration prepared by the system, which owns bias and sample buffering.
 pub(crate) struct InertialPrediction<'a> {
     pub preintegrated: &'a PreintegratedImu,
     /// Camera-to-body transform `T_BC`, or `None` for a camera-frame body.
     pub camera_to_body: Option<Pose3d>,
     pub gravity_world: Vec3F64,
+}
+
+/// Where a frame's IMU edge starts, with the preintegration from there to the frame.
+pub(crate) struct InertialAnchor<'a> {
+    pub origin: AnchorOrigin<'a>,
+    pub preintegrated: PreintegratedImu,
+}
+
+pub(crate) enum AnchorOrigin<'a> {
+    /// The last keyframe, held at its bundle-adjusted state.
+    Keyframe(FrameNavState),
+    /// The previous frame, under the prior its own solve left.
+    PreviousFrame(&'a NavPrior),
+}
+
+impl InertialAnchor<'_> {
+    pub(crate) fn as_anchor(&self) -> Anchor<'_> {
+        match &self.origin {
+            AnchorOrigin::Keyframe(state) => Anchor::Fixed(state),
+            AnchorOrigin::PreviousFrame(prior) => Anchor::Prior(prior),
+        }
+    }
+
+    /// The anchor state propagated through the preintegration, keeping its bias.
+    pub(crate) fn predict(
+        &self,
+        gravity_world: Vec3F64,
+        camera_to_body: Option<Pose3d>,
+    ) -> FrameNavState {
+        let anchor = match &self.origin {
+            AnchorOrigin::Keyframe(state) => state,
+            AnchorOrigin::PreviousFrame(prior) => &prior.mean,
+        };
+        let (pose_cw, velocity) = predict_pose_imu(
+            anchor.pose_cw,
+            anchor.velocity,
+            gravity_world,
+            &self.preintegrated,
+            camera_to_body,
+        );
+        FrameNavState {
+            pose_cw,
+            velocity,
+            bias: anchor.bias,
+        }
+    }
 }
 
 /// Predicted world-to-camera pose for this frame, plus the propagated world
@@ -87,10 +135,13 @@ fn body_to_world(pose_w2c: &Pose3d, camera_to_body: Option<Pose3d>) -> Pose3d {
 
 #[cfg(test)]
 mod tests {
-    use super::{InertialPrediction, predict_pose};
+    use super::{AnchorOrigin, InertialAnchor, InertialPrediction, predict_pose};
+    use crate::tracking::pose_estimation::pose_inertial::FrameNavState;
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::{SO3F64, Vec3F64};
-    use kornia_sensors::imu::{ImuBias, ImuCalib, PreintegratedImu};
+    use kornia_factors::imu;
+    use kornia_factors::state::NavState;
+    use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 
     fn preintegration(dt: f64) -> PreintegratedImu {
         let mut preintegrated = PreintegratedImu::new(
@@ -104,6 +155,71 @@ mod tests {
         );
         preintegrated.dt = dt;
         preintegrated
+    }
+
+    /// The IMU factor must read zero at the state the prediction produced, for
+    /// a 1 kHz window, a non-trivial extrinsic and a pose far from the origin.
+    #[test]
+    fn the_imu_factor_is_zero_at_the_prediction() {
+        let bias = ImuBias {
+            gyro: Vec3F64::new(0.002, -0.001, 0.003),
+            accel: Vec3F64::new(0.1, -0.2, 0.05),
+        };
+        let calib = ImuCalib {
+            gyro_noise: 1.6968e-4,
+            accel_noise: 2.0e-3,
+            gyro_bias_noise: 1.9393e-5,
+            accel_bias_noise: 3.0e-3,
+        };
+        let samples: Vec<ImuMeasurement> = (0..=50)
+            .map(|k| {
+                let t = 100.0 + f64::from(k) * 1e-3;
+                ImuMeasurement {
+                    timestamp: t,
+                    gyro: Vec3F64::new(0.3, -0.5, 0.2 + 0.1 * (40.0 * t).sin()),
+                    accel: Vec3F64::new(-9.5, 0.4 + 0.2 * (30.0 * t).cos(), 1.8),
+                }
+            })
+            .collect();
+        let preintegrated =
+            PreintegratedImu::from_measurements(bias, calib, &samples, 100.0, 100.05);
+        let t_bc = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(1.2, -0.4, 2.0)).matrix(),
+            Vec3F64::new(0.05, -0.1, 0.02),
+        );
+        let state = FrameNavState {
+            pose_cw: Pose3d::new(
+                SO3F64::exp(Vec3F64::new(0.4, 2.1, -0.7)).matrix(),
+                Vec3F64::new(12.0, -30.0, 7.0),
+            ),
+            velocity: Vec3F64::new(0.8, -0.3, 0.4),
+            bias,
+        };
+        let gravity = Vec3F64::new(0.3, 9.7, -1.2);
+        let anchor = InertialAnchor {
+            origin: AnchorOrigin::Keyframe(state),
+            preintegrated,
+        };
+
+        let predicted = anchor.predict(gravity, Some(t_bc));
+
+        fn nav(s: &FrameNavState) -> NavState<'_> {
+            NavState {
+                pose_cw: &s.pose_cw,
+                velocity: s.velocity,
+                bias: s.bias,
+            }
+        }
+        let (residual, _, _) = imu::residual_and_jacobians(
+            nav(&state),
+            nav(&predicted),
+            &anchor.preintegrated,
+            &gravity,
+            Some(&t_bc),
+        );
+        let omega = imu::information(&anchor.preintegrated, 1.0).omega;
+        let chi2 = residual.dot(&(omega * residual));
+        assert!(chi2 < 1e-6, "IMU χ² at the prediction: {chi2}");
     }
 
     fn assert_pose_close(actual: Pose3d, expected: Pose3d) {

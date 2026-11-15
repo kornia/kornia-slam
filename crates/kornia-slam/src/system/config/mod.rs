@@ -79,6 +79,7 @@ impl Default for PipelineDefinition {
 pub struct OrbSlamPipeline {
     pub frontend: FrontendConfig,
     pub keyframes: KeyframePolicy,
+    pub tracking: TrackingConfig,
     pub mapping: MappingConfig,
     pub loop_closing: LoopClosingMode,
     /// Algorithm tuning, set from Rust only: configuration files always use the
@@ -162,6 +163,18 @@ pub struct MappingConfig {
     pub execution: LocalMappingMode,
 }
 
+/// Per-frame tracking.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct TrackingConfig {
+    /// Once the IMU is initialized, solve each frame's pose, velocity and bias
+    /// jointly against its map points and the IMU edge (ORB-SLAM3's
+    /// `PoseInertialOptimization*`) instead of a visual pose seeded by the
+    /// IMU prediction.
+    pub joint_inertial: bool,
+}
+
 /// Loop closing: place recognition over every keyframe, and verification,
 /// fusion and pose-graph correction of accepted loops.
 ///
@@ -241,7 +254,13 @@ impl fmt::Display for SystemConfig {
         if self.sensors.imu {
             writeln!(f, "  IMU integration")?;
         }
-        writeln!(f, "  tracking")?;
+        match orb.tracking.joint_inertial {
+            true => writeln!(
+                f,
+                "  tracking: joint pose-inertial once the IMU is initialized"
+            )?,
+            false => writeln!(f, "  tracking")?,
+        }
         let k = &orb.keyframes;
         write!(f, "  keyframes: every {}..=", k.min_frames_between)?;
         if k.max_frames_between == usize::MAX {

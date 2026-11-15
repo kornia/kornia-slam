@@ -106,14 +106,29 @@ impl InertialState {
         t0: f64,
         t1: f64,
     ) -> (PreintegratedImu, Vec<ImuMeasurement>) {
-        let samples: Vec<ImuMeasurement> = self
-            .pending_samples
+        let samples = self.samples_within(t0, t1);
+        let pre = PreintegratedImu::from_measurements(self.bias, noise, &samples, t0, t1);
+        (pre, samples)
+    }
+
+    /// Integrates `[t0, t1]` linearized at `bias` rather than the live estimate,
+    /// for an IMU edge that starts from a state with its own bias.
+    pub(crate) fn preintegrate_at(
+        &self,
+        noise: ImuCalib,
+        bias: ImuBias,
+        t0: f64,
+        t1: f64,
+    ) -> PreintegratedImu {
+        PreintegratedImu::from_measurements(bias, noise, &self.samples_within(t0, t1), t0, t1)
+    }
+
+    fn samples_within(&self, t0: f64, t1: f64) -> Vec<ImuMeasurement> {
+        self.pending_samples
             .iter()
             .filter(|m| m.timestamp >= t0 && m.timestamp <= t1)
             .copied()
-            .collect();
-        let pre = PreintegratedImu::from_measurements(self.bias, noise, &samples, t0, t1);
-        (pre, samples)
+            .collect()
     }
 
     /// The IMU edge between two keyframes, carrying its raw samples for later

@@ -2,6 +2,7 @@
 
 pub mod map_projection;
 pub mod pnp;
+pub(crate) mod pose_inertial;
 
 use kornia_3d::pose::Pose3d;
 

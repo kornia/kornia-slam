@@ -22,7 +22,7 @@
 
 mod keypoint_grid;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::{Pose3d, RansacParams, ransac_fundamental_8point};
@@ -303,6 +303,29 @@ impl MapProjectionEstimator {
         }
 
         try_track_and_refine(ref_correspondences, pose_before_tracking)
+    }
+
+    /// Matches the local map into `frame` around `pose`, for a caller that
+    /// solves the pose itself (ORB-SLAM3's `SearchLocalPoints` after an
+    /// inertial prediction). The local map is built around `seeds` and the
+    /// reference keyframe; `seeds` come first and keep their keypoints.
+    #[allow(clippy::too_many_arguments)]
+    pub fn match_local_map(
+        &self,
+        frame: &Frame,
+        pose: &Pose3d,
+        map: &Map,
+        camera: &PinholeCamera,
+        current_keyframe_idx: Option<usize>,
+        search_scale: f32,
+        seeds: &[(usize, usize)],
+    ) -> Vec<(usize, usize)> {
+        let current_kf = current_keyframe_idx.and_then(|ki| map.get_keyframe(ki));
+        let local_indices =
+            select_local_map_points(map, seeds, current_kf, LocalMapSelectionConfig::default());
+        let (projected, _, _) =
+            self.match_map_to_frame(map, &local_indices, frame, pose, camera, search_scale);
+        merge_matches(seeds, projected)
     }
 
     fn eligible_pre_seeded(
@@ -627,6 +650,21 @@ impl MapProjectionEstimator {
 
         matches
     }
+}
+
+/// `first`, then the pairs of `second` whose map point and keypoint are both unused.
+fn merge_matches(first: &[(usize, usize)], second: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let mut used_points: HashSet<usize> = first.iter().map(|&(mp, _)| mp).collect();
+    let mut used_keypoints: HashSet<usize> = first.iter().map(|&(_, kp)| kp).collect();
+    let mut merged = first.to_vec();
+    for (mp, kp) in second {
+        if !used_points.contains(&mp) && !used_keypoints.contains(&kp) {
+            used_points.insert(mp);
+            used_keypoints.insert(kp);
+            merged.push((mp, kp));
+        }
+    }
+    merged
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
