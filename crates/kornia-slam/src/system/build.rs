@@ -14,6 +14,7 @@ use crate::mapping::LocalMappingMode;
 use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
+use crate::tracking::pose_gate::PoseGate;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
 /// A [`SlamSystem`](crate::SlamSystem) that cannot be built from its
@@ -36,6 +37,7 @@ pub(crate) struct SystemSettings {
     pub keyframe_policy: KeyframePolicy,
     pub tracking_loss_recovery: TrackingLossRecoveryPolicy,
     pub recovery: RecoveryConfig,
+    pub pose_gate: PoseGate,
     pub local_mapping: LocalMappingMode,
     pub local_ba: LocalBaParams,
     /// Near/far depth threshold `mThDepth` (metres). When `Some`, each new
@@ -129,6 +131,7 @@ impl SystemConfig {
                 ..tuning.loss_recovery
             },
             recovery: orb.tracking_loss.reseed,
+            pose_gate: orb.tracking_loss.pose_gate,
             local_mapping: orb.mapping.execution,
             local_ba: orb
                 .mapping

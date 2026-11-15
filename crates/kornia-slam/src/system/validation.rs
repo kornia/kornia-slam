@@ -16,6 +16,7 @@ use crate::mapping::map::StateEnvelope;
 use crate::mapping::marginalization::BoundaryPrior;
 use crate::tracking::KeyframePolicy;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
+use crate::tracking::pose_gate::PoseGate;
 
 /// A system configuration that cannot be built or does not fit its source.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -87,6 +88,7 @@ impl OrbSlamPipeline {
         validate_local_ba(&self.mapping.local_ba)?;
         validate_loop_closing(&self.loop_closing, sensors)?;
         validate_recovery(&self.tracking_loss.reseed)?;
+        validate_pose_gate(&self.tracking_loss.pose_gate)?;
         validate_tuning(&self.tuning, self.loop_closing.is_enabled())
     }
 }
@@ -115,6 +117,28 @@ fn validate_recovery(recovery: &RecoveryConfig) -> Result<(), ConfigError> {
         AT_LEAST_ONE,
     )?;
     check(at("max_tilt_deg"), recovery.max_tilt_deg, POSITIVE)
+}
+
+fn validate_pose_gate(gate: &PoseGate) -> Result<(), ConfigError> {
+    let PoseGate::Enabled(limits) = gate else {
+        return Ok(());
+    };
+    let at = |field| format!("tracking_loss.pose_gate.{field}");
+    check(
+        at("max_rotation_gap_deg"),
+        limits.max_rotation_gap_deg,
+        POSITIVE,
+    )?;
+    check(
+        at("max_translation_gap_mps"),
+        limits.max_translation_gap_mps,
+        POSITIVE,
+    )?;
+    check(
+        at("max_recover_speed_mps"),
+        limits.max_recover_speed_mps,
+        POSITIVE,
+    )
 }
 
 fn validate_tuning(tuning: &OrbTuning, loop_closing: bool) -> Result<(), ConfigError> {

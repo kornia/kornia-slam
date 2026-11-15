@@ -62,6 +62,10 @@ pub struct RunCounters {
     pub bias_resets: u64,
     /// Frames skipped while re-seeding with the inertial state kept.
     pub reseed_stall_frames: u64,
+    /// Frames whose tracked pose the pose gate rejected for its rotation.
+    pub gate_rejects_rotation: u64,
+    /// Frames whose tracked pose the pose gate rejected for its position.
+    pub gate_rejects_translation: u64,
 }
 
 impl RunCounters {

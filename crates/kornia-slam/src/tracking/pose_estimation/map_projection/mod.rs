@@ -203,6 +203,11 @@ pub enum MapProjectionRejectReason {
     LowReferenceMatches,
     /// Too few valid 3D-2D correspondences could be built from reference matches.
     LowReferenceCorrespondences,
+    /// The pose turned too far from the inertial prediction.
+    RotationGap,
+    /// The pose moved too far from the inertial prediction, or while lost
+    /// from the last tracked pose.
+    TranslationGap,
 }
 
 /// Map-projection-based pose estimator.

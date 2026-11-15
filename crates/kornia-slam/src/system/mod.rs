@@ -45,6 +45,7 @@ use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_point
 use crate::tracking::motion::{InertialPrediction, body_to_world, predict_pose};
 use crate::tracking::optical_flow::FlowSurvivor;
 use crate::tracking::pose_estimation::Estimate;
+use crate::tracking::pose_estimation::map_projection::MapProjectionRejectReason;
 use crate::tracking::pose_gate::{GateReference, GateVerdict};
 use crate::tracking::tracker::{FlowGuess, FrameInput, GateReading, Tracker};
 
@@ -225,7 +226,9 @@ impl SlamSystem {
         let map_publication_gate = local_mapping.publication_gate();
         Self {
             rig,
-            tracker: Tracker::new(settings.map_projection).with_lk_kernel(settings.klt_kernel),
+            tracker: Tracker::new(settings.map_projection)
+                .with_lk_kernel(settings.klt_kernel)
+                .with_pose_gate(settings.pose_gate),
             two_view_init_config: settings.two_view_init,
             keyframe_policy: settings.keyframe_policy,
             tracking_loss_recovery: settings.tracking_loss_recovery,
@@ -1372,21 +1375,12 @@ impl SlamSystem {
         let trusted_prediction = self.imu_confident(timestamp_sec);
         // The outer prediction: a KeyframeDue flow pose shadows
         // `candidate_pose` below and must not become the reference.
-        let gate = (trusted_prediction
-            && predicted_velocity.is_some()
-            && (self.debug || self.tracker.pose_gate().is_enabled()))
-        .then(|| {
-            let dt_sec = timestamp_sec - prev_timestamp;
-            GateReference {
-                prediction: candidate_pose,
-                dt_sec,
-                lost: self
-                    .state
-                    .pose_before_loss
-                    .filter(|_| self.state.lost_since_sec.is_some())
-                    .map(|before_loss| (before_loss, currently_lost_for + dt_sec)),
-            }
-        });
+        let gate = self.pose_gate_reference(
+            candidate_pose,
+            predicted_velocity.filter(|_| trusted_prediction),
+            timestamp_sec - prev_timestamp,
+            currently_lost_for,
+        );
         if self.trace_enabled {
             let map = self.map.lock().unwrap();
             self.frame_trace = Some(FrameTrace::begin(
@@ -1510,6 +1504,15 @@ impl SlamSystem {
                 (TrackingStatus::Skipped, Vec::new(), 0, Some(reason))
             }
         };
+        match reject_reason {
+            Some(MapProjectionRejectReason::RotationGap) => {
+                self.counters.gate_rejects_rotation += 1
+            }
+            Some(MapProjectionRejectReason::TranslationGap) => {
+                self.counters.gate_rejects_translation += 1;
+            }
+            _ => {}
+        }
         if self.debug
             && let Some(gate) = &gate
             && let Some(reading) = self.tracker.last_gap()
@@ -1648,6 +1651,29 @@ impl SlamSystem {
             self.prune_imu_before(kf_ts.min(timestamp_sec));
         }
         Ok(self.frame_result(status))
+    }
+
+    /// What this frame's tracked pose is checked against: the inertial
+    /// `prediction`, only when the IMU produced one (`velocity`) and is
+    /// trusted, and only when the gate or the debug log needs it.
+    fn pose_gate_reference(
+        &self,
+        prediction: Pose3d,
+        velocity: Option<Vec3F64>,
+        dt_sec: f64,
+        lost_for_sec: f64,
+    ) -> Option<GateReference> {
+        (velocity.is_some() && (self.debug || self.tracker.pose_gate().is_enabled())).then(|| {
+            GateReference {
+                prediction,
+                dt_sec,
+                lost: self
+                    .state
+                    .pose_before_loss
+                    .filter(|_| self.state.lost_since_sec.is_some())
+                    .map(|before_loss| (before_loss, lost_for_sec + dt_sec)),
+            }
+        })
     }
 
     /// One `[predgap]` line: the accepted pose against the inertial prediction.

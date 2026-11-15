@@ -694,6 +694,34 @@ mod recovery_after_loss {
         system
     }
 
+    #[test]
+    fn the_gate_reference_needs_an_inertial_prediction_and_bounds_a_loss_from_the_last_tracked_pose()
+     {
+        let mut system = lost_metric_system(7.0);
+        let prediction = centred_at(7.05);
+        assert_eq!(
+            system.pose_gate_reference(prediction, Some(Vec3F64::ZERO), 0.05, 1.0),
+            None,
+            "neither the gate nor the debug log asks for it"
+        );
+        system.set_debug(true);
+        assert_eq!(
+            system.pose_gate_reference(prediction, None, 0.05, 1.0),
+            None,
+            "a constant-velocity guess is no reference"
+        );
+        let reference = system
+            .pose_gate_reference(prediction, Some(Vec3F64::ZERO), 0.05, 1.0)
+            .unwrap();
+        assert_eq!(reference.prediction, prediction);
+        assert_eq!(reference.lost, Some((centred_at(1.0), 1.05)));
+        system.state.mark_tracked();
+        let reference = system
+            .pose_gate_reference(prediction, Some(Vec3F64::ZERO), 0.05, 0.0)
+            .unwrap();
+        assert_eq!(reference.lost, None);
+    }
+
     fn stereo_frame(idx: usize) -> Frame {
         let mut frame = frame_seeing_points(idx, Pose3d::IDENTITY, &[]);
         frame.depth = vec![2.0; frame.features.keypoints_xy.len().max(1)];

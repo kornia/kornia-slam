@@ -238,6 +238,31 @@ fn invalid_setting(config: &SystemConfig) -> Option<String> {
 }
 
 #[test]
+fn pose_gate_limits_must_be_positive_and_finite() {
+    use crate::tracking::pose_gate::{PoseGate, PoseGateLimits};
+    let mut config = SystemConfig::default();
+    orb_mut(&mut config).tracking_loss.pose_gate = PoseGate::Enabled(PoseGateLimits {
+        max_translation_gap_mps: f64::INFINITY,
+        ..PoseGateLimits::default()
+    });
+    assert_eq!(
+        invalid_setting(&config).as_deref(),
+        Some("tracking_loss.pose_gate.max_translation_gap_mps")
+    );
+    orb_mut(&mut config).tracking_loss.pose_gate = PoseGate::Enabled(PoseGateLimits {
+        max_rotation_gap_deg: 0.0,
+        ..PoseGateLimits::default()
+    });
+    assert_eq!(
+        invalid_setting(&config).as_deref(),
+        Some("tracking_loss.pose_gate.max_rotation_gap_deg")
+    );
+    orb_mut(&mut config).tracking_loss.pose_gate = PoseGate::Enabled(PoseGateLimits::default());
+    assert!(config.validate().is_ok());
+    assert!(config.to_string().contains("pose gate: 5 deg"));
+}
+
+#[test]
 fn the_reseed_tilt_limit_must_be_positive() {
     let mut config = SystemConfig::default();
     orb_mut(&mut config).tracking_loss.reseed.max_tilt_deg = 0.0;
@@ -1051,6 +1076,43 @@ mod ron_files {
                 .keep_inertial
         );
         assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+    }
+
+    #[test]
+    fn the_pose_gate_defaults_off_round_trips_and_takes_default_limits() {
+        use crate::tracking::pose_gate::{PoseGate, PoseGateLimits};
+        let old = parse(
+            "(version: 1, pipeline: OrbSlam((tracking_loss: (reseed: (keep_inertial: true)))))",
+        )
+        .unwrap();
+        assert_eq!(orb(&old).tracking_loss.pose_gate, PoseGate::Disabled);
+        assert!(!config_display_mentions_gate(&old));
+
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((tracking_loss: (pose_gate: Enabled((max_rotation_gap_deg: 6.5))))))",
+        )
+        .unwrap();
+        let PoseGate::Enabled(limits) = orb(&config).tracking_loss.pose_gate else {
+            panic!("the gate is enabled");
+        };
+        assert_eq!(limits.max_rotation_gap_deg, 6.5);
+        assert_eq!(
+            limits.max_translation_gap_mps,
+            PoseGateLimits::default().max_translation_gap_mps
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+
+        let config =
+            parse("(version: 1, pipeline: OrbSlam((tracking_loss: (pose_gate: Enabled(())))))")
+                .unwrap();
+        assert_eq!(
+            orb(&config).tracking_loss.pose_gate,
+            PoseGate::Enabled(PoseGateLimits::default())
+        );
+    }
+
+    fn config_display_mentions_gate(config: &SystemConfig) -> bool {
+        config.to_string().contains("pose gate")
     }
 
     #[test]
