@@ -16,7 +16,7 @@
 //! with `T = T_cw` perturbed as `T ← T · Exp(ξ)`. The pose residual is the
 //! wheel factor's with identity extrinsics and an identity delta, so its
 //! Jacobian is `J_l⁻¹(r) · Ad(T_i)` for `i` and the negation for `j`
-//! ([`crate::se3::relative_pose_residual`]).
+//! ([`crate::relative_pose::residual_and_jacobian`]).
 //!
 //! The mean-gyro row keeps the gyro bias observable while parked: at rest the
 //! raw gyro reads bias plus white noise, so the mean of `T` seconds of samples
@@ -32,9 +32,9 @@
 //! [`crate::wheel_odometry::WheelOdomFactor`]) and decides which intervals
 //! were stationary.
 
+use crate::inertial::NavState;
+use crate::relative_pose;
 use crate::robust::huber_weight_and_cost;
-use crate::se3::relative_pose_residual;
-use crate::state::NavState;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat6F64, Vec3F64, Vec6F64};
 use kornia_sensors::imu::ImuCalib;
@@ -244,7 +244,7 @@ pub fn residual(
     i: NavState<'_>,
     j: NavState<'_>,
 ) -> StationaryResidual {
-    let (pose, pose_jacobian_i) = relative_pose_residual(
+    let (pose, pose_jacobian_i) = relative_pose::residual_and_jacobian(
         i.pose_cw,
         j.pose_cw,
         &Pose3d::IDENTITY,

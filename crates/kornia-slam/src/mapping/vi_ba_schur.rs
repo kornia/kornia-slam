@@ -71,10 +71,12 @@ use kornia_algebra::{Mat6F64, Mat15F64, SE3F32, SMatF64, SVecF64, Vec3F64, Vec6F
 use thiserror::Error;
 
 use crate::pose_conversion::{pose_to_se3, se3_to_pose, vec3_to_f32};
-use kornia_factors::imu::{self, ImuFactor};
+use kornia_factors::inertial::NavState;
+use kornia_factors::inertial::preintegration::{self, ImuFactor};
+use kornia_factors::inertial::stationary::{
+    self, StationaryFactor, StationaryInfo, StationaryResidual,
+};
 use kornia_factors::robust::huber_weight_and_cost;
-use kornia_factors::state::NavState;
-use kornia_factors::stationary::{self, StationaryFactor, StationaryInfo, StationaryResidual};
 use kornia_factors::wheel_odometry::{self, WheelOdomFactor};
 
 use kornia_3d::ba::{BaError, BaObservation};
@@ -678,11 +680,12 @@ fn visual_huber(chi2: f64, chi2_threshold: f64) -> (f64, f64) {
     huber_weight_and_cost(chi2, Some(chi2_threshold))
 }
 
-/// [`imu::information`], warning when the navigation covariance is singular:
-/// the first time always (it is a fault in the IMU input, not chatter), the
-/// rest only under KORNIA_SLAM_DEBUG, as it can recur every solve.
+/// [`preintegration::information`], warning when the navigation covariance
+/// is singular: the first time always (it is a fault in the IMU input, not
+/// chatter), the rest only under KORNIA_SLAM_DEBUG, as it can recur every
+/// solve.
 fn imu_information_matrix(pim: &PreintegratedImu, weight: f64) -> Mat15F64 {
-    let info = imu::information(pim, weight);
+    let info = preintegration::information(pim, weight);
     if info.diagonal_fallback {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -941,8 +944,8 @@ fn stationary_eval(
     stationary::residual(edge, info, i.nav_state(), j.nav_state())
 }
 
-/// Stationary edges ([`kornia_factors::stationary`]). The pose rows go
-/// through [`accumulate_pose_pair`]; the rest are linear with constant
+/// Stationary edges ([`kornia_factors::inertial::stationary`]). The pose rows
+/// go through [`accumulate_pose_pair`]; the rest are linear with constant
 /// Jacobians and are written directly (`m_vec −= JᵀΩr`, `m_mat += JᵀΩJ`):
 ///
 /// * `v_i`, `v_j` (`J = I`, weight `w`): `H_vv += wΩ_v`, `m_v −= wΩ_v v`.
@@ -1288,7 +1291,7 @@ pub fn visual_inertial_bundle_adjust(
                 continue;
             }
 
-            let (res, ji, jj) = imu::residual_and_jacobians(
+            let (res, ji, jj) = preintegration::residual_and_jacobians(
                 kfs[i].nav_state(),
                 kfs[j].nav_state(),
                 &edge.preintegrated,
@@ -1315,7 +1318,8 @@ pub fn visual_inertial_bundle_adjust(
             // distinct g2o edges). Scaling it by the *nav* residual's outlier-ness
             // was silencing the one thing meant to resist a bad nav window explaining
             // itself away through bias, in exactly the windows where that matters.
-            let (hw, c_imu) = imu::weight_and_cost(&res, &omega_raw, params.huber_imu_chi2);
+            let (hw, c_imu) =
+                preintegration::weight_and_cost(&res, &omega_raw, params.huber_imu_chi2);
             cost_imu += c_imu;
             let omega: Mat15F64 = {
                 let mut o = omega_raw;
@@ -1579,7 +1583,7 @@ pub fn visual_inertial_bundle_adjust(
             if kf_local[i] < 0 && kf_local[j] < 0 {
                 continue;
             }
-            let (res, _, _) = imu::residual_and_jacobians(
+            let (res, _, _) = preintegration::residual_and_jacobians(
                 kfs_trial[i].nav_state(),
                 kfs_trial[j].nav_state(),
                 &edge.preintegrated,
@@ -1592,7 +1596,8 @@ pub fn visual_inertial_bundle_adjust(
                     *x *= params.boundary_imu_info_scale;
                 }
             }
-            new_cost_imu += imu::weight_and_cost(&res, &omega_raw, params.huber_imu_chi2).1;
+            new_cost_imu +=
+                preintegration::weight_and_cost(&res, &omega_raw, params.huber_imu_chi2).1;
         }
         let mut new_cost_bias_prior = 0.0f64;
         if params.accel_bias_prior_weight > 0.0 {
@@ -1645,7 +1650,7 @@ pub fn visual_inertial_bundle_adjust(
         if kf_local[i] < 0 && kf_local[j] < 0 {
             continue;
         }
-        let (res, _, _) = imu::residual_and_jacobians(
+        let (res, _, _) = preintegration::residual_and_jacobians(
             kfs[i].nav_state(),
             kfs[j].nav_state(),
             &edge.preintegrated,

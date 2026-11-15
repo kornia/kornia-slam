@@ -5,8 +5,8 @@
 
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, Vec3F64};
-use kornia_factors::imu::ImuFactor;
-use kornia_factors::stationary::{StationaryFactor, StationaryGyro};
+use kornia_factors::inertial::preintegration::ImuFactor;
+use kornia_factors::inertial::stationary::{StationaryFactor, StationaryGyro};
 use kornia_factors::wheel_odometry::{WheelOdomFactor, WheelOdomMeasurement};
 use kornia_sensors::imu::{ImuBias, ImuCalib, PreintegratedImu};
 use kornia_sensors::wheel::PlanarMotion;

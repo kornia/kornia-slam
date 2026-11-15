@@ -20,7 +20,7 @@
 //! The measurement is the planar motion `kornia_sensors` preintegrates
 //! ([`kornia_sensors::wheel::WheelPreintegration`]).
 
-use crate::se3::relative_pose_residual;
+use crate::relative_pose;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat6F64, SMatF64, Vec6F64};
 use kornia_sensors::wheel::PlanarMotion;
@@ -250,7 +250,7 @@ pub fn residual_and_jacobian(
     pose_cw_j: &Pose3d,
     factor: &WheelOdomFactor,
 ) -> (Vec6F64, Mat6F64) {
-    relative_pose_residual(
+    relative_pose::residual_and_jacobian(
         pose_cw_i,
         pose_cw_j,
         &factor.t_cb_from,

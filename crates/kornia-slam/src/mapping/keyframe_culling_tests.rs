@@ -9,7 +9,7 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Mat3F64;
 use kornia_algebra::Vec3F64;
-use kornia_factors::stationary::StationaryFactor;
+use kornia_factors::inertial::stationary::StationaryFactor;
 use kornia_factors::wheel_odometry::{WheelOdomFactor, WheelOdomMeasurement};
 use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_sensors::wheel::PlanarMotion;

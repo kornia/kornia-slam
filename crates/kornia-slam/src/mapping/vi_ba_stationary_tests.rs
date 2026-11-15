@@ -1,6 +1,6 @@
 use super::*;
 use kornia_algebra::{Mat3F64, SE3F64, SO3F64};
-use kornia_factors::stationary::{StationaryFactor, StationaryGyro};
+use kornia_factors::inertial::stationary::{StationaryFactor, StationaryGyro};
 use kornia_sensors::imu::{ImuCalib, ImuMeasurement};
 
 fn camera() -> PinholeCamera {
@@ -228,7 +228,7 @@ fn huber_weights_only_pose_and_velocity_rows() {
     assert_eq!(q.weight, 1.0);
     // The bias part of the cost is the same with and without Huber.
     let info = f.information();
-    let bias = |e: &kornia_factors::stationary::StationaryResidual| {
+    let bias = |e: &kornia_factors::inertial::stationary::StationaryResidual| {
         let g = e.gyro_mean.unwrap();
         0.5 * (info.gyro_bias * e.gyro_bias.dot(e.gyro_bias)
             + info.accel_bias * e.accel_bias.dot(e.accel_bias)
