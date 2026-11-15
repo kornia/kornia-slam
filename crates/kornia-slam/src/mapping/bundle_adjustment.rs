@@ -10,9 +10,11 @@ use crate::mapping::map::{
 use crate::mapping::marginalization::{
     BoundaryPrior, FrozenPoseSigma, MarginalPrior, marginalize_frozen,
 };
-use crate::mapping::vi_ba_schur::{ImuHuber, RigObservationCamera, ViBaKeyframe, ViBaParams};
+use crate::mapping::vi_ba_schur::{
+    ImuHuber, RigObservationCamera, ViBaKeyframe, ViBaParams, ViBaResult,
+};
 use crate::mapping::visual_information::VisualInformation;
-use crate::pose_conversion::rigid;
+use crate::pose_conversion::{angle_deg, camera_centre, rigid};
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
 use kornia_3d::camera::PinholeCamera;
@@ -744,6 +746,16 @@ pub fn run_local_inertial_ba_with(
             "[vi_ba] write-back guard kept {points_rejected} landmark(s) at their old position"
         );
     }
+    if crate::debug_enabled() {
+        debug_window_line(
+            snapshot.keyframes(),
+            active_start,
+            &observations,
+            (&vi_keyframes, &window.positions),
+            &vi_result,
+            points_rejected,
+        );
+    }
     window.write_back_where(&vi_result.points, &keep, &mut update.map_points);
     if let (BoundaryPrior::Marginal(sigma), Some(edge)) = (params.boundary, boundary) {
         // A solve that fell back starts the chain from its own result.
@@ -768,6 +780,60 @@ pub fn run_local_inertial_ba_with(
     });
     update.outcome.solve = BaSolve::Solved;
     update
+}
+
+/// One `[vi_ba] WINDOW` line per solve: what the solve held fixed, and how far
+/// the newest keyframe moved against its landmarks (window-plan.md, card G).
+fn debug_window_line(
+    keyframes: &[Keyframe],
+    active_start: usize,
+    observations: &[BaObservation],
+    (kfs_before, points_before): (&[ViBaKeyframe], &[Vec3F64]),
+    result: &ViBaResult,
+    guard: usize,
+) {
+    let active: Vec<usize> = (active_start..keyframes.len())
+        .filter(|&slot| !keyframes[slot].anchor)
+        .collect();
+    let Some(&newest) = active.last() else {
+        return;
+    };
+    let lost = active
+        .iter()
+        .filter(|&&slot| keyframes[slot].inserted_while_lost)
+        .count();
+    let mut pinned = vec![false; points_before.len()];
+    let mut obs_fixed = 0;
+    for o in observations.iter().filter(|o| o.fixed_pose) {
+        obs_fixed += 1;
+        pinned[o.point_idx] = true;
+    }
+    let (before, after) = (&kfs_before[newest].pose, &result.keyframes[newest].pose);
+    let median_shift = |want_pinned: bool| {
+        let mut d: Vec<f64> = (0..points_before.len())
+            .filter(|&p| pinned[p] == want_pinned)
+            .map(|p| (result.points[p] - points_before[p]).length())
+            .collect();
+        d.sort_by(f64::total_cmp);
+        d.get(d.len() / 2).copied().unwrap_or(f64::NAN)
+    };
+    debug_eprintln!(
+        "[vi_ba] WINDOW kf={} active={} lost={lost} fixed={} pts={} pinned={} obs={} \
+            obs_fixed={obs_fixed} shift={:.4e} shift_rot={:.4e} pts_shift_pinned={:.4e} \
+            pts_shift_free={:.4e} guard={guard} iters={} conv={}",
+        keyframes[newest].frame.idx,
+        active.len(),
+        keyframes.len() - active.len(),
+        points_before.len(),
+        pinned.iter().filter(|&&p| p).count(),
+        observations.len(),
+        (camera_centre(after) - camera_centre(before)).length(),
+        angle_deg(before, after),
+        median_shift(true),
+        median_shift(false),
+        result.iterations,
+        result.converged,
+    );
 }
 
 /// The boundary prior for the window whose boundary IMU edge is `edge`:

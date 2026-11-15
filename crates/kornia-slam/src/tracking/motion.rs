@@ -89,11 +89,6 @@ pub(crate) fn body_to_world(pose_w2c: &Pose3d, camera_to_body: Option<Pose3d>) -
     }
 }
 
-/// Camera centre in the world frame, for speed checks.
-pub(crate) fn camera_centre(pose_world_to_cam: &Pose3d) -> Vec3F64 {
-    pose_world_to_cam.inverse().translation
-}
-
 /// Whether moving the camera centre from `before` to `after` in `gap_sec`
 /// stays under `max_speed_mps` on average. A non-finite pose never does.
 pub(crate) fn coast_is_plausible(

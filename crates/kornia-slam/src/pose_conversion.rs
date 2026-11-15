@@ -25,6 +25,20 @@ pub(crate) fn rigid(pose: Pose3d) -> Pose3d {
     Pose3d::new(orthonormalized(pose.rotation), pose.translation)
 }
 
+/// Camera centre in the world frame.
+pub(crate) fn camera_centre(pose_world_to_cam: &Pose3d) -> Vec3F64 {
+    pose_world_to_cam.inverse().translation
+}
+
+/// Rotation angle between two poses, degrees.
+pub(crate) fn angle_deg(from: &Pose3d, to: &Pose3d) -> f64 {
+    let relative = Pose3d::between(from, to);
+    SO3F64::from_matrix(&relative.rotation)
+        .log()
+        .length()
+        .to_degrees()
+}
+
 pub(crate) fn pose_to_se3(pose: &Pose3d) -> SE3F32 {
     // The quaternion of a scaled matrix is not unit, and `retract` keeps it so.
     let rotation = SO3F32::from_matrix(&mat3_to_f32(pose.rotation));

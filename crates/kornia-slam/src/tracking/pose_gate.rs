@@ -6,9 +6,9 @@
 //! per frame) is far below the PnP pose's own spread.
 
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::SO3F64;
 
-use crate::tracking::motion::{camera_centre, coast_is_plausible};
+use crate::pose_conversion::{angle_deg, camera_centre};
+use crate::tracking::motion::coast_is_plausible;
 
 /// Whether a tracked pose that disagrees with the inertial prediction is
 /// rejected; `Disabled` accepts on inliers alone.
@@ -79,14 +79,6 @@ pub(crate) enum GateVerdict {
     TranslationGap,
 }
 
-fn angle_deg(from: &Pose3d, to: &Pose3d) -> f64 {
-    let relative = Pose3d::between(from, to);
-    SO3F64::from_matrix(&relative.rotation)
-        .log()
-        .length()
-        .to_degrees()
-}
-
 impl PoseGap {
     pub(crate) fn measure(reference: &GateReference, pose_before: &Pose3d, pose: &Pose3d) -> Self {
         let centre = camera_centre(pose);
@@ -137,7 +129,7 @@ impl PoseGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kornia_algebra::Vec3F64;
+    use kornia_algebra::{SO3F64, Vec3F64};
 
     fn centred_at(x: f64) -> Pose3d {
         let mut pose = Pose3d::IDENTITY;

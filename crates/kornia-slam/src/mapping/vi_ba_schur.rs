@@ -1881,11 +1881,40 @@ pub fn visual_inertial_bundle_adjust(
             params.imu_t_bc.as_ref(),
         );
         let [nr, nv, np, nbg, nba] = imu_residual_norms(&res);
+        if !crate::debug_enabled() {
+            continue;
+        }
+        let omega = imu_edge_information(edge, &kf_local, params);
+        let nav = res.fixed_rows::<9>(0);
+        let chi2 = nav.dot(&(omega.fixed_view::<9, 9>(0, 0) * nav));
+        let (hw, _) = preintegration::weight_and_cost(
+            &res,
+            &omega,
+            imu_huber_chi2(edge, &kf_local, params).unwrap_or(0.0),
+        );
         debug_eprintln!(
             "[vi_ba] FINAL edge {i}→{j}  dt={:.3}s  |r_R|={nr:.4e}  |r_v|={nv:.4e}  \
                 |r_p|={np:.4e}  |r_bg|={nbg:.4e}  |r_ba|={nba:.4e}  \
-                (iters={iters_done} conv={converged})",
+                (iters={iters_done} conv={converged})  chi2={chi2:.4e} hw={hw:.4} boundary={}",
             edge.preintegrated.dt,
+            is_boundary_edge(edge, &kf_local),
+        );
+    }
+    if let Some(i) = (0..n_kf).rev().find(|&i| kf_local[i] >= 0) {
+        let (v, b) = (kfs[i].velocity, kfs[i].bias);
+        debug_eprintln!(
+            "[vi_ba] STATE kf={i} |v|={:.4e} v=({:.4e},{:.4e},{:.4e}) \
+                ba=({:.4e},{:.4e},{:.4e}) bg=({:.4e},{:.4e},{:.4e})",
+            v.length(),
+            v.x,
+            v.y,
+            v.z,
+            b.accel.x,
+            b.accel.y,
+            b.accel.z,
+            b.gyro.x,
+            b.gyro.y,
+            b.gyro.z,
         );
     }
 

@@ -9,8 +9,9 @@ use kornia_sensors::imu::ImuCalib;
 
 use crate::inertial::ImuWindowStats;
 use crate::inertial::initialization::rotation_from_to;
+pub(crate) use crate::pose_conversion::camera_centre;
 use crate::pose_conversion::rigid;
-pub(crate) use crate::tracking::motion::{camera_centre, coast_is_plausible};
+pub(crate) use crate::tracking::motion::coast_is_plausible;
 
 /// What survives a give-up of a metric, inertially initialized map.
 ///
