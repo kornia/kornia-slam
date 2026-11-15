@@ -76,12 +76,12 @@ use kornia_factors::inertial::preintegration::{self, ImuFactor};
 use kornia_factors::inertial::stationary::{
     self, StationaryFactor, StationaryInfo, StationaryResidual,
 };
-use kornia_factors::robust::huber_weight_and_cost;
 use kornia_factors::wheel_odometry::{self, WheelOdomFactor};
 
 use kornia_3d::ba::{BaError, BaObservation};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
+use kornia_3d::ransac::{HuberKernel, RobustKernel};
 use kornia_sensors::imu::{ImuBias, PreintegratedImu};
 
 const MIN_Z: f32 = 1e-3;
@@ -677,7 +677,14 @@ fn accum_jt_omega_j(
 
 /// Huber weight and cost `½ρ(chi2)` of a reprojection or depth residual.
 fn visual_huber(chi2: f64, chi2_threshold: f64) -> (f64, f64) {
-    huber_weight_and_cost(chi2, Some(chi2_threshold))
+    if chi2_threshold > 0.0 {
+        (
+            HuberKernel.weight(chi2, chi2_threshold),
+            0.5 * HuberKernel.rho(chi2, chi2_threshold),
+        )
+    } else {
+        (1.0, 0.5 * chi2)
+    }
 }
 
 /// [`preintegration::information`], warning when the navigation covariance

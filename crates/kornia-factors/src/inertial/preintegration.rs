@@ -20,7 +20,7 @@ use kornia_algebra::{Mat3F64, Mat15F64, SO3F64, Vec3F64, Vec15F64};
 use kornia_sensors::imu::PreintegratedImu;
 
 use crate::inertial::NavState;
-use crate::robust::huber_weight_and_cost;
+use kornia_3d::ransac::{HuberKernel, RobustKernel};
 
 /// An IMU constraint between keyframes `from_idx` and `to_idx`, usually
 /// consecutive; any pair works as long as `preintegrated` covers the interval.
@@ -170,7 +170,14 @@ pub fn weight_and_cost(res: &Vec15F64, omega_raw: &Mat15F64, chi2_threshold: f64
     let bias = res.fixed_rows::<6>(9);
     let nav_chi2 = nav.dot(&(omega_raw.fixed_view::<9, 9>(0, 0) * nav));
     let bias_chi2 = bias.dot(&(omega_raw.fixed_view::<6, 6>(9, 9) * bias));
-    let (hw, nav_cost) = huber_weight_and_cost(nav_chi2, Some(chi2_threshold));
+    let (hw, nav_cost) = if chi2_threshold > 0.0 {
+        (
+            HuberKernel.weight(nav_chi2, chi2_threshold),
+            0.5 * HuberKernel.rho(nav_chi2, chi2_threshold),
+        )
+    } else {
+        (1.0, 0.5 * nav_chi2)
+    };
     (hw, nav_cost + 0.5 * bias_chi2)
 }
 

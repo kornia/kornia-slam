@@ -2,6 +2,7 @@ use super::*;
 use kornia_algebra::{Mat3F64, SE3F64, SO3F64};
 use kornia_factors::inertial::stationary::{StationaryFactor, StationaryGyro};
 use kornia_sensors::imu::{ImuCalib, ImuMeasurement};
+use kornia_3d::ransac::{HuberKernel, RobustKernel};
 
 fn camera() -> PinholeCamera {
     PinholeCamera {
@@ -151,9 +152,12 @@ fn normal_equation_error(edge: &StationaryFactor, kfs: &[ViBaKeyframe]) -> f64 {
     let weight = stationary_eval(edge, &infos[0], &kfs[0], &kfs[1]).weight;
     let weighted =
         |range: std::ops::Range<usize>| -> f64 { range.map(|k| w[k] * r0[k] * r0[k]).sum() };
-    let expected_cost =
-        kornia_factors::robust::huber_weight_and_cost(weighted(0..12) / weight, edge.huber_chi2).1
-            + 0.5 * weighted(12..rows);
+    let nav_chi2 = weighted(0..12) / weight;
+    let nav_cost = match edge.huber_chi2 {
+        Some(k) if k > 0.0 => 0.5 * HuberKernel.rho(nav_chi2, k),
+        _ => 0.5 * nav_chi2,
+    };
+    let expected_cost = nav_cost + 0.5 * weighted(12..rows);
     let mut worst = (cost - expected_cost).abs() / (1e-6 * chi2.max(1e-12));
     let mut jac = vec![[0.0f64; 30]; rows];
     for col in 0..30 {
@@ -236,7 +240,8 @@ fn huber_weights_only_pose_and_velocity_rows() {
     };
     // The nav part is the Huber objective ½ρ of the quadratic one's chi².
     let chi2_nav = 2.0 * (q.cost - bias(&q));
-    let (w, huber_nav) = kornia_factors::robust::huber_weight_and_cost(chi2_nav, Some(1.0));
+    let w = HuberKernel.weight(chi2_nav, 1.0);
+    let huber_nav = 0.5 * HuberKernel.rho(chi2_nav, 1.0);
     assert_eq!(w, e.weight);
     assert!(((e.cost - bias(&e)) - huber_nav).abs() < 1e-9 * huber_nav);
     assert_eq!(bias(&e), bias(&q));
