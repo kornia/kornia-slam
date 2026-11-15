@@ -1,0 +1,296 @@
+struct AccelBiasRefinement {
+    scale: f64,
+    gravity_world: Vec3F64,
+    accel_bias: Vec3F64,
+    condition_number: f64,
+}
+
+struct VelocityRefinement {
+    velocities_world: Vec<Vec3F64>,
+}
+
+impl Pipeline {
+    /// Stage 3 of inertial init:
+    /// refine accelerometer bias, scale, and gravity direction with |g| fixed.
+    ///
+    /// Assumes gyro bias has already been estimated and `gravity_dir` came from
+    /// the scale/free-gravity solve. For stereo, pass `solve_scale = false`.
+    fn solve_accel_bias_refinement(
+        &self,
+        keyframes: &[&Keyframe],
+        frame_to_local: &std::collections::HashMap<usize, usize>,
+        gyro_bias: Vec3F64,
+        gravity_dir: Vec3F64,
+        initial_scale: f64,
+        solve_scale: bool,
+    ) -> Option<AccelBiasRefinement> {
+        let t_cb = self.imu_t_bc?.inverse();
+        let r_cb = t_cb.rotation;
+        let lever = t_cb.translation;
+
+        let g_dir = gravity_dir.normalize();
+        let g0 = g_dir * GRAVITY_MAGNITUDE;
+
+        // Two basis vectors spanning the tangent plane perpendicular to gravity.
+        let pick = if g_dir.x.abs() < 0.9 {
+            Vec3F64::new(1.0, 0.0, 0.0)
+        } else {
+            Vec3F64::new(0.0, 1.0, 0.0)
+        };
+        let b1 = g_dir.cross(pick).normalize();
+        let b2 = g_dir.cross(b1).normalize();
+
+        // Unknown vector:
+        // mono:   [scale, dtheta1, dtheta2, bax, bay, baz]
+        // stereo: [dtheta1, dtheta2, bax, bay, baz]
+        let scale_col = if solve_scale { Some(0usize) } else { None };
+        let gravity_col0 = usize::from(solve_scale);
+        let gravity_col1 = gravity_col0 + 1;
+        let accel_bias_col = gravity_col0 + 2;
+        let unknowns = accel_bias_col + 3;
+
+        let mut rows: Vec<Vec<f64>> = Vec::new();
+        let mut rhs: Vec<f64> = Vec::new();
+
+        let bias0 = ImuBias {
+            gyro: gyro_bias,
+            accel: Vec3F64::ZERO,
+        };
+
+        // Use triples of consecutive keyframes so velocities cancel.
+        for win in keyframes.windows(3) {
+            let kf1 = win[0];
+            let kf2 = win[1];
+            let kf3 = win[2];
+
+            let Some(edge12) = self.find_imu_edge(kf1.frame.idx, kf2.frame.idx) else {
+                continue;
+            };
+            let Some(edge23) = self.find_imu_edge(kf2.frame.idx, kf3.frame.idx) else {
+                continue;
+            };
+
+            let dt12 = edge12.preintegrated.dt;
+            let dt23 = edge23.preintegrated.dt;
+            if dt12 <= 0.0 || dt23 <= 0.0 {
+                continue;
+            }
+
+            let c1 = kf1.frame.pose_world_to_cam.inverse();
+            let c2 = kf2.frame.pose_world_to_cam.inverse();
+            let c3 = kf3.frame.pose_world_to_cam.inverse();
+
+            let r_wb1 = c1.rotation * r_cb;
+            let r_wb2 = c2.rotation * r_cb;
+
+            let p1 = c1.translation;
+            let p2 = c2.translation;
+            let p3 = c3.translation;
+
+            // Camera-to-body lever-arm contribution.
+            let l12 = c2.rotation * lever - c1.rotation * lever;
+            let l23 = c3.rotation * lever - c2.rotation * lever;
+
+            let dp12 = edge12.preintegrated.delta_position_with_bias(&bias0);
+            let dv12 = edge12.preintegrated.delta_velocity_with_bias(&bias0);
+            let dp23 = edge23.preintegrated.delta_position_with_bias(&bias0);
+
+            let jp_ba12 = edge12.preintegrated.d_position_d_bias_accel;
+            let jv_ba12 = edge12.preintegrated.d_velocity_d_bias_accel;
+            let jp_ba23 = edge23.preintegrated.d_position_d_bias_accel;
+
+            // This is the velocity-eliminated triple constraint.
+            //
+            // Shape:
+            //   A_s * s + A_g1 * dtheta1 + A_g2 * dtheta2
+            //     + A_ba * ba = b
+            //
+            // Fill this from the paper's Eq. 19/20, adapted to:
+            // - your body/camera convention
+            // - gravity direction +Y after alignment
+            // - existing preintegration Jacobian signs
+            //
+            // Keep this as explicit vector algebra, then write 3 scalar rows.
+            let lambda = (p2 - p1) * dt23 - (p3 - p2) * dt12;
+
+            let gravity_coeff = (dt12 * dt12 * dt23 + dt23 * dt23 * dt12) * 0.5;
+            let phi1 = b1 * gravity_coeff;
+            let phi2 = b2 * gravity_coeff;
+
+            let accel_bias_coeff =
+                r_wb2 * jp_ba23 * dt12
+                + r_wb1 * jv_ba12 * (dt12 * dt23)
+                - r_wb1 * jp_ba12 * dt23;
+
+            let known =
+                l12 * dt23
+                - l23 * dt12
+                + r_wb2 * dp23 * dt12
+                + r_wb1 * dv12 * (dt12 * dt23)
+                - r_wb1 * dp12 * dt23
+                + g0 * gravity_coeff;
+
+            for axis in 0..3 {
+                let mut row = vec![0.0; unknowns];
+
+                let mut b = -vec_axis(known, axis);
+
+                if let Some(col) = scale_col {
+                    row[col] = vec_axis(lambda, axis);
+                } else {
+                    b -= initial_scale * vec_axis(lambda, axis);
+                }
+
+                row[gravity_col0] = vec_axis(phi1, axis);
+                row[gravity_col1] = vec_axis(phi2, axis);
+
+                for ba_axis in 0..3 {
+                    row[accel_bias_col + ba_axis] =
+                        mat3_axis_col(accel_bias_coeff, axis, ba_axis);
+                }
+
+                rows.push(row);
+                rhs.push(b);
+            }
+        }
+
+        if rows.len() < unknowns {
+            return None;
+        }
+
+        let (solution, condition_number) = solve_least_squares_with_condition(&rows, &rhs)?;
+
+        let scale = if let Some(col) = scale_col {
+            solution[col]
+        } else {
+            initial_scale
+        };
+
+        let dtheta1 = solution[gravity_col0];
+        let dtheta2 = solution[gravity_col1];
+        let accel_bias = Vec3F64::new(
+            solution[accel_bias_col],
+            solution[accel_bias_col + 1],
+            solution[accel_bias_col + 2],
+        );
+
+        let gravity_world = (g0 + b1 * dtheta1 + b2 * dtheta2).normalize() * GRAVITY_MAGNITUDE;
+
+        if !scale.is_finite() || scale <= 1e-6 {
+            return None;
+        }
+        if !accel_bias.length().is_finite() || accel_bias.length() > 2.0 {
+            return None;
+        }
+
+        Some(AccelBiasRefinement {
+            scale,
+            gravity_world,
+            accel_bias,
+            condition_number,
+        })
+    }
+
+    /// Stage 4:
+    /// once scale, gravity, gyro bias, and accel bias are known, compute
+    /// keyframe velocities.
+    fn refine_velocities(
+        &self,
+        keyframes: &[&Keyframe],
+        frame_to_local: &std::collections::HashMap<usize, usize>,
+        scale: f64,
+        gravity_world: Vec3F64,
+        bias: ImuBias,
+    ) -> Option<VelocityRefinement> {
+        let t_cb = self.imu_t_bc?.inverse();
+        let r_cb = t_cb.rotation;
+        let lever = t_cb.translation;
+
+        let n = keyframes.len();
+        let unknowns = 3 * n;
+        let mut rows: Vec<Vec<f64>> = Vec::new();
+        let mut rhs: Vec<f64> = Vec::new();
+
+        let vel_col = |kf_local: usize, axis: usize| -> usize {
+            3 * kf_local + axis
+        };
+
+        for edge in self.map.imu_edges() {
+            let Some(&i) = frame_to_local.get(&edge.prev_kf_idx) else {
+                continue;
+            };
+            let Some(&j) = frame_to_local.get(&edge.curr_kf_idx) else {
+                continue;
+            };
+
+            let dt = edge.preintegrated.dt;
+            if dt <= 0.0 {
+                continue;
+            }
+
+            let ci = keyframes[i].frame.pose_world_to_cam.inverse();
+            let cj = keyframes[j].frame.pose_world_to_cam.inverse();
+
+            let r_wb_i = ci.rotation * r_cb;
+
+            let p_b_i = ci.translation * scale + ci.rotation * lever;
+            let p_b_j = cj.translation * scale + cj.rotation * lever;
+
+            let dp = r_wb_i * edge.preintegrated.delta_position_with_bias(&bias);
+            let dv = r_wb_i * edge.preintegrated.delta_velocity_with_bias(&bias);
+
+            // Position constraint:
+            // p_j - p_i = v_i dt + 0.5 g dt^2 + R_i Δp
+            for axis in 0..3 {
+                let mut row = vec![0.0; unknowns];
+                row[vel_col(i, axis)] = dt;
+
+                let b = vec_axis(
+                    p_b_j - p_b_i - gravity_world * (0.5 * dt * dt) - dp,
+                    axis,
+                );
+
+                rows.push(row);
+                rhs.push(b);
+            }
+
+            // Velocity consistency:
+            // v_j - v_i = g dt + R_i Δv
+            for axis in 0..3 {
+                let mut row = vec![0.0; unknowns];
+                row[vel_col(j, axis)] = 1.0;
+                row[vel_col(i, axis)] = -1.0;
+
+                let b = vec_axis(gravity_world * dt + dv, axis);
+
+                rows.push(row);
+                rhs.push(b);
+            }
+        }
+
+        if rows.len() < unknowns {
+            return None;
+        }
+
+        let solution = solve_least_squares(&rows, &rhs)?;
+
+        let velocities_world = (0..n)
+            .map(|i| {
+                Vec3F64::new(
+                    solution[vel_col(i, 0)],
+                    solution[vel_col(i, 1)],
+                    solution[vel_col(i, 2)],
+                )
+            })
+            .collect();
+
+        Some(VelocityRefinement { velocities_world })
+    }
+
+    fn find_imu_edge(&self, prev: usize, curr: usize) -> Option<&kornia_slam::map::ImuFactor> {
+        self.map
+            .imu_edges()
+            .iter()
+            .find(|e| e.prev_kf_idx == prev && e.curr_kf_idx == curr)
+    }
+}

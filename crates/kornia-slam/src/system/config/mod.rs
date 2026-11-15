@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopClosingConfig;
 use crate::mapping::LocalMappingMode;
+use crate::mapping::bundle_adjustment::DEFAULT_ACTIVE_KEYFRAMES;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
@@ -154,13 +155,25 @@ impl StereoCloseDepth {
 }
 
 /// Local mapping (keyframe insertion, culling and local BA / VI-BA).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct MappingConfig {
     /// `Synchronous` maps on the tracking thread before each frame returns,
     /// which makes runs replay identically.
     pub execution: LocalMappingMode,
+    /// Newest keyframes each local BA optimizes (at least 1); keyframes
+    /// sharing their landmarks join as fixed context.
+    pub local_ba_keyframes: usize,
+}
+
+impl Default for MappingConfig {
+    fn default() -> Self {
+        Self {
+            execution: LocalMappingMode::default(),
+            local_ba_keyframes: DEFAULT_ACTIVE_KEYFRAMES,
+        }
+    }
 }
 
 /// Per-frame tracking.
@@ -280,7 +293,11 @@ impl fmt::Display for SystemConfig {
             LocalMappingMode::Synchronous => "synchronous",
             LocalMappingMode::Asynchronous => "asynchronous",
         };
-        writeln!(f, "  local mapping: {execution}")?;
+        writeln!(
+            f,
+            "  local mapping: {execution}, BA over {} keyframes",
+            orb.mapping.local_ba_keyframes
+        )?;
         if let Some(vocabulary) = orb.loop_closing.vocabulary() {
             writeln!(f, "  loop closing: {}", vocabulary.display())?;
         }

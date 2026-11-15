@@ -67,7 +67,7 @@ fn display_describes_the_pipeline() {
   frontend: ORB, 1000 keypoints
   tracking
   keyframes: every 3..=8 frames, ref ratio 0.6
-  local mapping: asynchronous
+  local mapping: asynchronous, BA over 3 keyframes
 ",
         ),
         (
@@ -77,7 +77,7 @@ fn display_describes_the_pipeline() {
   stereo depth: rectified pair, close within 35 baselines
   tracking
   keyframes: every 3..=8 frames, ref ratio 0.6
-  local mapping: asynchronous
+  local mapping: asynchronous, BA over 3 keyframes
 ",
         ),
         (
@@ -87,7 +87,7 @@ fn display_describes_the_pipeline() {
   IMU integration
   tracking
   keyframes: every 3..=8 frames, ref ratio 0.6
-  local mapping: synchronous
+  local mapping: synchronous, BA over 3 keyframes
   loop closing: ORBvoc.txt
 ",
         ),
@@ -97,7 +97,7 @@ fn display_describes_the_pipeline() {
   frontend: ORB, 1000 keypoints
   tracking
   keyframes: every 3..=unbounded frames, ref ratio 0.6, parallax 10 px
-  local mapping: asynchronous
+  local mapping: asynchronous, BA over 3 keyframes
 ",
         ),
     ] {

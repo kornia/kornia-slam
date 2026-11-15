@@ -27,8 +27,9 @@ pub const STEREO_DEPTH_REL_SIGMA: f32 = 0.05;
 /// points.
 pub const STEREO_DEPTH_MIN_SIGMA: f32 = 0.02;
 
-/// Keyframes a local BA optimizes; older keyframes enter only as fixed poses.
-const MAX_ACTIVE_KFS: usize = 3;
+/// Keyframes a local BA optimizes by default; older keyframes enter only as
+/// fixed poses.
+pub const DEFAULT_ACTIVE_KEYFRAMES: usize = 3;
 
 /// Write-back guard of [`run_local_inertial_ba`]: an optimized landmark whose
 /// distance from its nearest observer grew by more than this factor...
@@ -38,7 +39,7 @@ const WRITE_BACK_MAX_GROWTH: f64 = 10.0;
 /// is kept.
 const WRITE_BACK_FAR_M: f64 = 50.0;
 
-/// The local BA window: the three newest keyframes and the live
+/// The local BA window: the [`DEFAULT_ACTIVE_KEYFRAMES`] newest keyframes and the live
 /// landmarks they observe, plus, as fixed context, every other keyframe that
 /// observes those landmarks and the IMU neighbours of the active keyframes.
 ///
@@ -46,7 +47,7 @@ const WRITE_BACK_FAR_M: f64 = 50.0;
 /// always precede the active ones in slot order, because the active keyframes
 /// are the newest.
 pub fn local_window(map: &Map) -> BaWindow {
-    local_window_with_neighbors(map, [])
+    local_window_sized(map, [], DEFAULT_ACTIVE_KEYFRAMES)
 }
 
 /// [`local_window`], with the caller's own keyframe links (`(from, to)` by
@@ -60,8 +61,18 @@ pub fn local_window_with_neighbors(
     map: &Map,
     neighbors: impl IntoIterator<Item = (usize, usize)>,
 ) -> BaWindow {
+    local_window_sized(map, neighbors, DEFAULT_ACTIVE_KEYFRAMES)
+}
+
+/// [`local_window_with_neighbors`] optimizing the `active_keyframes` newest
+/// keyframes; solve it with the same count.
+pub fn local_window_sized(
+    map: &Map,
+    neighbors: impl IntoIterator<Item = (usize, usize)>,
+    active_keyframes: usize,
+) -> BaWindow {
     let keyframes = map.keyframes();
-    let active_start = keyframes.len().saturating_sub(MAX_ACTIVE_KFS);
+    let active_start = keyframes.len().saturating_sub(active_keyframes);
     let active = &keyframes[active_start..];
     let landmark_ids = live_landmarks_of(map, active);
 
@@ -246,6 +257,15 @@ pub fn run_initial_ba(
 /// via camera), calls the Schur solver, and returns optimized poses and points.
 /// An early exit returns an unchanged update for the worker to publish normally.
 pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
+    run_local_ba_sized(snapshot, camera, DEFAULT_ACTIVE_KEYFRAMES)
+}
+
+/// [`run_local_ba`] optimizing the `active_keyframes` newest captured keyframes.
+pub fn run_local_ba_sized(
+    snapshot: BaSnapshot,
+    camera: &PinholeCamera,
+    active_keyframes: usize,
+) -> BaUpdate {
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
     const MIN_OBSERVATIONS: usize = 8;
@@ -255,7 +275,7 @@ pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
         return update;
     }
 
-    let active_start = n_kfs.saturating_sub(MAX_ACTIVE_KFS);
+    let active_start = n_kfs.saturating_sub(active_keyframes);
 
     let window = WindowPoints::collect(snapshot, &snapshot.keyframes()[active_start..]);
     if window.is_empty() {
@@ -328,6 +348,28 @@ pub fn run_local_inertial_ba(
     wheel_factors: &[WheelOdomFactor],
     stationary_factors: &[StationaryFactor],
 ) -> BaUpdate {
+    run_local_inertial_ba_sized(
+        snapshot,
+        camera,
+        imu_t_bc,
+        gravity_world,
+        wheel_factors,
+        stationary_factors,
+        DEFAULT_ACTIVE_KEYFRAMES,
+    )
+}
+
+/// [`run_local_inertial_ba`] optimizing the `active_keyframes` newest captured
+/// keyframes.
+pub fn run_local_inertial_ba_sized(
+    snapshot: BaSnapshot,
+    camera: &PinholeCamera,
+    imu_t_bc: Option<Pose3d>,
+    gravity_world: Vec3F64,
+    wheel_factors: &[WheelOdomFactor],
+    stationary_factors: &[StationaryFactor],
+    active_keyframes: usize,
+) -> BaUpdate {
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
     use crate::mapping::vi_ba_schur::{ViBaParams, visual_inertial_bundle_adjust};
@@ -339,7 +381,7 @@ pub fn run_local_inertial_ba(
         return update;
     }
 
-    let active_start = n_kfs.saturating_sub(MAX_ACTIVE_KFS);
+    let active_start = n_kfs.saturating_sub(active_keyframes);
 
     let window = WindowPoints::collect(snapshot, &snapshot.keyframes()[active_start..]);
     if window.is_empty() {

@@ -78,6 +78,13 @@ impl OrbSlamPipeline {
             FrontendConfig::Orb(orb) => orb.validate()?,
         }
         validate_keyframes(&self.keyframes, sensors.imu)?;
+        if self.mapping.local_ba_keyframes == 0 {
+            return Err(ConfigError::InvalidSetting {
+                setting: "mapping.local_ba_keyframes".into(),
+                value: 0.0,
+                requirement: "at least 1",
+            });
+        }
         validate_loop_closing(&self.loop_closing, sensors)?;
         validate_tuning(&self.tuning, self.loop_closing.is_enabled())
     }

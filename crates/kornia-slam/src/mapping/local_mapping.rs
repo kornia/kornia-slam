@@ -36,24 +36,31 @@ pub struct KeyframeJob {
     pub imu_initialized: bool,
     pub imu_t_bc: Option<Pose3d>,
     pub gravity_world: Vec3F64,
+    /// Keyframes the local BA optimizes.
+    pub local_ba_keyframes: usize,
 }
 
-fn capture_local_window(map: &Map) -> BaSnapshot {
-    map.ba_snapshot(&super::bundle_adjustment::local_window(map))
+fn capture_local_window(map: &Map, job: &KeyframeJob) -> BaSnapshot {
+    map.ba_snapshot(&super::bundle_adjustment::local_window_sized(
+        map,
+        [],
+        job.local_ba_keyframes,
+    ))
 }
 
 fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJob) -> BaUpdate {
     if job.imu_initialized {
-        super::bundle_adjustment::run_local_inertial_ba(
+        super::bundle_adjustment::run_local_inertial_ba_sized(
             snapshot,
             camera,
             job.imu_t_bc,
             job.gravity_world,
             &[],
             &[],
+            job.local_ba_keyframes,
         )
     } else {
-        super::bundle_adjustment::run_local_ba(snapshot, camera)
+        super::bundle_adjustment::run_local_ba_sized(snapshot, camera, job.local_ba_keyframes)
     }
 }
 
@@ -123,6 +130,7 @@ impl LocalMapping {
             } => {
                 let snapshot = capture_local_window(
                     &map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    &job,
                 );
                 let update = solve_snapshot(snapshot, camera, &job);
                 // Cull under the same lock as the merge, so a completed result
@@ -233,6 +241,7 @@ impl LocalMappingHandle {
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         capture_local_window(
                             &map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            &job,
                         )
                     };
 
@@ -339,6 +348,7 @@ mod tests {
             imu_initialized: false,
             imu_t_bc: None,
             gravity_world: Vec3F64::ZERO,
+            local_ba_keyframes: crate::mapping::bundle_adjustment::DEFAULT_ACTIVE_KEYFRAMES,
         }
     }
 

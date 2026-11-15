@@ -1,0 +1,1500 @@
+//! Visual-Inertial Bundle Adjustment via dense Schur-complement reduction.
+//!
+//! Extends [`crate::schur_ba`] from 6-DOF visual BA to 15-DOF VI-BA by
+//! adding IMU preintegration residuals between consecutive keyframes.
+//!
+//! ## State layout per keyframe
+//!
+//! ```text
+//! x_i = [ ρ(3) | ω(3) | v(3) | b_g(3) | b_a(3) ]   (15-DOF tangent)
+//!          pose(6)     vel(3)   gyro-bias  accel-bias
+//! ```
+//!
+//! ## Block structure of the normal equations H·δx = b
+//!
+//! ```text
+//!     H = [ A    E  ]     A  = 15P × 15P  (BLOCK-TRIDIAGONAL, not diagonal!)
+//!         [ Eᵀ   C  ]     C  =  3N ×  3N  (block-diagonal, same as visual BA)
+//!                          E  = 15P ×  3N  (sparse, visual obs only)
+//! ```
+//!
+//! The tridiagonal structure of A comes from IMU residuals coupling frame i
+//! and frame i+1 through off-diagonal 15×15 blocks. Visual residuals add
+//! only to the diagonal 15×15 block of whichever frame they belong to.
+//!
+//! ## IMU residual (Mur-Artal & Tardós RA-L 2017, eq. 3-5)
+//!
+//! ```text
+//! r_ΔR  = Log( ΔR̃ᵀ · Rᵢᵀ · Rⱼ )       ∈ ℝ³
+//! r_Δv  = Rᵢᵀ(vⱼ - vᵢ - g·Δt) - Δṽ    ∈ ℝ³
+//! r_Δp  = Rᵢᵀ(pⱼ - pᵢ - vᵢ·Δt - ½g·Δt²) - Δp̃  ∈ ℝ³
+//! ```
+//!
+//! Jacobians use the preintegrated bias-correction Jacobians accumulated
+//! inside [`PreintegratedImu`] during integration, so no re-integration
+//! is needed when biases change within the BA loop.
+//!
+//! ## Schur elimination
+//!
+//! Identical to the pure-visual case — C (point block) is still block-diagonal
+//! and cheap to invert. The reduced camera system S = A - E·C⁻¹·Eᵀ is now
+//! 15P×15P (vs 6P×6P) but otherwise the same dense Cholesky solve applies.
+//!
+//! ## Reference
+//! Mur-Artal, R. and Tardós, J.D. (2017). "Visual-Inertial Monocular SLAM
+//! with Map Reuse." RA-L 2(2):796-803.
+
+use faer::prelude::Solve;
+use faer::Mat;
+use kornia_algebra::{Mat3AF32, Mat3F64, Vec3AF32, Vec3F64, SE3F32, SO3F32, SO3F64};
+use thiserror::Error;
+
+use kornia_3d::ba::{BaError, BaObservation};
+use kornia_3d::camera::PinholeCamera;
+use kornia_3d::pose::Pose3d;
+
+use crate::imu::{ImuBias, PreintegratedImu};
+use crate::schur_ba::MIN_Z;
+
+// Re-export the residual/Jacobian helper from schur_ba so we don't duplicate it.
+use crate::schur_ba::residual_and_jacobians;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Errors specific to VI-BA.
+#[derive(Debug, Error)]
+pub enum ViBaError {
+    #[error("Reduced system Cholesky failed (rank-deficient): {0}")]
+    CholeskyFailed(String),
+    #[error("All keyframe variables are fixed — nothing to optimise")]
+    NoFreeVariables,
+    #[error("IMU edge keyframe indices out of range: {0} → {1}")]
+    ImuEdgeOutOfRange(usize, usize),
+    #[error(transparent)]
+    Ba(#[from] BaError),
+}
+
+/// A single keyframe state for VI-BA.
+///
+/// Holds the 6-DOF pose, 3-DOF world-frame velocity, and 6-DOF IMU bias.
+/// Together these form the 15-DOF state vector that VI-BA optimises.
+#[derive(Debug, Clone)]
+pub struct ViBaKeyframe {
+    /// World→camera pose. Same convention as [`Pose3d`] in schur_ba.
+    pub pose: Pose3d,
+    /// Velocity in world frame (m/s).
+    pub velocity: Vec3F64,
+    /// IMU bias estimate at this keyframe.
+    pub bias: ImuBias,
+    /// If true, pose+velocity+bias are held fixed (used for the first keyframe
+    /// as the gauge anchor, or for marginalised frames).
+    pub fixed: bool,
+}
+
+/// An IMU edge connecting two consecutive keyframes.
+///
+/// `from_idx` and `to_idx` must be consecutive keyframe indices (to_idx =
+/// from_idx + 1 in a window), though non-consecutive indices work as long as
+/// `preintegrated` covers the interval.
+#[derive(Debug, Clone)]
+pub struct ImuEdge {
+    pub from_idx: usize,
+    pub to_idx: usize,
+    /// Preintegrated measurements between the two keyframes.
+    pub preintegrated: PreintegratedImu,
+}
+
+/// Parameters for VI-BA.
+#[derive(Debug, Clone)]
+pub struct ViBaParams {
+    pub max_iterations: usize,
+    /// Levenberg-Marquardt initial damping.
+    pub initial_lambda: f64,
+    /// Relative cost-decrease threshold for convergence.
+    pub cost_tolerance: f64,
+    /// Gravity vector in world frame, e.g. [0, 0, -9.81].
+    pub gravity: Vec3F64,
+}
+
+impl Default for ViBaParams {
+    fn default() -> Self {
+        Self {
+            max_iterations: 20,
+            initial_lambda: 1e-4,
+            cost_tolerance: 1e-6,
+            gravity: Vec3F64::new(0.0, 0.0, -9.81),
+        }
+    }
+}
+
+/// Output of VI-BA.
+#[derive(Debug, Clone)]
+pub struct ViBaResult {
+    pub keyframes: Vec<ViBaKeyframe>,
+    pub points: Vec<Vec3F64>,
+    pub iterations: usize,
+    pub converged: bool,
+    pub final_cost: f64,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal state helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Flat 15-DOF tangent vector for one keyframe:
+/// indices [0..6) = pose (ρ,ω), [6..9) = vel, [9..12) = b_g, [12..15) = b_a.
+type Tangent15 = [f64; 15];
+
+/// Convert Pose3d → SE3F32 (copy from schur_ba).
+fn pose_to_se3(pose: &Pose3d) -> SE3F32 {
+    let r = Mat3AF32::from_cols(
+        Vec3AF32::new(
+            pose.rotation.col(0).x as f32,
+            pose.rotation.col(0).y as f32,
+            pose.rotation.col(0).z as f32,
+        ),
+        Vec3AF32::new(
+            pose.rotation.col(1).x as f32,
+            pose.rotation.col(1).y as f32,
+            pose.rotation.col(1).z as f32,
+        ),
+        Vec3AF32::new(
+            pose.rotation.col(2).x as f32,
+            pose.rotation.col(2).y as f32,
+            pose.rotation.col(2).z as f32,
+        ),
+    );
+    SE3F32::new(
+        SO3F32::from_matrix(&r),
+        Vec3AF32::new(
+            pose.translation.x as f32,
+            pose.translation.y as f32,
+            pose.translation.z as f32,
+        ),
+    )
+}
+
+fn se3_to_pose(se3: &SE3F32) -> Pose3d {
+    let r = se3.r.matrix();
+    let t = se3.t;
+    Pose3d::new(
+        Mat3F64::from_cols(
+            Vec3F64::new(r.col(0).x as f64, r.col(0).y as f64, r.col(0).z as f64),
+            Vec3F64::new(r.col(1).x as f64, r.col(1).y as f64, r.col(1).z as f64),
+            Vec3F64::new(r.col(2).x as f64, r.col(2).y as f64, r.col(2).z as f64),
+        ),
+        Vec3F64::new(t.x as f64, t.y as f64, t.z as f64),
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IMU residual and Jacobians
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Skew-symmetric (hat) matrix of a 3-vector.
+#[inline]
+fn skew(v: Vec3F64) -> Mat3F64 {
+    // Column-major: col j = e_j × v... but we build it directly.
+    //  [ 0  -vz   vy ]
+    //  [ vz   0  -vx ]
+    //  [-vy  vx    0 ]
+    Mat3F64::from_cols(
+        Vec3F64::new(0.0,   v.z, -v.y),
+        Vec3F64::new(-v.z,  0.0,  v.x),
+        Vec3F64::new(v.y,  -v.x,  0.0),
+    )
+}
+
+/// 3×3 matrix multiply: returns A·B.
+fn mat3_mul(a: &Mat3F64, b: &Mat3F64) -> Mat3F64 {
+    Mat3F64(a.mul_mat3(b))
+}
+
+/// 3×3 matrix transpose.
+fn mat3_transpose(m: &Mat3F64) -> Mat3F64 {
+    Mat3F64(*m.transpose())
+}
+
+/// Extract the rotation matrix from a Pose3d as Mat3F64.
+#[inline]
+fn pose_rot(p: &Pose3d) -> Mat3F64 {
+    p.rotation
+}
+
+/// Vee map: extract the rotation vector from a skew-symmetric matrix.
+/// Assumes m ≈ skew(v); returns v.
+fn vee(m: &Mat3F64) -> Vec3F64 {
+    // m[r,c] via column-major:  m.col(c)[r]
+    Vec3F64::new(
+        m.col(2).y - m.col(1).z,   // (m[2,1] - m[1,2]) / 2 … but RA-L uses full difference
+        m.col(0).z - m.col(2).x,
+        m.col(1).x - m.col(0).y,
+    ) * 0.5
+}
+
+/// Log map on SO(3): returns the rotation vector θ such that Exp(θ) = R.
+/// Uses the standard Rodrigues log formula.
+fn so3_log(r: &Mat3F64) -> Vec3F64 {
+    let trace = r.col(0).x + r.col(1).y + r.col(2).z;
+    // cos(θ) = (trace - 1) / 2, clamped to [-1, 1].
+    let cos_theta = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0);
+    let theta = cos_theta.acos(); // ∈ [0, π]
+    if theta.abs() < 1e-10 {
+        // Near identity: use first-order approximation.
+        return vee(r);
+    }
+    // Log(R) = θ / (2 sin θ) · (R - Rᵀ)
+    let factor = theta / (2.0 * theta.sin());
+    let diff = Mat3F64::from_cols(
+        r.col(0) - Mat3F64(*r.transpose()).col(0),
+        r.col(1) - Mat3F64(*r.transpose()).col(1),
+        r.col(2) - Mat3F64(*r.transpose()).col(2),
+    );
+    vee(&Mat3F64::from_cols(
+        diff.col(0) * factor,
+        diff.col(1) * factor,
+        diff.col(2) * factor,
+    ))
+}
+
+/// Right Jacobian inverse of SO(3): J_r⁻¹(θ).
+/// At θ ≈ 0, returns I + ½[θ]×.
+fn so3_right_jac_inv(theta: Vec3F64) -> Mat3F64 {
+    let angle = (theta.x * theta.x + theta.y * theta.y + theta.z * theta.z).sqrt();
+    if angle < 1e-10 {
+        // First-order: J_r⁻¹ ≈ I + ½[θ]×
+        let half_skew = skew(theta * 0.5);
+        return Mat3F64::from_cols(
+            Mat3F64::IDENTITY.col(0) + half_skew.col(0),
+            Mat3F64::IDENTITY.col(1) + half_skew.col(1),
+            Mat3F64::IDENTITY.col(2) + half_skew.col(2),
+        );
+    }
+    let s = skew(theta);
+    let s2 = mat3_mul(&s, &s);
+    let c1 = 1.0 / (angle * angle) - (1.0 + theta.cos()) / (2.0 * angle * theta.sin());
+    // J_r⁻¹ = I + ½[θ]× + (1/θ² - (1+cos θ)/(2θ sin θ))[θ]×²
+    Mat3F64::from_cols(
+        Mat3F64::IDENTITY.col(0) + skew(theta * 0.5).col(0) + s2.col(0) * c1,
+        Mat3F64::IDENTITY.col(1) + skew(theta * 0.5).col(1) + s2.col(1) * c1,
+        Mat3F64::IDENTITY.col(2) + skew(theta * 0.5).col(2) + s2.col(2) * c1,
+    )
+}
+
+/// Computes the 9-vector IMU residual [r_ΔR(3), r_Δv(3), r_Δp(3)] and the
+/// two 9×15 Jacobians (w.r.t. state at frame i and frame j).
+///
+/// All quantities in world frame. The preintegrated measurements inside
+/// `pim` have already been bias-corrected to first order via the stored
+/// bias-Jacobians.
+///
+/// # Outputs
+/// - `residual`: [r_ΔR(3) | r_Δv(3) | r_Δp(3)]
+/// - `ji`: 9×15 Jacobian w.r.t. x_i = [pose(6), v(3), b_g(3), b_a(3)]
+/// - `jj`: 9×15 Jacobian w.r.t. x_j = [pose(6), v(3), b_g(3), b_a(3)]
+///
+/// Row-major layout for both Jacobians.
+fn imu_residual_and_jacobians(
+    frame_i: &ViBaKeyframe,
+    frame_j: &ViBaKeyframe,
+    pim: &PreintegratedImu,
+    gravity: Vec3F64,
+) -> ([f64; 9], [f64; 135], [f64; 135]) {
+    let ri = pose_rot(&frame_i.pose); // R_{WB_i} — body-to-world rotation at i
+    let rj = pose_rot(&frame_j.pose);
+    let vi = frame_i.velocity;
+    let vj = frame_j.velocity;
+    let pi = frame_i.pose.translation; // world-frame position at i
+    let pj = frame_j.pose.translation;
+    let dt = pim.dt;
+
+    // ── Bias-corrected preintegrated measurements (first-order) ──────────
+    let delta_r = pim.delta_rotation_with_bias(&frame_i.bias);
+    let delta_v = pim.delta_velocity_with_bias(&frame_i.bias);
+    let delta_p = pim.delta_position_with_bias(&frame_i.bias);
+
+    // Ri^T  (world→body at frame i)
+    let ri_t = mat3_transpose(&ri);
+
+    // ── Residuals (RA-L 2017 eq. 3-5) ────────────────────────────────────
+    // r_ΔR = Log( ΔR̃ᵀ · Rᵢᵀ · Rⱼ )
+    let delta_r_t = mat3_transpose(&delta_r);
+    let r_ij = mat3_mul(&ri_t, &rj);          // Rᵢᵀ Rⱼ
+    let err_r_mat = mat3_mul(&delta_r_t, &r_ij); // ΔR̃ᵀ · Rᵢᵀ Rⱼ
+    let r_dr = so3_log(&err_r_mat);           // ∈ ℝ³
+
+    // r_Δv = Rᵢᵀ(vⱼ - vᵢ - g·Δt) - Δṽ
+    let v_term = ri_t * (vj - vi - gravity * dt);
+    let r_dv = v_term - delta_v;
+
+    // r_Δp = Rᵢᵀ(pⱼ - pᵢ - vᵢ·Δt - ½g·Δt²) - Δp̃
+    let p_term = ri_t * (pj - pi - vi * dt - gravity * (0.5 * dt * dt));
+    let r_dp = p_term - delta_p;
+
+    let residual: [f64; 9] = [
+        r_dr.x, r_dr.y, r_dr.z,
+        r_dv.x, r_dv.y, r_dv.z,
+        r_dp.x, r_dp.y, r_dp.z,
+    ];
+
+    // ── Jacobians ─────────────────────────────────────────────────────────
+    // J_r⁻¹ evaluated at r_ΔR (for the rotation residual rows).
+    // Near convergence this ≈ I; we compute it exactly.
+    let jr_inv = so3_right_jac_inv(r_dr);
+
+    // ── w.r.t. frame i ───────────────────────────────────────────────────
+    // Layout per row block of 15 cols: [dρ(3) | dω(3) | dv(3) | db_g(3) | db_a(3)]
+    //
+    // r_ΔR row (indices 0..3):
+    //   ∂r_ΔR/∂ρᵢ = 0      (translation doesn't affect rotation residual)
+    //   ∂r_ΔR/∂ωᵢ = -J_r⁻¹ · Rⱼᵀ · Rᵢ    (left-perturbation of Rᵢ)
+    //   ∂r_ΔR/∂vᵢ = 0
+    //   ∂r_ΔR/∂b_gᵢ = -J_r⁻¹ · J^{bg}_{ΔR}   (bias correction Jacobian)
+    //   ∂r_ΔR/∂b_aᵢ = 0
+    //
+    // r_Δv row (indices 3..6):
+    //   ∂r_Δv/∂ρᵢ = 0
+    //   ∂r_Δv/∂ωᵢ = [Rᵢᵀ(vⱼ-vᵢ-g·Δt)]×       (skew of the v_term)
+    //   ∂r_Δv/∂vᵢ = -Rᵢᵀ
+    //   ∂r_Δv/∂b_gᵢ = -J^{bg}_{Δv}
+    //   ∂r_Δv/∂b_aᵢ = -J^{ba}_{Δv}
+    //
+    // r_Δp row (indices 6..9):
+    //   ∂r_Δp/∂ρᵢ = -Rᵢᵀ                       (position enters via Rᵢᵀ·(pⱼ-pᵢ-…))
+    //   ∂r_Δp/∂ωᵢ = [Rᵢᵀ(pⱼ-pᵢ-vᵢΔt-½gΔt²)]×  (skew of p_term)
+    //   ∂r_Δp/∂vᵢ = -Rᵢᵀ·Δt
+    //   ∂r_Δp/∂b_gᵢ = -J^{bg}_{Δp}
+    //   ∂r_Δp/∂b_aᵢ = -J^{ba}_{Δp}
+
+    let rj_t = mat3_transpose(&rj);
+    let rjt_ri = mat3_mul(&rj_t, &ri);                   // Rⱼᵀ Rᵢ
+
+    // Rotation-residual Jacobians (rows 0..3).
+    let d_rdr_d_omegai = mat3_mul(&jr_inv, &mat3_mul(&mat3_transpose(&err_r_mat), &mat3_transpose(&ri)));
+    // Note: left perturbation exp(φ)·Rᵢ gives ∂r_ΔR/∂φ = -J_r⁻¹(r_ΔR)·(Rⱼᵀ·Rᵢ)
+    // The sign: perturbing Rᵢ → exp(φ)Rᵢ means err_r_mat → ΔR̃ᵀ·(Rᵢᵀexp(-φ))·Rⱼ
+    // ⇒ ∂r_ΔR/∂φ = -J_r⁻¹·Rⱼᵀ·Rᵢ (note double negative from -exp(-φ)·... → final sign is negative)
+    let d_rdr_d_omegai_neg = neg_mat3(&mat3_mul(&jr_inv, &rjt_ri));
+    let d_rdr_d_bgi = neg_mat3(&mat3_mul(&jr_inv, &pim.d_rotation_d_bias_gyro));
+
+    // v-residual Jacobians (rows 3..6).
+    let d_rdv_d_omegai = skew(v_term);          // [Rᵢᵀ(vⱼ-vᵢ-gΔt)]×
+    let d_rdv_d_vi = neg_mat3(&ri_t);
+    let d_rdv_d_bgi = neg_mat3(&pim.d_velocity_d_bias_gyro);
+    let d_rdv_d_bai = neg_mat3(&pim.d_velocity_d_bias_accel);
+
+    // p-residual Jacobians (rows 6..9).
+    let d_rdp_d_rhoi = neg_mat3(&ri_t);         // ∂r_Δp/∂ρᵢ = -Rᵢᵀ
+    let d_rdp_d_omegai = skew(p_term);          // [Rᵢᵀ(…)]×
+    let d_rdp_d_vi = neg_mat3(&mat3_scalar_mul(&ri_t, dt));
+    let d_rdp_d_bgi = neg_mat3(&pim.d_position_d_bias_gyro);
+    let d_rdp_d_bai = neg_mat3(&pim.d_position_d_bias_accel);
+
+    // Pack ji: 9 rows × 15 cols, row-major.
+    // Col layout: [ρ(0..3) | ω(3..6) | v(6..9) | b_g(9..12) | b_a(12..15)]
+    let mut ji = [0.0f64; 135];
+
+    // Rows 0..3 (r_ΔR).
+    // ∂/∂ρᵢ = 0 (already zero from init)
+    // ∂/∂ωᵢ = d_rdr_d_omegai_neg (3×3)
+    set_block_9x15(&mut ji, 0, 3, &d_rdr_d_omegai_neg);
+    // ∂/∂vᵢ = 0
+    // ∂/∂b_gᵢ = d_rdr_d_bgi (3×3)
+    set_block_9x15(&mut ji, 0, 9, &d_rdr_d_bgi);
+    // ∂/∂b_aᵢ = 0
+
+    // Rows 3..6 (r_Δv).
+    // ∂/∂ρᵢ = 0
+    set_block_9x15(&mut ji, 3, 3, &d_rdv_d_omegai);
+    set_block_9x15(&mut ji, 3, 6, &d_rdv_d_vi);
+    set_block_9x15(&mut ji, 3, 9, &d_rdv_d_bgi);
+    set_block_9x15(&mut ji, 3, 12, &d_rdv_d_bai);
+
+    // Rows 6..9 (r_Δp).
+    set_block_9x15(&mut ji, 6, 0, &d_rdp_d_rhoi);
+    set_block_9x15(&mut ji, 6, 3, &d_rdp_d_omegai);
+    set_block_9x15(&mut ji, 6, 6, &d_rdp_d_vi);
+    set_block_9x15(&mut ji, 6, 9, &d_rdp_d_bgi);
+    set_block_9x15(&mut ji, 6, 12, &d_rdp_d_bai);
+
+    // ── w.r.t. frame j ───────────────────────────────────────────────────
+    // r_ΔR:
+    //   ∂/∂ωⱼ = J_r⁻¹  (perturbing Rⱼ: ΔR̃ᵀ·Rᵢᵀ·exp(φ)·Rⱼ → +J_r⁻¹)
+    //
+    // r_Δv:
+    //   ∂/∂vⱼ = Rᵢᵀ
+    //
+    // r_Δp:
+    //   ∂/∂ρⱼ = Rᵢᵀ
+    //   (everything else at j is zero — preintegrated terms don't depend on j)
+    let mut jj = [0.0f64; 135];
+
+    // Rows 0..3 (r_ΔR): ∂/∂ωⱼ = J_r⁻¹
+    set_block_9x15(&mut jj, 0, 3, &jr_inv);
+
+    // Rows 3..6 (r_Δv): ∂/∂vⱼ = Rᵢᵀ
+    set_block_9x15(&mut jj, 3, 6, &ri_t);
+
+    // Rows 6..9 (r_Δp): ∂/∂ρⱼ = Rᵢᵀ  (position of j enters via Rᵢᵀ·pⱼ)
+    set_block_9x15(&mut jj, 6, 0, &ri_t);
+
+    (residual, ji, jj)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Small block-algebra helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Negate a Mat3F64.
+#[inline]
+fn neg_mat3(m: &Mat3F64) -> Mat3F64 {
+    Mat3F64::from_cols(-m.col(0), -m.col(1), -m.col(2))
+}
+
+/// Scalar multiply a Mat3F64.
+#[inline]
+fn mat3_scalar_mul(m: &Mat3F64, s: f64) -> Mat3F64 {
+    Mat3F64::from_cols(m.col(0) * s, m.col(1) * s, m.col(2) * s)
+}
+
+/// Write a 3×3 Mat3F64 block into a flat row-major 9×15 array.
+/// `row_start` is the starting row index (0, 3, or 6).
+/// `col_start` is the starting column index (0, 3, 6, 9, or 12).
+fn set_block_9x15(out: &mut [f64; 135], row_start: usize, col_start: usize, block: &Mat3F64) {
+    // Mat3F64 is column-major, so block.col(c)[r] gives element (r, c).
+    for c in 0..3 {
+        let col_data = block.col(col_start + c);  // This is wrong — col() takes col index directly
+        // Actually: col_data = block.col(c) since block is 3×3, not 15-wide.
+        let col_data = block.col(c);
+        for r in 0..3 {
+            // Row-major index into 9×15: (row_start + r) * 15 + (col_start + c)
+            out[(row_start + r) * 15 + (col_start + c)] = match r {
+                0 => col_data.x,
+                1 => col_data.y,
+                _ => col_data.z,
+            };
+        }
+    }
+}
+
+/// Accumulate Jᵀ·J into a 15×15 block (row-major flat [225]).
+/// J is row-major 9×15.
+fn ata_15x15_into(acc: &mut [f64; 225], j: &[f64; 135]) {
+    // acc += Jᵀ J: acc[i,k] += sum_r J[r,i]*J[r,k]
+    for i in 0..15 {
+        for k in 0..15 {
+            let mut s = 0.0f64;
+            for r in 0..9 {
+                s += j[r * 15 + i] * j[r * 15 + k];
+            }
+            acc[i * 15 + k] += s;
+        }
+    }
+}
+
+/// Accumulate off-diagonal Jᵢᵀ·Jⱼ into a 15×15 block.
+/// Used for the IMU coupling between frames i and j.
+/// acc += ji.T @ jj  (both are 9×15 row-major)
+fn ata_cross_15x15_into(acc: &mut [f64; 225], ji: &[f64; 135], jj: &[f64; 135]) {
+    for i in 0..15 {
+        for k in 0..15 {
+            let mut s = 0.0f64;
+            for r in 0..9 {
+                s += ji[r * 15 + i] * jj[r * 15 + k];
+            }
+            acc[i * 15 + k] += s;
+        }
+    }
+}
+
+/// Accumulate -Jᵀ·r into a 15-vector RHS.
+/// j: 9×15 row-major, r: 9-vector.
+fn atb_15x1_into_imu(acc: &mut [f64; 15], j: &[f64; 135], r: &[f64; 9]) {
+    for i in 0..15 {
+        let mut s = 0.0f64;
+        for row in 0..9 {
+            s += j[row * 15 + i] * r[row];
+        }
+        acc[i] -= s;
+    }
+}
+
+/// Accumulate visual Jᵀ·J (2×6 visual pose Jacobian) into the [0..6,0..6]
+/// sub-block of a 15×15 accumulator.
+fn ata_visual_into_15x15(acc: &mut [f64; 225], j_pose: &[f32; 12]) {
+    // j_pose is 2×6 row-major. We extend it to 2×15 with zeros in [6..15].
+    // acc[i,k] += sum_{r=0}^{1} j_pose[r,i]*j_pose[r,k]  for i,k ∈ [0..6]
+    let r0 = &j_pose[0..6];
+    let r1 = &j_pose[6..12];
+    for i in 0..6 {
+        for k in 0..6 {
+            acc[i * 15 + k] += (r0[i] * r0[k] + r1[i] * r1[k]) as f64;
+        }
+    }
+}
+
+/// Accumulate visual -Jᵀ·r into the [0..6] sub-vector of a 15-element RHS.
+fn atb_visual_into_15(acc: &mut [f64; 15], j_pose: &[f32; 12], r: &[f32; 2]) {
+    for i in 0..6 {
+        acc[i] -= (j_pose[i] * r[0] + j_pose[6 + i] * r[1]) as f64;
+    }
+}
+
+/// Accumulate visual Jᵀ_pose · J_point into a 15×3 cross-term block.
+/// Only the [0..6] rows of the 15×3 are non-zero.
+fn atb_visual_15x3(acc: &mut [f64; 45], j_pose: &[f32; 12], j_point: &[f32; 6]) {
+    let jp0 = &j_pose[0..6];
+    let jp1 = &j_pose[6..12];
+    let jx0 = &j_point[0..3];
+    let jx1 = &j_point[3..6];
+    for i in 0..6 {
+        for k in 0..3 {
+            acc[i * 3 + k] += (jp0[i] * jx0[k] + jp1[i] * jx1[k]) as f64;
+        }
+    }
+}
+
+/// 3×3 inversion (same as schur_ba, but f64).
+fn invert_3x3_f64(m: &[f64; 9]) -> Option<[f64; 9]> {
+    let (a, b, c, d, e, f, g, h, i) =
+        (m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]);
+    let det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if det.abs() < 1e-20 {
+        return None;
+    }
+    let inv = 1.0 / det;
+    Some([
+        (e * i - f * h) * inv, (c * h - b * i) * inv, (b * f - c * e) * inv,
+        (f * g - d * i) * inv, (a * i - c * g) * inv, (c * d - a * f) * inv,
+        (d * h - e * g) * inv, (b * g - a * h) * inv, (a * e - b * d) * inv,
+    ])
+}
+
+/// 3×3 multiply f64: returns A·B (row-major).
+fn mat3_mul_flat(a: &[f64; 9], b: &[f64; 9]) -> [f64; 9] {
+    let mut out = [0.0f64; 9];
+    for i in 0..3 {
+        for k in 0..3 {
+            for j in 0..3 {
+                out[i * 3 + k] += a[i * 3 + j] * b[j * 3 + k];
+            }
+        }
+    }
+    out
+}
+
+/// Mat3F64 → row-major [f64; 9].
+fn mat3_to_flat(m: &Mat3F64) -> [f64; 9] {
+    // Mat3F64 is column-major internally: col(c)[r]
+    let mut out = [0.0f64; 9];
+    for c in 0..3 {
+        let col = m.col(c);
+        let vals = [col.x, col.y, col.z];
+        for r in 0..3 {
+            out[r * 3 + c] = vals[r];
+        }
+    }
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Schur reduction helpers for 15-DOF blocks
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// B_15x3 @ C⁻¹_3x3 → 15×3 (both row-major).
+fn matmul_15x3_3x3(a: &[f64; 45], b: &[f64; 9]) -> [f64; 45] {
+    let mut out = [0.0f64; 45];
+    for i in 0..15 {
+        for k in 0..3 {
+            let mut s = 0.0f64;
+            for r in 0..3 {
+                s += a[i * 3 + r] * b[r * 3 + k];
+            }
+            out[i * 3 + k] = s;
+        }
+    }
+    out
+}
+
+/// (B_15x3 @ C⁻¹) @ g_point_3 → 15-vector.
+fn matvec_15x3_3(a: &[f64; 45], b: &[f64; 3]) -> [f64; 15] {
+    let mut out = [0.0f64; 15];
+    for i in 0..15 {
+        out[i] = a[i * 3] * b[0] + a[i * 3 + 1] * b[1] + a[i * 3 + 2] * b[2];
+    }
+    out
+}
+
+/// (B_15x3 @ C⁻¹) @ B2_15x3.T → 15×15.  Result += outer contribution.
+fn schur_15x15_contrib(acc: &mut [f64; 225], bc: &[f64; 45], b2: &[f64; 45]) {
+    // acc[i,k] -= sum_{r=0}^{2} bc[i,r] * b2[k,r]
+    for i in 0..15 {
+        for k in 0..15 {
+            let mut s = 0.0f64;
+            for r in 0..3 {
+                s += bc[i * 3 + r] * b2[k * 3 + r];
+            }
+            acc[i * 15 + k] -= s;
+        }
+    }
+}
+
+/// Back-substitute: C⁻¹ @ (g_p - Bᵀ·δc) → 3-vector point update.
+fn back_sub_point(
+    c_inv: &[f64; 9],
+    g_p: &[f64; 3],
+    b_blocks: &[(usize, [f64; 45])],
+    d_pose_all: &[f64],    // flat 15P vector
+) -> [f64; 3] {
+    let mut rhs = *g_p;
+    for (i_loc, b) in b_blocks {
+        // contrib = Bᵀ · δc_i  (B is 15×3, so Bᵀ is 3×15)
+        // rhs[k] -= sum_{r=0}^{14} B[r,k] * dp[i_loc*15 + r]
+        let base = i_loc * 15;
+        for k in 0..3 {
+            let mut s = 0.0f64;
+            for r in 0..15 {
+                s += b[r * 3 + k] * d_pose_all[base + r];
+            }
+            rhs[k] -= s;
+        }
+    }
+    // δp = C⁻¹ · rhs
+    [
+        c_inv[0] * rhs[0] + c_inv[1] * rhs[1] + c_inv[2] * rhs[2],
+        c_inv[3] * rhs[0] + c_inv[4] * rhs[1] + c_inv[5] * rhs[2],
+        c_inv[6] * rhs[0] + c_inv[7] * rhs[1] + c_inv[8] * rhs[2],
+    ]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Retract helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Apply a 15-DOF tangent update to a ViBaKeyframe.
+///
+/// Pose (6-DOF): use SE3F32::retract — same as schur_ba.
+/// Velocity (3-DOF): additive update in ℝ³.
+/// Bias (6-DOF): additive update in ℝ⁶.
+fn retract_keyframe(kf: &ViBaKeyframe, delta: &Tangent15) -> ViBaKeyframe {
+    // Pose retract (6-DOF).
+    let se3 = pose_to_se3(&kf.pose);
+    let delta_f32: [f32; 6] = [
+        delta[0] as f32, delta[1] as f32, delta[2] as f32,
+        delta[3] as f32, delta[4] as f32, delta[5] as f32,
+    ];
+    let se3_new = se3.retract(&delta_f32);
+    let pose_new = se3_to_pose(&se3_new);
+
+    // Velocity: additive.
+    let velocity_new = Vec3F64::new(
+        kf.velocity.x + delta[6],
+        kf.velocity.y + delta[7],
+        kf.velocity.z + delta[8],
+    );
+
+    // Bias: additive (biases live in ℝ⁶).
+    let bias_new = ImuBias {
+        gyro: Vec3F64::new(
+            kf.bias.gyro.x + delta[9],
+            kf.bias.gyro.y + delta[10],
+            kf.bias.gyro.z + delta[11],
+        ),
+        accel: Vec3F64::new(
+            kf.bias.accel.x + delta[12],
+            kf.bias.accel.y + delta[13],
+            kf.bias.accel.z + delta[14],
+        ),
+    };
+
+    ViBaKeyframe {
+        pose: pose_new,
+        velocity: velocity_new,
+        bias: bias_new,
+        fixed: kf.fixed,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IMU information matrix (9×9 inverse covariance)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Extract the 9×9 navigation sub-block from the 9×9 covariance stored in
+/// [`PreintegratedImu::covariance`] (column-major) and invert it to get
+/// the information matrix Σ⁻¹.
+///
+/// The covariance is [rot(3), vel(3), pos(3)] in column-major layout
+/// matching the residual layout [r_ΔR, r_Δv, r_Δp].
+///
+/// For simplicity we use the diagonal approximation — weighting each
+/// residual block independently. A full 9×9 inversion is straightforward
+/// but typically the off-diagonal coupling is small for short windows.
+fn imu_information_diagonal(pim: &PreintegratedImu) -> [f64; 9] {
+    // Extract diagonal of the 9×9 covariance (column-major: cov[i + i*9]).
+    let mut info = [0.0f64; 9];
+    for i in 0..9 {
+        let var = pim.covariance[i + i * 9];
+        // Clamp to avoid division by near-zero.
+        info[i] = if var > 1e-30 { 1.0 / var } else { 1e30 };
+    }
+    info
+}
+
+/// Weighted accumulation: acc += wᵢ · Jᵀᵢ Jᵢ where wᵢ is per-row weight.
+fn ata_15x15_weighted(acc: &mut [f64; 225], j: &[f64; 135], w: &[f64; 9]) {
+    for i in 0..15 {
+        for k in 0..15 {
+            let mut s = 0.0f64;
+            for r in 0..9 {
+                s += w[r] * j[r * 15 + i] * j[r * 15 + k];
+            }
+            acc[i * 15 + k] += s;
+        }
+    }
+}
+
+fn ata_cross_15x15_weighted(
+    acc: &mut [f64; 225],
+    ji: &[f64; 135],
+    jj: &[f64; 135],
+    w: &[f64; 9],
+) {
+    for i in 0..15 {
+        for k in 0..15 {
+            let mut s = 0.0f64;
+            for r in 0..9 {
+                s += w[r] * ji[r * 15 + i] * jj[r * 15 + k];
+            }
+            acc[i * 15 + k] += s;
+        }
+    }
+}
+
+fn atb_15x1_weighted_imu(
+    acc: &mut [f64; 15],
+    j: &[f64; 135],
+    r: &[f64; 9],
+    w: &[f64; 9],
+) {
+    for i in 0..15 {
+        let mut s = 0.0f64;
+        for row in 0..9 {
+            s += w[row] * j[row * 15 + i] * r[row];
+        }
+        acc[i] -= s;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main VI-BA driver
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Visual-Inertial Bundle Adjustment via dense Schur-complement reduction.
+///
+/// Jointly optimises camera poses, velocities, IMU biases (15-DOF per
+/// keyframe) and 3D landmark positions (3-DOF each) by minimising:
+///
+/// ```text
+/// F = Σ_{(i,j)∈Obs} ‖r^vis_{ij}‖² + Σ_{edges} ‖r^imu_{k,k+1}‖²_{Σ⁻¹}
+/// ```
+///
+/// ## Arguments
+/// - `keyframes`: initial keyframe states. Set `fixed = true` on at least one
+///   keyframe to remove gauge freedom (typically the first keyframe).
+/// - `points`: initial 3D landmark positions in world frame.
+/// - `observations`: visual observations (same schema as [`BaObservation`]).
+///   `fixed_pose` and `fixed_point` flags are respected.
+/// - `imu_edges`: IMU preintegration edges. Each edge must have valid
+///   `from_idx` and `to_idx` into `keyframes`. Non-consecutive indices work
+///   as long as the preintegrated interval is correct.
+/// - `camera`: pinhole camera intrinsics.
+/// - `params`: optimisation parameters including gravity vector.
+///
+/// ## Returns
+/// Optimised keyframes and points, plus convergence diagnostics.
+pub fn visual_inertial_bundle_adjust(
+    keyframes: &[ViBaKeyframe],
+    points: &[Vec3F64],
+    observations: &[BaObservation],
+    imu_edges: &[ImuEdge],
+    camera: &PinholeCamera,
+    params: &ViBaParams,
+) -> Result<ViBaResult, ViBaError> {
+    let n_kf = keyframes.len();
+    let n_pt = points.len();
+
+    // Validate IMU edges.
+    for edge in imu_edges {
+        if edge.from_idx >= n_kf || edge.to_idx >= n_kf {
+            return Err(ViBaError::ImuEdgeOutOfRange(edge.from_idx, edge.to_idx));
+        }
+    }
+
+    // Local index maps for free keyframes and free points.
+    let kf_local: Vec<i64> = {
+        let mut v = vec![-1i64; n_kf];
+        let mut next = 0i64;
+        for (i, kf) in keyframes.iter().enumerate() {
+            if !kf.fixed {
+                v[i] = next;
+                next += 1;
+            }
+        }
+        v
+    };
+    let pt_local: Vec<i64> = {
+        let mut v = vec![-1i64; n_pt];
+        let mut next = 0i64;
+        for (i, obs) in observations.iter().enumerate() {
+            // A point is free if any observation marks it as free.
+            let _ = i;
+            if obs.point_idx < n_pt && !obs.fixed_point {
+                if v[obs.point_idx] < 0 {
+                    v[obs.point_idx] = next;
+                    next += 1;
+                }
+            }
+        }
+        v
+    };
+    let n_free_kf = kf_local.iter().filter(|&&x| x >= 0).count();
+    let n_free_pt = pt_local.iter().filter(|&&x| x >= 0).count();
+
+    if n_free_kf == 0 {
+        return Err(ViBaError::NoFreeVariables);
+    }
+
+    // Mutable working state.
+    let mut kfs: Vec<ViBaKeyframe> = keyframes.to_vec();
+    let mut pts: Vec<Vec3F64> = points.to_vec();
+    let mut lambda = params.initial_lambda;
+    let mut iters_done = 0usize;
+    let mut converged = false;
+    let mut final_cost = 0.0f64;
+
+    // Dimension of the reduced camera system.
+    let dim = n_free_kf * 15;
+
+    for _iter in 0..params.max_iterations {
+        iters_done += 1;
+
+        // ── Step 1: Build A (15P×15P), C (3N×3N), E (15P×3N), b_c, b_p ──
+        //
+        // A is stored as n_free_kf diagonal blocks (15×15 each) plus
+        // per-IMU-edge off-diagonal cross blocks. We handle off-diagonals
+        // separately and assemble into the dense M matrix at the end.
+        let mut a_diag = vec![[0.0f64; 225]; n_free_kf];    // diagonal 15×15 blocks
+        let mut a_offdiag: Vec<(usize, usize, [f64; 225])> = Vec::new(); // (i,j, block)
+        let mut c_blocks = vec![[0.0f64; 9]; n_free_pt];
+        let mut g_kf = vec![[0.0f64; 15]; n_free_kf];
+        let mut g_pt = vec![[0.0f64; 3]; n_free_pt];
+
+        // Per-point B contributions: (kf_local_idx, B_15x3)
+        let mut b_by_point: Vec<Vec<(usize, [f64; 45])>> = vec![Vec::new(); n_free_pt];
+
+        let mut cost = 0.0f64;
+
+        // ── Visual residuals ──────────────────────────────────────────────
+        for obs in observations {
+            if obs.pose_idx >= n_kf || obs.point_idx >= n_pt {
+                continue;
+            }
+            let kf = &kfs[obs.pose_idx];
+            let pt = &pts[obs.point_idx];
+            let se3 = pose_to_se3(&kf.pose);
+
+            let (r, j_pose, j_point) =
+                residual_and_jacobians(&se3, pt, obs.pixel, camera);
+
+            let r_sq = (r[0] * r[0] + r[1] * r[1]) as f64;
+            cost += 0.5 * r_sq;
+
+            let kli = if obs.fixed_pose { -1 } else { kf_local[obs.pose_idx] };
+            let xli = if obs.fixed_point { -1 } else { pt_local[obs.point_idx] };
+
+            // Accumulate into A diagonal (only [0..6,0..6] sub-block is nonzero
+            // for visual observations).
+            if kli >= 0 {
+                let kli_u = kli as usize;
+                ata_visual_into_15x15(&mut a_diag[kli_u], &j_pose);
+                atb_visual_into_15(&mut g_kf[kli_u], &j_pose, &r);
+            }
+
+            // Accumulate into C.
+            if xli >= 0 {
+                let xli_u = xli as usize;
+                // C is 3×3 block: accumulate j_point.T @ j_point.
+                let r0 = &j_point[0..3];
+                let r1 = &j_point[3..6];
+                for i in 0..3 {
+                    for k in 0..3 {
+                        c_blocks[xli_u][i * 3 + k] +=
+                            (r0[i] * r0[k] + r1[i] * r1[k]) as f64;
+                    }
+                }
+                // g_point
+                for i in 0..3 {
+                    g_pt[xli_u][i] -=
+                        (j_point[i] * r[0] + j_point[3 + i] * r[1]) as f64;
+                }
+            }
+
+            // Accumulate B (15×3 cross term, nonzero only in rows 0..6).
+            if kli >= 0 && xli >= 0 {
+                let mut b_block = [0.0f64; 45];
+                atb_visual_15x3(&mut b_block, &j_pose, &j_point);
+                b_by_point[xli as usize].push((kli as usize, b_block));
+            }
+        }
+
+        // ── IMU residuals ─────────────────────────────────────────────────
+        for edge in imu_edges {
+            let ki = edge.from_idx;
+            let kj = edge.to_idx;
+            let kli = kf_local[ki];
+            let klj = kf_local[kj];
+
+            // Skip if both are fixed (no Jacobian contribution).
+            if kli < 0 && klj < 0 {
+                continue;
+            }
+
+            let (residual, ji, jj) = imu_residual_and_jacobians(
+                &kfs[ki],
+                &kfs[kj],
+                &edge.preintegrated,
+                params.gravity,
+            );
+
+            // Per-row information weights (diagonal approximation of Σ⁻¹).
+            let w = imu_information_diagonal(&edge.preintegrated);
+
+            // Weighted residual cost: ½ rᵀ Σ⁻¹ r.
+            cost += 0.5
+                * (0..9)
+                    .map(|r_idx| w[r_idx] * residual[r_idx] * residual[r_idx])
+                    .sum::<f64>();
+
+            // Diagonal block for frame i.
+            if kli >= 0 {
+                let kli_u = kli as usize;
+                ata_15x15_weighted(&mut a_diag[kli_u], &ji, &w);
+                atb_15x1_weighted_imu(&mut g_kf[kli_u], &ji, &residual, &w);
+            }
+
+            // Diagonal block for frame j.
+            if klj >= 0 {
+                let klj_u = klj as usize;
+                ata_15x15_weighted(&mut a_diag[klj_u], &jj, &w);
+                atb_15x1_weighted_imu(&mut g_kf[klj_u], &jj, &residual, &w);
+            }
+
+            // Off-diagonal coupling blocks (the tridiagonal fill-in).
+            if kli >= 0 && klj >= 0 {
+                let kli_u = kli as usize;
+                let klj_u = klj as usize;
+
+                // Block (i, j): Jiᵀ·Jj  (upper off-diagonal)
+                let mut block_ij = [0.0f64; 225];
+                ata_cross_15x15_weighted(&mut block_ij, &ji, &jj, &w);
+                a_offdiag.push((kli_u, klj_u, block_ij));
+
+                // Block (j, i): Jjᵀ·Ji = block_ij.T  (lower off-diagonal)
+                let mut block_ji = [0.0f64; 225];
+                ata_cross_15x15_weighted(&mut block_ji, &jj, &ji, &w);
+                a_offdiag.push((klj_u, kli_u, block_ji));
+            }
+        }
+
+        // ── Step 2: LM damping — add λ·I to diagonals of A and C ─────────
+        for ab in &mut a_diag {
+            for d in 0..15 {
+                ab[d * 15 + d] += lambda;
+            }
+        }
+        for cb in &mut c_blocks {
+            for d in 0..3 {
+                cb[d * 3 + d] += lambda;
+            }
+        }
+
+        // ── Step 3: Build reduced camera system M (dense 15Pf × 15Pf) ────
+        //
+        // M = A - E·C⁻¹·Eᵀ
+        // m = b_c - E·C⁻¹·b_p
+        //
+        // Assembly:
+        //   (a) Start M from A (diagonal + off-diagonal blocks).
+        //   (b) For each free point j, invert C_j, form B·C⁻¹, subtract
+        //       the Schur contribution B_i·C⁻¹·B_kᵀ from M[i,k].
+        let mut m_mat = Mat::<f64>::zeros(dim, dim);
+        let mut m_vec = vec![0.0f64; dim];
+
+        // Place A diagonal blocks.
+        for (k, ab) in a_diag.iter().enumerate() {
+            for i in 0..15 {
+                for j in 0..15 {
+                    m_mat[(k * 15 + i, k * 15 + j)] = ab[i * 15 + j];
+                }
+            }
+            for i in 0..15 {
+                m_vec[k * 15 + i] = g_kf[k][i];
+            }
+        }
+
+        // Place A off-diagonal blocks.
+        for (ki, kj, block) in &a_offdiag {
+            for i in 0..15 {
+                for j in 0..15 {
+                    m_mat[(ki * 15 + i, kj * 15 + j)] += block[i * 15 + j];
+                }
+            }
+        }
+
+        // Schur correction: subtract B·C⁻¹·Bᵀ from M, B·C⁻¹·g_p from m.
+        let mut c_inv_blocks: Vec<Option<[f64; 9]>> = Vec::with_capacity(n_free_pt);
+        for cb in &c_blocks {
+            c_inv_blocks.push(invert_3x3_f64(cb));
+        }
+
+        for (j, b_for_j) in b_by_point.iter().enumerate() {
+            let Some(c_inv_j) = c_inv_blocks[j] else {
+                continue;
+            };
+
+            // Pre-compute B_i · C⁻¹ for each camera touching this point.
+            let bc: Vec<(usize, [f64; 45])> = b_for_j
+                .iter()
+                .map(|(i_loc, b)| (*i_loc, matmul_15x3_3x3(b, &c_inv_j)))
+                .collect();
+
+            // RHS contribution: m[i] -= BC · g_p[j]
+            let gp = g_pt[j];
+            for (i_loc, bc_block) in &bc {
+                let bc_g = matvec_15x3_3(bc_block, &gp);
+                let base = i_loc * 15;
+                for r in 0..15 {
+                    m_vec[base + r] -= bc_g[r];
+                }
+            }
+
+            // LHS Schur: M[i1, i2] -= BC_i1 · B_i2.T
+            for (i1_loc, bc1) in &bc {
+                for (i2_loc, b2) in b_for_j {
+                    let row0 = i1_loc * 15;
+                    let col0 = i2_loc * 15;
+                    // bc1 is 15×3, b2 is 15×3. We want bc1 @ b2.T → 15×15.
+                    // out[r,c] -= sum_{k=0}^{2} bc1[r,k] * b2[c,k]
+                    for r in 0..15 {
+                        for c in 0..15 {
+                            let mut s = 0.0f64;
+                            for k in 0..3 {
+                                s += bc1[r * 3 + k] * b2[c * 3 + k];
+                            }
+                            m_mat[(row0 + r, col0 + c)] -= s;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Step 4: Symmetrize and solve M·δ = m via Cholesky ─────────────
+        for i in 0..dim {
+            for j in (i + 1)..dim {
+                let avg = 0.5 * (m_mat[(i, j)] + m_mat[(j, i)]);
+                m_mat[(i, j)] = avg;
+                m_mat[(j, i)] = avg;
+            }
+        }
+
+        let chol = match m_mat.llt(faer::Side::Lower) {
+            Ok(c) => c,
+            Err(e) => {
+                lambda *= 10.0;
+                if lambda > 1e12 {
+                    return Err(ViBaError::CholeskyFailed(format!("{e:?}")));
+                }
+                continue;
+            }
+        };
+
+        let m_col = Mat::<f64>::from_fn(dim, 1, |i, _| m_vec[i]);
+        let d_kf_col = chol.solve(&m_col);
+        let d_kf: Vec<f64> = (0..dim).map(|i| d_kf_col[(i, 0)]).collect();
+
+        // ── Step 5: Back-substitute for point updates ──────────────────────
+        // δp_j = C_j⁻¹ · (g_p_j - Bⱼᵀ · δc)
+        let mut d_pt = vec![[0.0f64; 3]; n_free_pt];
+        for (j, b_for_j) in b_by_point.iter().enumerate() {
+            let Some(c_inv_j) = c_inv_blocks[j] else {
+                continue;
+            };
+            d_pt[j] = back_sub_point(&c_inv_j, &g_pt[j], b_for_j, &d_kf);
+        }
+
+        // ── Step 6: Trial retract and cost evaluation ─────────────────────
+        let kfs_trial: Vec<ViBaKeyframe> = kfs
+            .iter()
+            .enumerate()
+            .map(|(i, kf)| {
+                let kli = kf_local[i];
+                if kli < 0 {
+                    return kf.clone();
+                }
+                let base = kli as usize * 15;
+                let mut delta = [0.0f64; 15];
+                delta.copy_from_slice(&d_kf[base..base + 15]);
+                retract_keyframe(kf, &delta)
+            })
+            .collect();
+
+        let pts_trial: Vec<Vec3F64> = pts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let xli = pt_local[i];
+                if xli < 0 {
+                    return *p;
+                }
+                let dp = d_pt[xli as usize];
+                Vec3F64::new(p.x + dp[0], p.y + dp[1], p.z + dp[2])
+            })
+            .collect();
+
+        // Recompute cost at trial point.
+        let mut new_cost = 0.0f64;
+
+        for obs in observations {
+            if obs.pose_idx >= n_kf || obs.point_idx >= n_pt {
+                continue;
+            }
+            let se3 = pose_to_se3(&kfs_trial[obs.pose_idx].pose);
+            let (r, _, _) =
+                residual_and_jacobians(&se3, &pts_trial[obs.point_idx], obs.pixel, camera);
+            new_cost += 0.5 * (r[0] * r[0] + r[1] * r[1]) as f64;
+        }
+
+        for edge in imu_edges {
+            let (residual, _, _) = imu_residual_and_jacobians(
+                &kfs_trial[edge.from_idx],
+                &kfs_trial[edge.to_idx],
+                &edge.preintegrated,
+                params.gravity,
+            );
+            let w = imu_information_diagonal(&edge.preintegrated);
+            new_cost += 0.5
+                * (0..9)
+                    .map(|r_idx| w[r_idx] * residual[r_idx] * residual[r_idx])
+                    .sum::<f64>();
+        }
+
+        // ── Step 7: Accept or reject (LM) ────────────────────────────────
+        if new_cost < cost {
+            let rel = if cost > 1e-14 {
+                (cost - new_cost) / cost
+            } else {
+                0.0
+            };
+            kfs = kfs_trial;
+            pts = pts_trial;
+            final_cost = new_cost;
+            lambda = (lambda / 3.0).max(1e-10);
+            if rel < params.cost_tolerance {
+                converged = true;
+                break;
+            }
+        } else {
+            lambda *= 10.0;
+            if lambda > 1e12 {
+                break;
+            }
+        }
+
+        final_cost = cost;
+    }
+
+    Ok(ViBaResult {
+        keyframes: kfs,
+        points: pts,
+        iterations: iters_done,
+        converged,
+        final_cost,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kornia_3d::ba::BaObservation;
+    use kornia_3d::camera::PinholeCamera;
+    use kornia_algebra::Mat3F64;
+    use crate::imu::{ImuCalib, ImuMeasurement};
+
+    fn test_camera() -> PinholeCamera {
+        PinholeCamera {
+            fx: 500.0, fy: 500.0, cx: 320.0, cy: 240.0,
+            k1: 0.0, k2: 0.0, p1: 0.0, p2: 0.0,
+        }
+    }
+
+    fn euroc_calib() -> ImuCalib {
+        ImuCalib {
+            gyro_noise: 1.6968e-4,
+            accel_noise: 2.0e-3,
+            gyro_bias_noise: 1.9393e-5,
+            accel_bias_noise: 3.0e-3,
+        }
+    }
+
+    /// Build a PreintegratedImu for a camera moving at constant velocity
+    /// `vel` (m/s, world frame) for duration `duration` seconds at `rate` Hz.
+    /// The camera is upright so accelerometer reads +g upward.
+    fn make_preintegrated(
+        vel: Vec3F64,
+        duration: f64,
+        rate: f64,
+        bias: ImuBias,
+        calib: ImuCalib,
+    ) -> PreintegratedImu {
+        let dt = 1.0 / rate;
+        let n = (duration * rate).round() as usize;
+        let mut pim = PreintegratedImu::new(bias, calib);
+        for k in 0..n {
+            let m = ImuMeasurement {
+                timestamp: k as f64 * dt,
+                gyro: Vec3F64::ZERO,
+                // Accelerometer must read +g to cancel gravity in the body frame
+                // (stationary or constant-velocity — no inertial acceleration).
+                accel: Vec3F64::new(0.0, 0.0, 9.81),
+            };
+            pim.integrate(&m, dt);
+        }
+        pim
+    }
+
+    /// Constant-velocity VI-BA test:
+    /// 3 keyframes moving at 0.5 m/s along X. IMU preintegration is
+    /// built from zero-gyro, +g-accel measurements. Points are in front.
+    /// We perturb velocities and biases and check VI-BA recovers them.
+    #[test]
+    fn viba_constant_velocity_recovery() {
+        let cam = test_camera();
+        let calib = euroc_calib();
+        let bias = ImuBias::default();
+        let gravity = Vec3F64::new(0.0, 0.0, -9.81);
+
+        let vel = Vec3F64::new(0.5, 0.0, 0.0);
+        let dt_kf = 0.2; // 5 Hz keyframe rate
+        let n_kf = 3usize;
+
+        // Ground truth keyframes: pose = identity rotation, translation along X.
+        let true_kfs: Vec<ViBaKeyframe> = (0..n_kf)
+            .map(|i| {
+                let t_world = vel * (i as f64 * dt_kf); // camera centre in world
+                ViBaKeyframe {
+                    // R_WC = I, t_WC = t_world → R_CW = I, t_CW = -t_world
+                    pose: Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(-t_world.x, 0.0, 0.0)),
+                    velocity: vel,
+                    bias,
+                    fixed: i == 0, // anchor first frame
+                }
+            })
+            .collect();
+
+        // Ground truth points in a 3×3 grid at Z=4m.
+        let true_points: Vec<Vec3F64> = (-1..=1)
+            .flat_map(|ix| {
+                (-1..=1).map(move |iy| {
+                    Vec3F64::new(ix as f64 * 0.5, iy as f64 * 0.5, 4.0)
+                })
+            })
+            .collect();
+
+        // Build visual observations.
+        let project = |kf: &ViBaKeyframe, pw: &Vec3F64| -> [f32; 2] {
+            let pc = kf.pose.transform_point(pw);
+            let u = cam.fx * pc.x / pc.z + cam.cx;
+            let v = cam.fy * pc.y / pc.z + cam.cy;
+            [u as f32, v as f32]
+        };
+
+        let mut observations = Vec::new();
+        for (ki, kf) in true_kfs.iter().enumerate() {
+            for (pi, pt) in true_points.iter().enumerate() {
+                let pc = kf.pose.transform_point(pt);
+                if pc.z < 0.5 { continue; }
+                observations.push(BaObservation {
+                    pose_idx: ki,
+                    point_idx: pi,
+                    pixel: project(kf, pt),
+                    fixed_pose: ki == 0,
+                    fixed_point: false,
+                    ..BaObservation::default()
+                });
+            }
+        }
+
+        // Build IMU edges between consecutive keyframes.
+        let imu_edges: Vec<ImuEdge> = (0..n_kf - 1)
+            .map(|k| ImuEdge {
+                from_idx: k,
+                to_idx: k + 1,
+                preintegrated: make_preintegrated(vel, dt_kf, 200.0, bias, calib),
+            })
+            .collect();
+
+        // Perturb velocities and biases (not the anchor frame).
+        let init_kfs: Vec<ViBaKeyframe> = true_kfs
+            .iter()
+            .enumerate()
+            .map(|(i, kf)| {
+                if i == 0 { return kf.clone(); }
+                ViBaKeyframe {
+                    pose: kf.pose,
+                    // Perturb velocity by 0.1 m/s.
+                    velocity: Vec3F64::new(kf.velocity.x + 0.1, kf.velocity.y, kf.velocity.z),
+                    // Perturb gyro bias by 0.01 rad/s.
+                    bias: ImuBias {
+                        gyro: Vec3F64::new(0.01, 0.0, 0.0),
+                        accel: Vec3F64::ZERO,
+                    },
+                    fixed: kf.fixed,
+                }
+            })
+            .collect();
+
+        let params = ViBaParams {
+            max_iterations: 30,
+            initial_lambda: 1e-3,
+            cost_tolerance: 1e-7,
+            gravity,
+        };
+
+        let result = visual_inertial_bundle_adjust(
+            &init_kfs,
+            &true_points, // points start at GT (test focuses on pose/vel/bias)
+            &observations,
+            &imu_edges,
+            &cam,
+            &params,
+        )
+        .unwrap();
+
+        assert!(result.converged || result.iterations < params.max_iterations,
+            "VI-BA did not converge in {} iterations", result.iterations);
+
+        // Check velocity recovery.
+        for (i, kf) in result.keyframes.iter().enumerate() {
+            if i == 0 { continue; }
+            let dv = (kf.velocity - vel).length();
+            assert!(dv < 0.05, "keyframe {i} velocity error {dv:.4} m/s too large");
+        }
+
+        // Check gyro bias recovery.
+        for (i, kf) in result.keyframes.iter().enumerate() {
+            if i == 0 { continue; }
+            let db = kf.bias.gyro.length();
+            assert!(db < 0.01, "keyframe {i} gyro bias error {db:.6} rad/s too large");
+        }
+    }
+
+    /// Jacobian sanity test: compare analytical IMU Jacobians against
+    /// numerical finite differences.
+    #[test]
+    fn imu_jacobians_finite_difference() {
+        let calib = euroc_calib();
+        let bias = ImuBias {
+            gyro: Vec3F64::new(0.001, -0.002, 0.0005),
+            accel: Vec3F64::new(0.01, -0.005, 0.02),
+        };
+        let gravity = Vec3F64::new(0.0, 0.0, -9.81);
+
+        // Build a non-trivial preintegrated edge: 0.1s at 200Hz with rotation.
+        let mut pim = PreintegratedImu::new(bias, calib);
+        for k in 0..20 {
+            let m = ImuMeasurement {
+                timestamp: k as f64 * 0.005,
+                gyro: Vec3F64::new(0.1, -0.05, 0.2),
+                accel: Vec3F64::new(0.0, 0.0, 9.81),
+            };
+            pim.integrate(&m, 0.005);
+        }
+
+        // Non-trivial states at i and j.
+        let make_kf = |rx: f64, ry: f64, rz: f64, tx: f64, ty: f64, tz: f64,
+                        vx: f64, vy: f64, vz: f64, bg: Vec3F64, ba: Vec3F64| ViBaKeyframe {
+            pose: Pose3d::new(
+                SO3F64::exp(Vec3F64::new(rx, ry, rz)).matrix(),
+                Vec3F64::new(tx, ty, tz),
+            ),
+            velocity: Vec3F64::new(vx, vy, vz),
+            bias: ImuBias { gyro: bg, accel: ba },
+            fixed: false,
+        };
+
+        let kf_i = make_kf(0.05, -0.03, 0.01, 0.1, -0.2, 0.05,
+                            0.5, 0.1, 0.0, bias.gyro, bias.accel);
+        let kf_j = make_kf(-0.02, 0.04, -0.01, 0.2, -0.18, 0.12,
+                            0.6, 0.08, 0.01, bias.gyro, bias.accel);
+
+        let (r0, ji_ana, _jj_ana) =
+            imu_residual_and_jacobians(&kf_i, &kf_j, &pim, gravity);
+
+        // Finite difference for frame i, velocity component (rows 3..6, cols 6..9).
+        // We check a subset for brevity.
+        let eps = 1e-6;
+        for col in 6..9 {
+            let mut kf_i_plus = kf_i.clone();
+            let mut kf_i_minus = kf_i.clone();
+            match col {
+                6 => { kf_i_plus.velocity.x += eps; kf_i_minus.velocity.x -= eps; }
+                7 => { kf_i_plus.velocity.y += eps; kf_i_minus.velocity.y -= eps; }
+                _ => { kf_i_plus.velocity.z += eps; kf_i_minus.velocity.z -= eps; }
+            }
+            let (rp, _, _) = imu_residual_and_jacobians(&kf_i_plus, &kf_j, &pim, gravity);
+            let (rm, _, _) = imu_residual_and_jacobians(&kf_i_minus, &kf_j, &pim, gravity);
+
+            for row in 3..6 {
+                let fd = (rp[row] - rm[row]) / (2.0 * eps);
+                let ana = ji_ana[row * 15 + col];
+                let err = (fd - ana).abs();
+                assert!(
+                    err < 1e-5,
+                    "IMU Jacobian mismatch at (row={row}, col={col}): \
+                     analytical={ana:.8}, fd={fd:.8}, err={err:.2e}"
+                );
+            }
+        }
+
+        // Check bias-accel columns (cols 12..15) for v-residual rows (3..6).
+        for col in 12..15 {
+            let d_col = col - 12;
+            let mut kf_i_plus = kf_i.clone();
+            let mut kf_i_minus = kf_i.clone();
+            match d_col {
+                0 => { kf_i_plus.bias.accel.x += eps; kf_i_minus.bias.accel.x -= eps; }
+                1 => { kf_i_plus.bias.accel.y += eps; kf_i_minus.bias.accel.y -= eps; }
+                _ => { kf_i_plus.bias.accel.z += eps; kf_i_minus.bias.accel.z -= eps; }
+            }
+            let (rp, _, _) = imu_residual_and_jacobians(&kf_i_plus, &kf_j, &pim, gravity);
+            let (rm, _, _) = imu_residual_and_jacobians(&kf_i_minus, &kf_j, &pim, gravity);
+
+            for row in 3..6 {
+                let fd = (rp[row] - rm[row]) / (2.0 * eps);
+                let ana = ji_ana[row * 15 + col];
+                let err = (fd - ana).abs();
+                assert!(
+                    err < 1e-5,
+                    "Bias-accel Jacobian mismatch at (row={row}, col={col}): \
+                     analytical={ana:.8}, fd={fd:.8}, err={err:.2e}"
+                );
+            }
+        }
+    }
+}

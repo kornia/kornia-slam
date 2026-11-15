@@ -136,6 +136,7 @@ pub struct SlamSystem {
     tracking_loss_recovery: TrackingLossRecoveryPolicy,
     // mThDepth (metres): back-project close stereo points at each keyframe when set
     stereo_close_depth: Option<f64>,
+    local_ba_keyframes: usize,
     joint_inertial_tracking: bool,
     debug: bool,
     debug_messages: Vec<String>,
@@ -188,6 +189,7 @@ impl SlamSystem {
             keyframe_policy: settings.keyframe_policy,
             tracking_loss_recovery: settings.tracking_loss_recovery,
             stereo_close_depth: settings.stereo_close_depth_m,
+            local_ba_keyframes: settings.local_ba_keyframes,
             joint_inertial_tracking: settings.joint_inertial_tracking,
             debug: false,
             debug_messages: Vec::new(),
@@ -825,6 +827,7 @@ impl SlamSystem {
             imu_initialized: true,
             imu_t_bc: self.rig.camera_to_body(),
             gravity_world: self.inertial.gravity_world,
+            local_ba_keyframes: self.local_ba_keyframes,
         }) {
             self.dbg("[local_mapping] worker is unavailable".into());
         }
@@ -1439,6 +1442,7 @@ impl SlamSystem {
             imu_initialized,
             imu_t_bc: self.rig.camera_to_body(),
             gravity_world: self.inertial.gravity_world,
+            local_ba_keyframes: self.local_ba_keyframes,
         }) {
             self.dbg("[local_mapping] worker is unavailable".into());
         }
@@ -1556,6 +1560,7 @@ impl SlamSystem {
                     imu_initialized: true,
                     imu_t_bc: self.rig.camera_to_body(),
                     gravity_world: self.inertial.gravity_world,
+                    local_ba_keyframes: self.local_ba_keyframes,
                 }) {
                     self.dbg("[local_mapping] worker is unavailable after PGO".into());
                 }
