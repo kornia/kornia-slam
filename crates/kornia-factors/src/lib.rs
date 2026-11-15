@@ -6,6 +6,7 @@
 //! the right as `T_cw ← T_cw · Exp(ξ)` with tangent order `[ρ; ω]`.
 
 pub mod imu;
+pub mod reprojection;
 pub mod robust;
 pub mod se3;
 pub mod state;
