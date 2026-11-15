@@ -27,7 +27,7 @@ SLAM Dunk, by Jacob Van Meter and Ayush Paul (code: https://github.com/jacobvm04
 | SLAM Dunk | 89.6 | 78.9 | 71.1 | 85.4 | 52.3 |
 
 **Features:** classical only; we found no learned features in the repo.
-- **Frame-to-frame tracking:** Basalt's patch optical flow (vendored from Basalt), with detection at half resolution.
+- **Frame-to-frame tracking:** OpenCV pyramidal LK (`cv::calcOpticalFlowPyrLK`), the same algorithm as ours, on Shi-Tomasi corners (`slam_dunk/engine/native/main.cpp`). Basalt is vendored only for the estimator, not for tracking. See "LK tricks from SLAM Dunk" below.
 - **Keyframe features:** OpenCV SIFT turned into RootSIFT. They use 900 features per image and a very low contrast threshold (0.006). Keyframe pairs are matched with an essential-matrix RANSAC.
 - **Loop closure (+Retrieval):** VLAD over the RootSIFT descriptors, with 48 words, power and L2 normalisation and IDF weighting. There is no vocabulary tree.
 - **Low light:** the camera gain metadata is read, and dark-adapted SIFT is available as an option.
@@ -140,7 +140,29 @@ These findings come from reading the code only; none of them is measured in the 
    - The ORB pyramid (scale 1.2) and the LK pyramid (scale 2) cannot share levels. Running ORB only on keyframes, with KLT in between (the KLT-first design), works on mono but lost tracked share on the rig.
 5. **Rig cameras:** KLT runs only on the primary camera today. Adding the other cameras adds pyramids, which makes 1 and 2 matter more.
 
-**Priority:** low for the LaMAria score. The median tracking time per frame on R_11 is 8.4–8.6 ms, while VI-BA costs 85–250 ms per solve. This work matters for the Orin and for the rig.
+### LK tricks from SLAM Dunk
+
+SLAM Dunk runs the same pyramidal LK as we do: OpenCV's `calcOpticalFlowPyrLK`, which our `FixedPointU8` kernel ports step for step. What it does differently around LK (`slam_dunk/engine/native/main.cpp`):
+
+| | SLAM Dunk | us today |
+|---|---|---|
+| Initial guess | Each point's ray is rotated by the gyro rotation integrated since the last frame, then projected through the fisheye model | IMU-predicted pixel |
+| Forward-backward check | Tracks back to the previous frame; drops the point if the round trip misses by more than 0.6 px, or if the LK error is above 35 | none |
+| Window and levels | 21×21, 3 levels; 20 iterations forward, 15 backward | similar window |
+| Points per camera | 160, refilled when fewer than 80 % remain | about 1000 ORB plus KLT |
+| Detector | Shi-Tomasi (`goodFeaturesToTrack`) at half resolution, 23 px minimum spacing, `cornerSubPix` refinement, 9 px border masked | FAST/ORB |
+| Images | Raw Aria fisheye, both cameras tracked in parallel | pinhole crop, KLT on the primary camera only |
+| Pyramid | The previous frame's pyramid is kept; one build per frame | same (our `KltPyramidCache`) |
+| Drift guard | Optional refinement against the patch where the point was first seen (`ANCHOR_FLOW`, off by default) | none |
+
+**Worth taking, in order:**
+1. **Forward-backward check:** one extra LK pass, and bad tracks are dropped before PnP.
+2. **Fewer, well-spread points:** Shi-Tomasi with a minimum spacing, at half-resolution detection. This also cuts the LK cost.
+3. **Raw fisheye on both cameras:** this needs the fisheye camera model in the tracker (roadmap item A9).
+
+Each one changes output, so each needs its own experiment card.
+
+**Priority of the pyramid speed items:** low for the LaMAria score. The forward-backward check and the point selection above are accuracy changes, not speed changes, so this does not apply to them. The median tracking time per frame on R_11 is 8.4–8.6 ms, while VI-BA costs 85–250 ms per solve. This work matters for the Orin and for the rig.
 
 ## How we work
 
