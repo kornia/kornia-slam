@@ -261,7 +261,7 @@ pub fn residual_and_jacobian(
 }
 
 /// The robust weight and the Huber cost `½ρ(rᵀΩr)` of one residual
-/// ([`crate::robust`]).
+/// ([`kornia_3d::ransac::RobustKernel::rho`]).
 pub fn robust_weight_and_cost(r: &Vec6F64, info: &Mat6F64, huber_chi2: Option<f64>) -> (f64, f64) {
     let chi2 = r.dot(&(info * r));
     match huber_chi2 {

@@ -232,7 +232,7 @@ pub struct StationaryResidual {
     /// Robust weight of the pose and velocity rows.
     pub weight: f64,
     /// `½ρ(chi²_nav) + ½ chi²_bias`, `ρ` the Huber objective of `weight`
-    /// ([`crate::robust`]).
+    /// ([`kornia_3d::ransac::RobustKernel::rho`]).
     pub cost: f64,
 }
 
