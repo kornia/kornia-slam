@@ -626,5 +626,13 @@ mod ron_files {
         };
         assert_eq!(custom_mapping.execution, LocalMappingMode::Synchronous);
         assert_eq!(custom_mapping.max_iterations, 20);
+
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).mapping = custom_mapping;
+        let text = ron(&config);
+        let parsed = parse(&text).unwrap();
+        assert_eq!(orb(&parsed).mapping.max_iterations, 20);
+        let slam = parsed.settings(&rig());
+        assert_eq!(slam.mapping.max_iterations, 20);
     }
 }
