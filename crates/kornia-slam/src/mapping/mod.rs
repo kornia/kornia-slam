@@ -20,5 +20,8 @@ pub mod local_mapping;
 pub mod map;
 pub mod vi_ba_schur;
 
-pub use local_mapping::{KeyframeJob, LocalMapping, LocalMappingMode};
-pub use map::{Keyframe, Map, MapPoint};
+pub use local_mapping::{
+    KeyframeJob, LocalMapping, LocalMappingMode, capture_local_window, merge_and_cull,
+    solve_snapshot,
+};
+pub use map::{BaSnapshot, BaUpdate, Keyframe, LocalBaMergeResult, Map, MapPoint};

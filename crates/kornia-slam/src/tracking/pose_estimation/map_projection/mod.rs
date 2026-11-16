@@ -229,23 +229,27 @@ impl MapProjectionEstimator {
                 return Err(MapProjectionRejectReason::LowPnpInliers);
             }
             let mut matches = correspondences;
-            if let Some(local) = self.refine_with_local_map(
-                map,
-                current_keyframe_idx,
-                &matches,
-                &curr_keypoints_undist,
-                &frame.features.descriptors,
-                &frame.features.octaves,
-                &grid,
-                frame.image_size,
-                camera,
-                &pose,
-                search_scale,
-            ) {
-                matches = local.matches;
-                if local.inliers >= self.config.pnp.min_inliers {
-                    pose = local.pose;
-                    inliers = local.inliers;
+            // Skip the second matching + PnP pass when the first pose is already
+            // well constrained (at least min_inliers).
+            if inliers < self.config.pnp.min_inliers {
+                if let Some(local) = self.refine_with_local_map(
+                    map,
+                    current_keyframe_idx,
+                    &matches,
+                    &curr_keypoints_undist,
+                    &frame.features.descriptors,
+                    &frame.features.octaves,
+                    &grid,
+                    frame.image_size,
+                    camera,
+                    &pose,
+                    search_scale,
+                ) {
+                    matches = local.matches;
+                    if local.inliers >= self.config.pnp.min_inliers {
+                        pose = local.pose;
+                        inliers = local.inliers;
+                    }
                 }
             }
             Ok(Estimate {
@@ -563,6 +567,7 @@ impl MapProjectionEstimator {
     ) -> Vec<(usize, usize)> {
         let mut matched_kp = vec![false; keypoints_xy.len()];
         let mut matches = Vec::new();
+        let mut candidate_buf = Vec::new();
         let camera_center = pose_world_to_cam.inverse().translation;
 
         for &mp_idx in candidates {
@@ -598,11 +603,11 @@ impl MapProjectionEstimator {
                 None
             };
 
-            let candidates = grid.query_radius(u, v, config.search_radius, keypoints_xy);
+            grid.query_radius_into(u, v, config.search_radius, keypoints_xy, &mut candidate_buf);
             let mut best_dist = u32::MAX;
             let mut best_kp = usize::MAX;
 
-            for kp_idx in candidates {
+            for &kp_idx in &candidate_buf {
                 if matched_kp[kp_idx] {
                     continue;
                 }

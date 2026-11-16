@@ -613,4 +613,26 @@ mod ron_files {
             })
         );
     }
+
+    #[test]
+    fn mapping_config_defaults_and_custom_iterations() {
+        let default_mapping = MappingConfig::default();
+        assert_eq!(default_mapping.execution, LocalMappingMode::Asynchronous);
+        assert_eq!(default_mapping.max_iterations, 50);
+
+        let custom_mapping = MappingConfig {
+            execution: LocalMappingMode::Synchronous,
+            max_iterations: 20,
+        };
+        assert_eq!(custom_mapping.execution, LocalMappingMode::Synchronous);
+        assert_eq!(custom_mapping.max_iterations, 20);
+
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).mapping = custom_mapping;
+        let text = ron(&config);
+        let parsed = parse(&text).unwrap();
+        assert_eq!(orb(&parsed).mapping.max_iterations, 20);
+        let slam = parsed.settings(&rig());
+        assert_eq!(slam.mapping.max_iterations, 20);
+    }
 }

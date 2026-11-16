@@ -55,6 +55,7 @@ use crate::mapping::map::{
 use crate::mapping::{KeyframeJob, LocalMapping};
 use crate::pose_conversion::apply_reference_pose_correction;
 use build::SystemSettings;
+use config::MappingConfig;
 use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
 use kornia_sensors::SensorRig;
@@ -77,6 +78,7 @@ pub struct SlamSystem {
     // IMU estimates, sample buffer and the inertial-initialization schedule
     inertial: InertialState,
     local_mapping: LocalMapping,
+    mapping_config: MappingConfig,
     // Place recognition for every keyframe, and loop closing when configured.
     loop_closer: Option<LoopCloser>,
     loop_closure_events: Vec<LoopClosureEvent>,
@@ -125,6 +127,7 @@ impl SlamSystem {
             map,
             map_publication_gate,
             local_mapping,
+            mapping_config: settings.mapping,
             state: SystemState::new(),
             inertial: InertialState::new(),
             loop_closer,
@@ -755,6 +758,7 @@ impl SlamSystem {
             imu_initialized: true,
             imu_t_bc: self.rig.camera_to_body(),
             gravity_world: self.inertial.gravity_world,
+            max_iterations: self.mapping_config.max_iterations,
         }) {
             self.dbg("[local_mapping] worker is unavailable".into());
         }
@@ -1212,6 +1216,7 @@ impl SlamSystem {
             imu_initialized,
             imu_t_bc: self.rig.camera_to_body(),
             gravity_world: self.inertial.gravity_world,
+            max_iterations: self.mapping_config.max_iterations,
         }) {
             self.dbg("[local_mapping] worker is unavailable".into());
         }
@@ -1328,6 +1333,7 @@ impl SlamSystem {
                     imu_initialized: true,
                     imu_t_bc: self.rig.camera_to_body(),
                     gravity_world: self.inertial.gravity_world,
+                    max_iterations: self.mapping_config.max_iterations,
                 }) {
                     self.dbg("[local_mapping] worker is unavailable after PGO".into());
                 }

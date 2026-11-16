@@ -302,24 +302,9 @@ pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
     update
 }
 
-/// Solves the same local window with velocity, bias and active IMU edges.
-/// Repropagated preintegrations remain in the returned update even if solving fails.
-///
-/// `wheel_factors` index keyframes by `Frame::idx`, like the map's IMU
-/// factors; those with an endpoint outside the window, or with both endpoints
-/// fixed, are dropped, and so is any that fails [`WheelOdomFactor::is_valid`]
-/// (one such factor would otherwise fail the whole solve).
-///
-/// `stationary_factors` are filtered the same way (by
-/// [`StationaryFactor::is_valid`]). Capture the window with
-/// [`local_window_with_neighbors`] so a stationary neighbour of the active
-/// keyframes is in it.
-///
-/// A landmark the solve left behind any keyframe observing it, or flung far
-/// away (its distance from the nearest observer grown more than tenfold and
-/// beyond 50 m), keeps its old position: such a landmark had no depth the
-/// window could observe, and written back it would poison the next window.
-/// [`BaUpdate::solve_stats`] reports how many, with the solver's own counts.
+pub const DEFAULT_VI_BA_MAX_ITERATIONS: usize = 50;
+
+/// Solves the same local window with velocity, bias and active IMU edges using the default iteration cap (50).
 pub fn run_local_inertial_ba(
     snapshot: BaSnapshot,
     camera: &PinholeCamera,
@@ -327,6 +312,28 @@ pub fn run_local_inertial_ba(
     gravity_world: Vec3F64,
     wheel_factors: &[WheelOdomFactor],
     stationary_factors: &[StationaryFactor],
+) -> BaUpdate {
+    run_local_inertial_ba_with_iterations(
+        snapshot,
+        camera,
+        imu_t_bc,
+        gravity_world,
+        wheel_factors,
+        stationary_factors,
+        DEFAULT_VI_BA_MAX_ITERATIONS,
+    )
+}
+
+/// Solves the same local window with velocity, bias and active IMU edges with a configurable iteration cap.
+/// Repropagated preintegrations remain in the returned update even if solving fails.
+pub fn run_local_inertial_ba_with_iterations(
+    snapshot: BaSnapshot,
+    camera: &PinholeCamera,
+    imu_t_bc: Option<Pose3d>,
+    gravity_world: Vec3F64,
+    wheel_factors: &[WheelOdomFactor],
+    stationary_factors: &[StationaryFactor],
+    max_iterations: usize,
 ) -> BaUpdate {
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
@@ -496,7 +503,7 @@ pub fn run_local_inertial_ba(
         &ViBaParams {
             imu_t_bc,
             gravity: gravity_world,
-            max_iterations: 50,
+            max_iterations,
             ..ViBaParams::default()
         },
     ) {

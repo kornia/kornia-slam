@@ -32,25 +32,41 @@ impl FromStr for LocalMappingMode {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct KeyframeJob {
     pub imu_initialized: bool,
     pub imu_t_bc: Option<Pose3d>,
     pub gravity_world: Vec3F64,
+    pub max_iterations: usize,
 }
 
-fn capture_local_window(map: &Map) -> BaSnapshot {
+impl Default for KeyframeJob {
+    fn default() -> Self {
+        Self {
+            imu_initialized: false,
+            imu_t_bc: None,
+            gravity_world: Vec3F64::new(0.0, 9.81, 0.0),
+            max_iterations: super::bundle_adjustment::DEFAULT_VI_BA_MAX_ITERATIONS,
+        }
+    }
+}
+
+/// Captures a local window snapshot of keyframes and landmarks for bundle adjustment.
+pub fn capture_local_window(map: &Map) -> BaSnapshot {
     map.ba_snapshot(&super::bundle_adjustment::local_window(map))
 }
 
-fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJob) -> BaUpdate {
+/// Solves a local window snapshot either via visual-inertial BA or visual BA according to `job`.
+pub fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJob) -> BaUpdate {
     if job.imu_initialized {
-        super::bundle_adjustment::run_local_inertial_ba(
+        super::bundle_adjustment::run_local_inertial_ba_with_iterations(
             snapshot,
             camera,
             job.imu_t_bc,
             job.gravity_world,
             &[],
             &[],
+            job.max_iterations,
         )
     } else {
         super::bundle_adjustment::run_local_ba(snapshot, camera)
@@ -79,7 +95,10 @@ enum LocalMappingBackend {
 /// merge and before the result is published, so a completed result is never
 /// observable ahead of its cleanup. A refused snapshot — one whose world epoch
 /// no longer matches — publishes nothing and must therefore cull nothing.
-fn merge_and_cull(map: &mut Map, update: BaUpdate) -> Result<LocalBaMergeResult, BaUpdateError> {
+pub fn merge_and_cull(
+    map: &mut Map,
+    update: BaUpdate,
+) -> Result<LocalBaMergeResult, BaUpdateError> {
     let merged = map.apply_ba_update(update)?;
     crate::mapping::culling::cull_landmarks(map);
     Ok(merged)
@@ -339,6 +358,7 @@ mod tests {
             imu_initialized: false,
             imu_t_bc: None,
             gravity_world: Vec3F64::ZERO,
+            max_iterations: 50,
         }
     }
 

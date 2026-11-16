@@ -46,6 +46,22 @@ impl KeypointGrid {
         radius: f32,
         keypoints_xy: &[[f32; 2]],
     ) -> Vec<usize> {
+        let mut result = Vec::new();
+        self.query_radius_into(x, y, radius, keypoints_xy, &mut result);
+        result
+    }
+
+    /// Appends indices of keypoints within `radius` pixels of `(x, y)` into `out`,
+    /// clearing `out` first to reuse caller-owned allocations.
+    pub(super) fn query_radius_into(
+        &self,
+        x: f32,
+        y: f32,
+        radius: f32,
+        keypoints_xy: &[[f32; 2]],
+        out: &mut Vec<usize>,
+    ) {
+        out.clear();
         let r_sq = radius * radius;
 
         let col_min = ((x - radius).max(0.0) / self.cell_w) as usize;
@@ -55,7 +71,6 @@ impl KeypointGrid {
         let row_max =
             (((y + radius).min(self.img_h - 1.0) / self.cell_h) as usize).min(self.n_rows - 1);
 
-        let mut result = Vec::new();
         for r in row_min..=row_max {
             for c in col_min..=col_max {
                 for &idx in &self.cells[r * self.n_cols + c] {
@@ -63,12 +78,11 @@ impl KeypointGrid {
                     let dx = kp[0] - x;
                     let dy = kp[1] - y;
                     if dx * dx + dy * dy <= r_sq {
-                        result.push(idx);
+                        out.push(idx);
                     }
                 }
             }
         }
-        result
     }
 }
 
@@ -125,5 +139,16 @@ mod tests {
         let mut result = grid.query_radius(12.0, 12.0, 20.0, &kps);
         result.sort();
         assert_eq!(result, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_query_radius_into_reuses_buffer() {
+        let kps = [[10.0, 10.0], [12.0, 11.0], [100.0, 100.0]];
+        let grid = KeypointGrid::new(&kps, 640.0, 480.0, 64.0);
+
+        let mut buf = vec![99, 98, 97];
+        grid.query_radius_into(12.0, 12.0, 20.0, &kps, &mut buf);
+        buf.sort();
+        assert_eq!(buf, vec![0, 1]);
     }
 }
