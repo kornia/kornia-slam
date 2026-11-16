@@ -613,4 +613,18 @@ mod ron_files {
             })
         );
     }
+
+    #[test]
+    fn mapping_config_defaults_and_custom_iterations() {
+        let default_mapping = MappingConfig::default();
+        assert_eq!(default_mapping.execution, LocalMappingMode::Asynchronous);
+        assert_eq!(default_mapping.max_iterations, 50);
+
+        let custom_mapping = MappingConfig {
+            execution: LocalMappingMode::Synchronous,
+            max_iterations: 20,
+        };
+        assert_eq!(custom_mapping.execution, LocalMappingMode::Synchronous);
+        assert_eq!(custom_mapping.max_iterations, 20);
+    }
 }

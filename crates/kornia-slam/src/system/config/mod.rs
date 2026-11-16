@@ -153,13 +153,24 @@ impl StereoCloseDepth {
 }
 
 /// Local mapping (keyframe insertion, culling and local BA / VI-BA).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct MappingConfig {
     /// `Synchronous` maps on the tracking thread before each frame returns,
     /// which makes runs replay identically.
     pub execution: LocalMappingMode,
+    /// Maximum iterations for local bundle adjustment (default 50).
+    pub max_iterations: usize,
+}
+
+impl Default for MappingConfig {
+    fn default() -> Self {
+        Self {
+            execution: LocalMappingMode::default(),
+            max_iterations: crate::mapping::bundle_adjustment::DEFAULT_VI_BA_MAX_ITERATIONS,
+        }
+    }
 }
 
 /// Loop closing: place recognition over every keyframe, and verification,
