@@ -22,6 +22,7 @@
 
 use crate::relative_pose;
 use kornia_3d::pose::Pose3d;
+use kornia_3d::ransac::{HuberKernel, RobustKernel};
 use kornia_algebra::{Mat6F64, SMatF64, Vec6F64};
 use kornia_sensors::wheel::PlanarMotion;
 
@@ -260,9 +261,13 @@ pub fn residual_and_jacobian(
 }
 
 /// The robust weight and the Huber cost `½ρ(rᵀΩr)` of one residual
-/// ([`crate::robust`]).
+/// ([`kornia_3d::ransac::RobustKernel::rho`]).
 pub fn robust_weight_and_cost(r: &Vec6F64, info: &Mat6F64, huber_chi2: Option<f64>) -> (f64, f64) {
-    crate::robust::huber_weight_and_cost(r.dot(&(info * r)), huber_chi2)
+    let chi2 = r.dot(&(info * r));
+    match huber_chi2 {
+        Some(k) if k > 0.0 => (HuberKernel.weight(chi2, k), 0.5 * HuberKernel.rho(chi2, k)),
+        _ => (1.0, 0.5 * chi2),
+    }
 }
 
 #[cfg(test)]

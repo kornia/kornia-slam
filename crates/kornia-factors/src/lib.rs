@@ -7,7 +7,6 @@
 
 pub mod inertial;
 pub mod relative_pose;
-pub mod robust;
 pub mod wheel_odometry;
 
 #[cfg(test)]

@@ -34,8 +34,8 @@
 
 use crate::inertial::NavState;
 use crate::relative_pose;
-use crate::robust::huber_weight_and_cost;
 use kornia_3d::pose::Pose3d;
+use kornia_3d::ransac::{HuberKernel, RobustKernel};
 use kornia_algebra::{Mat6F64, Vec3F64, Vec6F64};
 use kornia_sensors::imu::ImuCalib;
 
@@ -232,7 +232,7 @@ pub struct StationaryResidual {
     /// Robust weight of the pose and velocity rows.
     pub weight: f64,
     /// `½ρ(chi²_nav) + ½ chi²_bias`, `ρ` the Huber objective of `weight`
-    /// ([`crate::robust`]).
+    /// ([`kornia_3d::ransac::RobustKernel::rho`]).
     pub cost: f64,
 }
 
@@ -259,7 +259,13 @@ pub fn residual(
 
     let chi2_nav = pose.dot(&(info.pose * pose))
         + info.velocity * (i.velocity.dot(i.velocity) + j.velocity.dot(j.velocity));
-    let (weight, nav_cost) = huber_weight_and_cost(chi2_nav, factor.huber_chi2);
+    let (weight, nav_cost) = match factor.huber_chi2 {
+        Some(k) if k > 0.0 => (
+            HuberKernel.weight(chi2_nav, k),
+            0.5 * HuberKernel.rho(chi2_nav, k),
+        ),
+        _ => (1.0, 0.5 * chi2_nav),
+    };
     let chi2_bias = info.gyro_bias * gyro_bias.dot(gyro_bias)
         + info.accel_bias * accel_bias.dot(accel_bias)
         + info
