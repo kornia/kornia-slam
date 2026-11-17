@@ -47,3 +47,19 @@ pin_threads = ["dep:core_affinity"]
 
 [package.metadata.docs.rs]
 features = ["serde"]
+
+# Kernel benches (plan step K5); `upstream` is public only under bench_internals.
+[[bench]]
+name = "bench_upstream_lk_window"
+harness = false
+required-features = ["bench_internals"]
+
+[[bench]]
+name = "bench_upstream_good_features"
+harness = false
+required-features = ["bench_internals"]
+
+[[bench]]
+name = "bench_upstream_corner_subpix"
+harness = false
+required-features = ["bench_internals"]
