@@ -237,7 +237,6 @@ impl MapProjectionEstimator {
         self.local_map_rules = rules;
     }
 
-    #[allow(dead_code)] // skeleton: lane B calls it through the tracker
     pub(crate) fn set_window_start(&mut self, window_start_kf: Option<usize>) {
         self.window_start_kf = window_start_kf;
     }
