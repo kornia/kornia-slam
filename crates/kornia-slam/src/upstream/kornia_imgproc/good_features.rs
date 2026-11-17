@@ -636,4 +636,37 @@ mod tests {
         assert!(detect(&image(64, 48, |_, _| 77), &[], &params(false)).is_empty());
         assert!(detect(&image(12, 12, |x, _| (x * 20) as u8), &[], &params(true)).is_empty());
     }
+
+    #[test]
+    #[ignore = "needs tests/fixtures/upstream/frontend_opencv.bin from benches/opencv_frontend_fixtures.py"]
+    fn matches_opencv_good_features_to_track() {
+        use super::super::opencv_fixture as cv;
+        let fx = cv::load();
+        let p = GoodFeaturesParams {
+            max_corners: cv::MAX_CORNERS,
+            quality: cv::QUALITY,
+            min_spacing_px: cv::MIN_DISTANCE,
+            border_px: cv::BORDER,
+            half_resolution: false,
+        };
+        let ours = detect(&fx.frame1, &[], &p);
+        // OpenCV takes its quality threshold over the whole image, borders
+        // included, and breaks response ties in its own order.
+        let matched = fx
+            .corners
+            .iter()
+            .filter(|&&c| ours.iter().any(|&o| near(o, c, 0.5)))
+            .count();
+        assert!(
+            matched * 10 >= fx.corners.len() * 9,
+            "{matched} of {} OpenCV corners",
+            fx.corners.len()
+        );
+        assert!(
+            ours.len().abs_diff(fx.corners.len()) * 10 <= fx.corners.len(),
+            "{} vs {}",
+            ours.len(),
+            fx.corners.len()
+        );
+    }
 }

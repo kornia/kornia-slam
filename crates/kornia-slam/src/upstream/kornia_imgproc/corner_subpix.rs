@@ -281,4 +281,30 @@ mod tests {
         corner_sub_pix(&small, &mut tiny, 5, 20, 0.01);
         assert_eq!(tiny, [[2.0, 2.0]]);
     }
+
+    #[test]
+    #[ignore = "needs tests/fixtures/upstream/frontend_opencv.bin from benches/opencv_frontend_fixtures.py"]
+    fn matches_opencv_corner_sub_pix() {
+        use super::super::opencv_fixture as cv;
+        let fx = cv::load();
+        let mut ours = fx.corners.clone();
+        corner_sub_pix(
+            &fx.frame1,
+            &mut ours,
+            cv::SUBPIX_HALF_WIN,
+            cv::SUBPIX_MAX_ITER,
+            cv::EPSILON,
+        );
+        // f32 lane sums against OpenCV's f64 ones, and its getRectSubPix rounding.
+        let close = ours
+            .iter()
+            .zip(&fx.refined)
+            .filter(|(o, c)| (o[0] - c[0]).abs() <= 0.02 && (o[1] - c[1]).abs() <= 0.02)
+            .count();
+        assert!(
+            close * 100 >= ours.len() * 95,
+            "{close} of {} within 0.02 px",
+            ours.len()
+        );
+    }
 }

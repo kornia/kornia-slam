@@ -885,4 +885,38 @@ mod tests {
             (false, [3.0, 4.0], 0)
         );
     }
+
+    #[test]
+    #[ignore = "needs tests/fixtures/upstream/frontend_opencv.bin from benches/opencv_frontend_fixtures.py"]
+    fn matches_opencv_within_a_hundredth_of_a_pixel() {
+        use super::super::opencv_fixture::{self as cv, LK_MAX_ITER, LK_WIN};
+        let fx = cv::load();
+        let prev = LkFrame::new(&fx.frame1, LK_WIN, 0).unwrap();
+        let next = LkFrame::new(&fx.frame2, LK_WIN, 1).unwrap();
+        let mut template = LkTemplate::default();
+        for (i, &p) in fx.refined.iter().enumerate() {
+            let track = if extract_template(&prev, p, 0, LK_WIN, &mut template) {
+                track_template(&template, &next, p, LK_MAX_ITER, cv::EPSILON)
+            } else {
+                LkTrack {
+                    pixel: p,
+                    status: false,
+                    error: 0.0,
+                    iterations: 0,
+                }
+            };
+            assert_eq!(track.status, fx.status[i] == 1, "point {i} {p:?}");
+            if track.status {
+                let (dx, dy) = (
+                    track.pixel[0] - fx.tracked[i][0],
+                    track.pixel[1] - fx.tracked[i][1],
+                );
+                assert!(
+                    dx.abs() <= 0.01 && dy.abs() <= 0.01,
+                    "point {i}: {track:?} vs {:?}",
+                    fx.tracked[i]
+                );
+            }
+        }
+    }
 }
