@@ -6,14 +6,16 @@
 
 use std::path::{Path, PathBuf};
 
+use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use kornia_image::{Image, ImageSize};
 use kornia_imgproc::color::gray_from_rgb_u8;
 use kornia_io::png::read_image_png_rgb8;
+use kornia_sensors::ImuCalibration;
 use kornia_sensors::SensorRig;
 use kornia_sensors::imu::ImuMeasurement;
-use kornia_sensors::{ImuCalibration, RigCamera};
+use kornia_sensors::rig_calibration::rig_cameras_from_body_extrinsics;
 use kornia_slam::{CameraSelection, SensorSelection};
 use serde::Deserialize;
 
@@ -134,26 +136,18 @@ impl FrameSource for LamariaSource {
     fn rig(&self) -> SensorRig {
         let cameras = &self.dataset.calibration.cameras;
         let primary = &cameras[self.camera];
-        let mut rig = SensorRig::new(primary.camera.clone());
-        let primary_from_body = primary.camera_to_body.inverse();
-        let order = [self.camera, 1 - self.camera];
-        rig = rig.with_rig_cameras(
-            order
-                .iter()
-                .map(|&c| RigCamera {
-                    camera: cameras[c].camera.clone(),
-                    size: ImageSize {
-                        width: cameras[c].width,
-                        height: cameras[c].height,
-                    },
-                    primary_from_camera: if c == self.camera {
-                        Pose3d::IDENTITY
-                    } else {
-                        primary_from_body.compose(&cameras[c].camera_to_body)
-                    },
-                })
-                .collect(),
-        );
+        let extrinsics: Vec<(PinholeCamera, ImageSize, Pose3d)> = cameras
+            .iter()
+            .map(|c| {
+                let size = ImageSize {
+                    width: c.width,
+                    height: c.height,
+                };
+                (c.camera.clone(), size, c.camera_to_body)
+            })
+            .collect();
+        let mut rig = SensorRig::new(primary.camera.clone())
+            .with_rig_cameras(rig_cameras_from_body_extrinsics(&extrinsics, self.camera));
         if self.with_imu {
             rig.imu = Some(ImuCalibration {
                 noise: self.dataset.calibration.imu_noise,
@@ -221,4 +215,58 @@ fn read_gray(path: &Path) -> Result<Image<u8, 1>, SourceError> {
     let mut gray = Image::from_size_val(rgb.size(), 0).map_err(SourceError::other)?;
     gray_from_rgb_u8(&rgb, &mut gray).map_err(SourceError::other)?;
     Ok(gray)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kornia_algebra::SO3F64;
+
+    fn bits(pose: &Pose3d) -> Vec<u64> {
+        let r = pose.rotation.to_cols_array();
+        let t = pose.translation.to_array();
+        r.iter().chain(&t).map(|v| v.to_bits()).collect()
+    }
+
+    /// B1-P2 of `experiments/pr180-B-card.md`: the shared helper keeps the
+    /// expression this source composed inline.
+    #[test]
+    fn rig_cameras_keep_the_inline_composition() {
+        let camera = |fx| PinholeCamera {
+            fx,
+            fy: fx,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let size = ImageSize {
+            width: 640,
+            height: 480,
+        };
+        let camera_to_body = [
+            Pose3d::new(
+                SO3F64::exp(Vec3F64::new(0.31, -1.2, 0.05)).matrix(),
+                Vec3F64::new(0.0412, -0.0071, 0.0113),
+            ),
+            Pose3d::new(
+                SO3F64::exp(Vec3F64::new(-0.27, 1.1, -0.02)).matrix(),
+                Vec3F64::new(-0.0598, -0.0069, 0.0131),
+            ),
+        ];
+        let extrinsics: Vec<(PinholeCamera, ImageSize, Pose3d)> = (0..2)
+            .map(|c| (camera(240.0 + c as f64), size, camera_to_body[c]))
+            .collect();
+        for primary in [0, 1] {
+            let rig = rig_cameras_from_body_extrinsics(&extrinsics, primary);
+            let inline = camera_to_body[primary]
+                .inverse()
+                .compose(&camera_to_body[1 - primary]);
+            assert_eq!(rig[0].primary_from_camera, Pose3d::IDENTITY);
+            assert_eq!(rig[0].camera.fx, 240.0 + primary as f64);
+            assert_eq!(bits(&rig[1].primary_from_camera), bits(&inline));
+        }
+    }
 }
