@@ -370,8 +370,8 @@ mod tests {
         for k in 0..15 {
             covariance_i[(k, k)] = sigma_sq[k / 3];
         }
-        let state = |pose: &Pose3d| NavState {
-            pose_cw: pose,
+        let state = |pose_cw| NavState {
+            pose_cw,
             velocity,
             bias: ImuBias::default(),
         };

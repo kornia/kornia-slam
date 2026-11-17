@@ -38,7 +38,7 @@
 
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
-use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuMeasurement, SampleInterpolation};
+use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuMeasurement};
 
 use super::{ImuInitResult, ImuInitializer, in_window, window_is_mono};
 use crate::mapping::map::{Keyframe, Map};
@@ -263,6 +263,7 @@ mod tests {
     use kornia_algebra::{Mat3F64, SO3F64};
     use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbFeatures;
+    use kornia_sensors::imu::SampleInterpolation;
     use kornia_sensors::imu::{ImuCalib, PreintegratedImu};
 
     const RATE_HZ: f64 = 200.0;
