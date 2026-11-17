@@ -245,16 +245,26 @@ impl TrackSet {
     /// Rewrites every associated track's `position` from `map`, `None` for a
     /// culled point; returns how many it rewrote (`flow_position_refreshes`).
     pub fn refresh_positions(&mut self, map: &Map) -> u64 {
+        self.refresh_positions_with(|idx| {
+            map.map_points()
+                .get(idx)
+                .filter(|mp| !mp.culled)
+                .map(|mp| mp.position)
+        })
+    }
+
+    /// As [`Self::refresh_positions`] from `position_of(map point index)`,
+    /// for a caller holding landmarks outside a [`Map`].
+    pub fn refresh_positions_with(
+        &mut self,
+        position_of: impl Fn(usize) -> Option<Vec3F64>,
+    ) -> u64 {
         let mut rewritten = 0;
         for track in &mut self.tracks {
             let Some(idx) = track.map_point_idx else {
                 continue;
             };
-            track.position = map
-                .map_points()
-                .get(idx)
-                .filter(|mp| !mp.culled)
-                .map(|mp| mp.position);
+            track.position = position_of(idx);
             rewritten += 1;
         }
         rewritten

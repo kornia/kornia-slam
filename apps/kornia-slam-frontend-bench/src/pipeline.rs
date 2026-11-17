@@ -15,10 +15,12 @@ use kornia_imgproc::resize::resize_fast_mono;
 use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches};
 use kornia_slam::tracking::TrackingTimings;
 use kornia_slam::tracking::optical_flow::{
-    FlowPrediction, FlowSurvivor, KltPyramidCache, KltTracker, LkKernel, MapKeypointMatch,
-    TrackSet, snap_unique,
+    FlowPrediction, FlowStepInput, FlowSurvivor, KltPyramidCache, KltTracker, LkKernel,
+    MapKeypointMatch, RigFlow, RigFlowCamera, RigFlowSettings, TrackSet, snap_unique,
 };
 use kornia_slam::tracking::pose_estimation::pnp::{PnpConfig, solve_pnp};
+use kornia_slam::tracking::pose_estimation::rig_pnp::{RigObservation, solve_rig_pnp};
+use kornia_slam::tracking::timings::MAX_FLOW_SHARDS;
 
 use crate::trace::{LocalPoint, Trace, TraceFrame, TraceTrack};
 
@@ -39,6 +41,11 @@ pub enum Mode {
     /// ORB only on keyframes (from the trace's schedule) or when too few
     /// tracks survive; otherwise PnP on the flow survivors alone.
     KltFirst,
+    /// Card E's flow-only frame on every rig camera: the library's
+    /// `WindowedU8` flow step, then Gauss-Newton from the prediction. Tracks
+    /// re-seed from the trace at its keyframes, whose ORB runs on the
+    /// mapping thread under `keyframe_orb: Mapping`.
+    KltRig,
 }
 
 impl Mode {
@@ -46,9 +53,64 @@ impl Mode {
         match text {
             "today" => Some(Self::Today),
             "klt-first" => Some(Self::KltFirst),
+            "klt-rig" => Some(Self::KltRig),
             _ => None,
         }
     }
+}
+
+/// The flow stages of a `klt-rig` frame, in microseconds, and its critical
+/// path: the tracking-core stages, dispatch, the slowest shard and the join.
+pub fn flow_stages_header() -> String {
+    let mut header = String::from(
+        "flow_prepare_us,flow_dispatch_us,flow_parallel_us,flow_join_us,flow_pose_us,\
+         flow_bookkeeping_us,flow_map_wait_us",
+    );
+    for shard in 0..MAX_FLOW_SHARDS {
+        for stage in ["template", "forward", "backward", "project", "refill"] {
+            header.push_str(&format!(",s{shard}_{stage}_us"));
+        }
+    }
+    header.push_str(",critical_path_us");
+    header
+}
+
+pub fn flow_stages_row(timings: &TrackingTimings) -> String {
+    let us = |d: Duration| format!("{:.1}", d.as_secs_f64() * 1e6);
+    let mut row = [
+        timings.flow_prepare,
+        timings.flow_dispatch,
+        timings.flow_parallel,
+        timings.flow_join,
+        timings.flow_pose,
+        timings.flow_bookkeeping,
+        timings.flow_map_wait,
+    ]
+    .map(us)
+    .join(",");
+    for shard in &timings.shards {
+        for stage in [
+            shard.flow_template,
+            shard.flow_forward,
+            shard.flow_backward,
+            shard.flow_project,
+            shard.flow_refill,
+        ] {
+            row.push(',');
+            row.push_str(&us(stage));
+        }
+    }
+    row.push(',');
+    row.push_str(&us(timings.critical_path()));
+    row
+}
+
+/// The `klt-rig` flow: the frontend's settings and its pose iterations.
+#[derive(Clone, Copy)]
+pub struct RigFlowMode {
+    pub settings: RigFlowSettings,
+    /// Gauss-Newton iterations of the flow pose (`flow_pose: AnalyticGn`).
+    pub pose_iterations: usize,
 }
 
 #[derive(Default)]
@@ -124,6 +186,30 @@ pub struct Pipeline {
     tracks: TrackSet,
     previous: Option<Image<u8, 1>>,
     pnp: PnpConfig,
+    /// `klt-rig` only.
+    rig_flow: Option<RigFlow>,
+    pose_iterations: usize,
+    /// The latest `klt-rig` frame's flow stages.
+    flow_timings: TrackingTimings,
+}
+
+/// Replaces `tracks` with the traced ones, primary camera, keeping the
+/// shard layout.
+fn seed_tracks(tracks: &mut TrackSet, traced: &[TraceTrack]) {
+    let pixels: Vec<[f32; 2]> = traced.iter().map(|(p, _)| *p).collect();
+    let matches: Vec<MapKeypointMatch> = traced
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (_, mp))| {
+            mp.map(|map_point_idx| MapKeypointMatch {
+                map_point_idx,
+                keypoint_idx: i,
+            })
+        })
+        .collect();
+    if tracks.reconcile_from_matches(&matches, &pixels).is_err() {
+        tracks.clear();
+    }
 }
 
 /// Keypoints sorted by x for radius queries.
@@ -172,7 +258,8 @@ impl Pipeline {
         predict: bool,
         keypoints: Keypoints,
         first_tracks: Option<&Vec<TraceTrack>>,
-    ) -> Self {
+        rig_flow: Option<RigFlowMode>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let primary = &trace.cameras[0];
         let detector = OrbDetector {
             n_keypoints: keypoints.primary,
@@ -190,24 +277,29 @@ impl Pipeline {
                 detector.n_scales,
             )
         });
-        let mut tracks = TrackSet::new();
+        let cameras = trace.n_images().min(trace.cameras.len()).max(1);
+        let threads = rig_flow.map_or(1, |rig| rig.settings.threads);
+        let mut tracks = TrackSet::with_flow_threads(threads, cameras);
         if let Some(first) = first_tracks {
-            let pixels: Vec<[f32; 2]> = first.iter().map(|(p, _)| *p).collect();
-            let matches: Vec<MapKeypointMatch> = first
-                .iter()
-                .enumerate()
-                .filter_map(|(i, (_, mp))| {
-                    mp.map(|map_point_idx| MapKeypointMatch {
-                        map_point_idx,
-                        keypoint_idx: i,
-                    })
-                })
-                .collect();
-            if tracks.reconcile_from_matches(&matches, &pixels).is_err() {
-                tracks = TrackSet::new();
-            }
+            seed_tracks(&mut tracks, first);
         }
-        Self {
+        let flow = match (mode, rig_flow) {
+            (Mode::KltRig, Some(rig)) => Some(RigFlow::new(
+                rig.settings,
+                trace.cameras[..cameras]
+                    .iter()
+                    .enumerate()
+                    .map(|(c, camera)| RigFlowCamera {
+                        camera: camera.camera.clone(),
+                        // The trace has no extrinsics; secondary tracks come
+                        // from refill and carry no landmark here.
+                        camera_from_primary: (c > 0).then_some(Pose3d::IDENTITY),
+                    })
+                    .collect(),
+            )?),
+            _ => None,
+        };
+        Ok(Self {
             mode,
             predict,
             detector,
@@ -220,7 +312,15 @@ impl Pipeline {
             tracks,
             previous: None,
             pnp: PnpConfig::default(),
-        }
+            rig_flow: flow,
+            pose_iterations: rig_flow.map_or(1, |rig| rig.pose_iterations),
+            flow_timings: TrackingTimings::default(),
+        })
+    }
+
+    /// The latest `klt-rig` frame's flow stages.
+    pub fn flow_timings(&self) -> &TrackingTimings {
+        &self.flow_timings
     }
 
     pub fn step(
@@ -228,7 +328,11 @@ impl Pipeline {
         frame: &TraceFrame,
         images: &[Image<u8, 1>],
         local: &[LocalPoint],
+        traced_tracks: Option<&Vec<TraceTrack>>,
     ) -> Result<StepOutput, Box<dyn std::error::Error>> {
+        if self.mode == Mode::KltRig {
+            return self.klt_rig_step(frame, images, local, traced_tracks);
+        }
         let mut stages = Stages::default();
         let primary = images.first().ok_or("no image")?;
         let index_of: HashMap<usize, usize> = local
@@ -263,6 +367,108 @@ impl Pipeline {
         };
         self.previous = Some(primary.clone());
         Ok(out)
+    }
+
+    /// One `klt-rig` frame: the flow step on every camera, the pose by
+    /// Gauss-Newton from the prediction over the primary camera's tracked
+    /// landmarks (the trace has no extrinsics), then the track advance and
+    /// refill. At a traced keyframe the tracks re-seed from the trace
+    /// afterwards, outside the timed stages.
+    fn klt_rig_step(
+        &mut self,
+        frame: &TraceFrame,
+        images: &[Image<u8, 1>],
+        local: &[LocalPoint],
+        traced_tracks: Option<&Vec<TraceTrack>>,
+    ) -> Result<StepOutput, Box<dyn std::error::Error>> {
+        let mut timings = TrackingTimings::default();
+        let rig_flow = self.rig_flow.as_mut().ok_or("klt-rig needs its flow settings")?;
+        let images: Vec<&Image<u8, 1>> = images.iter().collect();
+        rig_flow.prepare(&images, frame.frame_idx as u64, &mut timings)?;
+        let index_of: HashMap<usize, usize> = local
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.map_point_idx, i))
+            .collect();
+        self.tracks
+            .refresh_positions_with(|mp| index_of.get(&mp).map(|&li| local[li].position));
+        let input = FlowStepInput {
+            frame_idx: frame.frame_idx as u64,
+            pose_world_to_primary: frame.trusted_prediction.then_some(frame.candidate_pose),
+            primary_rotation: None,
+        };
+        let output = rig_flow.step(&self.tracks, &input, &mut timings)?;
+        let survivors = output.survivors.clone();
+        let spawned = output.spawned.clone();
+
+        let started = Instant::now();
+        let landmark: HashMap<_, _> = self
+            .tracks
+            .tracks()
+            .iter()
+            .filter_map(|t| Some((t.id(), *index_of.get(&t.map_point_idx()?)?)))
+            .collect();
+        let mut correspondences = Vec::with_capacity(survivors.len());
+        let mut observations = Vec::with_capacity(survivors.len());
+        for ((survivor, &camera), undistorted) in survivors
+            .iter()
+            .zip(&output.cameras)
+            .zip(&output.undistorted)
+        {
+            let (0, Some(&li)) = (camera, landmark.get(&survivor.track_id)) else {
+                continue;
+            };
+            if !(undistorted[0].is_finite() && undistorted[1].is_finite()) {
+                continue;
+            }
+            correspondences.push((li, *undistorted));
+            observations.push(RigObservation {
+                point_world: local[li].position,
+                pixel: [undistorted[0] as f64, undistorted[1] as f64],
+                camera: &self.camera,
+                camera_from_primary: None,
+                sigma_px: 1.0,
+            });
+        }
+        let config = PnpConfig {
+            lm_max_iterations: self.pose_iterations,
+            outlier_rounds: 1,
+            ..self.pnp.clone()
+        };
+        let solved = solve_rig_pnp(&observations, &frame.candidate_pose, &config);
+        timings.flow_pose += started.elapsed();
+
+        let started = Instant::now();
+        if self.tracks.advance(survivors.clone()).is_err() {
+            self.tracks.clear();
+        }
+        for &(camera, pixel) in &spawned {
+            self.tracks.spawn_on(pixel, camera);
+        }
+        timings.flow_bookkeeping += started.elapsed();
+        if frame.keyframe
+            && let Some(traced) = traced_tracks
+        {
+            seed_tracks(&mut self.tracks, traced);
+        }
+        self.flow_timings = timings;
+
+        let stages = Stages {
+            klt_build: timings.flow_prepare,
+            klt_track: timings.flow_parallel,
+            pnp: timings.flow_pose,
+            ..Stages::default()
+        };
+        Ok(StepOutput {
+            stages,
+            n_kp: survivors.len(),
+            n_stereo: 0,
+            n_seeded: observations.len(),
+            n_proj: 0,
+            correspondences,
+            inliers: solved.map_or(0, |(_, inliers)| inliers),
+            orb_ran: false,
+        })
     }
 
     /// The library's motion-predicted start: map point projected at the

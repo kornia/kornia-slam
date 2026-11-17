@@ -12,7 +12,11 @@ mod trace;
 use std::io::Write;
 use std::path::PathBuf;
 
-use pipeline::{Keypoints, Mode, Pipeline};
+use kornia_slam::system::{
+    FlowPose, FrontendConfig, OrbFrontendConfig, PipelineDefinition, SystemConfig,
+};
+use kornia_slam::tracking::optical_flow::RigFlowSettings;
+use pipeline::{Keypoints, Mode, Pipeline, RigFlowMode};
 use trace::Trace;
 
 #[derive(argh::FromArgs)]
@@ -24,9 +28,17 @@ struct Args {
     /// output directory for times.txt, stages.csv and acc.csv
     #[argh(positional)]
     out: PathBuf,
-    /// frontend design: today (default) or klt-first
+    /// frontend design: today (default), klt-first or klt-rig
     #[argh(option, default = "String::from(\"today\")")]
     mode: String,
+    /// klt-rig: system config RON whose frontend knobs to run (an Orin
+    /// preset); default the frontend's defaults
+    #[argh(option)]
+    preset: Option<PathBuf>,
+    /// klt-rig: flow threads, the calling thread included (default: the
+    /// preset's)
+    #[argh(option)]
+    flow_threads: Option<usize>,
     /// on trusted frames, start LK at the predicted pose over two levels
     #[argh(switch)]
     predict: bool,
@@ -47,6 +59,36 @@ struct Args {
     count: usize,
 }
 
+/// The `klt-rig` flow of `preset`'s frontend (the frontend's defaults
+/// without one), on `flow_threads` threads when given.
+fn rig_flow_mode(
+    preset: Option<&std::path::Path>,
+    flow_threads: Option<usize>,
+) -> Result<RigFlowMode, Box<dyn std::error::Error>> {
+    let frontend = match preset {
+        Some(path) => {
+            let config = SystemConfig::from_ron_file(path)?;
+            let PipelineDefinition::OrbSlam(orb) = config.pipeline;
+            let FrontendConfig::Orb(frontend) = orb.frontend;
+            frontend
+        }
+        None => OrbFrontendConfig::default(),
+    };
+    let mut settings = RigFlowSettings::from_frontend(&frontend);
+    if let Some(threads) = flow_threads {
+        settings.threads = threads;
+    }
+    let pose_iterations = match frontend.flow_pose {
+        FlowPose::AnalyticGn { max_iter } => max_iter,
+        FlowPose::RansacPnp => kornia_slam::tracking::pose_estimation::pnp::PnpConfig::default()
+            .lm_max_iterations,
+    };
+    Ok(RigFlowMode {
+        settings,
+        pose_iterations,
+    })
+}
+
 /// Process CPU time in nanoseconds, the quantity a fixed core budget must fit.
 fn process_cpu_ns() -> u64 {
     let mut ts = libc::timespec {
@@ -63,7 +105,11 @@ fn process_cpu_ns() -> u64 {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Args = argh::from_env();
-    let mode = Mode::parse(&args.mode).ok_or("--mode must be `today` or `klt-first`")?;
+    let mode =
+        Mode::parse(&args.mode).ok_or("--mode must be `today`, `klt-first` or `klt-rig`")?;
+    let rig_flow = (mode == Mode::KltRig)
+        .then(|| rig_flow_mode(args.preset.as_deref(), args.flow_threads))
+        .transpose()?;
     let trace = Trace::load(&args.trace)?;
     std::fs::create_dir_all(&args.out)?;
     let frames: Vec<_> = trace
@@ -88,7 +134,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.predict,
         keypoints,
         trace.tracks.get(&first.frame_idx),
-    );
+        rig_flow,
+    )?;
+    let mut flow_stages = match mode {
+        Mode::KltRig => {
+            let mut file =
+                std::io::BufWriter::new(std::fs::File::create(args.out.join("flow_stages.csv"))?);
+            writeln!(file, "frame_idx,{}", pipeline::flow_stages_header())?;
+            Some(file)
+        }
+        Mode::Today | Mode::KltFirst => None,
+    };
 
     let mut times = Vec::with_capacity(frames.len());
     let mut stages = std::io::BufWriter::new(std::fs::File::create(args.out.join("stages.csv"))?);
@@ -105,9 +161,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let empty = Vec::new();
         let local = trace.local_map.get(&frame.frame_idx).unwrap_or(&empty);
         let start = process_cpu_ns();
-        let out = pipeline.step(frame, &images, local)?;
+        let out = pipeline.step(frame, &images, local, trace.tracks.get(&frame.frame_idx))?;
         times.push(process_cpu_ns() - start);
         writeln!(stages, "{},{}", frame.frame_idx, out.stages.row())?;
+        if let Some(file) = flow_stages.as_mut() {
+            writeln!(
+                file,
+                "{},{}",
+                frame.frame_idx,
+                pipeline::flow_stages_row(pipeline.flow_timings())
+            )?;
+        }
         let rmse = pipeline.rmse_at(&frame.pose, local, &out);
         writeln!(
             acc,

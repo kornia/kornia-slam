@@ -16,7 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 argh = "0.1"
-kornia-slam.workspace = true
+# serde reads the Orin preset RON files of `--mode klt-rig`.
+kornia-slam = { workspace = true, features = ["serde"] }
 kornia-3d.workspace = true
 kornia-algebra.workspace = true
 kornia-image.workspace = true
