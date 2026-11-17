@@ -832,8 +832,8 @@ mod recovery_after_loss {
         assert_eq!((bridge.prev_kf_idx, bridge.curr_kf_idx), (40, 141));
         let scale = system.recovery.bridge_covariance_scale;
         crate::system::recovery::tests::assert_scaled(
-            &plain.preintegrated.covariance,
-            &bridge.preintegrated.covariance,
+            plain.preintegrated.covariance.as_slice(),
+            bridge.preintegrated.covariance.as_slice(),
             scale,
         );
         let replayed = bridge.repreintegrate(bridge.preintegrated.bias);

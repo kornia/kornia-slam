@@ -440,8 +440,14 @@ fn failed_inertial_solve_still_returns_repropagated_measurements() {
 }
 #[test]
 fn stereo_depth_uses_proportional_sigma_with_floor() {
-    let stereo_depth_obs = |kf: &Keyframe, desc_idx: usize| {
-        let observation = with_stereo_depth(BaObservation::default(), kf, desc_idx);
+    let stereo_depth_obs = |kf: &Keyframe, desc_idx: usize, depth_sigma, pixel_sigma| {
+        let observation = with_stereo_depth(
+            BaObservation::default(),
+            kf,
+            desc_idx,
+            depth_sigma,
+            pixel_sigma,
+        );
         (observation.depth_meas, observation.depth_sigma)
     };
     let mut frame = test_frame(0, vec![[0u8; 32], [1u8; 32]]);

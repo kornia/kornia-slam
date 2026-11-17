@@ -427,8 +427,16 @@ pub(crate) mod tests {
         };
         let base = integrate(noise);
         let inflated = integrate(inflated_noise(noise, 100.0));
-        assert_scaled(&base.covariance, &inflated.covariance, 100.0);
-        assert_scaled(&base.bias_covariance, &inflated.bias_covariance, 100.0);
+        assert_scaled(
+            base.covariance.as_slice(),
+            inflated.covariance.as_slice(),
+            100.0,
+        );
+        assert_scaled(
+            base.bias_covariance.as_slice(),
+            inflated.bias_covariance.as_slice(),
+            100.0,
+        );
         assert_eq!(inflated.delta_position, base.delta_position);
     }
 }
