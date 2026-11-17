@@ -739,9 +739,15 @@ mod tests {
         };
         let p = LkPyramidU8::new(prev_lk, win, 0, true).unwrap();
         let q = LkPyramidU8::new(next_lk, win, 0, false).unwrap();
-        let theirs =
-            calc_optical_flow_pyr_lk_u8(&p, &q, &down(&pts), Some(&down(&guesses)), &params)
-                .unwrap();
+        let (their_pts, their_guesses) = (down(&pts), down(&guesses));
+        let theirs = calc_optical_flow_pyr_lk_u8(
+            &p,
+            &q,
+            &their_pts,
+            Some(their_guesses.as_slice()),
+            &params,
+        )
+        .unwrap();
         let mut template = LkTemplate::default();
         let mut tracked = 0;
         for (i, (&pt, &guess)) in pts.iter().zip(&guesses).enumerate() {
