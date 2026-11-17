@@ -573,7 +573,7 @@ impl Tracker {
                 continue;
             };
             let kp_idx = features.keypoints_xy.len();
-            if range.is_empty() {
+            if (*range).is_empty() {
                 *range = kp_idx..kp_idx;
             }
             range.end = kp_idx + 1;
@@ -591,7 +591,7 @@ impl Tracker {
         // Empty cameras sit where their neighbours end, so the ranges tile.
         let mut end = 0;
         for range in &mut camera_ranges {
-            if range.is_empty() {
+            if (*range).is_empty() {
                 *range = end..end;
             }
             end = range.end;
