@@ -26,7 +26,9 @@ use crate::tracking::pose_estimation::map_projection::{
 };
 use crate::tracking::pose_estimation::{Estimate, MapProjectionEstimator};
 use crate::tracking::pose_gate::{GateReference, GateVerdict, PoseGap, PoseGate};
-use crate::tracking::relocalization::{Relocalization, RelocalizationConfig, relocalize};
+use crate::tracking::relocalization::{
+    Relocalization, RelocalizationConfig, RelocalizationSolver, relocalize,
+};
 use crate::tracking::timings::TrackingTimings;
 
 /// Everything the tracker needs about the current frame that it does not own.
@@ -81,6 +83,7 @@ pub(crate) struct Tracker {
     /// Projection search scale set from the IMU trust; `None` keeps
     /// [`MapProjectionConfig::search_scale_for`].
     search_scale_override: Option<f32>,
+    relocalization: RelocalizationConfig,
 }
 
 impl Tracker {
@@ -95,7 +98,14 @@ impl Tracker {
             pose_gate: PoseGate::Disabled,
             last_gap: None,
             search_scale_override: None,
+            relocalization: RelocalizationConfig::default(),
         }
+    }
+
+    /// Draws relocalization hypotheses with `solver`.
+    pub(crate) fn with_relocalization_solver(mut self, solver: RelocalizationSolver) -> Self {
+        self.relocalization.solver = solver;
+        self
     }
 
     pub(crate) fn with_local_map_rules(mut self, rules: LocalMapRules) -> Self {
@@ -170,7 +180,7 @@ impl Tracker {
             map,
             camera,
             &self.estimator,
-            &RelocalizationConfig::default(),
+            &self.relocalization,
             accept,
         );
         if found.is_some() {
