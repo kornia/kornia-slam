@@ -83,7 +83,7 @@ pub struct SlamSystem {
     debug: bool,
     debug_messages: Vec<String>,
     // Under debug: when tracking first matched each landmark, by stable id.
-    landmark_first_tracked_sec: HashMap<u64, f64>,
+    landmark_first_tracked_sec: HashMap<usize, f64>,
     map: Arc<Mutex<Map>>,
     // Serializes compound map publication and short local-BA snapshot/merge phases.
     map_publication_gate: Option<Arc<Mutex<()>>>,
@@ -481,12 +481,13 @@ impl SlamSystem {
         let map = self.map.lock().unwrap();
         let mut old = 0;
         for &(mp_idx, _) in matches {
-            let Some(mp) = map.map_points().get(mp_idx) else {
+            if map.map_points().get(mp_idx).is_none() {
                 continue;
-            };
+            }
+            // Landmark slots are append-only until a map reset.
             let first = *self
                 .landmark_first_tracked_sec
-                .entry(mp.stable_id)
+                .entry(mp_idx)
                 .or_insert(now_sec);
             if now_sec - first > OLD_SEC {
                 old += 1;
