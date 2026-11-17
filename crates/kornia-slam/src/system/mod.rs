@@ -11,6 +11,7 @@ mod counters;
 mod file;
 mod input;
 mod state;
+mod trace;
 mod validation;
 pub mod wheel;
 
@@ -25,6 +26,7 @@ pub use counters::{RunCounters, SkipKind};
 pub use file::LoadError;
 pub use input::ProcessError;
 pub use state::{TrackingResult, TrackingStatus};
+pub use trace::{FrameTrace, TraceMapPoint, TraceTrack};
 pub use validation::ConfigError;
 
 use crate::frontend::{FrontendObservation, OrbFrontend};
@@ -35,6 +37,7 @@ use crate::tracking::{
     median_parallax_px,
 };
 
+use crate::tracking::TrackingTimings;
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 use crate::tracking::motion::{InertialPrediction, predict_pose};
 use crate::tracking::tracker::{FrameInput, Tracker};
@@ -96,6 +99,9 @@ pub struct SlamSystem {
     // The last processed image, for optical-flow tracks into the next frame.
     previous_image: Option<Image<u8, 1>>,
     tracking_duration: Duration,
+    tracking_timings: TrackingTimings,
+    trace_enabled: bool,
+    frame_trace: Option<FrameTrace>,
     // Number given to the next frame; it becomes the keyframe's id in the map.
     next_frame_idx: usize,
     counters: RunCounters,
@@ -151,6 +157,9 @@ impl SlamSystem {
             frontend,
             previous_image: None,
             tracking_duration: Duration::ZERO,
+            tracking_timings: TrackingTimings::default(),
+            trace_enabled: false,
+            frame_trace: None,
             next_frame_idx: 0,
             counters: RunCounters::default(),
             last_skip: None,
@@ -408,6 +417,8 @@ impl SlamSystem {
         self.report_stereo(&frame);
         // Taken out for the call so tracking can borrow it alongside `self`.
         let previous_image = self.previous_image.take();
+        self.tracking_timings = TrackingTimings::default();
+        self.frame_trace = None;
         let tracking_start = Instant::now();
         self.last_skip = None;
         let result = self.process_prepared(frame, previous_image.as_ref(), image, timestamp_sec);
@@ -424,6 +435,27 @@ impl SlamSystem {
     /// mapping, excluding feature extraction (see [`Self::frontend_observation`]).
     pub fn tracking_duration(&self) -> Duration {
         self.tracking_duration
+    }
+
+    /// Per-stage times of the latest successfully processed frame's
+    /// tracking; zero for stages it did not run (all of them in bootstrap).
+    pub fn tracking_timings(&self) -> &TrackingTimings {
+        &self.tracking_timings
+    }
+
+    /// Records a [`FrameTrace`] for every tracked frame from now on. Off
+    /// after [`SlamSystem::build`]; reading state only, it changes no result.
+    pub fn set_trace(&mut self, on: bool) {
+        self.trace_enabled = on;
+        if !on {
+            self.frame_trace = None;
+        }
+    }
+
+    /// The latest frame's trace, when tracing is on and the frame went
+    /// through frame-to-map tracking.
+    pub fn frame_trace(&self) -> Option<&FrameTrace> {
+        self.frame_trace.as_ref()
     }
 
     /// The frontend output of the latest successfully processed frame.
@@ -1079,8 +1111,22 @@ impl SlamSystem {
             .state
             .lost_since_sec
             .map_or(0.0, |t0| timestamp_sec - t0);
+        let trusted_prediction = self.imu_confident(timestamp_sec);
         let result = {
             let map = self.map.lock().unwrap();
+            if self.trace_enabled {
+                self.frame_trace = Some(FrameTrace::begin(
+                    frame.idx,
+                    timestamp_sec,
+                    candidate_pose,
+                    trusted_prediction,
+                    &map,
+                    self.state
+                        .current_keyframe_idx
+                        .and_then(|ki| map.get_keyframe(ki)),
+                    self.tracker.tracks(),
+                ));
+            }
             self.tracker.estimate(
                 FrameInput {
                     frame: &frame,
@@ -1090,10 +1136,11 @@ impl SlamSystem {
                     pose_before,
                     current_keyframe_idx: self.state.current_keyframe_idx,
                     lost_for_sec: currently_lost_for,
-                    trusted_prediction: self.imu_confident(timestamp_sec),
+                    trusted_prediction,
                 },
                 &map,
                 &self.rig.camera,
+                &mut self.tracking_timings,
             )
         };
 
@@ -1177,7 +1224,11 @@ impl SlamSystem {
                 map_guard.update_observation_counts(&visible, &matches);
             }
 
-            if self.try_insert_keyframe(&frame, timestamp_sec, tracked_inliers, &matches) {
+            let insert_start = Instant::now();
+            let inserted =
+                self.try_insert_keyframe(&frame, timestamp_sec, tracked_inliers, &matches);
+            self.tracking_timings.keyframe_insert += insert_start.elapsed();
+            if inserted {
                 status = TrackingStatus::KeyframeAccepted;
             }
         }
@@ -1190,6 +1241,11 @@ impl SlamSystem {
             && self.relocalize(&frame)
         {
             status = TrackingStatus::Tracked;
+        }
+        if let Some(trace) = self.frame_trace.as_mut() {
+            trace.pose = self.state.pose_world_to_cam;
+            trace.tracked = status != TrackingStatus::Skipped;
+            trace.keyframe = status == TrackingStatus::KeyframeAccepted;
         }
         if status == TrackingStatus::Skipped {
             let policy = &self.tracking_loss_recovery;

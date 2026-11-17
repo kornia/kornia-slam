@@ -37,6 +37,7 @@ use crate::frame::{Frame, is_finite_xy, undistort_keypoint};
 use crate::mapping::map::{Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
 use crate::mapping::visual_information::VisualInformation;
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
+use crate::tracking::timings::{TrackingTimings, timed};
 
 use super::Estimate;
 use super::rig_pnp::{RigObservation, solve_rig_pnp};
@@ -236,6 +237,33 @@ impl MapProjectionEstimator {
         search_scale: f32,
         pre_seeded: Option<Vec<(usize, usize)>>,
     ) -> Result<Estimate, MapProjectionRejectReason> {
+        self.estimate_pose_timed(
+            frame,
+            candidate_pose,
+            pose_before_tracking,
+            map,
+            camera,
+            current_keyframe_idx,
+            search_scale,
+            pre_seeded,
+            &mut TrackingTimings::default(),
+        )
+    }
+
+    /// Like [`Self::estimate_pose`], adding each stage's time to `timings`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn estimate_pose_timed(
+        &self,
+        frame: &Frame,
+        candidate_pose: &Pose3d,
+        pose_before_tracking: &Pose3d,
+        map: &Map,
+        camera: &PinholeCamera,
+        current_keyframe_idx: Option<usize>,
+        search_scale: f32,
+        pre_seeded: Option<Vec<(usize, usize)>>,
+        timings: &mut TrackingTimings,
+    ) -> Result<Estimate, MapProjectionRejectReason> {
         let pnp = &self.config.pnp;
 
         // Bound the initial projection search to the local map around the
@@ -246,32 +274,37 @@ impl MapProjectionEstimator {
         let local_indices =
             select_local_map_points(map, &[], current_kf, LocalMapSelectionConfig::default());
 
-        let (projection_matches, curr_keypoints_undist, grids) = self.match_map_to_frame(
-            map,
-            &local_indices,
-            frame,
-            candidate_pose,
-            camera,
-            search_scale,
-        );
+        let (projection_matches, curr_keypoints_undist, grids) =
+            timed(&mut timings.projection_search, || {
+                self.match_map_to_frame(
+                    map,
+                    &local_indices,
+                    frame,
+                    candidate_pose,
+                    camera,
+                    search_scale,
+                )
+            });
 
         // Shared logic: try_track → refine_pose → Estimate, or propagate
         // rejection with the PnP inlier count when that is what failed.
         type Rejection = (MapProjectionRejectReason, Option<usize>);
-        let try_track_and_refine = |mut correspondences: Vec<(usize, usize)>,
-                                    pose_init: &Pose3d|
+        let mut try_track_and_refine = |mut correspondences: Vec<(usize, usize)>,
+                                        pose_init: &Pose3d|
          -> Result<Estimate, Rejection> {
             correspondences
                 .retain(|&(_, kp_idx)| curr_keypoints_undist.get(kp_idx).is_some_and(is_finite_xy));
-            let correspondences = self.geometric_consistency_filter(
-                current_kf,
-                &correspondences,
-                frame,
-                &curr_keypoints_undist,
-                camera,
-            );
-            let (mut pose, mut inliers) = self
-                .solve_pnp(
+            let correspondences = timed(&mut timings.consistency_filter, || {
+                self.geometric_consistency_filter(
+                    current_kf,
+                    &correspondences,
+                    frame,
+                    &curr_keypoints_undist,
+                    camera,
+                )
+            });
+            let (mut pose, mut inliers) = timed(&mut timings.pnp, || {
+                self.solve_pnp(
                     map.map_points(),
                     &correspondences,
                     &curr_keypoints_undist,
@@ -280,22 +313,25 @@ impl MapProjectionEstimator {
                     pose_init,
                     search_scale,
                 )
-                .ok_or((MapProjectionRejectReason::PnpFailed, None))?;
+            })
+            .ok_or((MapProjectionRejectReason::PnpFailed, None))?;
             if inliers < pnp.min_inliers_early {
                 return Err((MapProjectionRejectReason::LowPnpInliers, Some(inliers)));
             }
             let mut matches = correspondences;
-            if let Some(local) = self.refine_with_local_map(
-                map,
-                current_keyframe_idx,
-                &matches,
-                &curr_keypoints_undist,
-                &frame.features.descriptors,
-                &frame.features.octaves,
-                &grids,
-                &pose,
-                search_scale,
-            ) {
+            if let Some(local) = timed(&mut timings.local_refine, || {
+                self.refine_with_local_map(
+                    map,
+                    current_keyframe_idx,
+                    &matches,
+                    &curr_keypoints_undist,
+                    &frame.features.descriptors,
+                    &frame.features.octaves,
+                    &grids,
+                    &pose,
+                    search_scale,
+                )
+            }) {
                 matches = local.matches;
                 if local.inliers >= self.config.pnp.min_inliers {
                     pose = local.pose;
@@ -355,13 +391,15 @@ impl MapProjectionEstimator {
             return Err(last_reject);
         };
 
-        let ref_matches = match_orb_descriptors(
-            &current_kf.frame.features.orientations,
-            &current_kf.frame.features.descriptors,
-            &frame.features.orientations,
-            &frame.features.descriptors,
-            self.config.match_config,
-        );
+        let ref_matches = timed(&mut timings.projection_search, || {
+            match_orb_descriptors(
+                &current_kf.frame.features.orientations,
+                &current_kf.frame.features.descriptors,
+                &frame.features.orientations,
+                &frame.features.descriptors,
+                self.config.match_config,
+            )
+        });
 
         const MIN_REF_MATCHES: usize = 15;
         if ref_matches.len() < MIN_REF_MATCHES {

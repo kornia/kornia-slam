@@ -9,6 +9,7 @@ pub(crate) mod parallax;
 mod policy;
 pub mod pose_estimation;
 pub mod relocalization;
+pub mod timings;
 pub(crate) mod tracker;
 
 pub use local_map::{LocalMapSelectionConfig, select_local_map_points};
@@ -17,3 +18,4 @@ pub use policy::{
     KeyframeEvidence, KeyframePolicy, KeyframesWhileLost, TrackingLossRecoveryPolicy,
 };
 pub use pose_estimation::MapProjectionEstimator;
+pub use timings::TrackingTimings;
