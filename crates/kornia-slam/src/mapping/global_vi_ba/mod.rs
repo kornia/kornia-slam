@@ -4,12 +4,31 @@
 //! `FullInertialBA` (`Optimizer.cc:392-811`); landmarks are eliminated by the
 //! Schur complement and the reduced system is a faer sparse Cholesky in f64.
 
+mod calibration;
+mod imu_edges;
+mod problem;
+mod reduced;
+mod report;
+
+use std::collections::HashMap;
+use std::time::Instant;
+
 use kornia_3d::pose::Pose3d;
-use kornia_sensors::imu::GyroIntrinsics;
+use kornia_sensors::imu::{GyroIntrinsics, PreintegratedImu};
 
 use super::session::SessionDump;
 use super::visual_information::VisualInformation;
 use crate::system::{ConfigError, StereoDepthSigma};
+use calibration::{Layout, prior_rows};
+use imu_edges::{ImuEdge, ImuModel, build_edges};
+use problem::{GaugeAnchor, Problem, State};
+use reduced::{Linearization, Pattern};
+
+/// Levenberg-Marquardt damping: start, bounds and factor.
+const LAMBDA_START: f64 = 1e-3;
+const LAMBDA_MIN: f64 = 1e-9;
+const LAMBDA_MAX: f64 = 1e10;
+const LAMBDA_FACTOR: f64 = 10.0;
 
 /// The offline pass's settings: the run file's `offline_ba` section. Only the
 /// `offline-ba` subcommand reads them; every calibration state and the segment
@@ -129,18 +148,40 @@ pub struct CalibrationEstimate {
 
 /// Counters of one offline solve, printed as `[offline_ba]` lines.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct OfflineBaReport {
+    /// Tracked frames the output re-anchors.
     pub frames: usize,
+    /// Accepted LM steps.
     pub iterations: usize,
     pub initial_cost: f64,
     pub final_cost: f64,
+    /// Observations dropped at `outlier_px`, and at `tight_outlier_px`.
     pub dropped_outlier: usize,
     pub dropped_tight_outlier: usize,
+    /// Connected components: keyframes joined by an IMU edge or a landmark.
     pub components: usize,
+    /// IMU edges across a segment boundary.
     pub bridged: usize,
+    /// Longest gap (s) at a segment boundary.
+    pub gap_max_s: f64,
     pub covisible_median: usize,
     pub nnz_reduced: usize,
     pub nnz_factor: usize,
+    /// Wall time of each LM iteration, damping trials included (ms).
+    pub iteration_ms: Vec<f64>,
+    /// Mean whitened IMU rotation residual at the start and the end, and of
+    /// the bridged edges at the end.
+    pub imu_rot_whitened0: f64,
+    pub imu_rot_whitened: f64,
+    pub bridge_rot_whitened: f64,
+    /// Per camera, per slice: rotation offset (°) and focal scale (%).
+    pub camera_rotation_deg: Vec<Vec<f64>>,
+    pub camera_focal_pct: Vec<Vec<f64>>,
+    pub gyro_scale_pct: Option<[f64; 3]>,
+    /// Shear xy, xz, yz (mrad).
+    pub gyro_shear_mrad: Option<[f64; 3]>,
+    pub td_ms: Option<f64>,
 }
 
 pub struct OfflineBaResult {
@@ -163,12 +204,244 @@ pub enum OfflineBaError {
 }
 
 /// Solves one global VI-BA over `session`, weighting observations as the
-/// online VI-BA does (`visual`, `stereo_depth_sigma`).
+/// online VI-BA does (`visual`, `stereo_depth_sigma`). Runs on one thread,
+/// so the result depends on the dump alone: it sets faer's global
+/// parallelism to sequential.
 pub fn offline_visual_inertial_ba(
-    _session: &SessionDump,
-    _visual: &VisualInformation,
-    _stereo_depth_sigma: StereoDepthSigma,
-    _config: &OfflineBaConfig,
+    session: &SessionDump,
+    visual: &VisualInformation,
+    stereo_depth_sigma: StereoDepthSigma,
+    config: &OfflineBaConfig,
 ) -> Result<OfflineBaResult, OfflineBaError> {
-    todo!("lane D: offline global VI-BA")
+    config.validate()?;
+    faer::set_global_parallelism(faer::Par::Seq);
+    let layout = Layout::new(&config.calibration, session.rig.cameras.len());
+    let (problem, start) = Problem::new(session, *visual, stereo_depth_sigma, &layout)?;
+    let (edges, gap_max_s) = build_edges(&problem, config.bridge_segments);
+    let imu = ImuModel::new(&problem, config.imu_kernel, &layout);
+    let slots = keyframe_slots(session);
+    let mut report = OfflineBaReport {
+        frames: session
+            .frames
+            .iter()
+            .filter(|f| slots.contains_key(&f.reference_kf))
+            .count(),
+        bridged: edges.iter().filter(|e| e.bridged).count(),
+        gap_max_s,
+        ..OfflineBaReport::default()
+    };
+    let solves = config.max_iterations > 0 && !start.keyframes.is_empty();
+    if solves {
+        report.dropped_outlier = problem.drop_outliers(&start, &layout, config.outlier_px);
+    }
+    let imu_pairs: Vec<(usize, usize)> = edges.iter().map(|e| (e.from, e.to)).collect();
+    let observers = problem.observers();
+    let gauge = problem.gauge_anchors(&imu_pairs, &observers, &start);
+    report.components = gauge.len();
+
+    let solve = Solve {
+        problem: &problem,
+        imu: &imu,
+        layout: &layout,
+        edges: &edges,
+        gauge: &gauge,
+        config,
+    };
+    let pims = imu.integrate_all(&edges, &start, &layout);
+    report.imu_rot_whitened0 = imu.mean_rotation_whitened(&edges, &pims, &start, |_| true);
+    report.initial_cost = solve.cost(&start, &pims);
+    report.final_cost = report.initial_cost;
+    let (state, pims) = if solves {
+        let pattern = Pattern::new(start.keyframes.len(), &imu_pairs, &observers)?;
+        report.nnz_reduced = pattern.nnz();
+        report.nnz_factor = pattern.nnz_factor();
+        report.covisible_median = pattern.covisible_median();
+        solve.run(&pattern, start, pims, &mut report)?
+    } else {
+        (start, pims)
+    };
+    report.imu_rot_whitened = imu.mean_rotation_whitened(&edges, &pims, &state, |_| true);
+    report.bridge_rot_whitened = imu.mean_rotation_whitened(&edges, &pims, &state, |e| e.bridged);
+    let calibration = state.calibration.estimate(&layout);
+    report.record_calibration(&calibration);
+    Ok(OfflineBaResult {
+        body_poses: problem.dump_body_poses(session, &state),
+        calibration,
+        report,
+    })
 }
+
+/// Each tracked frame of `session` re-anchored on its keyframe's solved
+/// `T_bw` (`body_poses`, in dump order): `T_bw(frame) = T_bc ·
+/// T_frame_from_kf · T_cb · T_bw(kf)`, with the factory extrinsic the online
+/// relative motion was measured with. In recording order; a frame whose
+/// keyframe has no pose is left out.
+pub fn reanchor_frames(session: &SessionDump, body_poses: &[Pose3d]) -> Vec<(f64, Pose3d)> {
+    let body_from_primary = session.rig.camera_to_body.to_pose();
+    let primary_from_body = body_from_primary.inverse();
+    let slots = keyframe_slots(session);
+    session
+        .frames
+        .iter()
+        .filter_map(|frame| {
+            let pose_bw = body_poses.get(*slots.get(&frame.reference_kf)?)?;
+            let body_from_kf_body = body_from_primary
+                .compose(&frame.frame_from_kf.to_pose())
+                .compose(&primary_from_body);
+            Some((frame.timestamp_sec, body_from_kf_body.compose(pose_bw)))
+        })
+        .collect()
+}
+
+/// Dump position of every keyframe by its id.
+fn keyframe_slots(session: &SessionDump) -> HashMap<u64, usize> {
+    session
+        .keyframes
+        .iter()
+        .enumerate()
+        .map(|(slot, kf)| (kf.kf_idx, slot))
+        .collect()
+}
+
+/// What one solve reads and never changes.
+struct Solve<'s, 'a> {
+    problem: &'s Problem<'a>,
+    imu: &'s ImuModel<'s, 'a>,
+    layout: &'s Layout,
+    edges: &'s [ImuEdge],
+    gauge: &'s [GaugeAnchor],
+    config: &'s OfflineBaConfig,
+}
+
+/// An accepted step: the new state, its integrations when each state gets
+/// its own, and its cost.
+type Accepted = (State, Option<Vec<PreintegratedImu>>, f64);
+
+impl Solve<'_, '_> {
+    fn cost(&self, state: &State, pims: &[PreintegratedImu]) -> f64 {
+        let visual: f64 = (0..self.problem.observations.len())
+            .filter(|&o| self.problem.observations[o].active.get())
+            .map(|o| self.problem.observation_cost(o, state, self.layout))
+            .sum();
+        let inertial: f64 = self
+            .edges
+            .iter()
+            .zip(pims)
+            .map(|(edge, pim)| self.imu.cost(edge, pim, state))
+            .sum();
+        let priors: f64 = prior_rows(self.layout, &self.config.calibration, &state.calibration)
+            .iter()
+            .map(|row| 0.5 * row.residual * row.residual)
+            .sum();
+        visual + inertial + priors + self.problem.gauge_cost(self.gauge, state)
+    }
+
+    /// Levenberg-Marquardt from `state`: observations past `outlier_px` were
+    /// dropped before, those past `tight_outlier_px` go from
+    /// `tighten_from_iteration` on (visloc's two stages).
+    fn run(
+        &self,
+        pattern: &Pattern,
+        mut state: State,
+        mut pims: Vec<PreintegratedImu>,
+        report: &mut OfflineBaReport,
+    ) -> Result<(State, Vec<PreintegratedImu>), OfflineBaError> {
+        let config = self.config;
+        let mut cost = report.initial_cost;
+        let mut lambda = LAMBDA_START;
+        for iteration in 1..=config.max_iterations {
+            let started = Instant::now();
+            if iteration >= config.tighten_from_iteration {
+                let dropped =
+                    self.problem
+                        .drop_outliers(&state, self.layout, config.tight_outlier_px);
+                if dropped > 0 {
+                    report.dropped_tight_outlier += dropped;
+                    cost = self.cost(&state, &pims);
+                }
+            }
+            let imu: Vec<_> = self
+                .edges
+                .iter()
+                .zip(&pims)
+                .map(|(edge, pim)| self.imu.linearize(edge, pim, &state, self.layout))
+                .collect();
+            let priors = prior_rows(self.layout, &config.calibration, &state.calibration);
+            let linearization = Linearization {
+                problem: self.problem,
+                state: &state,
+                layout: self.layout,
+                edges: self.edges,
+                imu: &imu,
+                gauge: self.gauge,
+                priors: &priors,
+                landmark_damping_floor: config.landmark_damping_floor,
+            };
+            let step = self.damped_step(&linearization, pattern, &pims, cost, &mut lambda);
+            report
+                .iteration_ms
+                .push(started.elapsed().as_secs_f64() * 1e3);
+            let (candidate, candidate_pims, candidate_cost) = match step {
+                Ok(Some(accepted)) => accepted,
+                Ok(None) => break,
+                Err(error) if iteration == 1 => return Err(error),
+                Err(_) => break,
+            };
+            report.iterations = iteration;
+            let decrease = (cost - candidate_cost) / cost.max(f64::MIN_POSITIVE);
+            state = candidate;
+            if let Some(candidate_pims) = candidate_pims {
+                pims = candidate_pims;
+            }
+            cost = candidate_cost;
+            if decrease < config.relative_cost_tolerance {
+                break;
+            }
+        }
+        report.final_cost = cost;
+        Ok((state, pims))
+    }
+
+    /// Raises the damping until a step lowers the cost; `Ok(None)` when none
+    /// did, the error when no damping gave a system that factorised.
+    fn damped_step(
+        &self,
+        linearization: &Linearization<'_>,
+        pattern: &Pattern,
+        pims: &[PreintegratedImu],
+        cost: f64,
+        lambda: &mut f64,
+    ) -> Result<Option<Accepted>, OfflineBaError> {
+        let mut factorised = false;
+        let mut last_error = None;
+        while *lambda <= LAMBDA_MAX {
+            match linearization.assemble(pattern, *lambda).solve(pattern) {
+                Ok((dx, dc)) => {
+                    factorised = true;
+                    let dl = linearization.landmark_steps(*lambda, &dx, &dc);
+                    let candidate = linearization.state.retracted(&dx, &dl, &dc);
+                    let candidate_pims = self
+                        .imu
+                        .reintegrates()
+                        .then(|| self.imu.integrate_all(self.edges, &candidate, self.layout));
+                    let candidate_cost =
+                        self.cost(&candidate, candidate_pims.as_deref().unwrap_or(pims));
+                    // A NaN cost is refused too.
+                    if candidate_cost < cost {
+                        *lambda = (*lambda / LAMBDA_FACTOR).max(LAMBDA_MIN);
+                        return Ok(Some((candidate, candidate_pims, candidate_cost)));
+                    }
+                }
+                Err(error) => last_error = Some(error),
+            }
+            *lambda *= LAMBDA_FACTOR;
+        }
+        match (factorised, last_error) {
+            (false, Some(error)) => Err(error),
+            _ => Ok(None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

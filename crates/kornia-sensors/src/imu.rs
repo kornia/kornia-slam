@@ -68,9 +68,20 @@ pub struct GyroIntrinsics {
 }
 
 impl GyroIntrinsics {
+    /// No correction: `S = 0`.
+    pub const IDENTITY: Self = Self {
+        scale: Vec3F64::ZERO,
+        shear: Vec3F64::ZERO,
+    };
+
     /// The corrected reading `(I + S) · gyro`, rad/s.
-    pub fn apply(&self, _gyro: Vec3F64) -> Vec3F64 {
-        todo!("lane D: gyro intrinsics")
+    pub fn apply(&self, gyro: Vec3F64) -> Vec3F64 {
+        let (s, k) = (self.scale, self.shear);
+        Vec3F64::new(
+            (1.0 + s.x) * gyro.x + k.x * gyro.y + k.y * gyro.z,
+            k.x * gyro.x + (1.0 + s.y) * gyro.y + k.z * gyro.z,
+            k.y * gyro.x + k.z * gyro.y + (1.0 + s.z) * gyro.z,
+        )
     }
 }
 
@@ -416,6 +427,23 @@ mod tests {
     use kornia_algebra::Vec9F64;
 
     const EPS: f64 = 1e-8;
+
+    #[test]
+    fn gyro_intrinsics_apply_the_symmetric_correction() {
+        let gyro = Vec3F64::new(0.3, -0.7, 1.1);
+        assert_eq!(GyroIntrinsics::IDENTITY.apply(gyro), gyro);
+        let intrinsics = GyroIntrinsics {
+            scale: Vec3F64::new(0.01, -0.02, 0.03),
+            shear: Vec3F64::new(0.001, -0.002, 0.004),
+        };
+        let out = intrinsics.apply(gyro);
+        let expected = Vec3F64::new(
+            1.01 * 0.3 + 0.001 * -0.7 - 0.002 * 1.1,
+            0.001 * 0.3 + 0.98 * -0.7 + 0.004 * 1.1,
+            -0.002 * 0.3 + 0.004 * -0.7 + 1.03 * 1.1,
+        );
+        assert!((out - expected).length() < 1e-15, "{out:?} vs {expected:?}");
+    }
 
     fn default_calib() -> ImuCalib {
         // EuRoC V1 sensor parameters

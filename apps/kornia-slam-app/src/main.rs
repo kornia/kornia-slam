@@ -126,7 +126,6 @@ struct Args {
 
 #[derive(argh::FromArgs)]
 #[argh(subcommand)]
-#[allow(dead_code)] // skeleton: lane D reads the arguments
 enum Command {
     OfflineBa(OfflineBaArgs),
 }
@@ -135,7 +134,6 @@ enum Command {
 /// file's `offline_ba` settings; no online run happens.
 #[derive(argh::FromArgs)]
 #[argh(subcommand, name = "offline-ba")]
-#[allow(dead_code)] // skeleton: lane D reads the arguments
 struct OfflineBaArgs {
     /// session file written by --session-out
     #[argh(option)]
@@ -218,8 +216,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tui_active = !args.no_tui;
 
     let mut run = RunConfig::from_ron_file(&args.config)?;
-    if let Some(Command::OfflineBa(_)) = &args.command {
-        todo!("lane D: offline-ba subcommand");
+    if let Some(Command::OfflineBa(offline)) = &args.command {
+        return run_offline_ba(&run, offline);
     }
     apply_loop_gate_overrides(&mut run.system.pipeline)?;
     if !tui_active {
@@ -577,9 +575,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let unanchored = smoothed.write(writer, |kf| system.keyframe_pose(kf))?;
         eprintln!("Smoothed trajectory: {unanchored} frame(s) without a surviving keyframe");
     }
-    if let (Some(recorder), Some(smoothed), Some(path)) =
-        (session_recorder, smoothed.as_ref(), args.session_out.as_deref())
-    {
+    if let (Some(recorder), Some(smoothed), Some(path)) = (
+        session_recorder,
+        smoothed.as_ref(),
+        args.session_out.as_deref(),
+    ) {
         let unanchored = recorder.write(std::path::Path::new(path), &system, smoothed)?;
         eprintln!("Session: {path}, {unanchored} frame(s) without a dumped keyframe");
     }
@@ -597,6 +597,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &gt_positions,
             std::path::Path::new(&args.eval_out),
         )?;
+    }
+    Ok(())
+}
+
+/// `offline-ba`: one global VI-BA over a recorded session, with the run
+/// file's `offline_ba` settings and its local-BA visual error model.
+fn run_offline_ba(run: &RunConfig, args: &OfflineBaArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use kornia_slam::mapping::global_vi_ba::{offline_visual_inertial_ba, reanchor_frames};
+
+    let dump = session::read(std::path::Path::new(&args.session))?;
+    let PipelineDefinition::OrbSlam(orb) = &run.system.pipeline;
+    let local_ba = &orb.mapping.local_ba;
+    let result = offline_visual_inertial_ba(
+        &dump,
+        &local_ba.visual_information,
+        local_ba.stereo_depth_sigma,
+        &run.offline_ba,
+    )?;
+    eprint!("{}", result.report);
+    // The solved states are `T_bw`: written as given, they are `world_from_body`.
+    let mut writer =
+        trajectory::TrajectoryWriter::create(std::path::Path::new(&args.trajectory_out), None)?;
+    for (timestamp_sec, pose_bw) in reanchor_frames(&dump, &result.body_poses) {
+        writer.write(timestamp_sec, &pose_bw)?;
+    }
+    writer.finish()?;
+    if let Some(path) = args.report.as_deref() {
+        let out = std::io::BufWriter::new(std::fs::File::create(path)?);
+        serde_json::to_writer_pretty(out, &result.report)?;
     }
     Ok(())
 }
@@ -631,6 +660,27 @@ mod cli_tests {
         let args = parse(&["--config", "r.ron", "--evaluate", "--eval-out", "out"]).unwrap();
         assert!(args.evaluate);
         assert_eq!(args.eval_out, "out");
+    }
+
+    #[test]
+    fn offline_ba_is_an_optional_subcommand() {
+        assert!(parse(&["--config", "r.ron"]).unwrap().command.is_none());
+        let args = parse(&[
+            "--config",
+            "r.ron",
+            "offline-ba",
+            "--session",
+            "s.cbor",
+            "--trajectory-out",
+            "t.txt",
+        ])
+        .unwrap();
+        let Some(Command::OfflineBa(offline)) = args.command else {
+            panic!("offline-ba did not parse");
+        };
+        assert_eq!(offline.session, "s.cbor");
+        assert_eq!(offline.trajectory_out, "t.txt");
+        assert!(offline.report.is_none());
     }
 
     #[test]

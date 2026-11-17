@@ -34,7 +34,6 @@ pub struct RunConfig {
     pub rig_calibration: Option<PathBuf>,
     /// Settings of the `offline-ba` subcommand; the online run never reads them.
     #[serde(default)]
-    #[allow(dead_code)] // skeleton: lane D reads it
     pub offline_ba: OfflineBaConfig,
 }
 
