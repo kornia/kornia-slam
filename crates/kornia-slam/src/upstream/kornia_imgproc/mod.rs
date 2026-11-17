@@ -3,3 +3,4 @@
 pub mod corner_subpix;
 pub mod good_features;
 pub mod lk_window;
+pub mod pyrdown_u8;
