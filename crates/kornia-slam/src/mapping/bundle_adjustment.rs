@@ -57,6 +57,8 @@ pub struct LocalBaParams {
     pub lost_keyframes: LostKeyframes,
     pub visual_kernel: VisualKernel,
     pub large_window: LargeWindow,
+    /// Levenberg-Marquardt initial damping of a VI-BA solve.
+    pub initial_lambda: f64,
     /// The inertial initialization is recent: VIBA2 has not run.
     pub recently_initialized: bool,
     /// Ask VI-BA for the newest keyframe's marginal covariance.
@@ -120,8 +122,39 @@ impl Default for LocalBaParams {
             lost_keyframes: LostKeyframes::Free,
             visual_kernel: VisualKernel::L2,
             large_window: LargeWindow::Off,
+            initial_lambda: 1.0,
             recently_initialized: false,
             newest_marginal: false,
+        }
+    }
+}
+
+impl LocalBaParams {
+    /// Whether a keyframe tracked with `tracked_inliers` PnP inliers solves
+    /// in the large window (ORB-SLAM3's `bLarge`, `LocalMapping.cc:148`).
+    pub(crate) fn large_window_applies(&self, tracked_inliers: usize) -> bool {
+        matches!(
+            self.large_window,
+            LargeWindow::Enabled { min_tracked_inliers, .. } if tracked_inliers > min_tracked_inliers
+        )
+    }
+
+    /// These settings with the large window's size, iteration cap and
+    /// initial damping (`Optimizer.cc:2389-2393, 2513-2517`).
+    pub(crate) fn large(&self) -> Self {
+        match self.large_window {
+            LargeWindow::Enabled {
+                active_keyframes,
+                max_iterations,
+                initial_lambda,
+                ..
+            } => Self {
+                active_keyframes,
+                max_iterations,
+                initial_lambda,
+                ..*self
+            },
+            LargeWindow::Off => *self,
         }
     }
 }
@@ -712,6 +745,7 @@ pub fn run_local_inertial_ba_with(
         imu_t_bc,
         gravity: gravity_world,
         max_iterations: params.max_iterations,
+        initial_lambda: params.initial_lambda,
         boundary_imu_info_scale: params.boundary_imu_info_scale,
         boundary_scales_bias_rows: params.boundary_scales_bias_rows,
         boundary: params.boundary,

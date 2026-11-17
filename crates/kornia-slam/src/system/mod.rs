@@ -454,6 +454,7 @@ impl SlamSystem {
             ba_updates_rejected: mapping.ba_updates_rejected,
             ba_solves: mapping.ba_solves,
             ba_solve_ns: mapping.ba_solve_ns,
+            large_window_solves: mapping.large_window_solves,
             ..self.counters
         }
     }
@@ -1753,7 +1754,7 @@ impl SlamSystem {
                 ));
             } else if due
                 && let Some(role) = role
-                && self.insert_keyframe(&frame, timestamp_sec, &[], role)
+                && self.insert_keyframe(&frame, timestamp_sec, &[], 0, role)
             {
                 let idx = frame.idx;
                 self.dbg(match role {
@@ -2293,16 +2294,24 @@ impl SlamSystem {
         if !self.keyframe_due(&evidence, timestamp_sec) {
             return false;
         }
-        self.insert_keyframe(frame, timestamp_sec, matches, KeyframeRole::Tracked)
+        self.insert_keyframe(
+            frame,
+            timestamp_sec,
+            matches,
+            tracked_inliers,
+            KeyframeRole::Tracked,
+        )
     }
 
     /// Publishes `frame` as a keyframe at the current tracking pose and runs
     /// the mapping work it earns; an anchor earns growth only.
+    /// `tracked_inliers`: the frame's PnP inliers, 0 when not tracked.
     fn insert_keyframe(
         &mut self,
         frame: &Frame,
         timestamp_sec: f64,
         matches: &[(usize, usize)],
+        tracked_inliers: usize,
         role: KeyframeRole,
     ) -> bool {
         // Guard: reference KF must exist before we can triangulate.
@@ -2441,7 +2450,7 @@ impl SlamSystem {
             gravity_world: self.inertial.gravity_world,
             local_ba: self.job_local_ba(),
             wheel_factors: self.wheel_factors(),
-            tracked_inliers: 0,
+            tracked_inliers,
         }) {
             self.dbg("[local_mapping] worker is unavailable".into());
         }

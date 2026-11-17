@@ -895,3 +895,42 @@ fn anchors_inside_the_window_stay_fixed_through_both_solves() {
     );
     assert_eq!(anchors(&map), before);
 }
+
+/// ORB-SLAM3's `bLarge` is strict (`inliers > 100`), and only the window's
+/// size, iteration cap and initial damping change with it.
+#[test]
+fn the_large_window_applies_above_its_inlier_threshold() {
+    let params = LocalBaParams {
+        active_keyframes: 10,
+        large_window: LargeWindow::Enabled {
+            min_tracked_inliers: 100,
+            active_keyframes: 25,
+            max_iterations: 4,
+            initial_lambda: 1e-2,
+        },
+        ..LocalBaParams::default()
+    };
+    assert!(!params.large_window_applies(100));
+    assert!(params.large_window_applies(101));
+    assert!(!LocalBaParams::default().large_window_applies(10_000));
+
+    let large = params.large();
+    assert_eq!(
+        (
+            large.active_keyframes,
+            large.max_iterations,
+            large.initial_lambda
+        ),
+        (25, 4, 1e-2)
+    );
+    assert_eq!(
+        LocalBaParams {
+            active_keyframes: 10,
+            max_iterations: params.max_iterations,
+            initial_lambda: params.initial_lambda,
+            ..large
+        },
+        params
+    );
+    assert_eq!(LocalBaParams::default().large(), LocalBaParams::default());
+}

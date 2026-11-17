@@ -51,11 +51,29 @@ pub struct KeyframeJob {
     pub tracked_inliers: usize,
 }
 
+impl KeyframeJob {
+    /// Whether this job solves in the large window; VI-BA only, as
+    /// ORB-SLAM3's `LocalInertialBA`.
+    fn large_window(&self) -> bool {
+        self.imu_initialized && self.local_ba.large_window_applies(self.tracked_inliers)
+    }
+
+    /// The local-BA settings this job solves with.
+    fn ba_params(&self) -> LocalBaParams {
+        if self.large_window() {
+            self.local_ba.large()
+        } else {
+            self.local_ba
+        }
+    }
+}
+
 fn capture_local_window(map: &Map, job: &KeyframeJob) -> BaSnapshot {
-    map.ba_snapshot(&local_window_of(map, job.local_ba.active_keyframes, []))
+    map.ba_snapshot(&local_window_of(map, job.ba_params().active_keyframes, []))
 }
 
 fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJob) -> BaUpdate {
+    let params = job.ba_params();
     if job.imu_initialized {
         run_local_inertial_ba_with(
             snapshot,
@@ -64,10 +82,10 @@ fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJo
             job.gravity_world,
             &job.wheel_factors,
             &[],
-            &job.local_ba,
+            &params,
         )
     } else {
-        run_local_ba_with(snapshot, camera, &job.local_ba)
+        run_local_ba_with(snapshot, camera, &params)
     }
 }
 
@@ -80,6 +98,7 @@ pub(crate) struct LocalMappingCounts {
     pub ba_updates_rejected: u64,
     pub ba_solves: u64,
     pub ba_solve_ns: u64,
+    pub large_window_solves: u64,
 }
 
 // Atomics because the asynchronous worker writes them while tracking reads.
@@ -91,6 +110,7 @@ struct LocalMappingCounters {
     ba_updates_rejected: AtomicU64,
     ba_solves: AtomicU64,
     ba_solve_ns: AtomicU64,
+    large_window_solves: AtomicU64,
 }
 
 impl LocalMappingCounters {
@@ -103,6 +123,9 @@ impl LocalMappingCounters {
             return;
         }
         add(&self.ba_solves, 1);
+        if job.large_window() {
+            add(&self.large_window_solves, 1);
+        }
         let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         add(&self.ba_solve_ns, elapsed_ns);
         if outcome.solve == BaSolve::Failed {
@@ -132,6 +155,7 @@ impl LocalMappingCounters {
             ba_updates_rejected: read(&self.ba_updates_rejected),
             ba_solves: read(&self.ba_solves),
             ba_solve_ns: read(&self.ba_solve_ns),
+            large_window_solves: read(&self.large_window_solves),
         }
     }
 }

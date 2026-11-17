@@ -113,6 +113,7 @@ impl LocalBaConfig {
             lost_keyframes: self.lost_keyframes,
             visual_kernel: self.visual_kernel,
             large_window: self.large_window,
+            initial_lambda: LocalBaParams::default().initial_lambda,
             recently_initialized: false,
             newest_marginal: false,
         }

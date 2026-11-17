@@ -568,7 +568,7 @@ mod anchors {
     #[test]
     fn an_anchor_stays_out_of_the_imu_chain_and_the_next_keyframe_bridges_it() {
         let mut system = system();
-        assert!(system.insert_keyframe(&frame(4), 0.2, &[], KeyframeRole::Anchor));
+        assert!(system.insert_keyframe(&frame(4), 0.2, &[], 0, KeyframeRole::Anchor));
         {
             let map = system.map.lock().unwrap();
             let anchor = map.get_keyframe(4).unwrap();
@@ -580,7 +580,7 @@ mod anchors {
         assert_eq!(system.inertial.last_keyframe_timestamp_sec, Some(0.0));
         assert_eq!(system.state.last_anchor_timestamp_sec, Some(0.2));
 
-        assert!(system.insert_keyframe(&frame(8), 0.4, &[], KeyframeRole::Tracked));
+        assert!(system.insert_keyframe(&frame(8), 0.4, &[], 0, KeyframeRole::Tracked));
         let map = system.map.lock().unwrap();
         let [edge] = map.imu_factors() else {
             panic!("one edge, got {}", map.imu_factors().len());
@@ -595,7 +595,7 @@ mod anchors {
     fn anchors_are_spaced_from_the_newest_anchor_and_tracking_clears_it() {
         let mut system = system();
         assert!(system.keyframe_due_while_lost(0.2));
-        assert!(system.insert_keyframe(&frame(4), 0.2, &[], KeyframeRole::Anchor));
+        assert!(system.insert_keyframe(&frame(4), 0.2, &[], 0, KeyframeRole::Anchor));
         assert!(!system.keyframe_due_while_lost(0.3));
         assert!(system.keyframe_due_while_lost(0.4));
         system.state.mark_tracked();
@@ -618,7 +618,7 @@ mod anchors {
             .unwrap()
             .edit_keyframes_for_test(|_, kf| kf.imu_bias = tracked_bias);
         system.state.velocity_world = Vec3F64::new(1.0, 0.0, 0.0);
-        assert!(system.insert_keyframe(&frame(4), 0.2, &[], KeyframeRole::Anchor));
+        assert!(system.insert_keyframe(&frame(4), 0.2, &[], 0, KeyframeRole::Anchor));
         system.map.lock().unwrap().edit_keyframes_for_test(|_, kf| {
             if kf.anchor {
                 kf.velocity_world = Vec3F64::new(-5.0, 0.0, 0.0);
