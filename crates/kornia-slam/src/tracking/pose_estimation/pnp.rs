@@ -6,9 +6,11 @@ use kornia_3d::pose::Pose3d;
 use kornia_3d::ransac::RobustKernelKind;
 use kornia_algebra::{Mat3AF32, Vec2F32, Vec3AF32, Vec3F64};
 
-use super::pose_lm::{self, Refined};
 use crate::mapping::visual_information::VisualInformation;
 use crate::pose_conversion::{mat3_to_f32, mat3_to_f64, vec3_to_f32, vec3_to_f64};
+use crate::upstream::kornia_3d::refine_analytic::{
+    RefinedPose, refine_pose_analytic, supports_kernel,
+};
 
 /// PnP pose-estimation thresholds.
 #[derive(Debug, Clone)]
@@ -280,9 +282,9 @@ fn refine(
     rotation: &Mat3AF32,
     translation: &Vec3AF32,
     params: &LMRefineParams,
-) -> Option<Refined> {
-    if pose_lm::supports(params) {
-        return pose_lm::refine_pose(points_world, points_image, k, rotation, translation, params);
+) -> Option<RefinedPose> {
+    if supports_kernel(params) {
+        return refine_pose_analytic(points_world, points_image, k, rotation, translation, params);
     }
     let lm = refine_pose_lm(
         points_world,
@@ -294,7 +296,7 @@ fn refine(
         params,
     )
     .ok()?;
-    Some(Refined {
+    Some(RefinedPose {
         rotation: lm.rotation,
         translation: lm.translation,
         converged: lm.converged.unwrap_or(false),

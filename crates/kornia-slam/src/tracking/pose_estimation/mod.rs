@@ -5,7 +5,6 @@ pub mod pnp;
 // Skeleton for the PR #180 lanes: lane A fills and calls the pose-inertial solve.
 #[allow(dead_code)]
 pub(crate) mod pose_inertial;
-mod pose_lm;
 pub mod rig_pnp;
 
 use kornia_3d::pose::Pose3d;
