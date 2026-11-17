@@ -716,6 +716,7 @@ pub fn run_local_inertial_ba_with(
         boundary_scales_bias_rows: params.boundary_scales_bias_rows,
         boundary: params.boundary,
         imu_huber: params.imu_huber,
+        imu_recently_initialized: params.recently_initialized,
         rig_views: rig_views.clone(),
         observation_views: observation_views.clone(),
         observation_sigma_px,

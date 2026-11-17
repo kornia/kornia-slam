@@ -59,10 +59,10 @@ impl InertialInitSchedule {
         self.start_kf_idx
     }
 
-    /// A window is open and VIBA2 has not run (ORB-SLAM3's `bRecInit`).
-    #[allow(dead_code)] // skeleton: lane A calls it
+    /// A window is open and VIBA2 has not run (ORB-SLAM3's `bRecInit`,
+    /// `LocalMapping.cc:149`).
     pub(crate) fn recently_initialized(&self) -> bool {
-        todo!("lane A: recently initialized")
+        self.start_kf_idx.is_some() && !self.viba2_done
     }
 
     pub(crate) fn retry_due(&self, timestamp_sec: f64) -> bool {
@@ -158,6 +158,22 @@ mod tests {
 
         assert_eq!(mono, 1e10);
         assert_eq!(stereo, 1e5);
+    }
+
+    #[test]
+    fn recently_initialized_lasts_until_viba2() {
+        let mut schedule = InertialInitSchedule::default();
+        assert!(!schedule.recently_initialized(), "no window yet");
+        schedule.start(7, 100.0);
+        assert!(schedule.recently_initialized());
+        schedule.complete(Refinement::Viba1);
+        assert!(schedule.recently_initialized());
+        schedule.complete(Refinement::Viba2);
+        assert!(!schedule.recently_initialized());
+        schedule.start(40, 200.0);
+        assert!(schedule.recently_initialized(), "a new window re-arms it");
+        schedule.close();
+        assert!(!schedule.recently_initialized());
     }
 
     #[test]

@@ -839,7 +839,9 @@ fn imu_huber_chi2(edge: &ImuFactor, kf_local: &[i64], params: &ViBaParams) -> Op
         ImuHuber::AllEdges => Some(params.huber_imu_chi2),
         ImuHuber::BoundaryOnly => is_boundary_edge(edge, kf_local).then_some(params.huber_imu_chi2),
         ImuHuber::Off => None,
-        ImuHuber::BoundaryOrRecentInit => todo!("lane A: Huber while recently initialized"),
+        ImuHuber::BoundaryOrRecentInit => (params.imu_recently_initialized
+            || is_boundary_edge(edge, kf_local))
+        .then_some(params.huber_imu_chi2),
     }
 }
 
@@ -2425,6 +2427,26 @@ mod tests {
         }
         assert_eq!(chi2(ImuHuber::BoundaryOnly, &[-1, 0]), k);
         assert_eq!(chi2(ImuHuber::BoundaryOnly, &[0, 1]), None);
+    }
+
+    /// `BoundaryOrRecentInit` is `BoundaryOnly` once VIBA2 has run, and
+    /// robustifies every edge before it.
+    #[test]
+    fn imu_huber_guards_every_edge_while_recently_initialized() {
+        let edge = spin_edge(0, 0.0, ViBaParams::default().gravity);
+        let chi2 = |imu_recently_initialized, kf_local: &[i64]| {
+            let params = ViBaParams {
+                imu_huber: ImuHuber::BoundaryOrRecentInit,
+                imu_recently_initialized,
+                ..ViBaParams::default()
+            };
+            imu_huber_chi2(&edge, kf_local, &params)
+        };
+        let k = Some(ViBaParams::default().huber_imu_chi2);
+        assert_eq!(chi2(true, &[0, 1]), k);
+        assert_eq!(chi2(true, &[-1, 0]), k);
+        assert_eq!(chi2(false, &[-1, 0]), k);
+        assert_eq!(chi2(false, &[0, 1]), None);
     }
 
     #[test]

@@ -1418,7 +1418,7 @@ impl SlamSystem {
             imu_initialized: true,
             imu_t_bc: self.rig.camera_to_body(),
             gravity_world: self.inertial.gravity_world,
-            local_ba: self.local_ba,
+            local_ba: self.job_local_ba(),
             wheel_factors: self.wheel_factors(),
             tracked_inliers: 0,
         }) {
@@ -1914,6 +1914,15 @@ impl SlamSystem {
             self.state.velocity_world = velocity_world; // propagate for next frame
         }
         (candidate_pose, predicted_velocity)
+    }
+
+    /// The local-BA settings of a job submitted now: the run's, with the
+    /// inertial schedule's state.
+    fn job_local_ba(&self) -> LocalBaParams {
+        LocalBaParams {
+            recently_initialized: self.inertial.schedule.recently_initialized(),
+            ..self.local_ba
+        }
     }
 
     /// Counts a `Midpoint` window that held its last sample to `t1`: no sample
@@ -2430,7 +2439,7 @@ impl SlamSystem {
             imu_initialized,
             imu_t_bc: self.rig.camera_to_body(),
             gravity_world: self.inertial.gravity_world,
-            local_ba: self.local_ba,
+            local_ba: self.job_local_ba(),
             wheel_factors: self.wheel_factors(),
             tracked_inliers: 0,
         }) {
@@ -2607,7 +2616,7 @@ impl SlamSystem {
                     imu_initialized: true,
                     imu_t_bc: self.rig.camera_to_body(),
                     gravity_world: self.inertial.gravity_world,
-                    local_ba: self.local_ba,
+                    local_ba: self.job_local_ba(),
                     wheel_factors: self.wheel_factors(),
                     tracked_inliers: 0,
                 }) {
