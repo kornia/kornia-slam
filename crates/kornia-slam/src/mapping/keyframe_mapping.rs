@@ -178,7 +178,81 @@ pub(crate) fn prepare_keyframe_growth(
                 triangulation_neighbours: neighbours,
             }
         }
-        GrowthNeighbours::OrbSlam3 { .. } => todo!("lane A: ORB-SLAM3 growth neighbours"),
+        GrowthNeighbours::OrbSlam3 { covisible } => orb_slam3_growth(map, keyframe_idx, covisible),
+    }
+}
+
+/// ORB-SLAM3 links keyframes sharing at least 15 landmarks
+/// (`KeyFrame::UpdateConnections`).
+const MIN_COVISIBILITY_WEIGHT: usize = 15;
+/// Second-order fusion neighbours per target, and the size the temporal
+/// keyframes fill the fusion list to (`LocalMapping.cc:741-763`).
+const FUSION_TARGETS: usize = 20;
+
+/// ORB-SLAM3's lists, triangulation from `CreateNewMapPoints`
+/// (`LocalMapping.cc:388-407`) and fusion from `SearchInNeighbors`
+/// (`:714-763`). The new keyframe is not in the map yet, so its covisibility
+/// stands in as the previous keyframe's: that keyframe, then its best
+/// covisible neighbours.
+fn orb_slam3_growth(map: &Map, keyframe_idx: usize, covisible: usize) -> KeyframeGrowthPlan {
+    // Newest first: ORB-SLAM3's `mPrevKF` chain.
+    let recent: Vec<usize> = map
+        .keyframes()
+        .iter()
+        .rev()
+        .map(|kf| kf.frame.idx)
+        .filter(|&idx| idx != keyframe_idx)
+        .collect();
+    let best_covisible = |kf_idx: usize, n: usize| -> Vec<usize> {
+        map.covisible_keyframes_min_weight(kf_idx, MIN_COVISIBILITY_WEIGHT)
+            .into_iter()
+            .map(|(idx, _)| idx)
+            .filter(|&idx| idx != keyframe_idx)
+            .take(n)
+            .collect()
+    };
+    let mut nearest = Vec::new();
+    if let Some(&previous) = recent.first() {
+        nearest.push(previous);
+        extend_unique(&mut nearest, best_covisible(previous, covisible));
+        nearest.truncate(covisible);
+    }
+
+    let mut triangulation_neighbours = nearest.clone();
+    for &idx in recent.iter().take(covisible) {
+        if triangulation_neighbours.len() > covisible {
+            break;
+        }
+        extend_unique(&mut triangulation_neighbours, [idx]);
+    }
+
+    let mut fusion_neighbours = nearest.clone();
+    for &target in &nearest {
+        extend_unique(
+            &mut fusion_neighbours,
+            best_covisible(target, FUSION_TARGETS),
+        );
+    }
+    for &idx in &recent {
+        if fusion_neighbours.len() >= FUSION_TARGETS {
+            break;
+        }
+        extend_unique(&mut fusion_neighbours, [idx]);
+    }
+
+    KeyframeGrowthPlan {
+        keyframe_idx,
+        triangulation_neighbours,
+        fusion_neighbours,
+    }
+}
+
+/// Appends each of `ids` not in `list` yet, in order.
+fn extend_unique(list: &mut Vec<usize>, ids: impl IntoIterator<Item = usize>) {
+    for id in ids {
+        if !list.contains(&id) {
+            list.push(id);
+        }
     }
 }
 
@@ -460,6 +534,23 @@ mod tests {
         let plan = prepare_keyframe_growth(&map, 9, GrowthNeighbours::RecentTen);
 
         assert_eq!(plan.triangulation_neighbours, vec![4]);
+    }
+
+    /// Without covisibility the ORB-SLAM3 lists are the previous keyframe,
+    /// then the temporal chain: `covisible + 1` at most for triangulation,
+    /// up to 20 for fusion; never the grown keyframe.
+    #[test]
+    fn orb_slam3_neighbours_fall_back_to_the_temporal_chain() {
+        let mut map = Map::new();
+        for idx in 1..=6 {
+            map.insert_keyframe(Keyframe::from_frame(empty_frame(idx)))
+                .unwrap();
+        }
+
+        let plan = prepare_keyframe_growth(&map, 6, GrowthNeighbours::OrbSlam3 { covisible: 2 });
+
+        assert_eq!(plan.triangulation_neighbours, vec![5, 4]);
+        assert_eq!(plan.fusion_neighbours, vec![5, 4, 3, 2, 1]);
     }
 
     /// Each pair is published before the next is prepared, so the second
