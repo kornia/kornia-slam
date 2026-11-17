@@ -81,9 +81,9 @@ fn vertical_row(r: [&[u8]; 5], v: &mut [u16]) {
         v[x + LANES..x + 2 * LANES].copy_from_slice(&sum_hi.to_array());
         x += 2 * LANES;
     }
-    for x in x..w {
+    for (x, out) in v.iter_mut().enumerate().skip(x) {
         let [a, b, c, d, e] = r.map(|row| u16::from(row[x]));
-        v[x] = a + e + 4 * (b + d) + 6 * c;
+        *out = a + e + 4 * (b + d) + 6 * c;
     }
 }
 
