@@ -311,7 +311,7 @@ mod tests {
             let (x, y) = ((i % 8) as f64 * 0.4 - 1.4, (i / 8) as f64 * 0.3 - 0.6);
             let mut m = ray_match(&side, Vec3F64::new(x, y, 4.0 + (i % 3) as f64));
             if i % 3 == 0 {
-                m.point_world = m.point_world + Vec3F64::new(0.7, -0.4, 0.5);
+                m.point_world += Vec3F64::new(0.7, -0.4, 0.5);
             }
             matches.push(m);
         }

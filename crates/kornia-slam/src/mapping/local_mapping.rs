@@ -206,8 +206,9 @@ enum LocalMappingBackend {
         map: Arc<Mutex<Map>>,
         camera: PinholeCamera,
         results: Mutex<Vec<LocalBaMergeResult>>,
-        /// The online calibration the next solve starts from.
-        calibration: Mutex<OnlineCalibrationState>,
+        /// The online calibration the next solve starts from; boxed, as it
+        /// dwarfs the asynchronous variant.
+        calibration: Box<Mutex<OnlineCalibrationState>>,
         /// Set by [`LocalMapping::with_deferred`].
         deferred: Option<DeferredKeyframeContext>,
     },
@@ -254,7 +255,7 @@ impl LocalMapping {
                 map,
                 camera,
                 results: Mutex::new(Vec::new()),
-                calibration: Mutex::new(OnlineCalibrationState::default()),
+                calibration: Box::new(Mutex::new(OnlineCalibrationState::default())),
                 deferred: None,
             },
             LocalMappingMode::Asynchronous => {

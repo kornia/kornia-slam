@@ -237,7 +237,7 @@ const SUBPIX_EPSILON: f32 = 0.03;
 
 /// Whether a check that runs every `every_n_frames` frames runs on this one.
 fn due(frame_idx: u64, every_n_frames: usize) -> bool {
-    frame_idx % (every_n_frames.max(1) as u64) == 0
+    frame_idx.is_multiple_of(every_n_frames.max(1) as u64)
 }
 
 fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {

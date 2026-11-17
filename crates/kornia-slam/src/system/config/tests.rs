@@ -314,7 +314,8 @@ fn relocalization_knobs_are_off_by_default_and_need_loop_closing() {
     assert!(!tracking_loss.reseed.relocalize_when_lost);
     assert_eq!(tracking_loss.reseed.own_window_keyframes, 0);
 
-    let knobs: [(&str, fn(&mut OrbSlamPipeline)); 3] = [
+    type Knob = (&'static str, fn(&mut OrbSlamPipeline));
+    let knobs: [Knob; 3] = [
         ("tracking_loss.relocalization.while_lost", |orb| {
             orb.tracking_loss.relocalization.while_lost = true;
         }),

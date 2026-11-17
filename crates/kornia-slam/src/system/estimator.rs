@@ -61,8 +61,9 @@ pub(super) struct EstimatorState {
 enum SolveAnchor {
     /// The last keyframe, held fixed, from its timestamp.
     Keyframe(FrameNavState, f64),
-    /// The previous frame under its prior.
-    Frame(NavPrior),
+    /// The previous frame under its prior; boxed, as it is ten times the
+    /// keyframe variant.
+    Frame(Box<NavPrior>),
 }
 
 /// A keyframe's inertial state, copied out of the map.
@@ -455,7 +456,7 @@ impl SlamSystem {
         if mode == PoseInertial::OrbSlam3
             && let Some(prior) = self.valid_frame_prior(frame_idx)
         {
-            return Some(SolveAnchor::Frame(prior));
+            return Some(SolveAnchor::Frame(Box::new(prior)));
         }
         let kf_sec = self.inertial.last_keyframe_timestamp_sec?;
         let map = self.map.lock().unwrap();

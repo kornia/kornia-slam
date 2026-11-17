@@ -39,6 +39,9 @@ use crate::tracking::relocalization::{
 use crate::tracking::timings::TrackingTimings;
 use crate::upstream::kornia_3d::refine_analytic::refine_pose_analytic;
 
+/// A flow frame, its `(keypoint, map point)` seeds and each seed's world point.
+pub(crate) type FlowFrame = (Frame, Vec<(usize, usize)>, Vec<kornia_algebra::Vec3F64>);
+
 /// Everything the tracker needs about the current frame that it does not own.
 pub(crate) struct FrameInput<'a> {
     pub frame: &'a Frame,
@@ -541,7 +544,7 @@ impl Tracker {
         output: &FlowOutput,
         image_size: ImageSize,
         min_tracks: usize,
-    ) -> Option<(Frame, Vec<(usize, usize)>, Vec<kornia_algebra::Vec3F64>)> {
+    ) -> Option<FlowFrame> {
         let tracks: HashMap<TrackId, (usize, kornia_algebra::Vec3F64)> = self
             .track_set
             .tracks()

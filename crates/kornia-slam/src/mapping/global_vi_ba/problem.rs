@@ -73,7 +73,7 @@ impl State {
         let keyframes = self
             .keyframes
             .iter()
-            .zip(keyframes.chunks_exact(15))
+            .zip(keyframes.as_chunks::<15>().0)
             .map(|(kf, d)| {
                 let e = SE3F64::exp(
                     Vec3F64::new(d[0], d[1], d[2]),
@@ -451,8 +451,8 @@ impl<'a> Problem<'a> {
         let (_, sw_pixel, sw_depth) = self.kernel(obs, pixel, depth);
         let mut rows = ObservationRows::default();
         if let Some((column, _)) = projection.offset {
-            for d in 0..3 {
-                rows.j_calibration[d] = Some((column + d, SVecF64::zeros()));
+            for (d, slot) in rows.j_calibration[..3].iter_mut().enumerate() {
+                *slot = Some((column + d, SVecF64::zeros()));
             }
         }
         if let Some(column) = projection.focal {

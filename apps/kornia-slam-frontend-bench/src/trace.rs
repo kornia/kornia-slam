@@ -138,7 +138,7 @@ impl Trace {
         let path = dir.join("local_map.bin");
         let bytes = std::fs::read(&path).map_err(|source| TraceError::Io { path, source })?;
         let mut local_map: BTreeMap<usize, Vec<LocalPoint>> = BTreeMap::new();
-        for record in bytes.chunks_exact(60) {
+        for record in bytes.as_chunks::<60>().0 {
             let u32_at = |o: usize| {
                 u32::from_le_bytes([record[o], record[o + 1], record[o + 2], record[o + 3]])
             };
