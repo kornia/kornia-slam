@@ -23,6 +23,7 @@ use crate::loop_closure::sparse_pgo::{
     sparse_pose_graph_optimize, weighted_relative_residual,
 };
 use crate::pose_conversion::pose_to_se3;
+use crate::upstream::kornia_3d::pose_ext::camera_centre;
 
 pub use gate::{
     GateDecision, LoopGate, LoopProposal, OdometryConsistencyGate, TemporalConsistencyGate,
@@ -552,7 +553,7 @@ impl<P> PoseGraph<P> {
 
     fn advance_path(&mut self, odometry: &Pose3d) {
         if let (Some(last), Some(anchor)) = (self.last_odometry, self.anchor.as_mut()) {
-            let step = (centre(odometry) - centre(&last)).length();
+            let step = (camera_centre(odometry) - camera_centre(&last)).length();
             let turn = turn_between(&self.config.manifold, &last, odometry);
             self.path_m += step;
             anchor.path_m += step;
@@ -865,13 +866,9 @@ fn whitened_squared(poses: &[Pose3d], edge: &InformationEdge) -> Option<f64> {
     )
 }
 
-fn centre(pose: &Pose3d) -> Vec3F64 {
-    pose.inverse().translation
-}
-
 /// Camera-centre distance, in the plane normal to gravity on a gravity manifold.
 fn distance_between(manifold: &GraphManifold, a: &Pose3d, b: &Pose3d) -> f64 {
-    let offset = centre(b) - centre(a);
+    let offset = camera_centre(b) - camera_centre(a);
     match manifold {
         GraphManifold::Se3 => offset.length(),
         GraphManifold::Gravity(gravity) => {

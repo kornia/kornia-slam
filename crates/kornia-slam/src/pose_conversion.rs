@@ -16,11 +16,6 @@ pub(crate) fn rigid(pose: Pose3d) -> Pose3d {
     Pose3d::new(orthonormalized(pose.rotation), pose.translation)
 }
 
-/// Camera centre in the world frame.
-pub(crate) fn camera_centre(pose_world_to_cam: &Pose3d) -> Vec3F64 {
-    pose_world_to_cam.inverse().translation
-}
-
 /// Rotation angle between two poses, degrees.
 pub(crate) fn angle_deg(from: &Pose3d, to: &Pose3d) -> f64 {
     let relative = Pose3d::between(from, to);

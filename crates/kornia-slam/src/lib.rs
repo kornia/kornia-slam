@@ -52,6 +52,7 @@ pub mod rig;
 pub mod stereo;
 pub mod system;
 pub mod tracking;
+pub(crate) mod upstream;
 
 pub use frame::Frame;
 pub use frontend::FrontendObservation;

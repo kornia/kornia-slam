@@ -11,6 +11,7 @@ use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::PreintegratedImu;
 
 use crate::pose_conversion::rigid;
+use crate::upstream::kornia_3d::pose_ext::camera_centre;
 
 /// Preintegration prepared by the system, which owns bias and sample buffering.
 pub(crate) struct InertialPrediction<'a> {
@@ -97,7 +98,7 @@ pub(crate) fn coast_is_plausible(
     gap_sec: f64,
     max_speed_mps: f64,
 ) -> bool {
-    let travelled = (after.inverse().translation - before.inverse().translation).length();
+    let travelled = (camera_centre(after) - camera_centre(before)).length();
     if !travelled.is_finite() {
         return false;
     }

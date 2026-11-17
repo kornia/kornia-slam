@@ -7,8 +7,9 @@
 
 use kornia_3d::pose::Pose3d;
 
-use crate::pose_conversion::{angle_deg, camera_centre};
+use crate::pose_conversion::angle_deg;
 use crate::tracking::motion::coast_is_plausible;
+use crate::upstream::kornia_3d::pose_ext::camera_centre;
 
 /// Whether a tracked pose that disagrees with the inertial prediction is
 /// rejected; `Disabled` accepts on inliers alone.

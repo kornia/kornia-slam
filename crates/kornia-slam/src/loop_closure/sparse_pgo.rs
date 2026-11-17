@@ -2083,6 +2083,7 @@ mod information_tests {
         GravityManifold, InformationEdge, RobustKernel, Se3Manifold, pose_to_se3,
         sparse_pose_graph_optimize, weighted_relative_residual,
     };
+    use crate::upstream::kornia_3d::pose_ext::camera_centre;
 
     const SIDE_POSES: usize = 4;
     const LOOP_POSES: usize = 4 * SIDE_POSES;
@@ -2091,10 +2092,6 @@ mod information_tests {
     fn planar_pose(yaw: f64, center: Vec3F64) -> Pose3d {
         let rotation = SO3F64::exp(Vec3F64::new(0.0, 0.0, -yaw)).matrix();
         Pose3d::new(rotation, -(rotation * center))
-    }
-
-    fn center(pose: &Pose3d) -> Vec3F64 {
-        pose.inverse().translation
     }
 
     /// A 4 m square, one pose per metre, turning 90 degrees at each corner, integrated with
@@ -2174,7 +2171,7 @@ mod information_tests {
         poses
             .iter()
             .zip(truth)
-            .map(|(pose, truth)| (center(pose) - center(truth)).length())
+            .map(|(pose, truth)| (camera_centre(pose) - camera_centre(truth)).length())
             .fold(0.0, f64::max)
     }
 
@@ -2259,7 +2256,7 @@ mod information_tests {
             ];
             let result =
                 sparse_pose_graph_optimize(&poses, &edges, &[0], &params(), &Se3Manifold).unwrap();
-            center(&result.poses[1]).x
+            camera_centre(&result.poses[1]).x
         };
         // Information-weighted mean: (1 * 1.0 + 4 * 1.2) / 5 = 1.16, and the mirror 1.04.
         assert!((solve(1.0, 2.0) - 1.16).abs() < 1e-3);

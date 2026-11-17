@@ -14,7 +14,8 @@ use crate::mapping::vi_ba_schur::{
     ImuHuber, RigObservationCamera, ViBaKeyframe, ViBaParams, ViBaResult,
 };
 use crate::mapping::visual_information::VisualInformation;
-use crate::pose_conversion::{angle_deg, camera_centre, rigid};
+use crate::pose_conversion::{angle_deg, rigid};
+use crate::upstream::kornia_3d::pose_ext::camera_centre;
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
 use kornia_3d::camera::PinholeCamera;
@@ -911,7 +912,6 @@ pub(super) fn landmarks_to_write_back(
     let n = after.1.len();
     let mut behind = vec![false; n];
     let mut nearest = vec![(f64::INFINITY, f64::INFINITY); n];
-    let camera_centre = |pose: &Pose3d| pose.inverse().translation;
     for (o, obs) in observations.iter().enumerate() {
         let (Some(kf_before), Some(kf_after)) =
             (before.0.get(obs.pose_idx), after.0.get(obs.pose_idx))
