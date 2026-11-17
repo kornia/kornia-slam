@@ -48,6 +48,8 @@ pub(crate) struct OrbFrontend {
     stereo: Option<StereoMatchConfig>,
     fisheye: Option<FisheyeMapping>,
     rig: Option<Arc<RigGeometry>>,
+    /// The pyramid stereo matching reads.
+    stereo_pyramid: StereoPyramid,
     observation: FrontendObservation,
 }
 
@@ -74,6 +76,7 @@ impl OrbFrontend {
             stereo,
             fisheye,
             rig: RigGeometry::from_rig(rig).map(Arc::new),
+            stereo_pyramid: StereoPyramid::Resized,
             observation: FrontendObservation::default(),
         }
     }
@@ -84,12 +87,10 @@ impl OrbFrontend {
         self
     }
 
-    /// Matches stereo and rig overlap on `pyramid`.
-    pub(crate) fn with_stereo_pyramid(self, pyramid: StereoPyramid) -> Self {
-        match pyramid {
-            StereoPyramid::Resized => self,
-            StereoPyramid::Shared => todo!("lane T: the detector's own pyramid"),
-        }
+    /// Matches stereo on `pyramid`; rig overlap matching reads no pyramid.
+    pub(crate) fn with_stereo_pyramid(mut self, pyramid: StereoPyramid) -> Self {
+        self.stereo_pyramid = pyramid;
+        self
     }
 
     /// The rig geometry features are extracted on; `None` outside a rig.
@@ -139,6 +140,9 @@ impl OrbFrontend {
         let start = Instant::now();
         self.observation.orb_per_camera.clear();
         self.observation.overlap = Duration::ZERO;
+        if self.stereo_pyramid == StereoPyramid::Shared {
+            return self.prepare_stereo_shared(idx, left, right, start);
+        }
         let features = self.timed_orb(left, false)?;
         let Some(config) = self.stereo.clone() else {
             return Ok(self.finish_frame(idx, left, features, None, start));
@@ -156,6 +160,65 @@ impl OrbFrontend {
         );
         self.observation.overlap = overlap_start.elapsed();
         Ok(self.finish_frame(idx, left, features, Some(matches), start))
+    }
+
+    /// [`Self::prepare_stereo_pair`] on the detector's own pyramid of each
+    /// image, built once for both ORB and the stereo search
+    /// (`StereoPyramid::Shared`). Its levels resize the previous level, not
+    /// the original, so the matches differ from the resized pyramid's.
+    fn prepare_stereo_shared(
+        &mut self,
+        idx: usize,
+        left: &Image<u8, 1>,
+        right: &Image<u8, 1>,
+        start: Instant,
+    ) -> Result<Frame, ImageError> {
+        let left_pyramid = self.detector_pyramid(left)?;
+        let features = self.timed_orb_on(&left_pyramid, false)?;
+        let Some(config) = self.stereo.clone() else {
+            return Ok(self.finish_frame(idx, left, features, None, start));
+        };
+        let right_pyramid = self.detector_pyramid(right)?;
+        let right_features = self.timed_orb_on(&right_pyramid, true)?;
+        let overlap_start = Instant::now();
+        let matches = compute_stereo_matches(
+            &left_pyramid,
+            &right_pyramid,
+            &features,
+            &right_features,
+            &config,
+        );
+        self.observation.overlap = overlap_start.elapsed();
+        Ok(self.finish_frame(idx, left, features, Some(matches), start))
+    }
+
+    /// The detector's pyramid of `image`, level 0 included.
+    fn detector_pyramid(&self, image: &Image<u8, 1>) -> Result<Vec<Image<u8, 1>>, ImageError> {
+        let mut levels = Vec::with_capacity(self.detector.n_scales);
+        self.detector.build_pyramid_u8_into(image, &mut levels)?;
+        let mut pyramid = Vec::with_capacity(levels.len() + 1);
+        pyramid.push(image.clone());
+        pyramid.extend(levels);
+        Ok(pyramid)
+    }
+
+    /// ORB on a pyramid from [`Self::detector_pyramid`], its time appended
+    /// to `orb_per_camera`; the pyramid build is in the stage before.
+    fn timed_orb_on(
+        &mut self,
+        pyramid: &[Image<u8, 1>],
+        secondary: bool,
+    ) -> Result<OrbFeatures, ImageError> {
+        let start = Instant::now();
+        let detector = if secondary {
+            &self.secondary
+        } else {
+            &self.detector
+        };
+        let levels: Vec<&Image<u8, 1>> = pyramid.iter().collect();
+        let features = detector.detect_and_extract_u8_from_pyramid(&levels)?;
+        self.observation.orb_per_camera.push(start.elapsed());
+        Ok(features)
     }
 
     /// Extracts features on every image of a validated rig capture, one image
