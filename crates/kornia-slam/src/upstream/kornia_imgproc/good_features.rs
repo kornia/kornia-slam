@@ -11,9 +11,10 @@
 //! response does not depend on the ISA.
 
 use kornia_image::Image;
-use wide::{f32x8, i16x8, i32x8, u8x16};
+use wide::{f32x8, i16x8};
 
-const LANES: usize = 8;
+use super::lanes::{LANES, lane_starts, load_i32, load8_i16, load16, store_i32};
+
 /// A response reads 2 pixels each side (Sobel, then the block), and the
 /// 3×3 maximum one response more.
 const SUPPORT: usize = 3;
@@ -314,15 +315,6 @@ fn respond(
     max
 }
 
-/// Starts of `LANES`-wide chunks covering `0..len`, the last one shifted
-/// back to end at `len`, so its overlap is recomputed with the same values;
-/// none when `len < LANES`.
-fn lane_starts(len: usize) -> impl Iterator<Item = usize> {
-    let last = len.checked_sub(LANES);
-    let before = last.map_or(0, |l| l.div_ceil(LANES));
-    (0..before).map(|k| k * LANES).chain(last)
-}
-
 /// 3×3 Sobel `(Ix, Iy)` at source offset `o`; products stored at `p`.
 fn gradient_products_lanes(
     src: &[u8],
@@ -331,7 +323,7 @@ fn gradient_products_lanes(
     products: &mut [Vec<i32>; 3],
     p: usize,
 ) {
-    let l = |k: usize| load8(&src[k..]);
+    let l = |k: usize| load8_i16(&src[k..]);
     let (up, dn) = (o - sw, o + sw);
     let ix = (l(up + 1) + l(o + 1) * 2i16 + l(dn + 1)) - (l(up - 1) + l(o - 1) * 2i16 + l(dn - 1));
     let iy = (l(dn - 1) + l(dn) * 2i16 + l(dn + 1)) - (l(up - 1) + l(up) * 2i16 + l(up + 1));
@@ -481,31 +473,6 @@ impl<'a> Spacing<'a> {
         }
         true
     }
-}
-
-#[inline(always)]
-fn load8(s: &[u8]) -> i16x8 {
-    let s = &s[..LANES];
-    i16x8::new(std::array::from_fn(|k| i16::from(s[k])))
-}
-
-#[inline(always)]
-fn load16(s: &[u8]) -> u8x16 {
-    let mut a = [0u8; 16];
-    a.copy_from_slice(&s[..16]);
-    u8x16::new(a)
-}
-
-#[inline(always)]
-fn load_i32(s: &[i32]) -> i32x8 {
-    let mut a = [0i32; LANES];
-    a.copy_from_slice(&s[..LANES]);
-    i32x8::new(a)
-}
-
-#[inline(always)]
-fn store_i32(s: &mut [i32], v: i32x8) {
-    s[..LANES].copy_from_slice(v.as_array());
 }
 
 #[cfg(test)]

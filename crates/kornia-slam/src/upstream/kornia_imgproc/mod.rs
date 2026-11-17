@@ -2,5 +2,6 @@
 
 pub mod corner_subpix;
 pub mod good_features;
+mod lanes;
 pub mod lk_window;
 pub mod pyrdown_u8;

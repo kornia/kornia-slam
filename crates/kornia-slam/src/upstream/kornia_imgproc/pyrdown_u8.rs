@@ -7,9 +7,9 @@
 //! so the vertical pass runs first here, at full rate on whole rows.
 
 use kornia_image::{Image, ImageError};
-use wide::{u8x16, u16x8};
+use wide::u16x8;
 
-const LANES: usize = 8;
+use super::lanes::{LANES, load16};
 
 /// OpenCV's `BORDER_REFLECT_101` index of `p` in `0..len`.
 #[inline]
@@ -106,13 +106,6 @@ fn horizontal_row(v: &[u16], out: &mut [u8]) {
         let t = |k: usize| u32::from(v[2 * dx + k]);
         *o = ((t(0) + t(4) + 4 * (t(1) + t(3)) + 6 * t(2) + 128) >> 8) as u8;
     }
-}
-
-#[inline(always)]
-fn load16(s: &[u8]) -> u8x16 {
-    let mut a = [0u8; 16];
-    a.copy_from_slice(&s[..16]);
-    u8x16::new(a)
 }
 
 #[inline(always)]

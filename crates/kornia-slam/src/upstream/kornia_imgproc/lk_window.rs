@@ -15,6 +15,7 @@
 use kornia_image::{Image, ImageError, ImageSize};
 use wide::{i16x8, i32x4, i32x8};
 
+use super::lanes::{LANES, load8_i16};
 use super::pyrdown_u8::{pyrdown_u8, reflect_101};
 
 /// Fractional bits of the bilinear weights.
@@ -26,8 +27,6 @@ const SAMPLE_SHIFT: i32 = W_BITS - 5;
 const FLT_SCALE: f32 = 1.0 / (1u32 << 20) as f32;
 /// `|J - I|` is in units of 1/32 pixel value.
 const SAMPLE_UNIT: f32 = 32.0;
-/// i16 lanes per vector; window rows are padded to a multiple.
-const LANES: usize = 8;
 /// Two consecutive updates that cancel to within this (pixels) mean the
 /// iteration oscillates; OpenCV then takes the half step and stops.
 const OSCILLATION_TOL: f32 = 0.01;
@@ -321,7 +320,7 @@ pub fn track_template(
 /// the caller checked that all reads are inside the plane.
 fn deriv_interior(data: &[u8], lw: usize, x0: usize, y0: usize, t: &mut LkTemplate) {
     let ds = t.deriv_stride();
-    let at = |o: usize| load8(&data[o..]);
+    let at = |o: usize| load8_i16(&data[o..]);
     for v in 0..=t.win {
         let center = (y0 + v) * lw + x0;
         for u in (0..ds).step_by(LANES) {
@@ -514,7 +513,7 @@ fn window_inside(jx: isize, jy: isize, t: &LkTemplate, lw: usize, lh: usize) -> 
 /// and `o + 1`, the next row at `o + stride`), as i16 lanes.
 #[inline(always)]
 fn bilinear_u8(data: &[u8], o: usize, stride: usize, w: [i16x8; 4]) -> i16x8 {
-    let p = [o, o + 1, o + stride, o + stride + 1].map(|k| load8(&data[k..]));
+    let p = [o, o + 1, o + stride, o + stride + 1].map(|k| load8_i16(&data[k..]));
     combine(p, w, SAMPLE_SHIFT)
 }
 
@@ -552,12 +551,6 @@ fn lane_mask(x: usize, cols: usize, tail: i16x8) -> i16x8 {
     } else {
         i16x8::splat(-1)
     }
-}
-
-#[inline(always)]
-fn load8(s: &[u8]) -> i16x8 {
-    let s = &s[..LANES];
-    i16x8::new(std::array::from_fn(|k| i16::from(s[k])))
 }
 
 fn hsum(v: i32x4) -> i64 {
