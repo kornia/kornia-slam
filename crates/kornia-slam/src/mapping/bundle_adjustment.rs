@@ -929,9 +929,8 @@ fn run_local_inertial_ba_inner(
         cheirality_rejections: vi_result.cheirality_rejections,
         cheirality_points_held: vi_result.cheirality_points_held,
         points_rejected,
-        // Lane C reports these from the calibrated solve.
-        calibration_gated: false,
-        calibration_columns: 0,
+        calibration_gated: vi_result.calibration_gated,
+        calibration_columns: vi_result.calibration_columns,
     });
     update.online_calibration = online_calibration;
     update.outcome.solve = BaSolve::Solved;

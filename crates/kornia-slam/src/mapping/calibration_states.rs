@@ -5,15 +5,22 @@
 //! clock offset (VINS-Fusion's `td`). OpenVINS keeps one flag per state
 //! (`StateOptions.h:47-56`); so does this layout.
 
-use kornia_algebra::Vec3F64;
+use kornia_3d::pose::Pose3d;
+use kornia_algebra::{SO3F64, Vec3F64};
 use kornia_sensors::imu::{GyroIntrinsics, ImuMeasurement};
 
-use super::global_vi_ba::{CalibrationEstimate, OfflineCalibrationConfig};
+use super::global_vi_ba::{
+    CalibrationEstimate, ClockOffsetPrior, GyroIntrinsicsPrior, OfflineCalibrationConfig,
+};
+use crate::system::OnlineCalibrationConfig;
 
 /// Central-difference steps of the gyro-intrinsics and clock columns: the
 /// clock step is a quarter of the 1 kHz sample spacing.
 const GYRO_STEP: f64 = 1e-6;
 const CLOCK_STEP_SEC: f64 = 0.25e-3;
+/// Central-difference step of the primary camera's rotation columns, which
+/// enter only the IMU residual (card G, D1).
+pub(in crate::mapping) const ROTATION_STEP_RAD: f64 = 1e-6;
 
 /// Column of every calibration state in the border of the reduced system.
 #[derive(Debug, Clone)]
@@ -29,7 +36,36 @@ pub(in crate::mapping) struct Layout {
 
 impl Layout {
     pub(in crate::mapping) fn new(config: &OfflineCalibrationConfig, cameras: usize) -> Self {
-        let slices = config.time_slices.max(1);
+        Self::with(
+            cameras,
+            config.time_slices.max(1),
+            [
+                config.camera_rotation.is_some(),
+                config.camera_focal.is_some(),
+                config.gyro_intrinsics.is_some(),
+                config.clock_offset.is_some(),
+            ],
+        )
+    }
+
+    /// The online layout: one slice per camera. Camera 0's rotation columns
+    /// hold the offset of the IMU-camera extrinsic (card G, D1); camera
+    /// `k ≥ 1`'s that of its extrinsic to camera 0.
+    pub(in crate::mapping) fn online(config: &OnlineCalibrationConfig, cameras: usize) -> Self {
+        Self::with(
+            cameras,
+            1,
+            [
+                config.camera_rotation.is_some(),
+                config.camera_focal.is_some(),
+                config.gyro_intrinsics.is_some(),
+                config.clock_offset.is_some(),
+            ],
+        )
+    }
+
+    /// Columns in the order rotation, focal, gyro, clock; `on` is that order.
+    fn with(cameras: usize, slices: usize, on: [bool; 4]) -> Self {
         let mut len = 0;
         let mut take = |on: bool, columns: usize| {
             on.then(|| {
@@ -38,10 +74,10 @@ impl Layout {
                 at
             })
         };
-        let rotation = take(config.camera_rotation.is_some(), cameras * slices * 3);
-        let focal = take(config.camera_focal.is_some(), cameras * slices);
-        let gyro = take(config.gyro_intrinsics.is_some(), 6);
-        let clock = take(config.clock_offset.is_some(), 1);
+        let rotation = take(on[0], cameras * slices * 3);
+        let focal = take(on[1], cameras * slices);
+        let gyro = take(on[2], 6);
+        let clock = take(on[3], 1);
         Self {
             cameras,
             slices,
@@ -51,6 +87,10 @@ impl Layout {
             clock,
             len,
         }
+    }
+
+    pub(in crate::mapping) fn cameras(&self) -> usize {
+        self.cameras
     }
 
     pub(in crate::mapping) fn slices(&self) -> usize {
@@ -81,6 +121,13 @@ impl Layout {
     /// `ImuTypes.cc:168-175`) instead of corrected to first order.
     pub(in crate::mapping) fn reintegrates(&self) -> bool {
         self.len > 0
+    }
+
+    /// Online only: the IMU edges are re-integrated only for the states that
+    /// enter the preintegration, the gyro and the clock (card G, D2); the
+    /// camera states keep the first-order bias correction.
+    pub(in crate::mapping) fn imu_reintegrates(&self) -> bool {
+        self.gyro.is_some() || self.clock.is_some()
     }
 }
 
@@ -215,13 +262,98 @@ pub(in crate::mapping) fn prior_rows(
             prior.step_sigma,
         );
     }
-    if let (Some(prior), Some(at)) = (config.gyro_intrinsics, layout.gyro()) {
+    imu_value_rows(
+        layout,
+        config.gyro_intrinsics,
+        config.clock_offset,
+        v,
+        &mut rows,
+    );
+    rows
+}
+
+/// The value priors of the gyro and clock states, which carry no random walk.
+fn imu_value_rows(
+    layout: &Layout,
+    gyro: Option<GyroIntrinsicsPrior>,
+    clock: Option<ClockOffsetPrior>,
+    v: &[f64],
+    rows: &mut Vec<PriorRow>,
+) {
+    if let (Some(prior), Some(at)) = (gyro, layout.gyro()) {
         rows.extend((0..6).map(|d| PriorRow::new(v, vec![(at + d, 1.0 / prior.sigma)])));
     }
-    if let (Some(prior), Some(at)) = (config.clock_offset, layout.clock()) {
+    if let (Some(prior), Some(at)) = (clock, layout.clock()) {
         rows.push(PriorRow::new(v, vec![(at, 1.0 / (prior.sigma_ms * 1e-3))]));
     }
+}
+
+/// The online priors (card G, C2): per camera state a value row to the
+/// factory value and a step row to `previous`, the estimate the solve
+/// started from; the gyro and clock states a value row only, as offline.
+/// The step rows make the estimate an exponential filter across solves, not
+/// a marginal: consecutive windows share data.
+pub(in crate::mapping) fn online_prior_rows(
+    layout: &Layout,
+    config: &OnlineCalibrationConfig,
+    current: &Calibration,
+    previous: &Calibration,
+) -> Vec<PriorRow> {
+    let v = &current.values;
+    let mut rows = Vec::new();
+    let mut per_camera = |column: &dyn Fn(usize) -> Option<usize>,
+                          width: usize,
+                          value_sigma: f64,
+                          step_sigma: f64| {
+        for at in (0..layout.cameras).filter_map(column) {
+            for d in 0..width {
+                rows.push(PriorRow::new(v, vec![(at + d, 1.0 / value_sigma)]));
+                // `previous` is a constant of this solve, so the row has one term.
+                let w = 1.0 / step_sigma;
+                rows.push(PriorRow {
+                    residual: w * (v[at + d] - previous.values[at + d]),
+                    terms: vec![(at + d, w)],
+                });
+            }
+        }
+    };
+    if let Some(prior) = config.camera_rotation {
+        per_camera(
+            &|c| layout.rotation(c, 0),
+            3,
+            prior.value_sigma_deg.to_radians(),
+            prior.step_sigma_deg.to_radians(),
+        );
+    }
+    if let Some(prior) = config.camera_focal {
+        per_camera(
+            &|c| layout.focal(c, 0),
+            1,
+            prior.value_sigma,
+            prior.step_sigma,
+        );
+    }
+    imu_value_rows(
+        layout,
+        config.gyro_intrinsics,
+        config.clock_offset,
+        v,
+        &mut rows,
+    );
     rows
+}
+
+/// `imu_t_bc · Exp(−θ)` (`X_body = T_bc · X_cam`): the IMU-camera extrinsic
+/// with the primary camera's rotation offset `θ` applied about the camera
+/// centre, so its translation is unchanged; `None` is the identity extrinsic.
+/// The body pose is then `T_bw = imu_t_bc · Exp(−θ) · T_cw`, `T_cw` the
+/// camera pose tracking estimates (card G, D1).
+pub(in crate::mapping) fn imu_t_bc_with_offset(
+    imu_t_bc: Option<&Pose3d>,
+    theta: Vec3F64,
+) -> Pose3d {
+    let offset = Pose3d::new(SO3F64::exp(theta * -1.0).matrix(), Vec3F64::ZERO);
+    imu_t_bc.unwrap_or(&Pose3d::IDENTITY).compose(&offset)
 }
 
 /// The IMU calibration columns of `layout` (gyro, then clock) and the

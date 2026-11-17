@@ -65,14 +65,26 @@
 //! to write back a landmark one solve moved more than tenfold and beyond 50 m,
 //! which catches a fling but not a slow walk.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use faer::Mat;
 use faer::prelude::Solve;
-use kornia_algebra::{Mat6F64, Mat15F64, SE3F32, SMatF64, SVecF64, Vec3F64, Vec6F64, Vec15F64};
+use kornia_algebra::{
+    Mat6F64, Mat15F64, SE3F32, SMatF64, SO3F64, SVecF64, Vec3F64, Vec6F64, Vec15F64,
+};
 use thiserror::Error;
 
+use crate::mapping::calibration_states::{
+    Calibration, Layout, PriorRow, ROTATION_STEP_RAD, corrected_samples, imu_calibration_columns,
+    imu_t_bc_with_offset, online_prior_rows,
+};
+use crate::mapping::map::ImuFactor as MapImuFactor;
 use crate::mapping::marginalization::{BoundaryPrior, MarginalPrior, accumulate_prior};
-use crate::mapping::online_calibration::{OnlineCalibrationInput, OnlineCalibrationState};
+use crate::mapping::online_calibration::{
+    OnlineCalibrationInput, OnlineCalibrationState, SolveLog, gate_open,
+};
 use crate::pose_conversion::{pose_to_se3, se3_to_pose, vec3_to_f32};
+use crate::system::OnlineCalibrationConfig;
 use kornia_factors::inertial::NavState;
 use kornia_factors::inertial::preintegration::{self, ImuFactor};
 use kornia_factors::inertial::stationary::{
@@ -84,7 +96,7 @@ use kornia_3d::ba::{BaError, BaObservation};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::ransac::{HuberKernel, RobustKernel};
-use kornia_sensors::imu::{ImuBias, PreintegratedImu};
+use kornia_sensors::imu::{ImuBias, ImuMeasurement, PreintegratedImu};
 
 const MIN_Z: f32 = 1e-3;
 
@@ -316,6 +328,12 @@ impl<'a> ObservationViews<'a> {
         k.checked_sub(1).and_then(|k| self.views.get(k))
     }
 
+    /// The camera of observation `o`: 0 for the primary, `k` for
+    /// `rig_views[k - 1]`.
+    fn camera_index(&self, o: usize) -> usize {
+        self.view(o).map_or(0, |_| usize::from(self.of[o]))
+    }
+
     fn pose(&self, o: usize, pose: &Pose3d) -> Pose3d {
         match self.view(o) {
             Some(view) => view.camera_from_primary.compose(pose),
@@ -413,6 +431,10 @@ pub struct ViBaResult {
     /// when [`ViBaParams::newest_marginal`] asked for it and that keyframe is
     /// free; taken from the last linearization.
     pub newest_marginal: Option<Mat15F64>,
+    /// The online calibration gate held the states (card G): no column.
+    pub calibration_gated: bool,
+    /// Calibration columns the solve added.
+    pub calibration_columns: usize,
 }
 
 /// Upper bound of the depth gate for a measured depth `d`, metres.
@@ -1261,17 +1283,569 @@ fn stationary_cost(
 /// gate held the states).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn visual_inertial_bundle_adjust_calibrated(
-    _keyframes: &[ViBaKeyframe],
-    _points: &[Vec3F64],
-    _observations: &[BaObservation],
-    _imu_edges: &[ImuFactor],
-    _wheel_edges: &[WheelOdomFactor],
-    _stationary_edges: &[StationaryFactor],
-    _camera: &PinholeCamera,
-    _params: &ViBaParams,
-    _calibration: &OnlineCalibrationInput<'_>,
+    keyframes: &[ViBaKeyframe],
+    points: &[Vec3F64],
+    observations: &[BaObservation],
+    imu_edges: &[ImuFactor],
+    wheel_edges: &[WheelOdomFactor],
+    stationary_edges: &[StationaryFactor],
+    camera: &PinholeCamera,
+    params: &ViBaParams,
+    calibration: &OnlineCalibrationInput<'_>,
 ) -> Result<(ViBaResult, OnlineCalibrationState), ViBaError> {
-    todo!("lane C: online calibration states in the local VI-BA")
+    static SOLVES: AtomicUsize = AtomicUsize::new(0);
+    let kf_local = free_keyframe_slots(
+        keyframes,
+        observations,
+        imu_edges,
+        wheel_edges,
+        stationary_edges,
+    );
+    let solve = CalibratedSolve::new(keyframes, &kf_local, params, calibration);
+    let (result, outcome) = solve_vi_ba(
+        keyframes,
+        points,
+        observations,
+        imu_edges,
+        wheel_edges,
+        stationary_edges,
+        camera,
+        params,
+        Some(&solve),
+    )?;
+    let next = calibration.start.advanced(
+        &calibration.config,
+        &solve.layout,
+        &outcome.values,
+        !solve.free,
+    );
+    if crate::debug_enabled() {
+        let ba_norm = (0..result.keyframes.len())
+            .rev()
+            .find(|&i| kf_local[i] >= 0)
+            .map_or(f64::NAN, |i| result.keyframes[i].bias.accel.length());
+        let log = SolveLog {
+            gated: !solve.free,
+            speed: solve.oldest_free_speed,
+            free: solve.free_keyframes,
+            layout: &solve.layout,
+            values: &outcome.values,
+            ba_norm,
+            edges_without_samples: outcome.edges_without_samples,
+            reintegrated: outcome.reintegrated,
+        };
+        eprintln!("{}", log.line(SOLVES.fetch_add(1, Ordering::Relaxed)));
+    }
+    Ok((result, next))
+}
+
+/// Slot of each free keyframe among the free ones, `-1` for a fixed one. A
+/// keyframe is free if it is not marked fixed and appears in at least one
+/// observation, IMU, wheel or stationary edge (otherwise it has no gradient,
+/// and is skipped to avoid rank deficiency).
+fn free_keyframe_slots(
+    keyframes: &[ViBaKeyframe],
+    observations: &[BaObservation],
+    imu_edges: &[ImuFactor],
+    wheel_edges: &[WheelOdomFactor],
+    stationary_edges: &[StationaryFactor],
+) -> Vec<i64> {
+    let n_kf = keyframes.len();
+    let mut kf_touched = vec![false; n_kf];
+    for obs in observations {
+        if obs.pose_idx < n_kf {
+            kf_touched[obs.pose_idx] = true;
+        }
+    }
+
+    for edge in imu_edges {
+        if edge.from_idx < n_kf {
+            kf_touched[edge.from_idx] = true;
+        }
+        if edge.to_idx < n_kf {
+            kf_touched[edge.to_idx] = true;
+        }
+    }
+    for (from, to) in wheel_edges
+        .iter()
+        .map(|e| (e.from_idx, e.to_idx))
+        .chain(stationary_edges.iter().map(|e| (e.from_idx, e.to_idx)))
+    {
+        for idx in [from, to] {
+            if idx < n_kf {
+                kf_touched[idx] = true;
+            }
+        }
+    }
+
+    let mut v = vec![-1i64; n_kf];
+    let mut next = 0i64;
+    for i in 0..n_kf {
+        if kf_touched[i] && !keyframes[i].fixed {
+            v[i] = next;
+            next += 1;
+        }
+    }
+    v
+}
+
+/// The calibration states of one solve (card G): their layout and priors,
+/// the estimate they start from, the gate's verdict and the window's IMU
+/// stream.
+struct CalibratedSolve<'a> {
+    layout: Layout,
+    config: OnlineCalibrationConfig,
+    /// The carried estimate: the start, and the mean of the step priors.
+    previous: Calibration,
+    /// The gate is open: the states are columns of the system. Closed, the
+    /// carried estimate enters as constants.
+    free: bool,
+    oldest_free_speed: Option<f64>,
+    free_keyframes: usize,
+    /// Time-sorted union of the window edges' raw samples, deduplicated by
+    /// stamp; empty unless the layout re-integrates.
+    stream: Vec<ImuMeasurement>,
+    /// The map edge of each IMU edge of the solve.
+    map_edges: &'a [&'a MapImuFactor],
+    /// Report each state's marginal sigma from the last linearization.
+    marginal_sigma: bool,
+}
+
+/// What a solve returns besides [`ViBaResult`]; empty without calibration.
+struct CalibratedOutcome {
+    values: Calibration,
+    /// Edges re-integrated from the stream, and edges that had no samples.
+    reintegrated: usize,
+    edges_without_samples: usize,
+    /// Per calibration column, when asked for and the gate was open; the
+    /// card G tests read it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    marginal_sigma: Option<Vec<f64>>,
+}
+
+impl<'a> CalibratedSolve<'a> {
+    fn new(
+        keyframes: &[ViBaKeyframe],
+        kf_local: &[i64],
+        params: &ViBaParams,
+        input: &'a OnlineCalibrationInput<'a>,
+    ) -> Self {
+        let layout = Layout::online(&input.config, 1 + params.rig_views.len());
+        let oldest_free_speed = kf_local
+            .iter()
+            .position(|&l| l >= 0)
+            .map(|i| keyframes[i].velocity.length());
+        let free_keyframes = kf_local.iter().filter(|&&l| l >= 0).count();
+        let stream = if layout.imu_reintegrates() {
+            window_stream(&input.map_edges)
+        } else {
+            Vec::new()
+        };
+        Self {
+            previous: input.start.start(&layout),
+            free: gate_open(oldest_free_speed, free_keyframes, input.active_keyframes),
+            layout,
+            config: input.config,
+            oldest_free_speed,
+            free_keyframes,
+            stream,
+            map_edges: &input.map_edges,
+            marginal_sigma: false,
+        }
+    }
+
+    /// Columns the states add to the reduced system: none while gated.
+    fn columns(&self) -> usize {
+        if self.free { self.layout.len } else { 0 }
+    }
+
+    /// `params.imu_t_bc` with the primary camera's rotation offset of
+    /// `values` (D1); the extrinsic itself without that state.
+    fn imu_t_bc(&self, values: &Calibration, params: &ViBaParams) -> Option<Pose3d> {
+        match self.layout.rotation(0, 0) {
+            Some(at) => Some(imu_t_bc_with_offset(
+                params.imu_t_bc.as_ref(),
+                values.vec3(at),
+            )),
+            None => params.imu_t_bc,
+        }
+    }
+
+    /// `edge` integrated from the window stream at `bias`, with the gyro
+    /// correction and the clock offset of `values`: the camera interval
+    /// `[t0, t1]` is `[t0 - td, t1 - td]` on the IMU clock, and the slice
+    /// adds the nearest sample on each side, as the edge stores them. `None`
+    /// for an edge without samples.
+    fn reintegrate(
+        &self,
+        edge: &MapImuFactor,
+        bias: ImuBias,
+        values: &Calibration,
+    ) -> Option<PreintegratedImu> {
+        if edge.raw_samples.is_empty() {
+            return None;
+        }
+        let td = values.clock_offset(&self.layout);
+        let (t0, t1) = (edge.t0 - td, edge.t1 - td);
+        let stream = &self.stream;
+        let lo = stream
+            .partition_point(|s| s.timestamp < t0)
+            .saturating_sub(1);
+        let hi = (stream.partition_point(|s| s.timestamp <= t1) + 1)
+            .min(stream.len())
+            .max(lo);
+        let slice = &stream[lo..hi];
+        let corrected;
+        let samples = if self.layout.gyro().is_some() {
+            corrected = corrected_samples(slice, &values.gyro(&self.layout));
+            corrected.as_slice()
+        } else {
+            slice
+        };
+        let mut preintegrated = PreintegratedImu::from_measurements_with(
+            bias,
+            edge.preintegrated.calib,
+            samples,
+            t0,
+            t1,
+            edge.interpolation,
+        );
+        preintegrated.widen_bias_walk(edge.bias_walk_extra_s);
+        Some(preintegrated)
+    }
+
+    /// Every edge re-integrated at its from-keyframe's bias in `kfs` and at
+    /// `values`, when the layout re-integrates (D2); an edge without samples
+    /// keeps its preintegration.
+    fn reintegrated_edges(
+        &self,
+        edges: &[ImuFactor],
+        kfs: &[ViBaKeyframe],
+        values: &Calibration,
+    ) -> Option<Vec<ImuFactor>> {
+        self.layout.imu_reintegrates().then(|| {
+            edges
+                .iter()
+                .enumerate()
+                .map(|(e, edge)| {
+                    let preintegrated = self
+                        .map_edges
+                        .get(e)
+                        .and_then(|map_edge| {
+                            self.reintegrate(map_edge, kfs[edge.from_idx].bias, values)
+                        })
+                        .unwrap_or_else(|| edge.preintegrated.clone());
+                    ImuFactor::new(edge.from_idx, edge.to_idx, preintegrated)
+                })
+                .collect()
+        })
+    }
+
+    /// The derivative of edge `e`'s residual along each calibration column
+    /// it reads, by central differences: the primary rotation on `edge`'s
+    /// preintegration (it enters only the extrinsic), the gyro and clock on
+    /// re-integrations of its map edge (`imu_edges.rs` offline).
+    fn imu_columns(
+        &self,
+        e: usize,
+        edge: &ImuFactor,
+        kfs: &[ViBaKeyframe],
+        values: &Calibration,
+        params: &ViBaParams,
+    ) -> Vec<(usize, Vec15F64)> {
+        let residual = |preintegrated: &PreintegratedImu, values: &Calibration| {
+            preintegration::residual_and_jacobians(
+                kfs[edge.from_idx].nav_state(),
+                kfs[edge.to_idx].nav_state(),
+                preintegrated,
+                &params.gravity,
+                self.imu_t_bc(values, params).as_ref(),
+            )
+            .0
+        };
+        let shifted = |column: usize, h: f64| {
+            let mut values = values.clone();
+            values.values[column] += h;
+            values
+        };
+        let mut columns = Vec::new();
+        if let Some(at) = self.layout.rotation(0, 0) {
+            let h = ROTATION_STEP_RAD;
+            for column in at..at + 3 {
+                let plus = residual(&edge.preintegrated, &shifted(column, h));
+                let minus = residual(&edge.preintegrated, &shifted(column, -h));
+                columns.push((column, (plus - minus) / (2.0 * h)));
+            }
+        }
+        let Some(map_edge) = self.map_edges.get(e) else {
+            return columns;
+        };
+        let bias = kfs[edge.from_idx].bias;
+        for (column, h) in imu_calibration_columns(&self.layout) {
+            let (plus, minus) = (shifted(column, h), shifted(column, -h));
+            let (Some(pim_plus), Some(pim_minus)) = (
+                self.reintegrate(map_edge, bias, &plus),
+                self.reintegrate(map_edge, bias, &minus),
+            ) else {
+                break;
+            };
+            columns.push((
+                column,
+                (residual(&pim_plus, &plus) - residual(&pim_minus, &minus)) / (2.0 * h),
+            ));
+        }
+        columns
+    }
+}
+
+/// The time-sorted union of `edges`' raw samples, deduplicated by stamp
+/// (as `map/ops/removal.rs` merges two edges).
+fn window_stream(edges: &[&MapImuFactor]) -> Vec<ImuMeasurement> {
+    let mut samples: Vec<ImuMeasurement> = edges
+        .iter()
+        .flat_map(|edge| edge.raw_samples.iter().copied())
+        .collect();
+    samples.sort_by(|a, b| a.timestamp.total_cmp(&b.timestamp));
+    samples.dedup_by(|a, b| a.timestamp == b.timestamp);
+    samples
+}
+
+/// An observation's camera under the calibration states: its focal scale
+/// `f (1 + s_k)` and, for a secondary camera, the rotation offset
+/// `Exp(φ_k)` on the left of its pose. The primary camera carries no
+/// rotation (D1).
+struct CalibratedView {
+    camera: PinholeCamera,
+    pose: SE3F32,
+    /// The factory focal lengths, the focal column's derivative.
+    factory_focal: (f64, f64),
+    rotation: Option<(usize, Vec3F64)>,
+    focal: Option<usize>,
+}
+
+impl CalibratedView {
+    fn new(
+        layout: &Layout,
+        values: &Calibration,
+        k: usize,
+        camera: &PinholeCamera,
+        pose: SE3F32,
+    ) -> Self {
+        let focal = layout.focal(k, 0);
+        let scale = focal.map_or(1.0, |at| 1.0 + values.values[at]);
+        let rotation = layout
+            .rotation(k, 0)
+            .filter(|_| k > 0)
+            .map(|at| (at, values.vec3(at)));
+        let pose = match rotation {
+            Some((_, phi)) => {
+                pose_to_se3(&Pose3d::new(SO3F64::exp(phi).matrix(), Vec3F64::ZERO)) * pose
+            }
+            None => pose,
+        };
+        let mut scaled = camera.clone();
+        scaled.fx *= scale;
+        scaled.fy *= scale;
+        Self {
+            camera: scaled,
+            pose,
+            factory_focal: (camera.fx, camera.fy),
+            rotation,
+            focal,
+        }
+    }
+
+    /// The pixel rows' derivatives along the calibration columns, whitened
+    /// by `w`, from the camera-frame point `p_c` (after the offset; the
+    /// projection is f32, the columns f64 from its `p_c`): the rotation
+    /// offset reads `J_l(φ)ᵀ (p_c × a)` with `a = ∂r/∂p_c` (offline
+    /// `problem.rs:618-625`), the focal scale `(fx x/z, fy y/z)`.
+    fn rows(&self, point_w: &Vec3F64, w: f64) -> Vec<(usize, [f64; 2])> {
+        let pc = self.pose * vec3_to_f32(*point_w);
+        let z = if pc.z.abs() < MIN_Z {
+            if pc.z >= 0.0 { MIN_Z } else { -MIN_Z }
+        } else {
+            pc.z
+        };
+        let p = Vec3F64::new(f64::from(pc.x), f64::from(pc.y), f64::from(z));
+        let mut rows = Vec::with_capacity(4);
+        if let Some((at, phi)) = self.rotation {
+            let (fx, fy) = (self.camera.fx, self.camera.fy);
+            let a_u = Vec3F64::new(fx / p.z, 0.0, -fx * p.x / (p.z * p.z)) * w;
+            let a_v = Vec3F64::new(0.0, fy / p.z, -fy * p.y / (p.z * p.z)) * w;
+            let jl_t = SO3F64::left_jacobian(phi).transpose();
+            let (g_u, g_v) = (jl_t * p.cross(a_u), jl_t * p.cross(a_v));
+            rows.push((at, [g_u.x, g_v.x]));
+            rows.push((at + 1, [g_u.y, g_v.y]));
+            rows.push((at + 2, [g_u.z, g_v.z]));
+        }
+        if let Some(at) = self.focal {
+            let (fx, fy) = self.factory_focal;
+            rows.push((at, [fx * p.x / p.z * w, fy * p.y / p.z * w]));
+        }
+        rows
+    }
+}
+
+/// The calibration columns of the reduced system (card G, C3), from
+/// `base = 15 P` on. The system is dense already, so their keyframe and
+/// calibration blocks go straight into it; their point couplings wait for
+/// the Schur elimination (offline `reduced.rs:252-293,466-487`).
+struct Border {
+    base: usize,
+    /// Per free point, `Jcᵀ Jx` of each calibration column its observations
+    /// read, one entry per column.
+    by_point: Vec<Vec<(usize, SVecF64<3>)>>,
+}
+
+impl Border {
+    const KF_DOF: usize = 15;
+
+    fn new(base: usize, n_free_pts: usize) -> Self {
+        Self {
+            base,
+            by_point: vec![Vec::new(); n_free_pts],
+        }
+    }
+
+    /// One observation's whitened rows: `columns` from [`CalibratedView::rows`],
+    /// `jp`, `jx` and `r` as the visual blocks take them.
+    #[allow(clippy::too_many_arguments)]
+    fn add_observation(
+        &mut self,
+        m_mat: &mut Mat<f64>,
+        m_vec: &mut [f64],
+        columns: &[(usize, [f64; 2])],
+        pose: Option<usize>,
+        point: Option<usize>,
+        jp: &SMatF64<2, 6>,
+        jx: &SMatF64<2, 3>,
+        r: &SVecF64<2>,
+    ) {
+        for &(c, jc) in columns {
+            let row = self.base + c;
+            m_vec[row] -= jc[0] * r[0] + jc[1] * r[1];
+            for &(d, jd) in columns {
+                m_mat[(row, self.base + d)] += jc[0] * jd[0] + jc[1] * jd[1];
+            }
+            if let Some(p) = pose {
+                let base = p * Self::KF_DOF;
+                for a in 0..6 {
+                    let h = jp[(0, a)] * jc[0] + jp[(1, a)] * jc[1];
+                    m_mat[(base + a, row)] += h;
+                    m_mat[(row, base + a)] += h;
+                }
+            }
+            if let Some(x) = point {
+                let b = SVecF64::<3>::from_fn(|k, _| jc[0] * jx[(0, k)] + jc[1] * jx[(1, k)]);
+                match self.by_point[x].iter_mut().find(|(e, _)| *e == c) {
+                    Some((_, sum)) => *sum += b,
+                    None => self.by_point[x].push((c, b)),
+                }
+            }
+        }
+    }
+
+    /// The calibration part of eliminating free point `x`: `M −= B C⁻¹ Bᵀ`
+    /// and `m −= B C⁻¹ g` over its calibration-calibration and
+    /// keyframe-calibration blocks; `b_for_j` are its keyframe couplings.
+    fn eliminate_point(
+        &self,
+        m_mat: &mut Mat<f64>,
+        m_vec: &mut [f64],
+        x: usize,
+        ci: &SMatF64<3, 3>,
+        g_point: &SVecF64<3>,
+        b_for_j: &[(usize, SMatF64<6, 3>)],
+    ) {
+        let columns = &self.by_point[x];
+        for (c, b_c) in columns {
+            // (b_c C⁻¹)ᵀ.
+            let bc = ci.transpose() * b_c;
+            let row = self.base + c;
+            m_vec[row] -= bc.dot(g_point);
+            for (d, b_d) in columns {
+                m_mat[(row, self.base + d)] -= bc.dot(b_d);
+            }
+            for (i_loc, b) in b_for_j {
+                let base = i_loc * Self::KF_DOF;
+                for (a, &v) in (b * bc).iter().enumerate() {
+                    m_mat[(base + a, row)] -= v;
+                    m_mat[(row, base + a)] -= v;
+                }
+            }
+        }
+    }
+
+    /// One IMU edge's calibration columns `j_c`, with the edge's weighted
+    /// information and residual, coupled to both endpoint keyframes (`l < 0`
+    /// is a fixed one; offline `reduced.rs:417-429`).
+    fn add_imu(
+        &self,
+        m_mat: &mut Mat<f64>,
+        m_vec: &mut [f64],
+        columns: &[(usize, Vec15F64)],
+        res: &Vec15F64,
+        omega: &Mat15F64,
+        endpoints: [(i64, &Mat15F64); 2],
+    ) {
+        for (c, j_c) in columns {
+            let row = self.base + c;
+            let oc = omega * j_c;
+            m_vec[row] -= oc.dot(res);
+            for (d, j_d) in columns {
+                m_mat[(row, self.base + d)] += j_d.dot(&oc);
+            }
+            for (l, j) in endpoints {
+                let Ok(l) = usize::try_from(l) else {
+                    continue;
+                };
+                let base = l * Self::KF_DOF;
+                for (a, &v) in (j.transpose() * oc).iter().enumerate() {
+                    m_mat[(base + a, row)] += v;
+                    m_mat[(row, base + a)] += v;
+                }
+            }
+        }
+    }
+
+    /// The linear prior rows; returns their cost.
+    fn add_priors(&self, m_mat: &mut Mat<f64>, m_vec: &mut [f64], rows: &[PriorRow]) -> f64 {
+        let mut cost = 0.0;
+        for row in rows {
+            cost += 0.5 * row.residual * row.residual;
+            for &(a, wa) in &row.terms {
+                m_vec[self.base + a] -= wa * row.residual;
+                for &(b, wb) in &row.terms {
+                    m_mat[(self.base + a, self.base + b)] += wa * wb;
+                }
+            }
+        }
+        cost
+    }
+}
+
+/// Cost of the prior rows of `solve` at `values`.
+fn prior_cost(solve: &CalibratedSolve<'_>, values: &Calibration) -> f64 {
+    online_prior_rows(&solve.layout, &solve.config, values, &solve.previous)
+        .iter()
+        .map(|row| 0.5 * row.residual * row.residual)
+        .sum()
+}
+
+/// Marginal sigma of each column from `base` on, from the undamped reduced
+/// system; `None` when it is not positive definite.
+fn border_marginal_sigma(information: &Mat<f64>, base: usize) -> Option<Vec<f64>> {
+    let dim = information.nrows();
+    let n = dim.checked_sub(base)?;
+    let chol = information.llt(faer::Side::Lower).ok()?;
+    let mut unit = Mat::<f64>::zeros(dim, n);
+    for c in 0..n {
+        unit[(base + c, c)] = 1.0;
+    }
+    let columns = chol.solve(&unit);
+    let sigma: Vec<f64> = (0..n).map(|c| columns[(base + c, c)].sqrt()).collect();
+    sigma.iter().all(|s| s.is_finite()).then_some(sigma)
 }
 
 /// Visual-inertial bundle adjustment via dense Schur-complement reduction.
@@ -1301,6 +1875,36 @@ pub fn visual_inertial_bundle_adjust(
     camera: &PinholeCamera,
     params: &ViBaParams,
 ) -> Result<ViBaResult, ViBaError> {
+    solve_vi_ba(
+        keyframes,
+        points,
+        observations,
+        imu_edges,
+        wheel_edges,
+        stationary_edges,
+        camera,
+        params,
+        None,
+    )
+    .map(|(result, _)| result)
+}
+
+/// The one body of both entries, so they cannot drift apart: without
+/// `calibration` it is the plain solve, bit for bit; with it, the states'
+/// columns form a border of the reduced system (card G, C3) while the gate
+/// is open, and their values enter as constants while it is closed.
+#[allow(clippy::too_many_arguments)]
+fn solve_vi_ba(
+    keyframes: &[ViBaKeyframe],
+    points: &[Vec3F64],
+    observations: &[BaObservation],
+    imu_edges: &[ImuFactor],
+    wheel_edges: &[WheelOdomFactor],
+    stationary_edges: &[StationaryFactor],
+    camera: &PinholeCamera,
+    params: &ViBaParams,
+    calibration: Option<&CalibratedSolve<'_>>,
+) -> Result<(ViBaResult, CalibratedOutcome), ViBaError> {
     const KF_DOF: usize = 15; // keyframe dimensions
 
     // NaN would gate (and first re-seed) every depth row; 0 or less would
@@ -1314,48 +1918,13 @@ pub fn visual_inertial_bundle_adjust(
     let views = ObservationViews::new(params);
 
     // ── Index maps: free keyframes and free points ────────────────────────
-    // A keyframe is free if it is not marked fixed AND appears in at least
-    // one observation, IMU or wheel edge (otherwise it has no gradient, and we
-    // skip it to avoid rank deficiency).
-
-    let mut kf_touched = vec![false; n_kf];
-    for obs in observations {
-        if obs.pose_idx < n_kf {
-            kf_touched[obs.pose_idx] = true;
-        }
-    }
-
-    for edge in imu_edges {
-        if edge.from_idx < n_kf {
-            kf_touched[edge.from_idx] = true;
-        }
-        if edge.to_idx < n_kf {
-            kf_touched[edge.to_idx] = true;
-        }
-    }
-    for (from, to) in wheel_edges
-        .iter()
-        .map(|e| (e.from_idx, e.to_idx))
-        .chain(stationary_edges.iter().map(|e| (e.from_idx, e.to_idx)))
-    {
-        for idx in [from, to] {
-            if idx < n_kf {
-                kf_touched[idx] = true;
-            }
-        }
-    }
-
-    let kf_local: Vec<i64> = {
-        let mut v = vec![-1i64; n_kf];
-        let mut next = 0i64;
-        for i in 0..n_kf {
-            if kf_touched[i] && !keyframes[i].fixed {
-                v[i] = next;
-                next += 1;
-            }
-        }
-        v
-    };
+    let kf_local = free_keyframe_slots(
+        keyframes,
+        observations,
+        imu_edges,
+        wheel_edges,
+        stationary_edges,
+    );
 
     let point_local: Vec<i64> = {
         let mut v = vec![-1i64; n_pts];
@@ -1409,6 +1978,17 @@ pub fn visual_inertial_bundle_adjust(
     let (depth_on, depth_rows_gated) =
         depth_gate(keyframes, &xyz, observations, params.depth_gate_factor);
 
+    // The calibration columns follow the keyframe states.
+    let n_cal = calibration.map_or(0, CalibratedSolve::columns);
+    let cal_base = n_free_kf * KF_DOF;
+    let mut calib = calibration.map_or_else(
+        || Calibration { values: Vec::new() },
+        |c| c.previous.clone(),
+    );
+    // Re-integrated at the current state, when a state needs it (D2).
+    let mut cal_edges = calibration.and_then(|c| c.reintegrated_edges(imu_edges, &kfs, &calib));
+    let mut last_border_information: Option<Mat<f64>> = None;
+
     let mut lambda = params.initial_lambda;
     let mut iters_done = 0usize;
     let mut converged = false;
@@ -1433,6 +2013,14 @@ pub fn visual_inertial_bundle_adjust(
         // m_mat.
         let mut vis = VisualBlocks::new(n_free_kf, n_free_pts);
         let mut cost_vis = 0.0f64;
+        // dim is 15*n_free_kf plus the calibration columns. Visual terms only
+        // touch the first 6 DOF of each 15-DOF block; IMU terms fill the rest.
+        let dim = n_free_kf * KF_DOF + n_cal;
+        let mut m_mat = Mat::<f64>::zeros(dim, dim);
+        let mut m_vec = vec![0.0f64; dim];
+        let mut border = (n_cal > 0).then(|| Border::new(cal_base, n_free_pts));
+        let imu_edges_now: &[ImuFactor] = cal_edges.as_deref().unwrap_or(imu_edges);
+        let imu_t_bc = calibration.map_or(params.imu_t_bc, |c| c.imu_t_bc(&calib, params));
 
         for (o, ((obs, &depth_row), inlier)) in observations
             .iter()
@@ -1448,6 +2036,18 @@ pub fn visual_inertial_bundle_adjust(
             let pose = &se3s[obs.pose_idx];
             let point = &xyz[obs.point_idx];
             let (obs_camera, obs_pose) = views.camera_pose(o, camera, pose);
+            let view = calibration.map(|c| {
+                CalibratedView::new(
+                    &c.layout,
+                    &calib,
+                    views.camera_index(o),
+                    obs_camera,
+                    obs_pose,
+                )
+            });
+            let (obs_camera, obs_pose) = view
+                .as_ref()
+                .map_or((obs_camera, obs_pose), |v| (&v.camera, v.pose));
             // residual_and_jacobians is f32 internally; cast results to f64.
             let (r_f32, jp_f32, jx_f32) =
                 residual_and_jacobians(&obs_pose, point, obs.pixel, obs_camera);
@@ -1471,7 +2071,13 @@ pub fn visual_inertial_bundle_adjust(
 
             let pli = usize::try_from(kf_local[obs.pose_idx]).ok();
             let xli = usize::try_from(point_local[obs.point_idx]).ok();
-            vis.add_rows(pli, xli, &jp, &jx, &(r_raw * sqrt_hw_vis));
+            let r_vis = r_raw * sqrt_hw_vis;
+            vis.add_rows(pli, xli, &jp, &jx, &r_vis);
+            if let (Some(border), Some(view)) = (border.as_mut(), view.as_ref()) {
+                let columns = view.rows(point, inv_sigma * sqrt_hw_vis);
+                border
+                    .add_observation(&mut m_mat, &mut m_vec, &columns, pli, xli, &jp, &jx, &r_vis);
+            }
 
             // Depth residual (stereo metric anchor) — see
             // depth_residual_and_jacobian for why this matters here.
@@ -1491,12 +2097,6 @@ pub fn visual_inertial_bundle_adjust(
         }
 
         // ── 2. Invert C blocks, build Schur-reduced system ───────────────
-        // dim is 15*n_free_kf. Visual terms only touch the first 6 DOF of
-        // each 15-DOF block; IMU terms fill the rest.
-        let dim = n_free_kf * KF_DOF;
-        let mut m_mat = Mat::<f64>::zeros(dim, dim);
-        let mut m_vec = vec![0.0f64; dim];
-
         // Scatter A blocks into the upper-left 6×6 of each 15×15 slot.
         for (k, (ab, gp)) in vis.a.iter().zip(&vis.g_pose).enumerate() {
             let base = k * KF_DOF;
@@ -1511,10 +2111,19 @@ pub fn visual_inertial_bundle_adjust(
         damp_point_blocks(&mut vis.c, lambda);
         let c_inv: Vec<Option<SMatF64<3, 3>>> = vis.c.iter().map(invert_point_block).collect();
 
-        for ((b_for_j, ci), g_point) in vis.b_by_point.iter().zip(&c_inv).zip(&vis.g_point) {
+        for (x, ((b_for_j, ci), g_point)) in vis
+            .b_by_point
+            .iter()
+            .zip(&c_inv)
+            .zip(&vis.g_point)
+            .enumerate()
+        {
             let Some(ci) = ci else {
                 continue;
             };
+            if let Some(border) = border.as_ref() {
+                border.eliminate_point(&mut m_mat, &mut m_vec, x, ci, g_point, b_for_j);
+            }
             let bc: Vec<(usize, SMatF64<6, 3>)> =
                 b_for_j.iter().map(|(i_loc, b)| (*i_loc, b * ci)).collect();
 
@@ -1534,7 +2143,7 @@ pub fn visual_inertial_bundle_adjust(
         // blocks) and J_i^T Ω J_j, J_j^T Ω J_i (off-diagonal 15×15 blocks).
         let mut cost_imu = 0.0f64;
 
-        for edge in imu_edges {
+        for (e, edge) in imu_edges_now.iter().enumerate() {
             let i = edge.from_idx;
             let j = edge.to_idx;
             let li = kf_local[i];
@@ -1548,7 +2157,7 @@ pub fn visual_inertial_bundle_adjust(
                 kfs[j].nav_state(),
                 &edge.preintegrated,
                 &params.gravity,
-                params.imu_t_bc.as_ref(),
+                imu_t_bc.as_ref(),
             );
 
             let omega_raw = imu_edge_information(edge, &kf_local, params);
@@ -1618,6 +2227,17 @@ pub fn visual_inertial_bundle_adjust(
                     &mut m_mat, &mut m_vec, base_j, base_i, &jj, &ji, &omega, &res, false,
                 );
             }
+            if let (Some(c), Some(border)) = (calibration, border.as_ref()) {
+                let columns = c.imu_columns(e, edge, &kfs, &calib, params);
+                border.add_imu(
+                    &mut m_mat,
+                    &mut m_vec,
+                    &columns,
+                    &res,
+                    &omega,
+                    [(li, &ji), (lj, &jj)],
+                );
+            }
         }
 
         // ── 3b. Accel-bias magnitude prior (unary, per free keyframe) ────────
@@ -1670,8 +2290,12 @@ pub fn visual_inertial_bundle_adjust(
             &stationary_info,
         );
 
-        let cost_f64 =
+        let mut cost_f64 =
             cost_vis + cost_imu + cost_bias_prior + cost_prior + cost_wheel + cost_stationary;
+        if let (Some(c), Some(border)) = (calibration, border.as_ref()) {
+            let rows = online_prior_rows(&c.layout, &c.config, &calib, &c.previous);
+            cost_f64 += border.add_priors(&mut m_mat, &mut m_vec, &rows);
+        }
         if initial_cost == f64::MAX {
             initial_cost = cost_f64;
         }
@@ -1679,6 +2303,9 @@ pub fn visual_inertial_bundle_adjust(
         hold_inertial_state(&mut m_mat, &mut m_vec, keyframes, &kf_local);
         if params.newest_marginal {
             last_information = Some(m_mat.clone());
+        }
+        if n_cal > 0 && calibration.is_some_and(|c| c.marginal_sigma) {
+            last_border_information = Some(m_mat.clone());
         }
 
         // ── 4. LM damping on full 15P system, then Cholesky ──────────────
@@ -1729,12 +2356,13 @@ pub fn visual_inertial_bundle_adjust(
 
         // ── 5. Point back-substitution (uses pose-DOF slice only) ────────
         let mut d_point = vec![SVecF64::<3>::zeros(); n_free_pts];
-        for (((b_for_j, ci), g_point), dx) in vis
+        for (x, (((b_for_j, ci), g_point), dx)) in vis
             .b_by_point
             .iter()
             .zip(&c_inv)
             .zip(&vis.g_point)
             .zip(&mut d_point)
+            .enumerate()
         {
             let Some(ci) = ci else {
                 continue;
@@ -1744,6 +2372,11 @@ pub fn visual_inertial_bundle_adjust(
                 let base = i_loc * KF_DOF;
                 let d_pose = Vec6F64::from_column_slice(&d_full[base..base + 6]);
                 rhs -= b_block.transpose() * d_pose;
+            }
+            if let Some(border) = border.as_ref() {
+                for (c, b_c) in &border.by_point[x] {
+                    rhs -= b_c * d_full[cal_base + c];
+                }
             }
             *dx = ci * rhs;
         }
@@ -1815,6 +2448,17 @@ pub fn visual_inertial_bundle_adjust(
             continue;
         }
 
+        let calib_trial = if n_cal > 0 {
+            calib.retracted(&d_full[cal_base..])
+        } else {
+            calib.clone()
+        };
+        let cal_edges_trial =
+            calibration.and_then(|c| c.reintegrated_edges(imu_edges, &kfs_trial, &calib_trial));
+        let imu_edges_trial: &[ImuFactor] = cal_edges_trial.as_deref().unwrap_or(imu_edges);
+        let imu_t_bc_trial =
+            calibration.map_or(params.imu_t_bc, |c| c.imu_t_bc(&calib_trial, params));
+
         // ── 7. Trial cost (visual + IMU) ─────────────────────────────────
         let mut new_cost_vis = 0.0f64;
         for (o, (obs, &depth_row)) in observations.iter().zip(&depth_on).enumerate() {
@@ -1822,6 +2466,18 @@ pub fn visual_inertial_bundle_adjust(
                 continue;
             }
             let (obs_camera, obs_pose) = views.camera_pose(o, camera, &se3s_trial[obs.pose_idx]);
+            let view = calibration.map(|c| {
+                CalibratedView::new(
+                    &c.layout,
+                    &calib_trial,
+                    views.camera_index(o),
+                    obs_camera,
+                    obs_pose,
+                )
+            });
+            let (obs_camera, obs_pose) = view
+                .as_ref()
+                .map_or((obs_camera, obs_pose), |v| (&v.camera, v.pose));
             let (r_f32, _, _) =
                 residual_and_jacobians(&obs_pose, &xyz_trial[obs.point_idx], obs.pixel, obs_camera);
             let mut chi2_vis = (r_f32[0] * r_f32[0] + r_f32[1] * r_f32[1]) as f64;
@@ -1842,7 +2498,7 @@ pub fn visual_inertial_bundle_adjust(
             }
         }
         let mut new_cost_imu = 0.0f64;
-        for edge in imu_edges {
+        for edge in imu_edges_trial {
             let i = edge.from_idx;
             let j = edge.to_idx;
             if (kf_local[i] < 0 && kf_local[j] < 0) || skip_edge(edge) {
@@ -1853,7 +2509,7 @@ pub fn visual_inertial_bundle_adjust(
                 kfs_trial[j].nav_state(),
                 &edge.preintegrated,
                 &params.gravity,
-                params.imu_t_bc.as_ref(),
+                imu_t_bc_trial.as_ref(),
             );
             let omega_raw = imu_edge_information(edge, &kf_local, params);
             new_cost_imu += preintegration::weight_and_cost(
@@ -1878,12 +2534,16 @@ pub fn visual_inertial_bundle_adjust(
         let new_cost_wheel = wheel_cost(&kfs_trial, &kf_local, wheel_edges, &wheel_info);
         let new_cost_stationary =
             stationary_cost(&kfs_trial, &kf_local, stationary_edges, &stationary_info);
-        let new_cost = (new_cost_vis
+        let mut new_cost_f64 = new_cost_vis
             + new_cost_imu
             + new_cost_bias_prior
             + new_cost_prior
             + new_cost_wheel
-            + new_cost_stationary) as f32;
+            + new_cost_stationary;
+        if let Some(c) = calibration.filter(|_| n_cal > 0) {
+            new_cost_f64 += prior_cost(c, &calib_trial);
+        }
+        let new_cost = new_cost_f64 as f32;
 
         // ── 8. LM accept / reject ─────────────────────────────────────────
         if new_cost < cost {
@@ -1895,6 +2555,8 @@ pub fn visual_inertial_bundle_adjust(
             kfs = kfs_trial;
             se3s = se3s_trial;
             xyz = xyz_trial;
+            calib = calib_trial;
+            cal_edges = cal_edges_trial;
             final_cost = new_cost as f64;
             lambda = (lambda / 3.0).max(1e-8);
             if rel < params.cost_tolerance {
@@ -1910,7 +2572,8 @@ pub fn visual_inertial_bundle_adjust(
     }
 
     // ── Post-convergence residual diagnostic ──────────────────────────────
-    for edge in imu_edges {
+    let imu_t_bc = calibration.map_or(params.imu_t_bc, |c| c.imu_t_bc(&calib, params));
+    for edge in cal_edges.as_deref().unwrap_or(imu_edges) {
         let i = edge.from_idx;
         let j = edge.to_idx;
         if (kf_local[i] < 0 && kf_local[j] < 0) || skip_edge(edge) {
@@ -1921,7 +2584,7 @@ pub fn visual_inertial_bundle_adjust(
             kfs[j].nav_state(),
             &edge.preintegrated,
             &params.gravity,
-            params.imu_t_bc.as_ref(),
+            imu_t_bc.as_ref(),
         );
         let [nr, nv, np, nbg, nba] = imu_residual_norms(&res);
         if !crate::debug_enabled() {
@@ -2019,22 +2682,52 @@ pub fn visual_inertial_bundle_adjust(
         })
         .collect();
 
-    Ok(ViBaResult {
-        keyframes: out_kfs,
-        points: out_pts,
-        iterations: iters_done,
-        converged,
-        final_cost,
-        initial_cost,
-        depth_rows_gated,
-        points_reseeded,
-        cheirality_rejections,
-        cheirality_points_held,
-        fallback,
-        prior_residual_first,
-        prior_residual_final,
-        newest_marginal,
-    })
+    let edges_without_samples = calibration.map_or(0, |c| {
+        c.map_edges
+            .iter()
+            .filter(|edge| edge.raw_samples.is_empty())
+            .count()
+    });
+    let reintegrated = calibration
+        .filter(|c| c.layout.imu_reintegrates())
+        .map_or(0, |c| {
+            (0..imu_edges.len())
+                .filter(|&e| {
+                    c.map_edges
+                        .get(e)
+                        .is_some_and(|m| !m.raw_samples.is_empty())
+                })
+                .count()
+        });
+    let outcome = CalibratedOutcome {
+        values: calib,
+        reintegrated,
+        edges_without_samples,
+        marginal_sigma: last_border_information
+            .and_then(|information| border_marginal_sigma(&information, cal_base)),
+    };
+
+    Ok((
+        ViBaResult {
+            keyframes: out_kfs,
+            points: out_pts,
+            iterations: iters_done,
+            converged,
+            final_cost,
+            initial_cost,
+            depth_rows_gated,
+            points_reseeded,
+            cheirality_rejections,
+            cheirality_points_held,
+            fallback,
+            prior_residual_first,
+            prior_residual_final,
+            newest_marginal,
+            calibration_gated: calibration.is_some_and(|c| !c.free),
+            calibration_columns: n_cal,
+        },
+        outcome,
+    ))
 }
 
 /// The 15×15 block of `information⁻¹` at `base`: the marginal covariance of
@@ -2528,3 +3221,7 @@ mod flung_landmark_tests;
 #[cfg(test)]
 #[path = "vi_ba_prior_tests.rs"]
 mod prior_tests;
+
+#[cfg(test)]
+#[path = "vi_ba_calibration_tests.rs"]
+mod calibration_tests;
