@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use kornia_3d::pose::Pose3d;
 
 use crate::loop_closure::VerifiedLoopEdge;
-use crate::loop_closure::closer::{LoopGraphInformation, solve_in_graph};
+use crate::loop_closure::closer::{LoopGraphSettings, solve_in_graph};
 use crate::loop_closure::fusion_plan::{FusionOp, FusionSnapshot};
 use crate::loop_closure::{InertialPgoContext, PgoConfig, PgoError, PgoResult, PoseGraph};
 
@@ -26,7 +26,7 @@ pub(crate) struct LoopSolveJob {
     pub loops: Vec<VerifiedLoopEdge>,
     pub graph: PoseGraph<()>,
     pub optimizer: PgoConfig,
-    pub information: LoopGraphInformation,
+    pub settings: LoopGraphSettings,
     pub inertial: Option<InertialPgoContext>,
     /// The loop neighbourhoods to fuse once solved; `None` fuses at writeback instead.
     pub fusion: Option<FusionSnapshot>,
@@ -55,7 +55,7 @@ impl LoopSolveJob {
             &self.keyframe_poses,
             &self.loops,
             &self.optimizer,
-            self.information,
+            self.settings,
             self.inertial,
         );
         let solve_time = started.elapsed();
@@ -236,7 +236,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{LoopSolveJob, LoopSolver, WorkerStopped};
-    use crate::loop_closure::{LoopGraphInformation, PgoConfig, PgoError, PoseGraph};
+    use crate::loop_closure::{LoopGraphSettings, PgoConfig, PgoError, PoseGraph};
 
     fn empty_job() -> LoopSolveJob {
         LoopSolveJob {
@@ -245,7 +245,7 @@ mod tests {
             loops: Vec::new(),
             graph: PoseGraph::new(Default::default()),
             optimizer: PgoConfig::default(),
-            information: LoopGraphInformation::default(),
+            settings: LoopGraphSettings::default(),
             inertial: None,
             fusion: None,
         }
