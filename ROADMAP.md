@@ -15,6 +15,117 @@ Themes derived from ongoing studies of industrial and egocentric deployments. Th
 - LaMAria / egocentric evaluation — https://github.com/kornia/kornia-slam/issues/78
 - Multi‑camera + IMU — https://github.com/kornia/kornia-slam/issues/138
 
+## Progress log
+
+Newest first, one entry per working day. "main" means a merged PR; "#180" means work on the
+`feat/global-pose-graph` branch (PR #180), which is not merged. Unless marked validated, branch work
+sits behind config knobs that default to the old behaviour, and nothing in it has been benchmarked yet.
+
+### 2026-11-17
+- **#180, rebased onto main.** No merge commits. kornia-rs is pinned to main `4ada5a7`. Reviewer comments applied:
+  - `rotation_defect`, `HuberKernel`, `CauchyKernel` and `Mat6F64::cholesky` from kornia-rs;
+  - one `camera_centre` helper;
+  - the `keyframes_while_lost` source-of-truth fix and validation.
+- **#180, estimator round** (cards A-D; knobs off, not validated):
+  - ORB-SLAM3 estimator port: window 10/25, bias at the window boundary, Huber placement, IMU sample interpolation, per-frame pose-inertial solve (idea from #195), keyframe and local-map rules;
+  - IMU covariance trust;
+  - G29 snap-back counter;
+  - recovery: G19 global rig PnP while lost, and a G28 re-seed with its own window;
+  - generic rig calibration and rays;
+  - analytic pose refine, and the PGO moved to `upstream/`;
+  - offline global VI-BA with calibration states, plus a `--session-out` dump.
+- **#180, 1 ms frontend round** (cards E, G; knobs off, not validated):
+  - KLT on every rig camera, the windowed u8 LK and `FlowPool` threads;
+  - the forward-backward check, Shi-Tomasi refill, gyro guess, anchor guard;
+  - analytic flow pose, keyframe-only bookkeeping;
+  - online calibration with `imu_t_bc` and the clock offset;
+  - `wide` SIMD kernels with OpenCV benches;
+  - robot presets `configs/pr180-frontend-1ms.ron` and `configs/pr180-full.ron`.
+- **Deferred:** raw Aria fisheye (card F), and keyframe ORB on the mapping thread (`keyframe_orb: Mapping`).
+- **Reverted:** Step 8 (SVD `orthonormalized`), because it changed the PGO fingerprint.
+- **Generic code** goes in `crates/kornia-slam/src/upstream/`, marked for kornia-rs later.
+- **#180, CI fixes:**
+  - clippy (rust 1.100), rustfmt and rustdoc;
+  - the offline VI-BA test fixture now has observable scale (constant acceleration left a scale and tilt null space);
+  - the full local gate is green.
+
+### 2026-11-16
+- **main:** #197, inertial factors use kornia-3d `RobustKernel::rho`/`weight`; local `robust.rs` removed.
+- **#180:** review received from cjpurackal.
+
+### 2026-11-15
+- **main:** #194, inertial factors grouped; `se3` renamed to `relative_pose`.
+- **#180:**
+  - re-seed with kept inertial state on rigid poses, the gyro attitude and a tilt check;
+  - a pose-acceptance gate against the inertial prediction;
+  - a VI-BA iteration-cap knob;
+  - the LaMAria sprint handoff (`experiments/lamaria-handoff.md`).
+
+### 2026-11-14
+- **main:**
+  - #185, #191, #192: factors, preintegration and VI-BA on kornia-algebra fixed-size types;
+  - #189: build against kornia-rs main;
+  - #190: reuse kornia-rs helpers.
+- **#180:** every pose kept rigid at the source; keyframes while lost as fixed anchors; non-rigid pose counters.
+
+### 2026-11-13
+- **main:**
+  - #175: IMU, wheel and stationary factors moved into kornia-factors;
+  - #181: loop closures solved on a worker thread;
+  - #182: seed after a give-up;
+  - #183: LK pyramid reuse;
+  - #188: clippy 1.100.
+- **#180:** run counters and a `[summary]` line; wheel odometry in the local BA; a keyframe bound; app flags `--trajectory-coasted` and `--no-pace`.
+
+### 2026-11-12
+- **#180:**
+  - KLT-first tracking between keyframes (mono);
+  - LK starts at the predicted pose;
+  - fixed-point u8 LK kernel;
+  - analytic pose-only LM in `solve_pnp`;
+  - frontend replay benchmark;
+  - a secondary-camera keypoint budget.
+
+### 2026-11-11
+- **#180:** a marginal prior for the VI-BA boundary, carried between windows; an optional state envelope on BA write-back; hold the inertial state of keyframes inserted while lost.
+
+### 2026-11-10
+- **#180:**
+  - multi-camera rigs: rig declaration, per-camera features and overlap points, per-camera tracking, stereo-inertial initialization;
+  - the LaMAria pinhole source;
+  - loop-closure fixes (Drift information, inline solve by default);
+  - robust kernel in the visual-only BA;
+  - octave-scaled visual information.
+
+### 2026-11-09
+- **#180:** landmark merge through observation records; loop fusion planned in the worker and applied at write-back; seed after a give-up at the last tracked pose.
+
+### 2026-11-08
+- **#180:** one global pose graph for loop closing:
+  - sparse PGO with information-weighted Cauchy edges;
+  - drift-based loop gate;
+  - persistent pose graph owned by `LoopCloser`;
+  - off-thread solve with snapshot write-back.
+
+### 2026-11-07
+- **#180:** `compact_landmarks` frees retired landmark slots.
+
+### Earlier (main)
+- **2026-10-04 to 10-29:**
+  - wheel-odometry VI-BA factor and stationary init (#158);
+  - tracking-loss recovery and relocalisation (#153);
+  - `process_imu`/`process_image` split (#165);
+  - wheel kinematics (#174);
+  - keyframe eviction at a map bound (#169);
+  - configurable pipelines (#149, #150);
+  - calibration through `SensorRig` (#147).
+- **2026-09-23 to 09-27:**
+  - map and system refactors (#105-#125);
+  - kornia-rs 0.2.0 on crates.io (#129);
+  - Copper integration guide (#130);
+  - v0.1.0 release (#136);
+  - IROS 2026 workshop paper (#137).
+
 ## Now — egocentric accuracy on LaMAria
 
 We are working toward top results on the [LaMAria](https://github.com/cvg/lamaria) egocentric benchmark ([#78](https://github.com/kornia/kornia-slam/issues/78)), using the Aria rig and IMU and no GPS. The work is sequenced by where the benchmark score is lost: each change states its theory and predictions first, ships behind a config knob that defaults to the old behaviour, and is compared window by window against ORB-SLAM3 in the same harness.
