@@ -12,7 +12,9 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 **New settings for a 1 ms frontend frame and for online calibration, all off by
 default.** Every default is today's behaviour, so existing run files load and
-run unchanged. Not implemented yet: most stop with `todo!` when set.
+run unchanged. Built, not validated: no benchmark has run on them. Not built:
+`frontend.keyframe_orb: Mapping` stops with `todo!`; the raw Aria fisheye input
+and its knobs are deferred to their own round.
 - `frontend.flow_threads` (`1`): threads the flow step runs on, the tracking
   thread included; 1, the rig's camera count or one more, at most 4.
 - `frontend.flow_first_core` (`None`): pins the flow workers from this core on;
@@ -50,6 +52,9 @@ run unchanged. Not implemented yet: most stop with `todo!` when set.
   IMU residual. Needs the IMU.
 - Cargo features `bench_internals`, `opencv_bench` and `pin_threads`, for the
   kernel benches and the flow-worker pinning.
+- Two untested run files for the robot test, `configs/pr180-frontend-1ms.ron`
+  (the Orin 2-core frontend preset) and `configs/pr180-full.ron` (the same plus
+  the estimator and recovery settings below).
 
 **New settings for the estimator, recovery and offline-BA work, all off by
 default.** Every default is the behaviour before the setting existed, so

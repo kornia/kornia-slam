@@ -133,6 +133,71 @@ Plan decision 6: every new behaviour has a knob, off by default, and pruning hap
 - Moves with no knob (card C, Step 8) are accepted on the identity gate, not on a score.
 - Nothing is pruned on a single sample, and a better number alone is not a fix (`slam-experiment` skill).
 
+## 1 ms frontend round (plan `pr180-frontend-1ms.md`)
+
+The round after the one above. Tags `pr180b/K`, `pr180b/L-K`, `pr180b/L-C` and `pr180b/F`; the tip is the branch head. Every new knob defaults to today's behaviour. It compiled with `cargo check` only; nothing below has run, and this file makes no score claim.
+
+**Deferred to their own rounds, so not validation tasks here:**
+- Lane F, the raw Aria fisheye input (`Fisheye624Camera`, `LamariaImages::RawFisheye`, `frontend.fisheye_weight`), and its download.
+- `frontend.keyframe_orb: Mapping` (lane T step 12): it stops with `todo!`, so keyframe frames cost about 15 ms more than the budget below.
+
+Decision D1 (card G): the primary camera's rotation offset is the camera-to-IMU extrinsic `imu_t_bc` inside the IMU residual, as VINS-Fusion does. The clock offset is unchanged.
+
+**Threading model (plan section 3).**
+- The tracking core predicts, trusts and gates, makes a level-0 padded copy of each camera and hands one shard per core to long-lived `klt-flow-<n>` workers (`std::sync::mpsc::sync_channel(1)`, no rayon).
+- Each shard runs start pixels, templates, LK forward and backward, filter, unproject and refill. The tracking core joins (`try_recv` spin up to 100 us, then a blocking `recv`), then does the rig pose and bookkeeping, then the off-nominal retries.
+- 2 cores: camera 0 on the tracking core, camera 1 on worker 1. 3 cores: each worker takes two thirds of one camera's tracks.
+- A track's shard is fixed when it spawns, and survivors merge in (camera, track id) order, so output must be identical for any thread count.
+- Estimated sync cost on Orin: 15 us critical path at 2 cores, 50 us at 3.
+
+**Budget (plan section 4), non-keyframe frame, 2 cameras, 640x480, 11x11, level 0, forward-backward every frame, microseconds:**
+
+| Stage | Where | Orin 2 cores, 48 tracks/camera | Orin 3 cores, 64 tracks/camera | x86 1 thread, 48 tracks/camera |
+|---|---|---|---|---|
+| IMU prediction, trust, gate | tracking core | 60 | 60 | 30 |
+| Level-0 padded copies | tracking core | 80 | 80 | 40 |
+| Dispatch plus wake | tracking core | 5 | 40 | 0 |
+| Start pixels | shard | 20 | 18 | 20 |
+| Templates with window-only Scharr | shard | 164 | 146 | 164 |
+| LK forward | shard | 226 | 201 | 226 |
+| LK backward | shard | 135 | 120 | 135 |
+| Round-trip, error, border filter | shard | 4 | 4 | 4 |
+| Fisheye unproject | shard | 40 | 35 | 40 |
+| Detection and refill, amortised | shard | 40 | 40 | 40 |
+| Join | tracking core | 10 | 10 | 0 |
+| Rig pose (analytic Gauss-Newton, 3 iterations) | tracking core | 136 | 168 | 68 |
+| Track advance, counts, keyframe decision | tracking core | 60 | 60 | 30 |
+| **Total (critical path)** | | **980** | **982** | **797** |
+
+Off-nominal, Orin 2 cores: refill 1,180 us; retry 1,380 us; both 1,580 us; one core with the same settings 1,594 us. "Fisheye unproject" is the ray unproject of the pinhole crop until the raw fisheye round.
+
+**Validation tasks (plan section 12), laptop `-j2`:**
+
+```bash
+cargo check -j2 --workspace --all-targets
+cargo check -j2 --manifest-path apps/kornia-slam-app/Cargo.toml --all-targets
+cargo check -j2 -p kornia-slam --benches --features bench_internals
+cargo check -j2 -p kornia-slam --lib --features bench_internals --target aarch64-unknown-linux-gnu
+grep -rn "core::arch\|std::arch" crates/kornia-slam/src/upstream   # must print nothing
+cargo test --release -j2 -p kornia-slam upstream::
+cargo test --release -j2 -p kornia-slam --test flow_zero_alloc
+RAYON_NUM_THREADS=1 taskset -c 8 cargo bench -j2 -p kornia-slam --features bench_internals,opencv_bench --bench bench_upstream_lk_window
+cargo build --release -j2 -p kornia-slam-frontend-bench
+```
+
+If the aarch64 check needs a C cross-compiler, report it and do not install one. Run the `bench_upstream_*` benches the same way.
+
+Also validation tasks:
+- **Orin bench** on `nvidia-orin01` with `kornia-slam-frontend-bench` (klt-rig mode, per-stage CSV), 2 cores and 3 cores, `taskset` to the cores; compare stage medians with the table above.
+- **Run files for the robot test:** `configs/pr180-frontend-1ms.ron` (frontend preset only) and `configs/pr180-full.ron` (plus cards A to D). Both untested.
+
+**Pass criteria:**
+- every kernel beats its OpenCV arm;
+- LK matches OpenCV within 0.01 px, with identical status;
+- the zero-allocation and thread-count tests pass;
+- stage medians are at or under the table above;
+- with all knobs off, output `cmp` equals `c0a1dc3`.
+
 ## Draft replies to Christian
 
 Not written yet and never posted by this workflow. After validation, write them from results, per review comment:

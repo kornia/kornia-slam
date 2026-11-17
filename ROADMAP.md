@@ -36,8 +36,12 @@ Scale and drift while tracking:
 - [ ] Calibration states in the offline BA: camera rotation and focal drift, gyro intrinsics, clock offset (built, knobs `offline_ba.calibration.*`, not yet validated)
 
 Field of view and speed:
-- [ ] Raw Aria fisheye cameras instead of the pinhole crop
-- [ ] ORB only on keyframes with KLT in between, on every rig camera
+- [ ] Raw Aria fisheye cameras instead of the pinhole crop: deferred to its own round (card F)
+- [ ] ORB only on keyframes with KLT in between, on every rig camera (built, knob `klt_rig`, not yet validated; `klt_first` already existed)
+- [ ] Optical flow on every rig camera, forward-backward check, refill, gyro guess and flow-only pose (built, knobs `klt_rig`, `forward_backward`, `track_refill`, `gyro_guess` and `flow_pose`, not yet validated)
+- [ ] Window-only fixed-point LK at an 11x11 window (built, knobs `klt_kernel: WindowedU8` and `klt_window`, not yet validated)
+- [ ] Flow workers across 2-3 cores (built, knob `flow_threads`, not yet validated)
+- [ ] Keyframe ORB on the mapping thread (`keyframe_orb: Mapping`): deferred, its design is open (lane T step 12)
 
 ## Next — complete the SLAM stack
 

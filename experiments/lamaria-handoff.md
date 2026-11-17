@@ -158,7 +158,7 @@ These findings come from reading the code only; none of them is measured in the 
 - With an IMU prediction, LK starts at the predicted pixel and searches only the fine levels.
 
 **Still open, largest first:**
-1. **Make the u8 fixed-point kernel the default.** `LkKernel::FixedPointU8` (u8 pyramid, i16 Scharr, Q14 windows, OpenCV's scheme) already exists. The default is still `F32`, which every frame casts the full image u8→f32 and runs an f32 pyrdown and an f32 Scharr. The earlier frontend plan predicted about 1.2 ms to build the u8 pyramid. The output changes slightly, so this needs an experiment card with an accuracy check. It is the first one to try, because it is a single knob.
+1. **The u8 fixed-point kernel is the default (done).** `LkKernel::FixedPointU8` (u8 pyramid, i16 Scharr, Q14 windows, OpenCV's scheme) is the default (`system/config/mod.rs:368`); `F32` stays selectable and supports only the 21×21 window. The earlier frontend plan predicted about 1.2 ms to build the u8 pyramid; that prediction is still unmeasured in the full pipeline. The window-only `WindowedU8` kernel (knob `frontend.klt_kernel`, built, not yet validated) is the next step.
 2. **Compute gradients only where tracks are.** Scharr runs over the whole image at every level. With about 300 tracks and a 21×21 window, that is about 10 % of the L0 pixels, so gradients computed lazily per window would save most of the cost.
 3. **Build coarse levels only when needed.** With a good IMU prediction, LK uses only levels 0–1, but levels 2–3 are still built for the cache. The saving is small: those levels hold about 1/16 of L0's area.
 4. **Stop building duplicate pyramids:**
