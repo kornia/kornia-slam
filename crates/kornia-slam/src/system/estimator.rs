@@ -1,7 +1,8 @@
 //! The per-frame estimator choices of card A, ported from ORB-SLAM3 and
 //! OpenVINS: keyframe evidence for ORB-SLAM3's insertion rules, the IMU
-//! covariance trust and the pose-inertial solve. Each one is behind its knob,
-//! and the defaults read none of this.
+//! covariance trust, the pose-inertial solve and the G29 snap-back counter
+//! and fix. Each one is behind its knob, and the defaults read none of this;
+//! the G29 counter only counts.
 
 use std::collections::HashSet;
 
@@ -21,8 +22,16 @@ use crate::tracking::pose_estimation::pose_inertial::{
     Anchor, FrameNavState, NavPrior, PoseInertialObservation, solve_pose_inertial,
 };
 use crate::tracking::{KeyframeEvidence, KeyframeRules};
+use crate::upstream::kornia_3d::pose_ext::camera_centre;
 
-use super::{PoseInertial, SlamSystem};
+use super::{PoseInertial, SlamSystem, SnapbackFix};
+
+/// A BA write-back moving the newest keyframe further than this counts as a
+/// shift (G29).
+const BA_SHIFT_M: f64 = 0.3;
+/// The next tracked step undoes a shift when it moves back this many times
+/// the shift along it.
+const SNAPBACK_RATIO: std::ops::RangeInclusive<f64> = 0.5..=2.0;
 
 /// Lane A's state carried across frames.
 #[derive(Debug, Default)]
@@ -40,6 +49,12 @@ pub(super) struct EstimatorState {
     /// A local-BA write-back changed the map since the last solve
     /// (ORB-SLAM3's `mbMapUpdated`).
     pub(super) map_changed: bool,
+    /// The newest keyframe's centre shift of the last write-back over
+    /// [`BA_SHIFT_M`], until the next tracked frame measures its step.
+    pub(super) pending_shift: Option<(usize, Vec3F64)>,
+    /// `snapback_fix`: the next tracked frame is solved from the corrected
+    /// keyframe.
+    pub(super) anchor_next_frame: bool,
 }
 
 /// What the pose-inertial solve of a frame starts from.
@@ -338,7 +353,8 @@ impl SlamSystem {
         prev_timestamp: f64,
         timestamp_sec: f64,
     ) {
-        let mode = self.tracking_config.pose_inertial;
+        let mode = self.pose_inertial_mode();
+        self.estimator.anchor_next_frame = false;
         if mode == PoseInertial::Off || !self.state.imu_initialized {
             return;
         }
@@ -418,7 +434,7 @@ impl SlamSystem {
     /// keyframe: always with `LastKeyframe`; with `OrbSlam3` after the map
     /// changed or without the previous frame's prior (`Tracking.cc:2970-2992`).
     pub(super) fn keyframe_anchored(&self, frame_idx: usize) -> bool {
-        match self.tracking_config.pose_inertial {
+        match self.pose_inertial_mode() {
             PoseInertial::Off => false,
             PoseInertial::LastKeyframe => true,
             PoseInertial::OrbSlam3 => self.valid_frame_prior(frame_idx).is_none(),
@@ -462,10 +478,12 @@ impl SlamSystem {
         pose_before: Pose3d,
         prev_timestamp: f64,
     ) -> (Pose3d, f64) {
-        if !self.state.imu_initialized
-            || self.tracking_config.pose_inertial != PoseInertial::OrbSlam3
-            || !self.keyframe_anchored(frame_idx)
-        {
+        let from_keyframe = match self.tracking_config.pose_inertial {
+            PoseInertial::OrbSlam3 => self.keyframe_anchored(frame_idx),
+            PoseInertial::LastKeyframe => false,
+            PoseInertial::Off => self.pose_inertial_mode() != PoseInertial::Off,
+        };
+        if !self.state.imu_initialized || !from_keyframe {
             return (pose_before, prev_timestamp);
         }
         let origin = self
@@ -502,6 +520,57 @@ impl SlamSystem {
                 })
             })
             .collect()
+    }
+
+    /// The solve this frame runs: the configured one, or with `snapback_fix`
+    /// a `LastKeyframe` solve on the first tracked frame after a write-back
+    /// (`Tracking.cc:2982-2991` without the rest of `OrbSlam3`).
+    fn pose_inertial_mode(&self) -> PoseInertial {
+        match self.tracking_config.pose_inertial {
+            PoseInertial::Off
+                if self.tracking_config.snapback_fix == SnapbackFix::AnchorNextFrame
+                    && self.estimator.anchor_next_frame =>
+            {
+                PoseInertial::LastKeyframe
+            }
+            mode => mode,
+        }
+    }
+
+    /// G29 at a BA write-back: the shift of the newest keyframe's centre,
+    /// kept for the next tracked frame when over [`BA_SHIFT_M`].
+    pub(super) fn note_ba_shift(
+        &mut self,
+        kf_idx: usize,
+        pose_before: &Pose3d,
+        pose_after: &Pose3d,
+    ) {
+        if self.tracking_config.snapback_fix == SnapbackFix::AnchorNextFrame {
+            self.estimator.anchor_next_frame = true;
+        }
+        let shift = camera_centre(pose_after) - camera_centre(pose_before);
+        if shift.length() > BA_SHIFT_M {
+            self.counters.ba_keyframe_shifts += 1;
+            self.estimator.pending_shift = Some((kf_idx, shift));
+        }
+    }
+
+    /// G29 on a tracked frame: how much of the pending shift its step from
+    /// the `predicted` pose to the `accepted` one undid.
+    pub(super) fn note_tracked_step(&mut self, predicted: &Pose3d, accepted: &Pose3d) {
+        let Some((kf_idx, shift)) = self.estimator.pending_shift.take() else {
+            return;
+        };
+        let step = camera_centre(accepted) - camera_centre(predicted);
+        let ratio = -step.dot(shift) / shift.dot(shift);
+        if SNAPBACK_RATIO.contains(&ratio) {
+            self.counters.ba_snapbacks += 1;
+        }
+        self.dbg(format!(
+            "[g29] kf={kf_idx} shift={:.3} next_step={:.3} ratio={ratio:.2}",
+            shift.length(),
+            step.length(),
+        ));
     }
 }
 

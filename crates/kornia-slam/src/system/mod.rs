@@ -871,8 +871,9 @@ impl SlamSystem {
             if let Some(marginal) = result.newest_marginal {
                 self.estimator.newest_marginal = Some(marginal);
             }
-            if !result.keyframe_corrections.is_empty() {
+            if let Some(newest) = result.keyframe_corrections.iter().max_by_key(|c| c.kf_idx) {
                 self.estimator.map_changed = true;
+                self.note_ba_shift(newest.kf_idx, &newest.pose_before, &newest.pose_after);
             }
             for correction in &result.keyframe_corrections {
                 if self.note_pose("ba_keyframe", correction.kf_idx, &correction.pose_after) {
@@ -1599,6 +1600,7 @@ impl SlamSystem {
         let (mut status, matches, tracked_inliers, reject_reason) = match result {
             Ok(mut estimate) => {
                 self.refine_pose_inertial(&frame, &mut estimate, prev_timestamp, timestamp_sec);
+                self.note_tracked_step(&candidate_pose, &estimate.pose);
                 self.state.pose_world_to_cam = estimate.pose;
                 self.note_pose("tracked", frame_idx, &estimate.pose);
                 // ORB-SLAM3 tracks against the most-voted keyframe
