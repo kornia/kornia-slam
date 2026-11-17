@@ -10,6 +10,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::PreintegratedImu;
 
+use crate::pose_conversion::rigid;
 use crate::upstream::kornia_3d::pose_ext::camera_centre;
 
 /// Preintegration prepared by the system, which owns bias and sample buffering.
@@ -49,10 +50,11 @@ pub(crate) fn predict_pose(
 
 /// Applies the last inter-frame motion again.
 fn predict_pose_visual(pose_before: Pose3d, visual_velocity: Option<Pose3d>) -> Pose3d {
-    visual_velocity
-        .map(|v| v.compose(&pose_before))
-        .unwrap_or(pose_before)
-        .orthonormalized()
+    rigid(
+        visual_velocity
+            .map(|v| v.compose(&pose_before))
+            .unwrap_or(pose_before),
+    )
 }
 
 /// Propagates the camera pose and body velocity through one preintegrated IMU
@@ -77,7 +79,7 @@ fn predict_pose_imu(
         Some(t_bc) => pred_body_to_world.compose(t_bc),
         None => pred_body_to_world,
     };
-    (pred_cam_to_world.inverse().orthonormalized(), v_j)
+    (rigid(pred_cam_to_world.inverse()), v_j)
 }
 
 pub(crate) fn body_to_world(pose_w2c: &Pose3d, camera_to_body: Option<Pose3d>) -> Pose3d {

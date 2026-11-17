@@ -12,6 +12,7 @@ use kornia_3d::ransac::{HuberKernel, RobustKernel};
 use kornia_algebra::{Mat3F64, Mat6F64, SO3F64, Vec3F64, Vec6F64};
 
 use super::pnp::PnpConfig;
+use crate::pose_conversion::rigid;
 
 /// One match: a world point and the undistorted pixel that camera `camera`
 /// observed it at, with that camera's `T_CP`.
@@ -112,7 +113,7 @@ fn refine(
     max_iterations: usize,
 ) -> Option<Pose3d> {
     // A scaled start keeps its scale: every step left-multiplies a rotation.
-    let mut pose = start.orthonormalized();
+    let mut pose = rigid(*start);
     let mut cost = robust_cost(observations, active, &pose, c_sq);
     let mut lambda = 1e-3;
     for _ in 0..max_iterations {
