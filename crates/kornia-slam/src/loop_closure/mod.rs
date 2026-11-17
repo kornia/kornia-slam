@@ -45,8 +45,8 @@ pub use odometry_gate::{
 };
 pub use pose_graph::{InertialPgoContext, PgoConfig, PgoError, PgoResult, optimize_pose_graph};
 pub use sparse_pgo::{
-    GravityManifold, InformationEdge, PoseGraphEdge, PoseManifold, RobustKernel, Se3Manifold,
-    SparsePgoError, SparsePgoResult, sparse_pose_graph_optimize,
+    GravityManifold, InformationEdge, PoseGraphEdge, PoseManifold, Se3Manifold, SparsePgoError,
+    SparsePgoResult, sparse_pose_graph_optimize,
 };
 pub use verification::{
     LoopVerificationConfig, LoopVerificationReject, VerifiedLoopEdge, verify_loop_candidate,

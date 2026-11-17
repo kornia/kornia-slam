@@ -15,12 +15,13 @@ use std::collections::{BTreeMap, HashMap};
 
 use kornia_3d::pgo::PgoParams;
 use kornia_3d::pose::Pose3d;
+use kornia_3d::ransac::{CauchyKernel, RobustKernel};
 use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 use thiserror::Error;
 
 use crate::loop_closure::sparse_pgo::{
-    GravityManifold, InformationEdge, RobustKernel, Se3Manifold, SparsePgoResult,
-    sparse_pose_graph_optimize, weighted_relative_residual,
+    GravityManifold, InformationEdge, Se3Manifold, SparsePgoResult, sparse_pose_graph_optimize,
+    weighted_relative_residual,
 };
 use crate::pose_conversion::pose_to_se3;
 use crate::upstream::kornia_3d::pose_ext::camera_centre;
@@ -812,11 +813,9 @@ impl<P> PoseGraph<P> {
             };
             values[row] = (1.0 / sigma) as f32;
         }
-        let kernel = match (edge.kind, self.config.loop_cauchy_scale) {
-            (EdgeKind::Loop, Some(scale)) => RobustKernel::Cauchy {
-                scale: scale as f32,
-            },
-            _ => RobustKernel::None,
+        let cauchy_scale = match (edge.kind, self.config.loop_cauchy_scale) {
+            (EdgeKind::Loop, Some(scale)) => Some(scale as f32),
+            _ => None,
         };
         let t_ab_meas = pose_to_se3(&edge.measurement);
         Ok(InformationEdge {
@@ -824,7 +823,7 @@ impl<P> PoseGraph<P> {
             pose_b: edge.to.0,
             t_ab_meas,
             sqrt_information,
-            kernel,
+            cauchy_scale,
         })
     }
 }
@@ -835,12 +834,9 @@ fn graph_cost(poses: &[Pose3d], edges: &[InformationEdge]) -> f64 {
         .iter()
         .filter_map(|edge| {
             let squared = whitened_squared(poses, edge)?;
-            Some(match edge.kernel {
-                RobustKernel::None => squared,
-                RobustKernel::Cauchy { scale } => {
-                    let c2 = f64::from(scale) * f64::from(scale);
-                    c2 * (squared / c2).ln_1p()
-                }
+            Some(match edge.cauchy_scale {
+                None => squared,
+                Some(scale) => CauchyKernel.rho(squared, f64::from(scale) * f64::from(scale)),
             })
         })
         .sum::<f64>()

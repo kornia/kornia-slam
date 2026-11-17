@@ -6,6 +6,7 @@ use faer::sparse::{SparseColMat, Triplet};
 use faer::{Mat, Side};
 use kornia_3d::pgo::{PgoEdge, PgoParams};
 use kornia_3d::pose::Pose3d;
+use kornia_3d::ransac::{CauchyKernel, RobustKernel};
 use kornia_algebra::{SE3F32, SO3F64, Vec3F64};
 use thiserror::Error;
 
@@ -36,15 +37,6 @@ pub struct SparsePgoResult {
     pub converged: bool,
 }
 
-/// A robust loss on an edge's whitened squared residual `s`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum RobustKernel {
-    /// Least squares, `rho(s) = s`.
-    None,
-    /// `rho(s) = c^2 ln(1 + s / c^2)` with `c = scale`, in whitened units.
-    Cauchy { scale: f32 },
-}
-
 /// A relative-pose edge with a full 6x6 square-root information `S`. Its residual is
 /// `S * log(t_ab_meas^-1 * T_b * T_a^-1)`, ordered (translation, rotation), in camera `b`.
 #[derive(Debug, Clone, Copy)]
@@ -55,7 +47,9 @@ pub struct InformationEdge {
     pub t_ab_meas: SE3F32,
     /// Row-major; the information is `S^T S`.
     pub sqrt_information: [[f32; RESIDUAL_DIM]; RESIDUAL_DIM],
-    pub kernel: RobustKernel,
+    /// Cauchy scale `c` on the whitened squared residual `s`, `rho(s) = c^2 ln(1 + s / c^2)`;
+    /// `None` is least squares.
+    pub cauchy_scale: Option<f32>,
 }
 
 mod sealed {
@@ -158,7 +152,7 @@ impl sealed::EdgeTerm for InformationEdge {
                 "pose-graph square-root information must be finite".into(),
             ));
         }
-        if let RobustKernel::Cauchy { scale } = self.kernel
+        if let Some(scale) = self.cauchy_scale
             && !(scale.is_finite() && scale > 0.0)
         {
             return Err(SparsePgoError::InvalidInput(
@@ -188,13 +182,9 @@ impl sealed::EdgeTerm for InformationEdge {
     }
 
     fn robust_weight(&self, residual: &[f32; RESIDUAL_DIM]) -> Option<f32> {
-        match self.kernel {
-            RobustKernel::None => None,
-            RobustKernel::Cauchy { scale } => {
-                let squared = residual.iter().map(|v| v * v).sum::<f32>();
-                Some(1.0 / (1.0 + squared / (scale * scale)))
-            }
-        }
+        let scale = self.cauchy_scale?;
+        let squared = residual.iter().map(|v| v * v).sum::<f32>();
+        Some(CauchyKernel.weight(f64::from(squared), cauchy_c_sq(scale)) as f32)
     }
 
     fn accumulate_cost(
@@ -202,18 +192,17 @@ impl sealed::EdgeTerm for InformationEdge {
         residual: &[f32; RESIDUAL_DIM],
         cost: &mut f32,
     ) -> Result<(), SparsePgoError> {
-        match self.kernel {
+        match self.cauchy_scale {
             // Per component, as PgoEdge sums: LM stops on a relative cost change near f32's
             // summation noise, so a different order stops it elsewhere in a flat valley.
-            RobustKernel::None => {
+            None => {
                 for value in residual {
                     *cost += value * value;
                 }
             }
-            RobustKernel::Cauchy { scale } => {
+            Some(scale) => {
                 let squared = residual.iter().map(|v| v * v).sum::<f32>();
-                let c2 = scale * scale;
-                *cost += c2 * (squared / c2).ln_1p();
+                *cost += CauchyKernel.rho(f64::from(squared), cauchy_c_sq(scale)) as f32;
             }
         }
         if !cost.is_finite() {
@@ -223,6 +212,11 @@ impl sealed::EdgeTerm for InformationEdge {
         }
         Ok(())
     }
+}
+
+/// `c^2` in f64, as [`CauchyKernel`] takes it.
+fn cauchy_c_sq(scale: f32) -> f64 {
+    f64::from(scale) * f64::from(scale)
 }
 
 struct NormalSystem<const DOF: usize> {
@@ -2080,8 +2074,8 @@ mod information_tests {
     use kornia_algebra::{SE3F32, SO3F64, Vec3F64};
 
     use super::{
-        GravityManifold, InformationEdge, RobustKernel, Se3Manifold, pose_to_se3,
-        sparse_pose_graph_optimize, weighted_relative_residual,
+        GravityManifold, InformationEdge, Se3Manifold, pose_to_se3, sparse_pose_graph_optimize,
+        weighted_relative_residual,
     };
     use crate::upstream::kornia_3d::pose_ext::camera_centre;
 
@@ -2119,27 +2113,25 @@ mod information_tests {
         std::array::from_fn(|row| std::array::from_fn(|col| if row == col { scale } else { 0.0 }))
     }
 
-    fn edge(meas: SE3F32, a: usize, b: usize, sqrt: f32, kernel: RobustKernel) -> InformationEdge {
+    fn edge(
+        meas: SE3F32,
+        a: usize,
+        b: usize,
+        sqrt: f32,
+        cauchy_scale: Option<f32>,
+    ) -> InformationEdge {
         InformationEdge {
             pose_a: a,
             pose_b: b,
             t_ab_meas: meas,
             sqrt_information: scaled_identity(sqrt),
-            kernel,
+            cauchy_scale,
         }
     }
 
     fn odometry(poses: &[Pose3d], sqrt: f32) -> Vec<InformationEdge> {
         (0..poses.len() - 1)
-            .map(|a| {
-                edge(
-                    measurement(poses, a, a + 1),
-                    a,
-                    a + 1,
-                    sqrt,
-                    RobustKernel::None,
-                )
-            })
+            .map(|a| edge(measurement(poses, a, a + 1), a, a + 1, sqrt, None))
             .collect()
     }
 
@@ -2185,7 +2177,7 @@ mod information_tests {
             LOOP_POSES - 1,
             0,
             100.0,
-            RobustKernel::None,
+            None,
         );
         edges.push(closing);
         let before = raw_residual_norm(&initial, &closing);
@@ -2201,7 +2193,7 @@ mod information_tests {
         assert_eq!(result.poses[0], initial[0]);
     }
 
-    fn solve_with_false_loop(kernel: RobustKernel) -> (f64, usize) {
+    fn solve_with_false_loop(cauchy_scale: Option<f32>) -> (f64, usize) {
         let truth = square(0.0);
         let mut edges = odometry(&truth, 10.0);
         edges.push(edge(
@@ -2209,10 +2201,10 @@ mod information_tests {
             LOOP_POSES - 1,
             0,
             10.0,
-            kernel,
+            cauchy_scale,
         ));
         // Claims pose 8, 5.7 m from the start, sits on it.
-        edges.push(edge(measurement(&truth, 0, 0), 8, 0, 10.0, kernel));
+        edges.push(edge(measurement(&truth, 0, 0), 8, 0, 10.0, cauchy_scale));
         let result =
             sparse_pose_graph_optimize(&truth, &edges, &[0], &params(), &gravity()).unwrap();
         assert!(result.converged);
@@ -2221,14 +2213,39 @@ mod information_tests {
 
     #[test]
     fn cauchy_down_weights_one_false_loop_edge() {
-        let (plain, _) = solve_with_false_loop(RobustKernel::None);
-        let (robust, iterations) = solve_with_false_loop(RobustKernel::Cauchy { scale: 1.0 });
+        let (plain, _) = solve_with_false_loop(None);
+        let (robust, iterations) = solve_with_false_loop(Some(1.0));
         println!("false loop: plain {plain} m, cauchy {robust} m in {iterations} iterations");
         assert!(
             plain > 0.5,
             "least squares should bend to the false edge: {plain} m"
         );
         assert!(robust < 0.05, "Cauchy left {robust} m of distortion");
+    }
+
+    fn ulps(a: f32, b: f32) -> i64 {
+        (i64::from(a.to_bits() as i32) - i64::from(b.to_bits() as i32)).abs()
+    }
+
+    /// P7 of `experiments/pr180-review-swaps-plan.md`: the f64 kernel against the old f32 bodies.
+    #[test]
+    fn cauchy_weight_and_rho_match_the_f32_bodies() {
+        use super::sealed::EdgeTerm;
+        for scale in [0.5f32, 1.0, 3.0] {
+            let loop_edge = edge(SE3F32::IDENTITY, 0, 1, 1.0, Some(scale));
+            for squared in [0.0f32, 1e-6, 0.3, 1.0, 9.0, 1e4] {
+                let residual = [squared.sqrt(), 0.0, 0.0, 0.0, 0.0, 0.0];
+                let squared = residual.iter().map(|v| v * v).sum::<f32>();
+                let c2 = scale * scale;
+                let weight = loop_edge.robust_weight(&residual).unwrap();
+                let old_weight = 1.0 / (1.0 + squared / c2);
+                assert!(ulps(weight, old_weight) <= 2, "{scale} {squared}");
+                let mut cost = 0.0;
+                loop_edge.accumulate_cost(&residual, &mut cost).unwrap();
+                let old_cost = c2 * (squared / c2).ln_1p();
+                assert!(ulps(cost, old_cost) <= 4, "{scale} {squared}");
+            }
+        }
     }
 
     #[test]
@@ -2239,20 +2256,8 @@ mod information_tests {
         let poses = [origin, planar_pose(0.0, Vec3F64::new(1.1, 0.3, 0.0))];
         let solve = |sqrt_near: f32, sqrt_far: f32| {
             let edges = [
-                edge(
-                    measurement(&[origin, near], 0, 1),
-                    0,
-                    1,
-                    sqrt_near,
-                    RobustKernel::None,
-                ),
-                edge(
-                    measurement(&[origin, far], 0, 1),
-                    0,
-                    1,
-                    sqrt_far,
-                    RobustKernel::None,
-                ),
+                edge(measurement(&[origin, near], 0, 1), 0, 1, sqrt_near, None),
+                edge(measurement(&[origin, far], 0, 1), 0, 1, sqrt_far, None),
             ];
             let result =
                 sparse_pose_graph_optimize(&poses, &edges, &[0], &params(), &Se3Manifold).unwrap();
@@ -2284,15 +2289,7 @@ mod information_tests {
             .collect();
         let information: Vec<InformationEdge> = weighted
             .iter()
-            .map(|e| {
-                edge(
-                    e.t_ab_meas,
-                    e.pose_a,
-                    e.pose_b,
-                    e.weight,
-                    RobustKernel::None,
-                )
-            })
+            .map(|e| edge(e.t_ab_meas, e.pose_a, e.pose_b, e.weight, None))
             .collect();
         let a =
             sparse_pose_graph_optimize(&initial, &weighted, &[0], &params(), &gravity()).unwrap();
