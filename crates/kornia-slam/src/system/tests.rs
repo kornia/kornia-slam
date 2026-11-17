@@ -558,13 +558,10 @@ mod anchors {
     #[test]
     fn the_config_selects_anchors_and_defaults_to_lost_keyframes() {
         assert_eq!(
-            TrackingLossRecoveryPolicy::default().keyframes_while_lost,
+            TrackingLossConfig::default().keyframes_while_lost,
             KeyframesWhileLost::Enabled
         );
-        assert_eq!(
-            system().tracking_loss_recovery.keyframes_while_lost,
-            KeyframesWhileLost::Anchor
-        );
+        assert_eq!(system().keyframes_while_lost, KeyframesWhileLost::Anchor);
     }
 
     #[test]

@@ -12,11 +12,12 @@ use crate::loop_closure::{
     LoopClosingConfig, LoopGraphInformation, LoopOdometryGate, LoopTemporalConsistency,
     OdometryRandomWalk,
 };
+use crate::mapping::bundle_adjustment::LostKeyframes;
 use crate::mapping::map::StateEnvelope;
 use crate::mapping::marginalization::BoundaryPrior;
-use crate::tracking::KeyframePolicy;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
 use crate::tracking::pose_gate::PoseGate;
+use crate::tracking::{KeyframePolicy, KeyframesWhileLost};
 
 /// A system configuration that cannot be built or does not fit its source.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -54,6 +55,12 @@ pub enum ConfigError {
     MissingSensor(&'static str),
     #[error("stereo cameras need rectified images; the source supplies raw fisheye images")]
     FisheyeStereo,
+    #[error(
+        "mapping.local_ba.lost_keyframes FixedInertial has no effect with \
+         tracking_loss.keyframes_while_lost {0:?}: it acts only on lost keyframes inserted as \
+         full states (Enabled)"
+    )]
+    LostKeyframesWithoutEffect(KeyframesWhileLost),
 }
 
 impl SystemConfig {
@@ -89,6 +96,10 @@ impl OrbSlamPipeline {
         validate_loop_closing(&self.loop_closing, sensors)?;
         validate_recovery(&self.tracking_loss.reseed)?;
         validate_pose_gate(&self.tracking_loss.pose_gate)?;
+        validate_lost_keyframes(
+            self.mapping.local_ba.lost_keyframes,
+            self.tracking_loss.keyframes_while_lost,
+        )?;
         validate_tuning(&self.tuning, self.loop_closing.is_enabled())
     }
 }
@@ -117,6 +128,23 @@ fn validate_recovery(recovery: &RecoveryConfig) -> Result<(), ConfigError> {
         AT_LEAST_ONE,
     )?;
     check(at("max_tilt_deg"), recovery.max_tilt_deg, POSITIVE)
+}
+
+/// `FixedInertial` acts only on keyframes inserted as full states while lost: anchors are
+/// already held fixed, and `Disabled` inserts none.
+fn validate_lost_keyframes(
+    lost_keyframes: LostKeyframes,
+    keyframes_while_lost: KeyframesWhileLost,
+) -> Result<(), ConfigError> {
+    match (lost_keyframes, keyframes_while_lost) {
+        (
+            LostKeyframes::FixedInertial,
+            KeyframesWhileLost::Anchor | KeyframesWhileLost::Disabled,
+        ) => Err(ConfigError::LostKeyframesWithoutEffect(
+            keyframes_while_lost,
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn validate_pose_gate(gate: &PoseGate) -> Result<(), ConfigError> {

@@ -151,6 +151,7 @@ pub struct SlamSystem {
     two_view_init_config: TwoViewInitConfig,
     keyframe_policy: KeyframePolicy,
     tracking_loss_recovery: TrackingLossRecoveryPolicy,
+    keyframes_while_lost: KeyframesWhileLost,
     recovery: RecoveryConfig,
     runaway: RunawayDetector,
     tilt: TiltMonitor,
@@ -232,6 +233,7 @@ impl SlamSystem {
             two_view_init_config: settings.two_view_init,
             keyframe_policy: settings.keyframe_policy,
             tracking_loss_recovery: settings.tracking_loss_recovery,
+            keyframes_while_lost: settings.keyframes_while_lost,
             recovery: settings.recovery,
             runaway: RunawayDetector::new(
                 settings.recovery.runaway_window_sec,
@@ -1617,7 +1619,7 @@ impl SlamSystem {
                 }
                 return Ok(self.bootstrap_step(frame, timestamp_sec));
             }
-            let role = match policy.keyframes_while_lost {
+            let role = match self.keyframes_while_lost {
                 KeyframesWhileLost::Enabled => Some(KeyframeRole::Lost),
                 KeyframesWhileLost::Anchor => Some(KeyframeRole::Anchor),
                 KeyframesWhileLost::Disabled => None,

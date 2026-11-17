@@ -263,6 +263,35 @@ fn pose_gate_limits_must_be_positive_and_finite() {
 }
 
 #[test]
+fn fixed_inertial_lost_keyframes_need_keyframes_inserted_as_full_states() {
+    use crate::mapping::bundle_adjustment::LostKeyframes;
+    use crate::tracking::KeyframesWhileLost;
+    let with = |lost_keyframes, keyframes_while_lost| {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).mapping.local_ba.lost_keyframes = lost_keyframes;
+        orb_mut(&mut config).tracking_loss.keyframes_while_lost = keyframes_while_lost;
+        config.validate()
+    };
+    for keyframes_while_lost in [
+        KeyframesWhileLost::Enabled,
+        KeyframesWhileLost::Anchor,
+        KeyframesWhileLost::Disabled,
+    ] {
+        assert_eq!(with(LostKeyframes::Free, keyframes_while_lost), Ok(()));
+    }
+    assert_eq!(
+        with(LostKeyframes::FixedInertial, KeyframesWhileLost::Enabled),
+        Ok(())
+    );
+    for inert in [KeyframesWhileLost::Anchor, KeyframesWhileLost::Disabled] {
+        assert_eq!(
+            with(LostKeyframes::FixedInertial, inert),
+            Err(ConfigError::LostKeyframesWithoutEffect(inert))
+        );
+    }
+}
+
+#[test]
 fn the_reseed_tilt_limit_must_be_positive() {
     let mut config = SystemConfig::default();
     orb_mut(&mut config).tracking_loss.reseed.max_tilt_deg = 0.0;

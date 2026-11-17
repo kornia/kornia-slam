@@ -15,7 +15,7 @@ use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::pose_gate::PoseGate;
-use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
+use crate::tracking::{KeyframePolicy, KeyframesWhileLost, TrackingLossRecoveryPolicy};
 
 /// A [`SlamSystem`](crate::SlamSystem) that cannot be built from its
 /// configuration and rig.
@@ -36,6 +36,7 @@ pub(crate) struct SystemSettings {
     pub map_projection: MapProjectionConfig,
     pub keyframe_policy: KeyframePolicy,
     pub tracking_loss_recovery: TrackingLossRecoveryPolicy,
+    pub keyframes_while_lost: KeyframesWhileLost,
     pub recovery: RecoveryConfig,
     pub pose_gate: PoseGate,
     pub local_mapping: LocalMappingMode,
@@ -127,10 +128,8 @@ impl SystemConfig {
                     .with_visual_information(orb.mapping.local_ba.visual_information)
             },
             keyframe_policy: orb.keyframes,
-            tracking_loss_recovery: TrackingLossRecoveryPolicy {
-                keyframes_while_lost: orb.tracking_loss.keyframes_while_lost,
-                ..tuning.loss_recovery
-            },
+            tracking_loss_recovery: tuning.loss_recovery,
+            keyframes_while_lost: orb.tracking_loss.keyframes_while_lost,
             recovery: orb.tracking_loss.reseed,
             pose_gate: orb.tracking_loss.pose_gate,
             local_mapping: orb.mapping.execution,
