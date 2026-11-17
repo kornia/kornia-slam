@@ -21,9 +21,9 @@ use faer::{Mat, Side};
 use kornia_algebra::{Mat15F64, SMatF64, SVecF64, Vec3F64};
 
 use super::OfflineBaError;
-use super::calibration::{Layout, PriorRow};
 use super::imu_edges::{ImuEdge, ImuLinearization};
 use super::problem::{GaugeAnchor, ObservationRows, Problem, State};
+use crate::mapping::calibration_states::{Layout, PriorRow};
 
 /// DoF of a keyframe state `[ρ ω v b_g b_a]`, and of its pose part.
 const STATE_DOF: usize = 15;

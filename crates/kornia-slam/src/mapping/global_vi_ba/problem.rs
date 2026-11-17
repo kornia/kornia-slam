@@ -17,9 +17,9 @@ use kornia_algebra::{Mat3F64, SE3F64, SMatF64, SO3F64, SVecF64, Vec3F64};
 use kornia_sensors::imu::{ImuBias, ImuCalib};
 
 use super::OfflineBaError;
-use super::calibration::{Calibration, Layout};
 use crate::mapping::SegmentId;
 use crate::mapping::bundle_adjustment::STEREO_DEPTH_MIN_SIGMA;
+use crate::mapping::calibration_states::{Calibration, Layout};
 use crate::mapping::session::{ImuSample, SESSION_DUMP_VERSION, SessionDump};
 use crate::mapping::vi_ba_schur::{ViBaParams, visual_huber};
 use crate::mapping::visual_information::VisualInformation;

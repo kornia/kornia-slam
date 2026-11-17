@@ -11,18 +11,14 @@ use kornia_factors::inertial::preintegration::{
 use kornia_sensors::imu::{GyroIntrinsics, ImuBias, ImuMeasurement, PreintegratedImu};
 
 use super::OfflineImuKernel;
-use super::calibration::Layout;
 use super::problem::{Problem, State};
+use crate::mapping::calibration_states::{Layout, corrected_samples, imu_calibration_columns};
 
 /// VINS-Fusion builds no IMU factor over more than 10 s (`estimator.cpp:1057-1058`).
 const MAX_EDGE_GAP_SEC: f64 = 10.0;
 /// ORB-SLAM3 `FullInertialBA`: Huber δ = √16.92 on every inertial edge
 /// (`Optimizer.cc:540-542`).
 const IMU_HUBER_CHI2: f64 = 16.92;
-/// Central-difference steps of the gyro-intrinsics and clock columns: the
-/// clock step is a quarter of the 1 kHz sample spacing.
-const GYRO_STEP: f64 = 1e-6;
-const CLOCK_STEP_SEC: f64 = 0.25e-3;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ImuEdge {
@@ -116,14 +112,15 @@ impl<'p, 'a> ImuModel<'p, 'a> {
         let (t0, t1) = (edge.t0 - td, edge.t1 - td);
         let lo = samples.partition_point(|s| s.t < t0);
         let hi = samples.partition_point(|s| s.t <= t1).max(lo);
-        let measurements: Vec<ImuMeasurement> = samples[lo..hi]
+        let raw: Vec<ImuMeasurement> = samples[lo..hi]
             .iter()
             .map(|s| ImuMeasurement {
                 timestamp: s.t,
-                gyro: gyro.apply(Vec3F64::from_array(s.gyro)),
+                gyro: Vec3F64::from_array(s.gyro),
                 accel: Vec3F64::from_array(s.accel),
             })
             .collect();
+        let measurements = corrected_samples(&raw, gyro);
         PreintegratedImu::from_measurements(bias, self.problem.noise, &measurements, t0, t1)
     }
 
@@ -209,14 +206,7 @@ impl<'p, 'a> ImuModel<'p, 'a> {
         state: &State,
         layout: &Layout,
     ) -> Vec<(usize, Vec15F64)> {
-        let mut columns: Vec<(usize, f64)> = Vec::new();
-        if let Some(at) = layout.gyro() {
-            columns.extend((at..at + 6).map(|c| (c, GYRO_STEP)));
-        }
-        if let Some(at) = layout.clock() {
-            columns.push((at, CLOCK_STEP_SEC));
-        }
-        columns
+        imu_calibration_columns(layout)
             .into_iter()
             .map(|(column, h)| {
                 let at = |step: f64| {

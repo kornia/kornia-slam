@@ -4,7 +4,6 @@
 //! `FullInertialBA` (`Optimizer.cc:392-811`); landmarks are eliminated by the
 //! Schur complement and the reduced system is a faer sparse Cholesky in f64.
 
-mod calibration;
 mod imu_edges;
 mod problem;
 mod reduced;
@@ -18,8 +17,8 @@ use kornia_sensors::imu::{GyroIntrinsics, PreintegratedImu};
 
 use super::session::SessionDump;
 use super::visual_information::VisualInformation;
+use crate::mapping::calibration_states::{Layout, prior_rows};
 use crate::system::{ConfigError, StereoDepthSigma};
-use calibration::{Layout, prior_rows};
 use imu_edges::{ImuEdge, ImuModel, build_edges};
 use problem::{GaugeAnchor, Problem, State};
 use reduced::{Linearization, Pattern};
