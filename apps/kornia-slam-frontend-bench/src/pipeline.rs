@@ -575,7 +575,8 @@ impl Pipeline {
             .iter()
             .map(|&(_, kp)| Vec2F32::new(undistorted[kp][0], undistorted[kp][1]))
             .collect();
-        solve_pnp(&world, &image, &self.camera, pose_init, &self.pnp)
+        // No octaves: every point weighs as octave 0, main's behaviour before the octave argument.
+        solve_pnp(&world, &image, &[], &self.camera, pose_init, &self.pnp)
     }
 
     /// The library's projection search: each local point, in order, takes
