@@ -18,7 +18,12 @@ use crate::Frame;
 use crate::frame::RigFeatures;
 use crate::mapping::Map;
 use crate::rig::RigGeometry;
-use crate::tracking::flow_tracker::{FlowStepCounts, FlowStepInput, RigFlow, rotated_ray_pixel};
+use crate::pose_conversion::{mat3_to_f32, mat3_to_f64, vec3_to_f32, vec3_to_f64};
+use crate::tracking::flow_tracker::{
+    FlowOutput, FlowStepCounts, FlowStepInput, RigFlow, rotated_ray_pixel,
+};
+use crate::tracking::pose_estimation::rig_pnp::{RigObservation, solve_rig_pnp};
+use crate::upstream::kornia_3d::refine_analytic::refine_pose_analytic;
 use crate::tracking::local_map::{LocalMapRules, LocalMapSelectionConfig};
 use crate::tracking::optical_flow::{
     FlowPrediction, FlowSurvivor, KltPyramidCache, KltTracker, LkKernel, MapKeypointMatch, Track,
@@ -526,6 +531,162 @@ impl Tracker {
         }
     }
 
+    /// [`Self::flow_frame`] from a `WindowedU8` step's `output` and each
+    /// track's stored position, without the map: the seeds' world points
+    /// come back with the frame, whose keypoints are already undistorted
+    /// and carry no descriptors (an ORB or keyframe path never sees it).
+    pub(crate) fn flow_frame_windowed(
+        &self,
+        idx: usize,
+        output: &FlowOutput,
+        image_size: ImageSize,
+        min_tracks: usize,
+    ) -> Option<(Frame, Vec<(usize, usize)>, Vec<kornia_algebra::Vec3F64>)> {
+        let tracks: HashMap<TrackId, (usize, kornia_algebra::Vec3F64)> = self
+            .track_set
+            .tracks()
+            .iter()
+            .filter_map(|track| Some((track.id(), (track.map_point_idx()?, track.position()?))))
+            .collect();
+        let n = output.survivors.len();
+        let mut features = OrbFeatures {
+            keypoints_xy: Vec::with_capacity(n),
+            orientations: Vec::with_capacity(n),
+            descriptors: Vec::with_capacity(n),
+            octaves: Vec::with_capacity(n),
+        };
+        let mut keypoints_undist = Vec::with_capacity(n);
+        let mut points = Vec::with_capacity(n);
+        let mut seeded = Vec::with_capacity(n);
+        let cameras = self.rig.as_ref().map_or(1, |rig| rig.views().len());
+        let mut camera_ranges: Vec<std::ops::Range<usize>> = (0..cameras).map(|_| 0..0).collect();
+        // The output is in camera order already.
+        for ((survivor, &camera), undistorted) in output
+            .survivors
+            .iter()
+            .zip(&output.cameras)
+            .zip(&output.undistorted)
+        {
+            let (Some(&(mp_idx, position)), Some(range)) =
+                (tracks.get(&survivor.track_id), camera_ranges.get_mut(camera))
+            else {
+                continue;
+            };
+            let kp_idx = features.keypoints_xy.len();
+            if range.is_empty() {
+                *range = kp_idx..kp_idx;
+            }
+            range.end = kp_idx + 1;
+            seeded.push((mp_idx, kp_idx));
+            points.push(position);
+            features.keypoints_xy.push(survivor.pixel);
+            features.orientations.push(0.0);
+            features.descriptors.push([0; 32]);
+            features.octaves.push(0);
+            keypoints_undist.push(*undistorted);
+        }
+        if seeded.len() < min_tracks {
+            return None;
+        }
+        // Empty cameras sit where their neighbours end, so the ranges tile.
+        let mut end = 0;
+        for range in &mut camera_ranges {
+            if range.is_empty() {
+                *range = end..end;
+            }
+            end = range.end;
+        }
+        let n = seeded.len();
+        let frame = Frame {
+            idx,
+            features,
+            pose_world_to_cam: Pose3d::IDENTITY,
+            image_size,
+            keypoint_colors: vec![[0; 3]; n],
+            u_right: Vec::new(),
+            depth: Vec::new(),
+            keypoints_undist,
+            rig: self.flow_rig_features(camera_ranges),
+        };
+        Some((frame, seeded, points))
+    }
+
+    /// The pose of a flow frame by Gauss-Newton from the prediction over its
+    /// seeds, no RANSAC (`FlowPose::AnalyticGn`): `solve_rig_pnp` over every
+    /// camera on a rig, `refine_pose_analytic` on one camera. `points[k]` is
+    /// seed `k`'s world point. Returns the estimate with its inliers from
+    /// cameras 1 and up, or `None` below `min_inliers`, where RANSAC PnP
+    /// takes over.
+    pub(crate) fn estimate_flow_analytic(
+        &mut self,
+        input: FrameInput<'_>,
+        seeded: Vec<(usize, usize)>,
+        points: &[kornia_algebra::Vec3F64],
+        camera: &PinholeCamera,
+        max_iter: usize,
+    ) -> Option<Result<(Estimate, usize), MapProjectionRejectReason>> {
+        let frame = input.frame;
+        let mut config = self.estimator.config().pnp.clone();
+        config.lm_max_iterations = max_iter;
+        config.outlier_rounds = 1;
+        let mut observations = Vec::with_capacity(seeded.len());
+        let mut matches = Vec::with_capacity(seeded.len());
+        for (&(mp_idx, kp_idx), &point_world) in seeded.iter().zip(points) {
+            let Some(&pixel) = frame
+                .keypoints_undist
+                .get(kp_idx)
+                .filter(|p| p[0].is_finite() && p[1].is_finite())
+            else {
+                continue;
+            };
+            let view = frame.secondary_view(kp_idx);
+            observations.push(RigObservation {
+                point_world,
+                pixel: [pixel[0] as f64, pixel[1] as f64],
+                camera: view.map_or(camera, |view| &view.camera),
+                camera_from_primary: view.map(|view| &view.camera_from_primary),
+                // Level-0 tracks: octave 0's unit information.
+                sigma_px: 1.0,
+            });
+            matches.push((mp_idx, kp_idx));
+        }
+        let start = input.candidate_pose;
+        let pose = if frame.is_rig() {
+            solve_rig_pnp(&observations, &start, &config)?.0
+        } else {
+            refine_mono(&observations, &start, &config, max_iter)?
+        };
+        let final_sq = config.final_reproj_threshold_px.powi(2);
+        let inlier = |o: &RigObservation<'_>| {
+            let p_primary = pose.transform_point(&o.point_world);
+            let p_camera = o
+                .camera_from_primary
+                .map_or(p_primary, |t| t.transform_point(&p_primary));
+            o.camera
+                .reprojection_error_sq_cam(&p_camera, o.pixel[0], o.pixel[1])
+                .is_some_and(|e| e <= final_sq)
+        };
+        let inliers = observations.iter().filter(|o| inlier(o)).count();
+        if inliers < config.min_inliers {
+            return None;
+        }
+        let secondary = observations
+            .iter()
+            .filter(|o| o.camera_from_primary.is_some() && inlier(o))
+            .count();
+        let estimate = Estimate {
+            pose,
+            matches,
+            inliers,
+            most_voted_keyframe: None,
+        };
+        self.last_gap = None;
+        Some(
+            self.accept(&input, estimate)
+                .map(|estimate| (estimate, secondary)),
+        )
+    }
+
     /// The pose of a [`Self::flow_frame`] from its seeds alone: consistency
     /// filter and PnP, no projection search or refinement. The track set is
     /// left untouched; [`Self::accept_flow_only`] commits it.
@@ -767,6 +928,50 @@ impl Tracker {
             }
         }
     }
+}
+
+/// One camera's pose by `refine_pose_analytic` from `start`, over the
+/// observations within the prior gate.
+fn refine_mono(
+    observations: &[RigObservation<'_>],
+    start: &Pose3d,
+    config: &crate::tracking::pose_estimation::pnp::PnpConfig,
+    max_iter: usize,
+) -> Option<Pose3d> {
+    let camera = observations.first()?.camera;
+    let prior_sq = config.prior_reproj_threshold_px.powi(2);
+    let mut points_world = Vec::with_capacity(observations.len());
+    let mut points_image = Vec::with_capacity(observations.len());
+    for o in observations {
+        if camera
+            .reprojection_error_sq_world(start, &o.point_world, o.pixel[0], o.pixel[1])
+            .is_some_and(|e| e <= prior_sq)
+        {
+            points_world.push(vec3_to_f32(o.point_world));
+            points_image.push(kornia_algebra::Vec2F32::new(o.pixel[0] as f32, o.pixel[1] as f32));
+        }
+    }
+    if points_world.len() < config.min_correspondences {
+        return None;
+    }
+    let params = kornia_3d::pnp::LMRefineParams {
+        max_iterations: max_iter.max(1),
+        robust: config.robust,
+        robust_scale_sq: config.robust_scale_sq,
+        ..kornia_3d::pnp::LMRefineParams::default()
+    };
+    let refined = refine_pose_analytic(
+        &points_world,
+        &points_image,
+        &mat3_to_f32(camera.intrinsic_matrix()),
+        &mat3_to_f32(start.rotation),
+        &vec3_to_f32(start.translation),
+        &params,
+    )?;
+    Some(Pose3d::new(
+        mat3_to_f64(refined.rotation),
+        vec3_to_f64(refined.translation),
+    ))
 }
 
 /// Where each of `tracks` should appear at `pose` (world to `camera`): its

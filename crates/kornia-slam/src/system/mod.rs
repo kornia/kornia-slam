@@ -1639,6 +1639,7 @@ impl SlamSystem {
             ),
             FrameSource::Ready(_) => FlowOnly::Unavailable,
         };
+        let flow_tracked = matches!(flow_only, FlowOnly::Tracked(..));
         let (frame, result) = match flow_only {
             FlowOnly::Tracked(frame, estimate) => (*frame, Ok(estimate)),
             outcome => {
@@ -1747,7 +1748,11 @@ impl SlamSystem {
             }
         }
 
-        if status == TrackingStatus::Tracked {
+        // ORB-SLAM3 counts no visibility on a frame without a projection
+        // search (`Tracking.cc:3357,3379`).
+        let count_visibility =
+            !(flow_tracked && self.flow.bookkeeping == FlowBookkeeping::KeyframesOnly);
+        if status == TrackingStatus::Tracked && count_visibility {
             // Visibility bookkeeping over the local map only (mirrors
             // ORB-SLAM3, which counts mnVisible on local-map points): full-map
             // scans here would grow with trajectory length.
@@ -1776,7 +1781,10 @@ impl SlamSystem {
                 );
                 map_guard.update_observation_counts(&visible, &matches);
             }
-
+        }
+        // A flow frame built without the map has no descriptors; its
+        // keyframe decision ran in `track_flow_only`.
+        if status == TrackingStatus::Tracked && !(flow_tracked && self.flow_frames_lock_free()) {
             let insert_start = Instant::now();
             let inserted =
                 self.try_insert_keyframe(&frame, timestamp_sec, tracked_inliers, &matches);
@@ -1882,15 +1890,25 @@ impl SlamSystem {
         trusted_prediction: bool,
     ) -> Option<Vec<FlowSurvivor>> {
         if let Some(rig_flow) = self.rig_flow.as_mut() {
+            let frame_idx = self.next_frame_idx - 1;
             let input = FlowStepInput {
-                frame_idx: self.next_frame_idx as u64 - 1,
+                frame_idx: frame_idx as u64,
                 pose_world_to_primary: (trusted_prediction && self.klt_prediction.is_some())
                     .then_some(*candidate_pose),
                 primary_rotation: self.gyro_rotation,
             };
-            return self
-                .tracker
-                .flow_windowed(rig_flow, &input, &mut self.tracking_timings);
+            let survivors =
+                self.tracker
+                    .flow_windowed(rig_flow, &input, &mut self.tracking_timings);
+            if self.debug {
+                let threads = rig_flow.threads();
+                let shard_tracks = rig_flow.output().shard_tracks;
+                for (shard, tracks) in shard_tracks.iter().take(threads).enumerate() {
+                    self.debug_messages
+                        .push(format!("[flow] frame={frame_idx} shard={shard} tracks={tracks}"));
+                }
+            }
+            return survivors;
         }
         let map = self.map.lock().unwrap();
         let guess = self
@@ -1975,7 +1993,9 @@ impl SlamSystem {
     }
 
     /// Tracks a deferred frame from its flow survivors alone when they carry
-    /// it and no keyframe is due; ORB then never runs for this frame.
+    /// it and no keyframe is due; ORB then never runs for this frame. With
+    /// `WindowedU8` and `FlowPose::AnalyticGn` the frame and its pose come
+    /// from the tracks' stored positions, without the map lock.
     fn track_flow_only(
         &mut self,
         idx: usize,
@@ -1987,38 +2007,109 @@ impl SlamSystem {
         let (Some(min_tracks), Some(survivors)) = (self.klt_min_tracks, survivors) else {
             return FlowOnly::Unavailable;
         };
-        let map = self.map.lock().unwrap();
-        let Some((mut frame, seeded)) =
-            self.tracker
-                .flow_frame(idx, survivors, &map, current_image.size(), min_tracks)
-        else {
-            return FlowOnly::Unavailable;
+        let analytic = match self.flow.pose {
+            FlowPose::AnalyticGn { max_iter } => Some(max_iter),
+            FlowPose::RansacPnp => None,
         };
-        frame.ensure_undistorted(&self.rig.camera);
+        let mut map_guard = None;
+        let mut points = Vec::new();
+        let (frame, seeded) = match self.rig_flow.as_ref().filter(|_| analytic.is_some()) {
+            Some(rig_flow) => {
+                let Some((frame, seeded, positions)) = self.tracker.flow_frame_windowed(
+                    idx,
+                    rig_flow.output(),
+                    current_image.size(),
+                    min_tracks,
+                ) else {
+                    return FlowOnly::Unavailable;
+                };
+                points = positions;
+                (frame, seeded)
+            }
+            None => {
+                let waited = Instant::now();
+                let map = self.map.lock().unwrap();
+                self.tracking_timings.flow_map_wait += waited.elapsed();
+                let Some((mut frame, seeded)) =
+                    self.tracker
+                        .flow_frame(idx, survivors, &map, current_image.size(), min_tracks)
+                else {
+                    return FlowOnly::Unavailable;
+                };
+                frame.ensure_undistorted(&self.rig.camera);
+                if analytic.is_some() {
+                    points = seeded
+                        .iter()
+                        .map(|&(mp_idx, _)| map.map_points()[mp_idx].position)
+                        .collect();
+                }
+                map_guard = Some(map);
+                (frame, seeded)
+            }
+        };
         let n_seeded = seeded.len();
-        let result = self.tracker.estimate_flow_only(
-            FrameInput {
-                frame: &frame,
-                candidate_pose: estimation.candidate_pose,
-                pose_before: estimation.pose_before,
-                current_keyframe_idx: self.state.current_keyframe_idx,
-                lost_for_sec: estimation.lost_for_sec,
-                trusted_prediction: estimation.trusted_prediction,
-                gate: estimation.gate,
+        let current_keyframe_idx = self.state.current_keyframe_idx;
+
+        let started = Instant::now();
+        let solved = analytic.and_then(|max_iter| {
+            self.tracker.estimate_flow_analytic(
+                flow_input(&frame, estimation, current_keyframe_idx),
+                seeded.clone(),
+                &points,
+                &self.rig.camera,
+                max_iter,
+            )
+        });
+        self.tracking_timings.flow_pose += started.elapsed();
+        let fell_back = analytic.is_some() && solved.is_none();
+        self.counters.flow_pose_fallbacks += u64::from(fell_back);
+        let (result, secondary_inliers) = match solved {
+            Some(result) => match result {
+                Ok((estimate, secondary)) => (Ok(estimate), secondary),
+                Err(reason) => (Err(reason), 0),
             },
-            seeded,
-            &map,
-            &self.rig.camera,
-            &mut self.tracking_timings,
-        );
-        drop(map);
+            None => {
+                let map = match map_guard.take() {
+                    Some(map) => map,
+                    None => {
+                        let waited = Instant::now();
+                        let map = self.map.lock().unwrap();
+                        self.tracking_timings.flow_map_wait += waited.elapsed();
+                        map
+                    }
+                };
+                let result = self.tracker.estimate_flow_only(
+                    flow_input(&frame, estimation, current_keyframe_idx),
+                    seeded,
+                    &map,
+                    &self.rig.camera,
+                    &mut self.tracking_timings,
+                );
+                let threshold_px = self
+                    .tracker
+                    .map_projection_config()
+                    .pnp
+                    .final_reproj_threshold_px;
+                let secondary = match &result {
+                    Ok(estimate) if frame.is_rig() => {
+                        secondary_inliers(&frame, &estimate.matches, &map, &estimate.pose, threshold_px)
+                    }
+                    _ => 0,
+                };
+                (result, secondary)
+            }
+        };
+        drop(map_guard);
         let Ok(estimate) = result else {
             self.dbg(format!("[klt-first] frame={idx} refused seeded={n_seeded}"));
             return FlowOnly::Refused;
         };
+
+        let started = Instant::now();
         let evidence =
             self.keyframe_evidence(&frame, estimate.inliers, &estimate.matches, timestamp_sec);
         if self.keyframe_due(&evidence, timestamp_sec) {
+            self.tracking_timings.flow_bookkeeping += started.elapsed();
             self.dbg(format!(
                 "[klt-first] frame={idx} keyframe due seeded={n_seeded} inliers={}",
                 estimate.inliers
@@ -2027,7 +2118,25 @@ impl SlamSystem {
         }
         self.tracker.accept_flow_only(&estimate, &frame, survivors);
         self.frontend.observe_flow(&frame.features.keypoints_xy);
+        self.tracking_timings.flow_bookkeeping += started.elapsed();
+        self.counters.flow_frames += 1;
+        self.counters.flow_seeds += n_seeded as u64;
+        self.counters.flow_inliers += estimate.inliers as u64;
+        self.counters.flow_secondary_inliers += secondary_inliers as u64;
+        if self.flow.rig == KltRig::AllCameras || self.rig_flow.is_some() {
+            self.dbg(format!(
+                "[klt-first] frame={idx} tracked seeded={n_seeded} inliers={} secondary={secondary_inliers} fallback={}",
+                estimate.inliers,
+                u8::from(fell_back),
+            ));
+        }
         FlowOnly::Tracked(Box::new(frame), estimate)
+    }
+
+    /// Whether a frame tracked from flow alone was built without the map,
+    /// so it carries no descriptors and cannot become a keyframe.
+    fn flow_frames_lock_free(&self) -> bool {
+        self.rig_flow.is_some() && matches!(self.flow.pose, FlowPose::AnalyticGn { .. })
     }
 
     /// The motion model's pose at `timestamp_sec` from `pose_before` at
@@ -2807,6 +2916,55 @@ impl SlamSystem {
         }
         self.loop_closure_events.extend(outcome.events);
     }
+}
+
+/// The tracker's view of a flow frame `frame`.
+fn flow_input<'a>(
+    frame: &'a Frame,
+    estimation: &Estimation,
+    current_keyframe_idx: Option<usize>,
+) -> FrameInput<'a> {
+    FrameInput {
+        frame,
+        candidate_pose: estimation.candidate_pose,
+        pose_before: estimation.pose_before,
+        current_keyframe_idx,
+        lost_for_sec: estimation.lost_for_sec,
+        trusted_prediction: estimation.trusted_prediction,
+        gate: estimation.gate,
+    }
+}
+
+/// How many of `matches` are rig cameras 1 and up within `threshold_px` of
+/// their map point at `pose`.
+fn secondary_inliers(
+    frame: &Frame,
+    matches: &[(usize, usize)],
+    map: &Map,
+    pose: &Pose3d,
+    threshold_px: f64,
+) -> usize {
+    let threshold_sq = threshold_px * threshold_px;
+    matches
+        .iter()
+        .filter(|&&(mp_idx, kp_idx)| {
+            let (Some(view), Some(mp), Some(pixel)) = (
+                frame.secondary_view(kp_idx),
+                map.map_points().get(mp_idx),
+                frame.keypoints_undist.get(kp_idx),
+            ) else {
+                return false;
+            };
+            view.camera
+                .reprojection_error_sq_world(
+                    &view.pose(pose),
+                    &mp.position,
+                    pixel[0] as f64,
+                    pixel[1] as f64,
+                )
+                .is_some_and(|error_sq| error_sq <= threshold_sq)
+        })
+        .count()
 }
 
 /// The `WindowedU8` flow knobs of `settings`; without a prediction search LK

@@ -15,7 +15,7 @@ use crate::tracking::flow_pool::{FlowFrames, FlowPool, FlowPoolError};
 use crate::tracking::optical_flow::{
     FlowSurvivor, KltTracker, SurvivorFilterConfig, Track, TrackId, TrackSet,
 };
-use crate::tracking::timings::{ShardTimings, TrackingTimings};
+use crate::tracking::timings::{MAX_FLOW_SHARDS, ShardTimings, TrackingTimings};
 use crate::tracking::tracker::project_raw;
 use crate::upstream::kornia_imgproc::corner_subpix::corner_sub_pix;
 use crate::upstream::kornia_imgproc::good_features::{
@@ -619,6 +619,8 @@ pub struct FlowOutput {
     /// `(camera, pixel)` of each refill corner, current frame, in order.
     pub spawned: Vec<(usize, [f32; 2])>,
     pub counts: FlowStepCounts,
+    /// Tracks each shard ran in the first pass (shard imbalance).
+    pub shard_tracks: [usize; MAX_FLOW_SHARDS],
 }
 
 impl FlowOutput {
@@ -628,6 +630,7 @@ impl FlowOutput {
         self.undistorted.clear();
         self.spawned.clear();
         self.counts = FlowStepCounts::default();
+        self.shard_tracks = [0; MAX_FLOW_SHARDS];
     }
 }
 
@@ -895,8 +898,9 @@ impl RigFlow {
     fn run_pass(&mut self, timings: &mut TrackingTimings) -> Result<(), FlowPoolError> {
         let frames = self.frames.as_ref().ok_or(FlowPoolError::FrameShared)?;
         if !self.guess.retry {
-            for shard in &self.shards {
+            for (shard, slot) in self.shards.iter().zip(&mut self.output.shard_tracks) {
                 self.output.counts.tracks_tried += shard.tracks.len() as u64;
+                *slot = shard.tracks.len();
             }
         }
         self.pool.step(&mut self.shards, frames, &self.guess)?;
