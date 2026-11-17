@@ -12,6 +12,8 @@
 
 use std::path::{Path, PathBuf};
 
+use kornia_sensors::SensorRig;
+use kornia_sensors::rig_calibration::{RigCalibration, RigCalibrationError};
 use kornia_slam::SystemConfig;
 use kornia_slam::mapping::global_vi_ba::OfflineBaConfig;
 use kornia_slam::system::ConfigError;
@@ -54,6 +56,32 @@ pub enum RunConfigError {
     System { path: PathBuf, source: ConfigError },
     #[error("{}: source: {message}", path.display())]
     Source { path: PathBuf, message: String },
+}
+
+/// A rig calibration file that cannot replace the source's calibration.
+#[derive(Debug, thiserror::Error)]
+pub enum RigCalibrationFileError {
+    #[error("{}: {source}", path.display())]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("{}: {source}", path.display())]
+    Parse {
+        path: PathBuf,
+        source: Box<ron::error::SpannedError>,
+    },
+    #[error("{}: {in_file} cameras, the source's rig has {in_source}", path.display())]
+    CameraCount {
+        path: PathBuf,
+        in_file: usize,
+        in_source: usize,
+    },
+    #[error("{}: {source}", path.display())]
+    Invalid {
+        path: PathBuf,
+        source: RigCalibrationError,
+    },
 }
 
 /// Reads only the system version, so a system written for another schema
@@ -115,6 +143,48 @@ impl RunConfig {
     fn resolve_paths(&mut self, base_dir: &Path) {
         self.source.resolve_paths(base_dir);
         self.system.resolve_paths(base_dir);
+        if let Some(path) = &mut self.rig_calibration
+            && path.is_relative()
+        {
+            *path = base_dir.join(&*path);
+        }
+    }
+
+    /// `rig` with the run's rig calibration file applied; `rig` unchanged
+    /// without one. The file must describe as many cameras as `rig` has.
+    pub fn apply_rig_calibration(
+        &self,
+        rig: SensorRig,
+    ) -> Result<SensorRig, RigCalibrationFileError> {
+        let Some(path) = &self.rig_calibration else {
+            return Ok(rig);
+        };
+        let text =
+            std::fs::read_to_string(path).map_err(|source| RigCalibrationFileError::Read {
+                path: path.clone(),
+                source,
+            })?;
+        let calibration: RigCalibration = ron::Options::default()
+            .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME)
+            .from_str(&text)
+            .map_err(|error| RigCalibrationFileError::Parse {
+                path: path.clone(),
+                source: Box::new(error),
+            })?;
+        let in_source = rig.cameras.len().max(1);
+        if calibration.cameras.len() != in_source {
+            return Err(RigCalibrationFileError::CameraCount {
+                path: path.clone(),
+                in_file: calibration.cameras.len(),
+                in_source,
+            });
+        }
+        calibration
+            .apply_to(rig)
+            .map_err(|source| RigCalibrationFileError::Invalid {
+                path: path.clone(),
+                source,
+            })
     }
 }
 

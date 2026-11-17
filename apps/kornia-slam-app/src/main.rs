@@ -23,6 +23,7 @@ mod utils;
 use config::RunConfig;
 use evaluation::associate_gt;
 use kornia_algebra::{SO3F64, Vec3F64};
+use kornia_sensors::rig_calibration::RigCalibration;
 use kornia_slam::loop_closure::{LoopOdometryGate, LoopTemporalConsistency};
 use kornia_slam::system::PipelineDefinition;
 use kornia_slam::{LoopClosureEvent, SkipKind, SlamSystem};
@@ -236,12 +237,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.evaluate && ground_truth.is_none() {
         return Err("--evaluate needs ground truth, and this source has none".into());
     }
-    if args.write_rig_calibration.is_some() {
-        todo!("lane B: --write-rig-calibration");
+    if let Some(path) = &args.write_rig_calibration {
+        let calibration = RigCalibration::from_sensor_rig(&source.rig());
+        let text = ron::ser::to_string_pretty(&calibration, ron::ser::PrettyConfig::default())?;
+        std::fs::write(path, text)?;
+        return Ok(());
     }
-    if run.rig_calibration.is_some() {
-        todo!("lane B: rig_calibration");
-    }
+    let rig = run.apply_rig_calibration(source.rig())?;
     if !tui_active && let Some(summary) = summary {
         eprintln!("{summary}");
     }
@@ -254,7 +256,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .loop_closing
         .vocabulary()
         .map(std::path::Path::to_path_buf);
-    let mut system = SlamSystem::build(run.system, source.rig()).map_err(|e| e.to_string())?;
+    let mut system = SlamSystem::build(run.system, rig).map_err(|e| e.to_string())?;
     system.set_debug(args.debug);
     let mut session_recorder = args.session_out.as_ref().map(|_| {
         system.set_session_recording(true);
