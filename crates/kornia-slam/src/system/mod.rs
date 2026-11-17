@@ -228,6 +228,10 @@ pub struct SlamSystem {
     // The primary camera's `R_cur_prev` from this frame's preintegrated gyro
     // (`GyroGuess::RotatedRay`).
     gyro_rotation: Option<Mat3F64>,
+    // A local-mapping result was applied since the last adoption, and the
+    // keyframe whose landmarks were last adopted (`adopt_landmarks`).
+    mapping_result_applied: bool,
+    adopted_keyframe: Option<usize>,
 }
 
 impl SlamSystem {
@@ -343,6 +347,8 @@ impl SlamSystem {
             rig_flow,
             flow,
             gyro_rotation: None,
+            mapping_result_applied: false,
+            adopted_keyframe: None,
         }
     }
 
@@ -886,6 +892,7 @@ impl SlamSystem {
             .map(|gate| gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
         self.apply_local_mapping_results();
         self.apply_loop_closing_results();
+        self.adopt_landmarks();
 
         match self.state.mode {
             SystemMode::Bootstrap => {
@@ -955,7 +962,12 @@ impl SlamSystem {
             return;
         };
 
-        for result in self.local_mapping.drain_results() {
+        let results = self.local_mapping.drain_results();
+        if !results.is_empty() {
+            self.mapping_result_applied = true;
+            self.refresh_track_positions();
+        }
+        for result in results {
             if let Some(marginal) = result.newest_marginal {
                 self.estimator.newest_marginal = Some(marginal);
             }
@@ -990,6 +1002,93 @@ impl SlamSystem {
             self.state.velocity_world = correction.velocity_world;
             self.inertial.bias = correction.imu_bias;
         }
+    }
+
+    /// Rewrites the tracks' stored map-point positions after a map change,
+    /// under one map lock; only `WindowedU8` shards read them.
+    fn refresh_track_positions(&mut self) {
+        if self.rig_flow.is_none() {
+            return;
+        }
+        let map = self.map.lock().unwrap();
+        self.counters.flow_position_refreshes += self.tracker.refresh_positions(&map);
+    }
+
+    /// Spawns tracks on the landmarks the latest keyframe created, once a
+    /// mapping result is applied after it (`adopt_landmarks`). Tracks refer
+    /// to the previous frame here: a landmark of that very frame starts at
+    /// its keypoint; an older keyframe's is tracked into it from the kept
+    /// keyframe frames, starting at its projection.
+    fn adopt_landmarks(&mut self) {
+        let (true, true, Some(kf_idx)) = (
+            self.flow.adopt_landmarks,
+            self.mapping_result_applied,
+            self.state.last_keyframe_idx,
+        ) else {
+            return;
+        };
+        self.mapping_result_applied = false;
+        if self.adopted_keyframe == Some(kf_idx) {
+            return;
+        }
+        self.adopted_keyframe = Some(kf_idx);
+        let previous_idx = self.next_frame_idx.checked_sub(2);
+        let pose = self.state.pose_world_to_cam;
+        let cameras = self.rig_flow.as_ref().map_or(1, RigFlow::cameras);
+        let landmarks: Vec<([f32; 2], usize, usize, Vec3F64)> = {
+            let map = self.map.lock().unwrap();
+            let Some(kf) = map.get_keyframe(kf_idx) else {
+                return;
+            };
+            kf.map_point_by_desc_idx
+                .iter()
+                .enumerate()
+                .filter_map(|(desc_idx, mp_idx)| {
+                    let mp_idx = (*mp_idx)?;
+                    let mp = map
+                        .map_points()
+                        .get(mp_idx)
+                        .filter(|mp| !mp.culled && mp.keyframe_idx == kf_idx)?;
+                    let camera = kf.frame.camera_of(desc_idx);
+                    let pixel = *kf.frame.features.keypoints_xy.get(desc_idx)?;
+                    (camera < cameras).then_some((pixel, camera, mp_idx, mp.position))
+                })
+                .collect()
+        };
+        for (pixel, camera, mp_idx, position) in landmarks {
+            let pixel = if previous_idx == Some(kf_idx) {
+                Some(pixel)
+            } else {
+                self.carry_landmark(kf_idx, camera, pixel, &pose, &position)
+            };
+            if let Some(pixel) = pixel {
+                self.tracker.adopt(pixel, camera, mp_idx, position);
+            }
+        }
+    }
+
+    /// A kept keyframe landmark's pixel in the previous frame (`WindowedU8`
+    /// only), starting at its projection at that frame's pose.
+    fn carry_landmark(
+        &mut self,
+        kf_idx: usize,
+        camera: usize,
+        pixel: [f32; 2],
+        pose_world_to_primary: &Pose3d,
+        position: &Vec3F64,
+    ) -> Option<[f32; 2]> {
+        let (model, pose) = match camera {
+            0 => (&self.rig.camera, *pose_world_to_primary),
+            c => {
+                let view = self.frontend.rig_geometry()?.view(c)?;
+                (&view.camera, view.pose(pose_world_to_primary))
+            }
+        };
+        let start = crate::tracking::tracker::project_raw(model, &pose.transform_point(position), pixel)
+            .unwrap_or(pixel);
+        self.rig_flow
+            .as_mut()?
+            .adopt(kf_idx as u64, camera, pixel, start)
     }
 
     fn dbg(&mut self, msg: String) {
@@ -2691,6 +2790,12 @@ impl SlamSystem {
         }
 
         self.state.current_keyframe_idx = Some(frame.idx);
+        if self.flow.adopt_landmarks
+            && let Some(rig_flow) = self.rig_flow.as_mut()
+            && let Err(error) = rig_flow.keep_keyframe()
+        {
+            self.dbg(format!("[flow] frame={} keyframe frames not kept: {error}", frame.idx));
+        }
         if anchor {
             // The IMU chain, its sample buffer and the next keyframe's edge
             // stay at the last tracked keyframe.
@@ -2837,7 +2942,11 @@ impl SlamSystem {
         let started = Instant::now();
         let outcome = {
             let mut map = self.map.lock().unwrap();
-            loop_closer.on_keyframe(&mut map, &self.rig.camera, kf_idx, context)
+            let outcome = loop_closer.on_keyframe(&mut map, &self.rig.camera, kf_idx, context);
+            if self.rig_flow.is_some() && outcome.tracking_correction.is_some() {
+                self.counters.flow_position_refreshes += self.tracker.refresh_positions(&map);
+            }
+            outcome
         };
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         let graph_nodes = loop_closer.graph_nodes();
@@ -2867,7 +2976,11 @@ impl SlamSystem {
         };
         let outcome = {
             let mut map = self.map.lock().unwrap();
-            loop_closer.on_frame(&mut map, &self.rig.camera, context)
+            let outcome = loop_closer.on_frame(&mut map, &self.rig.camera, context);
+            if self.rig_flow.is_some() && outcome.tracking_correction.is_some() {
+                self.counters.flow_position_refreshes += self.tracker.refresh_positions(&map);
+            }
+            outcome
         };
         let graph_nodes = loop_closer.graph_nodes();
         if let Some(latency) = outcome.written_back {

@@ -107,7 +107,6 @@ impl FlowSettings {
     pub(crate) fn unbuilt_knob(&self) -> Option<&'static str> {
         let today = Self::new(&OrbFrontendConfig::default());
         [
-            ("adopt_landmarks", self.adopt_landmarks),
             ("keyframe_orb", self.keyframe_orb != today.keyframe_orb),
         ]
         .into_iter()

@@ -52,6 +52,20 @@ pub struct Track {
 }
 
 impl Track {
+    /// An unassociated track at `pixel`, outside any set: what the survivor
+    /// filter measures a solve's movement from.
+    pub(crate) fn at(pixel: [f32; 2]) -> Self {
+        Self {
+            id: TrackId(0),
+            pixel,
+            map_point_idx: None,
+            age: 1,
+            position: None,
+            camera: 0,
+            shard: 0,
+        }
+    }
+
     /// Stable identity across frames.
     pub fn id(&self) -> TrackId {
         self.id
@@ -965,6 +979,74 @@ pub(crate) fn carry_klt_survivors(track_set: &mut TrackSet, survivors: Option<Ve
 mod tests {
     use super::*;
     use kornia_image::ImageSize;
+
+    /// A map with one keyframe and a landmark per position, each seen by
+    /// its own feature.
+    fn map_with(positions: &[Vec3F64]) -> Map {
+        use crate::mapping::map::tests::test_frame;
+        use crate::mapping::map::{Keyframe, LandmarkSeed, ObservationKey};
+        let mut map = Map::new();
+        let descriptors = (0..positions.len()).map(|i| [i as u8; 32]).collect();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, descriptors)))
+            .unwrap();
+        for (feature, &position) in positions.iter().enumerate() {
+            map.insert_landmark(LandmarkSeed {
+                position,
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx: feature,
+                },
+            })
+            .unwrap();
+        }
+        map
+    }
+
+    #[test]
+    fn refresh_positions_follows_moved_and_culled_points() {
+        let before = Vec3F64::new(0.0, 0.0, 4.0);
+        let moved = Vec3F64::new(0.5, 0.0, 4.0);
+        let mut tracks = TrackSet::new();
+        tracks
+            .reconcile_from_matches(
+                &[
+                    MapKeypointMatch {
+                        map_point_idx: 0,
+                        keypoint_idx: 0,
+                    },
+                    MapKeypointMatch {
+                        map_point_idx: 1,
+                        keypoint_idx: 1,
+                    },
+                ],
+                &[[10.0, 10.0], [20.0, 20.0]],
+            )
+            .unwrap();
+        tracks.spawn([30.0, 30.0]);
+
+        assert_eq!(tracks.refresh_positions(&map_with(&[before, before])), 2);
+        assert!(tracks.tracks()[..2].iter().all(|t| t.position() == Some(before)));
+        assert_eq!(tracks.tracks()[2].position(), None);
+
+        // The map changed under the tracks: one point moved, the other merged away.
+        let mut map = map_with(&[moved, before]);
+        let merged = map.merge_map_points(0, 1).unwrap();
+        assert_eq!(tracks.refresh_positions(&map), 2);
+        let position_of = |idx: usize| {
+            tracks
+                .tracks()
+                .iter()
+                .find(|t| t.map_point_idx() == Some(idx))
+                .unwrap()
+                .position()
+        };
+        assert_eq!(position_of(merged.replaced), None);
+        assert_eq!(
+            position_of(merged.survivor),
+            Some(map.map_points()[merged.survivor].position)
+        );
+    }
 
     #[test]
     fn spawn_inserts_tracks_with_unique_ids() {

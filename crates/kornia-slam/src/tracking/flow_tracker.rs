@@ -645,6 +645,10 @@ pub struct RigFlow {
     /// `(camera, track id, survivor, undistorted)` of a step, before sorting.
     merged: Vec<(usize, TrackId, FlowSurvivor, [f32; 2])>,
     output: FlowOutput,
+    /// Copies of the latest keyframe's frames, for `adopt_landmarks`.
+    keyframe: Vec<LkFrame>,
+    /// Template a landmark is adopted with.
+    adopted: LkTemplate,
 }
 
 impl RigFlow {
@@ -685,7 +689,62 @@ impl RigFlow {
             guess,
             merged: Vec::new(),
             output: FlowOutput::default(),
+            keyframe: Vec::new(),
+            adopted: LkTemplate::default(),
         })
+    }
+
+    /// Keeps a copy of the current frames as the latest keyframe's, which
+    /// its new landmarks are adopted from once mapping returns.
+    pub(crate) fn keep_keyframe(&mut self) -> Result<(), FlowPoolError> {
+        let Some(frames) = self.frames.as_ref() else {
+            return Ok(());
+        };
+        self.keyframe.truncate(frames.current.len());
+        for (camera, frame) in frames.current.iter().enumerate() {
+            match self.keyframe.get_mut(camera) {
+                Some(copy) => copy.rebuild(frame.plane(), frame.frame_id())?,
+                None => self.keyframe.push(LkFrame::new(
+                    frame.plane(),
+                    self.settings.window,
+                    frame.frame_id(),
+                )?),
+            }
+        }
+        Ok(())
+    }
+
+    /// Where a landmark seen at `pixel` in camera `camera` of the kept
+    /// keyframe `keyframe_idx` is in the previous frame, which the tracks'
+    /// pixels refer to: its keyframe template tracked from `start`. `None`
+    /// without that keyframe or when the solve fails the survivor filter.
+    pub(crate) fn adopt(
+        &mut self,
+        keyframe_idx: u64,
+        camera: usize,
+        pixel: [f32; 2],
+        start: [f32; 2],
+    ) -> Option<[f32; 2]> {
+        let keyframe = self
+            .keyframe
+            .get(camera)
+            .filter(|frame| frame.frame_id() == keyframe_idx)?;
+        let previous = self.frames.as_ref()?.previous.get(camera)?;
+        if !extract_template(keyframe, pixel, 0, self.settings.window, &mut self.adopted) {
+            return None;
+        }
+        let (_, max_iter) = self.settings.predicted;
+        let result = track_template(&self.adopted, previous, start, max_iter, self.settings.epsilon);
+        let size = previous.plane().size();
+        KltTracker::accepts(
+            &Track::at(pixel),
+            u8::from(result.status),
+            result.error,
+            result.pixel,
+            [size.width as f32, size.height as f32],
+            &SurvivorFilterConfig::default(),
+        )
+        .then_some(result.pixel)
     }
 
     pub fn threads(&self) -> usize {
