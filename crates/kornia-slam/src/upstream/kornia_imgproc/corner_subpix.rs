@@ -26,8 +26,8 @@ const MAX_ITERS: usize = 100;
 /// Refines `corners` (pixels) in place over a `(2 half_win + 1)²` window,
 /// for at most `max_iter` steps or until a step is below `epsilon` pixels.
 /// A corner that moves more than `half_win` in either axis keeps its input
-/// value, as OpenCV's. Nothing moves when `half_win` is 0 or the image is
-/// smaller than `2 half_win + 5` in either axis.
+/// value, as OpenCV's. Nothing moves when `half_win` is 0, the image is
+/// smaller than `2 half_win + 5` in either axis, or the corner is outside it.
 pub fn corner_sub_pix(
     image: &Image<u8, 1>,
     corners: &mut [[f32; 2]],
@@ -94,6 +94,10 @@ fn refine(
     eps2: f64,
 ) -> [f32; 2] {
     let (w, h) = (image.width() as f32, image.height() as f32);
+    let inside = |c: [f32; 2]| c[0] >= 0.0 && c[0] < w && c[1] >= 0.0 && c[1] < h;
+    if !inside(start) {
+        return start;
+    }
     let mut c = start;
     for _ in 0..max_iters {
         fill_patch(image, c, window, patch);
@@ -110,8 +114,7 @@ fn refine(
         let (dx, dy) = (next[0] - c[0], next[1] - c[1]);
         let err = f64::from(dx * dx + dy * dy);
         c = next;
-        let inside = c[0] >= 0.0 && c[0] < w && c[1] >= 0.0 && c[1] < h;
-        if !inside || err <= eps2 {
+        if !inside(c) || err <= eps2 {
             break;
         }
     }

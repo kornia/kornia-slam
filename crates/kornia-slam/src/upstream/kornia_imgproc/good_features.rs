@@ -539,11 +539,7 @@ mod tests {
             ((x * 37 + y * 101 + (x * y) % 23) % 251) as u8
         });
         let mut scratch = GoodFeaturesScratch::default();
-        let p = GoodFeaturesParams {
-            half_resolution: false,
-            ..params(false)
-        };
-        good_features_to_track(&img, &[], &p, &mut scratch, &mut Vec::new());
+        good_features_to_track(&img, &[], &params(false), &mut scratch, &mut Vec::new());
         let (w, h) = (img.width(), img.height());
         let px = |x: usize, y: usize| i32::from(img.as_slice()[y * w + x]);
         let grad = |x: usize, y: usize| {
