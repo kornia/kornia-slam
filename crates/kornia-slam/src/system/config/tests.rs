@@ -302,6 +302,60 @@ fn the_reseed_tilt_limit_must_be_positive() {
 }
 
 #[test]
+fn relocalization_knobs_are_off_by_default_and_need_loop_closing() {
+    use crate::tracking::relocalization::RelocalizationSolver;
+    let mut defaults = SystemConfig::default();
+    let tracking_loss = &orb_mut(&mut defaults).tracking_loss;
+    assert!(!tracking_loss.relocalization.while_lost);
+    assert_eq!(
+        tracking_loss.relocalization.solver,
+        RelocalizationSolver::PrimaryEpnp
+    );
+    assert_eq!(tracking_loss.relocalization.max_jump_m, 0.5);
+    assert!(!tracking_loss.reseed.relocalize_when_lost);
+    assert_eq!(tracking_loss.reseed.own_window_keyframes, 0);
+
+    let knobs: [(&str, fn(&mut OrbSlamPipeline)); 3] = [
+        ("tracking_loss.relocalization.while_lost", |orb| {
+            orb.tracking_loss.relocalization.while_lost = true;
+        }),
+        ("tracking_loss.relocalization.solver", |orb| {
+            orb.tracking_loss.relocalization.solver = RelocalizationSolver::RigAp3p;
+        }),
+        ("tracking_loss.reseed.relocalize_when_lost", |orb| {
+            orb.tracking_loss.reseed.relocalize_when_lost = true;
+        }),
+    ];
+    let stereo = sensors(CameraSelection::Stereo, false);
+    for (knob, set) in knobs {
+        let mut without = with_loop_closing(LoopClosingMode::Disabled, stereo);
+        set(orb_mut(&mut without));
+        assert_eq!(
+            without.validate(),
+            Err(ConfigError::RelocalizationWithoutVocabulary(knob))
+        );
+        let mut with = with_loop_closing(loop_closing(), stereo);
+        set(orb_mut(&mut with));
+        assert_eq!(with.validate(), Ok(()), "{knob}");
+    }
+    for mode in [LoopClosingMode::Disabled, loop_closing()] {
+        assert_eq!(with_loop_closing(mode, stereo).validate(), Ok(()));
+    }
+}
+
+#[test]
+fn the_relocalization_jump_bound_must_be_positive() {
+    for bad in [0.0, -1.0, f64::INFINITY] {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).tracking_loss.relocalization.max_jump_m = bad;
+        assert_eq!(
+            invalid_setting(&config).as_deref(),
+            Some("tracking_loss.relocalization.max_jump_m")
+        );
+    }
+}
+
+#[test]
 fn settings_are_range_checked() {
     let mut config = SystemConfig::default();
     let orb = orb_mut(&mut config);
