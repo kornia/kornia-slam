@@ -14,6 +14,13 @@ use thiserror::Error;
 
 use crate::mapping::Map;
 use crate::tracking::flow_tracker::ShardLayout;
+
+// The `WindowedU8` flow step, public for the frontend bench and the
+// zero-allocation test only.
+#[doc(hidden)]
+pub use crate::tracking::flow_tracker::{
+    FlowOutput, FlowStepCounts, FlowStepInput, RigFlow, RigFlowCamera, RigFlowSettings,
+};
 use crate::tracking::timings::{TrackingTimings, timed};
 
 /// Stable identity for a feature track.

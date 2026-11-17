@@ -3,7 +3,7 @@
 //! the global pool ORB runs on.
 
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -32,7 +32,11 @@ pub enum FlowPoolError {
     Frame(#[from] LkWindowError),
 }
 
+/// How long the join spins on a worker before it parks (plan section 3).
+const JOIN_SPIN: Duration = Duration::from_micros(100);
+
 /// One worker's reused job; moved to the worker and back every step.
+#[derive(Default)]
 struct FlowJob {
     shard: FlowShard,
     previous: Vec<Arc<LkFrame>>,
@@ -77,12 +81,15 @@ impl FlowPool {
                  feature; flow workers are not pinned"
             );
         }
-        if threads > 1 {
-            todo!("lane T: flow workers");
+        let threads = threads.max(1);
+        let mut workers = Vec::with_capacity(threads - 1);
+        for n in 1..threads {
+            let core = first_core.map(|first| first + n - 1);
+            workers.push(FlowWorker::spawn(n, core)?);
         }
         Ok(Self {
-            threads: 1,
-            workers: Vec::new(),
+            threads,
+            workers,
             inline_timings: ShardTimings::default(),
             timings: StepTimings::default(),
         })
@@ -96,13 +103,32 @@ impl FlowPool {
         guess: &ShardGuess,
     ) -> Result<(), FlowPoolError> {
         self.timings = StepTimings::default();
-        let Some((inline, _)) = shards.split_first_mut() else {
+        let Some((inline, rest)) = shards.split_first_mut() else {
             return Ok(());
         };
         let started = Instant::now();
+        for (n, (worker, shard)) in self.workers.iter_mut().zip(rest.iter_mut()).enumerate() {
+            worker.dispatch(n + 1, shard, frames, guess)?;
+        }
+        let dispatched = Instant::now();
+        self.timings.dispatch = dispatched - started;
+
         inline.run(&frames.previous, &frames.current, guess, &mut self.inline_timings);
-        self.timings.parallel = started.elapsed();
+        for (n, worker) in self.workers.iter_mut().enumerate() {
+            worker.wait(n + 1)?;
+        }
+        let joined = Instant::now();
+        self.timings.parallel = joined - dispatched;
+
         self.timings.shards[0] = self.inline_timings;
+        for (n, (worker, shard)) in self.workers.iter_mut().zip(rest.iter_mut()).enumerate() {
+            let job = worker.job.as_mut().ok_or(FlowPoolError::WorkerGone(n + 1))?;
+            std::mem::swap(&mut job.shard, shard);
+            if let Some(slot) = self.timings.shards.get_mut(n + 1) {
+                *slot = job.timings;
+            }
+        }
+        self.timings.join = joined.elapsed();
         Ok(())
     }
 
@@ -123,6 +149,95 @@ impl FlowPool {
     pub(crate) fn threads(&self) -> usize {
         self.threads
     }
+}
+
+impl FlowWorker {
+    /// Starts worker `n`, pinned to `core` when given; waits until it runs.
+    fn spawn(n: usize, core: Option<usize>) -> Result<Self, FlowPoolError> {
+        let (jobs, inbox) = sync_channel::<FlowJob>(1);
+        let (outbox, done) = sync_channel::<FlowJob>(1);
+        let (ready_tx, ready) = sync_channel::<bool>(1);
+        let handle = std::thread::Builder::new()
+            .name(format!("klt-flow-{n}"))
+            .spawn(move || {
+                let pinned = core.is_none_or(pin_current_thread);
+                if ready_tx.send(pinned).is_err() || !pinned {
+                    return;
+                }
+                while let Ok(mut job) = inbox.recv() {
+                    job.shard
+                        .run(&job.previous, &job.current, &job.guess, &mut job.timings);
+                    // The tracking core must hold the only frame references
+                    // after the join, to rebuild them in place.
+                    job.previous.clear();
+                    job.current.clear();
+                    if outbox.send(job).is_err() {
+                        break;
+                    }
+                }
+            })?;
+        match ready.recv() {
+            Ok(true) => {}
+            Ok(false) => return Err(FlowPoolError::Pin(core.unwrap_or_default())),
+            Err(_) => return Err(FlowPoolError::WorkerGone(n)),
+        }
+        Ok(Self {
+            jobs,
+            done,
+            job: Some(FlowJob::default()),
+            handle: Some(handle),
+        })
+    }
+
+    /// Moves `shard` and this step's frames and guess to the worker.
+    fn dispatch(
+        &mut self,
+        n: usize,
+        shard: &mut FlowShard,
+        frames: &FlowFrames,
+        guess: &ShardGuess,
+    ) -> Result<(), FlowPoolError> {
+        let mut job = self.job.take().ok_or(FlowPoolError::WorkerGone(n))?;
+        std::mem::swap(&mut job.shard, shard);
+        job.previous.clear();
+        job.previous.extend(frames.previous.iter().cloned());
+        job.current.clear();
+        job.current.extend(frames.current.iter().cloned());
+        job.guess.clone_from(guess);
+        self.jobs
+            .send(job)
+            .map_err(|_| FlowPoolError::WorkerGone(n))
+    }
+
+    /// Takes the job back: a short spin, since a shard is about as long as
+    /// the inline one, then a blocking receive.
+    fn wait(&mut self, n: usize) -> Result<(), FlowPoolError> {
+        let spin_until = Instant::now() + JOIN_SPIN;
+        let job = loop {
+            match self.done.try_recv() {
+                Ok(job) => break Some(job),
+                Err(TryRecvError::Disconnected) => break None,
+                Err(TryRecvError::Empty) if Instant::now() < spin_until => {
+                    std::hint::spin_loop();
+                }
+                Err(TryRecvError::Empty) => break self.done.recv().ok(),
+            }
+        };
+        self.job = Some(job.ok_or(FlowPoolError::WorkerGone(n))?);
+        Ok(())
+    }
+}
+
+/// Pins the calling thread to `core`; `false` when the OS refuses.
+#[cfg(feature = "pin_threads")]
+fn pin_current_thread(core: usize) -> bool {
+    core_affinity::set_for_current(core_affinity::CoreId { id: core })
+}
+
+/// Without `pin_threads` the deployment confines the process instead.
+#[cfg(not(feature = "pin_threads"))]
+fn pin_current_thread(_core: usize) -> bool {
+    true
 }
 
 impl Drop for FlowPool {
