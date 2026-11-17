@@ -15,6 +15,7 @@ use crate::pose_conversion::rotation_defect;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 use kornia_factors::wheel_odometry::{WheelOdomFactor, WheelOdomMeasurement};
+use kornia_sensors::wheel::PlanarMotion;
 
 /// A wheel-odometry configuration or mount that cannot be used.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -303,8 +304,16 @@ impl WheelOdomConfig {
         cov[0][0] = cov[0][0].max(self.min_translation_sigma_m.powi(2));
         cov[1][1] = cov[1][1].max(self.min_translation_sigma_m.powi(2));
         cov[2][2] = cov[2][2].max(self.min_heading_sigma_rad.powi(2));
-        WheelOdomMeasurement::new(d.delta, cov)
-            .with_out_of_plane_sigmas(self.z_sigma.hypot(self.z_slope * d.path_m), self.tilt_sigma)
+        // Main's measurement takes kornia-sensors' PlanarMotion, not a (delta, cov) pair.
+        let covariance = mat3_from_rows(&[
+            cov[0][0], cov[0][1], cov[0][2], cov[1][0], cov[1][1], cov[1][2], cov[2][0], cov[2][1],
+            cov[2][2],
+        ]);
+        WheelOdomMeasurement::new(PlanarMotion {
+            delta: d.delta,
+            covariance,
+        })
+        .with_out_of_plane_sigmas(self.z_sigma.hypot(self.z_slope * d.path_m), self.tilt_sigma)
     }
 }
 
@@ -963,6 +972,13 @@ pub(crate) fn mat3_from_rows(rows: &[f64; 9]) -> Mat3F64 {
 mod tests {
     use super::*;
 
+    /// Row-major copy of the measurement's covariance, now a `Mat3F64` inside main's
+    /// `PlanarMotion`, so the checks below keep their `[r][c]` indexing.
+    fn cov(m: &WheelOdomMeasurement) -> [[f64; 3]; 3] {
+        let c: kornia_algebra::SMatF64<3, 3> = m.motion.covariance.into();
+        std::array::from_fn(|r| std::array::from_fn(|k| c[(r, k)]))
+    }
+
     const MS: u64 = 1_000_000;
 
     fn cfg() -> WheelOdomConfig {
@@ -1034,10 +1050,7 @@ mod tests {
         assert!((d.covariance[0][0] - 0.02f64.powi(2) * 0.6).abs() < 1e-15);
         // Parked: floored, not infinite information.
         let parked = w.cfg.measurement(&parked_delta());
-        assert_eq!(
-            parked.covariance[0][0],
-            DEFAULT_MIN_TRANSLATION_SIGMA_M.powi(2)
-        );
+        assert_eq!(cov(&parked)[0][0], DEFAULT_MIN_TRANSLATION_SIGMA_M.powi(2));
         assert!(parked.information().is_some());
     }
 
@@ -1216,7 +1229,7 @@ mod tests {
         assert!((var(500) - kh2 * 0.5).abs() < 1e-12, "{}", var(500));
         assert!((var(1000) - kh2 * 1.0).abs() < 1e-12, "{}", var(1000));
         let m = cfg.measurement(&w.delta(0, 1000 * MS, 0).unwrap());
-        assert!(m.covariance[2][2] > DEFAULT_MIN_HEADING_SIGMA_RAD.powi(2) * 10.0);
+        assert!(cov(&m)[2][2] > DEFAULT_MIN_HEADING_SIGMA_RAD.powi(2) * 10.0);
         // The systematic term adds ks^2 d^2 on top.
         cfg.heading_scale_sigma_per_m = 0.02;
         let w = state_with(cfg, &drive(0.0));
@@ -1238,9 +1251,9 @@ mod tests {
             (200, 1.0, 2.0, 0.3),
         ]);
         let m = c.measurement(&parked.delta(50 * MS, 150 * MS, 0).unwrap());
-        assert_eq!(m.covariance[0][0], DEFAULT_MIN_TRANSLATION_SIGMA_M.powi(2));
-        assert_eq!(m.covariance[1][1], DEFAULT_MIN_TRANSLATION_SIGMA_M.powi(2));
-        assert_eq!(m.covariance[2][2], DEFAULT_MIN_HEADING_SIGMA_RAD.powi(2));
+        assert_eq!(cov(&m)[0][0], DEFAULT_MIN_TRANSLATION_SIGMA_M.powi(2));
+        assert_eq!(cov(&m)[1][1], DEFAULT_MIN_TRANSLATION_SIGMA_M.powi(2));
+        assert_eq!(cov(&m)[2][2], DEFAULT_MIN_HEADING_SIGMA_RAD.powi(2));
         // 0.5 m/s straight; both ends between readings.
         let moving = state(&[
             (0, 0.0, 0.0, 0.0),
@@ -1251,7 +1264,7 @@ mod tests {
         assert!((d.speed_m_s[0] - 0.5).abs() < 1e-9 && (d.speed_m_s[1] - 0.5).abs() < 1e-9);
         let m = c.measurement(&d);
         let want = 2.0 * 0.25 * sigma * sigma;
-        assert!((m.covariance[1][1] - d.covariance[1][1] - want).abs() < 1e-15);
+        assert!((cov(&m)[1][1] - d.covariance[1][1] - want).abs() < 1e-15);
         // 0.5 rad/s on the spot.
         let turning = state(&[
             (0, 0.0, 0.0, 0.0),
@@ -1260,7 +1273,7 @@ mod tests {
         ]);
         let d = turning.delta(50 * MS, 150 * MS, 0).unwrap();
         let m = c.measurement(&d);
-        assert!((m.covariance[2][2] - d.covariance[2][2] - want).abs() < 1e-15);
+        assert!((cov(&m)[2][2] - d.covariance[2][2] - want).abs() < 1e-15);
     }
 
     #[test]
@@ -1288,7 +1301,7 @@ mod tests {
     fn the_measurement_is_symmetric_and_its_information_positive_definite() {
         let w = state_with(noisy_cfg(), &drive(std::f64::consts::FRAC_PI_2));
         let m = w.cfg.measurement(&w.delta(0, 1000 * MS, 0).unwrap());
-        let c = m.covariance;
+        let c = cov(&m);
         assert!(c[0][1] != 0.0 && c[0][2] != 0.0 && c[1][2] != 0.0, "{c:?}");
         for (i, row) in c.iter().enumerate() {
             for (j, x) in row.iter().enumerate() {
@@ -1300,10 +1313,10 @@ mod tests {
         let mut l = [[0.0f64; 6]; 6];
         for i in 0..6 {
             for j in 0..6 {
-                assert!((info[i][j] - info[j][i]).abs() <= 1e-9 * info[i][i].abs().max(1.0));
+                assert!((info[(i, j)] - info[(j, i)]).abs() <= 1e-9 * info[(i, i)].abs().max(1.0));
             }
             for j in 0..=i {
-                let s: f64 = info[i][j] - (0..j).map(|k| l[i][k] * l[j][k]).sum::<f64>();
+                let s: f64 = info[(i, j)] - (0..j).map(|k| l[i][k] * l[j][k]).sum::<f64>();
                 if i == j {
                     assert!(s > 0.0, "not positive definite at {i}");
                     l[i][i] = s.sqrt();
@@ -1325,7 +1338,7 @@ mod tests {
         c.clock_sigma_s = 0.0;
         let w = state_with(c.clone(), &drive(std::f64::consts::FRAC_PI_2));
         let d = w.delta(0, 1000 * MS, 0).unwrap();
-        let (p, m) = (d.covariance, c.measurement(&d).covariance);
+        let (p, m) = (d.covariance, cov(&c.measurement(&d)));
         // R(90 deg)^T maps start x to end -y and start y to end x.
         assert!((m[0][0] - p[1][1]).abs() < 1e-12 * p[1][1].max(1.0));
         assert!((m[1][1] - p[0][0]).abs() < 1e-12 * p[0][0].max(1.0));
@@ -1434,7 +1447,7 @@ mod tests {
         let f = w.factors();
         assert_eq!(f.len(), 1);
         assert_eq!((f[0].from_idx, f[0].to_idx), (3, 4));
-        assert!(close(f[0].measurement.delta, [0.15, 0.0, 0.0]));
+        assert!(close(f[0].measurement.motion.delta, [0.15, 0.0, 0.0]));
         // The oldest mount stands in for a stamp before it: it is nearer the truth than the
         // configured one once a head is publishing.
         assert_eq!(f[0].t_cb_from, tilted);
