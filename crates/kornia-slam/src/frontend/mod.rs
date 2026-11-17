@@ -92,6 +92,11 @@ impl OrbFrontend {
         }
     }
 
+    /// The rig geometry features are extracted on; `None` outside a rig.
+    pub(crate) fn rig_geometry(&self) -> Option<&Arc<RigGeometry>> {
+        self.rig.as_ref()
+    }
+
     pub(crate) fn observation(&self) -> &FrontendObservation {
         &self.observation
     }

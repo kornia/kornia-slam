@@ -7,6 +7,7 @@
 //! track set consistent with whichever happened.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
@@ -16,6 +17,7 @@ use kornia_imgproc::features::OrbFeatures;
 use crate::Frame;
 use crate::frame::RigFeatures;
 use crate::mapping::Map;
+use crate::rig::RigGeometry;
 use crate::tracking::local_map::{LocalMapRules, LocalMapSelectionConfig};
 use crate::tracking::optical_flow::{
     FlowPrediction, FlowSurvivor, KltPyramidCache, KltTracker, LkKernel, MapKeypointMatch, Track,
@@ -84,6 +86,13 @@ pub(crate) struct Tracker {
     /// [`MapProjectionConfig::search_scale_for`].
     search_scale_override: Option<f32>,
     relocalization: RelocalizationConfig,
+    /// The rig whose every camera optical flow tracks (`klt_rig:
+    /// AllCameras`); `None` tracks the primary camera only.
+    rig: Option<Arc<RigGeometry>>,
+    /// Pyramid caches of rig cameras 1 and up on the per-camera kernels.
+    secondary_klt_caches: Vec<KltPyramidCache>,
+    /// Track sets cleared by a duplicate map point in reconciliation.
+    reconcile_clears: u64,
 }
 
 impl Tracker {
@@ -99,7 +108,37 @@ impl Tracker {
             last_gap: None,
             search_scale_override: None,
             relocalization: RelocalizationConfig::default(),
+            rig: None,
+            secondary_klt_caches: Vec::new(),
+            reconcile_clears: 0,
         }
+    }
+
+    /// Tracks every camera of `rig` by optical flow, spreading new tracks
+    /// over `flow_threads` shards.
+    pub(crate) fn with_rig_flow(mut self, rig: Arc<RigGeometry>, flow_threads: usize) -> Self {
+        let cameras = rig.views().len();
+        self.secondary_klt_caches = (1..cameras).map(|_| KltPyramidCache::new()).collect();
+        self.track_set = TrackSet::with_flow_threads(flow_threads, cameras);
+        self.rig = Some(rig);
+        self
+    }
+
+    /// Runs optical flow with `window`-pixel LK windows.
+    pub(crate) fn with_lk_window(mut self, window: usize) -> Self {
+        self.klt_tracker = self.klt_tracker.with_window(window);
+        self
+    }
+
+    /// Whether today's kernels track every rig camera, each from its own
+    /// previous image.
+    pub(crate) fn flows_rig(&self) -> bool {
+        self.rig.is_some() && self.klt_tracker.kernel() != LkKernel::WindowedU8
+    }
+
+    /// Track sets cleared by a duplicate map point in reconciliation so far.
+    pub(crate) fn reconcile_clears(&self) -> u64 {
+        self.reconcile_clears
     }
 
     /// Draws relocalization hypotheses with `solver`.
@@ -200,7 +239,7 @@ impl Tracker {
     /// Drops optical-flow continuity. Used when the map's world frame changes
     /// under the tracks, which invalidates them.
     pub(crate) fn reset_tracks(&mut self) {
-        self.track_set = TrackSet::new();
+        self.track_set.clear();
     }
 
     /// Follows the tracks from `previous` into `current` by optical flow,
@@ -238,39 +277,69 @@ impl Tracker {
         tracked.ok()
     }
 
-    /// Where each track should appear at `guess.pose`: its map point's
-    /// projection, carried back into raw pixels by the distortion offset at
-    /// the track's last pixel; the last pixel itself without a map point.
+    /// [`Self::flow`] on every rig camera, each from its own previous image
+    /// with today's kernels: `previous[c]` and `current[c]` are camera `c`'s.
+    /// Survivors come out in camera order.
+    pub(crate) fn flow_cameras(
+        &mut self,
+        previous: &[&Image<u8, 1>],
+        current: &[&Image<u8, 1>],
+        guess: Option<FlowGuess<'_>>,
+        timings: &mut TrackingTimings,
+    ) -> Option<Vec<FlowSurvivor>> {
+        if self.track_set.is_empty() || previous.len() < current.len() {
+            return None;
+        }
+        let rig = self.rig.clone()?;
+        let mut survivors = Vec::with_capacity(self.track_set.len());
+        for (camera, (&previous, &current)) in previous.iter().zip(current).enumerate() {
+            let tracks: Vec<Track> = self
+                .track_set
+                .tracks()
+                .iter()
+                .filter(|track| track.camera() == camera)
+                .copied()
+                .collect();
+            if tracks.is_empty() {
+                continue;
+            }
+            let view = rig.view(camera)?;
+            let initial_pixels = guess.as_ref().map(|guess| {
+                predicted_pixels(&tracks, guess.map, &view.pose(guess.pose), &view.camera)
+            });
+            let prediction =
+                guess
+                    .as_ref()
+                    .zip(initial_pixels.as_deref())
+                    .map(|(guess, initial_pixels)| FlowPrediction {
+                        initial_pixels,
+                        max_level: guess.max_level,
+                        max_iter: guess.max_iter,
+                    });
+            let cache = match camera {
+                0 => &mut self.klt_cache,
+                c => self.secondary_klt_caches.get_mut(c - 1)?,
+            };
+            let tracked =
+                self.klt_tracker
+                    .track_cached(cache, &tracks, prediction, previous, current, timings);
+            self.klt_errors += u64::from(tracked.is_err());
+            survivors.extend(tracked.ok()?);
+        }
+        Some(survivors)
+    }
+
+    /// Where each track should appear at `guess.pose`; see [`predicted_pixels`].
     fn predicted_pixels(&self, guess: &FlowGuess<'_>) -> Vec<[f32; 2]> {
-        self.track_set
-            .tracks()
-            .iter()
-            .map(|track| {
-                let raw = track.pixel();
-                track
-                    .map_point_idx()
-                    .and_then(|idx| guess.map.map_points().get(idx))
-                    .filter(|mp| !mp.culled)
-                    .and_then(|mp| {
-                        let p_cam = guess.pose.transform_point(&mp.position);
-                        guess.camera.project_to_pixel(&p_cam, 1e-6)
-                    })
-                    .and_then(|uv| {
-                        let undistorted = guess.camera.undistort(raw[0] as f64, raw[1] as f64)?;
-                        Some([
-                            (uv.x + raw[0] as f64 - undistorted.x) as f32,
-                            (uv.y + raw[1] as f64 - undistorted.y) as f32,
-                        ])
-                    })
-                    .unwrap_or(raw)
-            })
-            .collect()
+        predicted_pixels(self.track_set.tracks(), guess.map, guess.pose, guess.camera)
     }
 
     /// A frame made of the survivors that carry a map point: each keypoint
-    /// is the survivor's pixel with its map point's descriptor, primary
-    /// camera only. Returns it with the `(map point, keypoint)` seeds, or
-    /// `None` when fewer than `min_tracks` survivors carry a map point.
+    /// is the survivor's pixel with its map point's descriptor. With rig flow
+    /// the keypoints are grouped by camera into the frame's camera ranges, so
+    /// the pose solve sees every camera's rays; otherwise primary camera only.
+    /// Returns it with the `(map point, keypoint)` seeds, or `None` when fewer
+    /// than `min_tracks` survivors carry a map point.
     pub(crate) fn flow_frame(
         &self,
         idx: usize,
@@ -279,11 +348,11 @@ impl Tracker {
         image_size: ImageSize,
         min_tracks: usize,
     ) -> Option<(Frame, Vec<(usize, usize)>)> {
-        let map_points: HashMap<TrackId, usize> = self
+        let tracks: HashMap<TrackId, (usize, usize)> = self
             .track_set
             .tracks()
             .iter()
-            .filter_map(|track| Some((track.id(), track.map_point_idx()?)))
+            .filter_map(|track| Some((track.id(), (track.map_point_idx()?, track.camera()))))
             .collect();
         let mut features = OrbFeatures {
             keypoints_xy: Vec::with_capacity(survivors.len()),
@@ -291,19 +360,28 @@ impl Tracker {
             descriptors: Vec::with_capacity(survivors.len()),
             octaves: Vec::with_capacity(survivors.len()),
         };
+        let cameras = self.rig.as_ref().map_or(1, |rig| rig.views().len());
+        let mut camera_ranges = Vec::with_capacity(cameras);
         let mut seeded = Vec::with_capacity(survivors.len());
-        for survivor in survivors {
-            let Some(&mp_idx) = map_points.get(&survivor.track_id) else {
-                continue;
-            };
-            let Some(mp) = map.map_points().get(mp_idx).filter(|mp| !mp.culled) else {
-                continue;
-            };
-            seeded.push((mp_idx, features.keypoints_xy.len()));
-            features.keypoints_xy.push(survivor.pixel);
-            features.orientations.push(0.0);
-            features.descriptors.push(mp.descriptor);
-            features.octaves.push(0);
+        for camera in 0..cameras {
+            let begin = features.keypoints_xy.len();
+            for survivor in survivors {
+                let Some(&(mp_idx, _)) = tracks
+                    .get(&survivor.track_id)
+                    .filter(|&&(_, track_camera)| track_camera == camera)
+                else {
+                    continue;
+                };
+                let Some(mp) = map.map_points().get(mp_idx).filter(|mp| !mp.culled) else {
+                    continue;
+                };
+                seeded.push((mp_idx, features.keypoints_xy.len()));
+                features.keypoints_xy.push(survivor.pixel);
+                features.orientations.push(0.0);
+                features.descriptors.push(mp.descriptor);
+                features.octaves.push(0);
+            }
+            camera_ranges.push(begin..features.keypoints_xy.len());
         }
         if seeded.len() < min_tracks {
             return None;
@@ -318,9 +396,23 @@ impl Tracker {
             u_right: Vec::new(),
             depth: Vec::new(),
             keypoints_undist: Vec::new(),
-            rig: RigFeatures::default(),
+            rig: self.flow_rig_features(camera_ranges),
         };
         Some((frame, seeded))
+    }
+
+    /// The rig part of a flow frame: every camera's range under rig flow,
+    /// nothing otherwise (a primary-only frame is mono to the solver).
+    fn flow_rig_features(&self, camera_ranges: Vec<std::ops::Range<usize>>) -> RigFeatures {
+        match &self.rig {
+            Some(rig) => RigFeatures {
+                geometry: Some(Arc::clone(rig)),
+                camera_ranges,
+                left_to_right: Vec::new(),
+                stereo_points: Vec::new(),
+            },
+            None => RigFeatures::default(),
+        }
     }
 
     /// The pose of a [`Self::flow_frame`] from its seeds alone: consistency
@@ -394,25 +486,82 @@ impl Tracker {
 
     /// Advances the tracks onto an accepted flow-only estimate of `frame`.
     pub(crate) fn accept_flow_only(&mut self, estimate: &Estimate, frame: &Frame) {
-        self.reconcile(&estimate.matches, &frame.features.keypoints_xy);
+        self.reconcile(&estimate.matches, frame);
     }
 
-    fn reconcile(&mut self, matches: &[(usize, usize)], primary_keypoints: &[[f32; 2]]) {
+    /// Re-associates the tracks with `frame`'s accepted matches: the primary
+    /// camera's, or every camera's under rig flow.
+    fn reconcile(&mut self, matches: &[(usize, usize)], frame: &Frame) {
+        let keypoints = match self.rig {
+            Some(_) => &frame.features.keypoints_xy[..],
+            None => &frame.features.keypoints_xy[frame.camera_range(0)],
+        };
         let track_matches: Vec<MapKeypointMatch> = matches
             .iter()
-            .filter(|&&(_, keypoint_idx)| keypoint_idx < primary_keypoints.len())
+            .filter(|&&(_, keypoint_idx)| keypoint_idx < keypoints.len())
             .map(|&(map_point_idx, keypoint_idx)| MapKeypointMatch {
                 map_point_idx,
                 keypoint_idx,
             })
             .collect();
-        if self
-            .track_set
-            .reconcile_from_matches(&track_matches, primary_keypoints)
-            .is_err()
-        {
-            self.track_set = TrackSet::new();
+        let reconciled = match self.rig {
+            Some(_) => self.track_set.reconcile_in_cameras(&track_matches, keypoints, |kp| {
+                frame.camera_of(kp)
+            }),
+            None => self
+                .track_set
+                .reconcile_from_matches(&track_matches, keypoints),
+        };
+        if reconciled.is_err() {
+            self.reconcile_clears += 1;
+            self.track_set.clear();
         }
+    }
+
+    /// The flow survivors snapped to `frame`'s ORB keypoints of their own
+    /// camera, as `(map point, keypoint)` seeds.
+    fn snap_survivors(
+        &mut self,
+        survivors: &[FlowSurvivor],
+        frame: &Frame,
+    ) -> Option<Vec<(usize, usize)>> {
+        let cameras = match self.rig {
+            Some(_) => frame.rig.camera_ranges.len().max(1),
+            None => 1,
+        };
+        let camera_of: HashMap<TrackId, usize> = self
+            .track_set
+            .tracks()
+            .iter()
+            .map(|track| (track.id(), track.camera()))
+            .collect();
+        let mut seeds = Vec::new();
+        for camera in 0..cameras {
+            let range = frame.camera_range(camera);
+            let in_camera: Vec<FlowSurvivor> = if cameras == 1 {
+                survivors.to_vec()
+            } else {
+                survivors
+                    .iter()
+                    .filter(|s| camera_of.get(&s.track_id) == Some(&camera))
+                    .copied()
+                    .collect()
+            };
+            let snapped = snap_unique(
+                &self.track_set,
+                &in_camera,
+                &frame.features.keypoints_xy[range.clone()],
+                3.0,
+            );
+            self.snap_errors += u64::from(snapped.is_err());
+            seeds.extend(
+                snapped
+                    .ok()?
+                    .into_iter()
+                    .map(|matched| (matched.map_point_idx, range.start + matched.keypoint_idx)),
+            );
+        }
+        Some(seeds)
     }
 
     /// Estimates this frame's pose against the map, seeding the projection
@@ -431,21 +580,11 @@ impl Tracker {
     ) -> Result<Estimate, MapProjectionRejectReason> {
         let search_scale = self.search_scale(&input);
 
-        // Optical flow follows the primary camera only; its keypoints come first.
-        let primary_keypoints = &input.frame.features.keypoints_xy[input.frame.camera_range(0)];
+        // Without rig flow, optical flow follows the primary camera only; its
+        // keypoints come first.
         let pre_seeded = klt_survivors
-            .as_ref()
-            .and_then(|survivors| {
-                let snapped = snap_unique(&self.track_set, survivors, primary_keypoints, 3.0);
-                self.snap_errors += u64::from(snapped.is_err());
-                snapped.ok()
-            })
-            .map(|matches| {
-                matches
-                    .into_iter()
-                    .map(|matched| (matched.map_point_idx, matched.keypoint_idx))
-                    .collect()
-            });
+            .as_deref()
+            .and_then(|survivors| self.snap_survivors(survivors, input.frame));
 
         let result = self.estimator.estimate_pose_timed(
             input.frame,
@@ -461,7 +600,7 @@ impl Tracker {
 
         self.last_gap = None;
         let result = result.and_then(|estimate| self.accept(&input, estimate));
-        self.settle(result, klt_survivors, primary_keypoints)
+        self.settle(result, klt_survivors, input.frame)
     }
 
     /// Reconciles the tracks with an accepted estimate, or advances them onto
@@ -470,11 +609,11 @@ impl Tracker {
         &mut self,
         result: Result<Estimate, MapProjectionRejectReason>,
         klt_survivors: Option<Vec<FlowSurvivor>>,
-        primary_keypoints: &[[f32; 2]],
+        frame: &Frame,
     ) -> Result<Estimate, MapProjectionRejectReason> {
         match result {
             Ok(estimate) => {
-                self.reconcile(&estimate.matches, primary_keypoints);
+                self.reconcile(&estimate.matches, frame);
                 Ok(estimate)
             }
             Err(reason) => {
@@ -483,6 +622,45 @@ impl Tracker {
             }
         }
     }
+}
+
+/// Where each of `tracks` should appear at `pose` (world to `camera`): its
+/// map point's projection, carried back into raw pixels by the distortion
+/// offset at the track's last pixel; the last pixel itself without a map
+/// point.
+fn predicted_pixels(
+    tracks: &[Track],
+    map: &Map,
+    pose: &Pose3d,
+    camera: &PinholeCamera,
+) -> Vec<[f32; 2]> {
+    tracks
+        .iter()
+        .map(|track| {
+            let raw = track.pixel();
+            track
+                .map_point_idx()
+                .and_then(|idx| map.map_points().get(idx))
+                .filter(|mp| !mp.culled)
+                .and_then(|mp| project_raw(camera, &pose.transform_point(&mp.position), raw))
+                .unwrap_or(raw)
+        })
+        .collect()
+}
+
+/// `p_cam` projected through the ideal pinhole and carried back into raw
+/// pixels by the distortion offset at `raw`, a nearby raw pixel.
+pub(crate) fn project_raw(
+    camera: &PinholeCamera,
+    p_cam: &kornia_algebra::Vec3F64,
+    raw: [f32; 2],
+) -> Option<[f32; 2]> {
+    let uv = camera.project_to_pixel(p_cam, 1e-6)?;
+    let undistorted = camera.undistort(raw[0] as f64, raw[1] as f64)?;
+    Some([
+        (uv.x + raw[0] as f64 - undistorted.x) as f32,
+        (uv.y + raw[1] as f64 - undistorted.y) as f32,
+    ])
 }
 
 #[cfg(test)]
@@ -631,8 +809,7 @@ mod tests {
         assert_eq!(reading.verdict, Some(GateVerdict::TranslationGap));
         assert!((reading.gap.trans_m - 1095.0).abs() < 1e-9);
 
-        let primary = frame.features.keypoints_xy.clone();
-        assert!(tracker.settle(result, Some(survivors), &primary).is_err());
+        assert!(tracker.settle(result, Some(survivors), &frame).is_err());
         let after: Vec<[f32; 2]> = tracker.tracks().iter().map(|t| t.pixel()).collect();
         assert_eq!(after.len(), before.len());
         for (a, b) in after.iter().zip(&before) {

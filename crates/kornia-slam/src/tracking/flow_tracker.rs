@@ -13,6 +13,63 @@ use crate::tracking::timings::ShardTimings;
 use crate::upstream::kornia_imgproc::good_features::GoodFeaturesScratch;
 use crate::upstream::kornia_imgproc::lk_window::{LkFrame, LkTemplate};
 
+/// Which flow shard a new track runs on, fixed at its spawn (plan section 3).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ShardLayout {
+    threads: usize,
+    cameras: usize,
+    /// Tracks spawned so far per camera, for the `cameras + 1` split.
+    spawned: Vec<u64>,
+}
+
+impl ShardLayout {
+    /// Shards for `threads` flow threads on `cameras` cameras; validation
+    /// allows 1, `cameras` or `cameras + 1` threads.
+    pub(crate) fn new(threads: usize, cameras: usize) -> Self {
+        Self {
+            threads,
+            cameras,
+            spawned: vec![0; cameras],
+        }
+    }
+
+    fn shards(&self) -> usize {
+        self.threads.max(1)
+    }
+
+    /// The shard of the next track spawned in `camera`. With one thread per
+    /// camera a camera is its shard; with one thread more, worker `c + 1`
+    /// takes two thirds of camera `c` and the tracking core the rest.
+    pub(crate) fn assign(&mut self, camera: usize) -> usize {
+        if self.shards() == 1 {
+            return 0;
+        }
+        let shard = if self.threads == self.cameras + 1 {
+            match self.spawned.get_mut(camera) {
+                Some(k) => {
+                    let shard = if *k % 3 == 0 { 0 } else { camera + 1 };
+                    *k += 1;
+                    shard
+                }
+                None => 0,
+            }
+        } else {
+            camera
+        };
+        shard.min(self.shards() - 1)
+    }
+
+    /// The shard that refills `camera`: the camera's own worker.
+    pub(crate) fn refill_shard(&self, camera: usize) -> usize {
+        let shard = match self.shards() {
+            1 => 0,
+            threads if threads == self.cameras + 1 => camera + 1,
+            _ => camera,
+        };
+        shard.min(self.shards() - 1)
+    }
+}
+
 /// One camera's model for a flow step, refreshed in place each frame.
 #[derive(Debug, Clone)]
 pub(crate) struct FlowCamera {

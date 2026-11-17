@@ -107,7 +107,6 @@ impl FlowSettings {
     pub(crate) fn unbuilt_knob(&self) -> Option<&'static str> {
         let today = Self::new(&OrbFrontendConfig::default());
         [
-            ("klt_window", self.window != today.window),
             ("adopt_landmarks", self.adopt_landmarks),
             ("gyro_guess", self.gyro_guess != today.gyro_guess),
             ("flow_pose", self.pose != today.pose),

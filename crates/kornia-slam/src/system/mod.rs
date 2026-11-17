@@ -199,6 +199,9 @@ pub struct SlamSystem {
     frontend: OrbFrontend,
     // The last processed image, for optical-flow tracks into the next frame.
     previous_image: Option<Image<u8, 1>>,
+    // Rig cameras 1 and up of the last processed capture, kept only when
+    // today's kernels track every rig camera (`klt_rig: AllCameras`).
+    previous_secondary: Vec<Image<u8, 1>>,
     tracking_duration: Duration,
     tracking_timings: TrackingTimings,
     trace_enabled: bool,
@@ -260,17 +263,26 @@ impl SlamSystem {
         flow_pool: FlowPool,
     ) -> Self {
         let camera = rig.camera.clone();
+        let flow = settings.frontend_flow;
+        let mut tracker = Tracker::new(settings.map_projection)
+            .with_lk_kernel(settings.klt_kernel)
+            .with_lk_window(flow.window)
+            .with_pose_gate(settings.pose_gate)
+            .with_local_map_rules(settings.tracking.local_map)
+            .with_relocalization_solver(settings.relocalization.solver);
+        if flow.rig == KltRig::AllCameras
+            && rig.is_multi_camera()
+            && let Some(geometry) = frontend.rig_geometry()
+        {
+            tracker = tracker.with_rig_flow(Arc::clone(geometry), flow.threads);
+        }
         let map = Arc::new(Mutex::new(Map::new()));
         let local_mapping =
             LocalMapping::new(settings.local_mapping, Arc::clone(&map), camera.clone());
         let map_publication_gate = local_mapping.publication_gate();
         Self {
             rig,
-            tracker: Tracker::new(settings.map_projection)
-                .with_lk_kernel(settings.klt_kernel)
-                .with_pose_gate(settings.pose_gate)
-                .with_local_map_rules(settings.tracking.local_map)
-                .with_relocalization_solver(settings.relocalization.solver),
+            tracker,
             two_view_init_config: settings.two_view_init,
             keyframe_policy: settings.keyframe_policy,
             tracking_loss_recovery: settings.tracking_loss_recovery,
@@ -307,6 +319,7 @@ impl SlamSystem {
             loop_closure_events: Vec::new(),
             frontend,
             previous_image: None,
+            previous_secondary: Vec::new(),
             tracking_duration: Duration::ZERO,
             tracking_timings: TrackingTimings::default(),
             trace_enabled: false,
@@ -482,6 +495,7 @@ impl SlamSystem {
             ba_solves: mapping.ba_solves,
             ba_solve_ns: mapping.ba_solve_ns,
             large_window_solves: mapping.large_window_solves,
+            flow_reconcile_clears: self.tracker.reconcile_clears(),
             ..self.counters
         }
     }
@@ -619,6 +633,11 @@ impl SlamSystem {
             idx: self.next_frame_idx,
             capture,
         };
+        let primary_only = [image];
+        let images: &[&Image<u8, 1>] = match capture {
+            Capture::Rig(images) => images,
+            Capture::Mono(_) | Capture::Stereo(..) => &primary_only,
+        };
         let deferrable = self.klt_min_tracks.is_some()
             && self.state.mode != SystemMode::Bootstrap
             && self.previous_image.is_some();
@@ -627,7 +646,7 @@ impl SlamSystem {
         } else {
             FrameSource::Ready(Box::new(self.extract(pending)?))
         };
-        self.track_frame(source, image, timestamp_sec)
+        self.track_frame(source, images, timestamp_sec)
     }
 
     /// ORB features of a capture, undistorted, with the stereo report.
@@ -660,13 +679,17 @@ impl SlamSystem {
         }
     }
 
-    /// Takes a prepared or deferred frame as the next one and tracks it.
+    /// Takes a prepared or deferred frame as the next one and tracks it;
+    /// `images[0]` is the primary camera's image.
     fn track_frame(
         &mut self,
         source: FrameSource<'_>,
-        image: &Image<u8, 1>,
+        images: &[&Image<u8, 1>],
         timestamp_sec: f64,
     ) -> Result<TrackingResult, ProcessError> {
+        let Some(&image) = images.first() else {
+            return Err(ProcessError::NotARig);
+        };
         self.next_frame_idx += 1;
         if self.session_recording {
             self.session_frame_timestamps
@@ -680,7 +703,7 @@ impl SlamSystem {
         self.deferred_extraction = Duration::ZERO;
         let tracking_start = Instant::now();
         self.last_skip = None;
-        let result = self.process_prepared(source, previous_image.as_ref(), image, timestamp_sec);
+        let result = self.process_prepared(source, previous_image.as_ref(), images, timestamp_sec);
         self.tracking_duration = tracking_start
             .elapsed()
             .saturating_sub(self.deferred_extraction);
@@ -695,6 +718,9 @@ impl SlamSystem {
             }
         }
         self.retain_previous_image(image, previous_image);
+        if self.tracker.flows_rig() {
+            self.retain_secondary_images(&images[1..]);
+        }
         result
     }
 
@@ -739,6 +765,20 @@ impl SlamSystem {
             }
             _ => Some(image.clone()),
         };
+    }
+
+    /// Copies rig cameras 1 and up into their previous-image buffers.
+    fn retain_secondary_images(&mut self, images: &[&Image<u8, 1>]) {
+        self.previous_secondary.truncate(images.len());
+        for (camera, image) in images.iter().enumerate() {
+            match self.previous_secondary.get_mut(camera) {
+                Some(buffer) if buffer.size() == image.size() => {
+                    buffer.as_slice_mut().copy_from_slice(image.as_slice());
+                }
+                Some(buffer) => *buffer = (*image).clone(),
+                None => self.previous_secondary.push((*image).clone()),
+            }
+        }
     }
 
     /// Map reuse: how many of the frame's matches are landmarks tracking
@@ -810,7 +850,7 @@ impl SlamSystem {
         &mut self,
         source: FrameSource<'_>,
         previous_image: Option<&Image<u8, 1>>,
-        current_image: &Image<u8, 1>,
+        images: &[&Image<u8, 1>],
         timestamp_sec: f64,
     ) -> Result<TrackingResult, ProcessError> {
         // Local-BA snapshots, merges, and their correction messages can only
@@ -828,10 +868,10 @@ impl SlamSystem {
                 Ok(self.bootstrap_step(frame, timestamp_sec))
             }
             SystemMode::ImuInit => {
-                self.inertial_init_step(source, previous_image, current_image, timestamp_sec)
+                self.inertial_init_step(source, previous_image, images, timestamp_sec)
             }
             SystemMode::Tracking => {
-                self.tracking_step(source, previous_image, current_image, timestamp_sec)
+                self.tracking_step(source, previous_image, images, timestamp_sec)
             }
         }
     }
@@ -1334,10 +1374,10 @@ impl SlamSystem {
         &mut self,
         source: FrameSource<'_>,
         previous_image: Option<&Image<u8, 1>>,
-        current_image: &Image<u8, 1>,
+        images: &[&Image<u8, 1>],
         timestamp_sec: f64,
     ) -> Result<TrackingResult, ProcessError> {
-        let result = self.tracking_step(source, previous_image, current_image, timestamp_sec)?;
+        let result = self.tracking_step(source, previous_image, images, timestamp_sec)?;
 
         if result.status == TrackingStatus::KeyframeAccepted
             && let Some(start_idx) = self.inertial.schedule.start_kf_idx()
@@ -1504,9 +1544,10 @@ impl SlamSystem {
         &mut self,
         source: FrameSource<'_>,
         previous_image: Option<&Image<u8, 1>>,
-        current_image: &Image<u8, 1>,
+        images: &[&Image<u8, 1>],
         timestamp_sec: f64,
     ) -> Result<TrackingResult, ProcessError> {
+        let current_image = images[0];
         let frame_idx = source.idx();
         let pose_before = self.state.pose_world_to_cam;
         let prev_timestamp = self.state.last_frame_timestamp_sec;
@@ -1550,30 +1591,12 @@ impl SlamSystem {
                 self.tracker.local_map_config(),
             ));
         }
-        let survivors = match self.klt_prediction.filter(|_| trusted_prediction) {
-            Some((max_level, max_iter)) => {
-                let map = self.map.lock().unwrap();
-                let guess = FlowGuess {
-                    map: &map,
-                    pose: &candidate_pose,
-                    camera: &self.rig.camera,
-                    max_level,
-                    max_iter,
-                };
-                self.tracker.flow(
-                    previous_image,
-                    current_image,
-                    Some(guess),
-                    &mut self.tracking_timings,
-                )
-            }
-            None => self.tracker.flow(
-                previous_image,
-                current_image,
-                None,
-                &mut self.tracking_timings,
-            ),
-        };
+        let survivors = self.flow(
+            previous_image,
+            images,
+            &candidate_pose,
+            trusted_prediction,
+        );
         let estimation = Estimation {
             candidate_pose,
             pose_before,
@@ -1820,6 +1843,48 @@ impl SlamSystem {
             self.prune_imu_before(kf_ts.min(timestamp_sec));
         }
         Ok(self.frame_result(status))
+    }
+
+    /// This frame's optical-flow survivors from the previous capture, started
+    /// at the predicted pose's pixels when the prediction is trusted.
+    fn flow(
+        &mut self,
+        previous_image: Option<&Image<u8, 1>>,
+        images: &[&Image<u8, 1>],
+        candidate_pose: &Pose3d,
+        trusted_prediction: bool,
+    ) -> Option<Vec<FlowSurvivor>> {
+        let map = self.map.lock().unwrap();
+        let guess = self
+            .klt_prediction
+            .filter(|_| trusted_prediction)
+            .map(|(max_level, max_iter)| FlowGuess {
+                map: &map,
+                pose: candidate_pose,
+                camera: &self.rig.camera,
+                max_level,
+                max_iter,
+            });
+        if self.tracker.flows_rig() {
+            let mut previous: Vec<&Image<u8, 1>> = Vec::with_capacity(images.len());
+            previous.extend(previous_image);
+            previous.extend(self.previous_secondary.iter());
+            return self
+                .tracker
+                .flow_cameras(&previous, images, guess, &mut self.tracking_timings);
+        }
+        if guess.is_none() {
+            // Today's unpredicted flow reads no map.
+            drop(map);
+            return self.tracker.flow(
+                previous_image,
+                images[0],
+                None,
+                &mut self.tracking_timings,
+            );
+        }
+        self.tracker
+            .flow(previous_image, images[0], guess, &mut self.tracking_timings)
     }
 
     /// What this frame's tracked pose is checked against: the inertial

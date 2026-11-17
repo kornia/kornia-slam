@@ -13,6 +13,7 @@ use kornia_imgproc::pyramid::pyrdown_f32;
 use thiserror::Error;
 
 use crate::mapping::Map;
+use crate::tracking::flow_tracker::ShardLayout;
 use crate::tracking::timings::{TrackingTimings, timed};
 
 /// Stable identity for a feature track.
@@ -124,11 +125,45 @@ pub enum TrackSetError {
 pub struct TrackSet {
     next_id: u64,
     tracks: Vec<Track>,
+    /// Flow shard of each new track; every track on shard 0 by default.
+    layout: ShardLayout,
+    /// Identities never restart, since flow shards cache templates by them.
+    monotonic_ids: bool,
 }
 
 impl TrackSet {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty set whose new tracks are spread over `threads` flow shards
+    /// of a `cameras`-camera rig (see `FlowPool`).
+    pub fn with_flow_threads(threads: usize, cameras: usize) -> Self {
+        Self {
+            layout: ShardLayout::new(threads, cameras),
+            ..Self::default()
+        }
+    }
+
+    /// Keeps identities unique across [`Self::clear`], for flow shards that
+    /// cache templates by track identity.
+    pub(crate) fn with_monotonic_ids(mut self) -> Self {
+        self.monotonic_ids = true;
+        self
+    }
+
+    /// Drops every track, keeping the shard layout. Identities restart, as
+    /// in a new set, unless they must stay unique.
+    pub fn clear(&mut self) {
+        self.tracks.clear();
+        if !self.monotonic_ids {
+            self.next_id = 0;
+        }
+    }
+
+    /// Flow shard that refills `camera` (see `FlowPool`).
+    pub(crate) fn refill_shard(&self, camera: usize) -> usize {
+        self.layout.refill_shard(camera)
     }
 
     pub fn tracks(&self) -> &[Track] {
@@ -163,10 +198,52 @@ impl TrackSet {
         id
     }
 
+    /// As [`Self::spawn_in`], on the shard the layout gives `camera`.
+    pub fn spawn_on(&mut self, pixel: [f32; 2], camera: usize) -> TrackId {
+        let shard = self.layout.assign(camera);
+        self.spawn_in(pixel, camera, shard)
+    }
+
+    /// A new track already associated with map point `map_point_idx` at
+    /// `position` (world frame).
+    pub(crate) fn spawn_associated(
+        &mut self,
+        pixel: [f32; 2],
+        camera: usize,
+        map_point_idx: usize,
+        position: Vec3F64,
+    ) -> TrackId {
+        let id = self.spawn_on(pixel, camera);
+        if let Some(track) = self.tracks.last_mut() {
+            track.map_point_idx = Some(map_point_idx);
+            track.position = Some(position);
+        }
+        id
+    }
+
     /// Rewrites every associated track's `position` from `map`, `None` for a
     /// culled point; returns how many it rewrote (`flow_position_refreshes`).
-    pub fn refresh_positions(&mut self, _map: &Map) -> u64 {
-        todo!("lane T: track positions after a map change")
+    pub fn refresh_positions(&mut self, map: &Map) -> u64 {
+        let mut rewritten = 0;
+        for track in &mut self.tracks {
+            let Some(idx) = track.map_point_idx else {
+                continue;
+            };
+            track.position = map
+                .map_points()
+                .get(idx)
+                .filter(|mp| !mp.culled)
+                .map(|mp| mp.position);
+            rewritten += 1;
+        }
+        rewritten
+    }
+
+    /// Whether some track follows map point `map_point_idx`.
+    pub(crate) fn follows(&self, map_point_idx: usize) -> bool {
+        self.tracks
+            .iter()
+            .any(|track| track.map_point_idx == Some(map_point_idx))
     }
 
     /// Advances the active set to the supplied KLT survivors.
@@ -210,6 +287,19 @@ impl TrackSet {
         matches: &[MapKeypointMatch],
         keypoints: &[[f32; 2]],
     ) -> Result<(), TrackSetError> {
+        self.reconcile_in_cameras(matches, keypoints, |_| 0)
+    }
+
+    /// As [`Self::reconcile_from_matches`] over every rig camera's keypoints:
+    /// `camera_of` gives the camera of a keypoint index. A map point now seen
+    /// by another camera starts a new track, since its template and shard
+    /// belong to the old camera.
+    pub(crate) fn reconcile_in_cameras(
+        &mut self,
+        matches: &[MapKeypointMatch],
+        keypoints: &[[f32; 2]],
+        camera_of: impl Fn(usize) -> usize,
+    ) -> Result<(), TrackSetError> {
         let mut seen_map_points = HashSet::with_capacity(matches.len());
         let mut seen_keypoints = HashSet::with_capacity(matches.len());
         for matched in matches {
@@ -229,38 +319,45 @@ impl TrackSet {
             .iter()
             .filter_map(|track| track.map_point_idx.map(|idx| (idx, *track)))
             .collect();
+        let retained = |matched: &MapKeypointMatch| {
+            old_by_map_point
+                .get(&matched.map_point_idx)
+                .filter(|previous| previous.camera() == camera_of(matched.keypoint_idx))
+        };
         let new_count = matches
             .iter()
-            .filter(|matched| !old_by_map_point.contains_key(&matched.map_point_idx))
+            .filter(|matched| retained(matched).is_none())
             .count();
         let start_id = self.reserve_ids(new_count);
         let mut next_new_id = start_id;
 
-        self.tracks = matches
-            .iter()
-            .map(|matched| {
-                if let Some(previous) = old_by_map_point.get(&matched.map_point_idx) {
-                    Track {
-                        pixel: keypoints[matched.keypoint_idx],
-                        map_point_idx: Some(matched.map_point_idx),
-                        age: previous.age.saturating_add(1),
-                        ..*previous
-                    }
-                } else {
-                    let id = TrackId(next_new_id);
-                    next_new_id += 1;
-                    Track {
-                        id,
-                        pixel: keypoints[matched.keypoint_idx],
-                        map_point_idx: Some(matched.map_point_idx),
-                        age: 1,
-                        position: None,
-                        camera: 0,
-                        shard: 0,
-                    }
+        let mut tracks = Vec::with_capacity(matches.len());
+        for matched in matches {
+            let pixel = keypoints[matched.keypoint_idx];
+            let track = if let Some(previous) = retained(matched) {
+                Track {
+                    pixel,
+                    map_point_idx: Some(matched.map_point_idx),
+                    age: previous.age.saturating_add(1),
+                    ..*previous
                 }
-            })
-            .collect();
+            } else {
+                let id = TrackId(next_new_id);
+                next_new_id += 1;
+                let camera = camera_of(matched.keypoint_idx);
+                Track {
+                    id,
+                    pixel,
+                    map_point_idx: Some(matched.map_point_idx),
+                    age: 1,
+                    position: None,
+                    camera: camera as u8,
+                    shard: self.layout.assign(camera) as u8,
+                }
+            };
+            tracks.push(track);
+        }
+        self.tracks = tracks;
         Ok(())
     }
 
@@ -364,8 +461,19 @@ impl KltTracker {
         self
     }
 
+    /// Tracks with `win × win` LK windows; the f32 kernel supports 21 only.
+    pub fn with_window(mut self, win: usize) -> Self {
+        self.params.win_size = win;
+        self
+    }
+
     pub fn params(&self) -> &PyrLKParams {
         &self.params
+    }
+
+    /// The kernel [`Self::track_cached`] runs on.
+    pub fn kernel(&self) -> LkKernel {
+        self.kernel
     }
 
     pub fn survivor_filter(&self) -> SurvivorFilterConfig {
@@ -626,7 +734,8 @@ impl KltTracker {
         survivors
     }
 
-    fn accepts(
+    /// Whether a flow result for `track` survives `filter`.
+    pub(crate) fn accepts(
         track: &Track,
         status: u8,
         error: f32,
@@ -842,7 +951,7 @@ pub fn snap_unique(
 /// re-seeds from the next successful frame.
 pub(crate) fn carry_klt_survivors(track_set: &mut TrackSet, survivors: Option<Vec<FlowSurvivor>>) {
     if survivors.is_none_or(|survivors| track_set.advance(survivors).is_err()) {
-        *track_set = TrackSet::new();
+        track_set.clear();
     }
 }
 
