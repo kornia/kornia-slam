@@ -15,16 +15,21 @@
 
 use faer::Mat;
 use faer::prelude::Solve;
-use kornia_algebra::Vec3F64;
+use kornia_algebra::{SE3F64, SO3F64, Vec3F64};
+use kornia_factors::inertial::preintegration::{self, ImuFactor};
 use thiserror::Error;
 
 use crate::mapping::vi_ba_schur::{
-    ImuFactor, ViBaKeyframe, ViBaParams, accum_jt_omega_j, idx15, imu_information_matrix,
-    imu_residual_and_jacobians,
+    ViBaKeyframe, ViBaParams, accum_jt_omega_j, imu_information_matrix,
 };
-use crate::mapping::wheel_odom::se3_log;
 
 const DOF: usize = 15;
+
+/// Row-major index of `(row, col)` in the prior's 15×15 information.
+#[inline]
+const fn idx15(row: usize, col: usize) -> usize {
+    row * DOF + col
+}
 
 /// A prior moved further than this from its linearization point, in metres
 /// or radians of the pose tangent, is dropped: its FEJ Hessian no longer
@@ -107,12 +112,14 @@ pub struct MarginalPrior {
 impl MarginalPrior {
     /// `kf ⊖ lin_point`.
     pub fn tangent(&self, kf: &ViBaKeyframe) -> [f64; 15] {
-        let pose = se3_log(&self.lin_point.pose.inverse().compose(&kf.pose));
+        let delta = self.lin_point.pose.inverse().compose(&kf.pose);
+        let (rho, omega) =
+            SE3F64::new(SO3F64::from_matrix(&delta.rotation), delta.translation).log();
         let v = kf.velocity - self.lin_point.velocity;
         let bg = kf.bias.gyro - self.lin_point.bias.gyro;
         let ba = kf.bias.accel - self.lin_point.bias.accel;
         let mut d = [0.0; DOF];
-        d[..6].copy_from_slice(&pose);
+        d[..6].copy_from_slice(&[rho.x, rho.y, rho.z, omega.x, omega.y, omega.z]);
         for (k, x) in [v, bg, ba].into_iter().enumerate() {
             d[6 + 3 * k..9 + 3 * k].copy_from_slice(&[x.x, x.y, x.z]);
         }
@@ -200,9 +207,9 @@ pub(super) fn marginalize_frozen(
     if !pseudo.is_valid() {
         return Err(MarginalizationError::InvalidSigma);
     }
-    let (res, j_frozen, j_next) = imu_residual_and_jacobians(
-        frozen,
-        next,
+    let (res, j_frozen, j_next) = preintegration::residual_and_jacobians(
+        frozen.nav_state(),
+        next.nav_state(),
         &edge.preintegrated,
         &params.gravity,
         params.imu_t_bc.as_ref(),
@@ -280,7 +287,6 @@ pub(super) fn marginalize_frozen(
 mod tests {
     use super::*;
     use kornia_3d::pose::Pose3d;
-    use kornia_algebra::SO3F64;
     use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 
     const EDGE_S: f64 = 0.2;
@@ -352,11 +358,7 @@ mod tests {
             };
             pim.integrate(&sample, dt);
         }
-        ImuFactor {
-            from_idx: k,
-            to_idx: k + 1,
-            preintegrated: pim,
-        }
+        ImuFactor::new(k, k + 1, pim)
     }
 
     /// Six keyframes of constant acceleration with a slow yaw, states
@@ -404,9 +406,9 @@ mod tests {
         let mut h = Mat::<f64>::zeros(n, n);
         let mut m = vec![0.0; n];
         for e in edges {
-            let (res, ji, jj) = imu_residual_and_jacobians(
-                &keyframes[e.from_idx],
-                &keyframes[e.to_idx],
+            let (res, ji, jj) = preintegration::residual_and_jacobians(
+                keyframes[e.from_idx].nav_state(),
+                keyframes[e.to_idx].nav_state(),
                 &e.preintegrated,
                 &params.gravity,
                 None,
@@ -470,11 +472,7 @@ mod tests {
         }
         let window_edges: Vec<ImuFactor> = edges[3..]
             .iter()
-            .map(|e| ImuFactor {
-                from_idx: e.from_idx - 3,
-                to_idx: e.to_idx - 3,
-                preintegrated: e.preintegrated.clone(),
-            })
+            .map(|e| ImuFactor::new(e.from_idx - 3, e.to_idx - 3, e.preintegrated.clone()))
             .collect();
         let sliding = gn_step(
             &keyframes[3..],

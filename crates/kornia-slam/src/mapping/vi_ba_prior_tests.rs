@@ -101,11 +101,7 @@ fn cruise_edge(k: usize, gravity: Vec3F64) -> ImuFactor {
     for _ in 0..n {
         preintegrated.integrate(&sample, EDGE_S / n as f64);
     }
-    ImuFactor {
-        from_idx: k,
-        to_idx: k + 1,
-        preintegrated,
-    }
+    ImuFactor::new(k, k + 1, preintegrated)
 }
 
 /// Fixed landmarks 5 and 15 m ahead of each free keyframe, imaged exactly:

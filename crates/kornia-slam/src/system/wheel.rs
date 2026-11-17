@@ -11,10 +11,10 @@
 
 use std::collections::VecDeque;
 
-use crate::mapping::wheel_odom::{WheelOdomFactor, WheelOdomMeasurement};
 use crate::pose_conversion::rotation_defect;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
+use kornia_factors::wheel_odometry::{WheelOdomFactor, WheelOdomMeasurement};
 
 /// A wheel-odometry configuration or mount that cannot be used.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

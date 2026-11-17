@@ -309,7 +309,7 @@ impl SlamSystem {
     }
 
     /// Adds wheel odometry to local BA: each keyframe interval the readings cover becomes a
-    /// planar [`crate::mapping::wheel_odom::WheelOdomFactor`]. Off until called, and with no
+    /// planar [`kornia_factors::wheel_odometry::WheelOdomFactor`]. Off until called, and with no
     /// effect on a system that is never given readings.
     pub fn enable_wheel_odometry(&mut self, config: wheel::WheelOdomConfig) {
         self.wheel = Some(wheel::WheelState::new(config));
@@ -337,7 +337,7 @@ impl SlamSystem {
         }
     }
 
-    fn wheel_factors(&self) -> Vec<crate::mapping::wheel_odom::WheelOdomFactor> {
+    fn wheel_factors(&self) -> Vec<kornia_factors::wheel_odometry::WheelOdomFactor> {
         self.wheel
             .as_ref()
             .map_or_else(Vec::new, |w| w.factors().to_vec())

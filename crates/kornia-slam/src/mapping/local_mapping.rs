@@ -45,7 +45,7 @@ pub struct KeyframeJob {
     pub gravity_world: Vec3F64,
     pub local_ba: LocalBaParams,
     /// Wheel-odometry edges between keyframes; empty without a wheel feed.
-    pub wheel_factors: Vec<super::wheel_odom::WheelOdomFactor>,
+    pub wheel_factors: Vec<kornia_factors::wheel_odometry::WheelOdomFactor>,
 }
 
 fn capture_local_window(map: &Map, job: &KeyframeJob) -> BaSnapshot {

@@ -157,7 +157,7 @@ pub struct ViBaKeyframe {
 }
 
 impl ViBaKeyframe {
-    fn nav_state(&self) -> NavState<'_> {
+    pub(super) fn nav_state(&self) -> NavState<'_> {
         NavState {
             pose_cw: &self.pose,
             velocity: self.velocity,

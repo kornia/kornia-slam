@@ -446,7 +446,7 @@ impl MapProjectionEstimator {
         camera: &PinholeCamera,
         current_keyframe_idx: Option<usize>,
         search_scale: f32,
-        seeded: Vec<(usize, usize)>,
+        mut seeded: Vec<(usize, usize)>,
         timings: &mut TrackingTimings,
     ) -> Result<Estimate, MapProjectionRejectReason> {
         let pnp = &self.config.pnp;
@@ -455,6 +455,7 @@ impl MapProjectionEstimator {
         }
         let current_kf = current_keyframe_idx.and_then(|ki| map.get_keyframe(ki));
         let keypoints_undist = undistorted_keypoints(frame, camera);
+        seeded.retain(|&(_, kp_idx)| keypoints_undist.get(kp_idx).is_some_and(is_finite_xy));
         let grids = view_grids(frame, &keypoints_undist, camera);
         let matches = timed(&mut timings.consistency_filter, || {
             self.geometric_consistency_filter(current_kf, &seeded, frame, &keypoints_undist, camera)
