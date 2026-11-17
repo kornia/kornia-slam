@@ -81,7 +81,7 @@ impl FrozenPoseSigma {
     }
 }
 
-/// Why [`marginalize_frozen`] produced no prior.
+/// Why marginalizing a frozen keyframe produced no prior.
 #[derive(Debug, Error, PartialEq)]
 pub enum MarginalizationError {
     #[error("frozen pose sigma is not finite and positive")]
