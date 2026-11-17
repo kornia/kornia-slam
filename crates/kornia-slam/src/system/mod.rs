@@ -73,6 +73,7 @@ use crate::mapping::map::{
     InertialAlignmentError, Keyframe, Map, MapInsertion, MapMutationError, MapPoint,
     StateEnvelopeLimits,
 };
+use crate::mapping::session::{SessionKeyframe, SessionLandmark, snapshot_map};
 use crate::mapping::{GrowthNeighbours, KeyframeJob, LocalMapping, SegmentId};
 use crate::pose_conversion::{RIGID_TOLERANCE, apply_reference_pose_correction};
 use build::SystemSettings;
@@ -164,9 +165,11 @@ pub struct SlamSystem {
     #[allow(dead_code)] // skeleton: lane A reads it
     sample_interpolation: SampleInterpolation,
     // Keyframes a map bound evicted, copied while a session is recorded.
-    #[allow(dead_code)] // skeleton: lane D reads it
     session_recording: bool,
     evicted_keyframes: Vec<Keyframe>,
+    // `(frame idx, timestamp)` of every frame tracked while recording: a
+    // keyframe holds no stamp of its own.
+    session_frame_timestamps: Vec<(usize, f64)>,
     /// The current re-seed holds its translation at the last tracked
     /// position; the attitude still follows the gyro.
     reseed_held: bool,
@@ -260,6 +263,7 @@ impl SlamSystem {
             sample_interpolation: settings.inertial.sample_interpolation,
             session_recording: false,
             evicted_keyframes: Vec::new(),
+            session_frame_timestamps: Vec::new(),
             reseed_held: false,
             reseed_coast_from_sec: 0.0,
             stereo_close_depth: settings.stereo_close_depth_m,
@@ -319,6 +323,31 @@ impl SlamSystem {
         self.segments.of(kf_idx)
     }
 
+    /// The recorded session's keyframes (live, then evicted) and live
+    /// landmarks; a keyframe tracked before recording began is stamped NaN.
+    pub fn session_snapshot(&self) -> (Vec<SessionKeyframe>, Vec<SessionLandmark>) {
+        let stamps = &self.session_frame_timestamps;
+        let timestamp_of = |idx: usize| {
+            stamps
+                .binary_search_by_key(&idx, |&(i, _)| i)
+                .map_or(f64::NAN, |slot| stamps[slot].1)
+        };
+        let map = self.map.lock().unwrap();
+        snapshot_map(
+            &map,
+            &self.rig,
+            &self.evicted_keyframes,
+            |kf| self.segment_of(kf),
+            timestamp_of,
+        )
+    }
+
+    /// Gravity in the world frame (m/s²): `+Y` once the inertial
+    /// initialization has aligned the map.
+    pub fn gravity_world(&self) -> Vec3F64 {
+        self.inertial.gravity_world
+    }
+
     /// Runs inside a frame, which already holds the map publication gate.
     fn enforce_map_bound(&mut self) {
         let Some((max_keyframes, culling)) = self.map_bound.clone() else {
@@ -326,13 +355,25 @@ impl SlamSystem {
         };
         let report = {
             let mut map = self.map.lock().unwrap();
+            // Only a map above the bound loses keyframes, so only then is a copy owed.
+            let before = (self.session_recording && map.keyframes().len() > max_keyframes)
+                .then(|| map.keyframes().to_vec());
             let wheel_factors = self.wheel.as_mut().map(|w| w.factors_mut());
-            crate::mapping::culling::bound_keyframes(
+            let report = crate::mapping::culling::bound_keyframes(
                 &mut map,
                 max_keyframes,
                 &culling,
                 wheel_factors,
-            )
+            );
+            if let Some(before) = before {
+                let removed: std::collections::HashSet<usize> = report.removed().collect();
+                self.evicted_keyframes.extend(
+                    before
+                        .into_iter()
+                        .filter(|kf| removed.contains(&kf.frame.idx)),
+                );
+            }
+            report
         };
         if report.culled.is_empty() && report.evicted.is_empty() {
             return;
@@ -597,6 +638,10 @@ impl SlamSystem {
         timestamp_sec: f64,
     ) -> Result<TrackingResult, ProcessError> {
         self.next_frame_idx += 1;
+        if self.session_recording {
+            self.session_frame_timestamps
+                .push((self.next_frame_idx - 1, timestamp_sec));
+        }
         self.inertial.latest_image_timestamp_sec = Some(timestamp_sec);
         // Taken out for the call so tracking can borrow it alongside `self`.
         let previous_image = self.previous_image.take();

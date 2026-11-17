@@ -111,17 +111,50 @@ impl SmoothedTrajectory {
         Ok(unanchored)
     }
 
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// Every recorded frame as `(timestamp, keyframe, T_frame_from_kf)`
+    /// against the nearest keyframe of its parent chain that `kept` holds;
+    /// a frame with no such keyframe is left out.
+    pub fn anchored_frames<'a>(
+        &'a self,
+        kept: impl Fn(usize) -> bool + 'a,
+    ) -> impl Iterator<Item = (f64, usize, Pose3d)> + 'a {
+        self.frames.iter().filter_map(move |frame| {
+            let (kf, kf_from_ancestor) =
+                self.walk_parents(frame.reference_kf, |kf| kept(kf).then_some(kf))?;
+            Some((
+                frame.timestamp_sec,
+                kf,
+                frame.frame_from_kf.compose(&kf_from_ancestor),
+            ))
+        })
+    }
+
     fn final_keyframe_pose(
         &self,
         kf: usize,
         final_pose: &impl Fn(usize) -> Option<Pose3d>,
     ) -> Option<Pose3d> {
+        self.walk_parents(kf, final_pose)
+            .map(|(pose, kf_from_ancestor)| kf_from_ancestor.compose(&pose))
+    }
+
+    /// The first `found(ancestor)` up the parent chain from `kf`, with
+    /// `T_kf_from_ancestor`.
+    fn walk_parents<T>(
+        &self,
+        kf: usize,
+        found: impl Fn(usize) -> Option<T>,
+    ) -> Option<(T, Pose3d)> {
         let mut kf_from_ancestor = Pose3d::IDENTITY;
         let mut current = kf;
         // Parents always precede their children, so the chain ends.
         loop {
-            if let Some(pose) = final_pose(current) {
-                return Some(kf_from_ancestor.compose(&pose));
+            if let Some(value) = found(current) {
+                return Some((value, kf_from_ancestor));
             }
             let (parent, child_from_parent) = self.parents.get(&current)?;
             kf_from_ancestor = kf_from_ancestor.compose(child_from_parent);
@@ -190,6 +223,25 @@ mod tests {
         assert_eq!(written(&path), vec![-2.5, -3.5, -3.5]);
         assert_eq!(unanchored, 1);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Each frame stands on the nearest kept keyframe up its chain, with the
+    /// relative pose composed along the way.
+    #[test]
+    fn frames_are_anchored_to_the_nearest_kept_ancestor() {
+        let mut smoothed = SmoothedTrajectory::default();
+        smoothed.record(0.0, &translation(1.5), 10, &translation(1.0));
+        smoothed.record(0.1, &translation(2.5), 20, &translation(2.0));
+        smoothed.record(0.2, &translation(3.5), 30, &translation(3.0));
+        let anchored: Vec<_> = smoothed
+            .anchored_frames(|kf| kf == 10)
+            .map(|(t, kf, pose)| (t, kf, pose.translation.x))
+            .collect();
+        assert_eq!(
+            anchored,
+            vec![(0.0, 10, 0.5), (0.1, 10, 1.5), (0.2, 10, 2.5)]
+        );
+        assert_eq!(smoothed.anchored_frames(|kf| kf == 99).count(), 0);
     }
 
     #[test]

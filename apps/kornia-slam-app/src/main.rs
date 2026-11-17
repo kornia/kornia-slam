@@ -13,6 +13,7 @@ mod config;
 mod datasets;
 mod evaluation;
 mod map_dump;
+mod session;
 mod source;
 mod summary;
 mod trace_out;
@@ -225,6 +226,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprint!("{}", run.system);
     }
 
+    let imu_time_offset_ns = match &run.source {
+        source::SourceConfig::Lamaria(lamaria) => lamaria.imu_time_offset_ns,
+        _ => 0,
+    };
     let OpenedSource {
         mut source,
         ground_truth,
@@ -253,9 +258,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(std::path::Path::to_path_buf);
     let mut system = SlamSystem::build(run.system, source.rig()).map_err(|e| e.to_string())?;
     system.set_debug(args.debug);
-    if args.session_out.is_some() {
-        todo!("lane D: --session-out");
-    }
+    let mut session_recorder = args.session_out.as_ref().map(|_| {
+        system.set_session_recording(true);
+        session::SessionRecorder::new(imu_time_offset_ns)
+    });
     let mut trace_writer = args
         .trace_out
         .as_deref()
@@ -282,10 +288,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .transpose()?;
-    let mut smoothed = args
-        .trajectory_smoothed
-        .as_ref()
-        .map(|_| trajectory::SmoothedTrajectory::default());
+    // The session dump carries the smoothed frames too.
+    let mut smoothed = (args.trajectory_smoothed.is_some() || args.session_out.is_some())
+        .then(trajectory::SmoothedTrajectory::default);
     let mut blackout = args
         .blackout
         .as_deref()
@@ -359,6 +364,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rec.set_duration_secs("timestamp", timestamp_sec);
         }
 
+        if let Some(recorder) = session_recorder.as_mut() {
+            recorder.record(image.size(), &imu_samples);
+        }
         system.process_imu(&imu_samples);
         system.set_trace(trace_writer.is_some() && (args.trace_from..args.trace_to).contains(&idx));
         let result = match right_image.as_ref() {
@@ -561,13 +569,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(writer) = trajectory_coasted {
         writer.finish()?;
     }
-    if let (Some(smoothed), Some(path)) = (smoothed, args.trajectory_smoothed.as_deref()) {
+    if let (Some(smoothed), Some(path)) = (smoothed.as_ref(), args.trajectory_smoothed.as_deref()) {
         let writer = trajectory::TrajectoryWriter::create(
             std::path::Path::new(path),
             system.rig().camera_to_body(),
         )?;
         let unanchored = smoothed.write(writer, |kf| system.keyframe_pose(kf))?;
         eprintln!("Smoothed trajectory: {unanchored} frame(s) without a surviving keyframe");
+    }
+    if let (Some(recorder), Some(smoothed), Some(path)) =
+        (session_recorder, smoothed.as_ref(), args.session_out.as_deref())
+    {
+        let unanchored = recorder.write(std::path::Path::new(path), &system, smoothed)?;
+        eprintln!("Session: {path}, {unanchored} frame(s) without a dumped keyframe");
     }
     if let Some(path) = args.dump_map.as_deref() {
         system.with_map_points(|map_points| {
