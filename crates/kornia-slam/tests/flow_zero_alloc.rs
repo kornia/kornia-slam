@@ -184,7 +184,9 @@ fn replay(threads: usize, frames: usize, mut after_step: impl FnMut(usize, &[Flo
 
 #[test]
 fn a_warm_flow_step_does_not_allocate() {
-    let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for threads in 1..=3 {
         ALLOCATIONS.store(0, Ordering::SeqCst);
         replay(threads, WARM_UP + COUNTED, |_, _| {});
@@ -198,7 +200,9 @@ fn a_warm_flow_step_does_not_allocate() {
 
 #[test]
 fn survivors_do_not_depend_on_the_thread_count() {
-    let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let run = |threads| {
         let mut all = Vec::new();
         replay(threads, 30, |_, survivors| all.push(survivors.to_vec()));

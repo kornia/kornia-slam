@@ -1036,7 +1036,11 @@ mod tests {
         tracks.spawn([30.0, 30.0]);
 
         assert_eq!(tracks.refresh_positions(&map_with(&[before, before])), 2);
-        assert!(tracks.tracks()[..2].iter().all(|t| t.position() == Some(before)));
+        assert!(
+            tracks.tracks()[..2]
+                .iter()
+                .all(|t| t.position() == Some(before))
+        );
         assert_eq!(tracks.tracks()[2].position(), None);
 
         // The map changed under the tracks: one point moved, the other merged away.

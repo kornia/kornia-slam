@@ -2171,12 +2171,11 @@ fn solve_vi_ba(
             // distinct g2o edges). Scaling it by the *nav* residual's outlier-ness
             // was silencing the one thing meant to resist a bad nav window explaining
             // itself away through bias, in exactly the windows where that matters.
-            let (hw, c_imu) =
-                preintegration::weight_and_cost(
-                    &res,
-                    &omega_raw,
-                    imu_huber_chi2(edge, &kf_local, params).unwrap_or(0.0),
-                );
+            let (hw, c_imu) = preintegration::weight_and_cost(
+                &res,
+                &omega_raw,
+                imu_huber_chi2(edge, &kf_local, params).unwrap_or(0.0),
+            );
             cost_imu += c_imu;
             let omega: Mat15F64 = {
                 let mut o = omega_raw;
@@ -2759,9 +2758,8 @@ mod tests {
     use super::{
         BaObservation, ImuFactor, ImuHuber, ObservationViews, PinholeCamera, Pose3d,
         PreintegratedImu, RigObservationCamera, ViBaKeyframe, ViBaParams,
-        depth_residual_and_jacobian, imu_edge_information, imu_huber_chi2,
-        imu_information_matrix, residual_and_jacobians, visual_huber,
-        visual_inertial_bundle_adjust,
+        depth_residual_and_jacobian, imu_edge_information, imu_huber_chi2, imu_information_matrix,
+        residual_and_jacobians, visual_huber, visual_inertial_bundle_adjust,
     };
     use kornia_algebra::{SE3F32, SO3F32, SO3F64, Vec3AF32, Vec3F64};
     use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement};

@@ -10,7 +10,9 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::Mat3F64;
 use kornia_image::Image;
 
-use crate::system::{AnchorGuard, ForwardBackward, GyroGuess, KltRetry, OrbFrontendConfig, TrackRefill};
+use crate::system::{
+    AnchorGuard, ForwardBackward, GyroGuess, KltRetry, OrbFrontendConfig, TrackRefill,
+};
 use crate::tracking::flow_pool::{FlowFrames, FlowPool, FlowPoolError};
 use crate::tracking::optical_flow::{
     FlowSurvivor, KltTracker, SurvivorFilterConfig, Track, TrackId, TrackSet,
@@ -166,15 +168,17 @@ impl TemplateCache {
     fn align(&mut self, tracks: &[Track]) {
         self.scratch.clear();
         for track in tracks {
-            let (frame_id, template) =
-                match self.entries.binary_search_by_key(&track.id(), |entry| entry.0) {
-                    Ok(k) => {
-                        let entry = &mut self.entries[k];
-                        let frame_id = std::mem::replace(&mut entry.1, TAKEN);
-                        (frame_id, std::mem::take(&mut entry.2))
-                    }
-                    Err(_) => (NO_TEMPLATE, self.spare.pop().unwrap_or_default()),
-                };
+            let (frame_id, template) = match self
+                .entries
+                .binary_search_by_key(&track.id(), |entry| entry.0)
+            {
+                Ok(k) => {
+                    let entry = &mut self.entries[k];
+                    let frame_id = std::mem::replace(&mut entry.1, TAKEN);
+                    (frame_id, std::mem::take(&mut entry.2))
+                }
+                Err(_) => (NO_TEMPLATE, self.spare.pop().unwrap_or_default()),
+            };
             self.scratch.push((track.id(), frame_id, template));
         }
         for (_, frame_id, template) in self.entries.drain(..) {
@@ -291,7 +295,9 @@ impl FlowShard {
                 self.anchor_drops += 1;
                 continue;
             }
-            self.keep(slot, &track, result, previous, current, model, guess, timings);
+            self.keep(
+                slot, &track, result, previous, current, model, guess, timings,
+            );
         }
         if !guess.retry {
             self.templates.sort();
@@ -338,7 +344,13 @@ impl FlowShard {
             .max_level
             .min(previous.levels().min(current.levels()).saturating_sub(1));
         for level in (1..=levels).rev() {
-            if !extract_template(previous, track.pixel(), level, guess.window, &mut self.coarse) {
+            if !extract_template(
+                previous,
+                track.pixel(),
+                level,
+                guess.window,
+                &mut self.coarse,
+            ) {
                 continue;
             }
             let coarse =
@@ -466,7 +478,10 @@ impl FlowShard {
         else {
             return;
         };
-        let Some(frame) = current.get(camera).filter(|_| guess.refill_shard == self.index) else {
+        let Some(frame) = current
+            .get(camera)
+            .filter(|_| guess.refill_shard == self.index)
+        else {
             return;
         };
         let missing = per_camera.saturating_sub(guess.refill_occupied.len());
@@ -524,7 +539,11 @@ fn start_pixel(track: &Track, model: &FlowCamera, guess: &ShardGuess) -> [f32; 2
 }
 
 /// The ray through `raw` rotated by `R_cur_prev`, back in raw pixels.
-pub(crate) fn rotated_ray_pixel(camera: &PinholeCamera, rotation: &Mat3F64, raw: [f32; 2]) -> Option<[f32; 2]> {
+pub(crate) fn rotated_ray_pixel(
+    camera: &PinholeCamera,
+    rotation: &Mat3F64,
+    raw: [f32; 2],
+) -> Option<[f32; 2]> {
     let undistorted = camera.undistort(raw[0] as f64, raw[1] as f64)?;
     let ray = kornia_algebra::Vec3F64::new(
         (undistorted.x - camera.cx) / camera.fx,
@@ -734,7 +753,13 @@ impl RigFlow {
             return None;
         }
         let (_, max_iter) = self.settings.predicted;
-        let result = track_template(&self.adopted, previous, start, max_iter, self.settings.epsilon);
+        let result = track_template(
+            &self.adopted,
+            previous,
+            start,
+            max_iter,
+            self.settings.epsilon,
+        );
         let size = previous.plane().size();
         KltTracker::accepts(
             &Track::at(pixel),
@@ -789,8 +814,12 @@ impl RigFlow {
             };
             for image in images {
                 let window = self.settings.window;
-                frames.previous.push(Arc::new(LkFrame::new(image, window, frame_idx)?));
-                frames.current.push(Arc::new(LkFrame::new(image, window, frame_idx)?));
+                frames
+                    .previous
+                    .push(Arc::new(LkFrame::new(image, window, frame_idx)?));
+                frames
+                    .current
+                    .push(Arc::new(LkFrame::new(image, window, frame_idx)?));
             }
             self.frames = Some(frames);
             return Ok(());
@@ -852,7 +881,9 @@ impl RigFlow {
         timings.flow_prepare += started.elapsed();
 
         self.run_pass(timings)?;
-        if let KltRetry::CoarseLevel { max_level: retry_level } = self.settings.retry
+        if let KltRetry::CoarseLevel {
+            max_level: retry_level,
+        } = self.settings.retry
             && retry_level > max_level
             && self.shards.iter().any(|shard| !shard.retry.is_empty())
         {

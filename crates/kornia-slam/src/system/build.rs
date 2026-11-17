@@ -106,11 +106,9 @@ impl FlowSettings {
     /// reads yet. Knobs that need `WindowedU8` stop inside its flow path.
     pub(crate) fn unbuilt_knob(&self) -> Option<&'static str> {
         let today = Self::new(&OrbFrontendConfig::default());
-        [
-            ("keyframe_orb", self.keyframe_orb != today.keyframe_orb),
-        ]
-        .into_iter()
-        .find_map(|(knob, set)| set.then_some(knob))
+        [("keyframe_orb", self.keyframe_orb != today.keyframe_orb)]
+            .into_iter()
+            .find_map(|(knob, set)| set.then_some(knob))
     }
 }
 

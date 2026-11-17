@@ -17,13 +17,11 @@ use kornia_imgproc::features::OrbFeatures;
 use crate::Frame;
 use crate::frame::RigFeatures;
 use crate::mapping::Map;
-use crate::rig::RigGeometry;
 use crate::pose_conversion::{mat3_to_f32, mat3_to_f64, vec3_to_f32, vec3_to_f64};
+use crate::rig::RigGeometry;
 use crate::tracking::flow_tracker::{
     FlowOutput, FlowStepCounts, FlowStepInput, RigFlow, rotated_ray_pixel,
 };
-use crate::tracking::pose_estimation::rig_pnp::{RigObservation, solve_rig_pnp};
-use crate::upstream::kornia_3d::refine_analytic::refine_pose_analytic;
 use crate::tracking::local_map::{LocalMapRules, LocalMapSelectionConfig};
 use crate::tracking::optical_flow::{
     FlowPrediction, FlowSurvivor, KltPyramidCache, KltTracker, LkKernel, MapKeypointMatch, Track,
@@ -32,12 +30,14 @@ use crate::tracking::optical_flow::{
 use crate::tracking::pose_estimation::map_projection::{
     MapProjectionConfig, MapProjectionRejectReason,
 };
+use crate::tracking::pose_estimation::rig_pnp::{RigObservation, solve_rig_pnp};
 use crate::tracking::pose_estimation::{Estimate, MapProjectionEstimator};
 use crate::tracking::pose_gate::{GateReference, GateVerdict, PoseGap, PoseGate};
 use crate::tracking::relocalization::{
     Relocalization, RelocalizationConfig, RelocalizationSolver, relocalize,
 };
 use crate::tracking::timings::TrackingTimings;
+use crate::upstream::kornia_3d::refine_analytic::refine_pose_analytic;
 
 /// Everything the tracker needs about the current frame that it does not own.
 pub(crate) struct FrameInput<'a> {
@@ -366,9 +366,9 @@ impl Tracker {
                 0 => &mut self.klt_cache,
                 c => self.secondary_klt_caches.get_mut(c - 1)?,
             };
-            let tracked =
-                self.klt_tracker
-                    .track_cached(cache, &tracks, prediction, previous, current, timings);
+            let tracked = self
+                .klt_tracker
+                .track_cached(cache, &tracks, prediction, previous, current, timings);
             self.klt_errors += u64::from(tracked.is_err());
             survivors.extend(tracked.ok()?);
         }
@@ -567,9 +567,10 @@ impl Tracker {
             .zip(&output.cameras)
             .zip(&output.undistorted)
         {
-            let (Some(&(mp_idx, position)), Some(range)) =
-                (tracks.get(&survivor.track_id), camera_ranges.get_mut(camera))
-            else {
+            let (Some(&(mp_idx, position)), Some(range)) = (
+                tracks.get(&survivor.track_id),
+                camera_ranges.get_mut(camera),
+            ) else {
                 continue;
             };
             let kp_idx = features.keypoints_xy.len();
@@ -808,9 +809,9 @@ impl Tracker {
             })
             .collect();
         let reconciled = match self.rig {
-            Some(_) => self.track_set.reconcile_in_cameras(&track_matches, keypoints, |kp| {
-                frame.camera_of(kp)
-            }),
+            Some(_) => self
+                .track_set
+                .reconcile_in_cameras(&track_matches, keypoints, |kp| frame.camera_of(kp)),
             None => self
                 .track_set
                 .reconcile_from_matches(&track_matches, keypoints),
@@ -948,7 +949,10 @@ fn refine_mono(
             .is_some_and(|e| e <= prior_sq)
         {
             points_world.push(vec3_to_f32(o.point_world));
-            points_image.push(kornia_algebra::Vec2F32::new(o.pixel[0] as f32, o.pixel[1] as f32));
+            points_image.push(kornia_algebra::Vec2F32::new(
+                o.pixel[0] as f32,
+                o.pixel[1] as f32,
+            ));
         }
     }
     if points_world.len() < config.min_correspondences {

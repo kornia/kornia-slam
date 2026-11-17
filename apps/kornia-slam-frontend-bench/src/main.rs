@@ -80,8 +80,9 @@ fn rig_flow_mode(
     }
     let pose_iterations = match frontend.flow_pose {
         FlowPose::AnalyticGn { max_iter } => max_iter,
-        FlowPose::RansacPnp => kornia_slam::tracking::pose_estimation::pnp::PnpConfig::default()
-            .lm_max_iterations,
+        FlowPose::RansacPnp => {
+            kornia_slam::tracking::pose_estimation::pnp::PnpConfig::default().lm_max_iterations
+        }
     };
     Ok(RigFlowMode {
         settings,
@@ -105,8 +106,7 @@ fn process_cpu_ns() -> u64 {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Args = argh::from_env();
-    let mode =
-        Mode::parse(&args.mode).ok_or("--mode must be `today`, `klt-first` or `klt-rig`")?;
+    let mode = Mode::parse(&args.mode).ok_or("--mode must be `today`, `klt-first` or `klt-rig`")?;
     let rig_flow = (mode == Mode::KltRig)
         .then(|| rig_flow_mode(args.preset.as_deref(), args.flow_threads))
         .transpose()?;

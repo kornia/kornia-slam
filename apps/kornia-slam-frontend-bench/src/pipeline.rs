@@ -382,7 +382,10 @@ impl Pipeline {
         traced_tracks: Option<&Vec<TraceTrack>>,
     ) -> Result<StepOutput, Box<dyn std::error::Error>> {
         let mut timings = TrackingTimings::default();
-        let rig_flow = self.rig_flow.as_mut().ok_or("klt-rig needs its flow settings")?;
+        let rig_flow = self
+            .rig_flow
+            .as_mut()
+            .ok_or("klt-rig needs its flow settings")?;
         let images: Vec<&Image<u8, 1>> = images.iter().collect();
         rig_flow.prepare(&images, frame.frame_idx as u64, &mut timings)?;
         let index_of: HashMap<usize, usize> = local

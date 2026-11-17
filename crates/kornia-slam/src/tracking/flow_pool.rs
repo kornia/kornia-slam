@@ -113,7 +113,12 @@ impl FlowPool {
         let dispatched = Instant::now();
         self.timings.dispatch = dispatched - started;
 
-        inline.run(&frames.previous, &frames.current, guess, &mut self.inline_timings);
+        inline.run(
+            &frames.previous,
+            &frames.current,
+            guess,
+            &mut self.inline_timings,
+        );
         for (n, worker) in self.workers.iter_mut().enumerate() {
             worker.wait(n + 1)?;
         }
@@ -122,7 +127,10 @@ impl FlowPool {
 
         self.timings.shards[0] = self.inline_timings;
         for (n, (worker, shard)) in self.workers.iter_mut().zip(rest.iter_mut()).enumerate() {
-            let job = worker.job.as_mut().ok_or(FlowPoolError::WorkerGone(n + 1))?;
+            let job = worker
+                .job
+                .as_mut()
+                .ok_or(FlowPoolError::WorkerGone(n + 1))?;
             std::mem::swap(&mut job.shard, shard);
             if let Some(slot) = self.timings.shards.get_mut(n + 1) {
                 *slot = job.timings;
