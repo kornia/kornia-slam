@@ -591,7 +591,7 @@ fn descale(v: i32, n: i32) -> i32 {
 fn corner(p: [f32; 2], win: usize, width: usize, height: usize) -> Option<[isize; 2]> {
     let (x, y) = (p[0].floor(), p[1].floor());
     let w = win as f32;
-    if x < -w || x >= width as f32 || y < -w || y >= height as f32 {
+    if !(-w..width as f32).contains(&x) || !(-w..height as f32).contains(&y) {
         return None;
     }
     Some([x as isize, y as isize])
@@ -823,7 +823,7 @@ mod tests {
         assert!(track.status);
         assert!((track.pixel[0] - 100.6).abs() < 0.05, "{track:?}");
         assert!((track.pixel[1] - 79.65).abs() < 0.05, "{track:?}");
-        assert!(track.iterations >= 1 && track.iterations <= 10);
+        assert!((1..=10).contains(&track.iterations));
     }
 
     #[test]

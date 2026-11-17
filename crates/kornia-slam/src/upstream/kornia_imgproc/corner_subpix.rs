@@ -94,7 +94,7 @@ fn refine(
     eps2: f64,
 ) -> [f32; 2] {
     let (w, h) = (image.width() as f32, image.height() as f32);
-    let inside = |c: [f32; 2]| c[0] >= 0.0 && c[0] < w && c[1] >= 0.0 && c[1] < h;
+    let inside = |c: [f32; 2]| (0.0..w).contains(&c[0]) && (0.0..h).contains(&c[1]);
     if !inside(start) {
         return start;
     }

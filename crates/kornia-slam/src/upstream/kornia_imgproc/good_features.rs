@@ -116,10 +116,8 @@ pub fn good_features_to_track(
     let threshold = max_response * params.quality;
     let border = params.border_px as f32;
     let inside = |p: [f32; 2]| {
-        p[0] >= border
-            && p[1] >= border
-            && p[0] <= (w as f32 - 1.0) - border
-            && p[1] <= (h as f32 - 1.0) - border
+        (border..=(w as f32 - 1.0) - border).contains(&p[0])
+            && (border..=(h as f32 - 1.0) - border).contains(&p[1])
     };
     candidates.clear();
     for_each_region(&source, &cells, occupied_cells, |region| {
@@ -175,7 +173,8 @@ impl Source {
     fn cell_of(&self, p: [f32; 2], cells: &Cells) -> Option<usize> {
         let f = self.factor as f32;
         let (x, y) = ((p[0] - self.offset) / f, (p[1] - self.offset) / f);
-        let inside = x >= 0.0 && y >= 0.0 && x < self.width as f32 && y < self.height as f32;
+        let inside =
+            (0.0..self.width as f32).contains(&x) && (0.0..self.height as f32).contains(&y);
         if !inside {
             return None;
         }
@@ -574,7 +573,10 @@ mod tests {
             );
         }
         for (i, a) in found.iter().enumerate() {
-            assert!(a[0] >= 9.0 && a[1] >= 9.0 && a[0] <= 150.0 && a[1] <= 110.0);
+            assert!(
+                (9.0..=150.0).contains(&a[0]) && (9.0..=110.0).contains(&a[1]),
+                "{a:?}"
+            );
             for b in &found[i + 1..] {
                 let d2 = (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2);
                 assert!(d2 >= 100.0, "{a:?} and {b:?} closer than the spacing");
