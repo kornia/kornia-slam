@@ -8,7 +8,6 @@
 
 use super::snapshot::KeyframeBaState;
 use crate::mapping::map::{BaUpdate, Map};
-use crate::pose_conversion::rigid;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat15F64, SO3F64, Vec3F64};
 use kornia_sensors::imu::ImuBias;
@@ -360,10 +359,15 @@ impl Map {
             let (after, correction) = match node_by_keyframe.get(&idx) {
                 Some(&node) if before == snapshot[node] => (solved[node], corrections[node]),
                 Some(&node) => (
-                    rigid(before.compose(&corrections[node].inverse())),
+                    before
+                        .compose(&corrections[node].inverse())
+                        .orthonormalized(),
                     corrections[node],
                 ),
-                None => (rigid(before.compose(&frontier.inverse())), frontier),
+                None => (
+                    before.compose(&frontier.inverse()).orthonormalized(),
+                    frontier,
+                ),
             };
             if !finite_pose(&correction) || !finite_pose(&after) {
                 return Err(PoseGraphCorrectionError::NonFiniteCorrection);

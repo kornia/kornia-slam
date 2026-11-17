@@ -10,7 +10,6 @@ use kornia_sensors::imu::ImuCalib;
 use crate::inertial::ImuWindowStats;
 use crate::inertial::initialization::rotation_from_to;
 use crate::mapping::SegmentId;
-use crate::pose_conversion::rigid;
 pub(crate) use crate::tracking::motion::coast_is_plausible;
 pub(crate) use crate::upstream::kornia_3d::pose_ext::camera_centre;
 
@@ -206,7 +205,7 @@ impl RunawayDetector {
 /// re-seed keeps the gyro's attitude but not the coast's translation.
 pub(crate) fn held_at(attitude: &Pose3d, position: &Pose3d) -> Pose3d {
     let rotation = attitude.rotation;
-    rigid(Pose3d::new(rotation, -(rotation * camera_centre(position))))
+    Pose3d::new(rotation, -(rotation * camera_centre(position))).orthonormalized()
 }
 
 /// Seconds of specific force the tilt check averages: one sample is a
@@ -289,10 +288,7 @@ pub(crate) fn leveled(
     let correction = rotation_from_to(measured_up, -gravity_world).matrix();
     let cam_to_world = pose_world_to_cam.inverse();
     let rotation = (correction * cam_to_world.rotation).transpose();
-    rigid(Pose3d::new(
-        rotation,
-        -(rotation * cam_to_world.translation),
-    ))
+    Pose3d::new(rotation, -(rotation * cam_to_world.translation)).orthonormalized()
 }
 
 #[cfg(test)]
@@ -477,7 +473,7 @@ pub(crate) mod tests {
         );
         let position = centred_at(3.0);
         let held = held_at(&attitude, &position);
-        assert_eq!(held.rotation, rigid(attitude).rotation);
+        assert_eq!(held.rotation, attitude.orthonormalized().rotation);
         assert!((camera_centre(&held) - Vec3F64::new(3.0, 0.0, 0.0)).length() < 1e-12);
     }
 

@@ -1,18 +1,13 @@
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::SO3F64;
 
-pub(crate) use crate::upstream::kornia_3d::pose_ext::{orthonormalized, pose_to_se3, se3_to_pose};
+pub(crate) use crate::upstream::kornia_3d::pose_ext::{pose_to_se3, se3_to_pose};
 pub(crate) use crate::upstream::kornia_algebra::cast::{
     mat3_to_f32, mat3_to_f64, vec3_to_f32, vec3_to_f64,
 };
 
 /// Largest [`Pose3d::rotation_defect`] a pose rotation may carry and still count as rigid.
 pub(crate) const RIGID_TOLERANCE: f64 = 1e-6;
-
-/// `pose` with its rotation [`orthonormalized`]; the translation is kept.
-pub(crate) fn rigid(pose: Pose3d) -> Pose3d {
-    Pose3d::new(orthonormalized(pose.rotation), pose.translation)
-}
 
 /// Rotation angle between two poses, degrees.
 pub(crate) fn angle_deg(from: &Pose3d, to: &Pose3d) -> f64 {
@@ -32,7 +27,9 @@ pub(crate) fn apply_reference_pose_correction(
     reference_after: Pose3d,
 ) -> Pose3d {
     let current_from_reference = Pose3d::between(&reference_before, &current_pose);
-    rigid(current_from_reference.compose(&reference_after))
+    current_from_reference
+        .compose(&reference_after)
+        .orthonormalized()
 }
 
 #[cfg(test)]
@@ -50,9 +47,34 @@ mod tests {
 
     /// Angle in radians between two rotations.
     fn angle(a: &Mat3F64, b: &Mat3F64) -> f64 {
-        SO3F64::from_matrix(&orthonormalized(a.transpose() * *b))
-            .log()
-            .length()
+        let relative = Pose3d::new(a.transpose() * *b, Vec3F64::ZERO).orthonormalized();
+        SO3F64::from_matrix(&relative.rotation).log().length()
+    }
+
+    /// The quaternion projection `se3_to_pose` used before the SVD one.
+    fn quaternion_projection(r: Mat3F64) -> Mat3F64 {
+        SO3F64::from_quaternion(SO3F64::from_matrix(&r).q.normalize()).matrix()
+    }
+
+    #[test]
+    fn svd_and_quaternion_projection_agree_within_the_input_defect() {
+        let exact = Pose3d::new(rotation(), Vec3F64::ZERO);
+        let noise =
+            Mat3F64::from_cols_array(&[1e-9, -1e-9, 1e-9, -1e-9, 1e-9, 1e-9, 1e-9, -1e-9, -1e-9]);
+        let inputs = [
+            (exact, 1e-14),
+            (Pose3d::new(rotation() + noise, Vec3F64::ZERO), 1e-8),
+            (scaled_pose(1.001), 3.3e-4),
+        ];
+        for (input, tolerance) in inputs {
+            let projected = input.orthonormalized();
+            assert!(projected.rotation_defect() < 1e-12);
+            let svd = projected.rotation;
+            let old = quaternion_projection(input.rotation);
+            assert!(angle(&svd, &old) <= tolerance, "{}", angle(&svd, &old));
+            assert!(angle(&svd, &old) <= input.rotation_defect().max(1e-14));
+        }
+        assert!(angle(&scaled_pose(1.001).orthonormalized().rotation, &rotation()) < 1e-12);
     }
 
     fn assert_pose_close(a: &Pose3d, b: &Pose3d, tolerance: f64) {
