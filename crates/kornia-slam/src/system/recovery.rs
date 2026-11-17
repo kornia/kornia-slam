@@ -94,13 +94,11 @@ impl Segments {
     }
 
     /// The newest segment: the one being tracked, or the one just given up.
-    #[allow(dead_code)] // skeleton: lane B calls it
     pub(crate) fn latest(&self) -> SegmentId {
         self.starts.len().saturating_sub(1) as SegmentId
     }
 
     /// First keyframe of the newest segment; `None` before the first seed.
-    #[allow(dead_code)] // skeleton: lane B calls it
     pub(crate) fn latest_start(&self) -> Option<usize> {
         self.starts.last().copied()
     }
@@ -111,15 +109,14 @@ impl Segments {
 /// near the prediction, or a drifted part of the map would teleport the
 /// trajectory. Once lost, an older segment is another map to merge into
 /// (ORB-SLAM3's Atlas): its drift against the coast is unknown, so any jump is.
-#[allow(dead_code)] // skeleton: lane B calls it
 pub(crate) fn relocalization_adopted(
-    _segments: &Segments,
-    _kf_idx: usize,
-    _jump_m: f64,
-    _max_jump_m: f64,
-    _lost: bool,
+    segments: &Segments,
+    kf_idx: usize,
+    jump_m: f64,
+    max_jump_m: f64,
+    lost: bool,
 ) -> bool {
-    todo!("lane B: relocalization once lost")
+    jump_m <= max_jump_m || (lost && segments.of(kf_idx) != segments.latest())
 }
 
 /// The keyframe a bridge edge starts from: the last one before a give-up.
@@ -482,6 +479,31 @@ pub(crate) mod tests {
         let held = held_at(&attitude, &position);
         assert_eq!(held.rotation, rigid(attitude).rotation);
         assert!((camera_centre(&held) - Vec3F64::new(3.0, 0.0, 0.0)).length() < 1e-12);
+    }
+
+    #[test]
+    fn keyframes_belong_to_the_segment_they_were_seeded_in() {
+        let mut segments = Segments::default();
+        segments.begin(0);
+        segments.begin(131);
+        segments.begin(6866);
+        assert_eq!(
+            [0, 130, 131, 6000, 6866, 9000].map(|kf| segments.of(kf)),
+            [0, 0, 1, 1, 2, 2]
+        );
+        assert_eq!(segments.latest(), 2);
+    }
+
+    #[test]
+    fn a_lost_camera_adopts_any_jump_into_an_older_segment_only() {
+        let mut segments = Segments::default();
+        segments.begin(0);
+        segments.begin(131);
+        let adopted = |kf, jump, lost| relocalization_adopted(&segments, kf, jump, 0.5, lost);
+        assert!(adopted(200, 0.4, false) && adopted(50, 0.4, false));
+        assert!(!adopted(50, 30.0, false), "tracking or recently lost");
+        assert!(!adopted(200, 30.0, true), "the segment just lost");
+        assert!(adopted(50, 30.0, true), "an older segment, once lost");
     }
 
     #[test]

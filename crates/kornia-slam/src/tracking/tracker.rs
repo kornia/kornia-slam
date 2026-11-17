@@ -114,7 +114,6 @@ impl Tracker {
     }
 
     /// Restricts the local map to keyframes at or after `window_start_kf`.
-    #[allow(dead_code)] // skeleton: lane B calls it
     pub(crate) fn set_window_start(&mut self, window_start_kf: Option<usize>) {
         self.estimator.set_window_start(window_start_kf);
     }

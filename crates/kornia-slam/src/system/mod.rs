@@ -245,7 +245,8 @@ impl SlamSystem {
             tracker: Tracker::new(settings.map_projection)
                 .with_lk_kernel(settings.klt_kernel)
                 .with_pose_gate(settings.pose_gate)
-                .with_local_map_rules(settings.tracking.local_map),
+                .with_local_map_rules(settings.tracking.local_map)
+                .with_relocalization_solver(settings.relocalization.solver),
             two_view_init_config: settings.two_view_init,
             keyframe_policy: settings.keyframe_policy,
             tracking_loss_recovery: settings.tracking_loss_recovery,
@@ -914,6 +915,14 @@ impl SlamSystem {
             let reseeding = self.state.reseeding();
             if reseeding {
                 self.coast_while_reseeding(curr_frame.idx, timestamp_sec);
+                if self.recovery.relocalize_when_lost {
+                    // No segment is tracked while re-seeding, so no own window applies.
+                    self.tracker.set_window_start(None);
+                    if self.relocalize(&curr_frame, true) {
+                        self.resume_after_lost_relocalization(timestamp_sec);
+                        return self.frame_result(TrackingStatus::Tracked);
+                    }
+                }
             }
             let result = self.bootstrap_stereo(curr_frame, timestamp_sec);
             if reseeding && result.status == TrackingStatus::Skipped {
@@ -927,6 +936,17 @@ impl SlamSystem {
             self.last_skip = Some(SkipKind::Bootstrap);
         }
         result
+    }
+
+    /// Tracks on from a relocalization found while re-seeding. The pose jumped
+    /// to the map's, so neither the bridge nor an IMU edge from the last
+    /// keyframe holds across it: the next keyframe starts a new chain.
+    fn resume_after_lost_relocalization(&mut self, timestamp_sec: f64) {
+        self.state.mode = SystemMode::Tracking;
+        self.state.last_keyframe_idx = None;
+        self.state.bridge_anchor = None;
+        self.inertial.last_keyframe_timestamp_sec = Some(timestamp_sec);
+        self.runaway.clear();
     }
 
     /// Carries the pose over a frame of a stalled re-seed on the kept inertial
@@ -1240,6 +1260,12 @@ impl SlamSystem {
     /// A segment re-seeded with the inertial state kept tracks inertially at once.
     fn finish_bootstrap(&mut self, kf_idx: usize, timestamp_sec: f64) {
         self.segments.begin(kf_idx);
+        if self.segments_reported() {
+            self.dbg(format!(
+                "[recover] segment {} begins at kf={kf_idx}",
+                self.segments.latest()
+            ));
+        }
         self.state.current_keyframe_idx = Some(kf_idx);
         self.state.last_keyframe_idx = Some(kf_idx);
         self.state.mode = if self.state.imu_initialized {
@@ -1450,6 +1476,7 @@ impl SlamSystem {
         let prev_timestamp = self.state.last_frame_timestamp_sec;
 
         self.refresh_reference_inertial_state();
+        self.update_seeded_window();
 
         let (candidate_pose, predicted_velocity) =
             self.predict_frame_pose(pose_before, prev_timestamp, timestamp_sec);
@@ -1634,9 +1661,14 @@ impl SlamSystem {
                     .state
                     .current_keyframe_idx
                     .and_then(|ki| map_guard.get_keyframe(ki));
-                let local_indices =
-                    select_local_map_points(&map_guard, &matches, current_kf, local_map_config)
-                        .points;
+                let selection =
+                    select_local_map_points(&map_guard, &matches, current_kf, local_map_config);
+                if local_map_config.window_start_kf.is_some() {
+                    self.counters.seeded_window_frames += 1;
+                    self.counters.seeded_window_dropped_points +=
+                        selection.dropped_by_window as u64;
+                }
+                let local_indices = selection.points;
                 let visible = crate::tracking::local_map::landmarks_in_frame_frustum(
                     &map_guard,
                     &local_indices,
@@ -1659,11 +1691,15 @@ impl SlamSystem {
         // With a settled IMU the system coasts instead (below): a relocalized
         // pose taken from an older part of a drifted map would jump away from
         // the inertial state, which ORB-SLAM3 also avoids in inertial mode.
-        if status == TrackingStatus::Skipped
-            && self.relocalization_due(timestamp_sec)
-            && self.relocalize(&frame, false)
-        {
-            status = TrackingStatus::Tracked;
+        if status == TrackingStatus::Skipped && self.relocalization_due(timestamp_sec) {
+            let only_while_lost =
+                self.relocalization.while_lost && self.imu_confident(timestamp_sec);
+            if self.relocalize(&frame, false) {
+                status = TrackingStatus::Tracked;
+                if only_while_lost {
+                    self.counters.relocalizations_while_lost += 1;
+                }
+            }
         }
         if let Some(trace) = self.frame_trace.as_mut() {
             trace.pose = self.state.pose_world_to_cam;
@@ -1962,7 +1998,34 @@ impl SlamSystem {
     /// First keyframe of a re-seeded segment while it tracks and grows only
     /// against its own keyframes (`reseed.own_window_keyframes`).
     fn seeded_window_start(&self) -> Option<usize> {
-        None
+        self.tracker.local_map_config().window_start_kf
+    }
+
+    /// Sets the own window for this frame: from the second segment on, while
+    /// the newest segment holds fewer than `own_window_keyframes` keyframes.
+    fn update_seeded_window(&mut self) {
+        let own = self.recovery.own_window_keyframes;
+        let window = match self.segments.latest_start() {
+            Some(start) if own > 0 && self.segments.latest() > 0 => {
+                let held = self
+                    .map
+                    .lock()
+                    .unwrap()
+                    .keyframes()
+                    .iter()
+                    .filter(|kf| kf.frame.idx >= start)
+                    .count();
+                (held < own).then_some(start)
+            }
+            _ => None,
+        };
+        self.tracker.set_window_start(window);
+    }
+
+    /// Whether segment debug lines print: only with a knob that reads the
+    /// segments, so the logs of a run without them stay comparable.
+    fn segments_reported(&self) -> bool {
+        self.recovery.relocalize_when_lost || self.recovery.own_window_keyframes > 0
     }
 
     /// Ends the segment tracking was lost in. A metric, inertially initialized
@@ -2103,16 +2166,24 @@ impl SlamSystem {
 
     /// Recovers the pose against the map from place-recognition candidates
     /// and resumes tracking from it. Needs the loop closer's vocabulary and
-    /// keyframe database. `lost`: after a give-up.
-    fn relocalize(&mut self, frame: &Frame, _lost: bool) -> bool {
+    /// keyframe database. `lost`: after a give-up (see
+    /// [`recovery::relocalization_adopted`]).
+    fn relocalize(&mut self, frame: &Frame, lost: bool) -> bool {
         const MAX_CANDIDATES: usize = 5;
         let Some(loop_closer) = self.loop_closer.as_ref() else {
+            if lost || self.relocalization.while_lost {
+                self.counters.relocalization_without_vocabulary += 1;
+            }
             return false;
         };
+        self.counters.relocalization_attempts += 1;
+        let started = Instant::now();
         // A pose far from where the motion model put the camera belongs to a
         // part of the map that has drifted from here; adopting it would
         // teleport the trajectory.
         let predicted_position = self.state.pose_world_to_cam.inverse().translation;
+        let max_jump_m = self.relocalization.max_jump_m;
+        let segments = &self.segments;
         let mut refused = Vec::new();
         let found = {
             let map = self.map.lock().unwrap();
@@ -2125,13 +2196,21 @@ impl SlamSystem {
                 .relocalize(frame, &candidates, &map, &self.rig.camera, |found| {
                     let jump =
                         (found.estimate.pose.inverse().translation - predicted_position).length();
-                    let near = jump <= RELOCALIZATION_MAX_JUMP_M;
-                    if !near {
+                    let adopted = recovery::relocalization_adopted(
+                        segments,
+                        found.keyframe_idx,
+                        jump,
+                        max_jump_m,
+                        lost,
+                    );
+                    if !adopted {
                         refused.push((found.keyframe_idx, jump));
                     }
-                    near
+                    adopted
                 })
         };
+        self.counters.relocalization_ns += started.elapsed().as_nanos() as u64;
+        self.counters.relocalization_refused_jump += refused.len() as u64;
         for (keyframe_idx, jump) in refused {
             self.dbg(format!(
                 "[reloc] frame={} refused kf={keyframe_idx} jump={jump:.2}m",
@@ -2141,10 +2220,22 @@ impl SlamSystem {
         let Some(found) = found else {
             return false;
         };
-        self.dbg(format!(
-            "[reloc] frame={} against kf={} inliers={}",
-            frame.idx, found.keyframe_idx, found.estimate.inliers
-        ));
+        self.counters.relocalizations += 1;
+        let segment = self.segments.of(found.keyframe_idx);
+        if lost && segment != self.segments.latest() {
+            self.counters.relocalizations_older_segment += 1;
+        }
+        self.dbg(if self.segments_reported() {
+            format!(
+                "[reloc] frame={} against kf={} (segment {segment}) inliers={}",
+                frame.idx, found.keyframe_idx, found.estimate.inliers
+            )
+        } else {
+            format!(
+                "[reloc] frame={} against kf={} inliers={}",
+                frame.idx, found.keyframe_idx, found.estimate.inliers
+            )
+        });
         self.state.pose_world_to_cam = found.estimate.pose;
         self.note_pose("reloc", frame.idx, &found.estimate.pose);
         self.state.current_keyframe_idx = Some(found.keyframe_idx);
@@ -2532,10 +2623,6 @@ fn format_loop_timing(t: &LoopTiming) -> String {
         t.fusion_stale,
     )
 }
-
-/// Largest distance, in metres, between the motion-model pose and a
-/// relocalized one that is adopted.
-const RELOCALIZATION_MAX_JUMP_M: f64 = 0.5;
 
 /// Low-match two-view rejections a monocular bootstrap reference survives.
 const MAX_LOW_MATCH_REJECTIONS: usize = 10;
