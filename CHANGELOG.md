@@ -12,8 +12,8 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 **New settings for the estimator, recovery and offline-BA work, all off by
 default.** Every default is the behaviour before the setting existed, so
-existing run files load and run unchanged. Not validated yet; most are not
-implemented yet and stop with `todo!` when set.
+existing run files load and run unchanged. Built, not validated: none of them
+has been scored on a benchmark sequence yet.
 - `mapping.local_ba.large_window` (`Off`): ORB-SLAM3's longer window when the
   keyframe was tracked strongly, `Enabled(min_tracked_inliers, active_keyframes,
   max_iterations, initial_lambda)`.

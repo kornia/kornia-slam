@@ -21,16 +21,19 @@ We are working toward top results on the [LaMAria](https://github.com/cvg/lamari
 
 Losses and recovery:
 - [x] Keep every pose rigid at the source; rotation scale crept in through repeated pose corrections
-- [x] Lost-mode keyframes as fixed anchors (knob)
-- [x] Keep gravity, bias and velocity through a tracking loss, so a re-seeded map shares the old world frame (knob)
-- [x] Reject tracked poses that disagree with the gyro prediction (knob)
-- [ ] Global PnP relocalisation while lost; a re-seeded map with its own local window
+- [ ] Lost-mode keyframes as fixed anchors (built, knob `keyframes_while_lost`, not yet validated; no gain on its own)
+- [ ] Keep gravity, bias and velocity through a tracking loss, so a re-seeded map shares the old world frame (built, knob `tracking_loss.reseed.keep_inertial`, not yet validated; no gain on its own)
+- [ ] Reject tracked poses that disagree with the gyro prediction (built, knob `tracking_loss.pose_gate`, not yet validated; no gain on the proxy)
+- [ ] Global PnP relocalisation while lost; a re-seeded map with its own local window (built, knobs `tracking_loss.relocalization.while_lost` and `.solver`, `tracking_loss.reseed.own_window_keyframes` and `.relocalize_when_lost`, not yet validated)
 
 Scale and drift while tracking:
-- [ ] Longer visual-inertial BA window, and keyframes no longer dragged away from the map by BA
-- [ ] Per-frame velocity state and a pose-inertial solve per frame
-- [ ] IMU bias and noise model, compared across ORB-SLAM3, Basalt and other references
-- [ ] Offline global visual-inertial BA
+- [ ] Longer visual-inertial BA window, and keyframes no longer dragged away from the map by BA (built, knobs `mapping.local_ba.large_window`, `mapping.local_ba.imu_huber`, `tracking.snapback_fix`, not yet validated; `mapping.local_ba.active_keyframes` already existed)
+- [ ] Per-frame velocity state and a pose-inertial solve per frame (built, knob `tracking.pose_inertial`, not yet validated)
+- [ ] ORB-SLAM3's keyframe insertion, local map and growth rules (built, knobs `keyframes.rules`, `tracking.local_map`, `mapping.growth_neighbours`, not yet validated)
+- [ ] IMU bias and noise model, compared across ORB-SLAM3, Basalt and other references (built in part, knob `inertial.sample_interpolation`, not yet validated)
+- [ ] IMU covariance trust: trust the inertial prediction by its propagated covariance (built, knob `tracking.imu_trust`, not yet validated)
+- [ ] Offline global visual-inertial BA (built, run file `offline_ba` and the `offline-ba` subcommand over a `--session-out` dump, not yet validated)
+- [ ] Calibration states in the offline BA: camera rotation and focal drift, gyro intrinsics, clock offset (built, knobs `offline_ba.calibration.*`, not yet validated)
 
 Field of view and speed:
 - [ ] Raw Aria fisheye cameras instead of the pinhole crop
@@ -47,7 +50,12 @@ Field of view and speed:
       ([#71](https://github.com/kornia/kornia-slam/issues/71), [#72](https://github.com/kornia/kornia-slam/pull/72))
 - [ ] Match ORB-SLAM3 on trajectory accuracy and tracking robustness
 - [ ] Upstream general-purpose code (solvers, camera models, image ops) to
-      [kornia-rs](https://github.com/kornia/kornia-rs)
+      [kornia-rs](https://github.com/kornia/kornia-rs). Staged in `crates/kornia-slam/src/upstream/`, one module per target (built, not yet upstreamed):
+  - [ ] `kornia_3d::pgo`: PGO manifolds and edges
+  - [ ] `kornia_3d::pnp::refine`: analytic 2x6 pose refine
+  - [ ] `kornia_3d::pnp::gpnp`: generalised PnP and AP3P on rig rays
+  - [ ] `kornia_3d::pose`: `camera_centre` and the `Pose3d`/`SE3` conversions
+  - [ ] `kornia_algebra`: f32/f64 casts
 
 ## Library structure
 
@@ -55,7 +63,9 @@ Field of view and speed:
 - [ ] Pluggable place recognition, including learned global descriptors such as DINOv3
       ([#48](https://github.com/kornia/kornia-slam/issues/48))
 - [ ] Multi-camera rigs (2+ cameras), ported from Rerun's
-      [slam-rs](https://github.com/rerun-io/examples-monorepo/tree/main/packages/slam-rs)
+      [slam-rs](https://github.com/rerun-io/examples-monorepo/tree/main/packages/slam-rs);
+      generic rig calibration file, a ray per rig pixel and a rig-aware AP3P (built, knobs `rig_calibration`
+      and `tracking_loss.relocalization.solver: RigAp3p`, not yet validated)
 - [ ] Explore [Atlas](https://github.com/kornia/kornia-slam/issues/59), a manifold-native estimation and factor-graph foundation, as
       the base for BA, VI-BA and pose-graph optimization
 - [ ] Split `SlamSystem` into tracking, mapping, inertial, and loop-closing subsystems

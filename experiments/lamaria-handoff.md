@@ -1,4 +1,6 @@
-# LaMAria sprint: handoff (2026-11-15)
+# LaMAria sprint: handoff (2026-11-17, updated for the PR #180 round; first written 2026-11-15)
+
+The 2026-11-17 round rebased the branch on main, and built the estimator, recovery, rig and offline-BA changes below behind knobs. Nothing from that round has been compiled beyond `cargo check`, run or scored; every number in this note predates it. See `experiments/pr180-validation-handoff.md`.
 
 This note is for whoever picks up the LaMAria accuracy work on this branch (PR #180). It says where the score stands, what we learned, why progress has been slow, and what we recommend doing next.
 
@@ -47,7 +49,7 @@ SLAM Dunk, by Jacob Van Meter and Ayush Paul (code: https://github.com/jacobvm04
 
 ## What is on this branch
 
-Every change sits behind a RON knob that defaults to the old behaviour. With the knobs off, the output is byte-identical to the base.
+Every change sits behind a RON knob that defaults to the old behaviour. With the knobs off, the output is meant to be byte-identical to the base. That claim is unverified since the rebase: the identity gate (`pr180/F` against `pr180/S`, `cmp`) has not been run.
 
 | change | knob | result |
 |---|---|---|
@@ -55,12 +57,32 @@ Every change sits behind a RON knob that defaults to the old behaviour. With the
 | Lost-mode keyframes as fixed anchors | `keyframes_while_lost: Anchor` | No gain on its own. |
 | Keep gravity, bias and velocity through a tracking loss (G22, G25) | `tracking_loss.reseed.keep_inertial` | The 140 m world re-rotation is gone. Not adopted: the seed is fed by bad accepted poses. |
 | Reject tracked poses that disagree with the gyro prediction (G21) | `tracking_loss.pose_gate` (rotation only, 5 deg) | It rejects the 1096 m bad pose on R_11, and on EuRoC V1_03 ATE goes from 0.2225 to 0.1799 m. The proxy shows no gain: without a re-seed, each reject becomes a cold restart. |
+| Midpoint IMU sample interpolation (A5) | `inertial.sample_interpolation: Midpoint` | not yet validated |
+| IMU Huber on the boundary edge, and on every edge until VIBA2 (A4) | `mapping.local_ba.imu_huber: BoundaryOrRecentInit` | not yet validated |
+| ORB-SLAM3's 25-keyframe window when tracking is strong (A2) | `mapping.local_ba.large_window` | not yet validated |
+| ORB-SLAM3 triangulation and fusion neighbours (A9) | `mapping.growth_neighbours: OrbSlam3` | not yet validated |
+| ORB-SLAM3 local keyframes and reference keyframe (A8) | `tracking.local_map: OrbSlam3` | not yet validated |
+| ORB-SLAM3 keyframe insertion rules (A7) | `keyframes.rules: OrbSlam3` | not yet validated |
+| Pose-inertial solve per frame (A6, G13) | `tracking.pose_inertial` | not yet validated |
+| Trust the IMU prediction by its propagated covariance (T) | `tracking.imu_trust: Covariance` | not yet validated |
+| Snap-back counter and the anchored next-frame fix (G29) | `tracking.snapback_fix: AnchorNextFrame` (the counter `ba_snapbacks` is always on) | not yet validated |
+| Relocalise on every lost frame, rig-aware AP3P (B3, G19) | `tracking_loss.relocalization.while_lost`, `.solver`, `.max_jump_m` | not yet validated |
+| A re-seeded segment tracks its own window first (B4, G28) | `tracking_loss.reseed.own_window_keyframes` | not yet validated |
+| Map segments and relocalisation once lost, port of `4a2ee7b` (B5) | `tracking_loss.reseed.relocalize_when_lost` | not yet validated |
+| Generic rig calibration file and rig rays (B1, B2) | run file `rig_calibration`, CLI `--write-rig-calibration` | not yet validated |
+| Session dump and offline global VI-BA with calibration states (D, A7, A8) | run file `offline_ba`, `--session-out`, subcommand `offline-ba` | not yet validated |
+| Analytic pose refine and PGO manifolds and edges under `upstream/` (C) | none: a move | not yet validated; must `cmp` equal `pr180/S` |
+| SVD projection onto SO(3), `Pose3d::orthonormalized` (Step 8) | none | not yet validated; dropped if the PGO fingerprint changes |
 
-## Work in flight, not yet on this branch
+The tags are in `experiments/pr180-validation-handoff.md`. The knob defaults are today's behaviour, except where a card says a numeric field holds the default of a pass someone asked for.
 
-Branch `exp/vi-window` (two commits, both behaviour-neutral with knobs off):
+## Work in flight
+
+The two `exp/vi-window` commits are now on this branch, rebased with it (both behaviour-neutral with knobs off):
 - the VI-BA window, nav chi2 and newest state are printed in debug builds only;
 - the VI-BA iteration cap becomes the knob `local_ba.max_iterations`, default 50.
+
+The PR #180 round (cards A to D in `experiments/`) is built and not validated: no test, clippy run, identity gate or benchmark has run on it. Validation is a separate workflow; its protocol is `experiments/pr180-validation-handoff.md`. The results below are from the earlier `exp/vi-window` runs.
 
 The window size is already a knob, `mapping.local_ba.active_keyframes`. It defaults to 3, while ORB-SLAM3 uses 10 or 25.
 
@@ -76,18 +98,22 @@ The window size is already a knob, `mapping.local_ba.active_keyframes`. It defau
   - Likely mechanism: the past ties into the window only through the boundary IMU edge, whose bias rows are weighted 1e-2 (`mapping/vi_ba_schur.rs`, the boundary edge rows).
   - With 10 free keyframes, the bias soaks up rotation error.
 - **Cost:** BA is about 2.9x more expensive at window 10. Capping iterations at 10 or 20 cuts the cost but loses too much of the gain.
-- **Running now:** card B, which gives the boundary bias rows full weight, at windows 10 and 3. It is the direct test of the MH_03 mechanism.
+- **Running at the time of writing (2026-11-15):** card B, which gives the boundary bias rows full weight, at windows 10 and 3. It is the direct test of the MH_03 mechanism.
 
 ## What we learned (gap list, by score at stake)
 
-1. **Drift and scale while tracking (G6, G18):** the 3-keyframe window is too short. A longer window helps a lot, but the bias then needs a stronger tie to the past.
+Status words below: built means the code exists behind a knob, not validated means no run has scored it.
+
+1. **Drift and scale while tracking (G6, G18):** the 3-keyframe window is too short. A longer window helps a lot, but the bias then needs a stronger tie to the past. G6: built (A1 to A9 and T, card A), not validated.
 2. **Keyframes dragged away by BA (G29):** BA moves a keyframe to satisfy its IMU edge, then the next PnP snaps back.
    - Window landmarks move with the keyframe, so the snap-back must come from landmarks outside the window.
-   - This is untested.
-3. **Global PnP while lost (G19):** there is no relocalisation while lost, so every reject or give-up costs coverage.
-4. **Re-seeded map locks onto the old map (G28):** a new 10-point seed tracks against the whole kept map, which gives 5–13 m pose jumps.
-5. **Per-frame velocity and a pose-inertial solve per frame (G13):** today the IMU only seeds and vetoes the pose solve.
-6. **Offline global visual-inertial BA (A7):** not built yet. Comparable systems gain from this.
+   - This is untested. G29: built (counter and `snapback_fix`), not validated.
+3. **Global PnP while lost (G19):** there is no relocalisation while lost, so every reject or give-up costs coverage. G19: built (card B3), not validated.
+4. **Re-seeded map locks onto the old map (G28):** a new 10-point seed tracks against the whole kept map, which gives 5–13 m pose jumps. G28: built (card B4, with B5), not validated.
+5. **Per-frame velocity and a pose-inertial solve per frame (G13):** today the IMU only seeds and vetoes the pose solve. G13: built (`tracking.pose_inertial`), not validated.
+6. **Offline global visual-inertial BA (A7) and calibration states (A8):** built (card D), not validated. Comparable systems gain from this. G18 (drift and scale) is the gap they target and stays open until scored.
+
+A9 (raw fisheye on both cameras) is not built; only the rig rays and the generic rig calibration file (card B1, B2) are.
 
 **Ruled out:** KLT-first tracking patch A, anchors alone, the re-seed without the gate, and the initial scale offset (G23).
 
@@ -180,6 +206,8 @@ Each one changes output, so each needs its own experiment card.
 
 ## Gaps in this handoff
 
+- **The 2026-11-17 round has no results.** Nothing in it was compiled beyond `cargo check -j2`, run or scored. Every row marked "not yet validated" above stands on theory and predictions in the cards only.
 - **The scoring harness is not in the repo yet.** That means the splice harness (our trajectory spliced into the ORB-SLAM3 trajectory and scored with the official evaluator), the window and series readers, and the proxy runner.
 - **The detailed plans and results files** for each experiment also live outside the repo.
+- The cards cite the gap ledger as `slam-viba/audit/gap-ledger.md`, outside the repo. `experiments/gap-ledger.md` is a new in-repo copy of the PR #180 rows only (G6, G13, G18, G19, G28, G29, A7, A8), not a copy of that file.
 - Ask the owner for them, or move them into `experiments/` as the first step.
