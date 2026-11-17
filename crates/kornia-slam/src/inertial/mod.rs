@@ -6,6 +6,7 @@
 
 pub mod initialization;
 mod schedule;
+pub mod trust;
 
 pub use initialization::{
     AlignedTrackingState, ImuInitConfig, ImuInitResult, ImuInitializer, ImuWindowStats,

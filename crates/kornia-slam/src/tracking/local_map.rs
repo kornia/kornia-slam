@@ -25,6 +25,36 @@ pub struct LocalMapSelectionConfig {
     pub min_covis_weight: usize,
     /// Below this many selected landmarks, fall back to the whole active map.
     pub min_selected_before_fallback: usize,
+    /// Which keyframes the selection admits.
+    pub rules: LocalMapRules,
+    /// Keep only points observed by a keyframe at or after this one: a
+    /// re-seeded segment tracking its own window. `None` keeps every point.
+    pub window_start_kf: Option<usize>,
+}
+
+/// How tracking picks its local keyframes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum LocalMapRules {
+    /// The current keyframe plus the 10 most-voted keyframes.
+    #[default]
+    Kornia,
+    /// ORB-SLAM3's inertial `Tracking::UpdateLocalKeyFrames`
+    /// (`Tracking.cc:3457-3606`), without children and parent: this map has
+    /// no spanning tree.
+    OrbSlam3,
+}
+
+/// One local-map selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalMapSelection {
+    /// Indices of the selected map points, ascending.
+    pub points: Vec<usize>,
+    /// Points the window removed; 0 when `window_start_kf` is `None`.
+    pub dropped_by_window: usize,
+    /// The most-voted keyframe; `None` without votes or under
+    /// [`LocalMapRules::Kornia`].
+    pub most_voted_keyframe: Option<usize>,
 }
 
 impl Default for LocalMapSelectionConfig {
@@ -34,14 +64,49 @@ impl Default for LocalMapSelectionConfig {
             max_covis_neighbors: 10,
             min_covis_weight: 15,
             min_selected_before_fallback: 4,
+            rules: LocalMapRules::Kornia,
+            window_start_kf: None,
         }
     }
 }
 
-/// Builds the local map for tracking: indices of non-culled map points
-/// observed by the current keyframe, the keyframes owning the tracked points,
-/// and their covisibility neighbors.
+/// Builds the local map for tracking: the rule picks keyframes and points,
+/// whole-map fallback included, then the window, when set, filters them.
 pub fn select_local_map_points(
+    map: &Map,
+    tracked_matches: &[(usize, usize)],
+    current_keyframe: Option<&Keyframe>,
+    config: LocalMapSelectionConfig,
+) -> LocalMapSelection {
+    let mut points = match config.rules {
+        LocalMapRules::Kornia => {
+            select_voted_points(map, tracked_matches, current_keyframe, config)
+        }
+        LocalMapRules::OrbSlam3 => todo!("lane A: ORB-SLAM3 local keyframes"),
+    };
+    let dropped_by_window = config
+        .window_start_kf
+        .map_or(0, |start| filter_to_window(map, &mut points, start));
+    LocalMapSelection {
+        points,
+        dropped_by_window,
+        most_voted_keyframe: None,
+    }
+}
+
+/// Keeps the points of `points` observed by a keyframe at or after
+/// `window_start_kf`; returns how many were removed.
+pub(crate) fn filter_to_window(
+    _map: &Map,
+    _points: &mut Vec<usize>,
+    _window_start_kf: usize,
+) -> usize {
+    todo!("lane B: own-window local map")
+}
+
+/// Indices of non-culled map points observed by the current keyframe, the
+/// keyframes owning the tracked points, and their covisibility neighbors.
+fn select_voted_points(
     map: &Map,
     tracked_matches: &[(usize, usize)],
     current_keyframe: Option<&Keyframe>,

@@ -34,6 +34,21 @@ pub struct KeyframePolicy {
     /// bound. `SlamSystem` applies it from the frame timestamps;
     /// [`Self::should_insert_with`] does not see time.
     pub max_interval_sec: Option<f64>,
+    /// The rule set the decision follows.
+    pub rules: KeyframeRules,
+}
+
+/// Which keyframe insertion rules apply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum KeyframeRules {
+    /// The fields of [`KeyframePolicy`].
+    #[default]
+    Kornia,
+    /// ORB-SLAM3's `Tracking::NeedNewKeyFrame`, inertial branches
+    /// (`Tracking.cc:3064-3214`); the other [`KeyframePolicy`] fields are
+    /// ignored. `max_frames` is ORB-SLAM3's `mMaxFrames`, the camera rate.
+    OrbSlam3 { max_frames: usize },
 }
 
 impl Default for KeyframePolicy {
@@ -44,6 +59,7 @@ impl Default for KeyframePolicy {
             ref_ratio: 0.6,
             min_parallax_px: None,
             max_interval_sec: None,
+            rules: KeyframeRules::Kornia,
         }
     }
 }
@@ -66,6 +82,18 @@ pub struct KeyframeEvidence {
     /// the last keyframe, pixels (see [`super::median_parallax_px`]); `None`
     /// when it was not measured.
     pub median_parallax_px: Option<f64>,
+    /// Reference-keyframe map points seen at least 3 times (2 while the map
+    /// holds at most 2 keyframes): ORB-SLAM3's `nRefMatches`.
+    pub ref_points_min_obs: usize,
+    /// Close stereo points tracked, and close stereo points not tracked.
+    pub tracked_close: usize,
+    pub untracked_close: usize,
+    /// The first tracked frame after a loss (ORB-SLAM3's `RECENTLY_LOST`).
+    pub recently_lost: bool,
+    pub imu_initialized: bool,
+    pub mono_inertial: bool,
+    pub secs_since_last_kf: Option<f64>,
+    pub frames_since_reloc: Option<usize>,
 }
 
 impl KeyframeEvidence {
@@ -82,7 +110,7 @@ impl KeyframeEvidence {
             last_keyframe_idx,
             tracked_inliers,
             n_ref_map_points,
-            median_parallax_px: None,
+            ..Self::default()
         }
     }
 
@@ -128,6 +156,9 @@ impl KeyframePolicy {
     /// tracked ratio against the reference falls below `ref_ratio`; and, if
     /// `min_parallax_px` is set, when the measured parallax reaches it.
     pub fn should_insert_with(&self, evidence: &KeyframeEvidence) -> bool {
+        if let KeyframeRules::OrbSlam3 { .. } = self.rules {
+            todo!("lane A: ORB-SLAM3 keyframe rules")
+        }
         let Some(last_kf_idx) = evidence.last_keyframe_idx else {
             return true;
         };
@@ -254,7 +285,7 @@ mod tests {
             last_keyframe_idx: Some(100),
             tracked_inliers: inliers,
             n_ref_map_points: n_ref,
-            median_parallax_px: None,
+            ..KeyframeEvidence::default()
         }
     }
 

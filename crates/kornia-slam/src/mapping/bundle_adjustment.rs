@@ -56,6 +56,29 @@ pub struct LocalBaParams {
     pub state_envelope: StateEnvelope,
     pub lost_keyframes: LostKeyframes,
     pub visual_kernel: VisualKernel,
+    pub large_window: LargeWindow,
+    /// The inertial initialization is recent: VIBA2 has not run.
+    pub recently_initialized: bool,
+    /// Ask VI-BA for the newest keyframe's marginal covariance.
+    pub newest_marginal: bool,
+}
+
+/// ORB-SLAM3's larger window when tracking is strong (`LocalMapping.cc:148`,
+/// `Optimizer.cc:2389-2393`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum LargeWindow {
+    #[default]
+    Off,
+    /// Used for a keyframe tracked with more than `min_tracked_inliers`
+    /// inliers. ORB-SLAM3: 100 (75 monocular), 25 keyframes, 4 iterations,
+    /// initial λ 1e-2.
+    Enabled {
+        min_tracked_inliers: usize,
+        active_keyframes: usize,
+        max_iterations: usize,
+        initial_lambda: f64,
+    },
 }
 
 /// Robust kernel of the visual-only local BA.
@@ -96,6 +119,9 @@ impl Default for LocalBaParams {
             state_envelope: StateEnvelope::Off,
             lost_keyframes: LostKeyframes::Free,
             visual_kernel: VisualKernel::L2,
+            large_window: LargeWindow::Off,
+            recently_initialized: false,
+            newest_marginal: false,
         }
     }
 }

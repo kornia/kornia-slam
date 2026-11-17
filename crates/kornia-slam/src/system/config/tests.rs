@@ -13,9 +13,9 @@ use crate::mapping::visual_information::VisualInformation;
 use crate::system::ConfigError;
 #[cfg(feature = "serde")]
 use crate::system::LoadError;
-use crate::tracking::KeyframePolicy;
 #[cfg(feature = "serde")]
 use crate::tracking::optical_flow::LkKernel;
+use crate::tracking::{KeyframePolicy, KeyframeRules};
 
 fn orb_mut(config: &mut SystemConfig) -> &mut OrbSlamPipeline {
     let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
@@ -596,6 +596,7 @@ mod runtime_settings {
             ref_ratio: 0.8,
             min_parallax_px: Some(12.0),
             max_interval_sec: Some(0.5),
+            rules: KeyframeRules::Kornia,
         };
         orb.mapping.execution = LocalMappingMode::Synchronous;
         orb.tuning.initialization.acceptance_config.min_inliers = 40;

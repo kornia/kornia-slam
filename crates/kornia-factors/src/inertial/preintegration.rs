@@ -208,6 +208,20 @@ pub fn information(pim: &PreintegratedImu, weight: f64) -> ImuInformation {
     }
 }
 
+/// Covariance of state `j` given state `i`'s, through the edge's linearisation:
+/// `J_j⁻¹ (J_i Σ_i J_iᵀ + Ω⁻¹) J_j⁻ᵀ`, layout `[ρ ω v b_g b_a]`. `None` if `J_j`
+/// is singular.
+pub fn propagate_state_covariance(
+    _state_i: NavState<'_>,
+    _covariance_i: &Mat15F64,
+    _state_j: NavState<'_>,
+    _preintegrated: &PreintegratedImu,
+    _gravity: &Vec3F64,
+    _t_bc: Option<&Pose3d>,
+) -> Option<Mat15F64> {
+    todo!("lane A: IMU covariance trust")
+}
+
 /// `1 / var`, or 1e6 for a (near-)zero variance.
 fn inverse_variance(var: f64) -> f64 {
     if var > 1e-20 { 1.0 / var } else { 1e6 }

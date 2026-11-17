@@ -258,6 +258,12 @@ pub struct ViBaParams {
     /// residual (see [`VisualInformation`](crate::mapping::visual_information::VisualInformation)).
     /// Empty means 1 px for all; the Huber knee then applies to the whitened residual.
     pub observation_sigma_px: Vec<f32>,
+    /// Return the newest keyframe's 15×15 marginal covariance in
+    /// [`ViBaResult::newest_marginal`] (for the IMU covariance trust).
+    pub newest_marginal: bool,
+    /// The inertial initialization is recent: VIBA2 has not run
+    /// ([`ImuHuber::BoundaryOrRecentInit`]).
+    pub imu_recently_initialized: bool,
 }
 
 /// IMU edges whose nav residual gets the Huber kernel.
@@ -269,6 +275,9 @@ pub enum ImuHuber {
     /// The boundary edge only, as ORB-SLAM3's `LocalInertialBA` (`i==N-1 || bRecInit`).
     BoundaryOnly,
     Off,
+    /// The boundary edge, plus every IMU edge until VIBA2 has run (ORB-SLAM3
+    /// `Optimizer.cc:2632`, `i==N-1 || bRecInit`).
+    BoundaryOrRecentInit,
 }
 
 /// A secondary rig camera: its model and `T_CP` from the primary camera,
@@ -358,6 +367,8 @@ impl Default for ViBaParams {
             rig_views: Vec::new(),
             observation_views: Vec::new(),
             observation_sigma_px: Vec::new(),
+            newest_marginal: false,
+            imu_recently_initialized: false,
         }
     }
 }
@@ -397,6 +408,9 @@ pub struct ViBaResult {
     /// its information is singular.
     pub prior_residual_first: Option<f64>,
     pub prior_residual_final: Option<f64>,
+    /// The newest free keyframe's marginal covariance, layout
+    /// `[ρ ω v b_g b_a]`, when [`ViBaParams::newest_marginal`] asked for it.
+    pub newest_marginal: Option<Mat15F64>,
 }
 
 /// Upper bound of the depth gate for a measured depth `d`, metres.
@@ -722,7 +736,7 @@ fn residual_and_jacobians(
 /// beyond the IMU factor's gravity magnitude in a 3-keyframe window; leaving
 /// it out measured ~25% scale drift, where stereo-only BA (which uses it, as
 /// `kornia_3d::ba_schur` does) stayed scale-consistent.
-fn depth_residual_and_jacobian(
+pub(crate) fn depth_residual_and_jacobian(
     pose: &SE3F32,
     point_w: &Vec3F64,
     d_meas: f64,
@@ -786,7 +800,7 @@ pub(super) fn accum_jt_omega_j(
 }
 
 /// Huber weight and cost `½ρ(chi2)` of a reprojection or depth residual.
-fn visual_huber(chi2: f64, chi2_threshold: f64) -> (f64, f64) {
+pub(crate) fn visual_huber(chi2: f64, chi2_threshold: f64) -> (f64, f64) {
     if chi2_threshold > 0.0 {
         (
             HuberKernel.weight(chi2, chi2_threshold),
@@ -825,6 +839,7 @@ fn imu_huber_chi2(edge: &ImuFactor, kf_local: &[i64], params: &ViBaParams) -> Op
         ImuHuber::AllEdges => Some(params.huber_imu_chi2),
         ImuHuber::BoundaryOnly => is_boundary_edge(edge, kf_local).then_some(params.huber_imu_chi2),
         ImuHuber::Off => None,
+        ImuHuber::BoundaryOrRecentInit => todo!("lane A: Huber while recently initialized"),
     }
 }
 
@@ -1986,6 +2001,7 @@ pub fn visual_inertial_bundle_adjust(
         fallback,
         prior_residual_first,
         prior_residual_final,
+        newest_marginal: None,
     })
 }
 

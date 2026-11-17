@@ -18,10 +18,11 @@ pub mod wheel;
 
 pub use build::BuildError;
 pub use config::{
-    CameraSelection, FrontendConfig, KltFirst, KltPrediction, LocalBaConfig, LoopClosingExecution,
-    LoopClosingMode, MappingConfig, OrbFrontendConfig, OrbSlamPipeline, OrbTuning,
-    PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth, StereoDepthSigma,
-    SystemConfig, TrackingLossConfig,
+    CameraSelection, FrontendConfig, InertialConfig, KltFirst, KltPrediction, LocalBaConfig,
+    LoopClosingExecution, LoopClosingMode, LostRelocalization, MappingConfig, OrbFrontendConfig,
+    OrbSlamPipeline, OrbTuning, PipelineDefinition, PoseInertial, SYSTEM_CONFIG_VERSION,
+    SensorSelection, SnapbackFix, StereoCloseDepth, StereoDepthSigma, SystemConfig, TrackingConfig,
+    TrackingLossConfig,
 };
 pub use counters::{RunCounters, SkipKind};
 #[cfg(feature = "serde")]
@@ -41,7 +42,7 @@ use crate::tracking::{
 };
 
 use crate::tracking::TrackingTimings;
-use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
+use crate::tracking::local_map::select_local_map_points;
 use crate::tracking::motion::{InertialPrediction, body_to_world, predict_pose};
 use crate::tracking::optical_flow::FlowSurvivor;
 use crate::tracking::pose_estimation::Estimate;
@@ -54,6 +55,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::Frame;
+use crate::inertial::trust::{ImuTrust, ImuTrustMode};
 use crate::inertial::{
     AppliedInitialization, ImuInitResult, InertialState, viba0_accel_bias_prior,
 };
@@ -71,15 +73,15 @@ use crate::mapping::map::{
     InertialAlignmentError, Keyframe, Map, MapInsertion, MapMutationError, MapPoint,
     StateEnvelopeLimits,
 };
-use crate::mapping::{KeyframeJob, LocalMapping};
+use crate::mapping::{GrowthNeighbours, KeyframeJob, LocalMapping, SegmentId};
 use crate::pose_conversion::{RIGID_TOLERANCE, apply_reference_pose_correction};
 use build::SystemSettings;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use kornia_image::Image;
 use kornia_sensors::SensorRig;
-use kornia_sensors::imu::ImuMeasurement;
-use recovery::{BridgeAnchor, RunawayDetector, TiltMonitor};
+use kornia_sensors::imu::{ImuMeasurement, SampleInterpolation};
+use recovery::{BridgeAnchor, RunawayDetector, Segments, TiltMonitor};
 
 /// The images of one capture, kept until its features are extracted.
 #[derive(Clone, Copy)]
@@ -155,6 +157,16 @@ pub struct SlamSystem {
     recovery: RecoveryConfig,
     runaway: RunawayDetector,
     tilt: TiltMonitor,
+    segments: Segments,
+    relocalization: LostRelocalization,
+    tracking_config: TrackingConfig,
+    growth_neighbours: GrowthNeighbours,
+    #[allow(dead_code)] // skeleton: lane A reads it
+    sample_interpolation: SampleInterpolation,
+    // Keyframes a map bound evicted, copied while a session is recorded.
+    #[allow(dead_code)] // skeleton: lane D reads it
+    session_recording: bool,
+    evicted_keyframes: Vec<Keyframe>,
     /// The current re-seed holds its translation at the last tracked
     /// position; the attitude still follows the gyro.
     reseed_held: bool,
@@ -229,7 +241,8 @@ impl SlamSystem {
             rig,
             tracker: Tracker::new(settings.map_projection)
                 .with_lk_kernel(settings.klt_kernel)
-                .with_pose_gate(settings.pose_gate),
+                .with_pose_gate(settings.pose_gate)
+                .with_local_map_rules(settings.tracking.local_map),
             two_view_init_config: settings.two_view_init,
             keyframe_policy: settings.keyframe_policy,
             tracking_loss_recovery: settings.tracking_loss_recovery,
@@ -240,6 +253,13 @@ impl SlamSystem {
                 settings.recovery.max_coast_speed_mps,
             ),
             tilt: TiltMonitor::default(),
+            segments: Segments::default(),
+            relocalization: settings.relocalization,
+            tracking_config: settings.tracking,
+            growth_neighbours: settings.growth_neighbours,
+            sample_interpolation: settings.inertial.sample_interpolation,
+            session_recording: false,
+            evicted_keyframes: Vec::new(),
             reseed_held: false,
             reseed_coast_from_sec: 0.0,
             stereo_close_depth: settings.stereo_close_depth_m,
@@ -280,6 +300,23 @@ impl SlamSystem {
         culling: crate::mapping::culling::KeyframeCullingConfig,
     ) {
         self.map_bound = Some((max_keyframes, culling));
+    }
+
+    /// Records a session for an offline pass: each keyframe a map bound removes
+    /// is copied first, so a dump holds every keyframe made. The online map
+    /// behaves as without it.
+    pub fn set_session_recording(&mut self, on: bool) {
+        self.session_recording = on;
+    }
+
+    /// Keyframes a map bound removed while recording, oldest first.
+    pub fn evicted_keyframes(&self) -> &[Keyframe] {
+        &self.evicted_keyframes
+    }
+
+    /// The map segment keyframe `kf_idx` was seeded in.
+    pub fn segment_of(&self, kf_idx: usize) -> SegmentId {
+        self.segments.of(kf_idx)
     }
 
     /// Runs inside a frame, which already holds the map publication gate.
@@ -1157,6 +1194,7 @@ impl SlamSystem {
     /// it relates IMU deltas to camera poses; otherwise tracking is visual-only.
     /// A segment re-seeded with the inertial state kept tracks inertially at once.
     fn finish_bootstrap(&mut self, kf_idx: usize, timestamp_sec: f64) {
+        self.segments.begin(kf_idx);
         self.state.current_keyframe_idx = Some(kf_idx);
         self.state.last_keyframe_idx = Some(kf_idx);
         self.state.mode = if self.state.imu_initialized {
@@ -1310,6 +1348,7 @@ impl SlamSystem {
             gravity_world: self.inertial.gravity_world,
             local_ba: self.local_ba,
             wheel_factors: self.wheel_factors(),
+            tracked_inliers: 0,
         }) {
             self.dbg("[local_mapping] worker is unavailable".into());
         }
@@ -1395,6 +1434,7 @@ impl SlamSystem {
                     .current_keyframe_idx
                     .and_then(|ki| map.get_keyframe(ki)),
                 self.tracker.tracks(),
+                self.tracker.local_map_config(),
             ));
         }
         let survivors = match self.klt_prediction.filter(|_| trusted_prediction) {
@@ -1543,17 +1583,15 @@ impl SlamSystem {
             // scans here would grow with trajectory length.
             // Release this non-reentrant lock before keyframe insertion locks the map.
             {
+                let local_map_config = self.tracker.local_map_config();
                 let mut map_guard = self.map.lock().unwrap();
                 let current_kf = self
                     .state
                     .current_keyframe_idx
                     .and_then(|ki| map_guard.get_keyframe(ki));
-                let local_indices = select_local_map_points(
-                    &map_guard,
-                    &matches,
-                    current_kf,
-                    LocalMapSelectionConfig::default(),
-                );
+                let local_indices =
+                    select_local_map_points(&map_guard, &matches, current_kf, local_map_config)
+                        .points;
                 let visible = crate::tracking::local_map::landmarks_in_frame_frustum(
                     &map_guard,
                     &local_indices,
@@ -1577,8 +1615,8 @@ impl SlamSystem {
         // pose taken from an older part of a drifted map would jump away from
         // the inertial state, which ORB-SLAM3 also avoids in inertial mode.
         if status == TrackingStatus::Skipped
-            && !self.imu_confident(timestamp_sec)
-            && self.relocalize(&frame)
+            && self.relocalization_due(timestamp_sec)
+            && self.relocalize(&frame, false)
         {
             status = TrackingStatus::Tracked;
         }
@@ -1829,6 +1867,7 @@ impl SlamSystem {
             tracked_inliers,
             n_ref_map_points,
             median_parallax_px,
+            ..KeyframeEvidence::default()
         }
     }
 
@@ -1847,14 +1886,38 @@ impl SlamSystem {
         interval_elapsed || self.keyframe_policy.should_insert_with(evidence)
     }
 
-    /// Whether the IMU has been initialized long enough to coast on.
+    /// Whether the IMU prediction is trusted enough to coast on.
     fn imu_confident(&self, timestamp_sec: f64) -> bool {
-        let min_confidence_sec = self.tracking_loss_recovery.min_imu_confidence_sec;
-        self.state.imu_initialized
-            && self
-                .state
-                .imu_init_timestamp_sec
-                .is_some_and(|t0| timestamp_sec - t0 >= min_confidence_sec)
+        self.imu_trust(timestamp_sec).trusted
+    }
+
+    /// How far the inertial prediction at `timestamp_sec` can be trusted.
+    fn imu_trust(&self, timestamp_sec: f64) -> ImuTrust {
+        match self.tracking_config.imu_trust {
+            ImuTrustMode::TimeSinceInit => {
+                let min_confidence_sec = self.tracking_loss_recovery.min_imu_confidence_sec;
+                ImuTrust::by_time(
+                    self.state.imu_initialized
+                        && self
+                            .state
+                            .imu_init_timestamp_sec
+                            .is_some_and(|t0| timestamp_sec - t0 >= min_confidence_sec),
+                )
+            }
+            ImuTrustMode::Covariance { .. } => todo!("lane A: IMU covariance trust"),
+        }
+    }
+
+    /// Whether a lost frame tries relocalization: while the IMU is not
+    /// trusted, or on every lost frame with `relocalization.while_lost`.
+    fn relocalization_due(&self, timestamp_sec: f64) -> bool {
+        !self.imu_confident(timestamp_sec) || self.relocalization.while_lost
+    }
+
+    /// First keyframe of a re-seeded segment while it tracks and grows only
+    /// against its own keyframes (`reseed.own_window_keyframes`).
+    fn seeded_window_start(&self) -> Option<usize> {
+        None
     }
 
     /// Ends the segment tracking was lost in. A metric, inertially initialized
@@ -1995,8 +2058,8 @@ impl SlamSystem {
 
     /// Recovers the pose against the map from place-recognition candidates
     /// and resumes tracking from it. Needs the loop closer's vocabulary and
-    /// keyframe database.
-    fn relocalize(&mut self, frame: &Frame) -> bool {
+    /// keyframe database. `lost`: after a give-up.
+    fn relocalize(&mut self, frame: &Frame, _lost: bool) -> bool {
         const MAX_CANDIDATES: usize = 5;
         let Some(loop_closer) = self.loop_closer.as_ref() else {
             return false;
@@ -2117,8 +2180,22 @@ impl SlamSystem {
         // that already contains the current keyframe would triangulate it
         // against itself and drop the oldest real neighbour. Selection policy
         // belongs to mapping.
-        let growth_plan =
-            keyframe_mapping::prepare_keyframe_growth(&self.map.lock().unwrap(), frame.idx);
+        let growth_plan = {
+            let map = self.map.lock().unwrap();
+            match self.seeded_window_start() {
+                Some(window_start_kf) => keyframe_mapping::prepare_seeded_window_growth(
+                    &map,
+                    frame.idx,
+                    self.growth_neighbours,
+                    window_start_kf,
+                ),
+                None => keyframe_mapping::prepare_keyframe_growth(
+                    &map,
+                    frame.idx,
+                    self.growth_neighbours,
+                ),
+            }
+        };
 
         let imu_edge = match (
             self.state.last_keyframe_idx,
@@ -2201,6 +2278,7 @@ impl SlamSystem {
             gravity_world: self.inertial.gravity_world,
             local_ba: self.local_ba,
             wheel_factors: self.wheel_factors(),
+            tracked_inliers: 0,
         }) {
             self.dbg("[local_mapping] worker is unavailable".into());
         }
@@ -2377,6 +2455,7 @@ impl SlamSystem {
                     gravity_world: self.inertial.gravity_world,
                     local_ba: self.local_ba,
                     wheel_factors: self.wheel_factors(),
+                    tracked_inliers: 0,
                 }) {
                     self.dbg("[local_mapping] worker is unavailable after PGO".into());
                 }

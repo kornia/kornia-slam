@@ -36,6 +36,9 @@ pub struct RigView {
     pub size: ImageSize,
     /// `T_CP`: `X_camera = T_CP * X_primary`.
     pub camera_from_primary: Pose3d,
+    /// `T_PC` as the rig gave it, not the inverse of `camera_from_primary`, so
+    /// rays of one camera share a bit-equal origin.
+    pub primary_from_camera: Pose3d,
     /// Pixels of this camera that some other camera also sees, between 1 and
     /// 50 m; `None` when no other camera shares its view.
     pub overlap: Option<PixelBox>,
@@ -45,6 +48,12 @@ impl RigView {
     /// Pose of this camera for a primary-camera pose (both world-to-camera).
     pub fn pose(&self, pose_world_to_primary: &Pose3d) -> Pose3d {
         self.camera_from_primary.compose(pose_world_to_primary)
+    }
+
+    /// Ray through an undistorted pixel of this camera in the primary frame:
+    /// `(origin, unit direction)` ([`kornia_sensors::camera_ray`]).
+    pub fn ray(&self, pixel_undist: [f64; 2]) -> (Vec3F64, Vec3F64) {
+        kornia_sensors::camera_ray(&self.camera, &self.primary_from_camera, pixel_undist)
     }
 }
 
@@ -67,6 +76,7 @@ impl RigGeometry {
                 camera: cam.camera.clone(),
                 size: cam.size,
                 camera_from_primary: cam.primary_from_camera.inverse(),
+                primary_from_camera: cam.primary_from_camera,
                 overlap: None,
             })
             .collect();

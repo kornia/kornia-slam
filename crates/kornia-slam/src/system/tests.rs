@@ -425,6 +425,7 @@ mod keyframe_evidence {
             tracked_inliers: 80,
             n_ref_map_points: 100,
             median_parallax_px: Some(0.3),
+            ..KeyframeEvidence::default()
         };
         assert!(!system.keyframe_policy.should_insert_with(&parked));
         assert!(!system.keyframe_due(&parked, 10.49));

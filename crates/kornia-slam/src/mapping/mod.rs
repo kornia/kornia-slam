@@ -15,13 +15,16 @@
 
 pub mod bundle_adjustment;
 pub mod culling;
+pub mod global_vi_ba;
 pub mod growth;
 pub(crate) mod keyframe_mapping;
 pub mod local_mapping;
 pub mod map;
 pub mod marginalization;
+pub mod session;
 pub mod vi_ba_schur;
 pub mod visual_information;
 
+pub use keyframe_mapping::GrowthNeighbours;
 pub use local_mapping::{KeyframeJob, LocalMapping, LocalMappingMode};
-pub use map::{Keyframe, Map, MapPoint};
+pub use map::{Keyframe, Map, MapPoint, SegmentId};

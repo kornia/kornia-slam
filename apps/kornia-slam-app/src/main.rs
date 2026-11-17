@@ -101,6 +101,16 @@ struct Args {
     #[argh(option)]
     trace_out: Option<String>,
 
+    /// write the opened source's rig as a rig calibration file (RON) to this
+    /// path, then exit
+    #[argh(option)]
+    write_rig_calibration: Option<String>,
+
+    /// record the session (keyframes, landmarks, IMU samples and tracked
+    /// frames) and write it at shutdown to this file (CBOR), for `offline-ba`
+    #[argh(option)]
+    session_out: Option<String>,
+
     /// first source frame index to trace (default 0)
     #[argh(option, default = "0")]
     trace_from: usize,
@@ -108,6 +118,35 @@ struct Args {
     /// source frame index to stop tracing at (default: never)
     #[argh(option, default = "usize::MAX")]
     trace_to: usize,
+
+    #[argh(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(argh::FromArgs)]
+#[argh(subcommand)]
+#[allow(dead_code)] // skeleton: lane D reads the arguments
+enum Command {
+    OfflineBa(OfflineBaArgs),
+}
+
+/// Offline global visual-inertial BA over a recorded session, with the run
+/// file's `offline_ba` settings; no online run happens.
+#[derive(argh::FromArgs)]
+#[argh(subcommand, name = "offline-ba")]
+#[allow(dead_code)] // skeleton: lane D reads the arguments
+struct OfflineBaArgs {
+    /// session file written by --session-out
+    #[argh(option)]
+    session: String,
+
+    /// write the solved trajectory here, in the --trajectory-out layout
+    #[argh(option)]
+    trajectory_out: String,
+
+    /// write the solve's counters to this JSON file
+    #[argh(option)]
+    report: Option<String>,
 }
 
 /// Evaluation switches for loop-closure tuning that configuration files do not
@@ -178,6 +217,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tui_active = !args.no_tui;
 
     let mut run = RunConfig::from_ron_file(&args.config)?;
+    if let Some(Command::OfflineBa(_)) = &args.command {
+        todo!("lane D: offline-ba subcommand");
+    }
     apply_loop_gate_overrides(&mut run.system.pipeline)?;
     if !tui_active {
         eprint!("{}", run.system);
@@ -190,6 +232,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } = run.source.open(run.system.sensors)?;
     if args.evaluate && ground_truth.is_none() {
         return Err("--evaluate needs ground truth, and this source has none".into());
+    }
+    if args.write_rig_calibration.is_some() {
+        todo!("lane B: --write-rig-calibration");
+    }
+    if run.rig_calibration.is_some() {
+        todo!("lane B: rig_calibration");
     }
     if !tui_active && let Some(summary) = summary {
         eprintln!("{summary}");
@@ -205,6 +253,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(std::path::Path::to_path_buf);
     let mut system = SlamSystem::build(run.system, source.rig()).map_err(|e| e.to_string())?;
     system.set_debug(args.debug);
+    if args.session_out.is_some() {
+        todo!("lane D: --session-out");
+    }
     let mut trace_writer = args
         .trace_out
         .as_deref()

@@ -16,6 +16,7 @@ use kornia_imgproc::features::OrbFeatures;
 use crate::Frame;
 use crate::frame::RigFeatures;
 use crate::mapping::Map;
+use crate::tracking::local_map::{LocalMapRules, LocalMapSelectionConfig};
 use crate::tracking::optical_flow::{
     FlowPrediction, FlowSurvivor, KltPyramidCache, KltTracker, LkKernel, MapKeypointMatch, Track,
     TrackId, TrackSet, carry_klt_survivors, snap_unique,
@@ -77,6 +78,9 @@ pub(crate) struct Tracker {
     snap_errors: u64,
     pose_gate: PoseGate,
     last_gap: Option<GateReading>,
+    /// Projection search scale set from the IMU trust; `None` keeps
+    /// [`MapProjectionConfig::search_scale_for`].
+    search_scale_override: Option<f32>,
 }
 
 impl Tracker {
@@ -90,7 +94,37 @@ impl Tracker {
             snap_errors: 0,
             pose_gate: PoseGate::Disabled,
             last_gap: None,
+            search_scale_override: None,
         }
+    }
+
+    pub(crate) fn with_local_map_rules(mut self, rules: LocalMapRules) -> Self {
+        self.estimator.set_local_map_rules(rules);
+        self
+    }
+
+    /// Restricts the local map to keyframes at or after `window_start_kf`.
+    #[allow(dead_code)] // skeleton: lane B calls it
+    pub(crate) fn set_window_start(&mut self, window_start_kf: Option<usize>) {
+        self.estimator.set_window_start(window_start_kf);
+    }
+
+    /// The local-map selection the estimator searches with.
+    pub(crate) fn local_map_config(&self) -> LocalMapSelectionConfig {
+        self.estimator.local_map_config()
+    }
+
+    #[allow(dead_code)] // skeleton: lane A calls it
+    pub(crate) fn set_search_scale_override(&mut self, search_scale: Option<f32>) {
+        self.search_scale_override = search_scale;
+    }
+
+    fn search_scale(&self, input: &FrameInput<'_>) -> f32 {
+        self.search_scale_override.unwrap_or_else(|| {
+            self.estimator
+                .config()
+                .search_scale_for(input.lost_for_sec, input.trusted_prediction)
+        })
     }
 
     /// Rejects an accepted pose that disagrees with the inertial prediction.
@@ -287,10 +321,7 @@ impl Tracker {
         camera: &PinholeCamera,
         timings: &mut TrackingTimings,
     ) -> Result<Estimate, MapProjectionRejectReason> {
-        let search_scale = self
-            .estimator
-            .config()
-            .search_scale_for(input.lost_for_sec, input.trusted_prediction);
+        let search_scale = self.search_scale(&input);
         let estimate = self.estimator.estimate_from_seeds(
             input.frame,
             &input.candidate_pose,
@@ -385,10 +416,7 @@ impl Tracker {
         camera: &PinholeCamera,
         timings: &mut TrackingTimings,
     ) -> Result<Estimate, MapProjectionRejectReason> {
-        let search_scale = self
-            .estimator
-            .config()
-            .search_scale_for(input.lost_for_sec, input.trusted_prediction);
+        let search_scale = self.search_scale(&input);
 
         // Optical flow follows the primary camera only; its keypoints come first.
         let primary_keypoints = &input.frame.features.keypoints_xy[input.frame.camera_range(0)];
@@ -550,6 +578,7 @@ mod tests {
             pose,
             matches: (0..20).map(|i| (i, i)).collect(),
             inliers: 20,
+            most_voted_keyframe: None,
         }
     }
 

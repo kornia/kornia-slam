@@ -47,6 +47,7 @@ pub struct FrameTrace {
 }
 
 impl FrameTrace {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin(
         frame_idx: usize,
         timestamp_sec: f64,
@@ -55,9 +56,9 @@ impl FrameTrace {
         map: &Map,
         current_kf: Option<&Keyframe>,
         tracks: &[Track],
+        local_map_config: LocalMapSelectionConfig,
     ) -> Self {
-        let local_indices =
-            select_local_map_points(map, &[], current_kf, LocalMapSelectionConfig::default());
+        let local_indices = select_local_map_points(map, &[], current_kf, local_map_config).points;
         let local_map = local_indices
             .iter()
             .filter_map(|&idx| {

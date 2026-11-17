@@ -10,6 +10,53 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**New settings for the estimator, recovery and offline-BA work, all off by
+default.** Every default is the behaviour before the setting existed, so
+existing run files load and run unchanged. Not validated yet; most are not
+implemented yet and stop with `todo!` when set.
+- `mapping.local_ba.large_window` (`Off`): ORB-SLAM3's longer window when the
+  keyframe was tracked strongly, `Enabled(min_tracked_inliers, active_keyframes,
+  max_iterations, initial_lambda)`.
+- `mapping.local_ba.imu_huber: BoundaryOrRecentInit`: Huber on the boundary edge,
+  and on every IMU edge until VIBA2 has run.
+- `mapping.growth_neighbours` (`RecentTen`): `OrbSlam3(covisible)` grows and fuses
+  against ORB-SLAM3's covisibility lists instead of the 10 most recent keyframes.
+- `inertial.sample_interpolation` (`Hold`): `Midpoint` integrates the mean of
+  consecutive IMU samples, the end samples interpolated to the frame stamps.
+- `tracking.pose_inertial` (`Off`): a pose-inertial solve per frame,
+  `LastKeyframe` or `OrbSlam3`; needs the IMU.
+- `tracking.imu_trust` (`TimeSinceInit`): `Covariance(search_sigmas)` trusts the
+  inertial prediction by its propagated covariance instead of time since
+  initialization; needs the IMU.
+- `tracking.local_map` (`Kornia`): `OrbSlam3` picks tracking's local keyframes
+  as ORB-SLAM3's `UpdateLocalKeyFrames`.
+- `tracking.snapback_fix` (`Off`): `AnchorNextFrame` anchors the frame after a
+  local-BA write-back at the corrected keyframe; needs the IMU, and is refused
+  together with `pose_inertial`.
+- `keyframes.rules` (`Kornia`): `OrbSlam3(max_frames)` inserts keyframes by
+  ORB-SLAM3's `NeedNewKeyFrame`.
+- `tracking_loss.relocalization.while_lost` (`false`): relocalize on every lost
+  frame, also while the IMU is confident; needs loop closing's vocabulary.
+- `tracking_loss.relocalization.solver` (`PrimaryEpnp`): `PrimaryAp3p`, or
+  `RigAp3p` on every rig camera's rays; needs loop closing's vocabulary.
+- `tracking_loss.relocalization.max_jump_m` (`0.5`): how far a relocalized pose
+  may lie from the coasted one within the segment being tracked.
+- `tracking_loss.reseed.relocalize_when_lost` (`false`): relocalize while
+  re-seeding after a give-up, into any older segment of the map whatever the
+  jump; needs loop closing's vocabulary.
+- `tracking_loss.reseed.own_window_keyframes` (`0`, off): a re-seeded segment
+  tracks and grows only against its own keyframes until it holds that many.
+- Run file `rig_calibration` (omitted): a rig calibration file that replaces the
+  source's camera geometry; `--write-rig-calibration <path>` writes one from the
+  source.
+- Run file `offline_ba` (defaults): settings of the new `offline-ba` subcommand,
+  an offline global VI-BA over a session recorded with `--session-out <file>`;
+  its calibration states (`calibration.camera_rotation`, `camera_focal`,
+  `gyro_intrinsics`, `clock_offset`) and `bridge_segments` are off. The online
+  run never reads it.
+- A fourth `[summary] estimator_recovery` line prints the counters these settings
+  move, plus relocalization attempts and time in every mode.
+
 **IMU, wheel-odometry and stationary factors move to a new `kornia-factors` crate.**
 Their residuals, Jacobians, information matrices and the Huber cost the VI-BA
 factors share no longer live inside `kornia-slam`'s mapping module, so another

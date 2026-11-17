@@ -32,6 +32,8 @@ impl Default for ImuBias {
 
 /// IMU noise parameters from the sensor datasheet.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct ImuCalib {
     /// Gyroscope white noise density (rad/s/√Hz).
     pub gyro_noise: f64,
@@ -41,6 +43,35 @@ pub struct ImuCalib {
     pub gyro_bias_noise: f64,
     /// Accelerometer bias random walk (m/s³/√Hz).
     pub accel_bias_noise: f64,
+}
+
+/// How a preintegration turns samples into intervals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SampleInterpolation {
+    /// Each sample held over the interval that ends at its stamp, the last
+    /// one to `t1` ([`PreintegratedImu::from_measurements`]).
+    #[default]
+    Hold,
+    /// The mean of consecutive samples, the end samples interpolated to the
+    /// frame stamps (ORB-SLAM3 `Tracking.cc:1684-1720`). The integrator
+    /// stays Euler.
+    Midpoint,
+}
+
+/// Symmetric gyro correction `ω ← (I + S) ω`: `scale` on the diagonal of `S`,
+/// `shear` its off-diagonal entries (xy, xz, yz). Unitless.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GyroIntrinsics {
+    pub scale: Vec3F64,
+    pub shear: Vec3F64,
+}
+
+impl GyroIntrinsics {
+    /// The corrected reading `(I + S) · gyro`, rad/s.
+    pub fn apply(&self, _gyro: Vec3F64) -> Vec3F64 {
+        todo!("lane D: gyro intrinsics")
+    }
 }
 
 /// Preintegrated IMU measurements between two camera frames.
@@ -174,6 +205,23 @@ impl PreintegratedImu {
         }
 
         pre
+    }
+
+    /// [`Self::from_measurements`] with a choice of `interpolation`.
+    /// `Midpoint` needs the samples just before `t0` and just after `t1` in
+    /// `samples`; without the latter it holds the last sample to `t1`.
+    pub fn from_measurements_with(
+        bias: ImuBias,
+        calib: ImuCalib,
+        samples: &[ImuMeasurement],
+        t0: f64,
+        t1: f64,
+        interpolation: SampleInterpolation,
+    ) -> Self {
+        match interpolation {
+            SampleInterpolation::Hold => Self::from_measurements(bias, calib, samples, t0, t1),
+            SampleInterpolation::Midpoint => todo!("lane A: midpoint sample interpolation"),
+        }
     }
 
     /// ΔR re-expressed at a new bias estimate via the first-order correction

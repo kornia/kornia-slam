@@ -13,6 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use kornia_slam::SystemConfig;
+use kornia_slam::mapping::global_vi_ba::OfflineBaConfig;
 use kornia_slam::system::ConfigError;
 use serde::Deserialize;
 
@@ -26,6 +27,15 @@ pub struct RunConfig {
     /// Omitted, the default monocular pipeline runs.
     #[serde(default)]
     pub system: SystemConfig,
+    /// A rig calibration file (RON) whose camera geometry, and IMU extrinsic
+    /// and noise, replace the source's; relative to the run file. Omitted, the
+    /// source's own calibration is used.
+    #[serde(default)]
+    pub rig_calibration: Option<PathBuf>,
+    /// Settings of the `offline-ba` subcommand; the online run never reads them.
+    #[serde(default)]
+    #[allow(dead_code)] // skeleton: lane D reads it
+    pub offline_ba: OfflineBaConfig,
 }
 
 /// A run file that cannot be read or does not describe a valid run.

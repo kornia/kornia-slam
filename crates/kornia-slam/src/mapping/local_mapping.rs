@@ -46,6 +46,9 @@ pub struct KeyframeJob {
     pub local_ba: LocalBaParams,
     /// Wheel-odometry edges between keyframes; empty without a wheel feed.
     pub wheel_factors: Vec<kornia_factors::wheel_odometry::WheelOdomFactor>,
+    /// PnP inliers the keyframe was tracked with; selects
+    /// [`LargeWindow`](crate::mapping::bundle_adjustment::LargeWindow).
+    pub tracked_inliers: usize,
 }
 
 fn capture_local_window(map: &Map, job: &KeyframeJob) -> BaSnapshot {
@@ -451,6 +454,7 @@ mod tests {
             gravity_world: Vec3F64::ZERO,
             local_ba: LocalBaParams::default(),
             wheel_factors: Vec::new(),
+            tracked_inliers: 0,
         }
     }
 

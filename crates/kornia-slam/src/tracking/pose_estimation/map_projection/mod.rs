@@ -36,7 +36,7 @@ use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 use crate::frame::{Frame, is_finite_xy, undistort_keypoint};
 use crate::mapping::map::{Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
 use crate::mapping::visual_information::VisualInformation;
-use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
+use crate::tracking::local_map::{LocalMapRules, LocalMapSelectionConfig, select_local_map_points};
 use crate::tracking::timings::{TrackingTimings, timed};
 
 use super::Estimate;
@@ -215,15 +215,41 @@ pub enum MapProjectionRejectReason {
 /// matching via ORB descriptors, and solving PnP.
 pub struct MapProjectionEstimator {
     config: MapProjectionConfig,
+    local_map_rules: LocalMapRules,
+    /// A re-seeded segment's first keyframe while it tracks its own window.
+    window_start_kf: Option<usize>,
 }
 
 impl MapProjectionEstimator {
     pub fn new(config: MapProjectionConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            local_map_rules: LocalMapRules::default(),
+            window_start_kf: None,
+        }
     }
 
     pub fn config(&self) -> &MapProjectionConfig {
         &self.config
+    }
+
+    pub(crate) fn set_local_map_rules(&mut self, rules: LocalMapRules) {
+        self.local_map_rules = rules;
+    }
+
+    #[allow(dead_code)] // skeleton: lane B calls it through the tracker
+    pub(crate) fn set_window_start(&mut self, window_start_kf: Option<usize>) {
+        self.window_start_kf = window_start_kf;
+    }
+
+    /// The one local-map selection every caller uses, so the visibility count
+    /// and the trace see what the search searched.
+    pub(crate) fn local_map_config(&self) -> LocalMapSelectionConfig {
+        LocalMapSelectionConfig {
+            rules: self.local_map_rules,
+            window_start_kf: self.window_start_kf,
+            ..LocalMapSelectionConfig::default()
+        }
     }
 
     /// Estimate the pose of `frame` against the map.
@@ -277,7 +303,7 @@ impl MapProjectionEstimator {
         // reference KF yet the builder falls back to all non-culled points.
         let current_kf = current_keyframe_idx.and_then(|ki| map.get_keyframe(ki));
         let local_indices =
-            select_local_map_points(map, &[], current_kf, LocalMapSelectionConfig::default());
+            select_local_map_points(map, &[], current_kf, self.local_map_config()).points;
 
         let (projection_matches, curr_keypoints_undist, grids) =
             timed(&mut timings.projection_search, || {
@@ -327,6 +353,7 @@ impl MapProjectionEstimator {
                 return Err((MapProjectionRejectReason::LowPnpInliers, Some(inliers)));
             }
             let mut matches = correspondences;
+            let mut most_voted_keyframe = None;
             if let Some(local) = timed(&mut timings.local_refine, || {
                 self.refine_with_local_map(
                     map,
@@ -342,6 +369,7 @@ impl MapProjectionEstimator {
                 )
             }) {
                 matches = local.matches;
+                most_voted_keyframe = local.most_voted_keyframe;
                 if local.inliers >= self.config.pnp.min_inliers {
                     pose = local.pose;
                     inliers = local.inliers;
@@ -361,6 +389,7 @@ impl MapProjectionEstimator {
                 pose,
                 inliers,
                 matches,
+                most_voted_keyframe,
             })
         };
 
@@ -480,6 +509,7 @@ impl MapProjectionEstimator {
             pose,
             inliers,
             matches,
+            most_voted_keyframe: None,
         })
     }
 
@@ -574,12 +604,9 @@ impl MapProjectionEstimator {
         frame_idx: usize,
     ) -> Option<Estimate> {
         let current_kf = current_kf_idx.and_then(|ki| map.get_keyframe(ki));
-        let local_indices = select_local_map_points(
-            map,
-            tracked_matches,
-            current_kf,
-            LocalMapSelectionConfig::default(),
-        );
+        let selection =
+            select_local_map_points(map, tracked_matches, current_kf, self.local_map_config());
+        let local_indices = selection.points;
         let min_corr = self.config.pnp.min_correspondences;
         if local_indices.len() < min_corr {
             return None;
@@ -618,6 +645,7 @@ impl MapProjectionEstimator {
             pose: new_pose,
             inliers,
             matches: global_matches,
+            most_voted_keyframe: selection.most_voted_keyframe,
         })
     }
 

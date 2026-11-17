@@ -9,6 +9,7 @@ use kornia_sensors::imu::ImuCalib;
 
 use crate::inertial::ImuWindowStats;
 use crate::inertial::initialization::rotation_from_to;
+use crate::mapping::SegmentId;
 use crate::pose_conversion::rigid;
 pub(crate) use crate::tracking::motion::coast_is_plausible;
 pub(crate) use crate::upstream::kornia_3d::pose_ext::camera_centre;
@@ -43,6 +44,14 @@ pub struct RecoveryConfig {
     /// world up at a give-up before the seed is levelled: about 3 deg is
     /// walking noise, and 10 deg leaks 1.7 m/s^2 into the coast.
     pub max_tilt_deg: f64,
+    /// Relocalize once lost (after a give-up) even with the IMU kept, against
+    /// any older segment of the map whatever the jump. Needs loop closing's
+    /// vocabulary.
+    pub relocalize_when_lost: bool,
+    /// With `N > 0`, a segment after the first tracks and grows only against
+    /// its own keyframes until it holds `N` of them (ORB-SLAM3 starts a new
+    /// Atlas map when lost). `0` is off.
+    pub own_window_keyframes: usize,
 }
 
 impl Default for RecoveryConfig {
@@ -55,8 +64,62 @@ impl Default for RecoveryConfig {
             max_bridge_sec: 10.0,
             min_seed_points: 50,
             max_tilt_deg: 10.0,
+            relocalize_when_lost: false,
+            own_window_keyframes: 0,
         }
     }
+}
+
+/// The segments of the map: a new one begins at each seed of the map, a cold
+/// start or a re-seed after a give-up (a light Atlas: one map, one world, the
+/// keyframes tagged by the segment they were built in).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Segments {
+    /// First keyframe of each segment, ascending.
+    starts: Vec<usize>,
+}
+
+impl Segments {
+    pub(crate) fn begin(&mut self, first_kf_idx: usize) {
+        self.starts.push(first_kf_idx);
+    }
+
+    /// The segment keyframe `kf_idx` belongs to.
+    pub(crate) fn of(&self, kf_idx: usize) -> SegmentId {
+        let segment = self
+            .starts
+            .partition_point(|&start| start <= kf_idx)
+            .saturating_sub(1);
+        segment as SegmentId
+    }
+
+    /// The newest segment: the one being tracked, or the one just given up.
+    #[allow(dead_code)] // skeleton: lane B calls it
+    pub(crate) fn latest(&self) -> SegmentId {
+        self.starts.len().saturating_sub(1) as SegmentId
+    }
+
+    /// First keyframe of the newest segment; `None` before the first seed.
+    #[allow(dead_code)] // skeleton: lane B calls it
+    pub(crate) fn latest_start(&self) -> Option<usize> {
+        self.starts.last().copied()
+    }
+}
+
+/// Whether a relocalization against keyframe `kf_idx`, `jump_m` away from the
+/// motion model, is adopted. Within the latest segment the pose must stay
+/// near the prediction, or a drifted part of the map would teleport the
+/// trajectory. Once lost, an older segment is another map to merge into
+/// (ORB-SLAM3's Atlas): its drift against the coast is unknown, so any jump is.
+#[allow(dead_code)] // skeleton: lane B calls it
+pub(crate) fn relocalization_adopted(
+    _segments: &Segments,
+    _kf_idx: usize,
+    _jump_m: f64,
+    _max_jump_m: f64,
+    _lost: bool,
+) -> bool {
+    todo!("lane B: relocalization once lost")
 }
 
 /// The keyframe a bridge edge starts from: the last one before a give-up.
@@ -253,6 +316,20 @@ pub(crate) mod tests {
         for (a, b) in base.iter().zip(scaled) {
             assert!((b - scale * a).abs() <= 1e-9 * scale * largest, "{a} {b}");
         }
+    }
+
+    #[test]
+    fn keyframes_belong_to_the_segment_they_were_seeded_in() {
+        let mut segments = Segments::default();
+        segments.begin(0);
+        segments.begin(131);
+        segments.begin(6866);
+        assert_eq!(
+            [0, 130, 131, 6000, 6866, 9000].map(|kf| segments.of(kf)),
+            [0, 0, 1, 1, 2, 2]
+        );
+        assert_eq!(segments.latest(), 2);
+        assert_eq!(segments.latest_start(), Some(6866));
     }
 
     fn walk(detector: &mut RunawayDetector, from_sec: f64, to_sec: f64, speed: f64) {

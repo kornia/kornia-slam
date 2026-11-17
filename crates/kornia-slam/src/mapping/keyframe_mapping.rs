@@ -103,7 +103,25 @@ pub(crate) fn keyframe_insertion(
 /// consumed during the same publication interval that produced it.
 pub(crate) struct KeyframeGrowthPlan {
     keyframe_idx: usize,
-    neighbor_keyframe_indices: Vec<usize>,
+    /// Neighbours the keyframe triangulates new landmarks against.
+    triangulation_neighbours: Vec<usize>,
+    /// Neighbours its landmarks are fused into; equal to the above under
+    /// [`GrowthNeighbours::RecentTen`].
+    fusion_neighbours: Vec<usize>,
+}
+
+/// Which keyframes a new keyframe grows and fuses against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum GrowthNeighbours {
+    /// The 10 most recent keyframes, for triangulation and fusion alike.
+    #[default]
+    RecentTen,
+    /// ORB-SLAM3's lists: `CreateNewMapPoints` (best covisible, then the
+    /// previous-keyframe chain) and `SearchInNeighbors` (best covisible, their
+    /// best 20, then temporal keyframes); `LocalMapping.cc:388-407, 714-763`.
+    /// `covisible` is 10 (30 monocular).
+    OrbSlam3 { covisible: usize },
 }
 
 /// A pair whose growth batch was refused, with the neighbour it was against.
@@ -139,19 +157,40 @@ const MAX_COVIS_KFS: usize = 10;
 /// list that already contained it would triangulate it against itself and drop
 /// the oldest real neighbour. The id is filtered anyway, so the policy states
 /// that intent rather than relying on call order alone.
-pub(crate) fn prepare_keyframe_growth(map: &Map, keyframe_idx: usize) -> KeyframeGrowthPlan {
-    let neighbor_keyframe_indices = map
-        .keyframes()
-        .iter()
-        .rev()
-        .map(|kf| kf.frame.idx)
-        .filter(|&idx| idx != keyframe_idx)
-        .take(MAX_COVIS_KFS)
-        .collect();
-    KeyframeGrowthPlan {
-        keyframe_idx,
-        neighbor_keyframe_indices,
+pub(crate) fn prepare_keyframe_growth(
+    map: &Map,
+    keyframe_idx: usize,
+    rule: GrowthNeighbours,
+) -> KeyframeGrowthPlan {
+    match rule {
+        GrowthNeighbours::RecentTen => {
+            let neighbours: Vec<usize> = map
+                .keyframes()
+                .iter()
+                .rev()
+                .map(|kf| kf.frame.idx)
+                .filter(|&idx| idx != keyframe_idx)
+                .take(MAX_COVIS_KFS)
+                .collect();
+            KeyframeGrowthPlan {
+                keyframe_idx,
+                fusion_neighbours: neighbours.clone(),
+                triangulation_neighbours: neighbours,
+            }
+        }
+        GrowthNeighbours::OrbSlam3 { .. } => todo!("lane A: ORB-SLAM3 growth neighbours"),
     }
+}
+
+/// [`prepare_keyframe_growth`] for a re-seeded segment still inside its own
+/// window: both lists keep only keyframes at or after `window_start_kf`.
+pub(crate) fn prepare_seeded_window_growth(
+    _map: &Map,
+    _keyframe_idx: usize,
+    _rule: GrowthNeighbours,
+    _window_start_kf: usize,
+) -> KeyframeGrowthPlan {
+    todo!("lane B: own-window growth")
 }
 
 /// Grows the accepted keyframe against its captured neighbours, then fuses its
@@ -169,11 +208,11 @@ pub(crate) fn grow_keyframe(
     triangulation_config: &TriangulationConfig,
 ) -> KeyframeGrowthResult {
     let mut result = KeyframeGrowthResult {
-        neighbor_count: plan.neighbor_keyframe_indices.len(),
+        neighbor_count: plan.triangulation_neighbours.len(),
         ..Default::default()
     };
 
-    for &neighbor_keyframe_idx in &plan.neighbor_keyframe_indices {
+    for &neighbor_keyframe_idx in &plan.triangulation_neighbours {
         let mut guard = map.lock().unwrap();
         let Some(request) = growth::pair_growth_request(
             &guard,
@@ -203,7 +242,7 @@ pub(crate) fn grow_keyframe(
     // descriptor, and the next neighbour's search must match against that,
     // not against the descriptor it had before fusion began.
     let mut guard = map.lock().unwrap();
-    for &neighbor_keyframe_idx in &plan.neighbor_keyframe_indices {
+    for &neighbor_keyframe_idx in &plan.fusion_neighbours {
         let links = growth::neighbor_fusion_links(
             &guard,
             plan.keyframe_idx,
@@ -394,10 +433,10 @@ mod tests {
                 .unwrap();
         }
 
-        let plan = prepare_keyframe_growth(&map, 999);
+        let plan = prepare_keyframe_growth(&map, 999, GrowthNeighbours::RecentTen);
 
         assert_eq!(
-            plan.neighbor_keyframe_indices,
+            plan.triangulation_neighbours,
             vec![31, 88, 2, 55, 7, 64, 12, 900, 5, 41],
             "the ten most recently inserted, newest first"
         );
@@ -414,9 +453,9 @@ mod tests {
                 .unwrap();
         }
 
-        let plan = prepare_keyframe_growth(&map, 9);
+        let plan = prepare_keyframe_growth(&map, 9, GrowthNeighbours::RecentTen);
 
-        assert_eq!(plan.neighbor_keyframe_indices, vec![4]);
+        assert_eq!(plan.triangulation_neighbours, vec![4]);
     }
 
     /// Each pair is published before the next is prepared, so the second
@@ -430,10 +469,10 @@ mod tests {
             map.insert_keyframe(Keyframe::from_frame(observing_frame(idx, offset, &points)))
                 .unwrap();
         }
-        let plan = prepare_keyframe_growth(&map, 30);
+        let plan = prepare_keyframe_growth(&map, 30, GrowthNeighbours::RecentTen);
         map.insert_keyframe(Keyframe::from_frame(observing_frame(30, 2.0, &points)))
             .unwrap();
-        assert_eq!(plan.neighbor_keyframe_indices, vec![20, 10]);
+        assert_eq!(plan.triangulation_neighbours, vec![20, 10]);
         let map = Mutex::new(map);
 
         let result = grow(&map, plan);
@@ -469,11 +508,11 @@ mod tests {
         // Shares no features: the pair has nothing to propose.
         map.insert_keyframe(Keyframe::from_frame(empty_frame(10)))
             .unwrap();
-        let plan = prepare_keyframe_growth(&map, 30);
+        let plan = prepare_keyframe_growth(&map, 30, GrowthNeighbours::RecentTen);
         map.insert_keyframe(Keyframe::from_frame(observing_frame(30, 2.0, &points)))
             .unwrap();
         assert_eq!(
-            plan.neighbor_keyframe_indices,
+            plan.triangulation_neighbours,
             vec![10, 20],
             "the skipped neighbour must be visited before the useful one"
         );
@@ -507,7 +546,7 @@ mod tests {
             .unwrap();
         map.insert_keyframe(Keyframe::from_frame(observing_frame(20, 1.0, &points)))
             .unwrap();
-        let plan = prepare_keyframe_growth(&map, 30);
+        let plan = prepare_keyframe_growth(&map, 30, GrowthNeighbours::RecentTen);
         map.insert_keyframe(Keyframe::from_frame(observing_frame(30, 2.0, &points)))
             .unwrap();
         let map = Mutex::new(map);
@@ -549,14 +588,15 @@ mod tests {
             map.insert_keyframe(Keyframe::from_frame(observing_frame(idx, offset, &points)))
                 .unwrap();
         }
-        let first_plan = prepare_keyframe_growth(&map, 30);
+        let first_plan = prepare_keyframe_growth(&map, 30, GrowthNeighbours::RecentTen);
         map.insert_keyframe(Keyframe::from_frame(observing_frame(30, 2.0, &points)))
             .unwrap();
         let map = Mutex::new(map);
         let first = grow(&map, first_plan);
         assert!(first.landmarks_added > 0);
 
-        let second_plan = prepare_keyframe_growth(&map.lock().unwrap(), 30);
+        let second_plan =
+            prepare_keyframe_growth(&map.lock().unwrap(), 30, GrowthNeighbours::RecentTen);
         let before = map.lock().unwrap().state_fingerprint_for_test();
 
         let result = grow(&map, second_plan);

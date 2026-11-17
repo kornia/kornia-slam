@@ -66,6 +66,41 @@ pub struct RunCounters {
     pub gate_rejects_rotation: u64,
     /// Frames whose tracked pose the pose gate rejected for its position.
     pub gate_rejects_translation: u64,
+    /// Local-BA write-backs that moved the newest keyframe's centre over 0.3 m.
+    pub ba_keyframe_shifts: u64,
+    /// Of those, next frames whose tracked step undid 0.5-2x of the shift.
+    pub ba_snapbacks: u64,
+    /// VI-BA solves run with the large window.
+    pub large_window_solves: u64,
+    /// Frames tracked by the pose-inertial solve.
+    pub pose_inertial_solves: u64,
+    /// Of those, solves anchored at a keyframe rather than the previous frame.
+    pub pose_inertial_keyframe_anchored: u64,
+    /// Frame priors dropped because their marginal was not positive definite.
+    pub pose_inertial_prior_dropped: u64,
+    /// Transitions of the IMU prediction from trusted to untrusted.
+    pub imu_trust_lost: u64,
+    /// Midpoint preintegrations that held the last sample to the frame stamp.
+    pub imu_tail_holds: u64,
+    /// Calls of relocalization that reached the candidate query.
+    pub relocalization_attempts: u64,
+    /// Relocalizations adopted.
+    pub relocalizations: u64,
+    /// Of those, adopted only because relocalization runs while lost: the
+    /// IMU was confident.
+    pub relocalizations_while_lost: u64,
+    /// Relocalized poses refused for jumping too far from the coasted one.
+    pub relocalization_refused_jump: u64,
+    /// Relocalizations adopted into an older segment once lost.
+    pub relocalizations_older_segment: u64,
+    /// Frames where a relocalization was due but no loop closer exists.
+    pub relocalization_without_vocabulary: u64,
+    /// Wall time inside relocalization, in nanoseconds.
+    pub relocalization_ns: u64,
+    /// Frames tracked with a re-seeded segment's own window active.
+    pub seeded_window_frames: u64,
+    /// Local-map points that window filtered out of the visibility count.
+    pub seeded_window_dropped_points: u64,
 }
 
 impl RunCounters {

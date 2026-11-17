@@ -4,18 +4,22 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::inertial::trust::ImuTrustMode;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{LoopClosingConfig, LoopGraphInformation, LoopGraphSettings};
-use crate::mapping::LocalMappingMode;
-use crate::mapping::bundle_adjustment::{LostKeyframes, VisualKernel};
+use crate::mapping::bundle_adjustment::{LargeWindow, LostKeyframes, VisualKernel};
 use crate::mapping::map::StateEnvelope;
 use crate::mapping::marginalization::BoundaryPrior;
 use crate::mapping::vi_ba_schur::ImuHuber;
 use crate::mapping::visual_information::VisualInformation;
+use crate::mapping::{GrowthNeighbours, LocalMappingMode};
+use crate::tracking::local_map::LocalMapRules;
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::{KeyframeObservations, MapProjectionConfig};
 use crate::tracking::pose_gate::PoseGate;
+use crate::tracking::relocalization::RelocalizationSolver;
 use crate::tracking::{KeyframePolicy, KeyframesWhileLost, TrackingLossRecoveryPolicy};
+use kornia_sensors::imu::SampleInterpolation;
 
 use super::recovery::RecoveryConfig;
 
@@ -94,6 +98,8 @@ pub struct OrbSlamPipeline {
     pub mapping: MappingConfig,
     pub loop_closing: LoopClosingMode,
     pub tracking_loss: TrackingLossConfig,
+    pub tracking: TrackingConfig,
+    pub inertial: InertialConfig,
     /// Algorithm tuning, set from Rust only: configuration files always use the
     /// defaults.
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -255,6 +261,80 @@ pub struct TrackingLossConfig {
     /// Whether a tracked pose that disagrees with the inertial prediction is
     /// rejected; a reject coasts, as any other.
     pub pose_gate: PoseGate,
+    pub relocalization: LostRelocalization,
+}
+
+/// When relocalization runs while tracking is lost, and how.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct LostRelocalization {
+    /// Relocalize on every lost frame, also while the IMU is confident;
+    /// otherwise only while it is not. Needs loop closing's vocabulary.
+    pub while_lost: bool,
+    pub solver: RelocalizationSolver,
+    /// Farthest a relocalized pose may lie from the coasted one, metres,
+    /// within the segment being tracked.
+    pub max_jump_m: f64,
+}
+
+impl Default for LostRelocalization {
+    fn default() -> Self {
+        Self {
+            while_lost: false,
+            solver: RelocalizationSolver::PrimaryEpnp,
+            max_jump_m: 0.5,
+        }
+    }
+}
+
+/// Per-frame tracking estimators. The defaults are the behaviour before these
+/// settings existed; the alternatives are ORB-SLAM3's, kept selectable.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct TrackingConfig {
+    pub pose_inertial: PoseInertial,
+    /// How far the inertial prediction is trusted.
+    pub imu_trust: ImuTrustMode,
+    pub local_map: LocalMapRules,
+    pub snapback_fix: SnapbackFix,
+}
+
+/// A pose-inertial solve per frame (the idea of PR #195, credit Astik):
+/// ORB-SLAM3's `PoseInertialOptimizationLast{Frame,KeyFrame}`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum PoseInertial {
+    /// Visual-only PnP; the IMU only seeds and vetoes it.
+    #[default]
+    Off,
+    /// `PoseInertialOptimizationLastKeyFrame` on every frame: the last
+    /// keyframe held fixed.
+    LastKeyframe,
+    /// ORB-SLAM3's choice per frame: `...LastFrame` under the previous frame's
+    /// 15×15 prior; `...LastKeyFrame` on the first frame after the map changed
+    /// (`Tracking.cc:2970-2992`).
+    OrbSlam3,
+}
+
+/// What follows a local-BA write-back that moved the reference keyframe.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SnapbackFix {
+    #[default]
+    Off,
+    /// On the first frame after a write-back, a `LastKeyframe` pose-inertial
+    /// solve anchored at the corrected keyframe (`Tracking.cc:2982-2991`).
+    AnchorNextFrame,
+}
+
+/// How IMU samples are integrated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct InertialConfig {
+    pub sample_interpolation: SampleInterpolation,
 }
 
 /// Local mapping (keyframe insertion, culling and local BA / VI-BA).
@@ -269,6 +349,8 @@ pub struct MappingConfig {
     /// Which tracked matches a new keyframe links; ORB-SLAM3 keeps only the
     /// pose inliers.
     pub keyframe_observations: KeyframeObservations,
+    /// Which keyframes a new keyframe triangulates and fuses against.
+    pub growth_neighbours: GrowthNeighbours,
 }
 
 /// The local BA / VI-BA window and its error model. The defaults are the
@@ -301,6 +383,7 @@ pub struct LocalBaConfig {
     pub lost_keyframes: LostKeyframes,
     /// The visual-only local BA's kernel; VI-BA is always robust.
     pub visual_kernel: VisualKernel,
+    pub large_window: LargeWindow,
 }
 
 impl Default for LocalBaConfig {
@@ -317,6 +400,7 @@ impl Default for LocalBaConfig {
             state_envelope: StateEnvelope::Off,
             lost_keyframes: LostKeyframes::Free,
             visual_kernel: VisualKernel::L2,
+            large_window: LargeWindow::Off,
         }
     }
 }

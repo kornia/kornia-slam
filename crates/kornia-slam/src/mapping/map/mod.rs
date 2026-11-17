@@ -75,6 +75,10 @@ pub use ops::{
 };
 pub use ops::{KeyframeRemoval, KeyframeRemovalError, StillNeighbour, StillSide};
 
+/// Index of a map segment: a new one begins at each seed of the map, a cold
+/// start or a re-seed after a give-up.
+pub type SegmentId = u32;
+
 /// ORB pyramid scale factor between adjacent levels (matches the kornia-imgproc
 /// ORB extractor default `downscale = 1.2`, which equals ORB-SLAM3's default).
 pub const ORB_SCALE_FACTOR: f64 = 1.2;

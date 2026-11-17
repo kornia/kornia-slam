@@ -59,6 +59,12 @@ impl InertialInitSchedule {
         self.start_kf_idx
     }
 
+    /// A window is open and VIBA2 has not run (ORB-SLAM3's `bRecInit`).
+    #[allow(dead_code)] // skeleton: lane A calls it
+    pub(crate) fn recently_initialized(&self) -> bool {
+        todo!("lane A: recently initialized")
+    }
+
     pub(crate) fn retry_due(&self, timestamp_sec: f64) -> bool {
         due_for_retry(self.last_attempt_sec, timestamp_sec)
     }

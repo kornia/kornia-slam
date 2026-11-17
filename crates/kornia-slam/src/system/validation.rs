@@ -3,21 +3,26 @@ use kornia_sensors::SensorRig;
 
 use super::config::{
     CameraSelection, FrontendConfig, LocalBaConfig, LoopClosingMode, OrbFrontendConfig,
-    OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection,
-    StereoCloseDepth, StereoDepthSigma, SystemConfig,
+    OrbSlamPipeline, OrbTuning, PipelineDefinition, PoseInertial, SYSTEM_CONFIG_VERSION,
+    SensorSelection, SnapbackFix, StereoCloseDepth, StereoDepthSigma, SystemConfig, TrackingConfig,
+    TrackingLossConfig,
 };
 use super::recovery::RecoveryConfig;
+use crate::inertial::trust::ImuTrustMode;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{
     LoopClosingConfig, LoopGraphInformation, LoopOdometryGate, LoopTemporalConsistency,
     OdometryRandomWalk,
 };
-use crate::mapping::bundle_adjustment::LostKeyframes;
+use crate::mapping::GrowthNeighbours;
+use crate::mapping::bundle_adjustment::{LargeWindow, LostKeyframes};
+use crate::mapping::global_vi_ba::OfflineBaConfig;
 use crate::mapping::map::StateEnvelope;
 use crate::mapping::marginalization::BoundaryPrior;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
 use crate::tracking::pose_gate::PoseGate;
-use crate::tracking::{KeyframePolicy, KeyframesWhileLost};
+use crate::tracking::relocalization::RelocalizationSolver;
+use crate::tracking::{KeyframePolicy, KeyframeRules, KeyframesWhileLost};
 
 /// A system configuration that cannot be built or does not fit its source.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -61,6 +66,19 @@ pub enum ConfigError {
          full states (Enabled)"
     )]
     LostKeyframesWithoutEffect(KeyframesWhileLost),
+    #[error(
+        "mapping.local_ba.large_window active_keyframes ({large}) is below \
+         mapping.local_ba.active_keyframes ({active})"
+    )]
+    LargeWindowNotLarger { active: usize, large: usize },
+    #[error("{0} needs the IMU: select sensors.imu")]
+    InertialKnobWithoutImu(&'static str),
+    #[error(
+        "tracking.snapback_fix AnchorNextFrame is part of tracking.pose_inertial: set one of them"
+    )]
+    SnapbackFixWithPoseInertial,
+    #[error("`{0}` needs loop closing's vocabulary: enable `pipeline.loop_closing`")]
+    RelocalizationWithoutVocabulary(&'static str),
 }
 
 impl SystemConfig {
@@ -96,6 +114,15 @@ impl OrbSlamPipeline {
         validate_loop_closing(&self.loop_closing, sensors)?;
         validate_recovery(&self.tracking_loss.reseed)?;
         validate_pose_gate(&self.tracking_loss.pose_gate)?;
+        validate_lost_relocalization(&self.tracking_loss, &self.loop_closing)?;
+        validate_estimator(&self.tracking, sensors.imu)?;
+        if let GrowthNeighbours::OrbSlam3 { covisible } = self.mapping.growth_neighbours {
+            check(
+                "mapping.growth_neighbours.covisible",
+                covisible as f64,
+                AT_LEAST_ONE,
+            )?;
+        }
         validate_lost_keyframes(
             self.mapping.local_ba.lost_keyframes,
             self.tracking_loss.keyframes_while_lost,
@@ -128,6 +155,59 @@ fn validate_recovery(recovery: &RecoveryConfig) -> Result<(), ConfigError> {
         AT_LEAST_ONE,
     )?;
     check(at("max_tilt_deg"), recovery.max_tilt_deg, POSITIVE)
+}
+
+/// Each relocalization knob is inert without the loop closer's vocabulary.
+fn validate_lost_relocalization(
+    tracking_loss: &TrackingLossConfig,
+    loop_closing: &LoopClosingMode,
+) -> Result<(), ConfigError> {
+    let relocalization = &tracking_loss.relocalization;
+    check(
+        "tracking_loss.relocalization.max_jump_m",
+        relocalization.max_jump_m,
+        POSITIVE,
+    )?;
+    if loop_closing.is_enabled() {
+        return Ok(());
+    }
+    let inert = if relocalization.while_lost {
+        Some("tracking_loss.relocalization.while_lost")
+    } else if relocalization.solver != RelocalizationSolver::PrimaryEpnp {
+        Some("tracking_loss.relocalization.solver")
+    } else if tracking_loss.reseed.relocalize_when_lost {
+        Some("tracking_loss.reseed.relocalize_when_lost")
+    } else {
+        None
+    };
+    inert.map_or(Ok(()), |knob| {
+        Err(ConfigError::RelocalizationWithoutVocabulary(knob))
+    })
+}
+
+/// The per-frame estimator knobs that read the IMU need it, and the snap-back
+/// fix is already part of the pose-inertial solve.
+fn validate_estimator(tracking: &TrackingConfig, imu: bool) -> Result<(), ConfigError> {
+    if let ImuTrustMode::Covariance { search_sigmas } = tracking.imu_trust {
+        check("tracking.imu_trust.search_sigmas", search_sigmas, POSITIVE)?;
+    }
+    if !imu {
+        if tracking.pose_inertial != PoseInertial::Off {
+            return Err(ConfigError::InertialKnobWithoutImu(
+                "tracking.pose_inertial",
+            ));
+        }
+        if tracking.imu_trust != ImuTrustMode::TimeSinceInit {
+            return Err(ConfigError::InertialKnobWithoutImu("tracking.imu_trust"));
+        }
+        if tracking.snapback_fix != SnapbackFix::Off {
+            return Err(ConfigError::InertialKnobWithoutImu("tracking.snapback_fix"));
+        }
+    }
+    if tracking.snapback_fix != SnapbackFix::Off && tracking.pose_inertial != PoseInertial::Off {
+        return Err(ConfigError::SnapbackFixWithPoseInertial);
+    }
+    Ok(())
 }
 
 /// `FixedInertial` acts only on keyframes inserted as full states while lost: anchors are
@@ -223,6 +303,13 @@ fn validate_keyframes(policy: &KeyframePolicy, imu: bool) -> Result<(), ConfigEr
     if let Some(secs) = policy.max_interval_sec {
         check("keyframes.max_interval_sec", secs, POSITIVE)?;
     }
+    if let KeyframeRules::OrbSlam3 { max_frames } = policy.rules {
+        check(
+            "keyframes.rules.max_frames",
+            max_frames as f64,
+            AT_LEAST_ONE,
+        )?;
+    }
     // IMU samples are kept until the next keyframe: a parked rig with no
     // bound would buffer them, and grow the next IMU edge, without limit.
     if imu && max == usize::MAX && policy.max_interval_sec.is_none() {
@@ -251,6 +338,26 @@ fn validate_local_ba(config: &LocalBaConfig) -> Result<(), ConfigError> {
     if let BoundaryPrior::Marginal(sigma) = config.boundary {
         check(at("boundary"), sigma.frozen_pose_sigma_m, POSITIVE)?;
         check(at("boundary"), sigma.frozen_pose_sigma_rad, POSITIVE)?;
+    }
+    if let LargeWindow::Enabled {
+        active_keyframes,
+        max_iterations,
+        initial_lambda,
+        ..
+    } = config.large_window
+    {
+        if active_keyframes < config.active_keyframes {
+            return Err(ConfigError::LargeWindowNotLarger {
+                active: config.active_keyframes,
+                large: active_keyframes,
+            });
+        }
+        check(
+            at("large_window.max_iterations"),
+            max_iterations as f64,
+            AT_LEAST_ONE,
+        )?;
+        check(at("large_window.initial_lambda"), initial_lambda, POSITIVE)?;
     }
     if let StateEnvelope::On(limits) = config.state_envelope {
         check(at("state_envelope"), limits.max_speed_mps, POSITIVE)?;
@@ -556,6 +663,67 @@ fn validate_correction(config: &LoopClosingConfig) -> Result<(), ConfigError> {
         pgo.initial_lambda.into(),
         POSITIVE,
     )
+}
+
+impl OfflineBaConfig {
+    /// Checks the offline pass's settings on their own.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let at = |field| format!("offline_ba.{field}");
+        check(
+            at("relative_cost_tolerance"),
+            self.relative_cost_tolerance,
+            POSITIVE,
+        )?;
+        check(at("outlier_px"), self.outlier_px, POSITIVE)?;
+        check(at("tight_outlier_px"), self.tight_outlier_px, POSITIVE)?;
+        if self.tight_outlier_px > self.outlier_px {
+            return Err(ConfigError::InvalidSetting {
+                setting: at("tight_outlier_px"),
+                value: self.tight_outlier_px,
+                requirement: "<= offline_ba.outlier_px",
+            });
+        }
+        check(
+            at("tighten_from_iteration"),
+            self.tighten_from_iteration as f64,
+            AT_LEAST_ONE,
+        )?;
+        check(
+            at("landmark_damping_floor"),
+            self.landmark_damping_floor,
+            OPEN_UNIT_UPPER,
+        )?;
+        let calibration = &self.calibration;
+        let at = |field| format!("offline_ba.calibration.{field}");
+        check(
+            at("time_slices"),
+            calibration.time_slices as f64,
+            Requirement("in 1..=64", |v| (1.0..=64.0).contains(&v)),
+        )?;
+        if let Some(prior) = calibration.camera_rotation {
+            check(
+                at("camera_rotation.step_sigma_deg"),
+                prior.step_sigma_deg,
+                POSITIVE,
+            )?;
+            check(
+                at("camera_rotation.value_sigma_deg"),
+                prior.value_sigma_deg,
+                POSITIVE,
+            )?;
+        }
+        if let Some(prior) = calibration.camera_focal {
+            check(at("camera_focal.step_sigma"), prior.step_sigma, POSITIVE)?;
+            check(at("camera_focal.value_sigma"), prior.value_sigma, POSITIVE)?;
+        }
+        if let Some(prior) = calibration.gyro_intrinsics {
+            check(at("gyro_intrinsics.sigma"), prior.sigma, POSITIVE)?;
+        }
+        if let Some(prior) = calibration.clock_offset {
+            check(at("clock_offset.sigma_ms"), prior.sigma_ms, POSITIVE)?;
+        }
+        Ok(())
+    }
 }
 
 /// A predicate on a finite value, with its description for error messages.

@@ -5,6 +5,7 @@ use crate::imu::ImuCalib;
 use crate::wheel::{DifferentialDrive, WheelNoise};
 use kornia_3d::camera::{FisheyeCamera, PinholeCamera};
 use kornia_3d::pose::Pose3d;
+use kornia_algebra::Vec3F64;
 use kornia_image::ImageSize;
 
 /// Camera calibration plus optional stereo, IMU and wheel calibration.
@@ -42,6 +43,23 @@ pub struct RigCamera {
     /// `T_PC`: `X_primary = T_PC * X_camera`, where the primary camera is
     /// [`SensorRig::camera`]. Identity for the primary itself.
     pub primary_from_camera: Pose3d,
+}
+
+/// Ray through an undistorted pixel of `camera`, in the primary-camera frame:
+/// `(origin, unit direction)`, origin = `primary_from_camera.translation`.
+pub fn camera_ray(
+    _camera: &PinholeCamera,
+    _primary_from_camera: &Pose3d,
+    _pixel_undist: [f64; 2],
+) -> (Vec3F64, Vec3F64) {
+    todo!("lane B: rig rays")
+}
+
+impl RigCamera {
+    /// [`camera_ray`] of this camera.
+    pub fn ray(&self, pixel_undist: [f64; 2]) -> (Vec3F64, Vec3F64) {
+        camera_ray(&self.camera, &self.primary_from_camera, pixel_undist)
+    }
 }
 
 impl SensorRig {
@@ -105,6 +123,12 @@ impl SensorRig {
     /// Camera-to-body transform `T_BC`, or `None` for a visual-only rig.
     pub fn camera_to_body(&self) -> Option<Pose3d> {
         self.imu.as_ref().map(|imu| imu.camera_to_body)
+    }
+
+    /// `T_BC` of rig camera `camera`: `camera_to_body ∘ primary_from_camera`.
+    /// `None` without an IMU or past the last camera.
+    pub fn camera_to_body_of(&self, _camera: usize) -> Option<Pose3d> {
+        todo!("lane B: per-camera body extrinsic")
     }
 
     /// Noise parameters to preintegrate with; the defaults for a rig without IMU

@@ -27,7 +27,8 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
          bias_resets={} reseed_stall_frames={} gate_rejects_rotation={} \
          gate_rejects_translation={}\n\
          [summary] frame_ms {}\n\
-         [summary] frontend_ms {}",
+         [summary] frontend_ms {}\n\
+         {}",
         c.frames,
         c.tracked,
         c.keyframes,
@@ -54,6 +55,38 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
         c.gate_rejects_translation,
         format_percentiles(&times.frame_ms),
         format_percentiles(&times.frontend_ms),
+        format_estimator_recovery(c),
+    )
+}
+
+/// The estimator (IMU trust, pose-inertial solve, G29) and recovery
+/// (relocalization, own window) counters, in a fixed order.
+fn format_estimator_recovery(c: &RunCounters) -> String {
+    format!(
+        "[summary] estimator_recovery ba_keyframe_shifts={} ba_snapbacks={} \
+         large_window_solves={} pose_inertial_solves={} pose_inertial_keyframe_anchored={} \
+         pose_inertial_prior_dropped={} imu_trust_lost={} imu_tail_holds={} \
+         relocalization_attempts={} relocalizations={} relocalizations_while_lost={} \
+         relocalization_refused_jump={} relocalizations_older_segment={} \
+         relocalization_without_vocabulary={} relocalization_ms={:.1} seeded_window_frames={} \
+         seeded_window_dropped_points={}",
+        c.ba_keyframe_shifts,
+        c.ba_snapbacks,
+        c.large_window_solves,
+        c.pose_inertial_solves,
+        c.pose_inertial_keyframe_anchored,
+        c.pose_inertial_prior_dropped,
+        c.imu_trust_lost,
+        c.imu_tail_holds,
+        c.relocalization_attempts,
+        c.relocalizations,
+        c.relocalizations_while_lost,
+        c.relocalization_refused_jump,
+        c.relocalizations_older_segment,
+        c.relocalization_without_vocabulary,
+        c.relocalization_ns as f64 / 1e6,
+        c.seeded_window_frames,
+        c.seeded_window_dropped_points,
     )
 }
 
@@ -110,6 +143,41 @@ mod tests {
                  gate_rejects_rotation=4 gate_rejects_translation=9"
             ),
             "{first}"
+        );
+    }
+
+    #[test]
+    fn the_last_line_holds_the_estimator_and_recovery_counters_in_order() {
+        let mut counters = RunCounters::default();
+        counters.ba_keyframe_shifts = 1;
+        counters.ba_snapbacks = 2;
+        counters.large_window_solves = 3;
+        counters.pose_inertial_solves = 4;
+        counters.pose_inertial_keyframe_anchored = 5;
+        counters.pose_inertial_prior_dropped = 6;
+        counters.imu_trust_lost = 7;
+        counters.imu_tail_holds = 8;
+        counters.relocalization_attempts = 9;
+        counters.relocalizations = 10;
+        counters.relocalizations_while_lost = 11;
+        counters.relocalization_refused_jump = 12;
+        counters.relocalizations_older_segment = 13;
+        counters.relocalization_without_vocabulary = 14;
+        counters.relocalization_ns = 15_000_000;
+        counters.seeded_window_frames = 16;
+        counters.seeded_window_dropped_points = 17;
+        let text = format(&counters, &FrameTimes::default());
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(
+            lines[3],
+            "[summary] estimator_recovery ba_keyframe_shifts=1 ba_snapbacks=2 \
+             large_window_solves=3 pose_inertial_solves=4 pose_inertial_keyframe_anchored=5 \
+             pose_inertial_prior_dropped=6 imu_trust_lost=7 imu_tail_holds=8 \
+             relocalization_attempts=9 relocalizations=10 relocalizations_while_lost=11 \
+             relocalization_refused_jump=12 relocalizations_older_segment=13 \
+             relocalization_without_vocabulary=14 relocalization_ms=15.0 \
+             seeded_window_frames=16 seeded_window_dropped_points=17"
         );
     }
 }

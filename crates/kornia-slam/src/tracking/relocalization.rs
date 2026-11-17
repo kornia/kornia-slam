@@ -34,6 +34,21 @@ pub struct RelocalizationConfig {
     pub ransac_threshold_px: f32,
     /// RANSAC iteration budget per candidate.
     pub ransac_iterations: usize,
+    pub solver: RelocalizationSolver,
+}
+
+/// How a relocalisation hypothesis is drawn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum RelocalizationSolver {
+    /// EPnP RANSAC on primary-camera matches.
+    #[default]
+    PrimaryEpnp,
+    /// AP3P RANSAC on primary-camera matches: a minimal set of 3, not 5.
+    PrimaryAp3p,
+    /// AP3P on the camera with the most matches, lifted to the rig and scored
+    /// on every camera's rays, then refined by rig PnP.
+    RigAp3p,
 }
 
 impl Default for RelocalizationConfig {
@@ -50,6 +65,7 @@ impl Default for RelocalizationConfig {
             min_inliers: 50,
             ransac_threshold_px: 4.0,
             ransac_iterations: 300,
+            solver: RelocalizationSolver::PrimaryEpnp,
         }
     }
 }

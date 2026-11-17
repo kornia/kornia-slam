@@ -2,16 +2,17 @@ use kornia_imgproc::features::OrbDetector;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    CameraSelection, FrontendConfig, LocalBaConfig, LoopClosingExecution, LoopClosingMode,
-    OrbSlamPipeline, PipelineDefinition, SensorSelection, StereoDepthSigma, SystemConfig,
+    CameraSelection, FrontendConfig, InertialConfig, LocalBaConfig, LoopClosingExecution,
+    LoopClosingMode, LostRelocalization, OrbSlamPipeline, PipelineDefinition, SensorSelection,
+    StereoDepthSigma, SystemConfig, TrackingConfig,
 };
 use super::recovery::RecoveryConfig;
 use super::validation::ConfigError;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabulary};
 use crate::loop_closure::{LoopCloser, LoopClosingConfig, LoopSolver};
-use crate::mapping::LocalMappingMode;
 use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
+use crate::mapping::{GrowthNeighbours, LocalMappingMode};
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::pose_gate::PoseGate;
@@ -52,6 +53,10 @@ pub(crate) struct SystemSettings {
     /// prediction; `None` keeps the full search.
     pub klt_prediction: Option<(usize, usize)>,
     pub klt_kernel: LkKernel,
+    pub tracking: TrackingConfig,
+    pub inertial: InertialConfig,
+    pub relocalization: LostRelocalization,
+    pub growth_neighbours: GrowthNeighbours,
 }
 
 impl SensorSelection {
@@ -107,6 +112,9 @@ impl LocalBaConfig {
             state_envelope: self.state_envelope,
             lost_keyframes: self.lost_keyframes,
             visual_kernel: self.visual_kernel,
+            large_window: self.large_window,
+            recently_initialized: false,
+            newest_marginal: false,
         }
     }
 }
@@ -150,6 +158,10 @@ impl SystemConfig {
                 .klt_prediction
                 .search()
                 .filter(|_| rig.fisheye.is_none()),
+            tracking: orb.tracking,
+            inertial: orb.inertial,
+            relocalization: orb.tracking_loss.relocalization,
+            growth_neighbours: orb.mapping.growth_neighbours,
         }
     }
 
