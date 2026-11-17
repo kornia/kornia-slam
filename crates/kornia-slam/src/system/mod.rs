@@ -1585,6 +1585,11 @@ impl SlamSystem {
             Ok(estimate) => {
                 self.state.pose_world_to_cam = estimate.pose;
                 self.note_pose("tracked", frame_idx, &estimate.pose);
+                // ORB-SLAM3 tracks against the most-voted keyframe
+                // (`Tracking.cc:3602-3606`); `None` under the default rules.
+                if let Some(kf_idx) = estimate.most_voted_keyframe {
+                    self.state.current_keyframe_idx = Some(kf_idx);
+                }
 
                 // When IMU-initialized, velocity_world was already updated by IMU
                 // preintegration (predict_pose_imu → pred_vel) before PnP ran; don't
