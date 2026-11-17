@@ -1,12 +1,12 @@
 //! The per-frame estimator choices of card A, ported from ORB-SLAM3 and
-//! OpenVINS: keyframe evidence for ORB-SLAM3's insertion rules and the IMU
-//! covariance trust. Each one is behind its knob, and the defaults read none
-//! of this.
+//! OpenVINS: keyframe evidence for ORB-SLAM3's insertion rules, the IMU
+//! covariance trust and the pose-inertial solve. Each one is behind its knob,
+//! and the defaults read none of this.
 
 use std::collections::HashSet;
 
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat15F64, Vec3F64};
+use kornia_algebra::{Mat15F64, Vec2F64, Vec3F64};
 use kornia_factors::inertial::NavState;
 use kornia_factors::inertial::preintegration::propagate_state_covariance;
 use kornia_sensors::imu::ImuBias;
@@ -14,9 +14,15 @@ use kornia_sensors::imu::ImuBias;
 use crate::Frame;
 use crate::inertial::trust::{ImuTrust, ImuTrustMode};
 use crate::mapping::Keyframe;
+use crate::mapping::map::ORB_SCALE_FACTOR;
+use crate::mapping::vi_ba_schur::RigObservationCamera;
+use crate::tracking::pose_estimation::Estimate;
+use crate::tracking::pose_estimation::pose_inertial::{
+    Anchor, FrameNavState, NavPrior, PoseInertialObservation, solve_pose_inertial,
+};
 use crate::tracking::{KeyframeEvidence, KeyframeRules};
 
-use super::SlamSystem;
+use super::{PoseInertial, SlamSystem};
 
 /// Lane A's state carried across frames.
 #[derive(Debug, Default)]
@@ -28,6 +34,20 @@ pub(super) struct EstimatorState {
     /// The covariance trust of the frame at the timestamp it was taken for.
     pub(super) trust: Option<(f64, ImuTrust)>,
     pub(super) trusted_before: bool,
+    /// The last frame the pose-inertial solve tracked: its index, the map's
+    /// world epoch then, and its prior for the next frame.
+    pub(super) frame_prior: Option<(usize, u64, NavPrior)>,
+    /// A local-BA write-back changed the map since the last solve
+    /// (ORB-SLAM3's `mbMapUpdated`).
+    pub(super) map_changed: bool,
+}
+
+/// What the pose-inertial solve of a frame starts from.
+enum SolveAnchor {
+    /// The last keyframe, held fixed, from its timestamp.
+    Keyframe(FrameNavState, f64),
+    /// The previous frame under its prior.
+    Frame(NavPrior),
 }
 
 /// A keyframe's inertial state, copied out of the map.
@@ -307,4 +327,201 @@ impl SlamSystem {
         let (_, median, _) = depths.select_nth_unstable_by(mid, f64::total_cmp);
         Some(*median)
     }
+
+    /// Under `tracking.pose_inertial`, refines a tracked `estimate` with the
+    /// pose-inertial solve and takes the frame's velocity and bias from it.
+    /// The visual estimate stays when the solve keeps too few inliers.
+    pub(super) fn refine_pose_inertial(
+        &mut self,
+        frame: &Frame,
+        estimate: &mut Estimate,
+        prev_timestamp: f64,
+        timestamp_sec: f64,
+    ) {
+        let mode = self.tracking_config.pose_inertial;
+        if mode == PoseInertial::Off || !self.state.imu_initialized {
+            return;
+        }
+        let Some(anchor) = self.solve_anchor(mode, frame.idx) else {
+            self.estimator.frame_prior = None;
+            return;
+        };
+        let (start_sec, keyframe_anchored) = match &anchor {
+            SolveAnchor::Keyframe(_, kf_sec) => (*kf_sec, true),
+            SolveAnchor::Frame(_) => (prev_timestamp, false),
+        };
+        let (preintegrated, _) =
+            self.inertial
+                .preintegrate_window(self.rig.imu_noise(), start_sec, timestamp_sec);
+        if preintegrated.dt <= 0.0 {
+            self.estimator.frame_prior = None;
+            return;
+        }
+        let observations = self.pose_inertial_observations(frame, &estimate.matches);
+        let initial = FrameNavState {
+            pose_cw: estimate.pose,
+            velocity: self.state.velocity_world,
+            bias: self.inertial.bias,
+        };
+        let solution = solve_pose_inertial(
+            match &anchor {
+                SolveAnchor::Keyframe(state, _) => Anchor::Fixed(state),
+                SolveAnchor::Frame(prior) => Anchor::Prior(prior),
+            },
+            &preintegrated,
+            self.inertial.gravity_world,
+            self.rig.camera_to_body(),
+            &rig_observation_cameras(frame),
+            &self.rig.camera,
+            initial,
+            &observations,
+            !frame.is_metric(),
+        );
+        let inliers = solution.inliers.iter().filter(|&&inlier| inlier).count();
+        let min_inliers = self.tracker.map_projection_config().pnp.min_inliers;
+        self.dbg(format!(
+            "[pose_inertial] frame={} anchor={} inliers={inliers} imu_chi2={:.3} prior_pd={}",
+            frame.idx,
+            if keyframe_anchored { "kf" } else { "frame" },
+            solution.imu_chi2,
+            u8::from(solution.prior.is_some()),
+        ));
+        if inliers < min_inliers {
+            self.estimator.frame_prior = None;
+            return;
+        }
+
+        self.counters.pose_inertial_solves += 1;
+        if keyframe_anchored {
+            self.counters.pose_inertial_keyframe_anchored += 1;
+        }
+        if solution.prior.is_none() {
+            self.counters.pose_inertial_prior_dropped += 1;
+        }
+        estimate.pose = solution.state.pose_cw;
+        estimate.inliers = inliers;
+        self.state.velocity_world = solution.state.velocity;
+        self.inertial.bias = solution.state.bias;
+        let epoch = self.map.lock().unwrap().world_epoch();
+        self.estimator.frame_prior = solution.prior.map(|prior| (frame.idx, epoch, prior));
+        self.estimator.map_changed = false;
+    }
+
+    /// Whether the previous frame's solve carries velocity and bias into this
+    /// frame, so the reference keyframe's are not copied (G13).
+    pub(super) fn frame_state_carried(&self, frame_idx: usize) -> bool {
+        self.tracking_config.pose_inertial != PoseInertial::Off
+            && self.valid_frame_prior(frame_idx).is_some()
+    }
+
+    /// Whether this frame's solve and prediction start from the last
+    /// keyframe: always with `LastKeyframe`; with `OrbSlam3` after the map
+    /// changed or without the previous frame's prior (`Tracking.cc:2970-2992`).
+    pub(super) fn keyframe_anchored(&self, frame_idx: usize) -> bool {
+        match self.tracking_config.pose_inertial {
+            PoseInertial::Off => false,
+            PoseInertial::LastKeyframe => true,
+            PoseInertial::OrbSlam3 => self.valid_frame_prior(frame_idx).is_none(),
+        }
+    }
+
+    /// The previous frame's prior, when it is that frame's and the map has
+    /// not changed since.
+    fn valid_frame_prior(&self, frame_idx: usize) -> Option<NavPrior> {
+        let (prior_frame, epoch, prior) = self.estimator.frame_prior?;
+        (!self.estimator.map_changed
+            && prior_frame + 1 == frame_idx
+            && epoch == self.map.lock().unwrap().world_epoch())
+        .then_some(prior)
+    }
+
+    fn solve_anchor(&self, mode: PoseInertial, frame_idx: usize) -> Option<SolveAnchor> {
+        if mode == PoseInertial::OrbSlam3
+            && let Some(prior) = self.valid_frame_prior(frame_idx)
+        {
+            return Some(SolveAnchor::Frame(prior));
+        }
+        let kf_sec = self.inertial.last_keyframe_timestamp_sec?;
+        let map = self.map.lock().unwrap();
+        let kf = map.get_keyframe(self.state.last_keyframe_idx?)?;
+        Some(SolveAnchor::Keyframe(
+            FrameNavState {
+                pose_cw: kf.frame.pose_world_to_cam,
+                velocity: kf.velocity_world,
+                bias: kf.imu_bias,
+            },
+            kf_sec,
+        ))
+    }
+
+    /// Where this frame's motion prediction starts: the last keyframe after
+    /// the map changed (`Tracking.cc:1746-1761`), otherwise the last frame.
+    pub(super) fn prediction_origin(
+        &self,
+        frame_idx: usize,
+        pose_before: Pose3d,
+        prev_timestamp: f64,
+    ) -> (Pose3d, f64) {
+        if !self.state.imu_initialized
+            || self.tracking_config.pose_inertial != PoseInertial::OrbSlam3
+            || !self.keyframe_anchored(frame_idx)
+        {
+            return (pose_before, prev_timestamp);
+        }
+        let origin = self
+            .inertial
+            .last_keyframe_timestamp_sec
+            .and_then(|kf_sec| {
+                let map = self.map.lock().unwrap();
+                let kf = map.get_keyframe(self.state.last_keyframe_idx?)?;
+                Some((kf.frame.pose_world_to_cam, kf_sec))
+            });
+        origin.unwrap_or((pose_before, prev_timestamp))
+    }
+
+    /// The tracked matches as reprojection rows: undistorted pixels weighted
+    /// by their octave, `1/σ²` with `σ = 1.2^octave` (ORB-SLAM3's
+    /// `invSigma2`).
+    fn pose_inertial_observations(
+        &self,
+        frame: &Frame,
+        matches: &[(usize, usize)],
+    ) -> Vec<PoseInertialObservation> {
+        let map = self.map.lock().unwrap();
+        matches
+            .iter()
+            .filter_map(|&(mp_idx, kp_idx)| {
+                let mp = map.map_points().get(mp_idx).filter(|mp| !mp.culled)?;
+                let [x, y] = frame.undistorted_xy(kp_idx, &self.rig.camera)?;
+                let octave = frame.features.octaves.get(kp_idx).copied().unwrap_or(0);
+                Some(PoseInertialObservation {
+                    point_w: mp.position,
+                    pixel: Vec2F64::new(f64::from(x), f64::from(y)),
+                    information: ORB_SCALE_FACTOR.powi(-2 * i32::from(octave)),
+                    view: u8::try_from(frame.camera_of(kp_idx)).ok()?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// The secondary cameras of `frame`'s rig, in rig order after the primary;
+/// empty outside a rig.
+fn rig_observation_cameras(frame: &Frame) -> Vec<RigObservationCamera> {
+    frame
+        .rig
+        .geometry
+        .as_ref()
+        .filter(|_| frame.is_rig())
+        .map(|rig| {
+            rig.views()
+                .iter()
+                .skip(1)
+                .map(|view| RigObservationCamera {
+                    camera: view.camera.clone(),
+                    camera_from_primary: view.camera_from_primary,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }

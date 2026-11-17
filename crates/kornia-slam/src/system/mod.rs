@@ -871,6 +871,9 @@ impl SlamSystem {
             if let Some(marginal) = result.newest_marginal {
                 self.estimator.newest_marginal = Some(marginal);
             }
+            if !result.keyframe_corrections.is_empty() {
+                self.estimator.map_changed = true;
+            }
             for correction in &result.keyframe_corrections {
                 if self.note_pose("ba_keyframe", correction.kf_idx, &correction.pose_after) {
                     self.counters.nonrigid_keyframes += 1;
@@ -1484,11 +1487,15 @@ impl SlamSystem {
         let pose_before = self.state.pose_world_to_cam;
         let prev_timestamp = self.state.last_frame_timestamp_sec;
 
-        self.refresh_reference_inertial_state();
+        if !self.frame_state_carried(frame_idx) {
+            self.refresh_reference_inertial_state();
+        }
         self.update_seeded_window();
 
+        let (prediction_from, prediction_sec) =
+            self.prediction_origin(frame_idx, pose_before, prev_timestamp);
         let (candidate_pose, predicted_velocity) =
-            self.predict_frame_pose(pose_before, prev_timestamp, timestamp_sec);
+            self.predict_frame_pose(prediction_from, prediction_sec, timestamp_sec);
         self.update_imu_trust(frame_idx, timestamp_sec, &candidate_pose);
 
         let currently_lost_for = self
@@ -1590,7 +1597,8 @@ impl SlamSystem {
         };
 
         let (mut status, matches, tracked_inliers, reject_reason) = match result {
-            Ok(estimate) => {
+            Ok(mut estimate) => {
+                self.refine_pose_inertial(&frame, &mut estimate, prev_timestamp, timestamp_sec);
                 self.state.pose_world_to_cam = estimate.pose;
                 self.note_pose("tracked", frame_idx, &estimate.pose);
                 // ORB-SLAM3 tracks against the most-voted keyframe

@@ -2,8 +2,6 @@
 
 pub mod map_projection;
 pub mod pnp;
-// Skeleton for the PR #180 lanes: lane A fills and calls the pose-inertial solve.
-#[allow(dead_code)]
 pub(crate) mod pose_inertial;
 pub mod rig_pnp;
 
