@@ -934,7 +934,7 @@ mod recovery_after_loss {
 
         let seed = system.state.pose_world_to_cam;
         assert!((recovery::camera_centre(&seed) - Vec3F64::new(1.0, 0.0, 0.0)).length() < 1e-9);
-        assert!(rotation_defect(&seed.rotation) < 1e-9);
+        assert!(seed.rotation_defect() < 1e-9);
         let turn = (seed.rotation - coasted.rotation).to_cols_array();
         assert!(turn.iter().all(|d| d.abs() < 1e-12), "{turn:?}");
         assert_eq!(system.state.velocity_world, Vec3F64::ZERO);

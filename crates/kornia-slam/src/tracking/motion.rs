@@ -290,7 +290,7 @@ mod tests {
         let (visual, _) = predict_pose(pose_before, Some(velocity), Vec3F64::ZERO, None);
         let (imu, _) = predict_pose(pose_before, None, Vec3F64::ZERO, Some(inertial));
         for pose in [visual, imu] {
-            assert!(crate::pose_conversion::rotation_defect(&pose.rotation) < 1e-12);
+            assert!(pose.rotation_defect() < 1e-12);
         }
     }
 }

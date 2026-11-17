@@ -184,7 +184,7 @@ fn a_scaled_moved_keyframe_is_stored_rigid() {
         .unwrap();
 
     let corrected = map.get_keyframe(1).unwrap().frame.pose_world_to_cam;
-    assert!(crate::pose_conversion::rotation_defect(&corrected.rotation) < 1e-12);
+    assert!(corrected.rotation_defect() < 1e-12);
 }
 
 /// (d) A solve from another world is refused without a write, and an accepted writeback makes a

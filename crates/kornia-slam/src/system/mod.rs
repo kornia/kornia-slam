@@ -72,7 +72,7 @@ use crate::mapping::map::{
     StateEnvelopeLimits,
 };
 use crate::mapping::{KeyframeJob, LocalMapping};
-use crate::pose_conversion::{RIGID_TOLERANCE, apply_reference_pose_correction, rotation_defect};
+use crate::pose_conversion::{RIGID_TOLERANCE, apply_reference_pose_correction};
 use build::SystemSettings;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
@@ -576,7 +576,7 @@ impl SlamSystem {
                 self.last_skip = None;
             }
             self.counters.record_frame(r.status, self.last_skip);
-            if rotation_defect(&r.pose_world_to_cam.rotation) > RIGID_TOLERANCE {
+            if r.pose_world_to_cam.rotation_defect() > RIGID_TOLERANCE {
                 self.counters.nonrigid_poses += 1;
             }
         }
@@ -814,7 +814,7 @@ impl SlamSystem {
 
     /// Logs a `[rigid]` line when `pose` is not rigid; returns whether it is not.
     fn note_pose(&mut self, site: &'static str, idx: usize, pose: &Pose3d) -> bool {
-        let defect = rotation_defect(&pose.rotation);
+        let defect = pose.rotation_defect();
         let nonrigid = defect > RIGID_TOLERANCE;
         if nonrigid {
             self.dbg(format!("[rigid] site={site} idx={idx} defect={defect:.1e}"));
@@ -950,7 +950,7 @@ impl SlamSystem {
         self.dbg(format!(
             "[bootstrap_stereo] frame={curr_idx} metric map created with {added} points \
              pose_defect={:.1e}",
-            rotation_defect(&self.state.pose_world_to_cam.rotation),
+            self.state.pose_world_to_cam.rotation_defect(),
         ));
         if let Some(anchor) = bridge_anchor {
             self.publish_bridge(anchor, curr_idx, timestamp_sec);

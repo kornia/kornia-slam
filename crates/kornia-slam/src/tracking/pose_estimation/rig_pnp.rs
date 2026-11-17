@@ -353,7 +353,7 @@ mod tests {
         let config = PnpConfig::default();
         let (_, inliers) = solve_rig_pnp(&observations, &start, &config).unwrap();
         let (pose, scaled_inliers) = solve_rig_pnp(&observations, &scaled_start, &config).unwrap();
-        assert!(crate::pose_conversion::rotation_defect(&pose.rotation) < 1e-12);
+        assert!(pose.rotation_defect() < 1e-12);
         assert_eq!(scaled_inliers, inliers);
     }
 

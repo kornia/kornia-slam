@@ -36,7 +36,6 @@ use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 use crate::frame::{Frame, is_finite_xy, undistort_keypoint};
 use crate::mapping::map::{Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
 use crate::mapping::visual_information::VisualInformation;
-use crate::pose_conversion::rotation_defect;
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 use crate::tracking::timings::{TrackingTimings, timed};
 
@@ -962,7 +961,7 @@ fn log_failed_pnp(
         diagnostics.prior_survivors,
         diagnostics.last_round_active,
         config.prior_reproj_threshold_px,
-        rotation_defect(&pose_init.rotation),
+        pose_init.rotation_defect(),
     );
 }
 

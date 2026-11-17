@@ -11,7 +11,6 @@
 
 use std::collections::VecDeque;
 
-use crate::pose_conversion::rotation_defect;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 use kornia_factors::wheel_odometry::{WheelOdomFactor, WheelOdomMeasurement};
@@ -37,7 +36,7 @@ pub enum WheelError {
 
 /// `Some((max|R^T R - I|, det R))` when `r` is not a rotation, `None` when it is.
 fn rotation_residual(r: &Mat3F64) -> Option<(f64, f64)> {
-    let orthonormality_error = rotation_defect(r);
+    let orthonormality_error = Pose3d::new(*r, Vec3F64::ZERO).rotation_defect();
     let determinant = r.determinant();
     let rigid = orthonormality_error.is_finite()
         && orthonormality_error <= 1e-6
