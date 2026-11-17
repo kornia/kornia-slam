@@ -5,10 +5,11 @@
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crate::tracking::flow_tracker::{FlowShard, ShardGuess};
-use crate::tracking::timings::ShardTimings;
-use crate::upstream::kornia_imgproc::lk_window::LkFrame;
+use crate::tracking::timings::{MAX_FLOW_SHARDS, ShardTimings, TrackingTimings};
+use crate::upstream::kornia_imgproc::lk_window::{LkFrame, LkWindowError};
 
 /// The frames of one flow step, one entry per rig camera.
 pub(crate) struct FlowFrames {
@@ -27,6 +28,8 @@ pub enum FlowPoolError {
     Pin(usize),
     #[error("a flow frame is still shared after the join")]
     FrameShared,
+    #[error("flow frame: {0}")]
+    Frame(#[from] LkWindowError),
 }
 
 /// One worker's reused job; moved to the worker and back every step.
@@ -47,12 +50,22 @@ struct FlowWorker {
     handle: Option<JoinHandle<()>>,
 }
 
+/// Where the latest [`FlowPool::step`] spent its time.
+#[derive(Debug, Clone, Copy, Default)]
+struct StepTimings {
+    dispatch: Duration,
+    parallel: Duration,
+    join: Duration,
+    shards: [ShardTimings; MAX_FLOW_SHARDS],
+}
+
 /// Runs shard 0 on the calling thread and shard `n` on worker `n`.
 pub(crate) struct FlowPool {
     threads: usize,
     workers: Vec<FlowWorker>,
     /// Shard 0's timings, run inline.
     inline_timings: ShardTimings,
+    timings: StepTimings,
 }
 
 impl FlowPool {
@@ -71,17 +84,40 @@ impl FlowPool {
             threads: 1,
             workers: Vec::new(),
             inline_timings: ShardTimings::default(),
+            timings: StepTimings::default(),
         })
     }
 
     /// Runs `shards[0]` inline and `shards[n]` on worker `n`, then joins.
     pub(crate) fn step(
         &mut self,
-        _shards: &mut [FlowShard],
-        _frames: &FlowFrames,
-        _guess: &ShardGuess,
+        shards: &mut [FlowShard],
+        frames: &FlowFrames,
+        guess: &ShardGuess,
     ) -> Result<(), FlowPoolError> {
-        todo!("lane T: dispatch and join")
+        self.timings = StepTimings::default();
+        let Some((inline, _)) = shards.split_first_mut() else {
+            return Ok(());
+        };
+        let started = Instant::now();
+        inline.run(&frames.previous, &frames.current, guess, &mut self.inline_timings);
+        self.timings.parallel = started.elapsed();
+        self.timings.shards[0] = self.inline_timings;
+        Ok(())
+    }
+
+    /// Adds the latest step's times to `timings`.
+    pub(crate) fn add_timings(&self, timings: &mut TrackingTimings) {
+        timings.flow_dispatch += self.timings.dispatch;
+        timings.flow_parallel += self.timings.parallel;
+        timings.flow_join += self.timings.join;
+        for (total, shard) in timings.shards.iter_mut().zip(&self.timings.shards) {
+            total.flow_template += shard.flow_template;
+            total.flow_forward += shard.flow_forward;
+            total.flow_backward += shard.flow_backward;
+            total.flow_project += shard.flow_project;
+            total.flow_refill += shard.flow_refill;
+        }
     }
 
     pub(crate) fn threads(&self) -> usize {

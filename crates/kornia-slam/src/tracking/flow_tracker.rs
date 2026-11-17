@@ -1,17 +1,26 @@
 //! One flow shard: the tracks of one worker, from start pixel to survivor,
-//! with every buffer reused from frame to frame (plan section 3).
+//! with every buffer reused from frame to frame (plan section 3), and
+//! [`RigFlow`], the `WindowedU8` flow step of every camera that runs them.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Mat3F64;
+use kornia_image::Image;
 
-use crate::system::{AnchorGuard, ForwardBackward, TrackRefill};
-use crate::tracking::optical_flow::{FlowSurvivor, Track, TrackId};
-use crate::tracking::timings::ShardTimings;
+use crate::system::{AnchorGuard, ForwardBackward, GyroGuess, KltRetry, OrbFrontendConfig, TrackRefill};
+use crate::tracking::flow_pool::{FlowFrames, FlowPool, FlowPoolError};
+use crate::tracking::optical_flow::{
+    FlowSurvivor, KltTracker, SurvivorFilterConfig, Track, TrackId, TrackSet,
+};
+use crate::tracking::timings::{ShardTimings, TrackingTimings};
+use crate::tracking::tracker::project_raw;
 use crate::upstream::kornia_imgproc::good_features::GoodFeaturesScratch;
-use crate::upstream::kornia_imgproc::lk_window::{LkFrame, LkTemplate};
+use crate::upstream::kornia_imgproc::lk_window::{
+    LkFrame, LkTemplate, LkTrack, extract_template, track_template,
+};
 
 /// Which flow shard a new track runs on, fixed at its spawn (plan section 3).
 #[derive(Debug, Clone, Default)]
@@ -81,7 +90,7 @@ pub(crate) struct FlowCamera {
 }
 
 /// What every shard needs to start its tracks; filled by the tracking core.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct ShardGuess {
     pub frame_idx: u64,
     /// World to primary camera at the IMU prediction, when trusted.
@@ -95,11 +104,92 @@ pub(crate) struct ShardGuess {
     pub refill: TrackRefill,
     /// Camera refilled this frame, if any.
     pub refill_camera: Option<usize>,
+    /// The shard that runs the refill of `refill_camera`.
+    pub refill_shard: usize,
     /// Start-of-frame pixels of every track of `refill_camera`, all shards.
     pub refill_occupied: Vec<[f32; 2]>,
     pub anchor_guard: AnchorGuard,
     /// Retry pass: only `retry` tracks, from `max_level`.
     pub retry: bool,
+}
+
+impl Clone for ShardGuess {
+    fn clone(&self) -> Self {
+        let mut guess = Self::default();
+        guess.clone_from(self);
+        guess
+    }
+
+    /// Reuses `self`'s vectors: the pool copies the guess into every job
+    /// each frame, and a derived `clone_from` would allocate.
+    fn clone_from(&mut self, source: &Self) {
+        self.frame_idx = source.frame_idx;
+        self.pose_world_to_primary = source.pose_world_to_primary;
+        self.cameras.clone_from(&source.cameras);
+        self.max_level = source.max_level;
+        self.max_iter = source.max_iter;
+        self.epsilon = source.epsilon;
+        self.window = source.window;
+        self.forward_backward = source.forward_backward;
+        self.refill = source.refill;
+        self.refill_camera = source.refill_camera;
+        self.refill_shard = source.refill_shard;
+        self.refill_occupied.clone_from(&source.refill_occupied);
+        self.anchor_guard = source.anchor_guard;
+        self.retry = source.retry;
+    }
+}
+
+/// Frame id of a cache slot with no template.
+const NO_TEMPLATE: u64 = u64::MAX;
+/// Frame id of a slot whose template moved to the aligned list.
+const TAKEN: u64 = u64::MAX - 1;
+
+/// Templates keyed by track and the frame they were cut from. Templates of
+/// dropped tracks go to a spare list and are reused, so once the track count
+/// has peaked nothing allocates.
+#[derive(Debug, Default)]
+struct TemplateCache {
+    /// Sorted by track id between frames; aligned with the shard's tracks
+    /// during one.
+    entries: Vec<(TrackId, u64, LkTemplate)>,
+    scratch: Vec<(TrackId, u64, LkTemplate)>,
+    spare: Vec<LkTemplate>,
+}
+
+impl TemplateCache {
+    /// Reorders the entries to follow `tracks`, a slot per track; a new
+    /// track gets a spare template marked [`NO_TEMPLATE`].
+    fn align(&mut self, tracks: &[Track]) {
+        self.scratch.clear();
+        for track in tracks {
+            let (frame_id, template) =
+                match self.entries.binary_search_by_key(&track.id(), |entry| entry.0) {
+                    Ok(k) => {
+                        let entry = &mut self.entries[k];
+                        let frame_id = std::mem::replace(&mut entry.1, TAKEN);
+                        (frame_id, std::mem::take(&mut entry.2))
+                    }
+                    Err(_) => (NO_TEMPLATE, self.spare.pop().unwrap_or_default()),
+                };
+            self.scratch.push((track.id(), frame_id, template));
+        }
+        for (_, frame_id, template) in self.entries.drain(..) {
+            if frame_id != TAKEN {
+                self.spare.push(template);
+            }
+        }
+        std::mem::swap(&mut self.entries, &mut self.scratch);
+    }
+
+    /// Restores the id order lookups need.
+    fn sort(&mut self) {
+        self.entries.sort_unstable_by_key(|entry| entry.0);
+    }
+
+    fn find(&self, id: TrackId) -> Option<usize> {
+        self.entries.binary_search_by_key(&id, |entry| entry.0).ok()
+    }
 }
 
 /// One shard's tracks and every buffer it reuses; moved to a worker and back.
@@ -110,28 +200,555 @@ pub(crate) struct FlowShard {
     pub tracks: Vec<Track>,
     /// Output, in the order of `tracks`.
     pub survivors: Vec<FlowSurvivor>,
-    /// Tracks that failed at level 0, for `klt_retry`.
+    /// Each survivor's pixel undistorted in its camera, NaN where the
+    /// inversion fails; in the order of `survivors`.
+    pub undistorted: Vec<[f32; 2]>,
+    /// Tracks that failed at the first pass's level, for `klt_retry`.
     pub retry: Vec<TrackId>,
     pub spawned: Vec<(usize, [f32; 2])>,
     pub fb_rejects: u32,
     pub anchor_drops: u32,
     pub template_rebuilds: u32,
-    templates: Vec<(TrackId, u64, LkTemplate)>,
-    anchors: Vec<(TrackId, LkTemplate)>,
-    starts: Vec<[f32; 2]>,
+    /// Each track's template, cut where it ended in the last frame.
+    templates: TemplateCache,
+    /// Each track's first-sighting template (`AnchorGuard`).
+    anchors: TemplateCache,
+    /// Coarse-level template of the track being solved.
+    coarse: LkTemplate,
     features: GoodFeaturesScratch,
-    occupied: Vec<[f32; 2]>,
+    corners: Vec<[f32; 2]>,
 }
 
 impl FlowShard {
     /// Tracks `self.tracks` from `previous[c]` into `current[c]`.
     pub(crate) fn run(
         &mut self,
-        _previous: &[Arc<LkFrame>],
-        _current: &[Arc<LkFrame>],
-        _guess: &ShardGuess,
-        _timings: &mut ShardTimings,
+        previous: &[Arc<LkFrame>],
+        current: &[Arc<LkFrame>],
+        guess: &ShardGuess,
+        timings: &mut ShardTimings,
     ) {
-        todo!("lane T: flow shard")
+        *timings = ShardTimings::default();
+        self.survivors.clear();
+        self.undistorted.clear();
+        self.spawned.clear();
+        self.fb_rejects = 0;
+        self.anchor_drops = 0;
+        self.template_rebuilds = 0;
+        if !guess.retry {
+            self.retry.clear();
+            self.templates.align(&self.tracks);
+        }
+        for i in 0..self.tracks.len() {
+            let track = self.tracks[i];
+            let camera = track.camera();
+            let (Some(previous), Some(current), Some(model)) = (
+                previous.get(camera),
+                current.get(camera),
+                guess.cameras.get(camera),
+            ) else {
+                continue;
+            };
+            let slot = if guess.retry {
+                self.templates.find(track.id())
+            } else {
+                Some(i)
+            };
+            let Some(slot) = slot else {
+                continue;
+            };
+            let Some(result) = self.forward(slot, &track, previous, current, model, guess, timings)
+            else {
+                self.retry.push(track.id());
+                continue;
+            };
+            self.keep(slot, &track, result, current, model, guess, timings);
+        }
+        if !guess.retry {
+            self.templates.sort();
+        }
+    }
+
+    /// The forward solve of `track` from its cached template, recut when
+    /// it came from another frame; `None` when it fails the survivor filter.
+    #[allow(clippy::too_many_arguments)]
+    fn forward(
+        &mut self,
+        slot: usize,
+        track: &Track,
+        previous: &LkFrame,
+        current: &LkFrame,
+        model: &FlowCamera,
+        guess: &ShardGuess,
+        timings: &mut ShardTimings,
+    ) -> Option<LkTrack> {
+        let started = Instant::now();
+        let start = start_pixel(track, model, guess);
+        let (_, frame_id, template) = &mut self.templates.entries[slot];
+        if *frame_id != previous.frame_id() {
+            self.template_rebuilds += u32::from(*frame_id != NO_TEMPLATE);
+            *frame_id = if extract_template(previous, track.pixel(), 0, guess.window, template) {
+                previous.frame_id()
+            } else {
+                NO_TEMPLATE
+            };
+        }
+        let cut = *frame_id != NO_TEMPLATE;
+        timings.flow_template += started.elapsed();
+        if !cut {
+            return None;
+        }
+
+        let started = Instant::now();
+        let mut start = start;
+        let levels = guess.max_level.min(previous.levels().min(current.levels()).saturating_sub(1));
+        for level in (1..=levels).rev() {
+            if !extract_template(previous, track.pixel(), level, guess.window, &mut self.coarse) {
+                continue;
+            }
+            let coarse = track_template(&self.coarse, current, start, guess.max_iter, guess.epsilon);
+            if coarse.status {
+                start = coarse.pixel;
+            }
+        }
+        let template = &self.templates.entries[slot].2;
+        let result = track_template(template, current, start, guess.max_iter, guess.epsilon);
+        timings.flow_forward += started.elapsed();
+        let size = current.plane().size();
+        KltTracker::accepts(
+            track,
+            u8::from(result.status),
+            result.error,
+            result.pixel,
+            [size.width as f32, size.height as f32],
+            &SurvivorFilterConfig::default(),
+        )
+        .then_some(result)
+    }
+
+    /// Records a forward result as a survivor, with its next template cut
+    /// at the new pixel and its undistorted pixel.
+    #[allow(clippy::too_many_arguments)]
+    fn keep(
+        &mut self,
+        slot: usize,
+        track: &Track,
+        result: LkTrack,
+        current: &LkFrame,
+        model: &FlowCamera,
+        guess: &ShardGuess,
+        timings: &mut ShardTimings,
+    ) {
+        let started = Instant::now();
+        // The template at the forward result is the next frame's forward
+        // template, so a track costs one cut per frame.
+        let (_, frame_id, template) = &mut self.templates.entries[slot];
+        *frame_id = if extract_template(current, result.pixel, 0, guess.window, template) {
+            current.frame_id()
+        } else {
+            NO_TEMPLATE
+        };
+        timings.flow_template += started.elapsed();
+
+        let started = Instant::now();
+        let undistorted = model
+            .camera
+            .undistort(result.pixel[0] as f64, result.pixel[1] as f64)
+            .map_or([f32::NAN; 2], |uv| [uv.x as f32, uv.y as f32]);
+        self.survivors.push(FlowSurvivor {
+            track_id: track.id(),
+            pixel: result.pixel,
+            error: result.error,
+        });
+        self.undistorted.push(undistorted);
+        timings.flow_project += started.elapsed();
+    }
+}
+
+/// Where `track` starts in the current frame: its map point at the trusted
+/// prediction, carried into raw pixels by the distortion offset at its last
+/// pixel; otherwise the last pixel.
+fn start_pixel(track: &Track, model: &FlowCamera, guess: &ShardGuess) -> [f32; 2] {
+    let raw = track.pixel();
+    if let (Some(pose), Some(position)) = (guess.pose_world_to_primary, track.position()) {
+        let p_primary = pose.transform_point(&position);
+        let p_camera = model
+            .camera_from_primary
+            .map_or(p_primary, |t| t.transform_point(&p_primary));
+        if let Some(pixel) = project_raw(&model.camera, &p_camera, raw) {
+            return pixel;
+        }
+    }
+    raw
+}
+
+/// A camera of the rig [`RigFlow`] tracks.
+#[derive(Debug, Clone)]
+pub struct RigFlowCamera {
+    pub camera: PinholeCamera,
+    /// `T_CP`; `None` for the primary camera.
+    pub camera_from_primary: Option<Pose3d>,
+}
+
+/// The frontend knobs a [`RigFlow`] step reads.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RigFlowSettings {
+    /// Flow threads, the calling thread included.
+    pub threads: usize,
+    pub first_core: Option<usize>,
+    /// LK window side, odd.
+    pub window: usize,
+    /// `(max_level, max_iter)` from a trusted prediction.
+    pub predicted: (usize, usize),
+    /// `(max_level, max_iter)` without one.
+    pub unpredicted: (usize, usize),
+    /// LK convergence step (pixels).
+    pub epsilon: f32,
+    pub retry: KltRetry,
+    pub forward_backward: ForwardBackward,
+    pub refill: TrackRefill,
+    pub anchor_guard: AnchorGuard,
+    pub gyro_guess: GyroGuess,
+}
+
+impl RigFlowSettings {
+    /// The settings `frontend` selects; without a prediction search LK runs
+    /// kornia-imgproc's default pyramid.
+    pub fn from_frontend(frontend: &OrbFrontendConfig) -> Self {
+        let default = kornia_imgproc::optical_flow_pyr_lk::PyrLKParams::default();
+        let unpredicted = (default.max_level, default.max_iter);
+        Self {
+            threads: frontend.flow_threads,
+            first_core: frontend.flow_first_core,
+            window: frontend.klt_window,
+            predicted: frontend.klt_prediction.search().unwrap_or(unpredicted),
+            unpredicted,
+            epsilon: default.epsilon,
+            retry: frontend.klt_retry,
+            forward_backward: frontend.forward_backward,
+            refill: frontend.track_refill,
+            anchor_guard: frontend.anchor_guard,
+            gyro_guess: frontend.gyro_guess,
+        }
+    }
+}
+
+/// What the tracking core knows about a frame before its flow step.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FlowStepInput {
+    pub frame_idx: u64,
+    /// World to primary camera at the IMU prediction, when trusted.
+    pub pose_world_to_primary: Option<Pose3d>,
+    /// `R_cur_prev` of the primary camera from the gyro.
+    pub primary_rotation: Option<Mat3F64>,
+}
+
+/// Tallies of one flow step.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FlowStepCounts {
+    pub tracks_tried: u64,
+    pub fb_rejects: u64,
+    pub retries: u64,
+    pub anchor_drops: u64,
+    pub template_rebuilds: u64,
+}
+
+/// The survivors of one flow step.
+#[derive(Debug, Default)]
+pub struct FlowOutput {
+    /// In (camera, track id) order, so the output is the same for any
+    /// thread count.
+    pub survivors: Vec<FlowSurvivor>,
+    /// Camera of each survivor.
+    pub cameras: Vec<usize>,
+    /// Each survivor's pixel undistorted in its camera (NaN where that
+    /// fails).
+    pub undistorted: Vec<[f32; 2]>,
+    /// `(camera, pixel)` of each refill corner, current frame, in order.
+    pub spawned: Vec<(usize, [f32; 2])>,
+    pub counts: FlowStepCounts,
+}
+
+impl FlowOutput {
+    fn clear(&mut self) {
+        self.survivors.clear();
+        self.cameras.clear();
+        self.undistorted.clear();
+        self.spawned.clear();
+        self.counts = FlowStepCounts::default();
+    }
+}
+
+/// The `WindowedU8` optical flow of every rig camera: a padded level-0 frame
+/// pair per camera, one shard per flow thread, and the pool that runs them.
+pub struct RigFlow {
+    settings: RigFlowSettings,
+    pool: FlowPool,
+    frames: Option<FlowFrames>,
+    shards: Vec<FlowShard>,
+    guess: ShardGuess,
+    /// `(camera, track id, survivor, undistorted)` of a step, before sorting.
+    merged: Vec<(usize, TrackId, FlowSurvivor, [f32; 2])>,
+    output: FlowOutput,
+}
+
+impl RigFlow {
+    /// Starts `settings.threads - 1` flow workers for `cameras`, the primary
+    /// first.
+    pub fn new(
+        settings: RigFlowSettings,
+        cameras: Vec<RigFlowCamera>,
+    ) -> Result<Self, FlowPoolError> {
+        let pool = FlowPool::new(settings.threads, settings.first_core)?;
+        let shards = (0..pool.threads())
+            .map(|index| FlowShard {
+                index,
+                ..FlowShard::default()
+            })
+            .collect();
+        let guess = ShardGuess {
+            cameras: cameras
+                .into_iter()
+                .map(|camera| FlowCamera {
+                    camera: camera.camera,
+                    camera_from_primary: camera.camera_from_primary,
+                    gyro_rotation: None,
+                })
+                .collect(),
+            window: settings.window,
+            epsilon: settings.epsilon,
+            forward_backward: settings.forward_backward,
+            refill: settings.refill,
+            anchor_guard: settings.anchor_guard,
+            ..ShardGuess::default()
+        };
+        Ok(Self {
+            settings,
+            pool,
+            frames: None,
+            shards,
+            guess,
+            merged: Vec::new(),
+            output: FlowOutput::default(),
+        })
+    }
+
+    pub fn threads(&self) -> usize {
+        self.pool.threads()
+    }
+
+    pub fn cameras(&self) -> usize {
+        self.guess.cameras.len()
+    }
+
+    /// Whether a frame has been prepared, so the next one has a previous.
+    pub fn has_frames(&self) -> bool {
+        self.frames.is_some()
+    }
+
+    /// Makes `images` (one per camera, primary first) the current frames and
+    /// the last ones the previous: one padded level-0 copy per camera, in
+    /// place. Images past the rig's cameras are ignored.
+    pub fn prepare(
+        &mut self,
+        images: &[&Image<u8, 1>],
+        frame_idx: u64,
+        timings: &mut TrackingTimings,
+    ) -> Result<(), FlowPoolError> {
+        let started = Instant::now();
+        let prepared = self.rebuild(images, frame_idx);
+        if prepared.is_err() {
+            self.frames = None;
+        }
+        timings.flow_prepare += started.elapsed();
+        prepared
+    }
+
+    fn rebuild(&mut self, images: &[&Image<u8, 1>], frame_idx: u64) -> Result<(), FlowPoolError> {
+        let cameras = self.cameras();
+        let images = &images[..images.len().min(cameras)];
+        let Some(frames) = self.frames.as_mut() else {
+            // Two copies of the first frame, so each side can be rebuilt in place.
+            let mut frames = FlowFrames {
+                previous: Vec::with_capacity(cameras),
+                current: Vec::with_capacity(cameras),
+            };
+            for image in images {
+                let window = self.settings.window;
+                frames.previous.push(Arc::new(LkFrame::new(image, window, frame_idx)?));
+                frames.current.push(Arc::new(LkFrame::new(image, window, frame_idx)?));
+            }
+            self.frames = Some(frames);
+            return Ok(());
+        };
+        std::mem::swap(&mut frames.previous, &mut frames.current);
+        for (frame, image) in frames.current.iter_mut().zip(images) {
+            Arc::get_mut(frame)
+                .ok_or(FlowPoolError::FrameShared)?
+                .rebuild(image, frame_idx)?;
+        }
+        Ok(())
+    }
+
+    /// The frame of `camera` the track set's pixels refer to after
+    /// [`Self::prepare`]: the previous one.
+    pub(crate) fn previous_frame(&self, camera: usize) -> Option<&LkFrame> {
+        self.frames
+            .as_ref()?
+            .previous
+            .get(camera)
+            .map(|frame| frame.as_ref())
+    }
+
+    /// The current frame of `camera`.
+    pub(crate) fn current_frame(&self, camera: usize) -> Option<&LkFrame> {
+        self.frames
+            .as_ref()?
+            .current
+            .get(camera)
+            .map(|frame| frame.as_ref())
+    }
+
+    /// The output of the latest [`Self::step`].
+    pub fn output(&self) -> &FlowOutput {
+        &self.output
+    }
+
+    /// Tracks `tracks` from the previous frames into the current ones.
+    pub fn step(
+        &mut self,
+        tracks: &TrackSet,
+        input: &FlowStepInput,
+        timings: &mut TrackingTimings,
+    ) -> Result<&FlowOutput, FlowPoolError> {
+        self.output.clear();
+        self.merged.clear();
+        if self.frames.is_none() || tracks.is_empty() {
+            return Ok(&self.output);
+        }
+        let started = Instant::now();
+        let (max_level, max_iter) = match input.pose_world_to_primary {
+            Some(_) => self.settings.predicted,
+            None => self.settings.unpredicted,
+        };
+        self.fill_guess(input, max_level, max_iter);
+        self.partition(tracks);
+        self.build_coarse(max_level)?;
+        timings.flow_prepare += started.elapsed();
+
+        self.run_pass(timings)?;
+        if let KltRetry::CoarseLevel { max_level: retry_level } = self.settings.retry
+            && retry_level > max_level
+            && self.shards.iter().any(|shard| !shard.retry.is_empty())
+        {
+            let started = Instant::now();
+            self.keep_retries();
+            self.guess.retry = true;
+            self.guess.max_level = retry_level;
+            self.guess.refill_camera = None;
+            self.build_coarse(retry_level)?;
+            timings.flow_prepare += started.elapsed();
+            self.run_pass(timings)?;
+        }
+        self.finish();
+        Ok(&self.output)
+    }
+
+    /// The per-frame part of the guess, in place.
+    fn fill_guess(&mut self, input: &FlowStepInput, max_level: usize, max_iter: usize) {
+        let guess = &mut self.guess;
+        guess.frame_idx = input.frame_idx;
+        guess.pose_world_to_primary = input.pose_world_to_primary;
+        guess.max_level = max_level;
+        guess.max_iter = max_iter;
+        guess.retry = false;
+        guess.refill_camera = None;
+        guess.refill_occupied.clear();
+        for camera in &mut guess.cameras {
+            camera.gyro_rotation = None;
+        }
+    }
+
+    /// Hands every track to the shard fixed at its spawn, in (camera, track
+    /// id) order.
+    fn partition(&mut self, tracks: &TrackSet) {
+        let last = self.shards.len() - 1;
+        for shard in &mut self.shards {
+            shard.tracks.clear();
+        }
+        for track in tracks.tracks() {
+            self.shards[track.shard().min(last)].tracks.push(*track);
+        }
+        for shard in &mut self.shards {
+            shard
+                .tracks
+                .sort_unstable_by_key(|track| (track.camera(), track.id()));
+        }
+    }
+
+    /// Levels `1..=max_level` of both frame sides, which the workers no
+    /// longer share after a join.
+    fn build_coarse(&mut self, max_level: usize) -> Result<(), FlowPoolError> {
+        if max_level == 0 {
+            return Ok(());
+        }
+        let frames = self.frames.as_mut().ok_or(FlowPoolError::FrameShared)?;
+        for frame in frames.previous.iter_mut().chain(frames.current.iter_mut()) {
+            Arc::get_mut(frame)
+                .ok_or(FlowPoolError::FrameShared)?
+                .build_coarse(max_level)?;
+        }
+        Ok(())
+    }
+
+    /// One pool step over every shard, its survivors merged in.
+    fn run_pass(&mut self, timings: &mut TrackingTimings) -> Result<(), FlowPoolError> {
+        let frames = self.frames.as_ref().ok_or(FlowPoolError::FrameShared)?;
+        if !self.guess.retry {
+            for shard in &self.shards {
+                self.output.counts.tracks_tried += shard.tracks.len() as u64;
+            }
+        }
+        self.pool.step(&mut self.shards, frames, &self.guess)?;
+        self.pool.add_timings(timings);
+        for shard in &self.shards {
+            let counts = &mut self.output.counts;
+            counts.fb_rejects += u64::from(shard.fb_rejects);
+            counts.anchor_drops += u64::from(shard.anchor_drops);
+            counts.template_rebuilds += u64::from(shard.template_rebuilds);
+            if self.guess.retry {
+                counts.retries += shard.tracks.len() as u64;
+            }
+            self.output.spawned.extend_from_slice(&shard.spawned);
+            // Survivors are a subsequence of the shard's tracks.
+            let mut tracks = shard.tracks.iter();
+            for (survivor, undistorted) in shard.survivors.iter().zip(&shard.undistorted) {
+                if let Some(track) = tracks.find(|track| track.id() == survivor.track_id) {
+                    self.merged
+                        .push((track.camera(), track.id(), *survivor, *undistorted));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Keeps in each shard only the tracks that failed the first pass.
+    fn keep_retries(&mut self) {
+        for shard in &mut self.shards {
+            let FlowShard { tracks, retry, .. } = shard;
+            let mut failed = retry.iter().peekable();
+            tracks.retain(|track| failed.next_if(|&&id| id == track.id()).is_some());
+        }
+    }
+
+    /// Sorts the merged survivors into the output.
+    fn finish(&mut self) {
+        self.merged
+            .sort_unstable_by_key(|&(camera, id, _, _)| (camera, id));
+        for &(camera, _, survivor, undistorted) in &self.merged {
+            self.output.survivors.push(survivor);
+            self.output.cameras.push(camera);
+            self.output.undistorted.push(undistorted);
+        }
     }
 }

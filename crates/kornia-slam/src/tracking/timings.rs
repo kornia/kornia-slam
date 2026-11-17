@@ -20,6 +20,17 @@ pub struct ShardTimings {
     pub flow_refill: Duration,
 }
 
+impl ShardTimings {
+    /// Sum of the shard's stages.
+    pub fn total(&self) -> Duration {
+        self.flow_template
+            + self.flow_forward
+            + self.flow_backward
+            + self.flow_project
+            + self.flow_refill
+    }
+}
+
 /// Wall time of each tracking stage of the latest frame. A stage that runs
 /// more than once in a frame (the estimator's fallback paths) is summed; a
 /// stage that did not run is zero.
@@ -80,7 +91,13 @@ impl TrackingTimings {
     /// The flow frame's critical path: the tracking-core stages, dispatch,
     /// the slowest shard and the join.
     pub fn critical_path(&self) -> Duration {
-        todo!("lane T: critical path of a flow frame")
+        let slowest_shard = self
+            .shards
+            .iter()
+            .map(ShardTimings::total)
+            .max()
+            .unwrap_or_default();
+        self.total().saturating_sub(self.flow_parallel) + slowest_shard
     }
 }
 

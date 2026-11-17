@@ -578,10 +578,9 @@ impl KltTracker {
             return Ok(Vec::new());
         }
         check_same_size(previous, current)?;
-        if self.kernel == LkKernel::WindowedU8 {
-            todo!("lane T: WindowedU8 runs in FlowShard");
-        }
-        if self.kernel == LkKernel::FixedPointU8 {
+        // `WindowedU8` runs on `RigFlow`'s shards; here it means the same
+        // fixed-point scheme on a full pyramid.
+        if matches!(self.kernel, LkKernel::FixedPointU8 | LkKernel::WindowedU8) {
             return self.track_cached_u8(cache, tracks, prediction, previous, current, timings);
         }
         let max_level = self.params.max_level;

@@ -18,6 +18,7 @@ use crate::Frame;
 use crate::frame::RigFeatures;
 use crate::mapping::Map;
 use crate::rig::RigGeometry;
+use crate::tracking::flow_tracker::{FlowStepCounts, FlowStepInput, RigFlow};
 use crate::tracking::local_map::{LocalMapRules, LocalMapSelectionConfig};
 use crate::tracking::optical_flow::{
     FlowPrediction, FlowSurvivor, KltPyramidCache, KltTracker, LkKernel, MapKeypointMatch, Track,
@@ -93,6 +94,12 @@ pub(crate) struct Tracker {
     secondary_klt_caches: Vec<KltPyramidCache>,
     /// Track sets cleared by a duplicate map point in reconciliation.
     reconcile_clears: u64,
+    /// `WindowedU8` flow tallies so far.
+    flow_counts: FlowStepCounts,
+    /// Refill corners of the latest flow step, spawned once the frame's
+    /// tracks are settled.
+    pending_spawns: Vec<(usize, [f32; 2])>,
+    refill_spawns: u64,
 }
 
 impl Tracker {
@@ -111,6 +118,9 @@ impl Tracker {
             rig: None,
             secondary_klt_caches: Vec::new(),
             reconcile_clears: 0,
+            flow_counts: FlowStepCounts::default(),
+            pending_spawns: Vec::new(),
+            refill_spawns: 0,
         }
     }
 
@@ -120,8 +130,22 @@ impl Tracker {
         let cameras = rig.views().len();
         self.secondary_klt_caches = (1..cameras).map(|_| KltPyramidCache::new()).collect();
         self.track_set = TrackSet::with_flow_threads(flow_threads, cameras);
+        if self.windowed() {
+            self.track_set = std::mem::take(&mut self.track_set).with_monotonic_ids();
+        }
         self.rig = Some(rig);
         self
+    }
+
+    /// Whether flow runs on `WindowedU8` shards, which cache templates by
+    /// track identity and predict from each track's stored position.
+    fn windowed(&self) -> bool {
+        self.klt_tracker.kernel() == LkKernel::WindowedU8
+    }
+
+    /// `WindowedU8` flow tallies so far, and the tracks refill spawned.
+    pub(crate) fn flow_counts(&self) -> (FlowStepCounts, u64) {
+        (self.flow_counts, self.refill_spawns)
     }
 
     /// Runs optical flow with `window`-pixel LK windows.
@@ -202,6 +226,9 @@ impl Tracker {
     /// Runs optical flow on `kernel`.
     pub(crate) fn with_lk_kernel(mut self, kernel: LkKernel) -> Self {
         self.klt_tracker = self.klt_tracker.with_kernel(kernel);
+        if self.windowed() {
+            self.track_set = std::mem::take(&mut self.track_set).with_monotonic_ids();
+        }
         self
     }
 
@@ -327,6 +354,70 @@ impl Tracker {
             survivors.extend(tracked.ok()?);
         }
         Some(survivors)
+    }
+
+    /// [`Self::flow`] on `WindowedU8` shards: every camera's tracks from
+    /// `flow`'s previous frames into its current ones.
+    pub(crate) fn flow_windowed(
+        &mut self,
+        flow: &mut RigFlow,
+        input: &FlowStepInput,
+        timings: &mut TrackingTimings,
+    ) -> Option<Vec<FlowSurvivor>> {
+        self.pending_spawns.clear();
+        if self.track_set.is_empty() {
+            return None;
+        }
+        match flow.step(&self.track_set, input, timings) {
+            Ok(output) => {
+                let counts = &mut self.flow_counts;
+                counts.tracks_tried += output.counts.tracks_tried;
+                counts.fb_rejects += output.counts.fb_rejects;
+                counts.retries += output.counts.retries;
+                counts.anchor_drops += output.counts.anchor_drops;
+                counts.template_rebuilds += output.counts.template_rebuilds;
+                self.pending_spawns.extend_from_slice(&output.spawned);
+                Some(output.survivors.clone())
+            }
+            Err(_) => {
+                self.klt_errors += 1;
+                None
+            }
+        }
+    }
+
+    /// Spawns the latest flow step's refill corners, once this frame's
+    /// tracks are settled; they join the map at the next keyframe.
+    pub(crate) fn spawn_refills(&mut self) {
+        for &(camera, pixel) in &self.pending_spawns {
+            self.track_set.spawn_on(pixel, camera);
+        }
+        self.refill_spawns += self.pending_spawns.len() as u64;
+        self.pending_spawns.clear();
+    }
+
+    /// Spawns a track already following map point `map_point_idx` at
+    /// `position`, seen at `pixel` in `camera` (`adopt_landmarks`).
+    pub(crate) fn adopt(
+        &mut self,
+        pixel: [f32; 2],
+        camera: usize,
+        map_point_idx: usize,
+        position: kornia_algebra::Vec3F64,
+    ) {
+        if !self.track_set.follows(map_point_idx) {
+            self.track_set
+                .spawn_associated(pixel, camera, map_point_idx, position);
+        }
+    }
+
+    /// Rewrites every track's map-point position after a map change; returns
+    /// how many it rewrote. Only `WindowedU8` shards read them.
+    pub(crate) fn refresh_positions(&mut self, map: &Map) -> u64 {
+        if !self.windowed() {
+            return 0;
+        }
+        self.track_set.refresh_positions(map)
     }
 
     /// Where each track should appear at `guess.pose`; see [`predicted_pixels`].
@@ -485,8 +576,39 @@ impl Tracker {
     }
 
     /// Advances the tracks onto an accepted flow-only estimate of `frame`.
-    pub(crate) fn accept_flow_only(&mut self, estimate: &Estimate, frame: &Frame) {
-        self.reconcile(&estimate.matches, frame);
+    /// On `WindowedU8` the tracks without a map point, refill's, are kept
+    /// too, so they live until a keyframe can give them one.
+    pub(crate) fn accept_flow_only(
+        &mut self,
+        estimate: &Estimate,
+        frame: &Frame,
+        survivors: &[FlowSurvivor],
+    ) {
+        if !self.windowed() {
+            self.reconcile(&estimate.matches, frame);
+            return;
+        }
+        let matched: std::collections::HashSet<usize> =
+            estimate.matches.iter().map(|&(mp_idx, _)| mp_idx).collect();
+        let keep: HashMap<TrackId, bool> = self
+            .track_set
+            .tracks()
+            .iter()
+            .map(|track| {
+                let kept = track
+                    .map_point_idx()
+                    .is_none_or(|mp_idx| matched.contains(&mp_idx));
+                (track.id(), kept)
+            })
+            .collect();
+        let advanced: Vec<FlowSurvivor> = survivors
+            .iter()
+            .filter(|survivor| keep.get(&survivor.track_id) == Some(&true))
+            .copied()
+            .collect();
+        if self.track_set.advance(advanced).is_err() {
+            self.track_set.clear();
+        }
     }
 
     /// Re-associates the tracks with `frame`'s accepted matches: the primary
@@ -600,7 +722,10 @@ impl Tracker {
 
         self.last_gap = None;
         let result = result.and_then(|estimate| self.accept(&input, estimate));
-        self.settle(result, klt_survivors, input.frame)
+        let settled = self.settle(result, klt_survivors, input.frame);
+        // Reconciliation can associate new map points.
+        self.refresh_positions(map);
+        settled
     }
 
     /// Reconciles the tracks with an accepted estimate, or advances them onto

@@ -45,10 +45,10 @@ use crate::tracking::{
 };
 
 use crate::tracking::TrackingTimings;
-use crate::tracking::flow_pool::FlowPool;
+use crate::tracking::flow_tracker::{FlowStepInput, RigFlow, RigFlowCamera, RigFlowSettings};
 use crate::tracking::local_map::select_local_map_points;
 use crate::tracking::motion::{InertialPrediction, body_to_world, predict_pose};
-use crate::tracking::optical_flow::FlowSurvivor;
+use crate::tracking::optical_flow::{FlowSurvivor, LkKernel};
 use crate::tracking::pose_estimation::Estimate;
 use crate::tracking::pose_estimation::map_projection::MapProjectionRejectReason;
 use crate::tracking::pose_gate::{GateReference, GateVerdict};
@@ -221,9 +221,10 @@ pub struct SlamSystem {
     estimator: estimator::EstimatorState,
     // The keyframe bound and the culling that enforces it first, when set.
     map_bound: Option<(usize, crate::mapping::culling::KeyframeCullingConfig)>,
-    // Flow workers of the 1 ms frontend; none with `flow_threads: 1`.
-    #[allow(dead_code)] // skeleton: lane T steps it
-    flow_pool: FlowPool,
+    // `WindowedU8` flow: level-0 frames, shards and workers of the 1 ms
+    // frontend; `None` on today's kernels.
+    rig_flow: Option<RigFlow>,
+    flow: build::FlowSettings,
 }
 
 impl SlamSystem {
@@ -242,16 +243,19 @@ impl SlamSystem {
             .with_secondary_keypoints(config.secondary_n_keypoints())
             .with_stereo_pyramid(config.stereo_pyramid());
         let loop_closer = config.loop_closer(&rig)?;
-        let flow_pool = FlowPool::new(
-            settings.frontend_flow.threads,
-            settings.frontend_flow.first_core,
-        )?;
+        let rig_flow = match settings.klt_kernel {
+            LkKernel::WindowedU8 => Some(RigFlow::new(
+                rig_flow_settings(&settings),
+                rig_flow_cameras(&rig, &frontend, settings.frontend_flow.rig),
+            )?),
+            LkKernel::F32 | LkKernel::FixedPointU8 => None,
+        };
         Ok(Self::assemble(
             rig,
             settings,
             frontend,
             loop_closer,
-            flow_pool,
+            rig_flow,
         ))
     }
 
@@ -260,7 +264,7 @@ impl SlamSystem {
         settings: SystemSettings,
         frontend: OrbFrontend,
         loop_closer: Option<LoopCloser>,
-        flow_pool: FlowPool,
+        rig_flow: Option<RigFlow>,
     ) -> Self {
         let camera = rig.camera.clone();
         let flow = settings.frontend_flow;
@@ -333,7 +337,8 @@ impl SlamSystem {
             wheel: None,
             estimator: estimator::EstimatorState::default(),
             map_bound: None,
-            flow_pool,
+            rig_flow,
+            flow,
         }
     }
 
@@ -484,6 +489,7 @@ impl SlamSystem {
     /// Tallies of frame outcomes and local-mapping work since [`Self::build`].
     pub fn run_counters(&self) -> RunCounters {
         let (klt_errors, snap_errors) = self.tracker.flow_error_counts();
+        let (flow, refill_spawns) = self.tracker.flow_counts();
         let mapping = self.local_mapping.counts();
         RunCounters {
             klt_errors,
@@ -496,6 +502,12 @@ impl SlamSystem {
             ba_solve_ns: mapping.ba_solve_ns,
             large_window_solves: mapping.large_window_solves,
             flow_reconcile_clears: self.tracker.reconcile_clears(),
+            flow_tracks_tried: flow.tracks_tried,
+            flow_fb_rejects: flow.fb_rejects,
+            flow_retries: flow.retries,
+            flow_anchor_drops: flow.anchor_drops,
+            flow_template_rebuilds: flow.template_rebuilds,
+            flow_refill_spawns: refill_spawns,
             ..self.counters
         }
     }
@@ -640,7 +652,7 @@ impl SlamSystem {
         };
         let deferrable = self.klt_min_tracks.is_some()
             && self.state.mode != SystemMode::Bootstrap
-            && self.previous_image.is_some();
+            && (self.previous_image.is_some() || self.rig_flow.as_ref().is_some_and(RigFlow::has_frames));
         let source = if deferrable {
             FrameSource::Deferred(pending)
         } else {
@@ -703,6 +715,12 @@ impl SlamSystem {
         self.deferred_extraction = Duration::ZERO;
         let tracking_start = Instant::now();
         self.last_skip = None;
+        if let Some(rig_flow) = self.rig_flow.as_mut()
+            && let Err(error) =
+                rig_flow.prepare(images, self.next_frame_idx as u64 - 1, &mut self.tracking_timings)
+        {
+            self.dbg(format!("[flow] frame={} frames not prepared: {error}", self.next_frame_idx - 1));
+        }
         let result = self.process_prepared(source, previous_image.as_ref(), images, timestamp_sec);
         self.tracking_duration = tracking_start
             .elapsed()
@@ -717,7 +735,10 @@ impl SlamSystem {
                 self.counters.nonrigid_poses += 1;
             }
         }
-        self.retain_previous_image(image, previous_image);
+        // `WindowedU8` keeps its own level-0 copies.
+        if self.rig_flow.is_none() {
+            self.retain_previous_image(image, previous_image);
+        }
         if self.tracker.flows_rig() {
             self.retain_secondary_images(&images[1..]);
         }
@@ -1643,6 +1664,8 @@ impl SlamSystem {
             }
         };
 
+        self.tracker.spawn_refills();
+
         let (mut status, matches, tracked_inliers, reject_reason) = match result {
             Ok(mut estimate) => {
                 self.refine_pose_inertial(&frame, &mut estimate, prev_timestamp, timestamp_sec);
@@ -1854,6 +1877,17 @@ impl SlamSystem {
         candidate_pose: &Pose3d,
         trusted_prediction: bool,
     ) -> Option<Vec<FlowSurvivor>> {
+        if let Some(rig_flow) = self.rig_flow.as_mut() {
+            let input = FlowStepInput {
+                frame_idx: self.next_frame_idx as u64 - 1,
+                pose_world_to_primary: (trusted_prediction && self.klt_prediction.is_some())
+                    .then_some(*candidate_pose),
+                primary_rotation: None,
+            };
+            return self
+                .tracker
+                .flow_windowed(rig_flow, &input, &mut self.tracking_timings);
+        }
         let map = self.map.lock().unwrap();
         let guess = self
             .klt_prediction
@@ -1986,7 +2020,7 @@ impl SlamSystem {
             ));
             return FlowOnly::KeyframeDue(estimate.pose);
         }
-        self.tracker.accept_flow_only(&estimate, &frame);
+        self.tracker.accept_flow_only(&estimate, &frame, survivors);
         self.frontend.observe_flow(&frame.features.keypoints_xy);
         FlowOnly::Tracked(Box::new(frame), estimate)
     }
@@ -2758,6 +2792,47 @@ impl SlamSystem {
             }
         }
         self.loop_closure_events.extend(outcome.events);
+    }
+}
+
+/// The `WindowedU8` flow knobs of `settings`; without a prediction search LK
+/// runs kornia-imgproc's default pyramid, as today's kernels do.
+fn rig_flow_settings(settings: &SystemSettings) -> RigFlowSettings {
+    let flow = settings.frontend_flow;
+    let default = kornia_imgproc::optical_flow_pyr_lk::PyrLKParams::default();
+    let unpredicted = (default.max_level, default.max_iter);
+    RigFlowSettings {
+        threads: flow.threads,
+        first_core: flow.first_core,
+        window: flow.window,
+        predicted: settings.klt_prediction.unwrap_or(unpredicted),
+        unpredicted,
+        epsilon: default.epsilon,
+        retry: flow.retry,
+        forward_backward: flow.forward_backward,
+        refill: flow.refill,
+        anchor_guard: flow.anchor_guard,
+        gyro_guess: flow.gyro_guess,
+    }
+}
+
+/// The cameras flow tracks: every rig camera under `klt_rig: AllCameras`,
+/// the primary otherwise.
+fn rig_flow_cameras(rig: &SensorRig, frontend: &OrbFrontend, klt_rig: KltRig) -> Vec<RigFlowCamera> {
+    match (klt_rig, frontend.rig_geometry()) {
+        (KltRig::AllCameras, Some(geometry)) => geometry
+            .views()
+            .iter()
+            .enumerate()
+            .map(|(camera, view)| RigFlowCamera {
+                camera: view.camera.clone(),
+                camera_from_primary: (camera > 0).then_some(view.camera_from_primary),
+            })
+            .collect(),
+        _ => vec![RigFlowCamera {
+            camera: rig.camera.clone(),
+            camera_from_primary: None,
+        }],
     }
 }
 
