@@ -868,6 +868,9 @@ impl SlamSystem {
         };
 
         for result in self.local_mapping.drain_results() {
+            if let Some(marginal) = result.newest_marginal {
+                self.estimator.newest_marginal = Some(marginal);
+            }
             for correction in &result.keyframe_corrections {
                 if self.note_pose("ba_keyframe", correction.kf_idx, &correction.pose_after) {
                     self.counters.nonrigid_keyframes += 1;
@@ -1486,6 +1489,7 @@ impl SlamSystem {
 
         let (candidate_pose, predicted_velocity) =
             self.predict_frame_pose(pose_before, prev_timestamp, timestamp_sec);
+        self.update_imu_trust(frame_idx, timestamp_sec, &candidate_pose);
 
         let currently_lost_for = self
             .state
@@ -1932,6 +1936,10 @@ impl SlamSystem {
     fn job_local_ba(&self) -> LocalBaParams {
         LocalBaParams {
             recently_initialized: self.inertial.schedule.recently_initialized(),
+            newest_marginal: matches!(
+                self.tracking_config.imu_trust,
+                ImuTrustMode::Covariance { .. }
+            ),
             ..self.local_ba
         }
     }
@@ -2013,18 +2021,21 @@ impl SlamSystem {
     /// How far the inertial prediction at `timestamp_sec` can be trusted.
     fn imu_trust(&self, timestamp_sec: f64) -> ImuTrust {
         match self.tracking_config.imu_trust {
-            ImuTrustMode::TimeSinceInit => {
-                let min_confidence_sec = self.tracking_loss_recovery.min_imu_confidence_sec;
-                ImuTrust::by_time(
-                    self.state.imu_initialized
-                        && self
-                            .state
-                            .imu_init_timestamp_sec
-                            .is_some_and(|t0| timestamp_sec - t0 >= min_confidence_sec),
-                )
+            ImuTrustMode::TimeSinceInit => ImuTrust::by_time(self.trusted_by_time(timestamp_sec)),
+            ImuTrustMode::Covariance { search_sigmas } => {
+                self.cached_covariance_trust(timestamp_sec, search_sigmas)
             }
-            ImuTrustMode::Covariance { .. } => todo!("lane A: IMU covariance trust"),
         }
+    }
+
+    /// Whether the IMU has been initialized for `min_imu_confidence_sec`.
+    fn trusted_by_time(&self, timestamp_sec: f64) -> bool {
+        let min_confidence_sec = self.tracking_loss_recovery.min_imu_confidence_sec;
+        self.state.imu_initialized
+            && self
+                .state
+                .imu_init_timestamp_sec
+                .is_some_and(|t0| timestamp_sec - t0 >= min_confidence_sec)
     }
 
     /// Whether a lost frame tries relocalization: while the IMU is not

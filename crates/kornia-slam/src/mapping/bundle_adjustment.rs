@@ -751,6 +751,7 @@ pub fn run_local_inertial_ba_with(
         boundary: params.boundary,
         imu_huber: params.imu_huber,
         imu_recently_initialized: params.recently_initialized,
+        newest_marginal: params.newest_marginal,
         rig_views: rig_views.clone(),
         observation_views: observation_views.clone(),
         observation_sigma_px,
@@ -822,6 +823,9 @@ pub fn run_local_inertial_ba_with(
         );
     }
     window.write_back_where(&vi_result.points, &keep, &mut update.map_points);
+    update.newest_marginal = vi_result
+        .newest_marginal
+        .map(|marginal| (snapshot.keyframes()[n_kfs - 1].frame.idx, marginal));
     if let (BoundaryPrior::Marginal(sigma), Some(edge)) = (params.boundary, boundary) {
         // A solve that fell back starts the chain from its own result.
         update.next_prior = vi_params.prior.take().or_else(|| {

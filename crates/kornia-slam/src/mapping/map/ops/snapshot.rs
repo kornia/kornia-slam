@@ -7,7 +7,7 @@ use super::correction::StateEnvelope;
 use crate::mapping::map::{ImuFactor, Keyframe, Map, MapPoint};
 use crate::mapping::marginalization::MarginalPrior;
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::Vec3F64;
+use kornia_algebra::{Mat15F64, Vec3F64};
 use kornia_sensors::imu::{ImuBias, PreintegratedImu};
 use std::collections::HashSet;
 
@@ -61,6 +61,9 @@ pub struct BaUpdate {
     /// Checked by [`Map::apply_ba_update`] before any write.
     pub(crate) state_envelope: StateEnvelope,
     pub(crate) outcome: BaOutcome,
+    /// The newest keyframe's id and marginal covariance, when the solve was
+    /// asked for it.
+    pub(crate) newest_marginal: Option<(usize, Mat15F64)>,
 }
 
 /// Whether the solver ran on an update, for the run counters.
@@ -187,6 +190,7 @@ impl BaSnapshot {
             next_prior: None,
             state_envelope: StateEnvelope::Off,
             outcome: BaOutcome::default(),
+            newest_marginal: None,
         }
     }
 }

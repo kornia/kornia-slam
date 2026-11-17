@@ -10,7 +10,7 @@ use super::snapshot::KeyframeBaState;
 use crate::mapping::map::{BaUpdate, Map};
 use crate::pose_conversion::rigid;
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{SO3F64, Vec3F64};
+use kornia_algebra::{Mat15F64, SO3F64, Vec3F64};
 use kornia_sensors::imu::ImuBias;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -626,6 +626,9 @@ pub struct KeyframeBaCorrection {
 pub struct LocalBaMergeResult {
     pub keyframe_corrections: Vec<KeyframeBaCorrection>,
     pub map_points_updated: usize,
+    /// The newest keyframe's id and marginal covariance, layout
+    /// `[ρ ω v b_g b_a]`, when the solve was asked for it.
+    pub newest_marginal: Option<(usize, Mat15F64)>,
 }
 
 impl Map {
@@ -698,7 +701,10 @@ impl Map {
             }
         }
 
-        let mut result = LocalBaMergeResult::default();
+        let mut result = LocalBaMergeResult {
+            newest_marginal: update.newest_marginal,
+            ..LocalBaMergeResult::default()
+        };
         // Which estimates to publish is decided against the capture baseline;
         // which landmarks became stale is decided against the *live* pose,
         // because that is the camera centre their geometry was derived from.

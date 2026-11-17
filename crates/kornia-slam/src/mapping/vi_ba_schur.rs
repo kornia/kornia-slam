@@ -408,8 +408,9 @@ pub struct ViBaResult {
     /// its information is singular.
     pub prior_residual_first: Option<f64>,
     pub prior_residual_final: Option<f64>,
-    /// The newest free keyframe's marginal covariance, layout
-    /// `[ρ ω v b_g b_a]`, when [`ViBaParams::newest_marginal`] asked for it.
+    /// The newest keyframe's marginal covariance, layout `[ρ ω v b_g b_a]`,
+    /// when [`ViBaParams::newest_marginal`] asked for it and that keyframe is
+    /// free; taken from the last linearization.
     pub newest_marginal: Option<Mat15F64>,
 }
 
@@ -1399,6 +1400,9 @@ pub fn visual_inertial_bundle_adjust(
     // Whether each observation's reprojection is a Huber inlier at the
     // current linearization point (refreshed by every system build).
     let mut vis_inlier = vec![false; observations.len()];
+    // The undamped reduced system of the latest linearization, kept only when
+    // the newest keyframe's marginal is asked for.
+    let mut last_information: Option<Mat<f64>> = None;
 
     for _iter in 0..params.max_iterations {
         iters_done += 1;
@@ -1654,6 +1658,9 @@ pub fn visual_inertial_bundle_adjust(
         }
         let cost = cost_f64 as f32;
         hold_inertial_state(&mut m_mat, &mut m_vec, keyframes, &kf_local);
+        if params.newest_marginal {
+            last_information = Some(m_mat.clone());
+        }
 
         // ── 4. LM damping on full 15P system, then Cholesky ──────────────
         // Damping goes on AFTER IMU terms so every diagonal entry sees it.
@@ -1936,6 +1943,10 @@ pub fn visual_inertial_bundle_adjust(
     }
 
     let prior_residual_final = prior.and_then(|(i, p)| prior_velocity_residual(p, &kfs[i]));
+    let newest_marginal = last_information.and_then(|information| {
+        let newest = usize::try_from(*kf_local.last()?).ok()?;
+        newest_marginal_covariance(&information, newest * KF_DOF)
+    });
     if let Some((i, p)) = prior {
         let fmt = |x: Option<f64>| x.map_or("-".to_string(), |x| format!("{x:.4e}"));
         let sigma_v = p.velocity_mean_and_sigma().map(|(_, s)| s);
@@ -2003,8 +2014,32 @@ pub fn visual_inertial_bundle_adjust(
         fallback,
         prior_residual_first,
         prior_residual_final,
-        newest_marginal: None,
+        newest_marginal,
     })
+}
+
+/// The 15×15 block of `information⁻¹` at `base`: the marginal covariance of
+/// one keyframe, the points already eliminated by the Schur complement.
+/// `None` when the system is not positive definite.
+fn newest_marginal_covariance(information: &Mat<f64>, base: usize) -> Option<Mat15F64> {
+    const KF_DOF: usize = 15;
+    let dim = information.nrows();
+    if base + KF_DOF > dim {
+        return None;
+    }
+    let chol = information.llt(faer::Side::Lower).ok()?;
+    let mut unit = Mat::<f64>::zeros(dim, KF_DOF);
+    for col in 0..KF_DOF {
+        unit[(base + col, col)] = 1.0;
+    }
+    let columns = chol.solve(&unit);
+    let covariance = Mat15F64::from_fn(|row, col| {
+        0.5 * (columns[(base + row, col)] + columns[(base + col, row)])
+    });
+    covariance
+        .iter()
+        .all(|v| v.is_finite())
+        .then_some(covariance)
 }
 
 #[cfg(test)]

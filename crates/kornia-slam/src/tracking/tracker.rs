@@ -123,9 +123,13 @@ impl Tracker {
         self.estimator.local_map_config()
     }
 
-    #[allow(dead_code)] // skeleton: lane A calls it
     pub(crate) fn set_search_scale_override(&mut self, search_scale: Option<f32>) {
         self.search_scale_override = search_scale;
+    }
+
+    /// The map-projection settings tracking searches with.
+    pub(crate) fn map_projection_config(&self) -> &MapProjectionConfig {
+        self.estimator.config()
     }
 
     fn search_scale(&self, input: &FrameInput<'_>) -> f32 {
