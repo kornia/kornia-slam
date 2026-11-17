@@ -82,7 +82,7 @@ use crate::mapping::{GrowthNeighbours, KeyframeJob, LocalMapping, SegmentId};
 use crate::pose_conversion::{RIGID_TOLERANCE, apply_reference_pose_correction};
 use build::SystemSettings;
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::Vec3F64;
+use kornia_algebra::{Mat3F64, Vec3F64};
 use kornia_image::Image;
 use kornia_sensors::SensorRig;
 use kornia_sensors::imu::{ImuMeasurement, SampleInterpolation};
@@ -225,6 +225,9 @@ pub struct SlamSystem {
     // frontend; `None` on today's kernels.
     rig_flow: Option<RigFlow>,
     flow: build::FlowSettings,
+    // The primary camera's `R_cur_prev` from this frame's preintegrated gyro
+    // (`GyroGuess::RotatedRay`).
+    gyro_rotation: Option<Mat3F64>,
 }
 
 impl SlamSystem {
@@ -339,6 +342,7 @@ impl SlamSystem {
             map_bound: None,
             rig_flow,
             flow,
+            gyro_rotation: None,
         }
     }
 
@@ -1882,7 +1886,7 @@ impl SlamSystem {
                 frame_idx: self.next_frame_idx as u64 - 1,
                 pose_world_to_primary: (trusted_prediction && self.klt_prediction.is_some())
                     .then_some(*candidate_pose),
-                primary_rotation: None,
+                primary_rotation: self.gyro_rotation,
             };
             return self
                 .tracker
@@ -1898,6 +1902,7 @@ impl SlamSystem {
                 camera: &self.rig.camera,
                 max_level,
                 max_iter,
+                gyro_rotation: self.gyro_rotation,
             });
         if self.tracker.flows_rig() {
             let mut previous: Vec<&Image<u8, 1>> = Vec::with_capacity(images.len());
@@ -2060,6 +2065,15 @@ impl SlamSystem {
         if let Some(velocity_world) = predicted_velocity {
             self.state.velocity_world = velocity_world; // propagate for next frame
         }
+        // A ray seen in the previous camera, in the current one:
+        // R_cur_prev = R_CB · ΔRᵀ · R_BC (card E step 9).
+        self.gyro_rotation = (self.flow.gyro_guess == GyroGuess::RotatedRay)
+            .then_some(())
+            .and(preintegrated.as_ref().zip(self.rig.camera_to_body()))
+            .map(|(preintegrated, camera_to_body)| {
+                let r_bc = camera_to_body.rotation;
+                r_bc.transpose() * preintegrated.delta_rotation.transpose() * r_bc
+            });
         (candidate_pose, predicted_velocity)
     }
 

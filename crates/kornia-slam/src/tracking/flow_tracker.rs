@@ -17,7 +17,10 @@ use crate::tracking::optical_flow::{
 };
 use crate::tracking::timings::{ShardTimings, TrackingTimings};
 use crate::tracking::tracker::project_raw;
-use crate::upstream::kornia_imgproc::good_features::GoodFeaturesScratch;
+use crate::upstream::kornia_imgproc::corner_subpix::corner_sub_pix;
+use crate::upstream::kornia_imgproc::good_features::{
+    GoodFeaturesParams, GoodFeaturesScratch, good_features_to_track,
+};
 use crate::upstream::kornia_imgproc::lk_window::{
     LkFrame, LkTemplate, LkTrack, extract_template, track_template,
 };
@@ -219,6 +222,24 @@ pub(crate) struct FlowShard {
     corners: Vec<[f32; 2]>,
 }
 
+/// Refill's Shi-Tomasi quality: VINS-Fusion's `goodFeaturesToTrack` level
+/// (`feature_tracker.cpp:184`).
+const REFILL_QUALITY: f32 = 0.01;
+/// `cornerSubPix` window half side, iterations and step, as OpenCV's LK
+/// sample (`samples/cpp/lkdemo.cpp`) refines new corners, at half its window.
+const SUBPIX_HALF_WIN: usize = 5;
+const SUBPIX_MAX_ITER: usize = 20;
+const SUBPIX_EPSILON: f32 = 0.03;
+
+/// Whether a check that runs every `every_n_frames` frames runs on this one.
+fn due(frame_idx: u64, every_n_frames: usize) -> bool {
+    frame_idx % (every_n_frames.max(1) as u64) == 0
+}
+
+fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {
+    (a[0] - b[0]).hypot(a[1] - b[1])
+}
+
 impl FlowShard {
     /// Tracks `self.tracks` from `previous[c]` into `current[c]`.
     pub(crate) fn run(
@@ -235,9 +256,13 @@ impl FlowShard {
         self.fb_rejects = 0;
         self.anchor_drops = 0;
         self.template_rebuilds = 0;
+        let anchored = !guess.retry && guess.anchor_guard != AnchorGuard::Off;
         if !guess.retry {
             self.retry.clear();
             self.templates.align(&self.tracks);
+            if anchored {
+                self.anchors.align(&self.tracks);
+            }
         }
         for i in 0..self.tracks.len() {
             let track = self.tracks[i];
@@ -262,10 +287,18 @@ impl FlowShard {
                 self.retry.push(track.id());
                 continue;
             };
-            self.keep(slot, &track, result, current, model, guess, timings);
+            if anchored && !self.anchor_holds(i, &track, result.pixel, previous, current, guess) {
+                self.anchor_drops += 1;
+                continue;
+            }
+            self.keep(slot, &track, result, previous, current, model, guess, timings);
         }
         if !guess.retry {
             self.templates.sort();
+            if anchored {
+                self.anchors.sort();
+            }
+            self.refill(current, guess, timings);
         }
     }
 
@@ -301,12 +334,15 @@ impl FlowShard {
 
         let started = Instant::now();
         let mut start = start;
-        let levels = guess.max_level.min(previous.levels().min(current.levels()).saturating_sub(1));
+        let levels = guess
+            .max_level
+            .min(previous.levels().min(current.levels()).saturating_sub(1));
         for level in (1..=levels).rev() {
             if !extract_template(previous, track.pixel(), level, guess.window, &mut self.coarse) {
                 continue;
             }
-            let coarse = track_template(&self.coarse, current, start, guess.max_iter, guess.epsilon);
+            let coarse =
+                track_template(&self.coarse, current, start, guess.max_iter, guess.epsilon);
             if coarse.status {
                 start = coarse.pixel;
             }
@@ -326,14 +362,49 @@ impl FlowShard {
         .then_some(result)
     }
 
+    /// Whether `track`, now at `pixel`, is still where its first-sighting
+    /// template tracks to (`AnchorGuard`); cuts that template on the first
+    /// frame the shard sees the track. Its solve counts as forward time.
+    fn anchor_holds(
+        &mut self,
+        slot: usize,
+        track: &Track,
+        pixel: [f32; 2],
+        previous: &LkFrame,
+        current: &LkFrame,
+        guess: &ShardGuess,
+    ) -> bool {
+        let AnchorGuard::Enabled {
+            every_n_frames,
+            max_drift_px,
+        } = guess.anchor_guard
+        else {
+            return true;
+        };
+        let (_, frame_id, anchor) = &mut self.anchors.entries[slot];
+        if *frame_id == NO_TEMPLATE {
+            if extract_template(previous, track.pixel(), 0, guess.window, anchor) {
+                *frame_id = previous.frame_id();
+            }
+            return true;
+        }
+        if !due(guess.frame_idx, every_n_frames) {
+            return true;
+        }
+        let anchored = track_template(anchor, current, pixel, guess.max_iter, guess.epsilon);
+        anchored.status && distance(anchored.pixel, pixel) <= max_drift_px
+    }
+
     /// Records a forward result as a survivor, with its next template cut
-    /// at the new pixel and its undistorted pixel.
+    /// at the new pixel and its undistorted pixel; drops it instead when its
+    /// round trip back into `previous` misses (`ForwardBackward`).
     #[allow(clippy::too_many_arguments)]
     fn keep(
         &mut self,
         slot: usize,
         track: &Track,
         result: LkTrack,
+        previous: &LkFrame,
         current: &LkFrame,
         model: &FlowCamera,
         guess: &ShardGuess,
@@ -341,14 +412,30 @@ impl FlowShard {
     ) {
         let started = Instant::now();
         // The template at the forward result is the next frame's forward
-        // template, so a track costs one cut per frame.
+        // template, and the backward solve's, so a track costs one cut per
+        // frame.
         let (_, frame_id, template) = &mut self.templates.entries[slot];
-        *frame_id = if extract_template(current, result.pixel, 0, guess.window, template) {
-            current.frame_id()
-        } else {
-            NO_TEMPLATE
-        };
+        let cut = extract_template(current, result.pixel, 0, guess.window, template);
+        *frame_id = if cut { current.frame_id() } else { NO_TEMPLATE };
         timings.flow_template += started.elapsed();
+
+        if let ForwardBackward::Enabled {
+            max_round_trip_px,
+            max_iter,
+            every_n_frames,
+        } = guess.forward_backward
+            && cut
+            && due(guess.frame_idx, every_n_frames)
+        {
+            let started = Instant::now();
+            let template = &self.templates.entries[slot].2;
+            let back = track_template(template, previous, track.pixel(), max_iter, guess.epsilon);
+            timings.flow_backward += started.elapsed();
+            if !back.status || distance(back.pixel, track.pixel()) > max_round_trip_px {
+                self.fb_rejects += 1;
+                return;
+            }
+        }
 
         let started = Instant::now();
         let undistorted = model
@@ -363,11 +450,62 @@ impl FlowShard {
         self.undistorted.push(undistorted);
         timings.flow_project += started.elapsed();
     }
+
+    /// New corners for the camera this shard refills this frame: Shi-Tomasi
+    /// in the cells no track of that camera occupies, then sub-pixel.
+    fn refill(&mut self, current: &[Arc<LkFrame>], guess: &ShardGuess, timings: &mut ShardTimings) {
+        let (
+            TrackRefill::Enabled {
+                per_camera,
+                min_spacing_px,
+                border_px,
+                ..
+            },
+            Some(camera),
+        ) = (guess.refill, guess.refill_camera)
+        else {
+            return;
+        };
+        let Some(frame) = current.get(camera).filter(|_| guess.refill_shard == self.index) else {
+            return;
+        };
+        let missing = per_camera.saturating_sub(guess.refill_occupied.len());
+        if missing == 0 {
+            return;
+        }
+        let started = Instant::now();
+        let params = GoodFeaturesParams {
+            max_corners: missing,
+            quality: REFILL_QUALITY,
+            min_spacing_px,
+            border_px,
+            half_resolution: true,
+        };
+        self.corners.clear();
+        good_features_to_track(
+            frame.plane(),
+            &guess.refill_occupied,
+            &params,
+            &mut self.features,
+            &mut self.corners,
+        );
+        corner_sub_pix(
+            frame.plane(),
+            &mut self.corners,
+            SUBPIX_HALF_WIN,
+            SUBPIX_MAX_ITER,
+            SUBPIX_EPSILON,
+        );
+        self.spawned
+            .extend(self.corners.iter().map(|&corner| (camera, corner)));
+        timings.flow_refill += started.elapsed();
+    }
 }
 
 /// Where `track` starts in the current frame: its map point at the trusted
 /// prediction, carried into raw pixels by the distortion offset at its last
-/// pixel; otherwise the last pixel.
+/// pixel; else its last ray rotated by the gyro (`GyroGuess::RotatedRay`);
+/// else its last pixel.
 fn start_pixel(track: &Track, model: &FlowCamera, guess: &ShardGuess) -> [f32; 2] {
     let raw = track.pixel();
     if let (Some(pose), Some(position)) = (guess.pose_world_to_primary, track.position()) {
@@ -379,7 +517,21 @@ fn start_pixel(track: &Track, model: &FlowCamera, guess: &ShardGuess) -> [f32; 2
             return pixel;
         }
     }
-    raw
+    model
+        .gyro_rotation
+        .and_then(|rotation| rotated_ray_pixel(&model.camera, &rotation, raw))
+        .unwrap_or(raw)
+}
+
+/// The ray through `raw` rotated by `R_cur_prev`, back in raw pixels.
+pub(crate) fn rotated_ray_pixel(camera: &PinholeCamera, rotation: &Mat3F64, raw: [f32; 2]) -> Option<[f32; 2]> {
+    let undistorted = camera.undistort(raw[0] as f64, raw[1] as f64)?;
+    let ray = kornia_algebra::Vec3F64::new(
+        (undistorted.x - camera.cx) / camera.fx,
+        (undistorted.y - camera.cy) / camera.fy,
+        1.0,
+    );
+    project_raw(camera, &(*rotation * ray), raw)
 }
 
 /// A camera of the rig [`RigFlow`] tracks.
@@ -633,6 +785,7 @@ impl RigFlow {
         };
         self.fill_guess(input, max_level, max_iter);
         self.partition(tracks);
+        self.plan_refill(tracks, input.frame_idx);
         self.build_coarse(max_level)?;
         timings.flow_prepare += started.elapsed();
 
@@ -664,8 +817,45 @@ impl RigFlow {
         guess.retry = false;
         guess.refill_camera = None;
         guess.refill_occupied.clear();
+        let primary_rotation = input
+            .primary_rotation
+            .filter(|_| self.settings.gyro_guess == GyroGuess::RotatedRay);
         for camera in &mut guess.cameras {
-            camera.gyro_rotation = None;
+            // R_cur_prev(c) = R_cp R_cur_prev(0) R_pc, through the extrinsic.
+            camera.gyro_rotation = primary_rotation.map(|rotation| {
+                camera.camera_from_primary.map_or(rotation, |t_cp| {
+                    t_cp.rotation * rotation * t_cp.rotation.transpose()
+                })
+            });
+        }
+    }
+
+    /// Picks this frame's refill camera, round robin, when it holds fewer
+    /// than `refill_below` of its tracks; its occupied pixels are every one of
+    /// its tracks', across shards, so the corners do not depend on the split.
+    fn plan_refill(&mut self, tracks: &TrackSet, frame_idx: u64) {
+        let TrackRefill::Enabled {
+            per_camera,
+            refill_below,
+            ..
+        } = self.settings.refill
+        else {
+            return;
+        };
+        let camera = (frame_idx % self.cameras().max(1) as u64) as usize;
+        let guess = &mut self.guess;
+        guess.refill_occupied.extend(
+            tracks
+                .tracks()
+                .iter()
+                .filter(|track| track.camera() == camera)
+                .map(Track::pixel),
+        );
+        if (guess.refill_occupied.len() as f32) < refill_below * per_camera as f32 {
+            guess.refill_camera = Some(camera);
+            guess.refill_shard = tracks.refill_shard(camera);
+        } else {
+            guess.refill_occupied.clear();
         }
     }
 

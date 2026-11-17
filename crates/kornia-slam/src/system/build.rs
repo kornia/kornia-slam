@@ -108,7 +108,6 @@ impl FlowSettings {
         let today = Self::new(&OrbFrontendConfig::default());
         [
             ("adopt_landmarks", self.adopt_landmarks),
-            ("gyro_guess", self.gyro_guess != today.gyro_guess),
             ("flow_pose", self.pose != today.pose),
             ("flow_bookkeeping", self.bookkeeping != today.bookkeeping),
             ("keyframe_orb", self.keyframe_orb != today.keyframe_orb),

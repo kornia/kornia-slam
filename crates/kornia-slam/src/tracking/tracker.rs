@@ -18,7 +18,7 @@ use crate::Frame;
 use crate::frame::RigFeatures;
 use crate::mapping::Map;
 use crate::rig::RigGeometry;
-use crate::tracking::flow_tracker::{FlowStepCounts, FlowStepInput, RigFlow};
+use crate::tracking::flow_tracker::{FlowStepCounts, FlowStepInput, RigFlow, rotated_ray_pixel};
 use crate::tracking::local_map::{LocalMapRules, LocalMapSelectionConfig};
 use crate::tracking::optical_flow::{
     FlowPrediction, FlowSurvivor, KltPyramidCache, KltTracker, LkKernel, MapKeypointMatch, Track,
@@ -71,6 +71,9 @@ pub(crate) struct FlowGuess<'a> {
     pub camera: &'a PinholeCamera,
     pub max_level: usize,
     pub max_iter: usize,
+    /// The primary camera's `R_cur_prev` from the gyro, for tracks without a
+    /// map point (`GyroGuess::RotatedRay`).
+    pub gyro_rotation: Option<kornia_algebra::Mat3F64>,
 }
 
 pub(crate) struct Tracker {
@@ -332,7 +335,18 @@ impl Tracker {
             }
             let view = rig.view(camera)?;
             let initial_pixels = guess.as_ref().map(|guess| {
-                predicted_pixels(&tracks, guess.map, &view.pose(guess.pose), &view.camera)
+                // R_cur_prev(c) = R_cp R_cur_prev(0) R_pc.
+                let r_cp = view.camera_from_primary.rotation;
+                let rotation = guess
+                    .gyro_rotation
+                    .map(|rotation| r_cp * rotation * r_cp.transpose());
+                predicted_pixels(
+                    &tracks,
+                    guess.map,
+                    &view.pose(guess.pose),
+                    &view.camera,
+                    rotation,
+                )
             });
             let prediction =
                 guess
@@ -422,7 +436,13 @@ impl Tracker {
 
     /// Where each track should appear at `guess.pose`; see [`predicted_pixels`].
     fn predicted_pixels(&self, guess: &FlowGuess<'_>) -> Vec<[f32; 2]> {
-        predicted_pixels(self.track_set.tracks(), guess.map, guess.pose, guess.camera)
+        predicted_pixels(
+            self.track_set.tracks(),
+            guess.map,
+            guess.pose,
+            guess.camera,
+            guess.gyro_rotation,
+        )
     }
 
     /// A frame made of the survivors that carry a map point: each keypoint
@@ -751,13 +771,14 @@ impl Tracker {
 
 /// Where each of `tracks` should appear at `pose` (world to `camera`): its
 /// map point's projection, carried back into raw pixels by the distortion
-/// offset at the track's last pixel; the last pixel itself without a map
-/// point.
+/// offset at the track's last pixel; without one, its last ray rotated by
+/// `gyro_rotation` when given, else the last pixel itself.
 fn predicted_pixels(
     tracks: &[Track],
     map: &Map,
     pose: &Pose3d,
     camera: &PinholeCamera,
+    gyro_rotation: Option<kornia_algebra::Mat3F64>,
 ) -> Vec<[f32; 2]> {
     tracks
         .iter()
@@ -768,6 +789,9 @@ fn predicted_pixels(
                 .and_then(|idx| map.map_points().get(idx))
                 .filter(|mp| !mp.culled)
                 .and_then(|mp| project_raw(camera, &pose.transform_point(&mp.position), raw))
+                .or_else(|| {
+                    gyro_rotation.and_then(|rotation| rotated_ray_pixel(camera, &rotation, raw))
+                })
                 .unwrap_or(raw)
         })
         .collect()
