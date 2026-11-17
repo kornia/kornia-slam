@@ -389,7 +389,7 @@ mod keyframe_evidence {
         frame.pose_world_to_cam = Pose3d::IDENTITY;
 
         let system = system_tracked_at(Some(10.0), yaw);
-        let evidence = system.keyframe_evidence(&frame, 9, &all_matches());
+        let evidence = system.keyframe_evidence(&frame, 9, &all_matches(), 0.0);
         assert_eq!(evidence.curr_idx, 7);
         assert_eq!(evidence.last_keyframe_idx, Some(0));
         assert_eq!(evidence.tracked_inliers, 9);
@@ -401,7 +401,7 @@ mod keyframe_evidence {
 
         let off = system_tracked_at(None, yaw);
         assert_eq!(
-            off.keyframe_evidence(&frame, 9, &all_matches())
+            off.keyframe_evidence(&frame, 9, &all_matches(), 0.0)
                 .median_parallax_px,
             None,
             "not measured unless the policy reads it"

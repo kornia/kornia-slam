@@ -7,6 +7,7 @@
 mod build;
 mod config;
 mod counters;
+mod estimator;
 #[cfg(feature = "serde")]
 mod file;
 mod input;
@@ -210,6 +211,8 @@ pub struct SlamSystem {
     last_skip: Option<SkipKind>,
     // Wheel-odometry readings and the keyframe edges built from them, when enabled.
     wheel: Option<wheel::WheelState>,
+    // Card A's per-frame estimator state.
+    estimator: estimator::EstimatorState,
     // The keyframe bound and the culling that enforces it first, when set.
     map_bound: Option<(usize, crate::mapping::culling::KeyframeCullingConfig)>,
 }
@@ -293,6 +296,7 @@ impl SlamSystem {
             counters: RunCounters::default(),
             last_skip: None,
             wheel: None,
+            estimator: estimator::EstimatorState::default(),
             map_bound: None,
         }
     }
@@ -1871,7 +1875,8 @@ impl SlamSystem {
             self.dbg(format!("[klt-first] frame={idx} refused seeded={n_seeded}"));
             return FlowOnly::Refused;
         };
-        let evidence = self.keyframe_evidence(&frame, estimate.inliers, &estimate.matches);
+        let evidence =
+            self.keyframe_evidence(&frame, estimate.inliers, &estimate.matches, timestamp_sec);
         if self.keyframe_due(&evidence, timestamp_sec) {
             self.dbg(format!(
                 "[klt-first] frame={idx} keyframe due seeded={n_seeded} inliers={}",
@@ -1949,6 +1954,7 @@ impl SlamSystem {
         frame: &Frame,
         tracked_inliers: usize,
         matches: &[(usize, usize)],
+        timestamp_sec: f64,
     ) -> KeyframeEvidence {
         let map = self.map.lock().unwrap();
         let n_ref_map_points = self
@@ -1972,14 +1978,16 @@ impl SlamSystem {
                     &self.rig.camera,
                 )
             });
-        KeyframeEvidence {
+        drop(map);
+        let evidence = KeyframeEvidence {
             curr_idx: frame.idx,
             last_keyframe_idx: self.state.last_keyframe_idx,
             tracked_inliers,
             n_ref_map_points,
             median_parallax_px,
             ..KeyframeEvidence::default()
-        }
+        };
+        self.with_orb_slam3_evidence(evidence, frame, matches, timestamp_sec)
     }
 
     /// The policy's decision, or `max_interval_sec` elapsed since the last
@@ -2270,6 +2278,7 @@ impl SlamSystem {
         self.note_pose("reloc", frame.idx, &found.estimate.pose);
         self.state.current_keyframe_idx = Some(found.keyframe_idx);
         self.state.velocity = None;
+        self.estimator.last_relocalization_frame = Some(frame.idx);
         true
     }
 
@@ -2295,7 +2304,7 @@ impl SlamSystem {
         tracked_inliers: usize,
         matches: &[(usize, usize)],
     ) -> bool {
-        let evidence = self.keyframe_evidence(frame, tracked_inliers, matches);
+        let evidence = self.keyframe_evidence(frame, tracked_inliers, matches, timestamp_sec);
         if !self.keyframe_due(&evidence, timestamp_sec) {
             return false;
         }
