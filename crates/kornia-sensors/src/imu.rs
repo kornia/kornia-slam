@@ -231,8 +231,59 @@ impl PreintegratedImu {
     ) -> Self {
         match interpolation {
             SampleInterpolation::Hold => Self::from_measurements(bias, calib, samples, t0, t1),
-            SampleInterpolation::Midpoint => todo!("lane A: midpoint sample interpolation"),
+            SampleInterpolation::Midpoint => {
+                Self::from_measurements_midpoint(bias, calib, samples, t0, t1)
+            }
         }
+    }
+
+    /// Trapezoids over the signal linear between samples: each interval
+    /// between consecutive breakpoints (`t0`, the stamps inside, `t1`)
+    /// integrates the mean of the signal at its two ends. A right Riemann sum
+    /// instead lags by half a sample period (OpenVINS `Propagator.cpp:269-349`
+    /// cuts and averages the same way).
+    fn from_measurements_midpoint(
+        bias: ImuBias,
+        calib: ImuCalib,
+        samples: &[ImuMeasurement],
+        t0: f64,
+        t1: f64,
+    ) -> Self {
+        let mut pre = Self::new(bias, calib);
+        let mut sorted: Vec<ImuMeasurement> = samples
+            .iter()
+            .filter(|m| m.timestamp.is_finite())
+            .copied()
+            .collect();
+        if sorted.is_empty() || t1 <= t0 {
+            return pre;
+        }
+        sorted.sort_by(|a, b| a.timestamp.total_cmp(&b.timestamp));
+
+        let mut breakpoints = Vec::with_capacity(sorted.len() + 2);
+        breakpoints.push(t0);
+        breakpoints.extend(
+            sorted
+                .iter()
+                .map(|m| m.timestamp)
+                .filter(|&t| t > t0 && t < t1),
+        );
+        breakpoints.push(t1);
+        for pair in breakpoints.windows(2) {
+            let (start, end) = (pair[0], pair[1]);
+            if end <= start {
+                continue;
+            }
+            let (gyro_start, accel_start) = reading_at(&sorted, start);
+            let (gyro_end, accel_end) = reading_at(&sorted, end);
+            let mean = ImuMeasurement {
+                timestamp: end,
+                gyro: (gyro_start + gyro_end) * 0.5,
+                accel: (accel_start + accel_end) * 0.5,
+            };
+            pre.integrate(&mean, end - start);
+        }
+        pre
     }
 
     /// ΔR re-expressed at a new bias estimate via the first-order correction
@@ -404,6 +455,25 @@ impl PreintegratedImu {
             let dt = measurements[i + 1].timestamp - measurements[i].timestamp;
             self.integrate(&measurements[i], dt);
         }
+    }
+}
+
+/// Gyro and accelerometer readings at `t` from time-sorted, non-empty
+/// `sorted`: linear between the two samples that bracket it, held at the
+/// nearest sample outside them.
+fn reading_at(sorted: &[ImuMeasurement], t: f64) -> (Vec3F64, Vec3F64) {
+    let after = sorted.partition_point(|m| m.timestamp < t);
+    match (after.checked_sub(1).map(|i| &sorted[i]), sorted.get(after)) {
+        (Some(a), Some(b)) => {
+            let f = (t - a.timestamp) / (b.timestamp - a.timestamp);
+            (
+                a.gyro + (b.gyro - a.gyro) * f,
+                a.accel + (b.accel - a.accel) * f,
+            )
+        }
+        (None, Some(b)) => (b.gyro, b.accel),
+        (Some(a), None) => (a.gyro, a.accel),
+        (None, None) => (Vec3F64::ZERO, Vec3F64::ZERO),
     }
 }
 
@@ -641,6 +711,79 @@ mod tests {
                 "diagonal {i} should not decrease"
             );
         }
+    }
+
+    /// Card A U1: ω = sin(2πt) about z at 200 Hz, frames every 50 ms offset
+    /// 1.3 ms from the sample grid. Holding each sample lags by half a sample
+    /// period (theory 7.8e-4 rad per interval); the midpoint is near exact
+    /// (theory 4.1e-6 rad).
+    #[test]
+    fn midpoint_removes_the_half_sample_lag() {
+        let omega = |t: f64| (2.0 * std::f64::consts::PI * t).sin();
+        let samples: Vec<ImuMeasurement> = (0..1000)
+            .map(|i| {
+                let t = i as f64 * 0.005;
+                ImuMeasurement {
+                    timestamp: t,
+                    gyro: Vec3F64::new(0.0, 0.0, omega(t)),
+                    accel: Vec3F64::ZERO,
+                }
+            })
+            .collect();
+        let angle_error = |interpolation: SampleInterpolation, t0: f64, t1: f64| {
+            let pre = PreintegratedImu::from_measurements_with(
+                ImuBias::default(),
+                default_calib(),
+                &samples,
+                t0,
+                t1,
+                interpolation,
+            );
+            let two_pi = 2.0 * std::f64::consts::PI;
+            let exact = ((two_pi * t0).cos() - (two_pi * t1).cos()) / two_pi;
+            (SO3F64::from_matrix(&pre.delta_rotation).log().z - exact).abs()
+        };
+        let worst = |interpolation| {
+            (0..80)
+                .map(|k| {
+                    let t0 = k as f64 * 0.05 + 0.0013;
+                    angle_error(interpolation, t0, t0 + 0.05)
+                })
+                .fold(0.0, f64::max)
+        };
+        let hold = worst(SampleInterpolation::Hold);
+        let midpoint = worst(SampleInterpolation::Midpoint);
+        assert!((7.0e-4..=8.5e-4).contains(&hold), "hold {hold:.3e}");
+        assert!(midpoint <= 1e-5, "midpoint {midpoint:.3e}");
+    }
+
+    #[test]
+    fn hold_through_from_measurements_with_is_from_measurements() {
+        let samples: Vec<ImuMeasurement> = (0..20)
+            .map(|i| ImuMeasurement {
+                timestamp: i as f64 * 0.005,
+                gyro: Vec3F64::new(0.1, -0.2 * i as f64, 0.3),
+                accel: Vec3F64::new(0.0, 0.5, 9.81),
+            })
+            .collect();
+        let direct = PreintegratedImu::from_measurements(
+            ImuBias::default(),
+            default_calib(),
+            &samples,
+            0.0013,
+            0.0813,
+        );
+        let with = PreintegratedImu::from_measurements_with(
+            ImuBias::default(),
+            default_calib(),
+            &samples,
+            0.0013,
+            0.0813,
+            SampleInterpolation::Hold,
+        );
+        assert_eq!(direct.delta_rotation, with.delta_rotation);
+        assert_eq!(direct.delta_velocity, with.delta_velocity);
+        assert_eq!(direct.covariance, with.covariance);
     }
 
     /// The covariance is `Σ_k J_k · N · J_kᵀ`, with `J_k` the central-difference

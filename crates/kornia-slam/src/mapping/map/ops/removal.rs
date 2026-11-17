@@ -469,6 +469,7 @@ impl Map {
             t0: before.t0,
             t1: after.t1,
             bias_walk_extra_s: before.bias_walk_extra_s + after.bias_walk_extra_s,
+            interpolation: before.interpolation,
         };
         let preintegrated = factor.repreintegrate(bias);
         if !(preintegrated.dt > 0.0 && valid_preintegration(&preintegrated)) {

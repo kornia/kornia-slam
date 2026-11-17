@@ -162,7 +162,6 @@ pub struct SlamSystem {
     relocalization: LostRelocalization,
     tracking_config: TrackingConfig,
     growth_neighbours: GrowthNeighbours,
-    #[allow(dead_code)] // skeleton: lane A reads it
     sample_interpolation: SampleInterpolation,
     // Keyframes a map bound evicted, copied while a session is recorded.
     session_recording: bool,
@@ -276,7 +275,9 @@ impl SlamSystem {
             local_mapping,
             local_ba: settings.local_ba,
             state: SystemState::new(),
-            inertial: InertialState::new(),
+            inertial: InertialState::with_sample_interpolation(
+                settings.inertial.sample_interpolation,
+            ),
             loop_closer,
             loop_closure_events: Vec::new(),
             frontend,
@@ -1889,9 +1890,13 @@ impl SlamSystem {
         // Preintegration is prepared here: the system owns bias and the sample
         // buffer. The motion model chooses between it and the visual model.
         let preintegrated = (self.state.imu_initialized && prev_timestamp > 0.0).then(|| {
-            self.inertial
-                .preintegrate_window(self.rig.imu_noise(), prev_timestamp, timestamp_sec)
-                .0
+            let (preintegrated, samples) = self.inertial.preintegrate_window(
+                self.rig.imu_noise(),
+                prev_timestamp,
+                timestamp_sec,
+            );
+            self.note_tail_hold(&samples, timestamp_sec);
+            preintegrated
         });
         let (candidate_pose, predicted_velocity) = predict_pose(
             pose_before,
@@ -1909,6 +1914,16 @@ impl SlamSystem {
             self.state.velocity_world = velocity_world; // propagate for next frame
         }
         (candidate_pose, predicted_velocity)
+    }
+
+    /// Counts a `Midpoint` window that held its last sample to `t1`: no sample
+    /// after the frame had arrived yet.
+    fn note_tail_hold(&mut self, samples: &[ImuMeasurement], t1: f64) {
+        if self.sample_interpolation == SampleInterpolation::Midpoint
+            && !samples.iter().any(|m| m.timestamp >= t1)
+        {
+            self.counters.imu_tail_holds += 1;
+        }
     }
 
     /// What the keyframe policy is shown for `frame`: the parallax is taken
@@ -2346,6 +2361,9 @@ impl SlamSystem {
             ),
             _ => None,
         };
+        if let Some(edge) = &imu_edge {
+            self.note_tail_hold(&edge.raw_samples, timestamp_sec);
+        }
         let KeyframeInsertion {
             insertion,
             close_points: n_close,

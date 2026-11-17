@@ -7,7 +7,7 @@ use crate::mapping::map::{
 };
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
-use kornia_sensors::imu::PreintegratedImu;
+use kornia_sensors::imu::{PreintegratedImu, SampleInterpolation};
 use std::collections::HashSet;
 
 #[test]
@@ -546,6 +546,7 @@ fn an_invalid_imu_edge_rejects_the_batch() {
         t0,
         t1,
         bias_walk_extra_s: 0.0,
+        interpolation: SampleInterpolation::Hold,
     };
     let mut request = MapInsertion {
         keyframes: vec![detached(1, 1)],
@@ -730,6 +731,7 @@ fn a_duplicate_imu_edge_within_one_batch_is_refused() {
         t0: 0.0,
         t1: 1.0,
         bias_walk_extra_s: 0.0,
+        interpolation: SampleInterpolation::Hold,
     };
     let before = map.state_fingerprint_for_test();
 

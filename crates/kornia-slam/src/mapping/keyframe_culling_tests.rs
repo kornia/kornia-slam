@@ -11,7 +11,9 @@ use kornia_algebra::Mat3F64;
 use kornia_algebra::Vec3F64;
 use kornia_factors::inertial::stationary::StationaryFactor;
 use kornia_factors::wheel_odometry::{WheelOdomFactor, WheelOdomMeasurement};
-use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
+use kornia_sensors::imu::{
+    ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu, SampleInterpolation,
+};
 use kornia_sensors::wheel::PlanarMotion;
 
 /// Frame ids of the keyframe fixture: non-contiguous so ids and slots differ.
@@ -307,6 +309,7 @@ fn imu_edge(slot: usize) -> ImuFactor {
         t0,
         t1,
         bias_walk_extra_s: 0.0,
+        interpolation: SampleInterpolation::Hold,
     }
 }
 
@@ -603,6 +606,7 @@ fn imu_edge_between(from: usize, to: usize, t0: f64, span_s: f64) -> ImuFactor {
         t0,
         t1,
         bias_walk_extra_s: 0.0,
+        interpolation: SampleInterpolation::Hold,
     }
 }
 

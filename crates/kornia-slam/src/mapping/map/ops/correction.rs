@@ -1582,7 +1582,7 @@ mod validation_tests {
         ImuFactor, Keyframe, LandmarkSeed, MapInsertion, ObservationKey, tests::test_frame,
     };
     use kornia_algebra::{Mat3F64, SO3F64};
-    use kornia_sensors::imu::{ImuCalib, PreintegratedImu};
+    use kornia_sensors::imu::{ImuCalib, PreintegratedImu, SampleInterpolation};
 
     fn seeded(kf: usize, feature: usize, position: Vec3F64) -> LandmarkSeed {
         LandmarkSeed {
@@ -1627,6 +1627,7 @@ mod validation_tests {
             t0: 0.0,
             t1: 0.1,
             bias_walk_extra_s: 0.0,
+            interpolation: SampleInterpolation::Hold,
         }
     }
 

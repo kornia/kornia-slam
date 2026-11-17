@@ -2,7 +2,9 @@ use super::*;
 use crate::mapping::map::tests::test_frame;
 use crate::mapping::map::{BaOutcome, ImuFactor, LandmarkSeed, MapInsertion, ObservationKey};
 use kornia_algebra::{Mat3F64, SO3F64};
-use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
+use kornia_sensors::imu::{
+    ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu, SampleInterpolation,
+};
 
 const KF_IDS: [usize; 5] = [80, 10, 90, 30, 120];
 
@@ -361,6 +363,7 @@ fn imu_edge(prev: usize, curr: usize) -> ImuFactor {
         t0: 0.0,
         t1: 0.1,
         bias_walk_extra_s: 0.0,
+        interpolation: SampleInterpolation::Hold,
     }
 }
 

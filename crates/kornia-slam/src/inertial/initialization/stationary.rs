@@ -38,7 +38,7 @@
 
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
-use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuMeasurement};
+use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuMeasurement, SampleInterpolation};
 
 use super::{ImuInitResult, ImuInitializer, in_window, window_is_mono};
 use crate::mapping::map::{Keyframe, Map};
@@ -391,6 +391,7 @@ mod tests {
                         t0,
                         t1,
                         bias_walk_extra_s: 0.0,
+                        interpolation: SampleInterpolation::Hold,
                     }],
                     ..Default::default()
                 })

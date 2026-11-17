@@ -19,7 +19,9 @@ use std::collections::VecDeque;
 use crate::mapping::Map;
 use crate::mapping::map::{ImuFactor, InertialAlignmentError};
 use kornia_algebra::Vec3F64;
-use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
+use kornia_sensors::imu::{
+    GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu, SampleInterpolation,
+};
 
 /// Longest span of IMU samples kept while no keyframe prunes them, well beyond
 /// the gap between keyframes. Also how far ahead of the latest image a sample
@@ -38,6 +40,7 @@ pub(crate) struct InertialState {
     pub(crate) initializer: ImuInitializer,
     pub(crate) schedule: InertialInitSchedule,
     pending_samples: VecDeque<ImuMeasurement>,
+    sample_interpolation: SampleInterpolation,
 }
 
 impl InertialState {
@@ -58,6 +61,15 @@ impl InertialState {
             }),
             schedule: InertialInitSchedule::default(),
             pending_samples: VecDeque::new(),
+            sample_interpolation: SampleInterpolation::Hold,
+        }
+    }
+
+    /// [`Self::new`] integrating its windows with `interpolation`.
+    pub(crate) fn with_sample_interpolation(interpolation: SampleInterpolation) -> Self {
+        Self {
+            sample_interpolation: interpolation,
+            ..Self::new()
         }
     }
 
@@ -107,13 +119,35 @@ impl InertialState {
         t0: f64,
         t1: f64,
     ) -> (PreintegratedImu, Vec<ImuMeasurement>) {
-        let samples: Vec<ImuMeasurement> = self
-            .pending_samples
-            .iter()
-            .filter(|m| m.timestamp >= t0 && m.timestamp <= t1)
-            .copied()
-            .collect();
-        let pre = PreintegratedImu::from_measurements(self.bias, noise, &samples, t0, t1);
+        let samples: Vec<ImuMeasurement> = match self.sample_interpolation {
+            SampleInterpolation::Hold => self
+                .pending_samples
+                .iter()
+                .filter(|m| m.timestamp >= t0 && m.timestamp <= t1)
+                .copied()
+                .collect(),
+            // The samples bracketing the window interpolate its ends.
+            SampleInterpolation::Midpoint => {
+                let start = self
+                    .pending_samples
+                    .partition_point(|m| m.timestamp < t0)
+                    .saturating_sub(1);
+                let end = (self.pending_samples.partition_point(|m| m.timestamp <= t1) + 1)
+                    .min(self.pending_samples.len());
+                self.pending_samples
+                    .range(start..end.max(start))
+                    .copied()
+                    .collect()
+            }
+        };
+        let pre = PreintegratedImu::from_measurements_with(
+            self.bias,
+            noise,
+            &samples,
+            t0,
+            t1,
+            self.sample_interpolation,
+        );
         (pre, samples)
     }
 
@@ -146,13 +180,25 @@ impl InertialState {
             t0,
             t1,
             bias_walk_extra_s: 0.0,
+            interpolation: self.sample_interpolation,
         })
     }
 
     /// Drops buffered samples strictly older than `timestamp` (typically the
     /// last keyframe: the next edge and all per-frame windows start there).
+    /// Under `Midpoint` the newest of them stays: it interpolates the start
+    /// of those windows.
     pub(crate) fn prune_before(&mut self, timestamp: f64) {
-        self.pending_samples.retain(|m| m.timestamp >= timestamp);
+        let keep_from = match self.sample_interpolation {
+            SampleInterpolation::Hold => timestamp,
+            SampleInterpolation::Midpoint => self
+                .pending_samples
+                .iter()
+                .rev()
+                .find(|m| m.timestamp < timestamp)
+                .map_or(timestamp, |m| m.timestamp),
+        };
+        self.pending_samples.retain(|m| m.timestamp >= keep_from);
     }
 
     /// Applies an initialization to the map, taking the new bias and gravity

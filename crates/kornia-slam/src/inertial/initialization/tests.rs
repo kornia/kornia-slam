@@ -4,7 +4,7 @@ use crate::mapping::map::{ImuFactor, MapInsertion};
 use kornia_algebra::Mat3F64;
 use kornia_image::ImageSize;
 use kornia_imgproc::features::OrbFeatures;
-use kornia_sensors::imu::{ImuCalib, ImuMeasurement};
+use kornia_sensors::imu::{ImuCalib, ImuMeasurement, SampleInterpolation};
 
 const RADIUS: f64 = 2.0;
 const OMEGA: f64 = 0.5;
@@ -158,6 +158,7 @@ fn synth_map_with_calib(s_true: f64, r_arb: Mat3F64, calib: ImuCalib, omega: f64
                     t0: t - kf_dt,
                     t1: t,
                     bias_walk_extra_s: 0.0,
+                    interpolation: SampleInterpolation::Hold,
                 }],
                 ..Default::default()
             })
@@ -355,6 +356,7 @@ fn recovers_scale_bias_gravity_from_synthetic_trajectory() {
                     t0: t - kf_dt,
                     t1: t,
                     bias_walk_extra_s: 0.0,
+                    interpolation: SampleInterpolation::Hold,
                 }],
                 ..Default::default()
             })
