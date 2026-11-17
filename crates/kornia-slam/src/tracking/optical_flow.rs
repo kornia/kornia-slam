@@ -1238,6 +1238,7 @@ mod tests {
                 camera: 0,
                 shard: 0,
             }],
+            ..TrackSet::default()
         };
 
         tracks
@@ -1677,6 +1678,7 @@ mod tests {
                     shard: 0,
                 },
             ],
+            ..TrackSet::default()
         };
         let survivors = [
             FlowSurvivor {
