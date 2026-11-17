@@ -97,11 +97,17 @@ pub fn select_local_map_points(
 /// Keeps the points of `points` observed by a keyframe at or after
 /// `window_start_kf`; returns how many were removed.
 pub(crate) fn filter_to_window(
-    _map: &Map,
-    _points: &mut Vec<usize>,
-    _window_start_kf: usize,
+    map: &Map,
+    points: &mut Vec<usize>,
+    window_start_kf: usize,
 ) -> usize {
-    todo!("lane B: own-window local map")
+    let before = points.len();
+    points.retain(|&idx| {
+        map.map_points()
+            .get(idx)
+            .is_some_and(|mp| mp.observer_keyframes().any(|kf| kf >= window_start_kf))
+    });
+    before - points.len()
 }
 
 /// Indices of non-culled map points observed by the current keyframe, the
@@ -234,4 +240,98 @@ pub fn landmarks_in_frustum(
         }
     }
     visible
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Frame;
+    use crate::mapping::map::{LandmarkSeed, ObservationKey};
+    use kornia_imgproc::features::OrbFeatures;
+
+    fn keyframe(idx: usize, features: usize) -> Keyframe {
+        Keyframe::from_frame(Frame {
+            idx,
+            features: OrbFeatures {
+                keypoints_xy: vec![[320.0, 240.0]; features],
+                orientations: vec![0.0; features],
+                descriptors: (0..features).map(|i| [i as u8; 32]).collect(),
+                octaves: vec![0; features],
+            },
+            pose_world_to_cam: Pose3d::IDENTITY,
+            image_size: ImageSize {
+                width: 640,
+                height: 480,
+            },
+            keypoint_colors: vec![[0; 3]; features],
+            u_right: Vec::new(),
+            depth: Vec::new(),
+            keypoints_undist: Vec::new(),
+            rig: Default::default(),
+        })
+    }
+
+    /// Keyframes 0, 5 and 10. Landmarks 0 and 3 are seen by keyframe 0 only,
+    /// 1 by 0 and 5, 2 by 10 and 4 by 5.
+    fn segmented_map() -> Map {
+        let mut map = Map::new();
+        for idx in [0, 5, 10] {
+            map.insert_keyframe(keyframe(idx, 4)).unwrap();
+        }
+        for (keyframe_idx, feature_idx) in [(0, 0), (0, 1), (10, 0), (0, 2), (5, 1)] {
+            map.insert_landmark(LandmarkSeed {
+                position: kornia_algebra::Vec3F64::new(0.0, 0.0, 5.0),
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx,
+                    feature_idx,
+                },
+            })
+            .unwrap();
+        }
+        map.link_observation(5, 0, 1).unwrap();
+        map
+    }
+
+    #[test]
+    fn the_window_keeps_points_seen_inside_it() {
+        let map = segmented_map();
+        let mut points = vec![0, 1, 2, 3, 4];
+        assert_eq!(filter_to_window(&map, &mut points, 5), 2);
+        assert_eq!(points, [1, 2, 4]);
+        let mut points = vec![0, 1, 2, 3, 4];
+        assert_eq!(filter_to_window(&map, &mut points, 0), 0);
+        assert_eq!(filter_to_window(&map, &mut points, 11), 5);
+        assert!(points.is_empty());
+    }
+
+    #[test]
+    fn the_window_filters_the_whole_map_fallback_too() {
+        let map = segmented_map();
+        let config = LocalMapSelectionConfig::default();
+        let open = select_local_map_points(&map, &[], None, config);
+        assert_eq!(
+            open.points,
+            [0, 1, 2, 3, 4],
+            "fewer than 4 selected: whole map"
+        );
+        assert_eq!(open.dropped_by_window, 0);
+        assert_eq!(
+            open.points,
+            select_voted_points(&map, &[], None, config),
+            "no window, no change"
+        );
+
+        let windowed = select_local_map_points(
+            &map,
+            &[],
+            None,
+            LocalMapSelectionConfig {
+                window_start_kf: Some(5),
+                ..config
+            },
+        );
+        assert_eq!(windowed.points, [1, 2, 4]);
+        assert_eq!(windowed.dropped_by_window, 2);
+    }
 }

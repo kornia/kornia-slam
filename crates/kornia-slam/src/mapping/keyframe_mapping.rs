@@ -185,12 +185,16 @@ pub(crate) fn prepare_keyframe_growth(
 /// [`prepare_keyframe_growth`] for a re-seeded segment still inside its own
 /// window: both lists keep only keyframes at or after `window_start_kf`.
 pub(crate) fn prepare_seeded_window_growth(
-    _map: &Map,
-    _keyframe_idx: usize,
-    _rule: GrowthNeighbours,
-    _window_start_kf: usize,
+    map: &Map,
+    keyframe_idx: usize,
+    rule: GrowthNeighbours,
+    window_start_kf: usize,
 ) -> KeyframeGrowthPlan {
-    todo!("lane B: own-window growth")
+    let mut plan = prepare_keyframe_growth(map, keyframe_idx, rule);
+    plan.triangulation_neighbours
+        .retain(|&idx| idx >= window_start_kf);
+    plan.fusion_neighbours.retain(|&idx| idx >= window_start_kf);
+    plan
 }
 
 /// Grows the accepted keyframe against its captured neighbours, then fuses its
@@ -610,5 +614,32 @@ mod tests {
             before,
             "a pass with nothing to do changed the map"
         );
+    }
+
+    #[test]
+    fn a_seeded_window_grows_against_its_own_keyframes_only() {
+        let mut map = Map::new();
+        for idx in 0..13 {
+            map.insert_keyframe(Keyframe::from_frame(empty_frame(idx)))
+                .unwrap();
+        }
+        let open = prepare_keyframe_growth(&map, 13, GrowthNeighbours::RecentTen);
+        assert_eq!(
+            open.triangulation_neighbours,
+            (3..13).rev().collect::<Vec<_>>()
+        );
+
+        let plan = prepare_seeded_window_growth(&map, 13, GrowthNeighbours::RecentTen, 8);
+        let window: Vec<usize> = (8..13).rev().collect();
+        assert_eq!(plan.keyframe_idx, 13);
+        assert_eq!(plan.triangulation_neighbours, window);
+        assert_eq!(plan.fusion_neighbours, window);
+
+        let unbounded = prepare_seeded_window_growth(&map, 13, GrowthNeighbours::RecentTen, 0);
+        assert_eq!(
+            unbounded.triangulation_neighbours,
+            open.triangulation_neighbours
+        );
+        assert_eq!(unbounded.fusion_neighbours, open.fusion_neighbours);
     }
 }
