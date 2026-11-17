@@ -48,11 +48,20 @@ pub struct RigCamera {
 /// Ray through an undistorted pixel of `camera`, in the primary-camera frame:
 /// `(origin, unit direction)`, origin = `primary_from_camera.translation`.
 pub fn camera_ray(
-    _camera: &PinholeCamera,
-    _primary_from_camera: &Pose3d,
-    _pixel_undist: [f64; 2],
+    camera: &PinholeCamera,
+    primary_from_camera: &Pose3d,
+    pixel_undist: [f64; 2],
 ) -> (Vec3F64, Vec3F64) {
-    todo!("lane B: rig rays")
+    let [u, v] = pixel_undist;
+    let bearing = Vec3F64::new(
+        (u - camera.cx) / camera.fx,
+        (v - camera.cy) / camera.fy,
+        1.0,
+    );
+    (
+        primary_from_camera.translation,
+        primary_from_camera.rotation * bearing.normalize(),
+    )
 }
 
 impl RigCamera {
@@ -127,8 +136,13 @@ impl SensorRig {
 
     /// `T_BC` of rig camera `camera`: `camera_to_body ∘ primary_from_camera`.
     /// `None` without an IMU or past the last camera.
-    pub fn camera_to_body_of(&self, _camera: usize) -> Option<Pose3d> {
-        todo!("lane B: per-camera body extrinsic")
+    pub fn camera_to_body_of(&self, camera: usize) -> Option<Pose3d> {
+        let primary_to_body = self.camera_to_body()?;
+        if self.cameras.is_empty() {
+            return (camera == 0).then_some(primary_to_body);
+        }
+        let rig_camera = self.cameras.get(camera)?;
+        Some(primary_to_body.compose(&rig_camera.primary_from_camera))
     }
 
     /// Noise parameters to preintegrate with; the defaults for a rig without IMU
@@ -224,6 +238,75 @@ mod tests {
 
         let rig = rig.with_stereo_baseline(0.11);
         assert_eq!(rig.stereo_bf(), Some(rig.camera.fx * 0.11));
+    }
+
+    /// Camera 1 looks 70 deg to the side of the primary, 11 cm away.
+    fn yawed_rig() -> SensorRig {
+        let yaw = kornia_algebra::SO3F64::exp(Vec3F64::new(0.0, 70f64.to_radians(), 0.0)).matrix();
+        let size = ImageSize {
+            width: 640,
+            height: 480,
+        };
+        SensorRig::new(test_camera()).with_rig_cameras(vec![
+            RigCamera {
+                camera: test_camera(),
+                size,
+                primary_from_camera: Pose3d::IDENTITY,
+            },
+            RigCamera {
+                camera: test_camera(),
+                size,
+                primary_from_camera: Pose3d::new(yaw, Vec3F64::new(0.11, 0.0, 0.0)),
+            },
+        ])
+    }
+
+    #[test]
+    fn a_ray_projects_back_to_its_pixel() {
+        let rig = yawed_rig();
+        for rig_camera in &rig.cameras {
+            let camera_from_primary = rig_camera.primary_from_camera.inverse();
+            for i in 0..100 {
+                let pixel = [(i % 10) as f64 * 64.0 + 3.5, (i / 10) as f64 * 48.0 + 2.5];
+                let (origin, direction) = rig_camera.ray(pixel);
+                assert!((direction.length() - 1.0).abs() < 1e-12);
+                let p_camera = camera_from_primary.transform_point(&(origin + direction * 5.0));
+                let back = rig_camera.camera.project_to_pixel(&p_camera, 0.1).unwrap();
+                assert!(
+                    (back.x - pixel[0]).abs() < 1e-9 && (back.y - pixel[1]).abs() < 1e-9,
+                    "{pixel:?} came back as {back:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rays_of_one_camera_share_a_bit_equal_origin() {
+        let rig = yawed_rig();
+        assert_eq!(rig.cameras[0].ray([10.0, 20.0]).0, Vec3F64::ZERO);
+        let (a, _) = rig.cameras[1].ray([10.0, 20.0]);
+        let (b, _) = rig.cameras[1].ray([600.0, 400.0]);
+        assert_eq!(
+            a.to_array().map(f64::to_bits),
+            b.to_array().map(f64::to_bits)
+        );
+    }
+
+    #[test]
+    fn each_rig_camera_has_its_body_extrinsic() {
+        let camera_to_body = Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            Vec3F64::new(0.0, 0.02, -0.01),
+        );
+        let rig = yawed_rig().with_imu(camera_to_body);
+        assert_eq!(rig.camera_to_body_of(0), Some(camera_to_body));
+        let expected = camera_to_body.compose(&rig.cameras[1].primary_from_camera);
+        assert_eq!(rig.camera_to_body_of(1), Some(expected));
+        assert!(rig.camera_to_body_of(2).is_none());
+        assert!(yawed_rig().camera_to_body_of(0).is_none());
+        let mono = SensorRig::new(test_camera()).with_imu(camera_to_body);
+        assert_eq!(mono.camera_to_body_of(0), Some(camera_to_body));
+        assert!(mono.camera_to_body_of(1).is_none());
     }
 
     #[test]
