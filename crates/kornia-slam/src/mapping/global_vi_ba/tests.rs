@@ -11,22 +11,34 @@ const FX: f64 = 400.0;
 const CX: f64 = 320.0;
 const CY: f64 = 240.0;
 const GRAVITY: [f64; 3] = [0.0, 9.81, 0.0];
-/// Start velocity (m/s) and constant acceleration (m/s²) of the synthetic
-/// walk, which never rotates; the acceleration makes the scale observable.
+/// Start velocity (m/s) of the synthetic walk, which never rotates, and its
+/// acceleration `A + W sin(ω t)` (m/s², rad/s). A constant acceleration alone
+/// would leave scale, roll and pitch to the free accel bias: `b_a = (1 - s) A`
+/// fits a world scaled by `s` exactly. The varying part makes them observable.
 const VELOCITY: [f64; 3] = [0.5, 0.0, 0.0];
 const ACCELERATION: [f64; 3] = [0.4, 0.0, 0.2];
+const WOBBLE: [f64; 3] = [0.3, 0.2, -0.3];
+const WOBBLE_RAD_S: f64 = 3.0;
 
 fn body_position(t: f64) -> Vec3F64 {
-    Vec3F64::from_array(VELOCITY) * t + Vec3F64::from_array(ACCELERATION) * (0.5 * t * t)
+    let w = WOBBLE_RAD_S;
+    Vec3F64::from_array(VELOCITY) * t
+        + Vec3F64::from_array(ACCELERATION) * (0.5 * t * t)
+        + Vec3F64::from_array(WOBBLE) * (t / w - (w * t).sin() / (w * w))
 }
 
 fn body_velocity(t: f64) -> [f64; 3] {
-    (Vec3F64::from_array(VELOCITY) + Vec3F64::from_array(ACCELERATION) * t).to_array()
+    let w = WOBBLE_RAD_S;
+    (Vec3F64::from_array(VELOCITY)
+        + Vec3F64::from_array(ACCELERATION) * t
+        + Vec3F64::from_array(WOBBLE) * ((1.0 - (w * t).cos()) / w))
+        .to_array()
 }
 
 /// A camera at the IMU accelerating past a wall of landmarks, with exact
-/// pixels and an exact IMU stream (specific force `a - g`, no rotation). `offset` moves the dumped landmarks and every
-/// keyframe but the first off the truth.
+/// pixels and an exact IMU stream (specific force `a - g`, no rotation).
+/// `offset` moves the dumped landmarks and every keyframe but the first off
+/// the truth.
 fn synthetic_session(offset: f64) -> SessionDump {
     let landmarks: Vec<Vec3F64> = (0..5)
         .flat_map(|i| (0..3).flat_map(move |j| (0..2).map(move |k| (i, j, k))))
@@ -71,15 +83,23 @@ fn synthetic_session(offset: f64) -> SessionDump {
             }
         })
         .collect();
+    // Each sample holds over the interval before it, so it carries that
+    // interval's mean acceleration and the preintegrated `Δv` stays exact.
+    const DT: f64 = 0.005;
     let imu = (0..=400)
-        .map(|i| ImuSample {
-            t: i as f64 * 0.005,
-            gyro: [0.0; 3],
-            accel: [
-                ACCELERATION[0] - GRAVITY[0],
-                ACCELERATION[1] - GRAVITY[1],
-                ACCELERATION[2] - GRAVITY[2],
-            ],
+        .map(|i| {
+            let t = i as f64 * DT;
+            let mean = if i == 0 {
+                Vec3F64::from_array(ACCELERATION)
+            } else {
+                (Vec3F64::from_array(body_velocity(t)) - Vec3F64::from_array(body_velocity(t - DT)))
+                    * (1.0 / DT)
+            };
+            ImuSample {
+                t,
+                gyro: [0.0; 3],
+                accel: (mean - Vec3F64::from_array(GRAVITY)).to_array(),
+            }
         })
         .collect();
     let identity = SessionPose::from_pose(&Pose3d::IDENTITY);
