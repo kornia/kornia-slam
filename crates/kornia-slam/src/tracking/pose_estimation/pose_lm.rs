@@ -12,249 +12,133 @@
 #![allow(clippy::needless_range_loop)]
 
 use kornia_3d::pnp::LMRefineParams;
-use kornia_3d::ransac::RobustKernelKind;
-use kornia_algebra::{Mat3AF32, SO3F32, Vec2F32, Vec3AF32};
+use kornia_3d::ransac::{RobustKernel, RobustKernelKind};
+use kornia_algebra::{
+    Mat3AF32, Mat3F64, Mat6F64, SO3F32, SO3F64, Vec2F32, Vec3AF32, Vec3F64, Vec6F64,
+};
+
+use crate::pose_conversion::{mat3_to_f32, mat3_to_f64, vec3_to_f32, vec3_to_f64};
 
 const LAMBDA_FACTOR: f64 = 10.0;
 const LAMBDA_MIN: f64 = 1e-10;
 const LAMBDA_MAX: f64 = 1e10;
 const STEP_TOLERANCE: f64 = 1e-6;
 
-/// Robust cost of one squared residual norm, and its IRLS weight.
-#[derive(Clone, Copy)]
-enum Loss {
-    L2,
-    Huber { delta: f64 },
-}
-
-impl Loss {
-    /// The loss `params` selects, or `None` for one this solver does not
-    /// implement.
-    fn from_params(params: &LMRefineParams) -> Option<Self> {
-        if params.robust == RobustKernelKind::Identity || !params.robust_scale_sq.is_finite() {
-            return Some(Self::L2);
-        }
-        match params.robust {
-            RobustKernelKind::Huber if params.robust_scale_sq > 0.0 => Some(Self::Huber {
-                delta: (params.robust_scale_sq as f64).sqrt(),
-            }),
-            _ => None,
-        }
+/// The robust kernel and squared scale `params` select, or `None` for a kernel
+/// this solver does not implement.
+fn kernel_from_params(params: &LMRefineParams) -> Option<(RobustKernelKind, f64)> {
+    if params.robust == RobustKernelKind::Identity || !params.robust_scale_sq.is_finite() {
+        return Some((RobustKernelKind::Identity, 0.0));
     }
-
-    fn rho(self, squared: f64) -> f64 {
-        match self {
-            Self::L2 => squared,
-            Self::Huber { delta } => {
-                let s = squared.sqrt();
-                if s <= delta {
-                    squared
-                } else {
-                    2.0 * delta * s - delta * delta
-                }
-            }
+    match params.robust {
+        RobustKernelKind::Huber if params.robust_scale_sq > 0.0 => {
+            Some((RobustKernelKind::Huber, f64::from(params.robust_scale_sq)))
         }
-    }
-
-    fn weight(self, squared: f64) -> f64 {
-        match self {
-            Self::L2 => 1.0,
-            Self::Huber { delta } => {
-                if squared <= delta * delta {
-                    1.0
-                } else {
-                    delta / squared.sqrt()
-                }
-            }
-        }
+        _ => None,
     }
 }
 
 #[derive(Clone, Copy)]
 struct Pose {
-    r: [[f64; 3]; 3],
-    t: [f64; 3],
+    r: Mat3F64,
+    t: Vec3F64,
 }
 
 impl Pose {
-    fn transform(&self, p: [f64; 3]) -> [f64; 3] {
-        let r = &self.r;
-        [
-            r[0][0] * p[0] + r[0][1] * p[1] + r[0][2] * p[2] + self.t[0],
-            r[1][0] * p[0] + r[1][1] * p[1] + r[1][2] * p[2] + self.t[1],
-            r[2][0] * p[0] + r[2][1] * p[1] + r[2][2] * p[2] + self.t[2],
-        ]
+    fn transform(&self, p: Vec3F64) -> Vec3F64 {
+        self.r * p + self.t
     }
 
     /// `self * exp(delta)` with `delta = (upsilon, omega)`: kornia's SE3
     /// `retract`, so the damped steps follow the generic solver's path.
-    fn right_update(&self, delta: &[f64; 6]) -> Self {
-        let (e, v) = se3_exp_parts([delta[3], delta[4], delta[5]]);
-        let vu: [f64; 3] = std::array::from_fn(|i| (0..3).map(|k| v[i][k] * delta[k]).sum());
-        let mut r = [[0.0; 3]; 3];
-        let mut t = self.t;
-        for i in 0..3 {
-            for j in 0..3 {
-                r[i][j] = (0..3).map(|k| self.r[i][k] * e[k][j]).sum();
-            }
-            t[i] += (0..3).map(|k| self.r[i][k] * vu[k]).sum::<f64>();
-        }
-        Self { r, t }
-    }
-}
-
-/// `(Exp(w), V(w))` of the SE3 exponential, `t = V(w) upsilon`.
-fn se3_exp_parts(w: [f64; 3]) -> ([[f64; 3]; 3], [[f64; 3]; 3]) {
-    let theta2 = w[0] * w[0] + w[1] * w[1] + w[2] * w[2];
-    let (b, c) = if theta2 < 1e-12 {
-        (0.5 - theta2 / 24.0, 1.0 / 6.0 - theta2 / 120.0)
-    } else {
-        let theta = theta2.sqrt();
-        (
-            (1.0 - theta.cos()) / theta2,
-            (theta - theta.sin()) / (theta2 * theta),
-        )
-    };
-    let k = [[0.0, -w[2], w[1]], [w[2], 0.0, -w[0]], [-w[1], w[0], 0.0]];
-    let mut v = [[0.0; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            let kk: f64 = (0..3).map(|l| k[i][l] * k[l][j]).sum();
-            v[i][j] = f64::from(u8::from(i == j)) + b * k[i][j] + c * kk;
+    fn right_update(&self, delta: &Vec6F64) -> Self {
+        let upsilon = Vec3F64::new(delta[0], delta[1], delta[2]);
+        let omega = Vec3F64::new(delta[3], delta[4], delta[5]);
+        Self {
+            r: self.r * SO3F64::exp(omega).matrix(),
+            t: self.t + self.r * (SO3F64::left_jacobian(omega) * upsilon),
         }
     }
-    (so3_exp(w), v)
-}
-
-fn so3_exp(w: [f64; 3]) -> [[f64; 3]; 3] {
-    let theta2 = w[0] * w[0] + w[1] * w[1] + w[2] * w[2];
-    let (a, b) = if theta2 < 1e-12 {
-        (1.0 - theta2 / 6.0, 0.5 - theta2 / 24.0)
-    } else {
-        let theta = theta2.sqrt();
-        (theta.sin() / theta, (1.0 - theta.cos()) / theta2)
-    };
-    let k = [[0.0, -w[2], w[1]], [w[2], 0.0, -w[0]], [-w[1], w[0], 0.0]];
-    let mut m = [[0.0; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            let kk: f64 = (0..3).map(|l| k[i][l] * k[l][j]).sum();
-            m[i][j] = f64::from(u8::from(i == j)) + a * k[i][j] + b * kk;
-        }
-    }
-    m
 }
 
 struct Problem<'a> {
-    points: &'a [[f64; 3]],
+    points: &'a [Vec3F64],
     pixels: &'a [[f64; 2]],
     fx: f64,
     fy: f64,
     cx: f64,
     cy: f64,
-    loss: Loss,
+    kernel: (RobustKernelKind, f64),
 }
 
 impl Problem<'_> {
     /// Robust cost at `pose`; `None` when a point is not in front of the
     /// camera, which the generic solver treats as an infeasible step.
     fn cost(&self, pose: &Pose) -> Option<f64> {
+        let (kernel, c_sq) = self.kernel;
         let mut total = 0.0;
         for (p, uv) in self.points.iter().zip(self.pixels) {
             let pc = pose.transform(*p);
-            if pc[2] <= 0.0 {
+            if pc.z <= 0.0 {
                 return None;
             }
-            let ru = self.fx * pc[0] / pc[2] + self.cx - uv[0];
-            let rv = self.fy * pc[1] / pc[2] + self.cy - uv[1];
-            total += self.loss.rho(ru * ru + rv * rv);
+            let ru = self.fx * pc.x / pc.z + self.cx - uv[0];
+            let rv = self.fy * pc.y / pc.z + self.cy - uv[1];
+            total += kernel.rho(ru * ru + rv * rv, c_sq);
         }
         Some(total)
     }
 
     /// Weighted normal equations `(J^T W J, J^T W r)` at `pose`.
-    fn normal_equations(&self, pose: &Pose) -> ([[f64; 6]; 6], [f64; 6]) {
-        let mut h = [[0.0; 6]; 6];
-        let mut g = [0.0; 6];
+    fn normal_equations(&self, pose: &Pose) -> (Mat6F64, Vec6F64) {
+        let (kernel, c_sq) = self.kernel;
+        let mut h = Mat6F64::zeros();
+        let mut g = Vec6F64::zeros();
         for (p, uv) in self.points.iter().zip(self.pixels) {
-            let [x, y, z] = pose.transform(*p);
-            let iz = 1.0 / z;
+            let pc = pose.transform(*p);
+            let iz = 1.0 / pc.z;
             let r = [
-                self.fx * x * iz + self.cx - uv[0],
-                self.fy * y * iz + self.cy - uv[1],
+                self.fx * pc.x * iz + self.cx - uv[0],
+                self.fy * pc.y * iz + self.cy - uv[1],
             ];
-            let w = self.loss.weight(r[0] * r[0] + r[1] * r[1]);
+            let w = kernel.weight(r[0] * r[0] + r[1] * r[1], c_sq);
             // d(pixel)/d(p_c) [R | -R [p]x] for p_c = R exp(delta) p + t.
             let jpi = [
-                [self.fx * iz, 0.0, -self.fx * x * iz * iz],
-                [0.0, self.fy * iz, -self.fy * y * iz * iz],
+                Vec3F64::new(self.fx * iz, 0.0, -self.fx * pc.x * iz * iz),
+                Vec3F64::new(0.0, self.fy * iz, -self.fy * pc.y * iz * iz),
             ];
-            let rows = jpi.map(|row| -> [f64; 3] {
-                std::array::from_fn(|k| (0..3).map(|l| row[l] * pose.r[l][k]).sum())
-            });
-            let [px, py, pz] = *p;
-            let jac = rows.map(|a| {
-                [
-                    a[0],
-                    a[1],
-                    a[2],
-                    -(a[1] * pz - a[2] * py),
-                    -(a[2] * px - a[0] * pz),
-                    -(a[0] * py - a[1] * px),
-                ]
+            let jac = jpi.map(|row| {
+                let a = pose.r.transpose() * row;
+                let b = p.cross(a);
+                [a.x, a.y, a.z, b.x, b.y, b.z]
             });
             let (ju, jv) = (jac[0], jac[1]);
             for i in 0..6 {
                 g[i] += w * (ju[i] * r[0] + jv[i] * r[1]);
                 for j in i..6 {
-                    h[i][j] += w * (ju[i] * ju[j] + jv[i] * jv[j]);
+                    h[(i, j)] += w * (ju[i] * ju[j] + jv[i] * jv[j]);
                 }
             }
         }
         for i in 0..6 {
             for j in 0..i {
-                h[i][j] = h[j][i];
+                h[(i, j)] = h[(j, i)];
             }
         }
         (h, g)
     }
 }
 
-/// Solves `a x = b` for a symmetric positive-definite 6x6 `a` (Cholesky).
-fn solve6(a: &[[f64; 6]; 6], b: &[f64; 6]) -> Option<[f64; 6]> {
-    let mut l = [[0.0; 6]; 6];
-    for i in 0..6 {
-        for j in 0..=i {
-            let s: f64 = (0..j).map(|k| l[i][k] * l[j][k]).sum();
-            if i == j {
-                let d = a[i][i] - s;
-                if d <= 0.0 || !d.is_finite() {
-                    return None;
-                }
-                l[i][i] = d.sqrt();
-            } else {
-                l[i][j] = (a[i][j] - s) / l[j][j];
-            }
-        }
-    }
-    let mut y = [0.0; 6];
-    for i in 0..6 {
-        y[i] = (b[i] - (0..i).map(|k| l[i][k] * y[k]).sum::<f64>()) / l[i][i];
-    }
-    let mut x = [0.0; 6];
-    for i in (0..6).rev() {
-        x[i] = (y[i] - (i + 1..6).map(|k| l[k][i] * x[k]).sum::<f64>()) / l[i][i];
-    }
-    Some(x)
-}
-
-fn norm(v: &[f64; 6]) -> f64 {
-    v.iter().map(|x| x * x).sum::<f64>().sqrt()
+/// The damped Gauss-Newton step `-(H + lambda I)^-1 g`; `None` when the damped
+/// system is not positive definite or the step is not finite.
+fn damped_step(h: &Mat6F64, g: &Vec6F64, lambda: f64) -> Option<Vec6F64> {
+    let step = (h + Mat6F64::identity() * lambda).cholesky()?.solve(&(-g));
+    step.iter().all(|v| v.is_finite()).then_some(step)
 }
 
 /// Whether [`refine_pose`] implements `params`' robust kernel.
 pub(crate) fn supports(params: &LMRefineParams) -> bool {
-    Loss::from_params(params).is_some()
+    kernel_from_params(params).is_some()
 }
 
 /// A refined pose and whether a tolerance, not the iteration cap, ended it.
@@ -276,14 +160,11 @@ pub(crate) fn refine_pose(
     translation: &Vec3AF32,
     params: &LMRefineParams,
 ) -> Option<Refined> {
-    let loss = Loss::from_params(params)?;
+    let kernel = kernel_from_params(params)?;
     if points_world.len() != points_image.len() || points_world.len() < 3 {
         return None;
     }
-    let points: Vec<[f64; 3]> = points_world
-        .iter()
-        .map(|p| [p.x as f64, p.y as f64, p.z as f64])
-        .collect();
+    let points: Vec<Vec3F64> = points_world.iter().map(|p| vec3_to_f64(*p)).collect();
     let pixels: Vec<[f64; 2]> = points_image
         .iter()
         .map(|p| [p.x as f64, p.y as f64])
@@ -295,36 +176,28 @@ pub(crate) fn refine_pose(
         fy: k.y_axis().y as f64,
         cx: k.z_axis().x as f64,
         cy: k.z_axis().y as f64,
-        loss,
+        kernel,
     };
     // The generic solver starts from the start rotation's unit quaternion,
     // which projects a not-quite-orthonormal prediction back onto SO(3).
     // The quaternion of a scaled matrix is not unit: normalize it, or the
     // scale survives into the result and compounds through the motion model.
     let rotation = SO3F32::from_quaternion(SO3F32::from_matrix(rotation).q.normalize()).matrix();
-    let columns = [rotation.x_axis(), rotation.y_axis(), rotation.z_axis()].map(|c| c.to_array());
     let mut pose = Pose {
-        r: std::array::from_fn(|i| std::array::from_fn(|j| columns[j][i] as f64)),
-        t: [
-            translation.x as f64,
-            translation.y as f64,
-            translation.z as f64,
-        ],
+        r: mat3_to_f64(rotation),
+        t: vec3_to_f64(*translation),
     };
     let mut cost = problem.cost(&pose)?;
     let mut lambda = params.initial_lambda as f64;
     let mut converged = false;
     for _ in 0..params.max_iterations {
-        let (mut h, g) = problem.normal_equations(&pose);
-        if norm(&g) < params.gradient_tolerance as f64 {
+        let (h, g) = problem.normal_equations(&pose);
+        if g.norm() < params.gradient_tolerance as f64 {
             converged = true;
             break;
         }
-        for (i, row) in h.iter_mut().enumerate() {
-            row[i] += lambda;
-        }
-        let delta = solve6(&h, &g.map(|v| -v))?;
-        if norm(&delta) < STEP_TOLERANCE {
+        let delta = damped_step(&h, &g, lambda)?;
+        if delta.norm() < STEP_TOLERANCE {
             converged = true;
             break;
         }
@@ -354,16 +227,9 @@ pub(crate) fn refine_pose(
             }
         }
     }
-    let r = pose.r;
-    let rotation = Mat3AF32::from_cols(
-        Vec3AF32::new(r[0][0] as f32, r[1][0] as f32, r[2][0] as f32),
-        Vec3AF32::new(r[0][1] as f32, r[1][1] as f32, r[2][1] as f32),
-        Vec3AF32::new(r[0][2] as f32, r[1][2] as f32, r[2][2] as f32),
-    );
-    let translation = Vec3AF32::new(pose.t[0] as f32, pose.t[1] as f32, pose.t[2] as f32);
     Some(Refined {
-        rotation,
-        translation,
+        rotation: mat3_to_f32(pose.r),
+        translation: vec3_to_f32(pose.t),
         converged,
     })
 }
@@ -373,6 +239,93 @@ mod tests {
     use super::*;
     use kornia_3d::pnp::refine_pose_lm;
 
+    /// Test-only oracles: the local bodies the kornia-rs calls replaced (P4 and P6 of
+    /// `experiments/pr180-review-swaps-plan.md`).
+    mod oracle {
+        fn skew(w: [f64; 3]) -> [[f64; 3]; 3] {
+            [[0.0, -w[2], w[1]], [w[2], 0.0, -w[0]], [-w[1], w[0], 0.0]]
+        }
+
+        fn identity_plus(a: f64, b: f64, w: [f64; 3]) -> [[f64; 3]; 3] {
+            let k = skew(w);
+            std::array::from_fn(|i| {
+                std::array::from_fn(|j| {
+                    let kk: f64 = (0..3).map(|l| k[i][l] * k[l][j]).sum();
+                    f64::from(u8::from(i == j)) + a * k[i][j] + b * kk
+                })
+            })
+        }
+
+        pub fn so3_exp(w: [f64; 3]) -> [[f64; 3]; 3] {
+            let theta2 = w[0] * w[0] + w[1] * w[1] + w[2] * w[2];
+            let (a, b) = if theta2 < 1e-12 {
+                (1.0 - theta2 / 6.0, 0.5 - theta2 / 24.0)
+            } else {
+                let theta = theta2.sqrt();
+                (theta.sin() / theta, (1.0 - theta.cos()) / theta2)
+            };
+            identity_plus(a, b, w)
+        }
+
+        /// `V(w)` of the SE3 exponential, `t = V(w) upsilon`.
+        pub fn se3_v(w: [f64; 3]) -> [[f64; 3]; 3] {
+            let theta2 = w[0] * w[0] + w[1] * w[1] + w[2] * w[2];
+            let (b, c) = if theta2 < 1e-12 {
+                (0.5 - theta2 / 24.0, 1.0 / 6.0 - theta2 / 120.0)
+            } else {
+                let theta = theta2.sqrt();
+                (
+                    (1.0 - theta.cos()) / theta2,
+                    (theta - theta.sin()) / (theta2 * theta),
+                )
+            };
+            identity_plus(b, c, w)
+        }
+
+        /// Solves `a x = b` for a symmetric positive-definite 6x6 `a` (Cholesky).
+        pub fn solve6(a: &[[f64; 6]; 6], b: &[f64; 6]) -> Option<[f64; 6]> {
+            let mut l = [[0.0; 6]; 6];
+            for i in 0..6 {
+                for j in 0..=i {
+                    let s: f64 = (0..j).map(|k| l[i][k] * l[j][k]).sum();
+                    if i == j {
+                        let d = a[i][i] - s;
+                        if d <= 0.0 || !d.is_finite() {
+                            return None;
+                        }
+                        l[i][i] = d.sqrt();
+                    } else {
+                        l[i][j] = (a[i][j] - s) / l[j][j];
+                    }
+                }
+            }
+            let mut y = [0.0; 6];
+            for i in 0..6 {
+                y[i] = (b[i] - (0..i).map(|k| l[i][k] * y[k]).sum::<f64>()) / l[i][i];
+            }
+            let mut x = [0.0; 6];
+            for i in (0..6).rev() {
+                x[i] = (y[i] - (i + 1..6).map(|k| l[k][i] * x[k]).sum::<f64>()) / l[i][i];
+            }
+            Some(x)
+        }
+    }
+
+    /// Row `i`, column `j` of `m`.
+    fn at(m: &Mat3F64, i: usize, j: usize) -> f64 {
+        m.to_cols_array()[3 * j + i]
+    }
+
+    fn max_abs_difference(m: &Mat3F64, oracle: &[[f64; 3]; 3]) -> f64 {
+        (0..9)
+            .map(|n| (at(m, n / 3, n % 3) - oracle[n / 3][n % 3]).abs())
+            .fold(0.0, f64::max)
+    }
+
+    fn rotation(w: [f64; 3]) -> Mat3F64 {
+        SO3F64::exp(Vec3F64::from_array(w)).matrix()
+    }
+
     fn scene(outlier: bool) -> (Vec<Vec3AF32>, Vec<Vec2F32>, Mat3AF32, Pose) {
         let k = Mat3AF32::from_cols(
             Vec3AF32::new(450.0, 0.0, 0.0),
@@ -380,27 +333,27 @@ mod tests {
             Vec3AF32::new(376.0, 240.0, 1.0),
         );
         let truth = Pose {
-            r: so3_exp([0.02, -0.03, 0.01]),
-            t: [0.05, -0.02, 0.1],
+            r: rotation([0.02, -0.03, 0.01]),
+            t: Vec3F64::new(0.05, -0.02, 0.1),
         };
         let mut world = Vec::new();
         let mut image = Vec::new();
         for i in 0..60 {
-            let p = [
+            let p = Vec3F64::new(
                 ((i * 37) % 17) as f64 * 0.1 - 0.8,
                 ((i * 11) % 13) as f64 * 0.08 - 0.5,
                 1.0 + ((i * 7) % 5) as f64 * 0.3,
-            ];
+            );
             let pc = truth.transform(p);
-            let u = 450.0 * pc[0] / pc[2] + 376.0;
-            let v = 450.0 * pc[1] / pc[2] + 240.0;
+            let u = 450.0 * pc.x / pc.z + 376.0;
+            let v = 450.0 * pc.y / pc.z + 240.0;
             // One gross outlier for the robust kernel to discount.
             let (du, dv) = if outlier && i == 5 {
                 (40.0, -30.0)
             } else {
                 (0.0, 0.0)
             };
-            world.push(Vec3AF32::new(p[0] as f32, p[1] as f32, p[2] as f32));
+            world.push(Vec3AF32::new(p.x as f32, p.y as f32, p.z as f32));
             image.push(Vec2F32::new((u + du) as f32, (v + dv) as f32));
         }
         (world, image, k, truth)
@@ -417,10 +370,10 @@ mod tests {
     #[test]
     fn the_jacobian_matches_central_differences() {
         let pose = Pose {
-            r: so3_exp([0.3, -0.2, 0.1]),
-            t: [0.2, -0.1, 0.5],
+            r: rotation([0.3, -0.2, 0.1]),
+            t: Vec3F64::new(0.2, -0.1, 0.5),
         };
-        let point = [[0.4, -0.3, 2.0]];
+        let point = [Vec3F64::new(0.4, -0.3, 2.0)];
         let pixel = [[100.0, 80.0]];
         let problem = Problem {
             points: &point,
@@ -429,20 +382,20 @@ mod tests {
             fy: 440.0,
             cx: 376.0,
             cy: 240.0,
-            loss: Loss::L2,
+            kernel: (RobustKernelKind::Identity, 0.0),
         };
         let residual = |pose: &Pose| {
             let pc = pose.transform(point[0]);
             [
-                450.0 * pc[0] / pc[2] + 376.0 - pixel[0][0],
-                440.0 * pc[1] / pc[2] + 240.0 - pixel[0][1],
+                450.0 * pc.x / pc.z + 376.0 - pixel[0][0],
+                440.0 * pc.y / pc.z + 240.0 - pixel[0][1],
             ]
         };
         let r0 = residual(&pose);
         let (h, g) = problem.normal_equations(&pose);
         // With one residual, g = J^T r and H = J^T J; recover J by differences.
         for k in 0..6 {
-            let mut d = [0.0; 6];
+            let mut d = Vec6F64::zeros();
             d[k] = 1e-6;
             let plus = residual(&pose.right_update(&d));
             d[k] = -1e-6;
@@ -456,9 +409,87 @@ mod tests {
             );
             let hkk = jk[0] * jk[0] + jk[1] * jk[1];
             assert!(
-                (hkk - h[k][k]).abs() < 1e-3 * (1.0 + hkk),
+                (hkk - h[(k, k)]).abs() < 1e-3 * (1.0 + hkk),
                 "h[{k}] {} vs {hkk}",
-                h[k][k]
+                h[(k, k)]
+            );
+        }
+    }
+
+    /// `Q diag(eigenvalues) Qᵀ` for a fixed orthogonal `Q`.
+    fn symmetric_with(eigenvalues: [f64; 6]) -> Mat6F64 {
+        let seed = Mat6F64::from_fn(|r, c| ((r * 5 + c * 11) as f64 * 0.29).cos());
+        let q = seed.qr().q();
+        q * Mat6F64::from_diagonal(&Vec6F64::from(eigenvalues)) * q.transpose()
+    }
+
+    fn rows(m: &Mat6F64) -> [[f64; 6]; 6] {
+        std::array::from_fn(|r| std::array::from_fn(|c| m[(r, c)]))
+    }
+
+    #[test]
+    fn the_cholesky_step_matches_the_local_solver() {
+        let g = Vec6F64::new(0.3, -1.2, 0.7, 2.0, -0.4, 0.9);
+        for kappa in [1.0f64, 1e2, 1e4] {
+            let h = symmetric_with(std::array::from_fn(|i| kappa.powf(i as f64 / 5.0)));
+            let new = damped_step(&h, &g, 0.0).unwrap();
+            let old = Vec6F64::from(oracle::solve6(&rows(&h), &(-g).into()).unwrap());
+            let relative = (new - old).norm() / old.norm();
+            assert!(relative <= 1e-12, "kappa {kappa}: {relative:e}");
+        }
+    }
+
+    #[test]
+    fn a_system_that_is_not_positive_definite_is_refused_by_both_solvers() {
+        let h = symmetric_with([1.0, 2.0, 3.0, 4.0, 5.0, -1.0]);
+        let g = Vec6F64::new(0.3, -1.2, 0.7, 2.0, -0.4, 0.9);
+        assert!(damped_step(&h, &g, 0.0).is_none());
+        assert!(oracle::solve6(&rows(&h), &(-g).into()).is_none());
+    }
+
+    #[test]
+    fn so3_exp_and_left_jacobian_match_the_local_bodies() {
+        let axis = Vec3F64::new(0.3, -0.2, 0.9).normalize();
+        for theta in [1e-7, 1e-5, 1e-3, 0.05, 0.5, 2.0, 3.0] {
+            let w = axis * theta;
+            let w_array = w.to_array();
+            let exp = SO3F64::exp(w).matrix();
+            let exp_error = max_abs_difference(&exp, &oracle::so3_exp(w_array));
+            assert!(exp_error <= 1e-15, "exp at {theta}: {exp_error:e}");
+            let jacobian = SO3F64::left_jacobian(w);
+            let jacobian_error = max_abs_difference(&jacobian, &oracle::se3_v(w_array));
+            let bound = 4e-16 / theta + 1e-15;
+            assert!(
+                jacobian_error <= bound,
+                "left Jacobian at {theta}: {jacobian_error:e} > {bound:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn huber_matches_the_local_loss() {
+        let (c_sq, delta) = (25.0f64, 5.0f64);
+        for squared in [0.0f64, 1.0, 24.9, 25.0, 25.1, 400.0, 1e6] {
+            let s = squared.sqrt();
+            let old_rho = if s <= delta {
+                squared
+            } else {
+                2.0 * delta * s - delta * delta
+            };
+            let old_weight = if squared <= delta * delta {
+                1.0
+            } else {
+                delta / s
+            };
+            let rho = RobustKernelKind::Huber.rho(squared, c_sq);
+            let weight = RobustKernelKind::Huber.weight(squared, c_sq);
+            assert!(
+                (rho - old_rho).abs() <= 1e-15 * old_rho.max(1.0),
+                "{squared}"
+            );
+            assert!(
+                (weight - old_weight).abs() <= 1e-15 * old_weight,
+                "{squared}"
             );
         }
     }
@@ -473,12 +504,12 @@ mod tests {
         for i in 0..3 {
             for j in 0..3 {
                 let col = [r.x_axis(), r.y_axis(), r.z_axis()][j].to_array();
-                assert!((col[i] as f64 - truth.r[i][j]).abs() < 1e-4);
+                assert!((col[i] as f64 - at(&truth.r, i, j)).abs() < 1e-4);
             }
         }
-        assert!((t.x as f64 - truth.t[0]).abs() < 1e-4);
-        assert!((t.y as f64 - truth.t[1]).abs() < 1e-4);
-        assert!((t.z as f64 - truth.t[2]).abs() < 1e-4);
+        assert!((t.x as f64 - truth.t.x).abs() < 1e-4);
+        assert!((t.y as f64 - truth.t.y).abs() < 1e-4);
+        assert!((t.z as f64 - truth.t.z).abs() < 1e-4);
     }
 
     #[test]
@@ -503,20 +534,20 @@ mod tests {
     fn a_scaled_start_rotation_is_projected_onto_so3_like_the_generic_solver() {
         let (world, image, k, truth) = scene(false);
         // A prediction that drifted off SO(3): a rotation scaled by 0.9.
-        let rotation = so3_exp([0.03, -0.01, 0.02]);
+        let rotation = rotation([0.03, -0.01, 0.02]);
         let col = |j: usize| {
             Vec3AF32::new(
-                0.9 * rotation[0][j] as f32,
-                0.9 * rotation[1][j] as f32,
-                0.9 * rotation[2][j] as f32,
+                0.9 * at(&rotation, 0, j) as f32,
+                0.9 * at(&rotation, 1, j) as f32,
+                0.9 * at(&rotation, 2, j) as f32,
             )
         };
         let scaled = Mat3AF32::from_cols(col(0), col(1), col(2));
         let refined = refine_pose(&world, &image, &k, &scaled, &Vec3AF32::ZERO, &params()).unwrap();
         let t = refined.translation;
-        assert!((t.x as f64 - truth.t[0]).abs() < 1e-4);
-        assert!((t.y as f64 - truth.t[1]).abs() < 1e-4);
-        assert!((t.z as f64 - truth.t[2]).abs() < 1e-4);
+        assert!((t.x as f64 - truth.t.x).abs() < 1e-4);
+        assert!((t.y as f64 - truth.t.y).abs() < 1e-4);
+        assert!((t.z as f64 - truth.t.z).abs() < 1e-4);
         let r = refined.rotation;
         for column in [r.x_axis(), r.y_axis(), r.z_axis()] {
             assert!((column.length() - 1.0).abs() < 1e-5);
