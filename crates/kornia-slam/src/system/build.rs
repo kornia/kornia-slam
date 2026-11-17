@@ -2,9 +2,10 @@ use kornia_imgproc::features::OrbDetector;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    CameraSelection, FrontendConfig, InertialConfig, LocalBaConfig, LoopClosingExecution,
-    LoopClosingMode, LostRelocalization, OrbSlamPipeline, PipelineDefinition, SensorSelection,
-    StereoDepthSigma, SystemConfig, TrackingConfig,
+    AnchorGuard, CameraSelection, FlowBookkeeping, FlowPose, ForwardBackward, FrontendConfig,
+    GyroGuess, InertialConfig, KeyframeOrb, KltRetry, KltRig, LocalBaConfig, LoopClosingExecution,
+    LoopClosingMode, LostRelocalization, OrbFrontendConfig, OrbSlamPipeline, PipelineDefinition,
+    SensorSelection, StereoDepthSigma, StereoPyramid, SystemConfig, TrackRefill, TrackingConfig,
 };
 use super::recovery::RecoveryConfig;
 use super::validation::ConfigError;
@@ -13,6 +14,7 @@ use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabular
 use crate::loop_closure::{LoopCloser, LoopClosingConfig, LoopSolver};
 use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
 use crate::mapping::{GrowthNeighbours, LocalMappingMode};
+use crate::tracking::flow_pool::FlowPoolError;
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::pose_gate::PoseGate;
@@ -28,6 +30,8 @@ pub enum BuildError {
     Vocabulary(#[from] VocabularyLoadError),
     #[error("could not start the loop-closing worker: {0}")]
     LoopWorker(#[from] std::io::Error),
+    #[error(transparent)]
+    FlowPool(#[from] FlowPoolError),
 }
 
 /// Settings a [`SlamSystem`](crate::SlamSystem) is assembled from, resolved
@@ -53,10 +57,66 @@ pub(crate) struct SystemSettings {
     /// prediction; `None` keeps the full search.
     pub klt_prediction: Option<(usize, usize)>,
     pub klt_kernel: LkKernel,
+    pub frontend_flow: FlowSettings,
     pub tracking: TrackingConfig,
     pub inertial: InertialConfig,
     pub relocalization: LostRelocalization,
     pub growth_neighbours: GrowthNeighbours,
+}
+
+/// The 1 ms frontend knobs the tracking path reads.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)] // skeleton: lane T reads the rest
+pub(crate) struct FlowSettings {
+    pub threads: usize,
+    pub first_core: Option<usize>,
+    pub rig: KltRig,
+    pub window: usize,
+    pub retry: KltRetry,
+    pub forward_backward: ForwardBackward,
+    pub refill: TrackRefill,
+    pub adopt_landmarks: bool,
+    pub gyro_guess: GyroGuess,
+    pub anchor_guard: AnchorGuard,
+    pub pose: FlowPose,
+    pub bookkeeping: FlowBookkeeping,
+    pub keyframe_orb: KeyframeOrb,
+}
+
+impl FlowSettings {
+    fn new(frontend: &OrbFrontendConfig) -> Self {
+        Self {
+            threads: frontend.flow_threads,
+            first_core: frontend.flow_first_core,
+            rig: frontend.klt_rig,
+            window: frontend.klt_window,
+            retry: frontend.klt_retry,
+            forward_backward: frontend.forward_backward,
+            refill: frontend.track_refill,
+            adopt_landmarks: frontend.adopt_landmarks,
+            gyro_guess: frontend.gyro_guess,
+            anchor_guard: frontend.anchor_guard,
+            pose: frontend.flow_pose,
+            bookkeeping: frontend.flow_bookkeeping,
+            keyframe_orb: frontend.keyframe_orb,
+        }
+    }
+
+    /// The first knob set away from today's behaviour that no tracking path
+    /// reads yet. Knobs that need `WindowedU8` stop inside its flow path.
+    pub(crate) fn unbuilt_knob(&self) -> Option<&'static str> {
+        let today = Self::new(&OrbFrontendConfig::default());
+        [
+            ("klt_window", self.window != today.window),
+            ("adopt_landmarks", self.adopt_landmarks),
+            ("gyro_guess", self.gyro_guess != today.gyro_guess),
+            ("flow_pose", self.pose != today.pose),
+            ("flow_bookkeeping", self.bookkeeping != today.bookkeeping),
+            ("keyframe_orb", self.keyframe_orb != today.keyframe_orb),
+        ]
+        .into_iter()
+        .find_map(|(knob, set)| set.then_some(knob))
+    }
 }
 
 impl SensorSelection {
@@ -113,6 +173,7 @@ impl LocalBaConfig {
             lost_keyframes: self.lost_keyframes,
             visual_kernel: self.visual_kernel,
             large_window: self.large_window,
+            online_calibration: self.online_calibration,
             initial_lambda: LocalBaParams::default().initial_lambda,
             recently_initialized: false,
             newest_marginal: false,
@@ -148,13 +209,14 @@ impl SystemConfig {
                 .params(stereo_baseline_m(rig).map(|baseline| rig.camera.fx * baseline)),
             stereo_close_depth_m: stereo_baseline_m(rig)
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
-            // A flow-only frame keeps the primary camera alone; on a rig the
-            // other cameras' correspondences are what carry hard segments.
+            // A primary-only flow frame drops the other cameras, whose
+            // correspondences are what carry a rig through hard segments.
             klt_min_tracks: frontend
                 .klt_first
                 .min_tracks()
-                .filter(|_| !rig.is_multi_camera()),
+                .filter(|_| frontend.klt_rig == KltRig::AllCameras || !rig.is_multi_camera()),
             klt_kernel: frontend.klt_kernel,
+            frontend_flow: FlowSettings::new(&frontend),
             klt_prediction: frontend
                 .klt_prediction
                 .search()
@@ -172,6 +234,19 @@ impl SystemConfig {
         frontend
             .secondary_n_keypoints
             .unwrap_or(frontend.n_keypoints)
+    }
+
+    /// The pyramid the stereo and overlap matching read.
+    pub(crate) fn stereo_pyramid(&self) -> StereoPyramid {
+        let FrontendConfig::Orb(frontend) = self.orb().frontend;
+        frontend.stereo_pyramid
+    }
+
+    /// Checks `frontend.flow_threads` against a rig returned by
+    /// [`SensorSelection::select_rig`].
+    pub(crate) fn validate_flow_threads(&self, rig: &SensorRig) -> Result<(), ConfigError> {
+        let FrontendConfig::Orb(frontend) = self.orb().frontend;
+        frontend.validate_flow_threads(rig.cameras.len())
     }
 
     /// Feature extractor settings for the configured frontend.

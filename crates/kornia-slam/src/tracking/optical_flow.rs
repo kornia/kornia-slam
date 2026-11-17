@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use kornia_algebra::Vec3F64;
 use kornia_image::{Image, ImageSize};
 use kornia_imgproc::filter::scharr_spatial_gradient_float;
 use kornia_imgproc::optical_flow_pyr_lk::{
@@ -11,6 +12,7 @@ use kornia_imgproc::optical_flow_pyr_lk::{
 use kornia_imgproc::pyramid::pyrdown_f32;
 use thiserror::Error;
 
+use crate::mapping::Map;
 use crate::tracking::timings::{TrackingTimings, timed};
 
 /// Stable identity for a feature track.
@@ -31,6 +33,14 @@ pub struct Track {
     pixel: [f32; 2],
     map_point_idx: Option<usize>,
     age: u32,
+    /// The associated map point's world position, copied when the track is
+    /// associated and refreshed after every map change, so shards predict
+    /// without the map lock; `None` once the point is culled.
+    position: Option<Vec3F64>,
+    /// Rig camera the track lives in; 0 outside a rig.
+    camera: u8,
+    /// Flow shard fixed at spawn (see `FlowPool`).
+    shard: u8,
 }
 
 impl Track {
@@ -52,6 +62,21 @@ impl Track {
     /// Number of consecutive frames represented by this track.
     pub fn age(&self) -> u32 {
         self.age
+    }
+
+    /// World position of the associated map point, as last refreshed.
+    pub fn position(&self) -> Option<Vec3F64> {
+        self.position
+    }
+
+    /// Rig camera the track lives in.
+    pub fn camera(&self) -> usize {
+        usize::from(self.camera)
+    }
+
+    /// Flow shard the track runs on.
+    pub fn shard(&self) -> usize {
+        usize::from(self.shard)
     }
 }
 
@@ -120,14 +145,28 @@ impl TrackSet {
 
     /// Inserts a new, unassociated track and returns its identity.
     pub fn spawn(&mut self, pixel: [f32; 2]) -> TrackId {
+        self.spawn_in(pixel, 0, 0)
+    }
+
+    /// As [`Self::spawn`], in rig camera `camera`, on flow shard `shard`.
+    pub fn spawn_in(&mut self, pixel: [f32; 2], camera: usize, shard: usize) -> TrackId {
         let id = self.allocate_id();
         self.tracks.push(Track {
             id,
             pixel,
             map_point_idx: None,
             age: 1,
+            position: None,
+            camera: camera as u8,
+            shard: shard as u8,
         });
         id
+    }
+
+    /// Rewrites every associated track's `position` from `map`, `None` for a
+    /// culled point; returns how many it rewrote (`flow_position_refreshes`).
+    pub fn refresh_positions(&mut self, _map: &Map) -> u64 {
+        todo!("lane T: track positions after a map change")
     }
 
     /// Advances the active set to the supplied KLT survivors.
@@ -152,10 +191,9 @@ impl TrackSet {
             .map(|survivor| {
                 let previous = by_id[&survivor.track_id];
                 Track {
-                    id: survivor.track_id,
                     pixel: survivor.pixel,
-                    map_point_idx: previous.map_point_idx,
                     age: previous.age.saturating_add(1),
+                    ..previous
                 }
             })
             .collect();
@@ -203,10 +241,10 @@ impl TrackSet {
             .map(|matched| {
                 if let Some(previous) = old_by_map_point.get(&matched.map_point_idx) {
                     Track {
-                        id: previous.id,
                         pixel: keypoints[matched.keypoint_idx],
                         map_point_idx: Some(matched.map_point_idx),
                         age: previous.age.saturating_add(1),
+                        ..*previous
                     }
                 } else {
                     let id = TrackId(next_new_id);
@@ -216,6 +254,9 @@ impl TrackSet {
                         pixel: keypoints[matched.keypoint_idx],
                         map_point_idx: Some(matched.map_point_idx),
                         age: 1,
+                        position: None,
+                        camera: 0,
+                        shard: 0,
                     }
                 }
             })
@@ -289,6 +330,8 @@ pub enum LkKernel {
     F32,
     /// OpenCV's scheme: u8 pyramid, i16 Scharr, Q14 fixed-point windows.
     FixedPointU8,
+    /// Window-only fixed-point LK on `wide`, from the predicted start.
+    WindowedU8,
 }
 
 /// A failed flow solve, from either kernel.
@@ -427,6 +470,9 @@ impl KltTracker {
             return Ok(Vec::new());
         }
         check_same_size(previous, current)?;
+        if self.kernel == LkKernel::WindowedU8 {
+            todo!("lane T: WindowedU8 runs in FlowShard");
+        }
         if self.kernel == LkKernel::FixedPointU8 {
             return self.track_cached_u8(cache, tracks, prediction, previous, current, timings);
         }
@@ -981,6 +1027,9 @@ mod tests {
                 pixel: [1.0, 2.0],
                 map_point_idx: None,
                 age: u32::MAX,
+                position: None,
+                camera: 0,
+                shard: 0,
             }],
         };
 
@@ -1252,6 +1301,9 @@ mod tests {
             pixel: [50.0, 50.0],
             map_point_idx: None,
             age: 1,
+            position: None,
+            camera: 0,
+            shard: 0,
         };
 
         assert!(!KltTracker::accepts(
@@ -1404,12 +1456,18 @@ mod tests {
                     pixel: [10.0, 10.0],
                     map_point_idx: Some(42),
                     age: 1,
+                    position: None,
+                    camera: 0,
+                    shard: 0,
                 },
                 Track {
                     id: b,
                     pixel: [20.0, 20.0],
                     map_point_idx: Some(42),
                     age: 1,
+                    position: None,
+                    camera: 0,
+                    shard: 0,
                 },
             ],
         };

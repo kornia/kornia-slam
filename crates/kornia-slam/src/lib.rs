@@ -52,6 +52,10 @@ pub mod rig;
 pub mod stereo;
 pub mod system;
 pub mod tracking;
+#[cfg(feature = "bench_internals")]
+#[doc(hidden)]
+pub mod upstream;
+#[cfg(not(feature = "bench_internals"))]
 pub(crate) mod upstream;
 
 pub use frame::Frame;

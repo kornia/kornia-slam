@@ -71,6 +71,7 @@ use kornia_algebra::{Mat6F64, Mat15F64, SE3F32, SMatF64, SVecF64, Vec3F64, Vec6F
 use thiserror::Error;
 
 use crate::mapping::marginalization::{BoundaryPrior, MarginalPrior, accumulate_prior};
+use crate::mapping::online_calibration::{OnlineCalibrationInput, OnlineCalibrationState};
 use crate::pose_conversion::{pose_to_se3, se3_to_pose, vec3_to_f32};
 use kornia_factors::inertial::NavState;
 use kornia_factors::inertial::preintegration::{self, ImuFactor};
@@ -1253,6 +1254,24 @@ fn stationary_cost(
             stationary_eval(edge, info, &kfs[edge.from_idx], &kfs[edge.to_idx]).cost
         })
         .sum()
+}
+
+/// [`visual_inertial_bundle_adjust`] with the calibration states of `calibration`:
+/// the result, and the state the next solve starts from (the input's when the
+/// gate held the states).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn visual_inertial_bundle_adjust_calibrated(
+    _keyframes: &[ViBaKeyframe],
+    _points: &[Vec3F64],
+    _observations: &[BaObservation],
+    _imu_edges: &[ImuFactor],
+    _wheel_edges: &[WheelOdomFactor],
+    _stationary_edges: &[StationaryFactor],
+    _camera: &PinholeCamera,
+    _params: &ViBaParams,
+    _calibration: &OnlineCalibrationInput<'_>,
+) -> Result<(ViBaResult, OnlineCalibrationState), ViBaError> {
+    todo!("lane C: online calibration states in the local VI-BA")
 }
 
 /// Visual-inertial bundle adjustment via dense Schur-complement reduction.

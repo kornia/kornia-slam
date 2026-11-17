@@ -4,17 +4,19 @@
 //! map owns capture and writeback; the local-mapping worker owns scheduling.
 
 use crate::mapping::map::{
-    BaSnapshot, BaSolve, BaUpdate, BaUpdateError, BaWindow, Keyframe, LocalBaStats, Map,
-    ORB_N_LEVELS, ORB_SCALE_FACTOR, StateEnvelope,
+    BaSnapshot, BaSolve, BaUpdate, BaUpdateError, BaWindow, ImuFactor as MapImuFactor, Keyframe,
+    LocalBaStats, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR, StateEnvelope,
 };
 use crate::mapping::marginalization::{
     BoundaryPrior, FrozenPoseSigma, MarginalPrior, marginalize_frozen,
 };
+use crate::mapping::online_calibration::{OnlineCalibrationInput, OnlineCalibrationState};
 use crate::mapping::vi_ba_schur::{
     ImuHuber, RigObservationCamera, ViBaKeyframe, ViBaParams, ViBaResult,
 };
 use crate::mapping::visual_information::VisualInformation;
 use crate::pose_conversion::angle_deg;
+use crate::system::OnlineCalibrationConfig;
 use crate::upstream::kornia_3d::pose_ext::camera_centre;
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
@@ -57,6 +59,8 @@ pub struct LocalBaParams {
     pub lost_keyframes: LostKeyframes,
     pub visual_kernel: VisualKernel,
     pub large_window: LargeWindow,
+    /// Calibration states a VI-BA solve estimates; all off by default.
+    pub online_calibration: OnlineCalibrationConfig,
     /// Levenberg-Marquardt initial damping of a VI-BA solve.
     pub initial_lambda: f64,
     /// The inertial initialization is recent: VIBA2 has not run.
@@ -122,6 +126,7 @@ impl Default for LocalBaParams {
             lost_keyframes: LostKeyframes::Free,
             visual_kernel: VisualKernel::L2,
             large_window: LargeWindow::Off,
+            online_calibration: OnlineCalibrationConfig::default(),
             initial_lambda: 1.0,
             recently_initialized: false,
             newest_marginal: false,
@@ -570,10 +575,67 @@ pub fn run_local_inertial_ba_with(
     stationary_factors: &[StationaryFactor],
     params: &LocalBaParams,
 ) -> BaUpdate {
+    run_local_inertial_ba_inner(
+        snapshot,
+        camera,
+        imu_t_bc,
+        gravity_world,
+        wheel_factors,
+        stationary_factors,
+        params,
+        None,
+    )
+}
+
+/// [`run_local_inertial_ba_with`] that also estimates `params.online_calibration`'s
+/// states, starting from `calibration`; the update carries the state the next
+/// solve starts from. With every state off it is `run_local_inertial_ba_with`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_local_inertial_ba_calibrated(
+    snapshot: BaSnapshot,
+    camera: &PinholeCamera,
+    imu_t_bc: Option<Pose3d>,
+    gravity_world: Vec3F64,
+    wheel_factors: &[WheelOdomFactor],
+    stationary_factors: &[StationaryFactor],
+    params: &LocalBaParams,
+    calibration: &OnlineCalibrationState,
+) -> BaUpdate {
+    let calibration = params
+        .online_calibration
+        .is_enabled()
+        .then_some((calibration, &params.online_calibration));
+    run_local_inertial_ba_inner(
+        snapshot,
+        camera,
+        imu_t_bc,
+        gravity_world,
+        wheel_factors,
+        stationary_factors,
+        params,
+        calibration,
+    )
+}
+
+/// The one body of both entries, so they cannot drift apart; `None` solves
+/// without calibration states.
+#[allow(clippy::too_many_arguments)]
+fn run_local_inertial_ba_inner(
+    snapshot: BaSnapshot,
+    camera: &PinholeCamera,
+    imu_t_bc: Option<Pose3d>,
+    gravity_world: Vec3F64,
+    wheel_factors: &[WheelOdomFactor],
+    stationary_factors: &[StationaryFactor],
+    params: &LocalBaParams,
+    calibration: Option<(&OnlineCalibrationState, &OnlineCalibrationConfig)>,
+) -> BaUpdate {
     let mut update = snapshot.into_update();
     update.state_envelope = params.state_envelope;
     let snapshot = &update.snapshot;
-    use crate::mapping::vi_ba_schur::visual_inertial_bundle_adjust;
+    use crate::mapping::vi_ba_schur::{
+        visual_inertial_bundle_adjust, visual_inertial_bundle_adjust_calibrated,
+    };
 
     const MIN_OBSERVATIONS: usize = 8;
 
@@ -669,7 +731,8 @@ pub fn run_local_inertial_ba_with(
     }
 
     // Build IMU edges; include only edges where at least one endpoint is active.
-    let imu_edges: Vec<preintegration::ImuFactor> = snapshot
+    // Each keeps its map edge alongside, for the calibrated solve's re-integration.
+    let (imu_edges, map_edges): (Vec<preintegration::ImuFactor>, Vec<&MapImuFactor>) = snapshot
         .imu_factors()
         .iter()
         .zip(&update.imu_preintegrations)
@@ -679,13 +742,12 @@ pub fn run_local_inertial_ba_with(
             if from < active_start && to < active_start {
                 return None;
             }
-            Some(preintegration::ImuFactor::new(
-                from,
-                to,
-                preintegrated.clone(),
+            Some((
+                preintegration::ImuFactor::new(from, to, preintegrated.clone()),
+                f,
             ))
         })
-        .collect();
+        .unzip();
 
     let wheel_edges: Vec<WheelOdomFactor> = wheel_factors
         .iter()
@@ -770,16 +832,37 @@ pub fn run_local_inertial_ba_with(
             }
         };
     }
-    let vi_result = match visual_inertial_bundle_adjust(
-        &vi_keyframes,
-        &window.positions,
-        &observations,
-        &imu_edges,
-        &wheel_edges,
-        &stationary_edges,
-        camera,
-        &vi_params,
-    ) {
+    let solved = match calibration {
+        None => visual_inertial_bundle_adjust(
+            &vi_keyframes,
+            &window.positions,
+            &observations,
+            &imu_edges,
+            &wheel_edges,
+            &stationary_edges,
+            camera,
+            &vi_params,
+        )
+        .map(|result| (result, None)),
+        Some((start, config)) => visual_inertial_bundle_adjust_calibrated(
+            &vi_keyframes,
+            &window.positions,
+            &observations,
+            &imu_edges,
+            &wheel_edges,
+            &stationary_edges,
+            camera,
+            &vi_params,
+            &OnlineCalibrationInput {
+                config: *config,
+                start,
+                map_edges,
+                active_keyframes: params.active_keyframes,
+            },
+        )
+        .map(|(result, state)| (result, Some(state))),
+    };
+    let (vi_result, online_calibration) = match solved {
         Ok(r) => r,
         Err(error) => {
             debug_eprintln!("[vi_ba] local inertial BA failed, window unchanged: {error}");
@@ -846,7 +929,11 @@ pub fn run_local_inertial_ba_with(
         cheirality_rejections: vi_result.cheirality_rejections,
         cheirality_points_held: vi_result.cheirality_points_held,
         points_rejected,
+        // Lane C reports these from the calibrated solve.
+        calibration_gated: false,
+        calibration_columns: 0,
     });
+    update.online_calibration = online_calibration;
     update.outcome.solve = BaSolve::Solved;
     update
 }

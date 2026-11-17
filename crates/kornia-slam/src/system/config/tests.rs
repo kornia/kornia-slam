@@ -13,7 +13,6 @@ use crate::mapping::visual_information::VisualInformation;
 use crate::system::ConfigError;
 #[cfg(feature = "serde")]
 use crate::system::LoadError;
-#[cfg(feature = "serde")]
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::{KeyframePolicy, KeyframeRules};
 
@@ -629,8 +628,472 @@ fn stereo_rejects_raw_fisheye_images() {
     assert_eq!(SensorSelection::default().validate_rig(&rig), Ok(()));
 }
 
+/// The Orin preset of card E: 2 threads with 48 tracks per camera, or 3
+/// with 64 (`configs/lamaria-rig-imu-orin{2,3}.ron`).
+fn orin_preset(threads: usize, per_camera: usize) -> SystemConfig {
+    let mut config = SystemConfig {
+        sensors: sensors(CameraSelection::Rig, true),
+        ..SystemConfig::default()
+    };
+    let orb = orb_mut(&mut config);
+    orb.mapping.execution = LocalMappingMode::Asynchronous;
+    orb.frontend = FrontendConfig::Orb(OrbFrontendConfig {
+        klt_kernel: LkKernel::WindowedU8,
+        flow_threads: threads,
+        klt_rig: KltRig::AllCameras,
+        klt_window: 11,
+        klt_prediction: KltPrediction::Enabled {
+            max_level: 0,
+            max_iter: 8,
+        },
+        klt_retry: KltRetry::CoarseLevel { max_level: 1 },
+        forward_backward: ForwardBackward::Enabled {
+            max_round_trip_px: 0.6,
+            max_iter: 4,
+            every_n_frames: 1,
+        },
+        track_refill: TrackRefill::Enabled {
+            per_camera,
+            min_spacing_px: 23.0,
+            refill_below: 0.8,
+            border_px: 9,
+        },
+        adopt_landmarks: true,
+        gyro_guess: GyroGuess::RotatedRay,
+        flow_pose: FlowPose::AnalyticGn { max_iter: 3 },
+        flow_bookkeeping: FlowBookkeeping::KeyframesOnly,
+        keyframe_orb: KeyframeOrb::Mapping,
+        ..OrbFrontendConfig::default()
+    });
+    config
+}
+
+/// A config whose frontend is `frontend` on `cameras`, with the IMU.
+fn with_frontend(frontend: OrbFrontendConfig, cameras: CameraSelection) -> SystemConfig {
+    let mut config = SystemConfig {
+        sensors: sensors(cameras, true),
+        ..SystemConfig::default()
+    };
+    orb_mut(&mut config).frontend = FrontendConfig::Orb(frontend);
+    config
+}
+
+#[test]
+fn the_flow_knobs_default_to_todays_frontend() {
+    let frontend = OrbFrontendConfig::default();
+    assert_eq!(frontend.flow_threads, 1);
+    assert_eq!(frontend.flow_first_core, None);
+    assert_eq!(frontend.klt_rig, KltRig::PrimaryOnly);
+    assert_eq!(frontend.klt_kernel, LkKernel::FixedPointU8);
+    assert_eq!(frontend.klt_window, 21);
+    assert_eq!(frontend.klt_prediction, KltPrediction::default());
+    assert_eq!(frontend.klt_retry, KltRetry::Off);
+    assert_eq!(frontend.forward_backward, ForwardBackward::Off);
+    assert_eq!(frontend.track_refill, TrackRefill::Off);
+    assert!(!frontend.adopt_landmarks);
+    assert_eq!(frontend.gyro_guess, GyroGuess::Off);
+    assert_eq!(frontend.anchor_guard, AnchorGuard::Off);
+    assert_eq!(frontend.flow_pose, FlowPose::RansacPnp);
+    assert_eq!(frontend.flow_bookkeeping, FlowBookkeeping::EveryFrame);
+    assert_eq!(frontend.keyframe_orb, KeyframeOrb::Tracking);
+    assert_eq!(frontend.stereo_pyramid, StereoPyramid::Resized);
+    for threads in [2, 3] {
+        let preset = orin_preset(threads, 48);
+        assert_eq!(preset.validate(), Ok(()), "{threads} threads");
+        assert!(preset.to_string().contains("flow threads"));
+    }
+}
+
+#[test]
+fn flow_knob_ranges_are_checked() {
+    let windowed = OrbFrontendConfig {
+        klt_kernel: LkKernel::WindowedU8,
+        ..OrbFrontendConfig::default()
+    };
+    for (frontend, setting) in [
+        (
+            OrbFrontendConfig {
+                flow_threads: 0,
+                ..windowed
+            },
+            "frontend.flow_threads",
+        ),
+        (
+            OrbFrontendConfig {
+                flow_threads: MAX_FLOW_THREADS + 1,
+                ..windowed
+            },
+            "frontend.flow_threads",
+        ),
+        (
+            OrbFrontendConfig {
+                klt_window: 10,
+                ..windowed
+            },
+            "frontend.klt_window",
+        ),
+        (
+            OrbFrontendConfig {
+                klt_window: 1,
+                ..windowed
+            },
+            "frontend.klt_window",
+        ),
+        (
+            OrbFrontendConfig {
+                klt_retry: KltRetry::CoarseLevel { max_level: 0 },
+                ..windowed
+            },
+            "frontend.klt_retry.max_level",
+        ),
+        (
+            OrbFrontendConfig {
+                forward_backward: ForwardBackward::Enabled {
+                    max_round_trip_px: 0.0,
+                    max_iter: 4,
+                    every_n_frames: 1,
+                },
+                ..windowed
+            },
+            "frontend.forward_backward.max_round_trip_px",
+        ),
+        (
+            OrbFrontendConfig {
+                forward_backward: ForwardBackward::Enabled {
+                    max_round_trip_px: f32::NAN,
+                    max_iter: 4,
+                    every_n_frames: 1,
+                },
+                ..windowed
+            },
+            "frontend.forward_backward.max_round_trip_px",
+        ),
+        (
+            OrbFrontendConfig {
+                forward_backward: ForwardBackward::Enabled {
+                    max_round_trip_px: 0.6,
+                    max_iter: 0,
+                    every_n_frames: 1,
+                },
+                ..windowed
+            },
+            "frontend.forward_backward.max_iter",
+        ),
+        (
+            OrbFrontendConfig {
+                forward_backward: ForwardBackward::Enabled {
+                    max_round_trip_px: 0.6,
+                    max_iter: 4,
+                    every_n_frames: 0,
+                },
+                ..windowed
+            },
+            "frontend.forward_backward.every_n_frames",
+        ),
+        (
+            OrbFrontendConfig {
+                track_refill: TrackRefill::Enabled {
+                    per_camera: 0,
+                    min_spacing_px: 23.0,
+                    refill_below: 0.8,
+                    border_px: 9,
+                },
+                ..windowed
+            },
+            "frontend.track_refill.per_camera",
+        ),
+        (
+            OrbFrontendConfig {
+                track_refill: TrackRefill::Enabled {
+                    per_camera: 48,
+                    min_spacing_px: 0.0,
+                    refill_below: 0.8,
+                    border_px: 9,
+                },
+                ..windowed
+            },
+            "frontend.track_refill.min_spacing_px",
+        ),
+        (
+            OrbFrontendConfig {
+                track_refill: TrackRefill::Enabled {
+                    per_camera: 48,
+                    min_spacing_px: 23.0,
+                    refill_below: 0.0,
+                    border_px: 9,
+                },
+                ..windowed
+            },
+            "frontend.track_refill.refill_below",
+        ),
+        (
+            OrbFrontendConfig {
+                track_refill: TrackRefill::Enabled {
+                    per_camera: 48,
+                    min_spacing_px: 23.0,
+                    refill_below: 1.5,
+                    border_px: 9,
+                },
+                ..windowed
+            },
+            "frontend.track_refill.refill_below",
+        ),
+        (
+            OrbFrontendConfig {
+                anchor_guard: AnchorGuard::Enabled {
+                    every_n_frames: 0,
+                    max_drift_px: 1.0,
+                },
+                ..windowed
+            },
+            "frontend.anchor_guard.every_n_frames",
+        ),
+        (
+            OrbFrontendConfig {
+                anchor_guard: AnchorGuard::Enabled {
+                    every_n_frames: 5,
+                    max_drift_px: 0.0,
+                },
+                ..windowed
+            },
+            "frontend.anchor_guard.max_drift_px",
+        ),
+        (
+            OrbFrontendConfig {
+                flow_pose: FlowPose::AnalyticGn { max_iter: 0 },
+                ..windowed
+            },
+            "frontend.flow_pose.max_iter",
+        ),
+    ] {
+        let config = with_frontend(frontend, CameraSelection::Rig);
+        assert_eq!(invalid_setting(&config).as_deref(), Some(setting));
+    }
+}
+
+#[test]
+fn flow_knobs_are_refused_without_the_knobs_they_need() {
+    let needs = |knob: &'static str, needs: &'static str| -> Result<(), ConfigError> {
+        Err(ConfigError::FrontendKnobNeeds { knob, needs })
+    };
+    let windowed = OrbFrontendConfig {
+        klt_kernel: LkKernel::WindowedU8,
+        ..OrbFrontendConfig::default()
+    };
+    let threaded = OrbFrontendConfig {
+        flow_threads: 2,
+        klt_rig: KltRig::AllCameras,
+        ..windowed
+    };
+    let on_rig = |frontend| with_frontend(frontend, CameraSelection::Rig).validate();
+    assert_eq!(on_rig(threaded), Ok(()));
+    assert_eq!(
+        on_rig(OrbFrontendConfig {
+            klt_rig: KltRig::PrimaryOnly,
+            ..threaded
+        }),
+        needs("flow_threads", "klt_rig AllCameras on a rig")
+    );
+    assert_eq!(
+        with_frontend(threaded, CameraSelection::Mono).validate(),
+        needs("flow_threads", "klt_rig AllCameras on a rig")
+    );
+    assert_eq!(
+        on_rig(OrbFrontendConfig {
+            klt_window: 11,
+            klt_kernel: LkKernel::F32,
+            ..OrbFrontendConfig::default()
+        }),
+        needs(
+            "klt_window",
+            "klt_kernel FixedPointU8 or WindowedU8 unless it is 21"
+        )
+    );
+    assert_eq!(
+        on_rig(OrbFrontendConfig {
+            klt_window: 11,
+            ..OrbFrontendConfig::default()
+        }),
+        Ok(())
+    );
+    let fixed_point = OrbFrontendConfig::default();
+    for (frontend, knob) in [
+        (
+            OrbFrontendConfig {
+                klt_retry: KltRetry::CoarseLevel { max_level: 1 },
+                ..fixed_point
+            },
+            "klt_retry",
+        ),
+        (
+            OrbFrontendConfig {
+                forward_backward: ForwardBackward::Enabled {
+                    max_round_trip_px: 0.6,
+                    max_iter: 4,
+                    every_n_frames: 1,
+                },
+                ..fixed_point
+            },
+            "forward_backward",
+        ),
+        (
+            OrbFrontendConfig {
+                track_refill: TrackRefill::Enabled {
+                    per_camera: 48,
+                    min_spacing_px: 23.0,
+                    refill_below: 0.8,
+                    border_px: 9,
+                },
+                ..fixed_point
+            },
+            "track_refill",
+        ),
+        (
+            OrbFrontendConfig {
+                anchor_guard: AnchorGuard::Enabled {
+                    every_n_frames: 5,
+                    max_drift_px: 1.0,
+                },
+                ..fixed_point
+            },
+            "anchor_guard",
+        ),
+        (
+            OrbFrontendConfig {
+                klt_kernel: LkKernel::FixedPointU8,
+                ..threaded
+            },
+            "flow_threads",
+        ),
+    ] {
+        assert_eq!(
+            on_rig(frontend),
+            needs(knob, "klt_kernel WindowedU8"),
+            "{knob}"
+        );
+    }
+    assert_eq!(
+        on_rig(OrbFrontendConfig {
+            keyframe_orb: KeyframeOrb::Mapping,
+            klt_first: KltFirst::Disabled,
+            ..OrbFrontendConfig::default()
+        }),
+        needs("keyframe_orb", "klt_first Enabled")
+    );
+}
+
+#[test]
+fn flow_threads_need_a_shard_layout_for_the_rig() {
+    for (threads, cameras, ok) in [
+        (1, 0, true),
+        (1, 2, true),
+        (2, 2, true),
+        (3, 2, true),
+        (4, 2, false),
+        (2, 0, false),
+    ] {
+        let frontend = OrbFrontendConfig {
+            flow_threads: threads,
+            ..OrbFrontendConfig::default()
+        };
+        let expected = if ok {
+            Ok(())
+        } else {
+            Err(ConfigError::FlowThreadsForRig { threads, cameras })
+        };
+        assert_eq!(
+            frontend.validate_flow_threads(cameras),
+            expected,
+            "{threads} threads, {cameras} cameras"
+        );
+    }
+}
+
+#[test]
+fn online_calibration_is_off_by_default_and_checked() {
+    use crate::mapping::global_vi_ba::{ClockOffsetPrior, RotationSlicePrior};
+    let default = LocalBaConfig::default().online_calibration;
+    assert_eq!(default, OnlineCalibrationConfig::default());
+    assert!(!default.is_enabled());
+    assert_eq!(default.camera_rotation, None);
+    assert_eq!(default.camera_focal, None);
+    assert_eq!(default.gyro_intrinsics, None);
+    assert_eq!(default.clock_offset, None);
+
+    let with = |online_calibration, imu| {
+        let mut config = SystemConfig {
+            sensors: sensors(CameraSelection::Mono, imu),
+            ..SystemConfig::default()
+        };
+        orb_mut(&mut config).mapping.local_ba.online_calibration = online_calibration;
+        config
+    };
+    let td = OnlineCalibrationConfig {
+        clock_offset: Some(ClockOffsetPrior { sigma_ms: 2.0 }),
+        ..OnlineCalibrationConfig::default()
+    };
+    assert!(td.is_enabled());
+    assert_eq!(with(td, true).validate(), Ok(()));
+    assert_eq!(
+        with(td, false).validate(),
+        Err(ConfigError::InertialKnobWithoutImu(
+            "mapping.local_ba.online_calibration"
+        ))
+    );
+    let zero = OnlineCalibrationConfig {
+        camera_rotation: Some(RotationSlicePrior {
+            step_sigma_deg: 0.0,
+            value_sigma_deg: 1.0,
+        }),
+        ..OnlineCalibrationConfig::default()
+    };
+    assert_eq!(
+        invalid_setting(&with(zero, true)).as_deref(),
+        Some("mapping.local_ba.online_calibration.camera_rotation.step_sigma_deg")
+    );
+}
+
 mod runtime_settings {
     use super::*;
+
+    /// `klt_rig: AllCameras` lets a rig defer ORB to flow frames; the default
+    /// keeps ORB on every rig frame.
+    #[test]
+    fn klt_first_reaches_a_rig_only_with_every_camera_tracked() {
+        let primary = rig().camera;
+        let view = |primary_from_camera| kornia_sensors::RigCamera {
+            camera: primary.clone(),
+            size: kornia_image::ImageSize {
+                width: 640,
+                height: 480,
+            },
+            primary_from_camera,
+        };
+        let two_cameras = rig().with_rig_cameras(vec![
+            view(Pose3d::IDENTITY),
+            view(Pose3d::new(
+                kornia_algebra::Mat3F64::IDENTITY,
+                kornia_algebra::Vec3F64::new(0.1, 0.0, 0.0),
+            )),
+        ]);
+        let selected = sensors(CameraSelection::Rig, false)
+            .select_rig(two_cameras)
+            .unwrap();
+        let klt_min_tracks = |klt_rig| {
+            let mut config = SystemConfig::default();
+            orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
+                klt_rig,
+                ..OrbFrontendConfig::default()
+            });
+            config.settings(&selected).klt_min_tracks
+        };
+        assert_eq!(klt_min_tracks(KltRig::PrimaryOnly), None);
+        assert_eq!(klt_min_tracks(KltRig::AllCameras), Some(80));
+        assert_eq!(
+            SystemConfig::default().settings(&rig()).klt_min_tracks,
+            Some(80)
+        );
+    }
 
     fn stereo_imu_rig() -> SensorRig {
         rig().with_stereo_baseline(0.11).with_imu(Pose3d::IDENTITY)
@@ -1119,6 +1582,7 @@ mod ron_files {
             klt_prediction: KltPrediction::Disabled,
             secondary_n_keypoints: Some(500),
             klt_kernel: LkKernel::F32,
+            ..OrbFrontendConfig::default()
         });
         settings.keyframes.ref_ratio = 0.75;
         settings.mapping.execution = LocalMappingMode::Synchronous;
@@ -1136,6 +1600,7 @@ mod ron_files {
                 klt_prediction: KltPrediction::Disabled,
                 secondary_n_keypoints: Some(500),
                 klt_kernel: LkKernel::F32,
+                ..OrbFrontendConfig::default()
             })
         );
     }
@@ -1237,5 +1702,105 @@ mod ron_files {
             orb(&parse(&ron(&config)).unwrap()).tracking_loss.reseed,
             reseed
         );
+    }
+
+    /// Card E's Orin 2-core preset, as `configs/lamaria-rig-imu-orin2.ron` sets it.
+    const ORIN2_PRESET: &str = r#"
+        (
+            version: 1,
+            sensors: ( cameras: Rig, imu: true ),
+            pipeline: OrbSlam((
+                frontend: Orb((
+                    klt_kernel: WindowedU8,
+                    flow_threads: 2,
+                    klt_rig: AllCameras,
+                    klt_window: 11,
+                    klt_prediction: Enabled(max_level: 0, max_iter: 8),
+                    klt_retry: CoarseLevel(max_level: 1),
+                    forward_backward: Enabled(max_round_trip_px: 0.6, max_iter: 4, every_n_frames: 1),
+                    track_refill: Enabled(per_camera: 48, min_spacing_px: 23.0, refill_below: 0.8, border_px: 9),
+                    adopt_landmarks: true,
+                    gyro_guess: RotatedRay,
+                    flow_pose: AnalyticGn(max_iter: 3),
+                    flow_bookkeeping: KeyframesOnly,
+                    keyframe_orb: Mapping,
+                )),
+                mapping: ( execution: Asynchronous ),
+            )),
+        )
+    "#;
+
+    #[test]
+    fn the_orin_presets_round_trip() {
+        let parsed = parse(ORIN2_PRESET).unwrap();
+        assert_eq!(orb(&parsed).frontend, orb(&orin_preset(2, 48)).frontend);
+        for preset in [orin_preset(2, 48), orin_preset(3, 64)] {
+            let text = ron(&preset);
+            let reparsed = parse(&text).unwrap();
+            assert_eq!(ron(&reparsed), text);
+            assert_eq!(orb(&reparsed).frontend, orb(&preset).frontend);
+        }
+        assert_eq!(
+            orb(&parse("(version: 1)").unwrap()).frontend,
+            FrontendConfig::default()
+        );
+    }
+
+    #[test]
+    fn each_online_calibration_state_parses() {
+        use crate::mapping::global_vi_ba::{
+            ClockOffsetPrior, FocalSlicePrior, GyroIntrinsicsPrior, RotationSlicePrior,
+        };
+        let online = |states: &str| {
+            parse(&format!(
+                "(version: 1, sensors: (imu: true), pipeline: OrbSlam((mapping: (local_ba: (online_calibration: ({states}))))))"
+            ))
+            .map(|config| orb(&config).mapping.local_ba.online_calibration)
+        };
+        assert_eq!(online("").unwrap(), OnlineCalibrationConfig::default());
+        assert_eq!(
+            online("clock_offset: Some((sigma_ms: 2.0))")
+                .unwrap()
+                .clock_offset,
+            Some(ClockOffsetPrior { sigma_ms: 2.0 })
+        );
+        assert_eq!(
+            online("camera_rotation: Some((step_sigma_deg: 0.05, value_sigma_deg: 1.0))")
+                .unwrap()
+                .camera_rotation,
+            Some(RotationSlicePrior {
+                step_sigma_deg: 0.05,
+                value_sigma_deg: 1.0
+            })
+        );
+        assert_eq!(
+            online("camera_focal: Some((step_sigma: 5e-4, value_sigma: 0.01))")
+                .unwrap()
+                .camera_focal,
+            Some(FocalSlicePrior {
+                step_sigma: 5e-4,
+                value_sigma: 0.01
+            })
+        );
+        assert_eq!(
+            online("gyro_intrinsics: Some((sigma: 0.005))")
+                .unwrap()
+                .gyro_intrinsics,
+            Some(GyroIntrinsicsPrior { sigma: 0.005 })
+        );
+        assert!(rejects_field(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((mapping: (local_ba: (online_calibration: (time_slices: 8))))))",
+            "time_slices"
+        ));
+        assert!(matches!(
+            online("clock_offset: Some((sigma_ms: 0.0))"),
+            Err(LoadError::Invalid(ConfigError::InvalidSetting { .. }))
+        ));
+        assert!(matches!(
+            parse(
+                "(version: 1, pipeline: OrbSlam((mapping: (local_ba: (online_calibration: (clock_offset: Some((sigma_ms: 2.0))))))))"
+            ),
+            Err(LoadError::Invalid(ConfigError::InertialKnobWithoutImu(_)))
+        ));
     }
 }

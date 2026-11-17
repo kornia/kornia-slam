@@ -10,6 +10,47 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**New settings for a 1 ms frontend frame and for online calibration, all off by
+default.** Every default is today's behaviour, so existing run files load and
+run unchanged. Not implemented yet: most stop with `todo!` when set.
+- `frontend.flow_threads` (`1`): threads the flow step runs on, the tracking
+  thread included; 1, the rig's camera count or one more, at most 4.
+- `frontend.flow_first_core` (`None`): pins the flow workers from this core on;
+  read only in builds with the new `pin_threads` feature.
+- `frontend.klt_rig` (`PrimaryOnly`): `AllCameras` tracks every rig camera, so
+  a rig frame can be tracked from flow alone.
+- `frontend.klt_kernel: WindowedU8`: window-only fixed-point LK from the
+  predicted start; the default stays `FixedPointU8`.
+- `frontend.klt_window` (`21`): the LK window, odd; the `F32` kernel supports 21
+  only.
+- `frontend.klt_retry` (`Off`): `CoarseLevel(max_level)` re-runs the tracks
+  that failed at the predicted level over coarser levels.
+- `frontend.forward_backward` (`Off`): `Enabled(max_round_trip_px, max_iter,
+  every_n_frames)` drops a track whose round trip back to the previous frame is
+  too long.
+- `frontend.track_refill` (`Off`): `Enabled(per_camera, min_spacing_px,
+  refill_below, border_px)` refills each camera with spaced Shi-Tomasi corners.
+- `frontend.adopt_landmarks` (`false`): tracks start from the landmarks each new
+  keyframe creates.
+- `frontend.gyro_guess` (`Off`): `RotatedRay` starts a track without a trusted
+  map-point prediction at its previous ray rotated by the gyro.
+- `frontend.anchor_guard` (`Off`): `Enabled(every_n_frames, max_drift_px)` drops
+  a track that drifts from its first-sighting template.
+- `frontend.flow_pose` (`RansacPnp`): `AnalyticGn(max_iter)` solves a flow
+  frame's pose by Gauss-Newton from the IMU prediction, RANSAC PnP as fallback.
+- `frontend.flow_bookkeeping` (`EveryFrame`): `KeyframesOnly` counts landmark
+  visibility only on frames that run ORB, as ORB-SLAM3.
+- `frontend.keyframe_orb` (`Tracking`): `Mapping` runs a flow keyframe's ORB,
+  overlap match and insert on the mapping thread; needs `klt_first`.
+- `frontend.stereo_pyramid` (`Resized`): `Shared` matches stereo and rig overlap
+  on the ORB detector's own pyramid; changes output.
+- `mapping.local_ba.online_calibration` (all `None`): the local VI-BA estimates
+  the clock offset, a rotation and a focal scale per camera, and the gyro
+  intrinsics online; camera 0's rotation is the IMU-camera extrinsic inside the
+  IMU residual. Needs the IMU.
+- Cargo features `bench_internals`, `opencv_bench` and `pin_threads`, for the
+  kernel benches and the flow-worker pinning.
+
 **New settings for the estimator, recovery and offline-BA work, all off by
 default.** Every default is the behaviour before the setting existed, so
 existing run files load and run unchanged. Built, not validated: none of them

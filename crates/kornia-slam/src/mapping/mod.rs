@@ -21,6 +21,9 @@ pub(crate) mod keyframe_mapping;
 pub mod local_mapping;
 pub mod map;
 pub mod marginalization;
+// Skeleton for card G: lane C fills it.
+#[allow(dead_code)]
+pub(crate) mod online_calibration;
 pub mod session;
 pub mod vi_ba_schur;
 pub mod visual_information;

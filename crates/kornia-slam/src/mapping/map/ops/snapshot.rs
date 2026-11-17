@@ -6,6 +6,7 @@
 use super::correction::StateEnvelope;
 use crate::mapping::map::{ImuFactor, Keyframe, Map, MapPoint};
 use crate::mapping::marginalization::MarginalPrior;
+use crate::mapping::online_calibration::OnlineCalibrationState;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat15F64, Vec3F64};
 use kornia_sensors::imu::{ImuBias, PreintegratedImu};
@@ -64,6 +65,9 @@ pub struct BaUpdate {
     /// The newest keyframe's id and marginal covariance, when the solve was
     /// asked for it.
     pub(crate) newest_marginal: Option<(usize, Mat15F64)>,
+    /// The calibration state the next solve starts from, set by a calibrated
+    /// solve; stored only if this update is applied.
+    pub(crate) online_calibration: Option<OnlineCalibrationState>,
 }
 
 /// Whether the solver ran on an update, for the run counters.
@@ -112,6 +116,10 @@ pub struct LocalBaStats {
     /// Landmarks whose optimized position was not written back: behind an
     /// observing keyframe, or flung far from every observer.
     pub points_rejected: usize,
+    /// The online calibration gate held the states: no calibration column.
+    pub calibration_gated: bool,
+    /// Calibration columns the solve added.
+    pub calibration_columns: usize,
 }
 
 impl BaUpdate {
@@ -191,6 +199,7 @@ impl BaSnapshot {
             state_envelope: StateEnvelope::Off,
             outcome: BaOutcome::default(),
             newest_marginal: None,
+            online_calibration: None,
         }
     }
 }

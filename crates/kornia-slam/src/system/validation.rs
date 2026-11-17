@@ -2,10 +2,11 @@ use kornia_imgproc::features::OrbMatchConfig;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    CameraSelection, FrontendConfig, LocalBaConfig, LoopClosingMode, OrbFrontendConfig,
-    OrbSlamPipeline, OrbTuning, PipelineDefinition, PoseInertial, SYSTEM_CONFIG_VERSION,
-    SensorSelection, SnapbackFix, StereoCloseDepth, StereoDepthSigma, SystemConfig, TrackingConfig,
-    TrackingLossConfig,
+    AnchorGuard, CameraSelection, FlowPose, ForwardBackward, FrontendConfig, KeyframeOrb, KltFirst,
+    KltRetry, KltRig, LocalBaConfig, LoopClosingMode, MAX_FLOW_THREADS, OnlineCalibrationConfig,
+    OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition, PoseInertial,
+    SYSTEM_CONFIG_VERSION, SensorSelection, SnapbackFix, StereoCloseDepth, StereoDepthSigma,
+    SystemConfig, TrackRefill, TrackingConfig, TrackingLossConfig,
 };
 use super::recovery::RecoveryConfig;
 use crate::inertial::trust::ImuTrustMode;
@@ -19,6 +20,7 @@ use crate::mapping::bundle_adjustment::{LargeWindow, LostKeyframes};
 use crate::mapping::global_vi_ba::OfflineBaConfig;
 use crate::mapping::map::StateEnvelope;
 use crate::mapping::marginalization::BoundaryPrior;
+use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
 use crate::tracking::pose_gate::PoseGate;
 use crate::tracking::relocalization::RelocalizationSolver;
@@ -79,6 +81,16 @@ pub enum ConfigError {
     SnapbackFixWithPoseInertial,
     #[error("`{0}` needs loop closing's vocabulary: enable `pipeline.loop_closing`")]
     RelocalizationWithoutVocabulary(&'static str),
+    #[error("frontend.{knob} needs {needs}")]
+    FrontendKnobNeeds {
+        knob: &'static str,
+        needs: &'static str,
+    },
+    #[error(
+        "frontend.flow_threads {threads} has no shard layout for {cameras} cameras: \
+         use 1, the camera count or one more"
+    )]
+    FlowThreadsForRig { threads: usize, cameras: usize },
 }
 
 impl SystemConfig {
@@ -107,10 +119,18 @@ impl SystemConfig {
 impl OrbSlamPipeline {
     fn validate(&self, sensors: &SensorSelection) -> Result<(), ConfigError> {
         match &self.frontend {
-            FrontendConfig::Orb(orb) => orb.validate()?,
+            FrontendConfig::Orb(orb) => {
+                orb.validate()?;
+                validate_flow(orb, sensors)?;
+            }
         }
         validate_keyframes(&self.keyframes, sensors.imu)?;
         validate_local_ba(&self.mapping.local_ba)?;
+        if self.mapping.local_ba.online_calibration.is_enabled() && !sensors.imu {
+            return Err(ConfigError::InertialKnobWithoutImu(
+                "mapping.local_ba.online_calibration",
+            ));
+        }
         validate_loop_closing(&self.loop_closing, sensors)?;
         validate_recovery(&self.tracking_loss.reseed)?;
         validate_pose_gate(&self.tracking_loss.pose_gate)?;
@@ -287,6 +307,172 @@ impl OrbFrontendConfig {
             StereoCloseDepth::Disabled => Ok(()),
         }
     }
+
+    /// Checks `flow_threads` against the camera count of the selected rig:
+    /// shards exist for 1 thread, one per camera, or one more (plan section 3).
+    pub(crate) fn validate_flow_threads(&self, cameras: usize) -> Result<(), ConfigError> {
+        let threads = self.flow_threads;
+        if threads == 1 || threads == cameras || threads == cameras + 1 {
+            Ok(())
+        } else {
+            Err(ConfigError::FlowThreadsForRig { threads, cameras })
+        }
+    }
+}
+
+/// The 1 ms frontend knobs: ranges, and the knobs each one needs.
+fn validate_flow(
+    frontend: &OrbFrontendConfig,
+    sensors: &SensorSelection,
+) -> Result<(), ConfigError> {
+    let at = |field| format!("frontend.{field}");
+    let needs = |knob: &'static str, requirement: &'static str| -> Result<(), ConfigError> {
+        Err(ConfigError::FrontendKnobNeeds {
+            knob,
+            needs: requirement,
+        })
+    };
+    check(
+        at("flow_threads"),
+        frontend.flow_threads as f64,
+        Requirement("in 1..=MAX_FLOW_THREADS", |v| {
+            (1.0..=MAX_FLOW_THREADS as f64).contains(&v)
+        }),
+    )?;
+    check(
+        at("klt_window"),
+        frontend.klt_window as f64,
+        Requirement("odd and >= 3", |v| v >= 3.0 && v % 2.0 == 1.0),
+    )?;
+    if let KltRetry::CoarseLevel { max_level } = frontend.klt_retry {
+        check(at("klt_retry.max_level"), max_level as f64, AT_LEAST_ONE)?;
+    }
+    if let ForwardBackward::Enabled {
+        max_round_trip_px,
+        max_iter,
+        every_n_frames,
+    } = frontend.forward_backward
+    {
+        check(
+            at("forward_backward.max_round_trip_px"),
+            max_round_trip_px.into(),
+            POSITIVE,
+        )?;
+        check(
+            at("forward_backward.max_iter"),
+            max_iter as f64,
+            AT_LEAST_ONE,
+        )?;
+        check(
+            at("forward_backward.every_n_frames"),
+            every_n_frames as f64,
+            AT_LEAST_ONE,
+        )?;
+    }
+    if let TrackRefill::Enabled {
+        per_camera,
+        min_spacing_px,
+        refill_below,
+        ..
+    } = frontend.track_refill
+    {
+        check(
+            at("track_refill.per_camera"),
+            per_camera as f64,
+            AT_LEAST_ONE,
+        )?;
+        check(
+            at("track_refill.min_spacing_px"),
+            min_spacing_px.into(),
+            POSITIVE,
+        )?;
+        check(
+            at("track_refill.refill_below"),
+            refill_below.into(),
+            OPEN_UNIT_UPPER,
+        )?;
+    }
+    if let AnchorGuard::Enabled {
+        every_n_frames,
+        max_drift_px,
+    } = frontend.anchor_guard
+    {
+        check(
+            at("anchor_guard.every_n_frames"),
+            every_n_frames as f64,
+            AT_LEAST_ONE,
+        )?;
+        check(
+            at("anchor_guard.max_drift_px"),
+            max_drift_px.into(),
+            POSITIVE,
+        )?;
+    }
+    if let FlowPose::AnalyticGn { max_iter } = frontend.flow_pose {
+        check(at("flow_pose.max_iter"), max_iter as f64, AT_LEAST_ONE)?;
+    }
+    let threaded = frontend.flow_threads > 1;
+    if threaded
+        && (frontend.klt_rig != KltRig::AllCameras || sensors.cameras != CameraSelection::Rig)
+    {
+        return needs("flow_threads", "klt_rig AllCameras on a rig");
+    }
+    // kornia-imgproc's f32 LK supports this window only (`optical_flow_pyr_lk.rs:39-44`).
+    if frontend.klt_window != 21 && frontend.klt_kernel == LkKernel::F32 {
+        return needs(
+            "klt_window",
+            "klt_kernel FixedPointU8 or WindowedU8 unless it is 21",
+        );
+    }
+    // These run on WindowedU8's per-track template cache.
+    if frontend.klt_kernel != LkKernel::WindowedU8 {
+        let windowed = [
+            ("klt_retry", frontend.klt_retry != KltRetry::Off),
+            (
+                "forward_backward",
+                frontend.forward_backward != ForwardBackward::Off,
+            ),
+            ("track_refill", frontend.track_refill != TrackRefill::Off),
+            ("anchor_guard", frontend.anchor_guard != AnchorGuard::Off),
+            ("flow_threads", threaded),
+        ];
+        if let Some((knob, _)) = windowed.into_iter().find(|&(_, on)| on) {
+            return needs(knob, "klt_kernel WindowedU8");
+        }
+    }
+    // Only a flow frame defers its keyframe ORB.
+    if frontend.keyframe_orb == KeyframeOrb::Mapping && frontend.klt_first == KltFirst::Disabled {
+        return needs("keyframe_orb", "klt_first Enabled");
+    }
+    Ok(())
+}
+
+/// Every online calibration sigma, as the offline ones.
+fn validate_online_calibration(config: &OnlineCalibrationConfig) -> Result<(), ConfigError> {
+    let at = |field| format!("mapping.local_ba.online_calibration.{field}");
+    if let Some(prior) = config.camera_rotation {
+        check(
+            at("camera_rotation.step_sigma_deg"),
+            prior.step_sigma_deg,
+            POSITIVE,
+        )?;
+        check(
+            at("camera_rotation.value_sigma_deg"),
+            prior.value_sigma_deg,
+            POSITIVE,
+        )?;
+    }
+    if let Some(prior) = config.camera_focal {
+        check(at("camera_focal.step_sigma"), prior.step_sigma, POSITIVE)?;
+        check(at("camera_focal.value_sigma"), prior.value_sigma, POSITIVE)?;
+    }
+    if let Some(prior) = config.gyro_intrinsics {
+        check(at("gyro_intrinsics.sigma"), prior.sigma, POSITIVE)?;
+    }
+    if let Some(prior) = config.clock_offset {
+        check(at("clock_offset.sigma_ms"), prior.sigma_ms, POSITIVE)?;
+    }
+    Ok(())
 }
 
 fn validate_keyframes(policy: &KeyframePolicy, imu: bool) -> Result<(), ConfigError> {
@@ -366,9 +552,10 @@ fn validate_local_ba(config: &LocalBaConfig) -> Result<(), ConfigError> {
     }
     match config.stereo_depth_sigma {
         StereoDepthSigma::RelativeDepth(value) | StereoDepthSigma::Disparity { px: value } => {
-            check(at("stereo_depth_sigma"), value, POSITIVE)
+            check(at("stereo_depth_sigma"), value, POSITIVE)?;
         }
     }
+    validate_online_calibration(&config.online_calibration)
 }
 
 fn validate_initialization(config: &TwoViewInitConfig) -> Result<(), ConfigError> {

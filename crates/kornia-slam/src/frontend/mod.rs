@@ -17,6 +17,7 @@ use kornia_sensors::SensorRig;
 use crate::frame::{Frame, RigFeatures};
 use crate::rig::RigGeometry;
 use crate::stereo::{StereoMatchConfig, StereoMatches, compute_stereo_matches};
+use crate::system::StereoPyramid;
 
 /// Fisheye keypoints beyond this incidence angle are dropped: a pinhole cannot
 /// represent rays at or past 90°, and precision degrades well before that.
@@ -81,6 +82,14 @@ impl OrbFrontend {
     pub(crate) fn with_secondary_keypoints(mut self, n_keypoints: usize) -> Self {
         self.secondary = with_keypoints(&self.detector, n_keypoints);
         self
+    }
+
+    /// Matches stereo and rig overlap on `pyramid`.
+    pub(crate) fn with_stereo_pyramid(self, pyramid: StereoPyramid) -> Self {
+        match pyramid {
+            StereoPyramid::Resized => self,
+            StereoPyramid::Shared => todo!("lane T: the detector's own pyramid"),
+        }
     }
 
     pub(crate) fn observation(&self) -> &FrontendObservation {

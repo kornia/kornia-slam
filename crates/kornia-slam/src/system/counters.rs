@@ -101,6 +101,36 @@ pub struct RunCounters {
     pub seeded_window_frames: u64,
     /// Local-map points that window filtered out of the visibility count.
     pub seeded_window_dropped_points: u64,
+    /// Frames tracked from optical flow alone.
+    pub flow_frames: u64,
+    /// Flow survivors with a map point, summed over flow frames.
+    pub flow_seeds: u64,
+    /// Pose inliers on flow frames.
+    pub flow_inliers: u64,
+    /// Of those, from rig cameras 1 and up.
+    pub flow_secondary_inliers: u64,
+    /// Tracks entering the forward solve.
+    pub flow_tracks_tried: u64,
+    /// Tracks dropped by the forward-backward round trip.
+    pub flow_fb_rejects: u64,
+    /// Tracks re-run at the coarse level.
+    pub flow_retries: u64,
+    /// Tracks spawned by refill.
+    pub flow_refill_spawns: u64,
+    /// Tracks dropped by the anchor guard.
+    pub flow_anchor_drops: u64,
+    /// `AnalyticGn` flow frames that fell back to RANSAC PnP.
+    pub flow_pose_fallbacks: u64,
+    /// Templates cut again because the cached one came from another frame.
+    pub flow_template_rebuilds: u64,
+    /// Track sets cleared by a duplicate map point in reconciliation.
+    pub flow_reconcile_clears: u64,
+    /// Track positions rewritten after a local-mapping result or a map correction.
+    pub flow_position_refreshes: u64,
+    /// Frames between a deferred keyframe falling due and its insert, summed.
+    pub deferred_keyframe_lag_frames: u64,
+    /// Longest the deferred keyframe queue has been.
+    pub deferred_keyframe_queue_max: u64,
 }
 
 impl RunCounters {

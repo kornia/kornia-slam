@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -9,11 +10,16 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 
 use crate::mapping::bundle_adjustment::{
-    LocalBaParams, local_window_of, run_local_ba_with, run_local_inertial_ba_with,
+    LocalBaParams, local_window_of, run_local_ba_with, run_local_inertial_ba_calibrated,
+    run_local_inertial_ba_with,
+};
+use crate::mapping::keyframe_mapping::{
+    DeferredKeyframe, DeferredKeyframeContext, DeferredKeyframeResult,
 };
 use crate::mapping::map::{
     BaOutcome, BaSnapshot, BaSolve, BaUpdate, BaUpdateError, LocalBaMergeResult, Map,
 };
+use crate::mapping::online_calibration::OnlineCalibrationState;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -72,9 +78,25 @@ fn capture_local_window(map: &Map, job: &KeyframeJob) -> BaSnapshot {
     map.ba_snapshot(&local_window_of(map, job.ba_params().active_keyframes, []))
 }
 
-fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJob) -> BaUpdate {
+fn solve_snapshot(
+    snapshot: BaSnapshot,
+    camera: &PinholeCamera,
+    job: &KeyframeJob,
+    calibration: &OnlineCalibrationState,
+) -> BaUpdate {
     let params = job.ba_params();
-    if job.imu_initialized {
+    if job.imu_initialized && params.online_calibration.is_enabled() {
+        run_local_inertial_ba_calibrated(
+            snapshot,
+            camera,
+            job.imu_t_bc,
+            job.gravity_world,
+            &job.wheel_factors,
+            &[],
+            &params,
+            calibration,
+        )
+    } else if job.imu_initialized {
         run_local_inertial_ba_with(
             snapshot,
             camera,
@@ -166,9 +188,10 @@ fn solve_counted(
     camera: &PinholeCamera,
     job: &KeyframeJob,
     counters: &LocalMappingCounters,
+    calibration: &OnlineCalibrationState,
 ) -> BaUpdate {
     let started = Instant::now();
-    let update = solve_snapshot(snapshot, camera, job);
+    let update = solve_snapshot(snapshot, camera, job, calibration);
     counters.record_solve(job, update.outcome, started);
     update
 }
@@ -183,6 +206,10 @@ enum LocalMappingBackend {
         map: Arc<Mutex<Map>>,
         camera: PinholeCamera,
         results: Mutex<Vec<LocalBaMergeResult>>,
+        /// The online calibration the next solve starts from.
+        calibration: Mutex<OnlineCalibrationState>,
+        /// Set by [`LocalMapping::with_deferred`].
+        deferred: Option<DeferredKeyframeContext>,
     },
     Asynchronous {
         handle: LocalMappingHandle,
@@ -202,6 +229,23 @@ fn merge_and_cull(map: &mut Map, update: BaUpdate) -> Result<LocalBaMergeResult,
     Ok(merged)
 }
 
+/// [`merge_and_cull`], keeping the calibration state `update` carries only if
+/// the merge is accepted, as the boundary prior is.
+fn merge_keeping_calibration(
+    map: &mut Map,
+    mut update: BaUpdate,
+    calibration: &mut OnlineCalibrationState,
+) -> Result<LocalBaMergeResult, BaUpdateError> {
+    let next = update.online_calibration.take();
+    let merged = merge_and_cull(map, update);
+    if merged.is_ok()
+        && let Some(next) = next
+    {
+        *calibration = next;
+    }
+    merged
+}
+
 impl LocalMapping {
     pub fn new(mode: LocalMappingMode, map: Arc<Mutex<Map>>, camera: PinholeCamera) -> Self {
         let counters = Arc::new(LocalMappingCounters::default());
@@ -210,6 +254,8 @@ impl LocalMapping {
                 map,
                 camera,
                 results: Mutex::new(Vec::new()),
+                calibration: Mutex::new(OnlineCalibrationState::default()),
+                deferred: None,
             },
             LocalMappingMode::Asynchronous => {
                 let publication_gate = Arc::new(Mutex::new(()));
@@ -226,6 +272,58 @@ impl LocalMapping {
             }
         };
         Self { backend, counters }
+    }
+
+    /// Enables the deferred keyframe path; the build calls it only with
+    /// `keyframe_orb: Mapping`.
+    #[allow(dead_code)] // skeleton: the build calls it once lane T builds the path
+    pub(crate) fn with_deferred(mut self, context: DeferredKeyframeContext) -> Self {
+        match &mut self.backend {
+            LocalMappingBackend::Synchronous { deferred, .. } => *deferred = Some(context),
+            LocalMappingBackend::Asynchronous { handle, .. } => {
+                // The worker is already running: the context goes into the
+                // shared state before any job is submitted.
+                handle
+                    .pending
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .deferred_context = Some(Arc::new(context));
+            }
+        }
+        self
+    }
+
+    /// Queues `job` (FIFO, never replaced, unlike `submit`'s latest-wins
+    /// job); `false` without [`Self::with_deferred`].
+    #[allow(dead_code)] // skeleton: lane T calls it
+    pub(crate) fn submit_deferred(&self, _job: DeferredKeyframe) -> bool {
+        if !self.has_deferred_context() {
+            return false;
+        }
+        todo!("lane T: queue a deferred keyframe")
+    }
+
+    /// The deferred keyframes finished since the last call, in queue order.
+    #[allow(dead_code)] // skeleton: lane T calls it
+    pub(crate) fn drain_deferred(&self) -> Vec<DeferredKeyframeResult> {
+        if !self.has_deferred_context() {
+            return Vec::new();
+        }
+        todo!("lane T: deferred keyframe results")
+    }
+
+    fn has_deferred_context(&self) -> bool {
+        match &self.backend {
+            LocalMappingBackend::Synchronous { deferred, .. } => deferred.is_some(),
+            LocalMappingBackend::Asynchronous { handle, .. } => handle
+                .pending
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .deferred_context
+                .is_some(),
+        }
     }
 
     /// Local-BA tallies so far. In asynchronous mode a job still on the
@@ -249,18 +347,24 @@ impl LocalMapping {
                 map,
                 camera,
                 results,
+                calibration,
+                ..
             } => {
                 let snapshot = capture_local_window(
                     &map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
                     &job,
                 );
-                let update = solve_counted(snapshot, camera, &job, &self.counters);
+                let mut calibration = calibration
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let update = solve_counted(snapshot, camera, &job, &self.counters, &calibration);
                 // Cull under the same lock as the merge, so a completed result
                 // is never observable before cleanup. A rejected snapshot culls
                 // nothing.
-                let merged = merge_and_cull(
+                let merged = merge_keeping_calibration(
                     &mut map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
                     update,
+                    &mut calibration,
                 );
                 self.counters.record_merge(&merged);
                 if let Ok(result) = merged {
@@ -290,6 +394,9 @@ impl LocalMapping {
 #[derive(Default)]
 struct PendingState {
     latest: Option<KeyframeJob>,
+    /// Keyframes whose ORB runs here, in order; never replaced.
+    deferred: VecDeque<DeferredKeyframe>,
+    deferred_context: Option<Arc<DeferredKeyframeContext>>,
     shutdown: bool,
 }
 
@@ -312,6 +419,7 @@ impl Drop for WorkerExit {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.shutdown = true;
         state.latest = None;
+        state.deferred.clear();
         self.pending.ready.notify_all();
     }
 }
@@ -339,13 +447,16 @@ impl LocalMappingHandle {
                 let _worker_exit = WorkerExit {
                     pending: Arc::clone(&worker_pending),
                 };
+                // The online calibration the next solve starts from.
+                let mut calibration = OnlineCalibrationState::default();
                 loop {
                     let job = {
                         let mut state = worker_pending
                             .state
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        while state.latest.is_none() && !state.shutdown {
+                        while state.latest.is_none() && state.deferred.is_empty() && !state.shutdown
+                        {
                             state = worker_pending
                                 .ready
                                 .wait(state)
@@ -353,6 +464,11 @@ impl LocalMappingHandle {
                         }
                         if state.shutdown {
                             break;
+                        }
+                        // Queued only with a context (`submit_deferred`), and
+                        // taken before `latest`.
+                        if let Some(_deferred) = state.deferred.pop_front() {
+                            todo!("lane T: deferred keyframe ORB, overlap, search and insert");
                         }
                         state.latest.take().expect("pending job disappeared")
                     };
@@ -369,7 +485,7 @@ impl LocalMappingHandle {
                         )
                     };
 
-                    let update = solve_counted(snapshot, &camera, &job, &counters);
+                    let update = solve_counted(snapshot, &camera, &job, &counters, &calibration);
 
                     // Merge is short and cannot interleave with keyframe publication
                     // or a world-frame transformation. Epoch mismatch rejects stale BA.
@@ -377,9 +493,10 @@ impl LocalMappingHandle {
                         let _publication = publication_gate
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let merged = merge_and_cull(
+                        let merged = merge_keeping_calibration(
                             &mut map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
                             update,
+                            &mut calibration,
                         );
                         counters.record_merge(&merged);
                         merged.is_ok_and(|result| result_sender.send(result).is_err())
@@ -428,6 +545,7 @@ impl Drop for LocalMappingHandle {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.shutdown = true;
             state.latest = None;
+            state.deferred.clear();
         }
         self.pending.ready.notify_one();
 

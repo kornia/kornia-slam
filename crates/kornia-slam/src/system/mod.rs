@@ -19,10 +19,12 @@ pub mod wheel;
 
 pub use build::BuildError;
 pub use config::{
-    CameraSelection, FrontendConfig, InertialConfig, KltFirst, KltPrediction, LocalBaConfig,
-    LoopClosingExecution, LoopClosingMode, LostRelocalization, MappingConfig, OrbFrontendConfig,
-    OrbSlamPipeline, OrbTuning, PipelineDefinition, PoseInertial, SYSTEM_CONFIG_VERSION,
-    SensorSelection, SnapbackFix, StereoCloseDepth, StereoDepthSigma, SystemConfig, TrackingConfig,
+    AnchorGuard, CameraSelection, FlowBookkeeping, FlowPose, ForwardBackward, FrontendConfig,
+    GyroGuess, InertialConfig, KeyframeOrb, KltFirst, KltPrediction, KltRetry, KltRig,
+    LocalBaConfig, LoopClosingExecution, LoopClosingMode, LostRelocalization, MAX_FLOW_THREADS,
+    MappingConfig, OnlineCalibrationConfig, OrbFrontendConfig, OrbSlamPipeline, OrbTuning,
+    PipelineDefinition, PoseInertial, SYSTEM_CONFIG_VERSION, SensorSelection, SnapbackFix,
+    StereoCloseDepth, StereoDepthSigma, StereoPyramid, SystemConfig, TrackRefill, TrackingConfig,
     TrackingLossConfig,
 };
 pub use counters::{RunCounters, SkipKind};
@@ -43,6 +45,7 @@ use crate::tracking::{
 };
 
 use crate::tracking::TrackingTimings;
+use crate::tracking::flow_pool::FlowPool;
 use crate::tracking::local_map::select_local_map_points;
 use crate::tracking::motion::{InertialPrediction, body_to_world, predict_pose};
 use crate::tracking::optical_flow::FlowSurvivor;
@@ -215,6 +218,9 @@ pub struct SlamSystem {
     estimator: estimator::EstimatorState,
     // The keyframe bound and the culling that enforces it first, when set.
     map_bound: Option<(usize, crate::mapping::culling::KeyframeCullingConfig)>,
+    // Flow workers of the 1 ms frontend; none with `flow_threads: 1`.
+    #[allow(dead_code)] // skeleton: lane T steps it
+    flow_pool: FlowPool,
 }
 
 impl SlamSystem {
@@ -224,11 +230,26 @@ impl SlamSystem {
     pub fn build(config: SystemConfig, rig: SensorRig) -> Result<Self, BuildError> {
         config.validate()?;
         let rig = config.sensors.select_rig(rig)?;
+        config.validate_flow_threads(&rig)?;
         let settings = config.settings(&rig);
+        if let Some(knob) = settings.frontend_flow.unbuilt_knob() {
+            todo!("lane T: frontend.{knob}");
+        }
         let frontend = OrbFrontend::new(config.orb_detector(), &rig)
-            .with_secondary_keypoints(config.secondary_n_keypoints());
+            .with_secondary_keypoints(config.secondary_n_keypoints())
+            .with_stereo_pyramid(config.stereo_pyramid());
         let loop_closer = config.loop_closer(&rig)?;
-        Ok(Self::assemble(rig, settings, frontend, loop_closer))
+        let flow_pool = FlowPool::new(
+            settings.frontend_flow.threads,
+            settings.frontend_flow.first_core,
+        )?;
+        Ok(Self::assemble(
+            rig,
+            settings,
+            frontend,
+            loop_closer,
+            flow_pool,
+        ))
     }
 
     fn assemble(
@@ -236,6 +257,7 @@ impl SlamSystem {
         settings: SystemSettings,
         frontend: OrbFrontend,
         loop_closer: Option<LoopCloser>,
+        flow_pool: FlowPool,
     ) -> Self {
         let camera = rig.camera.clone();
         let map = Arc::new(Mutex::new(Map::new()));
@@ -298,6 +320,7 @@ impl SlamSystem {
             wheel: None,
             estimator: estimator::EstimatorState::default(),
             map_bound: None,
+            flow_pool,
         }
     }
 
