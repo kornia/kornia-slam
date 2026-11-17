@@ -4,17 +4,16 @@ use faer::prelude::Solve;
 use faer::sparse::linalg::solvers::{Llt, SymbolicLlt};
 use faer::sparse::{SparseColMat, Triplet};
 use faer::{Mat, Side};
-use kornia_3d::pgo::{PgoEdge, PgoParams};
+use kornia_3d::pgo::PgoParams;
 use kornia_3d::pose::Pose3d;
-use kornia_3d::ransac::{CauchyKernel, RobustKernel};
-use kornia_algebra::{SE3F32, SO3F64, Vec3F64};
-use thiserror::Error;
 
-use crate::pose_conversion::{
-    pose_to_se3 as convert_pose_to_se3, se3_to_pose as convert_se3_to_pose,
+pub(crate) use crate::upstream::kornia_3d::pgo::edge::weighted_relative_residual;
+pub use crate::upstream::kornia_3d::pgo::{
+    GravityManifold, InformationEdge, PoseGraphEdge, PoseManifold, Se3Manifold, SparsePgoError,
 };
-
-const RESIDUAL_DIM: usize = 6;
+use crate::upstream::kornia_3d::pgo::{RESIDUAL_DIM, validate_delta, validate_pose};
+#[cfg(test)]
+use crate::upstream::kornia_3d::pgo::{edge::sealed, pose_to_se3};
 
 const NUM_JACOBIAN_EPS: f32 = 1e-3;
 
@@ -23,200 +22,12 @@ const LAMBDA_FACTOR: f32 = 10.0;
 const LAMBDA_MIN: f32 = 1e-10;
 const LAMBDA_MAX: f32 = 1e10;
 
-/// The local parameterisation a pose is optimised in. Poses are world-to-camera.
-pub trait PoseManifold<const DOF: usize> {
-    /// The pose moved by `delta` in this manifold's tangent space.
-    fn retract(&self, pose: &Pose3d, delta: &[f32; DOF]) -> Result<Pose3d, SparsePgoError>;
-}
-
 /// Optimised poses (world-to-camera, in input order) and how the solve ended.
 #[derive(Debug, Clone)]
 pub struct SparsePgoResult {
     pub poses: Vec<Pose3d>,
     pub iterations: usize,
     pub converged: bool,
-}
-
-/// A relative-pose edge with a full 6x6 square-root information `S`. Its residual is
-/// `S * log(t_ab_meas^-1 * T_b * T_a^-1)`, ordered (translation, rotation), in camera `b`.
-#[derive(Debug, Clone, Copy)]
-pub struct InformationEdge {
-    pub pose_a: usize,
-    pub pose_b: usize,
-    /// `T_b * T_a^-1` for world-to-camera `T`, as in [`PgoEdge`].
-    pub t_ab_meas: SE3F32,
-    /// Row-major; the information is `S^T S`.
-    pub sqrt_information: [[f32; RESIDUAL_DIM]; RESIDUAL_DIM],
-    /// Cauchy scale `c` on the whitened squared residual `s`, `rho(s) = c^2 ln(1 + s / c^2)`;
-    /// `None` is least squares.
-    pub cauchy_scale: Option<f32>,
-}
-
-mod sealed {
-    use kornia_3d::pose::Pose3d;
-
-    use super::{RESIDUAL_DIM, SparsePgoError};
-
-    pub trait EdgeTerm {
-        fn pose_a(&self) -> usize;
-        fn pose_b(&self) -> usize;
-        fn validate(&self) -> Result<(), SparsePgoError>;
-        fn residual(
-            &self,
-            pose_a: &Pose3d,
-            pose_b: &Pose3d,
-        ) -> Result<[f32; RESIDUAL_DIM], SparsePgoError>;
-        /// The IRLS weight at `residual`, `None` for plain least squares.
-        fn robust_weight(&self, residual: &[f32; RESIDUAL_DIM]) -> Option<f32>;
-        fn accumulate_cost(
-            &self,
-            residual: &[f32; RESIDUAL_DIM],
-            cost: &mut f32,
-        ) -> Result<(), SparsePgoError>;
-    }
-}
-
-/// An edge [`sparse_pose_graph_optimize`] accepts: kornia-3d's scalar-weighted [`PgoEdge`] or an
-/// [`InformationEdge`].
-pub trait PoseGraphEdge: sealed::EdgeTerm {}
-
-impl PoseGraphEdge for PgoEdge {}
-impl PoseGraphEdge for InformationEdge {}
-
-// The PgoEdge path is the pre-information solver verbatim: same residual, same per-component
-// cost sum, no robust weight. `optimize_pose_graph_output_is_bit_identical_to_b1be250` holds it.
-impl sealed::EdgeTerm for PgoEdge {
-    fn pose_a(&self) -> usize {
-        self.pose_a
-    }
-
-    fn pose_b(&self) -> usize {
-        self.pose_b
-    }
-
-    fn validate(&self) -> Result<(), SparsePgoError> {
-        if !self.weight.is_finite() {
-            return Err(SparsePgoError::InvalidInput(
-                "pose-graph edge weight must be finite".into(),
-            ));
-        }
-        validate_se3(&self.t_ab_meas)
-    }
-
-    fn residual(
-        &self,
-        pose_a: &Pose3d,
-        pose_b: &Pose3d,
-    ) -> Result<[f32; RESIDUAL_DIM], SparsePgoError> {
-        weighted_relative_residual(pose_a, pose_b, &self.t_ab_meas, self.weight)
-    }
-
-    fn robust_weight(&self, _residual: &[f32; RESIDUAL_DIM]) -> Option<f32> {
-        None
-    }
-
-    fn accumulate_cost(
-        &self,
-        residual: &[f32; RESIDUAL_DIM],
-        cost: &mut f32,
-    ) -> Result<(), SparsePgoError> {
-        for value in residual {
-            *cost += value * value;
-            if !cost.is_finite() {
-                return Err(SparsePgoError::InvalidInput(
-                    "pose-graph cost must be finite".into(),
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
-impl sealed::EdgeTerm for InformationEdge {
-    fn pose_a(&self) -> usize {
-        self.pose_a
-    }
-
-    fn pose_b(&self) -> usize {
-        self.pose_b
-    }
-
-    fn validate(&self) -> Result<(), SparsePgoError> {
-        if self
-            .sqrt_information
-            .iter()
-            .flatten()
-            .any(|v| !v.is_finite())
-        {
-            return Err(SparsePgoError::InvalidInput(
-                "pose-graph square-root information must be finite".into(),
-            ));
-        }
-        if let Some(scale) = self.cauchy_scale
-            && !(scale.is_finite() && scale > 0.0)
-        {
-            return Err(SparsePgoError::InvalidInput(
-                "Cauchy scale must be finite and positive".into(),
-            ));
-        }
-        validate_se3(&self.t_ab_meas)
-    }
-
-    fn residual(
-        &self,
-        pose_a: &Pose3d,
-        pose_b: &Pose3d,
-    ) -> Result<[f32; RESIDUAL_DIM], SparsePgoError> {
-        let raw = weighted_relative_residual(pose_a, pose_b, &self.t_ab_meas, 1.0)?;
-        let whitened: [f32; RESIDUAL_DIM] = std::array::from_fn(|row| {
-            (0..RESIDUAL_DIM)
-                .map(|col| self.sqrt_information[row][col] * raw[col])
-                .sum()
-        });
-        if whitened.iter().any(|value| !value.is_finite()) {
-            return Err(SparsePgoError::InvalidInput(
-                "pose-graph residual must be finite".into(),
-            ));
-        }
-        Ok(whitened)
-    }
-
-    fn robust_weight(&self, residual: &[f32; RESIDUAL_DIM]) -> Option<f32> {
-        let scale = self.cauchy_scale?;
-        let squared = residual.iter().map(|v| v * v).sum::<f32>();
-        Some(CauchyKernel.weight(f64::from(squared), cauchy_c_sq(scale)) as f32)
-    }
-
-    fn accumulate_cost(
-        &self,
-        residual: &[f32; RESIDUAL_DIM],
-        cost: &mut f32,
-    ) -> Result<(), SparsePgoError> {
-        match self.cauchy_scale {
-            // Per component, as PgoEdge sums: LM stops on a relative cost change near f32's
-            // summation noise, so a different order stops it elsewhere in a flat valley.
-            None => {
-                for value in residual {
-                    *cost += value * value;
-                }
-            }
-            Some(scale) => {
-                let squared = residual.iter().map(|v| v * v).sum::<f32>();
-                *cost += CauchyKernel.rho(f64::from(squared), cauchy_c_sq(scale)) as f32;
-            }
-        }
-        if !cost.is_finite() {
-            return Err(SparsePgoError::InvalidInput(
-                "pose-graph cost must be finite".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// `c^2` in f64, as [`CauchyKernel`] takes it.
-fn cauchy_c_sq(scale: f32) -> f64 {
-    f64::from(scale) * f64::from(scale)
 }
 
 struct NormalSystem<const DOF: usize> {
@@ -454,102 +265,6 @@ impl<const DOF: usize> NormalSystem<DOF> {
         }
         Ok(step.into_iter().map(|value| value as f32).collect())
     }
-}
-
-/// Sparse pose-graph construction or solve failure.
-#[derive(Debug, Error)]
-pub enum SparsePgoError {
-    #[error("invalid input: {0}")]
-    InvalidInput(String),
-    #[error("sparse matrix construction failed: {0}")]
-    SparseMatrix(String),
-    #[error("sparse Cholesky factorization failed: {0}")]
-    Factorization(String),
-}
-
-/// Full 6-DoF: a right perturbation of the world-to-camera pose.
-pub struct Se3Manifold;
-
-impl PoseManifold<6> for Se3Manifold {
-    fn retract(&self, pose: &Pose3d, delta: &[f32; 6]) -> Result<Pose3d, SparsePgoError> {
-        validate_delta(delta)?;
-        se3_to_pose(&pose_to_se3(pose)?.retract(delta))
-    }
-}
-
-/// 4-DoF for gravity-aligned graphs: the camera centre moves in world coordinates and the pose
-/// turns about the world `gravity_axis`, so roll and pitch never change.
-pub struct GravityManifold {
-    gravity_axis: Vec3F64,
-}
-
-impl GravityManifold {
-    pub fn new(gravity_axis: Vec3F64) -> Result<Self, SparsePgoError> {
-        Ok(Self {
-            gravity_axis: normalized_gravity(gravity_axis)?,
-        })
-    }
-}
-
-impl PoseManifold<4> for GravityManifold {
-    fn retract(&self, pose: &Pose3d, delta: &[f32; 4]) -> Result<Pose3d, SparsePgoError> {
-        validate_pose(pose)?;
-        validate_delta(delta)?;
-
-        let center = pose.inverse().translation
-            + Vec3F64::new(delta[0] as f64, delta[1] as f64, delta[2] as f64);
-        // Positive world-frame yaw corresponds to a negative right perturbation
-        // of the world-to-camera rotation.
-        let yaw = SO3F64::exp(self.gravity_axis * -(delta[3] as f64)).matrix();
-        let rotation = pose.rotation * yaw;
-        let retracted = Pose3d::new(rotation, -(rotation * center));
-        validate_pose(&retracted)?;
-        Ok(retracted)
-    }
-}
-
-pub(crate) fn pose_to_se3(pose: &Pose3d) -> Result<SE3F32, SparsePgoError> {
-    validate_pose(pose)?;
-    let se3 = convert_pose_to_se3(pose);
-    validate_se3(&se3)?;
-    Ok(se3)
-}
-
-pub(crate) fn se3_to_pose(se3: &SE3F32) -> Result<Pose3d, SparsePgoError> {
-    validate_se3(se3)?;
-    let pose = convert_se3_to_pose(se3);
-    validate_pose(&pose)?;
-    Ok(pose)
-}
-
-pub(crate) fn weighted_relative_residual(
-    pose_a: &Pose3d,
-    pose_b: &Pose3d,
-    measurement: &SE3F32,
-    weight: f32,
-) -> Result<[f32; RESIDUAL_DIM], SparsePgoError> {
-    if !weight.is_finite() {
-        return Err(SparsePgoError::InvalidInput(
-            "pose-graph edge weight must be finite".into(),
-        ));
-    }
-    validate_se3(measurement)?;
-    let error = measurement.inverse() * (pose_to_se3(pose_b)? * pose_to_se3(pose_a)?.inverse());
-    let (translation, rotation) = error.log();
-    let residual = [
-        weight * translation.x,
-        weight * translation.y,
-        weight * translation.z,
-        weight * rotation.x,
-        weight * rotation.y,
-        weight * rotation.z,
-    ];
-    if residual.iter().any(|value| !value.is_finite()) {
-        return Err(SparsePgoError::InvalidInput(
-            "pose-graph residual must be finite".into(),
-        ));
-    }
-    Ok(residual)
 }
 
 /// Levenberg-Marquardt over a sparse pose graph of world-to-camera poses. Fixed poses and poses
@@ -1181,66 +896,6 @@ fn validate_damping(damping: f32) -> Result<(), SparsePgoError> {
         ));
     }
     Ok(())
-}
-
-fn normalized_gravity(gravity_axis: Vec3F64) -> Result<Vec3F64, SparsePgoError> {
-    if !vec3_f64_is_finite(gravity_axis) {
-        return Err(SparsePgoError::InvalidInput(
-            "gravity vector must be finite".into(),
-        ));
-    }
-    let norm = gravity_axis.length();
-    if !norm.is_finite() {
-        return Err(SparsePgoError::InvalidInput(
-            "gravity vector magnitude must be finite".into(),
-        ));
-    }
-    if norm <= 1e-9 {
-        return Err(SparsePgoError::InvalidInput(
-            "gravity vector must be non-zero".into(),
-        ));
-    }
-    Ok(gravity_axis / norm)
-}
-
-fn validate_delta<const DOF: usize>(delta: &[f32; DOF]) -> Result<(), SparsePgoError> {
-    if delta.iter().any(|value| !value.is_finite()) {
-        return Err(SparsePgoError::InvalidInput(
-            "pose delta must contain only finite values".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_pose(pose: &Pose3d) -> Result<(), SparsePgoError> {
-    let rotation_is_finite = (0..3).all(|column| {
-        let value = pose.rotation.col(column);
-        vec3_f64_is_finite(value.into())
-    });
-    if !rotation_is_finite || !vec3_f64_is_finite(pose.translation) {
-        return Err(SparsePgoError::InvalidInput(
-            "pose must contain only finite values".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_se3(se3: &SE3F32) -> Result<(), SparsePgoError> {
-    let rotation = se3.r.matrix();
-    let rotation_is_finite = (0..3).all(|column| {
-        let value = rotation.col(column);
-        [value.x, value.y, value.z].into_iter().all(f32::is_finite)
-    });
-    if !rotation_is_finite || ![se3.t.x, se3.t.y, se3.t.z].into_iter().all(f32::is_finite) {
-        return Err(SparsePgoError::InvalidInput(
-            "SE(3) transform must contain only finite values".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn vec3_f64_is_finite(value: Vec3F64) -> bool {
-    [value.x, value.y, value.z].into_iter().all(f64::is_finite)
 }
 
 #[cfg(test)]

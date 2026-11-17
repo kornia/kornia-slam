@@ -1,19 +1,13 @@
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat3F64, SE3F32, SO3F32, SO3F64};
+use kornia_algebra::SO3F64;
 
+pub(crate) use crate::upstream::kornia_3d::pose_ext::{orthonormalized, pose_to_se3, se3_to_pose};
 pub(crate) use crate::upstream::kornia_algebra::cast::{
     mat3_to_f32, mat3_to_f64, vec3_to_f32, vec3_to_f64,
 };
 
 /// Largest [`Pose3d::rotation_defect`] a pose rotation may carry and still count as rigid.
 pub(crate) const RIGID_TOLERANCE: f64 = 1e-6;
-
-/// The rotation nearest `r` through its unit quaternion. `Pose3d::inverse` is a
-/// transpose, so a scaled rotation fed back through it compounds its scale
-/// (the Sophus invariant ORB-SLAM3 and Basalt rely on).
-pub(crate) fn orthonormalized(r: Mat3F64) -> Mat3F64 {
-    SO3F64::from_quaternion(SO3F64::from_matrix(&r).q.normalize()).matrix()
-}
 
 /// `pose` with its rotation [`orthonormalized`]; the translation is kept.
 pub(crate) fn rigid(pose: Pose3d) -> Pose3d {
@@ -27,22 +21,6 @@ pub(crate) fn angle_deg(from: &Pose3d, to: &Pose3d) -> f64 {
         .log()
         .length()
         .to_degrees()
-}
-
-pub(crate) fn pose_to_se3(pose: &Pose3d) -> SE3F32 {
-    // The quaternion of a scaled matrix is not unit, and `retract` keeps it so.
-    let rotation = SO3F32::from_matrix(&mat3_to_f32(pose.rotation));
-    SE3F32::new(
-        SO3F32::from_quaternion(rotation.q.normalize()),
-        vec3_to_f32(pose.translation),
-    )
-}
-
-pub(crate) fn se3_to_pose(se3: &SE3F32) -> Pose3d {
-    Pose3d::new(
-        orthonormalized(mat3_to_f64(se3.r.matrix())),
-        vec3_to_f64(se3.t),
-    )
 }
 
 /// Carries a reference-keyframe correction into the current tracking pose while
@@ -60,7 +38,7 @@ pub(crate) fn apply_reference_pose_correction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kornia_algebra::Vec3F64;
+    use kornia_algebra::{Mat3F64, SE3F32, SO3F32, Vec3F64};
 
     fn rotation() -> Mat3F64 {
         SO3F64::exp(Vec3F64::new(0.3, -0.2, 0.9)).matrix()
