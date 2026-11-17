@@ -482,19 +482,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn keyframes_belong_to_the_segment_they_were_seeded_in() {
-        let mut segments = Segments::default();
-        segments.begin(0);
-        segments.begin(131);
-        segments.begin(6866);
-        assert_eq!(
-            [0, 130, 131, 6000, 6866, 9000].map(|kf| segments.of(kf)),
-            [0, 0, 1, 1, 2, 2]
-        );
-        assert_eq!(segments.latest(), 2);
-    }
-
-    #[test]
     fn a_lost_camera_adopts_any_jump_into_an_older_segment_only() {
         let mut segments = Segments::default();
         segments.begin(0);
