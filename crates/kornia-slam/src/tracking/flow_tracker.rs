@@ -935,7 +935,8 @@ impl RigFlow {
 
     /// Picks this frame's refill camera, round robin, when it holds fewer
     /// than `refill_below` of its tracks; its occupied pixels are every one of
-    /// its tracks', across shards, so the corners do not depend on the split.
+    /// its tracks' start pixels in the current frame, which refill detects
+    /// on, across shards, so the corners do not depend on the split.
     fn plan_refill(&mut self, tracks: &TrackSet, frame_idx: u64) {
         let TrackRefill::Enabled {
             per_camera,
@@ -946,14 +947,19 @@ impl RigFlow {
             return;
         };
         let camera = (frame_idx % self.cameras().max(1) as u64) as usize;
-        let guess = &mut self.guess;
-        guess.refill_occupied.extend(
+        let Some(model) = self.guess.cameras.get(camera) else {
+            return;
+        };
+        let mut occupied = std::mem::take(&mut self.guess.refill_occupied);
+        occupied.extend(
             tracks
                 .tracks()
                 .iter()
                 .filter(|track| track.camera() == camera)
-                .map(Track::pixel),
+                .map(|track| start_pixel(track, model, &self.guess)),
         );
+        let guess = &mut self.guess;
+        guess.refill_occupied = occupied;
         if (guess.refill_occupied.len() as f32) < refill_below * per_camera as f32 {
             guess.refill_camera = Some(camera);
             guess.refill_shard = tracks.refill_shard(camera);
@@ -1146,5 +1152,69 @@ mod tests {
         assert_eq!(shard.fb_rejects, 0);
         assert_eq!(shard.survivors.len(), 1);
         assert!(distance(shard.survivors[0].pixel, [103.0, 80.0]) < 0.05);
+    }
+
+    fn refill() -> TrackRefill {
+        TrackRefill::Enabled {
+            per_camera: 48,
+            min_spacing_px: 23.0,
+            refill_below: 0.8,
+            border_px: 9,
+        }
+    }
+
+    fn rig_flow(gyro_guess: GyroGuess) -> RigFlow {
+        let settings = RigFlowSettings {
+            threads: 1,
+            first_core: None,
+            window: 11,
+            predicted: (0, 8),
+            unpredicted: (0, 8),
+            epsilon: 0.01,
+            retry: KltRetry::Off,
+            forward_backward: ForwardBackward::Off,
+            refill: refill(),
+            anchor_guard: AnchorGuard::Off,
+            gyro_guess,
+        };
+        let camera = RigFlowCamera {
+            camera: pinhole(),
+            camera_from_primary: None,
+        };
+        RigFlow::new(settings, vec![camera]).unwrap()
+    }
+
+    /// T8: refill detects on the current frame, so the occupied pixels are
+    /// where the tracks start there, not where they were.
+    #[test]
+    fn refill_occupancy_is_where_the_tracks_start() {
+        let mut flow = rig_flow(GyroGuess::RotatedRay);
+        let mut tracks = TrackSet::new();
+        for pixel in [[60.0, 50.0], [120.0, 90.0]] {
+            tracks.spawn(pixel);
+        }
+        // 7 degrees of yaw: about 25 px of flow at f = 200 px.
+        let yaw = 7f64.to_radians();
+        let rotation = Mat3F64::from_cols(
+            kornia_algebra::Vec3F64::new(yaw.cos(), 0.0, -yaw.sin()),
+            kornia_algebra::Vec3F64::new(0.0, 1.0, 0.0),
+            kornia_algebra::Vec3F64::new(yaw.sin(), 0.0, yaw.cos()),
+        );
+        let input = FlowStepInput {
+            frame_idx: 0,
+            pose_world_to_primary: None,
+            primary_rotation: Some(rotation),
+        };
+
+        flow.fill_guess(&input, 0, 8);
+        flow.plan_refill(&tracks, 0);
+
+        assert_eq!(flow.guess.refill_camera, Some(0));
+        assert_eq!(flow.guess.refill_occupied.len(), 2);
+        for (track, occupied) in tracks.tracks().iter().zip(&flow.guess.refill_occupied) {
+            let start = rotated_ray_pixel(&pinhole(), &rotation, track.pixel()).unwrap();
+            assert!(distance(start, track.pixel()) > 20.0);
+            assert_eq!(*occupied, start);
+        }
     }
 }
