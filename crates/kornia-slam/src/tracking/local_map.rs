@@ -11,6 +11,7 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_image::ImageSize;
 
+use crate::features::Descriptor;
 use crate::mapping::{Keyframe, Map};
 
 /// Bounds on the local-map search. The defaults are the values this system has
@@ -41,10 +42,10 @@ impl Default for LocalMapSelectionConfig {
 /// Builds the local map for tracking: indices of non-culled map points
 /// observed by the current keyframe, the keyframes owning the tracked points,
 /// and their covisibility neighbors.
-pub fn select_local_map_points(
-    map: &Map,
+pub fn select_local_map_points<D: Descriptor>(
+    map: &Map<D>,
     tracked_matches: &[(usize, usize)],
-    current_keyframe: Option<&Keyframe>,
+    current_keyframe: Option<&Keyframe<D>>,
     config: LocalMapSelectionConfig,
 ) -> Vec<usize> {
     // Vote over every keyframe observing each tracked point (ORB-SLAM3's
@@ -123,8 +124,8 @@ pub fn select_local_map_points(
 ///
 /// A projection test only: it says nothing about occlusion, descriptor
 /// distance, or the scale and viewing-angle gates the matcher applies later.
-pub fn landmarks_in_frustum(
-    map: &Map,
+pub fn landmarks_in_frustum<D: Descriptor>(
+    map: &Map<D>,
     candidates: &[usize],
     camera: &PinholeCamera,
     pose_world_to_cam: &Pose3d,

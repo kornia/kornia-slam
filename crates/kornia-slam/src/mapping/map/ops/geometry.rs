@@ -11,11 +11,12 @@
 //! depends on a camera centre that solve moved, even though its own position
 //! must never be written back from that stale capture.
 
+use crate::features::Descriptor;
 use crate::mapping::map::Map;
 use kornia_algebra::Vec3F64;
 use std::collections::HashSet;
 
-impl Map {
+impl<D: Descriptor> Map<D> {
     /// Recomputes the mean viewing direction and scale-invariance distance
     /// bounds for one map point from its observing keyframes (ORB-SLAM3's
     /// `MapPoint::UpdateNormalAndDepth`). No-op if the point is culled or its

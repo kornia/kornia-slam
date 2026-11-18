@@ -1,19 +1,20 @@
 use std::collections::HashSet;
 
 use kornia_3d::camera::PinholeCamera;
-use kornia_imgproc::features::hamming_distance;
 
+use crate::features::Descriptor;
 use crate::mapping::map::{Map, MapMutationError};
 
 use super::VerifiedLoopEdge;
 
 /// Bounded landmark search performed after an accepted loop correction.
 #[derive(Debug, Clone)]
-pub struct LoopFusionConfig {
+pub struct LoopFusionConfig<T = u32> {
     pub min_covisibility_weight: usize,
     pub max_neighbors_per_side: usize,
     pub search_radius_px: f32,
-    pub max_hamming: u32,
+    /// Maximum descriptor distance to accept a match.
+    pub max_distance: T,
     pub max_reprojection_error_px: f64,
 }
 
@@ -23,7 +24,7 @@ impl Default for LoopFusionConfig {
             min_covisibility_weight: 15,
             max_neighbors_per_side: 5,
             search_radius_px: 7.0,
-            max_hamming: 50,
+            max_distance: 50,
             max_reprojection_error_px: 3.0,
         }
     }
@@ -40,11 +41,11 @@ pub struct LoopFusionStats {
 }
 
 /// Adds and merges landmark observations across a geometrically verified loop.
-pub fn fuse_verified_loop(
-    map: &mut Map,
+pub fn fuse_verified_loop<D: Descriptor>(
+    map: &mut Map<D>,
     camera: &PinholeCamera,
     edge: &VerifiedLoopEdge,
-    config: &LoopFusionConfig,
+    config: &LoopFusionConfig<D::Distance>,
 ) -> LoopFusionStats {
     let query_side = loop_side_keyframes(map, edge.query_kf_idx, config);
     let candidate_side = loop_side_keyframes(map, edge.candidate_kf_idx, config);
@@ -68,7 +69,11 @@ pub fn fuse_verified_loop(
     stats
 }
 
-fn loop_side_keyframes(map: &Map, anchor: usize, config: &LoopFusionConfig) -> Vec<usize> {
+fn loop_side_keyframes<D: Descriptor, T>(
+    map: &Map<D>,
+    anchor: usize,
+    config: &LoopFusionConfig<T>,
+) -> Vec<usize> {
     if map.get_keyframe(anchor).is_none() {
         return Vec::new();
     }
@@ -82,12 +87,12 @@ fn loop_side_keyframes(map: &Map, anchor: usize, config: &LoopFusionConfig) -> V
     side
 }
 
-fn fuse_loop_direction(
-    map: &mut Map,
+fn fuse_loop_direction<D: Descriptor>(
+    map: &mut Map<D>,
     camera: &PinholeCamera,
     source_keyframes: &[usize],
     target_keyframes: &[usize],
-    config: &LoopFusionConfig,
+    config: &LoopFusionConfig<D::Distance>,
     stats: &mut LoopFusionStats,
 ) {
     let mut seen_points = HashSet::new();
@@ -137,7 +142,7 @@ fn fuse_loop_direction(
                 };
                 let projected_x = projected.x as f32;
                 let projected_y = projected.y as f32;
-                let mut best: Option<(usize, u32, f32)> = None;
+                let mut best: Option<(usize, D::Distance, f32)> = None;
                 for target_desc_idx in 0..target.frame.features.descriptors.len() {
                     let Some(keypoint) = target.frame.undistorted_xy(target_desc_idx, camera)
                     else {
@@ -150,17 +155,16 @@ fn fuse_loop_direction(
                     {
                         continue;
                     }
-                    let hamming = hamming_distance(
-                        &source_point.descriptor,
-                        &target.frame.features.descriptors[target_desc_idx],
-                    );
-                    if hamming > config.max_hamming {
+                    let descriptor_distance = source_point
+                        .descriptor
+                        .distance(&target.frame.features.descriptors[target_desc_idx]);
+                    if descriptor_distance > config.max_distance {
                         continue;
                     }
-                    if best.is_none_or(|(_, best_hamming, best_distance)| {
-                        (hamming, distance_sq).lt(&(best_hamming, best_distance))
+                    if best.is_none_or(|(_, best_descriptor, best_distance)| {
+                        (descriptor_distance, distance_sq).lt(&(best_descriptor, best_distance))
                     }) {
-                        best = Some((target_desc_idx, hamming, distance_sq));
+                        best = Some((target_desc_idx, descriptor_distance, distance_sq));
                     }
                 }
                 best.map(|(target_desc_idx, _, _)| {

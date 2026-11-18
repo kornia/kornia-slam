@@ -7,6 +7,7 @@
 //! The map does not need to know whether a position came from stereo depth or
 //! from pair triangulation — both paths build the same request.
 
+use crate::features::{Descriptor, DescriptorSet, Features};
 use crate::frame::{Frame, undistorted_camera};
 use crate::mapping::map::{
     LandmarkSeed, LandmarkTarget, Map, MapInsertion, ObservationKey, ObservationLink,
@@ -15,7 +16,7 @@ use crate::stereo::unproject_stereo;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::{Pose3d, TriangulationConfig, triangulate_matched_points};
 use kornia_algebra::{Mat3F64, SO3F64, Vec2F64, Vec3F64};
-use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 
 /// Minimum epipolar-consistent matches before a pair is worth triangulating.
@@ -30,8 +31,8 @@ const EPIPOLAR_CHI2: f64 = 3.84;
 /// slots already taken — tracked matches for a keyframe about to be published,
 /// or the stored associations of one already in the map — so a seed can never
 /// contend for a feature an earlier pass took.
-pub fn stereo_seeds(
-    frame: &Frame,
+pub fn stereo_seeds<D>(
+    frame: &Frame<D>,
     camera: &PinholeCamera,
     mthdepth: f64,
     claimed: &[Option<usize>],
@@ -72,14 +73,14 @@ pub fn stereo_seeds(
 /// to its `curr_kf_idx` feature and carries an explicit second observation on
 /// `prev_kf_idx` — without that second observer the point would bias its own
 /// scale and normal geometry and the cull would be over-aggressive.
-pub fn pair_growth_request(
-    map: &Map,
+pub fn pair_growth_request<D: Descriptor>(
+    map: &Map<D>,
     prev_kf_idx: usize,
     curr_kf_idx: usize,
-    match_config: OrbMatchConfig,
+    match_config: &D::MatchConfig,
     triangulation_config: &TriangulationConfig,
     camera: &PinholeCamera,
-) -> Option<MapInsertion> {
+) -> Option<MapInsertion<D>> {
     let prev_kf = map.get_keyframe(prev_kf_idx)?;
     let curr_kf = map.get_keyframe(curr_kf_idx)?;
     let scale_factor = map.scale_pyramid().factor;
@@ -138,23 +139,17 @@ pub fn pair_growth_request(
     // Brute-force descriptor matching over the unassociated subsets; the global
     // second-best ratio test and orientation consistency live in the matcher and
     // are essential for match quality.
-    let sub_matches = match_orb_descriptors(
-        &prev_unassoc
-            .iter()
-            .map(|&i| prev_kf.frame.features.orientations[i])
-            .collect::<Vec<_>>(),
-        &prev_unassoc
-            .iter()
-            .map(|&i| prev_kf.frame.features.descriptors[i])
-            .collect::<Vec<_>>(),
-        &curr_unassoc
-            .iter()
-            .map(|&i| curr_kf.frame.features.orientations[i])
-            .collect::<Vec<_>>(),
-        &curr_unassoc
-            .iter()
-            .map(|&i| curr_kf.frame.features.descriptors[i])
-            .collect::<Vec<_>>(),
+    let (prev_orientations, prev_descriptors) = subset(&prev_kf.frame.features, &prev_unassoc);
+    let (curr_orientations, curr_descriptors) = subset(&curr_kf.frame.features, &curr_unassoc);
+    let sub_matches = D::match_sets(
+        DescriptorSet {
+            orientations: &prev_orientations,
+            descriptors: &prev_descriptors,
+        },
+        DescriptorSet {
+            orientations: &curr_orientations,
+            descriptors: &curr_descriptors,
+        },
         match_config,
     );
 
@@ -269,20 +264,29 @@ pub fn pair_growth_request(
     (!request.landmarks.is_empty()).then_some(request)
 }
 
+/// Orientations (when the detector has them) and descriptors of `indices`.
+fn subset<D: Descriptor>(features: &Features<D>, indices: &[usize]) -> (Vec<f32>, Vec<D>) {
+    let orientations = if features.orientations.is_empty() {
+        Vec::new()
+    } else {
+        indices.iter().map(|&i| features.orientations[i]).collect()
+    };
+    let descriptors = indices.iter().map(|&i| features.descriptors[i]).collect();
+    (orientations, descriptors)
+}
+
 /// Search radius, in pixels, for a landmark's projection into a neighbour.
 const FUSE_SEARCH_RADIUS_PX: f32 = 7.0;
-/// Descriptor distance above which a projected landmark is not the keypoint.
-const FUSE_MAX_HAMMING: u32 = 50;
 
 /// Links the current keyframe's landmarks into neighbours that do not yet
 /// observe them — the forward half of ORB-SLAM3's `SearchInNeighbors`.
 ///
 /// Read-only: proposals are resolved deterministically here (a keypoint wanted
-/// by two landmarks goes to the smaller Hamming distance) and the caller
+/// by two landmarks goes to the smaller descriptor distance) and the caller
 /// publishes them. Duplicate merging and the second-hop covisible expansion are
 /// still not implemented.
-pub fn neighbor_fusion_links(
-    map: &Map,
+pub fn neighbor_fusion_links<D: Descriptor>(
+    map: &Map<D>,
     curr_kf_idx: usize,
     neighbor_kf_indices: &[usize],
     camera: &PinholeCamera,
@@ -310,8 +314,8 @@ pub fn neighbor_fusion_links(
             continue;
         };
 
-        // (keypoint in neighbour, landmark, hamming)
-        let mut proposals: Vec<(usize, usize, u32)> = Vec::new();
+        // (keypoint in neighbour, landmark, descriptor distance)
+        let mut proposals: Vec<(usize, usize, D::Distance)> = Vec::new();
         for &mp_idx in &curr_mp_indices {
             let mp = match map.map_points().get(mp_idx) {
                 Some(mp) if !mp.culled => mp,
@@ -326,8 +330,7 @@ pub fn neighbor_fusion_links(
             };
             let (u, v) = (pixel.x as f32, pixel.y as f32);
 
-            let mut best_dist = u32::MAX;
-            let mut best_kp = usize::MAX;
+            let mut best: Option<(D::Distance, usize)> = None;
             for kp_idx in 0..nb_kf.frame.features.keypoints_xy.len() {
                 if nb_kf.map_point(kp_idx).is_some() {
                     continue;
@@ -339,14 +342,16 @@ pub fn neighbor_fusion_links(
                 if dx * dx + dy * dy > r2 {
                     continue;
                 }
-                let dist =
-                    hamming_distance(&mp.descriptor, &nb_kf.frame.features.descriptors[kp_idx]);
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_kp = kp_idx;
+                let dist = mp
+                    .descriptor
+                    .distance(&nb_kf.frame.features.descriptors[kp_idx]);
+                if best.is_none_or(|(best_dist, _)| dist < best_dist) {
+                    best = Some((dist, kp_idx));
                 }
             }
-            if best_dist <= FUSE_MAX_HAMMING && best_kp != usize::MAX {
+            if let Some((best_dist, best_kp)) = best
+                && best_dist <= D::TH_LOW
+            {
                 proposals.push((best_kp, mp_idx, best_dist));
             }
         }
@@ -354,7 +359,7 @@ pub fn neighbor_fusion_links(
         // Closest descriptor wins a contested keypoint; one claim per keypoint
         // and one per landmark, since a landmark may hold only one feature in
         // any keyframe.
-        proposals.sort_by_key(|&(_, _, dist)| dist);
+        proposals.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal));
         let mut taken_kp: HashSet<usize> = HashSet::new();
         let mut taken_mp: HashSet<usize> = HashSet::new();
         for (kp_idx, mp_idx, _) in proposals {
@@ -471,7 +476,7 @@ mod tests {
             &map,
             10,
             10,
-            OrbMatchConfig::default(),
+            &kornia_imgproc::features::OrbMatchConfig::default(),
             &TriangulationConfig::default(),
             &camera(),
         );
@@ -515,7 +520,7 @@ mod tests {
             &map,
             10,
             20,
-            OrbMatchConfig::default(),
+            &kornia_imgproc::features::OrbMatchConfig::default(),
             &TriangulationConfig::default(),
             &camera,
         )
@@ -539,7 +544,7 @@ mod tests {
                 &map,
                 10,
                 20,
-                OrbMatchConfig::default(),
+                &kornia_imgproc::features::OrbMatchConfig::default(),
                 &TriangulationConfig::default(),
                 &camera,
             )
@@ -587,7 +592,7 @@ mod tests {
             &map,
             10,
             20,
-            OrbMatchConfig::default(),
+            &kornia_imgproc::features::OrbMatchConfig::default(),
             &TriangulationConfig::default(),
             &camera,
         )
@@ -636,6 +641,62 @@ mod tests {
         assert_eq!(links[0].landmark, LandmarkTarget::Existing(best));
         assert_eq!(links[0].observation.feature_idx, 0);
         assert_ne!(links[0].landmark, LandmarkTarget::Existing(worse));
+    }
+
+    #[test]
+    fn fusion_runs_on_float_descriptors_without_orientations() {
+        use crate::features::{ScalePyramid, scalar::Scalar};
+
+        let frame = |idx: usize, descriptors: Vec<Scalar>| {
+            let n = descriptors.len();
+            Frame {
+                idx,
+                features: Features {
+                    keypoints_xy: vec![[320.0, 240.0]; n],
+                    orientations: Vec::new(),
+                    descriptors,
+                    octaves: vec![0; n],
+                },
+                pose_world_to_cam: Pose3d::IDENTITY,
+                image_size: ImageSize {
+                    width: 640,
+                    height: 480,
+                },
+                keypoint_colors: vec![[0; 3]; n],
+                u_right: Vec::new(),
+                depth: Vec::new(),
+                keypoints_undist: Vec::new(),
+            }
+        };
+        let mut map = Map::with_scale_pyramid(ScalePyramid {
+            factor: 1.0,
+            n_levels: 1,
+        });
+        map.insert_keyframe(Keyframe::from_frame(frame(
+            10,
+            vec![Scalar(0.9), Scalar(0.1), Scalar(9.0)],
+        )))
+        .unwrap();
+        map.insert_keyframe(Keyframe::from_frame(frame(20, vec![Scalar(0.0)])))
+            .unwrap();
+        let landmark = |map: &mut Map<Scalar>, feature_idx| {
+            map.insert_landmark(LandmarkSeed {
+                position: Vec3F64::new(0.0, 0.0, 5.0),
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 10,
+                    feature_idx,
+                },
+            })
+            .unwrap()
+        };
+        let _worse = landmark(&mut map, 0);
+        let best = landmark(&mut map, 1);
+        let _beyond_threshold = landmark(&mut map, 2);
+
+        let links = neighbor_fusion_links(&map, 10, &[20], &camera());
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].landmark, LandmarkTarget::Existing(best));
     }
 
     /// A rejected candidate must reserve nothing. `(0, 1)` is refused because

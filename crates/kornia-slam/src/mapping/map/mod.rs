@@ -115,9 +115,11 @@ impl Map {
     pub fn new() -> Self {
         Self::with_scale_pyramid(ScalePyramid::ORB)
     }
+}
 
+impl<D> Map<D> {
     /// Returns all keyframes.
-    pub fn keyframes(&self) -> &[Keyframe] {
+    pub fn keyframes(&self) -> &[Keyframe<D>] {
         &self.keyframes
     }
 
@@ -127,23 +129,23 @@ impl Map {
     /// Private to this module tree — `map` and its descendants. Everything
     /// outside changes structure only through the canonical operations, which
     /// keep both sides of every link in step.
-    fn keyframes_mut(&mut self) -> &mut [Keyframe] {
+    fn keyframes_mut(&mut self) -> &mut [Keyframe<D>] {
         &mut self.keyframes
     }
 
     /// Returns the keyframe with frame index `idx`, if present.
-    pub fn get_keyframe(&self, idx: usize) -> Option<&Keyframe> {
+    pub fn get_keyframe(&self, idx: usize) -> Option<&Keyframe<D>> {
         self.keyframes.iter().find(|kf| kf.frame.idx == idx)
     }
 
     /// Mutable access to one stored keyframe, for numeric writeback. Private
     /// for the same reason as [`Map::keyframes_mut`].
-    fn get_keyframe_mut(&mut self, idx: usize) -> Option<&mut Keyframe> {
+    fn get_keyframe_mut(&mut self, idx: usize) -> Option<&mut Keyframe<D>> {
         self.keyframes.iter_mut().find(|kf| kf.frame.idx == idx)
     }
 
     /// Returns all map points.
-    pub fn map_points(&self) -> &[MapPoint] {
+    pub fn map_points(&self) -> &[MapPoint<D>] {
         &self.map_points
     }
 
@@ -154,7 +156,7 @@ impl Map {
     /// `swap` and `sort` would still reassign landmark identities without
     /// repairing the associations that index them, so this stays inside the
     /// module tree where every caller is auditable.
-    fn map_points_mut(&mut self) -> &mut [MapPoint] {
+    fn map_points_mut(&mut self) -> &mut [MapPoint<D>] {
         &mut self.map_points
     }
 

@@ -326,7 +326,7 @@ pub fn compute_stereo_matches(
 /// `camera` must be the rectified, zero-distortion camera the depths were
 /// computed against; keypoint coordinates are taken as-is (already undistorted
 /// for a rectified frame).
-pub fn unproject_stereo(frame: &Frame, camera: &PinholeCamera) -> Vec<(usize, Vec3F64)> {
+pub fn unproject_stereo<D>(frame: &Frame<D>, camera: &PinholeCamera) -> Vec<(usize, Vec3F64)> {
     let mut out = Vec::new();
     for (i, kp) in frame.features.keypoints_xy.iter().enumerate() {
         if let Some(z) = frame.stereo_depth(i) {

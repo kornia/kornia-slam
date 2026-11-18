@@ -5,28 +5,70 @@
 use std::cmp::Ordering;
 use std::fmt::Debug;
 
-use kornia_imgproc::features::{OrbFeatures, hamming_distance};
+use kornia_imgproc::features::{
+    OrbFeatures, OrbMatchConfig, hamming_distance, match_orb_descriptors,
+};
 
 /// A descriptor type kornia-slam can match and aggregate into landmarks.
 pub trait Descriptor: Copy + Debug + PartialEq + Send + Sync + 'static {
     /// Dissimilarity between two descriptors; smaller is more alike.
     type Distance: Copy + PartialOrd + Debug + Send + Sync;
+    /// Settings of [`Descriptor::match_sets`].
+    type MatchConfig: Clone + Debug + Send + Sync;
+
+    /// Distance within which a guided search accepts a match without a ratio
+    /// test (ORB-SLAM3's `ORBmatcher::TH_LOW`).
+    const TH_LOW: Self::Distance;
 
     fn distance(&self, other: &Self) -> Self::Distance;
+
+    /// Unguided matching of `query` against `candidates`: at most one
+    /// candidate per query, as `(query, candidate)` index pairs in query order.
+    fn match_sets(
+        query: DescriptorSet<'_, Self>,
+        candidates: DescriptorSet<'_, Self>,
+        config: &Self::MatchConfig,
+    ) -> Vec<(usize, usize)>;
 }
 
 /// ORB's 256-bit rBRIEF descriptor, compared by Hamming distance.
 impl Descriptor for [u8; 32] {
     type Distance = u32;
+    type MatchConfig = OrbMatchConfig;
+
+    const TH_LOW: u32 = 50;
 
     fn distance(&self, other: &Self) -> u32 {
         hamming_distance(self, other)
     }
+
+    fn match_sets(
+        query: DescriptorSet<'_, Self>,
+        candidates: DescriptorSet<'_, Self>,
+        config: &OrbMatchConfig,
+    ) -> Vec<(usize, usize)> {
+        match_orb_descriptors(
+            query.orientations,
+            query.descriptors,
+            candidates.orientations,
+            candidates.descriptors,
+            *config,
+        )
+    }
+}
+
+/// Descriptors with their keypoint orientations, the input of
+/// [`Descriptor::match_sets`]. `orientations` is either parallel to
+/// `descriptors` or empty.
+#[derive(Debug, Clone, Copy)]
+pub struct DescriptorSet<'a, D> {
+    pub orientations: &'a [f32],
+    pub descriptors: &'a [D],
 }
 
 /// Per-keypoint parallel vectors for one image. Index `i` in every vector
 /// describes the same keypoint.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Features<D = [u8; 32]> {
     /// Keypoints as `[col, row]` in full-resolution pixels.
     pub keypoints_xy: Vec<[f32; 2]>,
@@ -38,7 +80,25 @@ pub struct Features<D = [u8; 32]> {
     pub octaves: Vec<u8>,
 }
 
+impl<D> Default for Features<D> {
+    fn default() -> Self {
+        Self {
+            keypoints_xy: Vec::new(),
+            orientations: Vec::new(),
+            descriptors: Vec::new(),
+            octaves: Vec::new(),
+        }
+    }
+}
+
 impl<D> Features<D> {
+    pub fn descriptor_set(&self) -> DescriptorSet<'_, D> {
+        DescriptorSet {
+            orientations: &self.orientations,
+            descriptors: &self.descriptors,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.keypoints_xy.len()
     }
@@ -103,6 +163,48 @@ pub fn most_distinctive<T, D: Descriptor>(
     best.map(|(i, _)| i)
 }
 
+/// A one-dimensional float descriptor for exercising the generic paths with
+/// a non-Hamming distance and no orientations.
+#[cfg(test)]
+pub(crate) mod scalar {
+    use super::{Descriptor, DescriptorSet};
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub(crate) struct Scalar(pub f32);
+
+    impl Descriptor for Scalar {
+        type Distance = f32;
+        type MatchConfig = ();
+
+        const TH_LOW: f32 = 0.5;
+
+        fn distance(&self, other: &Self) -> f32 {
+            (self.0 - other.0).abs()
+        }
+
+        fn match_sets(
+            query: DescriptorSet<'_, Self>,
+            candidates: DescriptorSet<'_, Self>,
+            _config: &(),
+        ) -> Vec<(usize, usize)> {
+            query
+                .descriptors
+                .iter()
+                .enumerate()
+                .filter_map(|(i, q)| {
+                    let (j, d) = candidates
+                        .descriptors
+                        .iter()
+                        .map(|c| q.distance(c))
+                        .enumerate()
+                        .min_by(|a, b| a.1.total_cmp(&b.1))?;
+                    (d <= Self::TH_LOW).then_some((i, j))
+                })
+                .collect()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +225,14 @@ mod tests {
         // Equal medians resolve to the first descriptor.
         assert_eq!(most_distinctive(&[orb(4), orb(4)], |d| d), Some(0));
         assert_eq!(most_distinctive::<[u8; 32], [u8; 32]>(&[], |d| d), None);
+    }
+
+    #[test]
+    fn most_distinctive_works_for_float_distances() {
+        use scalar::Scalar;
+        // Upper medians: 9.6, 0.4, 0.5, 0.5.
+        let set = [Scalar(10.0), Scalar(0.4), Scalar(0.0), Scalar(0.5)];
+        assert_eq!(most_distinctive(&set, |d| d), Some(1));
     }
 
     #[test]
