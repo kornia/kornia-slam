@@ -55,6 +55,10 @@ pub enum RigCalibrationError {
     NotRigid { camera: usize, defect: f64 },
     #[error("camera {camera}: the last row of the transform is not 0 0 0 1")]
     NotHomogeneous { camera: usize },
+    #[error("camera {camera}: the transform has a non-finite entry")]
+    NotFinite { camera: usize },
+    #[error("camera {camera}: the rotation is a reflection")]
+    Reflection { camera: usize },
 }
 
 /// Largest [`Pose3d::rotation_defect`] a written transform may have: the
@@ -125,9 +129,17 @@ impl RigCalibration {
             if transform[3] != [0.0, 0.0, 0.0, 1.0] {
                 return Err(RigCalibrationError::NotHomogeneous { camera });
             }
-            let defect = pose_of(transform).rotation_defect();
+            if transform.iter().flatten().any(|v| !v.is_finite()) {
+                return Err(RigCalibrationError::NotFinite { camera });
+            }
+            let pose = pose_of(transform);
+            let defect = pose.rotation_defect();
             if defect > MAX_ROTATION_DEFECT {
                 return Err(RigCalibrationError::NotRigid { camera, defect });
+            }
+            // `RᵀR = I` holds for a reflection too, which would mirror every ray.
+            if pose.rotation.determinant() <= 0.0 {
+                return Err(RigCalibrationError::Reflection { camera });
             }
         }
         if pose_of(&primary.primary_from_camera) != Pose3d::IDENTITY {
@@ -358,6 +370,22 @@ mod tests {
         assert_eq!(
             apply(&projective),
             Err(RigCalibrationError::NotHomogeneous { camera: 1 })
+        );
+
+        // G10: an orthonormal reflection and a NaN translation are not rigid either.
+        let mut mirrored = good.clone();
+        for v in &mut mirrored.cameras[1].primary_from_camera[2][..3] {
+            *v = -*v;
+        }
+        assert_eq!(
+            apply(&mirrored),
+            Err(RigCalibrationError::Reflection { camera: 1 })
+        );
+        let mut not_finite = good.clone();
+        not_finite.cameras[1].primary_from_camera[1][3] = f64::NAN;
+        assert_eq!(
+            apply(&not_finite),
+            Err(RigCalibrationError::NotFinite { camera: 1 })
         );
 
         let empty = RigCalibration {
