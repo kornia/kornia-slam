@@ -56,6 +56,7 @@ Lane M (mapping, VI-BA and calibration):
 - D2: `a_flipped_gravity_is_not_absorbed_by_the_accel_bias` and `a_perturbed_rotating_start_converges_to_the_truth`, `crates/kornia-slam/src/mapping/global_vi_ba/tests.rs`, on a new two-axis rotating walk (`Sampling::Rotating`, interval-mean samples turned as `Hold` integrates them). Red on the old walk that never turns: gravity flipped reached 1.14e-8 against 1.13e-8 at the truth; rotating, 6.5e2 against 1.5e-8. Deviation: the review's final `|b_a| < 1e-3`, `|b_g| < 1e-5` asserts are not added, since `OfflineBaResult` does not return biases; the flipped-gravity cost is the check instead.
 - D12: `the_report_adds_the_applied_clock_offset`, `crates/kornia-slam/src/mapping/global_vi_ba/tests.rs`. New report field `td_total_ms` = `imu_time_offset_ns`·1e-6 + `td_ms`, printed next to `td_ms`; the field did not exist at 8f23e47, so the test does not build there. Card D P15's rewording is left to the docs stage.
 - E13: no test; documentation only. The `LargeWindow::Enabled` doc now says this solver's λ scales diag(H), so 1e-2 is not g2o's damping and about 1e-6 is nearer it. The `configs/pr180-*.ron` value is lane F's file and is left unchanged.
+- D9: `a_marginal_prior_is_never_negative`, `crates/kornia-slam/src/mapping/marginalization.rs`. Red at 8f23e47: the least value of a three-edge chained prior was −15.6. `MarginalPrior` gains `constant`, the joint cost at linearization minus ½ m₁ᵀH₁₁⁻¹m₁, carried through the chain.
 
 # E estimator
 

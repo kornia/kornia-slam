@@ -92,7 +92,7 @@ pub enum MarginalizationError {
     NonFinite,
 }
 
-/// Quadratic prior `½ dᵀ H d + bᵀ d` on one keyframe's 15-DOF state, in
+/// Quadratic prior `½ dᵀ H d + bᵀ d + c` on one keyframe's 15-DOF state, in
 /// `d = x ⊖ lin_point`: pose `Log(T₀⁻¹ T)` of the world→camera pose (the
 /// solver's right perturbation, `[ρ; ω]`), velocity (world, m/s) and biases
 /// additive.
@@ -107,6 +107,10 @@ pub struct MarginalPrior {
     pub info: [f64; 225],
     /// `b`, the cost gradient at `lin_point`.
     pub rhs: [f64; 15],
+    /// `c`: what the eliminated factors cost at their best, given `lin_point`,
+    /// so the prior's least value is not negative and the solve's relative
+    /// cost decrease is of the true total (D9).
+    pub constant: f64,
 }
 
 impl MarginalPrior {
@@ -133,12 +137,15 @@ impl MarginalPrior {
         })
     }
 
-    /// `½ dᵀ H d + bᵀ d` at `kf`.
+    /// `½ dᵀ H d + bᵀ d + c` at `kf`.
     pub fn cost(&self, kf: &ViBaKeyframe) -> f64 {
         let d = self.tangent(kf);
         let g = self.gradient(&d);
         // ½ dᵀHd + bᵀd = ½ dᵀ(b + Hd) + ½ bᵀd.
-        (0..DOF).map(|r| 0.5 * d[r] * (g[r] + self.rhs[r])).sum()
+        self.constant
+            + (0..DOF)
+                .map(|r| 0.5 * d[r] * (g[r] + self.rhs[r]))
+                .sum::<f64>()
     }
 
     /// Whether `kf` moved too far from the linearization point for the
@@ -215,6 +222,9 @@ pub(super) fn marginalize_frozen(
         params.imu_t_bc.as_ref(),
     );
     let omega = imu_information_matrix(&edge.preintegrated, params.imu_weight);
+    // The joint's cost at the linearization point; the pose pseudo-prior is
+    // centred there and adds nothing.
+    let mut joint_cost = 0.5 * res.dot(&(omega * res));
 
     // Joint over [frozen | next]; `m` is the negative gradient, as in the solver.
     let mut h = Mat::<f64>::zeros(2 * DOF, 2 * DOF);
@@ -236,7 +246,7 @@ pub(super) fn marginalize_frozen(
         }
     }
     if let Some(prior) = prior {
-        accumulate_prior(&mut h, &mut m, 0, prior, frozen);
+        joint_cost += accumulate_prior(&mut h, &mut m, 0, prior, frozen);
     }
     for d in 0..3 {
         h[(d, d)] += pseudo.frozen_pose_sigma_m.powi(-2);
@@ -268,7 +278,14 @@ pub(super) fn marginalize_frozen(
         }
     }
     let rhs: [f64; 15] = std::array::from_fn(|r| -(m[DOF + r] - schur(r, DOF)));
-    if !info.iter().chain(&rhs).all(|x| x.is_finite()) {
+    // Eliminating x₁ from `½ xᵀHx − mᵀx + c` leaves `c − ½ m₁ᵀ H₁₁⁻¹ m₁` at x₂ = 0.
+    let constant = joint_cost - 0.5 * (0..DOF).map(|k| m[k] * x[(k, DOF)]).sum::<f64>();
+    if !info
+        .iter()
+        .chain(&rhs)
+        .chain([&constant])
+        .all(|x| x.is_finite())
+    {
         return Err(MarginalizationError::NonFinite);
     }
     Ok(MarginalPrior {
@@ -280,6 +297,7 @@ pub(super) fn marginalize_frozen(
         },
         info,
         rhs,
+        constant,
     })
 }
 
@@ -525,6 +543,7 @@ mod tests {
             lin_point: lin_point.clone(),
             info,
             rhs: std::array::from_fn(|_| rng.next()),
+            constant: 0.0,
         };
         for scale in [1e-3, 0.1, 0.4] {
             let d: [f64; 15] = std::array::from_fn(|_| rng.next() * scale);
@@ -546,5 +565,36 @@ mod tests {
             );
         }
         assert!(!prior.is_stale(&lin_point));
+    }
+
+    /// D9: the prior is what is left of a sum of squares after eliminating
+    /// the frozen keyframe, so its least value is not negative. Red on the old
+    /// code (2026-11-18), which dropped the constant: its minimum was
+    /// `−½ bᵀH⁻¹b`, −15.6 here.
+    #[test]
+    fn a_marginal_prior_is_never_negative() {
+        let (keyframes, edges, params) = chain();
+        let pseudo = FrozenPoseSigma::default();
+        let mut prior = None;
+        for k in 0..3 {
+            prior = Some(
+                marginalize_frozen(
+                    prior.as_ref(),
+                    &keyframes[k],
+                    &keyframes[k + 1],
+                    &edges[k],
+                    &params,
+                    pseudo,
+                )
+                .unwrap(),
+            );
+        }
+        let prior = prior.unwrap();
+        let h = Mat::<f64>::from_fn(DOF, DOF, |r, c| prior.info[idx15(r, c)]);
+        let b = Mat::<f64>::from_fn(DOF, 1, |r, _| -prior.rhs[r]);
+        let step = h.llt(faer::Side::Lower).unwrap().solve(&b);
+        let d: Vec<f64> = (0..DOF).map(|r| step[(r, 0)]).collect();
+        let least = prior.cost(&retract(&prior.lin_point, &d));
+        assert!(least >= -1e-9, "least prior cost {least:.3e}");
     }
 }
