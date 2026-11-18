@@ -85,6 +85,7 @@ Cross-lane: E1, E7, G3 are one design in lane S (velocity and bias from the orig
 - T5: `the_gyro_guess_spans_one_frame_on_a_keyframe_anchored_prediction` (`system/tests.rs`, mod `gyro_guess`); today 0.1745 rad (10°) for a 0.0349 rad frame at 30°/s, 15 Hz, keyframe 5 frames back. `predict_frame` was first extracted unchanged so the test ran on today's behaviour.
 - T7: `the_keyframe_evidence_reports_its_map_lock_wait` (`system/tests.rs`, mod `keyframe_evidence`); a lock held 60 ms must show as at least 40 ms of wait. It needs the new timed evidence, so it does not compile on today's code, where neither evidence lock was timed. The review's first option (time the waits); caching the evidence at insert is left.
 - G7: `the_coast_speed_spans_the_gap_from_the_last_tracked_frame` (`system/tests.rs`, mod `recovery_after_loss`); a 2.1 m coast over 0.55 s read 4.2 m/s over 0.5 s and was held.
+- G12: `knobs_that_read_the_imu_are_refused_without_it` (`system/config/tests.rs`); `FixedInertial`, `pose_gate: Enabled` and `reseed.keep_inertial` validated without an IMU. Two existing fixtures (`pose_gate_limits_must_be_positive_and_finite`, `fixed_inertial_lost_keyframes_need_keyframes_inserted_as_full_states`) now select the IMU.
 
 # E estimator
 

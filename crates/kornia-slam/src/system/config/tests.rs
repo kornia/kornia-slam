@@ -239,7 +239,10 @@ fn invalid_setting(config: &SystemConfig) -> Option<String> {
 #[test]
 fn pose_gate_limits_must_be_positive_and_finite() {
     use crate::tracking::pose_gate::{PoseGate, PoseGateLimits};
-    let mut config = SystemConfig::default();
+    let mut config = SystemConfig {
+        sensors: sensors(CameraSelection::Stereo, true),
+        ..SystemConfig::default()
+    };
     orb_mut(&mut config).tracking_loss.pose_gate = PoseGate::Enabled(PoseGateLimits {
         max_translation_gap_mps: f64::INFINITY,
         ..PoseGateLimits::default()
@@ -266,7 +269,10 @@ fn fixed_inertial_lost_keyframes_need_keyframes_inserted_as_full_states() {
     use crate::mapping::bundle_adjustment::LostKeyframes;
     use crate::tracking::KeyframesWhileLost;
     let with = |lost_keyframes, keyframes_while_lost| {
-        let mut config = SystemConfig::default();
+        let mut config = SystemConfig {
+            sensors: sensors(CameraSelection::Stereo, true),
+            ..SystemConfig::default()
+        };
         orb_mut(&mut config).mapping.local_ba.lost_keyframes = lost_keyframes;
         orb_mut(&mut config).tracking_loss.keyframes_while_lost = keyframes_while_lost;
         config.validate()
@@ -1815,4 +1821,40 @@ mod ron_files {
             Err(LoadError::Invalid(ConfigError::InertialKnobWithoutImu(_)))
         ));
     }
+}
+
+/// G12: lost keyframes need a confident IMU, the pose gate an inertial
+/// prediction, and a kept inertial state an IMU; each is inert without one.
+#[test]
+fn knobs_that_read_the_imu_are_refused_without_it() {
+    use crate::mapping::bundle_adjustment::LostKeyframes;
+    use crate::tracking::pose_gate::{PoseGate, PoseGateLimits};
+    let with = |imu: bool, set: &dyn Fn(&mut OrbSlamPipeline)| {
+        let mut config = SystemConfig {
+            sensors: sensors(CameraSelection::Stereo, imu),
+            ..SystemConfig::default()
+        };
+        set(orb_mut(&mut config));
+        config.validate()
+    };
+    let knobs: [(&str, &dyn Fn(&mut OrbSlamPipeline)); 3] = [
+        ("mapping.local_ba.lost_keyframes", &|orb| {
+            orb.mapping.local_ba.lost_keyframes = LostKeyframes::FixedInertial
+        }),
+        ("tracking_loss.pose_gate", &|orb| {
+            orb.tracking_loss.pose_gate = PoseGate::Enabled(PoseGateLimits::default())
+        }),
+        ("tracking_loss.reseed.keep_inertial", &|orb| {
+            orb.tracking_loss.reseed.keep_inertial = true
+        }),
+    ];
+    for (knob, set) in knobs {
+        assert_eq!(with(true, set), Ok(()), "{knob}");
+        assert_eq!(
+            with(false, set),
+            Err(ConfigError::InertialKnobWithoutImu(knob)),
+            "{knob}"
+        );
+    }
+    assert_eq!(with(false, &|_| {}), Ok(()), "the defaults need no IMU");
 }

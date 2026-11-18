@@ -132,8 +132,8 @@ impl OrbSlamPipeline {
             ));
         }
         validate_loop_closing(&self.loop_closing, sensors)?;
-        validate_recovery(&self.tracking_loss.reseed)?;
-        validate_pose_gate(&self.tracking_loss.pose_gate)?;
+        validate_recovery(&self.tracking_loss.reseed, sensors.imu)?;
+        validate_pose_gate(&self.tracking_loss.pose_gate, sensors.imu)?;
         validate_lost_relocalization(&self.tracking_loss, &self.loop_closing)?;
         validate_estimator(&self.tracking, sensors.imu)?;
         if let GrowthNeighbours::OrbSlam3 { covisible } = self.mapping.growth_neighbours {
@@ -146,12 +146,19 @@ impl OrbSlamPipeline {
         validate_lost_keyframes(
             self.mapping.local_ba.lost_keyframes,
             self.tracking_loss.keyframes_while_lost,
+            sensors.imu,
         )?;
         validate_tuning(&self.tuning, self.loop_closing.is_enabled())
     }
 }
 
-fn validate_recovery(recovery: &RecoveryConfig) -> Result<(), ConfigError> {
+/// A kept inertial state needs the IMU (G12).
+fn validate_recovery(recovery: &RecoveryConfig, imu: bool) -> Result<(), ConfigError> {
+    if recovery.keep_inertial && !imu {
+        return Err(ConfigError::InertialKnobWithoutImu(
+            "tracking_loss.reseed.keep_inertial",
+        ));
+    }
     let at = |field| format!("tracking_loss.reseed.{field}");
     check(
         at("max_coast_speed_mps"),
@@ -231,11 +238,18 @@ fn validate_estimator(tracking: &TrackingConfig, imu: bool) -> Result<(), Config
 }
 
 /// `FixedInertial` acts only on keyframes inserted as full states while lost: anchors are
-/// already held fixed, and `Disabled` inserts none.
+/// already held fixed, `Disabled` inserts none, and without the IMU no lost keyframe
+/// is inserted at all (G12).
 fn validate_lost_keyframes(
     lost_keyframes: LostKeyframes,
     keyframes_while_lost: KeyframesWhileLost,
+    imu: bool,
 ) -> Result<(), ConfigError> {
+    if lost_keyframes == LostKeyframes::FixedInertial && !imu {
+        return Err(ConfigError::InertialKnobWithoutImu(
+            "mapping.local_ba.lost_keyframes",
+        ));
+    }
     match (lost_keyframes, keyframes_while_lost) {
         (
             LostKeyframes::FixedInertial,
@@ -247,10 +261,16 @@ fn validate_lost_keyframes(
     }
 }
 
-fn validate_pose_gate(gate: &PoseGate) -> Result<(), ConfigError> {
+/// The gate checks against an inertial prediction (G12).
+fn validate_pose_gate(gate: &PoseGate, imu: bool) -> Result<(), ConfigError> {
     let PoseGate::Enabled(limits) = gate else {
         return Ok(());
     };
+    if !imu {
+        return Err(ConfigError::InertialKnobWithoutImu(
+            "tracking_loss.pose_gate",
+        ));
+    }
     let at = |field| format!("tracking_loss.pose_gate.{field}");
     check(
         at("max_rotation_gap_deg"),
