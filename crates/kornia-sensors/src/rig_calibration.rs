@@ -390,8 +390,16 @@ mod tests {
         assert_eq!(rig.len(), 2);
         assert_eq!(rig[0].camera.fx, 250.0);
         assert_eq!(rig[0].primary_from_camera, Pose3d::IDENTITY);
-        let expected = cameras[1].2.inverse().compose(&cameras[0].2);
-        assert_eq!(rig[1].primary_from_camera, expected);
+        // G9: camera 0's point reaches the body the same way directly and through the primary.
+        let x_camera = Vec3F64::new(0.3, -0.2, 2.5);
+        let direct = cameras[0].2.transform_point(&x_camera);
+        let through_primary = cameras[1]
+            .2
+            .transform_point(&rig[1].primary_from_camera.transform_point(&x_camera));
+        assert!(
+            (direct - through_primary).length() < 1e-12,
+            "{direct:?} vs {through_primary:?}"
+        );
         assert!(rig_cameras_from_body_extrinsics(&cameras, 2).is_empty());
     }
 }

@@ -292,16 +292,27 @@ mod tests {
         );
     }
 
+    /// G9: camera 1's extrinsic takes a camera-1 point to the body through the primary, checked
+    /// on the point rather than against the implementation's own composition.
     #[test]
     fn each_rig_camera_has_its_body_extrinsic() {
         let camera_to_body = Pose3d::new(
-            kornia_algebra::Mat3F64::IDENTITY,
+            kornia_algebra::SO3F64::exp(Vec3F64::new(0.2, -0.4, 0.1)).matrix(),
             Vec3F64::new(0.0, 0.02, -0.01),
         );
         let rig = yawed_rig().with_imu(camera_to_body);
         assert_eq!(rig.camera_to_body_of(0), Some(camera_to_body));
-        let expected = camera_to_body.compose(&rig.cameras[1].primary_from_camera);
-        assert_eq!(rig.camera_to_body_of(1), Some(expected));
+        let x_camera = Vec3F64::new(0.3, -0.2, 2.5);
+        let through_primary = camera_to_body.transform_point(
+            &rig.cameras[1]
+                .primary_from_camera
+                .transform_point(&x_camera),
+        );
+        let x_body = rig.camera_to_body_of(1).unwrap().transform_point(&x_camera);
+        assert!(
+            (x_body - through_primary).length() < 1e-12,
+            "{x_body:?} vs {through_primary:?}"
+        );
         assert!(rig.camera_to_body_of(2).is_none());
         assert!(yawed_rig().camera_to_body_of(0).is_none());
         let mono = SensorRig::new(test_camera()).with_imu(camera_to_body);
