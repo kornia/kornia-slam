@@ -1140,8 +1140,10 @@ mod tests {
         let mut timings = ShardTimings::default();
         let mut tracks = TrackSet::new();
         tracks.spawn([98.4, 80.7]);
-        let mut shard = FlowShard::default();
-        shard.tracks = tracks.tracks().to_vec();
+        let mut shard = FlowShard {
+            tracks: tracks.tracks().to_vec(),
+            ..FlowShard::default()
+        };
         shard.run(&frames[0..1], &frames[1..2], &guess, &mut timings);
         let flow = shard.survivors[0];
         assert!(distance(flow.pixel, [100.4, 80.7]) < 0.05, "{flow:?}");
