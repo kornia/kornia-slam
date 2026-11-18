@@ -665,6 +665,37 @@ fn focal_and_gyro_scale_trade() {
     );
 }
 
+/// D5: a stereo depth is measured under the factory calibration: with the
+/// focal `(1 + s) f`, `f·B/d` reads `z / (1 + s)`. With a camera state on,
+/// those rows would pull it back to the factory value, so they stay out.
+/// Red on the old code (2026-11-18): 0.5 % came back as 0.413 %; 0.495 %
+/// without the rows, the priors' share.
+#[test]
+fn stereo_depths_do_not_hold_the_focal_at_the_factory_value() {
+    let focal = 0.005;
+    let mut window = window(&Truth {
+        focal,
+        ..Truth::default()
+    });
+    for o in &mut window.observations {
+        let z = window.keyframes[o.pose_idx]
+            .pose
+            .transform_point(&window.points[o.point_idx])
+            .z;
+        o.depth_meas = Some((z / (1.0 + focal)) as f32);
+        // A quarter pixel of disparity on a 0.1 m baseline.
+        o.depth_sigma = (0.25 * z * z / (window.camera.fx * 0.1)) as f32;
+    }
+    let (_, outcome, layout) = solve_window(&window, config(false, true, false, false), false);
+    let estimate = outcome.values.values[layout.focal(0, 0).unwrap()];
+    assert!(
+        (estimate - focal).abs() <= 1e-4,
+        "focal {:.3} % estimated {:.4} %",
+        focal * 1e2,
+        estimate * 1e2
+    );
+}
+
 /// GT4: the online value rows are `prior_rows`'s slice-0 rows bit for bit;
 /// each step row is `(current − previous) / step_sigma` on the state's
 /// column. `previous` is a constant of the solve, so it has no column.

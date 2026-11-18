@@ -116,6 +116,14 @@ impl Layout {
         self.clock
     }
 
+    /// A rotation or focal state is on: a stereo depth, measured under the
+    /// factory calibration, is then no measurement of the calibrated camera
+    /// (`f·B/d` reads `z / (1 + s)` under the focal `(1 + s) f`), and its row
+    /// would pull the state back to the factory value (D5).
+    pub(in crate::mapping) fn camera_states(&self) -> bool {
+        self.rotation.is_some() || self.focal.is_some()
+    }
+
     /// With any calibration state on, the IMU edges are re-preintegrated from
     /// the raw stream at every state (ORB-SLAM3 `Preintegrated::Reintegrate`,
     /// `ImuTypes.cc:168-175`) instead of corrected to first order.

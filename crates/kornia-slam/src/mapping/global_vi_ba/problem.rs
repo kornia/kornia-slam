@@ -281,7 +281,8 @@ impl<'a> Problem<'a> {
                     continue;
                 }
                 let pixel_sigma = f64::from(visual.sigma_px(obs.octave));
-                let depth = obs.depth.filter(|_| camera == 0).map(|z| {
+                let depth = obs.depth.filter(|_| camera == 0 && !layout.camera_states());
+                let depth = depth.map(|z| {
                     let z = f64::from(z);
                     let sigma = depth_sigma(stereo_depth_sigma, z, pixel_sigma, focal_baseline);
                     (z, 1.0 / sigma)

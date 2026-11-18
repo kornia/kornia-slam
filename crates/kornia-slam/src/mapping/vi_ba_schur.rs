@@ -2420,8 +2420,11 @@ fn solve_vi_ba(
         &point_free,
         params.depth_gate_factor,
     );
-    let (depth_on, depth_rows_gated) =
+    let (mut depth_on, depth_rows_gated) =
         depth_gate(keyframes, &xyz, observations, params.depth_gate_factor);
+    if calibration.is_some_and(|c| c.layout.camera_states()) {
+        depth_on.fill(false);
+    }
 
     // The calibration columns follow the keyframe states.
     let n_cal = calibration.map_or(0, CalibratedSolve::columns);
