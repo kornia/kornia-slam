@@ -82,6 +82,11 @@ has been scored on a benchmark sequence yet.
 - `tracking.refine_monotone` (`false`): the analytic PnP refine keeps its last
   LM step only when the step does not raise the cost; `false` keeps an uphill
   step inside the cost tolerance, as kornia-3d's generic solver does.
+- `tracking_loss.reseed.young_map_grace_sec` (`0.0`): seconds a map with too
+  few keyframes for the grace period may stay lost before it is reset; `0.0`
+  resets it at its first lost frame (card I).
+- `tracking_loss.reseed.min_cold_start_points` (`50`): fewest stereo points
+  that seed a map from a cold start (card I).
 - `keyframes.rules` (`Kornia`): `OrbSlam3(max_frames)` inserts keyframes by
   ORB-SLAM3's `NeedNewKeyFrame`.
 - `tracking_loss.relocalization.while_lost` (`false`): relocalize on every lost

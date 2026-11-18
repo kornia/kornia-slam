@@ -64,8 +64,8 @@ use crate::inertial::{
     AppliedInitialization, ImuInitResult, InertialState, viba0_accel_bias_prior,
 };
 use crate::initialization::bootstrap::{
-    self, BootstrapDecision, MIN_KEYPOINTS_FOR_BOOTSTRAP, MIN_STEREO_POINTS, MIN_VALID_POINTS,
-    TooFewStereoPoints, evaluate_bootstrap,
+    self, BootstrapDecision, MIN_KEYPOINTS_FOR_BOOTSTRAP, MIN_VALID_POINTS, TooFewStereoPoints,
+    evaluate_bootstrap,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{
@@ -1245,7 +1245,7 @@ impl SlamSystem {
         let min_points = if self.state.reseeding() {
             self.recovery.min_seed_points
         } else {
-            MIN_STEREO_POINTS
+            self.recovery.min_cold_start_points
         };
         let insertion = match bootstrap::stereo_initial_map(keyframe, &self.rig.camera, min_points)
         {
@@ -1978,7 +1978,18 @@ impl SlamSystem {
             let map_established =
                 self.map.lock().unwrap().keyframes().len() > policy.min_keyframes_for_grace;
 
-            if !map_established || recently_lost_for >= grace_period_sec {
+            if !map_established && recently_lost_for < self.recovery.young_map_grace_sec {
+                self.dbg(format!(
+                    "[lost] frame={} young map held after {recently_lost_for:.2}s",
+                    frame.idx
+                ));
+            }
+            if gives_up(
+                map_established,
+                recently_lost_for,
+                grace_period_sec,
+                self.recovery.young_map_grace_sec,
+            ) {
                 self.dbg(format!(
                     "[lost] frame={} giving up after {:.2}s (map_established={}): resetting",
                     frame.idx, recently_lost_for, map_established,
@@ -3290,6 +3301,21 @@ fn rig_flow_cameras(
             camera: rig.camera.clone(),
             camera_from_primary: None,
         }],
+    }
+}
+
+/// Whether a lost map is reset now: an established one after its grace
+/// period, a young one after `young_map_grace_sec` (at once when `0.0`).
+fn gives_up(
+    map_established: bool,
+    lost_for_sec: f64,
+    grace_period_sec: f64,
+    young_map_grace_sec: f64,
+) -> bool {
+    if map_established {
+        lost_for_sec >= grace_period_sec
+    } else {
+        lost_for_sec >= young_map_grace_sec
     }
 }
 

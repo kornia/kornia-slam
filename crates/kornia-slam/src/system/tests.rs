@@ -7,6 +7,7 @@ use kornia_image::ImageSize;
 use super::*;
 use crate::frontend::OrbFrontend;
 use crate::frontend::tests::synthetic_pair;
+use crate::initialization::bootstrap::MIN_STEREO_POINTS;
 use crate::loop_closure::place_recognition::{Vocabulary, VocabularyLoadError};
 use crate::mapping::LocalMappingMode;
 
@@ -1396,6 +1397,26 @@ mod recovery_after_loss {
     fn the_inertial_state_is_kept_only_when_asked() {
         assert!(!RecoveryConfig::default().keep_inertial);
         assert_eq!(RecoveryConfig::default().min_seed_points, MIN_STEREO_POINTS);
+    }
+
+    #[test]
+    fn card_i_defaults_keep_the_cold_start_and_the_young_map_reset() {
+        let recovery = RecoveryConfig::default();
+        assert_eq!(recovery.min_cold_start_points, MIN_STEREO_POINTS);
+        assert_eq!(recovery.young_map_grace_sec, 0.0);
+    }
+
+    #[test]
+    fn a_young_map_is_reset_at_once_unless_given_grace() {
+        for lost_for in [0.0, 0.1, 0.6] {
+            assert!(
+                gives_up(false, lost_for, 0.5, 0.0),
+                "grace 0.0, lost {lost_for}"
+            );
+            assert_eq!(gives_up(true, lost_for, 0.5, 0.0), lost_for >= 0.5);
+        }
+        assert!(!gives_up(false, 0.2, 5.0, 0.5));
+        assert!(gives_up(false, 0.5, 5.0, 0.5));
     }
 
     /// The first loss of a re-seeded segment gets its first anchor within
