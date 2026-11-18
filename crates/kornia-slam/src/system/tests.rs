@@ -947,6 +947,53 @@ mod windowed_tracks {
     }
 }
 
+mod gyro_guess {
+    use super::*;
+    use crate::tracking::parallax::tests::map_with_keyframe_at;
+
+    const RATE: f64 = 0.5236; // 30°/s
+    const DT: f64 = 1.0 / 15.0;
+    const T_KF: f64 = 0.1;
+
+    /// Angle of a rotation matrix, rad.
+    fn angle(r: Mat3F64) -> f64 {
+        let c = r.to_cols_array();
+        ((c[0] + c[4] + c[8] - 1.0) / 2.0).clamp(-1.0, 1.0).acos()
+    }
+
+    /// T5: with a keyframe-anchored prediction (OrbSlam3, no frame prior),
+    /// the gyro guess turns previous-frame pixels by one frame of rotation,
+    /// not by the whole window since the keyframe 5 frames back (10° for 2°).
+    #[test]
+    fn the_gyro_guess_spans_one_frame_on_a_keyframe_anchored_prediction() {
+        let config = config(CameraSelection::Mono, true, LoopClosingMode::Disabled);
+        let rig = SensorRig::new(camera()).with_imu(Pose3d::IDENTITY);
+        let mut system = SlamSystem::build(config, rig).unwrap();
+        system.tracking_config.pose_inertial = PoseInertial::OrbSlam3;
+        system.flow.gyro_guess = GyroGuess::RotatedRay;
+        *system.map.lock().unwrap() = map_with_keyframe_at(Pose3d::IDENTITY);
+        system.state.current_keyframe_idx = Some(0);
+        system.state.last_keyframe_idx = Some(0);
+        system.state.imu_initialized = true;
+        system.inertial.last_keyframe_timestamp_sec = Some(T_KF);
+        system.inertial.gravity_world = Vec3F64::ZERO;
+        let samples: Vec<ImuMeasurement> = (0..=400)
+            .map(|i| ImuMeasurement {
+                timestamp: i as f64 * 0.005,
+                gyro: Vec3F64::new(0.0, RATE, 0.0),
+                accel: Vec3F64::ZERO,
+            })
+            .collect();
+        system.process_imu(&samples);
+
+        let t = T_KF + 5.0 * DT;
+        let (pose_before, _) = system.predict_frame(4, Pose3d::IDENTITY, t - 2.0 * DT, t - DT);
+        system.predict_frame(5, pose_before, t - DT, t);
+        let turned = angle(system.gyro_rotation.expect("a rotated-ray guess"));
+        assert!((turned - RATE * DT).abs() < 1e-3, "{turned} rad");
+    }
+}
+
 mod inertial_origin {
     use super::*;
     use crate::tracking::local_map::LocalMapRules;

@@ -1722,10 +1722,8 @@ impl SlamSystem {
         }
         self.update_seeded_window();
 
-        let (prediction_from, prediction_sec) =
-            self.prediction_origin(frame_idx, pose_before, prev_timestamp);
         let (candidate_pose, predicted_velocity) =
-            self.predict_frame_pose(prediction_from, prediction_sec, timestamp_sec);
+            self.predict_frame(frame_idx, pose_before, prev_timestamp, timestamp_sec);
         self.update_imu_trust(frame_idx, timestamp_sec, &candidate_pose);
 
         let currently_lost_for = self
@@ -2288,6 +2286,28 @@ impl SlamSystem {
         self.rig_flow.is_some() && matches!(self.flow.pose, FlowPose::AnalyticGn { .. })
     }
 
+    /// This frame's predicted pose and velocity, from the origin
+    /// [`Self::prediction_origin`] picks.
+    fn predict_frame(
+        &mut self,
+        frame_idx: usize,
+        pose_before: Pose3d,
+        prev_timestamp: f64,
+        timestamp_sec: f64,
+    ) -> (Pose3d, Option<Vec3F64>) {
+        let (prediction_from, prediction_sec) =
+            self.prediction_origin(frame_idx, pose_before, prev_timestamp);
+        let (candidate_pose, predicted_velocity) =
+            self.predict_frame_pose(prediction_from, prediction_sec, timestamp_sec);
+        // A ray seen in the previous camera, in the current one: R_cur_prev
+        // over this frame only, whatever window the prediction integrated
+        // (card E step 9, T5).
+        self.gyro_rotation = (self.flow.gyro_guess == GyroGuess::RotatedRay
+            && predicted_velocity.is_some())
+        .then(|| candidate_pose.rotation * pose_before.rotation.transpose());
+        (candidate_pose, predicted_velocity)
+    }
+
     /// The motion model's pose at `timestamp_sec` from `pose_before` at
     /// `prev_timestamp`, advancing the world velocity when the IMU predicted;
     /// that velocity is returned with it.
@@ -2323,15 +2343,6 @@ impl SlamSystem {
         if let Some(velocity_world) = predicted_velocity {
             self.state.velocity_world = velocity_world; // propagate for next frame
         }
-        // A ray seen in the previous camera, in the current one:
-        // R_cur_prev = R_CB · ΔRᵀ · R_BC (card E step 9).
-        self.gyro_rotation = (self.flow.gyro_guess == GyroGuess::RotatedRay)
-            .then_some(())
-            .and(preintegrated.as_ref().zip(self.rig.camera_to_body()))
-            .map(|(preintegrated, camera_to_body)| {
-                let r_bc = camera_to_body.rotation;
-                r_bc.transpose() * preintegrated.delta_rotation.transpose() * r_bc
-            });
         (candidate_pose, predicted_velocity)
     }
 
