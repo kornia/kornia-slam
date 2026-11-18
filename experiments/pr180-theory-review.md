@@ -57,6 +57,7 @@ Lane M (mapping, VI-BA and calibration):
 - D12: `the_report_adds_the_applied_clock_offset`, `crates/kornia-slam/src/mapping/global_vi_ba/tests.rs`. New report field `td_total_ms` = `imu_time_offset_ns`·1e-6 + `td_ms`, printed next to `td_ms`; the field did not exist at 8f23e47, so the test does not build there. Card D P15's rewording is left to the docs stage.
 - E13: no test; documentation only. The `LargeWindow::Enabled` doc now says this solver's λ scales diag(H), so 1e-2 is not g2o's damping and about 1e-6 is nearer it. The `configs/pr180-*.ron` value is lane F's file and is left unchanged.
 - D9: `a_marginal_prior_is_never_negative`, `crates/kornia-slam/src/mapping/marginalization.rs`. Red at 8f23e47: the least value of a three-edge chained prior was −15.6. `MarginalPrior` gains `constant`, the joint cost at linearization minus ½ m₁ᵀH₁₁⁻¹m₁, carried through the chain.
+- D10: `the_prior_gradient_is_its_cost_derivative`, `crates/kornia-slam/src/mapping/marginalization.rs`. Red at 8f23e47: at a 10° tangent the system gradient on ρ_x was 2.644 against a cost derivative of 2.665. `accumulate_prior` now applies `blkdiag(J_r⁻¹(d), I₉)` to the gradient and to H (kornia-algebra's `SE3F64::right_jacobian_inverse`).
 
 # E estimator
 

@@ -177,8 +177,10 @@ impl MarginalPrior {
 }
 
 /// Adds `prior` on the free keyframe at system offset `base` to the reduced
-/// system (`m_mat += H`, `m_vec −= b + H d`, unit Jacobian at the
-/// linearization point) and returns its cost at `kf`. Never robustified.
+/// system (`m_mat += JᵀHJ`, `m_vec −= Jᵀ(b + H d)`) and returns its cost at
+/// `kf`. Never robustified. Under the solver's step `T · Exp(δ)` the pose
+/// tangent moves by `J_r⁻¹(d) δ`, so `J = blkdiag(J_r⁻¹(d), I₉)`: a unit
+/// Jacobian was 9 % off at the stale limit (D10).
 pub(super) fn accumulate_prior(
     m_mat: &mut Mat<f64>,
     m_vec: &mut [f64],
@@ -188,10 +190,23 @@ pub(super) fn accumulate_prior(
 ) -> f64 {
     let d = prior.tangent(kf);
     let g = prior.gradient(&d);
+    let jr_inv = SE3F64::right_jacobian_inverse(
+        Vec3F64::new(d[0], d[1], d[2]),
+        Vec3F64::new(d[3], d[4], d[5]),
+    );
+    let j = |r: usize, c: usize| match (r < 6, c < 6) {
+        (true, true) => jr_inv[(r, c)],
+        _ => f64::from(u8::from(r == c)),
+    };
+    // H J, then Jᵀ (H J) and Jᵀ g.
+    let hj: [f64; DOF * DOF] = std::array::from_fn(|rc| {
+        let (r, c) = (rc / DOF, rc % DOF);
+        (0..DOF).map(|k| prior.info[idx15(r, k)] * j(k, c)).sum()
+    });
     for r in 0..DOF {
-        m_vec[base + r] -= g[r];
+        m_vec[base + r] -= (0..DOF).map(|k| j(k, r) * g[k]).sum::<f64>();
         for c in 0..DOF {
-            m_mat[(base + r, base + c)] += prior.info[idx15(r, c)];
+            m_mat[(base + r, base + c)] += (0..DOF).map(|k| j(k, r) * hj[k * DOF + c]).sum::<f64>();
         }
     }
     prior.cost(kf)
@@ -596,5 +611,58 @@ mod tests {
         let d: Vec<f64> = (0..DOF).map(|r| step[(r, 0)]).collect();
         let least = prior.cost(&retract(&prior.lin_point, &d));
         assert!(least >= -1e-9, "least prior cost {least:.3e}");
+    }
+
+    /// D10: the gradient `accumulate_prior` puts in the system is the
+    /// derivative of the prior's cost under the solver's step `T · Exp(δ)`,
+    /// also 10° from the linearization point, so it agrees with the cost the
+    /// step is accepted on. Red on the old code (2026-11-18), whose unit
+    /// Jacobian left it off by 0.8 % on ρ_x here (2.644 against 2.665).
+    #[test]
+    fn the_prior_gradient_is_its_cost_derivative() {
+        let mut rng = Lcg(5);
+        let a: Vec<f64> = (0..225).map(|_| rng.next()).collect();
+        let mut info = [0.0; 225];
+        for r in 0..DOF {
+            for c in 0..DOF {
+                info[idx15(r, c)] = (0..DOF).map(|k| a[k * DOF + r] * a[k * DOF + c]).sum();
+            }
+            info[idx15(r, r)] += 1.0;
+        }
+        let lin_point = ViBaKeyframe {
+            pose: pose_at(rng.vec3(2.0), 0.3),
+            velocity: rng.vec3(1.0),
+            bias: ImuBias::default(),
+            fixed: false,
+            inertial_fixed: false,
+        };
+        let prior = MarginalPrior {
+            frame_idx: 0,
+            world_epoch: 0,
+            lin_point: lin_point.clone(),
+            info,
+            rhs: std::array::from_fn(|_| rng.next()),
+            constant: 0.0,
+        };
+        let mut d = [0.0; DOF];
+        d[..6].copy_from_slice(&[0.3, -0.2, 0.1, 0.1, -0.12, 0.06]);
+        let kf = retract(&lin_point, &d);
+        let mut m_mat = Mat::<f64>::zeros(DOF, DOF);
+        let mut m_vec = vec![0.0; DOF];
+        accumulate_prior(&mut m_mat, &mut m_vec, 0, &prior, &kf);
+        let h = 1e-6;
+        for i in 0..DOF {
+            let at = |h: f64| {
+                let mut step = [0.0; DOF];
+                step[i] = h;
+                prior.cost(&retract(&kf, &step))
+            };
+            let numeric = (at(h) - at(-h)) / (2.0 * h);
+            assert!(
+                (-m_vec[i] - numeric).abs() <= 1e-5 * numeric.abs().max(1.0),
+                "dof {i}: system {:.6e}, cost derivative {numeric:.6e}",
+                -m_vec[i]
+            );
+        }
     }
 }
