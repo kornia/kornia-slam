@@ -974,6 +974,7 @@ fn refine_mono(
         &mat3_to_f32(start.rotation),
         &vec3_to_f32(start.translation),
         &params,
+        config.refine_monotone,
     )?;
     Some(Pose3d::new(
         mat3_to_f64(refined.rotation),

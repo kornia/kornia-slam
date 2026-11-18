@@ -168,6 +168,13 @@ impl MapProjectionConfig {
         config
     }
 
+    /// This config with the PnP refine's monotone step rule set to `monotone`.
+    pub fn with_refine_monotone(&self, monotone: bool) -> Self {
+        let mut config = self.clone();
+        config.pnp.refine_monotone = monotone;
+        config
+    }
+
     /// `search_scale` to pass to `MapProjectionEstimator::estimate_pose` given
     /// how long tracking has been failing.
     ///

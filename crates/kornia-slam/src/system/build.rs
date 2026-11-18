@@ -189,6 +189,7 @@ impl SystemConfig {
                 ..tuning
                     .map_projection
                     .with_visual_information(orb.mapping.local_ba.visual_information)
+                    .with_refine_monotone(orb.tracking.refine_monotone)
             },
             keyframe_policy: orb.keyframes,
             tracking_loss_recovery: tuning.loss_recovery,

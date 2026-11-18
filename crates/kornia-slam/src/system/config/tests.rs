@@ -1191,6 +1191,17 @@ mod runtime_settings {
         );
     }
 
+    /// G11: off by default; when set it reaches the PnP refine.
+    #[test]
+    fn refine_monotone_reaches_the_pnp_refine() {
+        let selected = rig();
+        let monotone = |c: &SystemConfig| c.settings(&selected).map_projection.pnp.refine_monotone;
+        let mut config = SystemConfig::default();
+        assert!(!monotone(&config));
+        orb_mut(&mut config).tracking.refine_monotone = true;
+        assert!(monotone(&config));
+    }
+
     #[test]
     fn only_the_rig_selection_keeps_the_rig_cameras() {
         let primary = rig().camera;

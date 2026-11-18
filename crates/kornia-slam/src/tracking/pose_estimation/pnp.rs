@@ -42,6 +42,10 @@ pub struct PnpConfig {
     /// octave sigma (ORB-SLAM3's chi2 test on the `invSigma2`-weighted
     /// error). The kornia-3d LM itself stays unweighted.
     pub visual_information: VisualInformation,
+    /// The analytic LM adopts its last step only when the step does not raise the
+    /// cost (`tracking.refine_monotone`); `false` adopts an uphill step inside
+    /// `cost_tolerance`, as kornia-3d's generic solver.
+    pub refine_monotone: bool,
 }
 
 impl Default for PnpConfig {
@@ -57,6 +61,7 @@ impl Default for PnpConfig {
             outlier_rounds: 4,
             lm_max_iterations: 50,
             visual_information: VisualInformation::Unit,
+            refine_monotone: false,
         }
     }
 }
@@ -209,6 +214,7 @@ pub fn solve_pnp_with_diagnostics(
             &r_init_f32,
             &t_init_f32,
             &lm_params,
+            config.refine_monotone,
         ) else {
             return (None, diagnostics);
         };
@@ -282,9 +288,18 @@ fn refine(
     rotation: &Mat3AF32,
     translation: &Vec3AF32,
     params: &LMRefineParams,
+    monotone: bool,
 ) -> Option<RefinedPose> {
     if supports_kernel(params) {
-        return refine_pose_analytic(points_world, points_image, k, rotation, translation, params);
+        return refine_pose_analytic(
+            points_world,
+            points_image,
+            k,
+            rotation,
+            translation,
+            params,
+            monotone,
+        );
     }
     let lm = refine_pose_lm(
         points_world,

@@ -462,6 +462,9 @@ pub struct TrackingConfig {
     pub imu_trust: ImuTrustMode,
     pub local_map: LocalMapRules,
     pub snapback_fix: SnapbackFix,
+    /// The analytic pose refine adopts its last LM step only when the step does
+    /// not raise the cost; `false` keeps the generic solver's rule.
+    pub refine_monotone: bool,
 }
 
 /// A pose-inertial solve per frame (the idea of PR #195, credit Astik):

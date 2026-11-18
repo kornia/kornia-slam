@@ -79,6 +79,9 @@ has been scored on a benchmark sequence yet.
 - `tracking.snapback_fix` (`Off`): `AnchorNextFrame` anchors the frame after a
   local-BA write-back at the corrected keyframe; needs the IMU, and is refused
   together with `pose_inertial`.
+- `tracking.refine_monotone` (`false`): the analytic PnP refine keeps its last
+  LM step only when the step does not raise the cost; `false` keeps an uphill
+  step inside the cost tolerance, as kornia-3d's generic solver does.
 - `keyframes.rules` (`Kornia`): `OrbSlam3(max_frames)` inserts keyframes by
   ORB-SLAM3's `NeedNewKeyFrame`.
 - `tracking_loss.relocalization.while_lost` (`false`): relocalize on every lost

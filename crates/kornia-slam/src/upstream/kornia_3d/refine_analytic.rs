@@ -176,6 +176,9 @@ pub struct RefinedPose {
 
 /// Pose-only LM on undistorted pixels; `None` for an unsupported kernel, fewer than 3
 /// points, a start point behind the camera, or a singular damped system.
+///
+/// `monotone` adopts the step that meets `cost_tolerance` only when it does not raise
+/// the cost. `false` is the generic solver's rule, which adopts it either way.
 pub fn refine_pose_analytic(
     points_world: &[Vec3AF32],
     points_image: &[Vec2F32],
@@ -183,6 +186,7 @@ pub fn refine_pose_analytic(
     rotation: &Mat3AF32,
     translation: &Vec3AF32,
     params: &LMRefineParams,
+    monotone: bool,
 ) -> Option<RefinedPose> {
     let kernel = kernel_from_params(params)?;
     if points_world.len() != points_image.len() || points_world.len() < 3 {
@@ -233,8 +237,9 @@ pub fn refine_pose_analytic(
             (cost - new_cost).abs()
         };
         if relative_change < params.cost_tolerance as f64 {
-            // The generic solver keeps this last applied step.
-            if new_cost.is_finite() {
+            // The generic solver keeps this last step even uphill; `monotone`
+            // keeps it only downhill (G11).
+            if new_cost.is_finite() && (!monotone || new_cost <= cost) {
                 pose = candidate;
             }
             converged = true;
@@ -553,8 +558,16 @@ mod tests {
     fn recovers_a_perturbed_pose() {
         let (world, image, k, truth) = scene(false);
         let start = Mat3AF32::IDENTITY;
-        let refined =
-            refine_pose_analytic(&world, &image, &k, &start, &Vec3AF32::ZERO, &params()).unwrap();
+        let refined = refine_pose_analytic(
+            &world,
+            &image,
+            &k,
+            &start,
+            &Vec3AF32::ZERO,
+            &params(),
+            false,
+        )
+        .unwrap();
         let (r, t) = (refined.rotation, refined.translation);
         assert!(refined.converged);
         for i in 0..3 {
@@ -572,8 +585,16 @@ mod tests {
     fn agrees_with_the_generic_solver() {
         let (world, image, k, _) = scene(true);
         let start = Mat3AF32::IDENTITY;
-        let refined =
-            refine_pose_analytic(&world, &image, &k, &start, &Vec3AF32::ZERO, &params()).unwrap();
+        let refined = refine_pose_analytic(
+            &world,
+            &image,
+            &k,
+            &start,
+            &Vec3AF32::ZERO,
+            &params(),
+            false,
+        )
+        .unwrap();
         let (r, t) = (refined.rotation, refined.translation);
         let generic =
             refine_pose_lm(&world, &image, &k, &start, &Vec3AF32::ZERO, None, &params()).unwrap();
@@ -600,8 +621,16 @@ mod tests {
             )
         };
         let scaled = Mat3AF32::from_cols(col(0), col(1), col(2));
-        let refined =
-            refine_pose_analytic(&world, &image, &k, &scaled, &Vec3AF32::ZERO, &params()).unwrap();
+        let refined = refine_pose_analytic(
+            &world,
+            &image,
+            &k,
+            &scaled,
+            &Vec3AF32::ZERO,
+            &params(),
+            false,
+        )
+        .unwrap();
         let t = refined.translation;
         assert!((t.x as f64 - truth.t.x).abs() < 1e-4);
         assert!((t.y as f64 - truth.t.y).abs() < 1e-4);
@@ -623,6 +652,7 @@ mod tests {
             &Mat3AF32::IDENTITY,
             &Vec3AF32::ZERO,
             &params(),
+            false,
         );
         assert!(out.is_none());
     }
@@ -642,7 +672,77 @@ mod tests {
             &Mat3AF32::IDENTITY,
             &Vec3AF32::ZERO,
             &cauchy,
+            false,
         );
         assert!(out.is_none());
+    }
+
+    /// G11: a start (Huber, the outlier) whose first damped step raises the cost by
+    /// about 3 %, with `cost_tolerance` loose enough to stop on that step. The rule is
+    /// the same at the default 1e-6; the loose tolerance makes the step visible.
+    fn uphill_start() -> (Vec<Vec3AF32>, Vec<Vec2F32>, Mat3AF32, Pose, LMRefineParams) {
+        let (world, image, k, _) = scene(true);
+        let start = Pose {
+            r: rotation([0.6, -0.1, 0.05]),
+            t: Vec3F64::new(0.0, 0.0, 2.0),
+        };
+        let params = LMRefineParams {
+            initial_lambda: 1e3,
+            cost_tolerance: 0.05,
+            ..params()
+        };
+        (world, image, k, start, params)
+    }
+
+    fn cost_at(world: &[Vec3AF32], image: &[Vec2F32], k: &Mat3AF32, pose: &Pose) -> f64 {
+        let points: Vec<Vec3F64> = world.iter().map(|p| vec3_to_f64(*p)).collect();
+        let pixels: Vec<[f64; 2]> = image.iter().map(|p| [p.x as f64, p.y as f64]).collect();
+        let problem = Problem {
+            points: &points,
+            pixels: &pixels,
+            fx: k.x_axis().x as f64,
+            fy: k.y_axis().y as f64,
+            cx: k.z_axis().x as f64,
+            cy: k.z_axis().y as f64,
+            kernel: kernel_from_params(&params()).unwrap(),
+        };
+        problem.cost(pose).unwrap()
+    }
+
+    /// The start cost and the cost of the refined pose, `monotone` as given.
+    fn refined_cost(monotone: bool) -> (f64, f64) {
+        let (world, image, k, start, params) = uphill_start();
+        let refined = refine_pose_analytic(
+            &world,
+            &image,
+            &k,
+            &mat3_to_f32(start.r),
+            &vec3_to_f32(start.t),
+            &params,
+            monotone,
+        )
+        .unwrap();
+        assert!(refined.converged);
+        let pose = Pose {
+            r: mat3_to_f64(refined.rotation),
+            t: vec3_to_f64(refined.translation),
+        };
+        (
+            cost_at(&world, &image, &k, &start),
+            cost_at(&world, &image, &k, &pose),
+        )
+    }
+
+    #[test]
+    fn the_monotone_rule_refuses_an_uphill_step_inside_the_cost_tolerance() {
+        let (start, refined) = refined_cost(true);
+        assert!(refined <= start * (1.0 + 1e-6), "{start} -> {refined}");
+    }
+
+    #[test]
+    fn without_the_monotone_rule_an_uphill_step_inside_the_cost_tolerance_is_kept() {
+        let (start, refined) = refined_cost(false);
+        let rise = refined / start - 1.0;
+        assert!((0.01..0.05).contains(&rise), "{start} -> {refined}");
     }
 }
