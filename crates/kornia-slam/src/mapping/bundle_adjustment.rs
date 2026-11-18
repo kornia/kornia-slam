@@ -78,7 +78,9 @@ pub enum LargeWindow {
     Off,
     /// Used for a keyframe tracked with more than `min_tracked_inliers`
     /// inliers. ORB-SLAM3: 100 (75 monocular), 25 keyframes, 4 iterations,
-    /// initial λ 1e-2.
+    /// initial λ 1e-2. That λ is not ORB-SLAM3's damping here: g2o adds
+    /// `λ·I`, this solver `λ·diag(H)`, so 1e-2 damps every DOF by 1 %, orders
+    /// of magnitude more; about 1e-6 is nearer g2o's (E13).
     Enabled {
         min_tracked_inliers: usize,
         active_keyframes: usize,
