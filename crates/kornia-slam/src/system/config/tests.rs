@@ -1363,7 +1363,7 @@ mod ron_files {
         assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
 
         let config = parse(
-            "(version: 1, pipeline: OrbSlam((mapping: (local_ba: (lost_keyframes: FixedInertial)))))",
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((mapping: (local_ba: (lost_keyframes: FixedInertial)))))",
         )
         .unwrap();
         assert_eq!(
@@ -1643,7 +1643,7 @@ mod ron_files {
         assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
 
         let config = parse(
-            "(version: 1, pipeline: OrbSlam((tracking_loss: (keyframes_while_lost: Anchor, reseed: (keep_inertial: true, min_seed_points: 10)))))",
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (keyframes_while_lost: Anchor, reseed: (keep_inertial: true, min_seed_points: 10)))))",
         )
         .unwrap();
         let reseed = orb(&config).tracking_loss.reseed;
@@ -1666,14 +1666,14 @@ mod ron_files {
     fn the_pose_gate_defaults_off_round_trips_and_takes_default_limits() {
         use crate::tracking::pose_gate::{PoseGate, PoseGateLimits};
         let old = parse(
-            "(version: 1, pipeline: OrbSlam((tracking_loss: (reseed: (keep_inertial: true)))))",
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (reseed: (keep_inertial: true)))))",
         )
         .unwrap();
         assert_eq!(orb(&old).tracking_loss.pose_gate, PoseGate::Disabled);
         assert!(!config_display_mentions_gate(&old));
 
         let config = parse(
-            "(version: 1, pipeline: OrbSlam((tracking_loss: (pose_gate: Enabled((max_rotation_gap_deg: 6.5))))))",
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (pose_gate: Enabled((max_rotation_gap_deg: 6.5))))))",
         )
         .unwrap();
         let PoseGate::Enabled(limits) = orb(&config).tracking_loss.pose_gate else {
@@ -1687,7 +1687,7 @@ mod ron_files {
         assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
 
         let config =
-            parse("(version: 1, pipeline: OrbSlam((tracking_loss: (pose_gate: Enabled(())))))")
+            parse("(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (pose_gate: Enabled(())))))")
                 .unwrap();
         assert_eq!(
             orb(&config).tracking_loss.pose_gate,
@@ -1711,7 +1711,7 @@ mod ron_files {
         assert_eq!(defaults.bridge_covariance_scale, 100.0);
 
         let config = parse(
-            "(version: 1, pipeline: OrbSlam((tracking_loss: (reseed: (keep_inertial: true, min_seed_points: 10, max_tilt_deg: 7.5)))))",
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (reseed: (keep_inertial: true, min_seed_points: 10, max_tilt_deg: 7.5)))))",
         )
         .unwrap();
         let reseed = orb(&config).tracking_loss.reseed;
