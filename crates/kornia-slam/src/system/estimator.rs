@@ -33,12 +33,21 @@ const BA_SHIFT_M: f64 = 0.3;
 /// The next tracked step undoes a shift when it moves back this many times
 /// the shift along it.
 const SNAPBACK_RATIO: std::ops::RangeInclusive<f64> = 0.5..=2.0;
+/// ORB-SLAM3 stays visual for `mMaxFrames` frames after a relocalization
+/// (`Tracking.cc:2973`): one second at the camera rate, the window here
+/// without the OrbSlam3 keyframe rules' `max_frames`.
+const VISUAL_AFTER_RELOCALIZATION_SEC: f64 = 1.0;
+/// Longest window a keyframe is held exact over: white-noise information
+/// alone overstates a longer gap (27x at 5 s, E4).
+const MAX_FIXED_WINDOW_SEC: f64 = 1.0;
 
 /// Lane A's state carried across frames.
 #[derive(Debug, Default)]
 pub(super) struct EstimatorState {
     /// Frame index of the last relocalization.
     pub(super) last_relocalization_frame: Option<usize>,
+    /// Timestamp of the last relocalization.
+    pub(super) last_relocalization_sec: Option<f64>,
     /// The newest keyframe's id and marginal covariance from VI-BA.
     pub(super) newest_marginal: Option<(usize, Mat15F64)>,
     /// The covariance trust of the frame at the timestamp it was taken for.
@@ -355,6 +364,10 @@ impl SlamSystem {
         if mode == PoseInertial::Off || !self.state.imu_initialized {
             return;
         }
+        if self.recently_relocalized(frame.idx, timestamp_sec) {
+            self.estimator.frame_prior = None;
+            return;
+        }
         let Some(anchor) = self.solve_anchor(mode, frame.idx) else {
             self.estimator.frame_prior = None;
             return;
@@ -366,7 +379,8 @@ impl SlamSystem {
         let (preintegrated, _) =
             self.inertial
                 .preintegrate_window(self.rig.imu_noise(), start_sec, timestamp_sec);
-        if preintegrated.dt <= 0.0 {
+        if preintegrated.dt <= 0.0 || (keyframe_anchored && preintegrated.dt > MAX_FIXED_WINDOW_SEC)
+        {
             self.estimator.frame_prior = None;
             return;
         }
@@ -417,6 +431,22 @@ impl SlamSystem {
         let epoch = self.map.lock().unwrap().world_epoch();
         self.estimator.frame_prior = solution.prior.map(|prior| (frame.idx, epoch, prior));
         self.estimator.map_changed = false;
+    }
+
+    /// Whether the frame falls in the visual-only stretch after the last
+    /// relocalization: `max_frames` frames under the OrbSlam3 keyframe rules,
+    /// otherwise [`VISUAL_AFTER_RELOCALIZATION_SEC`].
+    fn recently_relocalized(&self, frame_idx: usize, timestamp_sec: f64) -> bool {
+        match self.keyframe_policy.rules {
+            KeyframeRules::OrbSlam3 { max_frames } => self
+                .estimator
+                .last_relocalization_frame
+                .is_some_and(|reloc| frame_idx <= reloc + max_frames),
+            KeyframeRules::Kornia => self
+                .estimator
+                .last_relocalization_sec
+                .is_some_and(|reloc| timestamp_sec - reloc <= VISUAL_AFTER_RELOCALIZATION_SEC),
+        }
     }
 
     /// Whether the previous frame's solve carries velocity and bias into this

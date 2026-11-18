@@ -750,6 +750,85 @@ mod anchors {
     }
 }
 
+mod pose_inertial_guards {
+    use super::*;
+    use crate::tracking::KeyframeRules;
+    use crate::tracking::parallax::tests::{
+        all_matches, frame_seeing_points, map_with_keyframe_at,
+    };
+    use crate::tracking::pose_estimation::Estimate;
+
+    /// A monocular-inertial system solving every tracked frame from its last
+    /// keyframe 0 (t = 0), with 2 s of IMU at rest and the debug log on.
+    fn system() -> SlamSystem {
+        let config = config(CameraSelection::Mono, true, LoopClosingMode::Disabled);
+        let rig = SensorRig::new(camera()).with_imu(Pose3d::IDENTITY);
+        let mut system = SlamSystem::build(config, rig).unwrap();
+        system.tracking_config.pose_inertial = PoseInertial::LastKeyframe;
+        *system.map.lock().unwrap() = map_with_keyframe_at(Pose3d::IDENTITY);
+        system.state.current_keyframe_idx = Some(0);
+        system.state.last_keyframe_idx = Some(0);
+        system.state.imu_initialized = true;
+        system.inertial.last_keyframe_timestamp_sec = Some(0.0);
+        let samples: Vec<ImuMeasurement> = (0..=400)
+            .map(|i| ImuMeasurement {
+                timestamp: i as f64 * 0.005,
+                gyro: Vec3F64::ZERO,
+                accel: Vec3F64::ZERO,
+            })
+            .collect();
+        system.process_imu(&samples);
+        system.set_debug(true);
+        system
+    }
+
+    /// Whether frame `idx` at `t` ran the pose-inertial solve.
+    fn solved(system: &mut SlamSystem, idx: usize, t: f64) -> bool {
+        let points: Vec<Vec3F64> =
+            system.with_map_points(|mps| mps.iter().map(|mp| mp.position).collect());
+        let frame = frame_seeing_points(idx, Pose3d::IDENTITY, &points);
+        let mut estimate = Estimate {
+            pose: Pose3d::IDENTITY,
+            matches: all_matches(),
+            inliers: points.len(),
+            most_voted_keyframe: None,
+        };
+        system.drain_debug_messages();
+        system.refine_pose_inertial(&frame, &mut estimate, t - 0.05, t);
+        system
+            .drain_debug_messages()
+            .iter()
+            .any(|m| m.starts_with("[pose_inertial]"))
+    }
+
+    /// E4: ORB-SLAM3 stays visual for `mMaxFrames` frames after a
+    /// relocalization (`Tracking.cc:2973`), and a keyframe held exact over a
+    /// window past a second is overconfident (27x at 5 s).
+    #[test]
+    fn the_solve_waits_after_a_relocalization_and_skips_a_long_fixed_window() {
+        let mut system = system();
+        assert!(solved(&mut system, 10, 0.5), "a short window solves");
+        assert!(!solved(&mut system, 30, 1.5), "1.5 s held exact");
+
+        system.keyframe_policy.rules = KeyframeRules::OrbSlam3 { max_frames: 10 };
+        system.estimator.last_relocalization_frame = Some(5);
+        assert!(
+            !solved(&mut system, 10, 0.5),
+            "5 frames after a relocalization"
+        );
+        assert!(solved(&mut system, 16, 0.5), "past max_frames");
+
+        system.keyframe_policy.rules = KeyframeRules::Kornia;
+        system.estimator.last_relocalization_sec = Some(0.2);
+        assert!(
+            !solved(&mut system, 40, 0.5),
+            "0.3 s after a relocalization"
+        );
+        system.estimator.last_relocalization_sec = Some(-0.6);
+        assert!(solved(&mut system, 41, 0.5), "past a second");
+    }
+}
+
 mod inertial_origin {
     use super::*;
     use crate::tracking::local_map::LocalMapRules;

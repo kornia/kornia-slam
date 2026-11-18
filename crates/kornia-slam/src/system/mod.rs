@@ -1131,7 +1131,7 @@ impl SlamSystem {
                 if self.recovery.relocalize_when_lost {
                     // No segment is tracked while re-seeding, so no own window applies.
                     self.tracker.set_window_start(None);
-                    if self.relocalize(&curr_frame, true) {
+                    if self.relocalize(&curr_frame, timestamp_sec, true) {
                         self.resume_after_lost_relocalization(timestamp_sec);
                         return self.frame_result(TrackingStatus::Tracked);
                     }
@@ -1928,7 +1928,7 @@ impl SlamSystem {
         if status == TrackingStatus::Skipped && self.relocalization_due(timestamp_sec) {
             let only_while_lost =
                 self.relocalization.while_lost && self.imu_confident(timestamp_sec);
-            if self.relocalize(&frame, false) {
+            if self.relocalize(&frame, timestamp_sec, false) {
                 status = TrackingStatus::Tracked;
                 if only_while_lost {
                     self.counters.relocalizations_while_lost += 1;
@@ -2635,7 +2635,7 @@ impl SlamSystem {
     /// and resumes tracking from it. Needs the loop closer's vocabulary and
     /// keyframe database. `lost`: after a give-up (see
     /// [`recovery::relocalization_adopted`]).
-    fn relocalize(&mut self, frame: &Frame, lost: bool) -> bool {
+    fn relocalize(&mut self, frame: &Frame, timestamp_sec: f64, lost: bool) -> bool {
         const MAX_CANDIDATES: usize = 5;
         let Some(loop_closer) = self.loop_closer.as_ref() else {
             if lost || self.relocalization.while_lost {
@@ -2713,6 +2713,8 @@ impl SlamSystem {
         self.state.current_keyframe_idx = Some(found.keyframe_idx);
         self.state.velocity = None;
         self.estimator.last_relocalization_frame = Some(frame.idx);
+        self.estimator.last_relocalization_sec = Some(timestamp_sec);
+        self.estimator.frame_prior = None;
         true
     }
 
