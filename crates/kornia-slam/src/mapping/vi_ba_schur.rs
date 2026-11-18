@@ -104,6 +104,10 @@ const MIN_Z: f32 = 1e-3;
 /// with no curvature at all is still damped.
 const MIN_DAMPING_FLOOR: f64 = 1e-6;
 
+/// An undamped point block whose smallest eigenvalue is at most this
+/// fraction of its largest is rank-deficient: its landmark's depth is free.
+const UNDAMPED_POINT_CONDITION: f64 = 1e-9;
+
 /// Metres added to the depth gate's upper bound, so a near measurement is not
 /// gated by the noise of a small depth (see [`ViBaParams::depth_gate_factor`]).
 const DEPTH_GATE_MARGIN_M: f64 = 1.0;
@@ -1848,6 +1852,414 @@ fn border_marginal_sigma(information: &Mat<f64>, base: usize) -> Option<Vec<f64>
     sigma.iter().all(|s| s.is_finite()).then_some(sigma)
 }
 
+/// What a build of the reduced system reads and never changes.
+#[derive(Clone, Copy)]
+struct SystemInputs<'a> {
+    keyframes: &'a [ViBaKeyframe],
+    observations: &'a [BaObservation],
+    depth_on: &'a [bool],
+    views: ObservationViews<'a>,
+    camera: &'a PinholeCamera,
+    params: &'a ViBaParams,
+    calibration: Option<&'a CalibratedSolve<'a>>,
+    kf_local: &'a [i64],
+    point_local: &'a [i64],
+    n_free_kf: usize,
+    n_free_pts: usize,
+    n_cal: usize,
+    prior: Option<(usize, &'a MarginalPrior)>,
+    wheel_edges: &'a [WheelOdomFactor],
+    wheel_info: &'a [Mat6F64],
+    stationary_edges: &'a [StationaryFactor],
+    stationary_info: &'a [StationaryInfo],
+}
+
+/// The state a build linearizes at, with the IMU edges integrated for it.
+#[derive(Clone, Copy)]
+struct SystemState<'s> {
+    kfs: &'s [ViBaKeyframe],
+    se3s: &'s [SE3F32],
+    xyz: &'s [Vec3F64],
+    calib: &'s Calibration,
+    imu_edges: &'s [ImuFactor],
+}
+
+/// The reduced keyframe system of one linearization, before LM damping of
+/// the keyframe block, and what back-substitution needs from the points.
+struct ReducedSystem {
+    m_mat: Mat<f64>,
+    m_vec: Vec<f64>,
+    vis: VisualBlocks,
+    c_inv: Vec<Option<SMatF64<3, 3>>>,
+    border: Option<Border>,
+    cost: f64,
+}
+
+/// Builds the reduced system at `state`, the point blocks damped by
+/// `lambda`. The observations of the free points `dropped_points` marks are
+/// left out.
+fn build_reduced_system(
+    inputs: &SystemInputs<'_>,
+    state: &SystemState<'_>,
+    lambda: f64,
+    vis_inlier: &mut [bool],
+    is_first_iter: bool,
+    dropped_points: &[bool],
+) -> ReducedSystem {
+    const KF_DOF: usize = 15;
+    let SystemInputs {
+        keyframes,
+        observations,
+        depth_on,
+        views,
+        camera,
+        params,
+        calibration,
+        kf_local,
+        point_local,
+        n_free_kf,
+        n_free_pts,
+        n_cal,
+        prior,
+        wheel_edges,
+        wheel_info,
+        stationary_edges,
+        stationary_info,
+    } = *inputs;
+    let SystemState {
+        kfs,
+        se3s,
+        xyz,
+        calib,
+        imu_edges: imu_edges_now,
+    } = *state;
+    let (n_kf, n_pts) = (keyframes.len(), xyz.len());
+    let cal_base = n_free_kf * KF_DOF;
+    let skip_edge = |edge: &ImuFactor| prior.is_some() && is_boundary_edge(edge, kf_local);
+
+    // ── 1. Schur blocks for visual residuals ─────────────────────────
+    // The blocks of bundle_adjust_schur_with_priors, but A is 6×6 (pose
+    // only) and is scattered into the 15×15 keyframe slot when building
+    // m_mat.
+    let mut vis = VisualBlocks::new(n_free_kf, n_free_pts);
+    let mut cost_vis = 0.0f64;
+    // dim is 15*n_free_kf plus the calibration columns. Visual terms only
+    // touch the first 6 DOF of each 15-DOF block; IMU terms fill the rest.
+    let dim = n_free_kf * KF_DOF + n_cal;
+    let mut m_mat = Mat::<f64>::zeros(dim, dim);
+    let mut m_vec = vec![0.0f64; dim];
+    let mut border = (n_cal > 0).then(|| Border::new(cal_base, n_free_pts));
+    let imu_t_bc = calibration.map_or(params.imu_t_bc, |c| c.imu_t_bc(&calib, params));
+
+    for (o, ((obs, &depth_row), inlier)) in observations
+        .iter()
+        .zip(depth_on)
+        .zip(vis_inlier.iter_mut())
+        .enumerate()
+    {
+        *inlier = false;
+        if obs.pose_idx >= n_kf || obs.point_idx >= n_pts {
+            continue;
+        }
+        let xli = usize::try_from(point_local[obs.point_idx]).ok();
+        if xli.is_some_and(|x| dropped_points.get(x) == Some(&true)) {
+            continue;
+        }
+
+        let pose = &se3s[obs.pose_idx];
+        let point = &xyz[obs.point_idx];
+        let (obs_camera, obs_pose) = views.camera_pose(o, camera, pose);
+        let view = calibration.map(|c| {
+            CalibratedView::new(
+                &c.layout,
+                &calib,
+                views.camera_index(o),
+                obs_camera,
+                obs_pose,
+            )
+        });
+        let (obs_camera, obs_pose) = view
+            .as_ref()
+            .map_or((obs_camera, obs_pose), |v| (&v.camera, v.pose));
+        // residual_and_jacobians is f32 internally; cast results to f64.
+        let (r_f32, jp_f32, jx_f32) =
+            residual_and_jacobians(&obs_pose, point, obs.pixel, obs_camera);
+
+        let inv_sigma = params
+            .observation_sigma_px
+            .get(o)
+            .map_or(1.0, |&sigma| 1.0 / f64::from(sigma));
+        let r_raw = SVecF64::<2>::from_fn(|i, _| f64::from(r_f32[i]) * inv_sigma);
+        let chi2_vis = r_raw.norm_squared();
+        *inlier = chi2_vis <= params.huber_reproj_px_sq;
+        let (hw_vis, c_vis) = visual_huber(chi2_vis, params.huber_reproj_px_sq);
+        cost_vis += c_vis;
+        let sqrt_hw_vis = hw_vis.sqrt();
+        let jp = SMatF64::<2, 6>::from_fn(|i, k| {
+            f64::from(jp_f32[i * 6 + k]) * inv_sigma * sqrt_hw_vis
+        });
+        let jx = SMatF64::<2, 3>::from_fn(|i, k| {
+            f64::from(jx_f32[i * 3 + k]) * inv_sigma * sqrt_hw_vis
+        });
+
+        let pli = usize::try_from(kf_local[obs.pose_idx]).ok();
+        let r_vis = r_raw * sqrt_hw_vis;
+        vis.add_rows(pli, xli, &jp, &jx, &r_vis);
+        if let (Some(border), Some(view)) = (border.as_mut(), view.as_ref()) {
+            let columns = view.rows(point, inv_sigma * sqrt_hw_vis);
+            border
+                .add_observation(&mut m_mat, &mut m_vec, &columns, pli, xli, &jp, &jx, &r_vis);
+        }
+
+        // Depth residual (stereo metric anchor) — see
+        // depth_residual_and_jacobian for why this matters here.
+        if let Some(d_meas) = obs.depth_meas.filter(|_| depth_row) {
+            let sigma = (obs.depth_sigma as f64).max(1e-6);
+            let (r_z_raw, jpd_raw, jxd_raw) =
+                depth_residual_and_jacobian(pose, point, d_meas as f64, sigma);
+            let chi2_depth = r_z_raw * r_z_raw;
+            let (hw_depth, c_depth) = visual_huber(chi2_depth, params.huber_depth_sigma_sq);
+            cost_vis += c_depth;
+            let sqrt_hw_depth = hw_depth.sqrt();
+            let jpd = SMatF64::<1, 6>::from_row_slice(&jpd_raw) * sqrt_hw_depth;
+            let jxd = SMatF64::<1, 3>::from_row_slice(&jxd_raw) * sqrt_hw_depth;
+            let r_z = SVecF64::<1>::new(r_z_raw * sqrt_hw_depth);
+            vis.add_rows(pli, xli, &jpd, &jxd, &r_z);
+        }
+    }
+
+    // ── 2. Invert C blocks, build Schur-reduced system ───────────────
+    // Scatter A blocks into the upper-left 6×6 of each 15×15 slot.
+    for (k, (ab, gp)) in vis.a.iter().zip(&vis.g_pose).enumerate() {
+        let base = k * KF_DOF;
+        add_block(&mut m_mat, base, base, ab);
+        m_vec[base..(6 + base)].copy_from_slice(gp.as_slice());
+    }
+
+    // Schur point elimination: M -= B C⁻¹ Bᵀ,  m -= B C⁻¹ g_point.
+    // Point back-substitution only needs the first 6 elements of each
+    // keyframe's delta (pose DOF), so the B blocks are 6×3 as before.
+
+    damp_point_blocks(&mut vis.c, lambda);
+    let c_inv: Vec<Option<SMatF64<3, 3>>> = vis.c.iter().map(invert_point_block).collect();
+
+    for (x, ((b_for_j, ci), g_point)) in vis
+        .b_by_point
+        .iter()
+        .zip(&c_inv)
+        .zip(&vis.g_point)
+        .enumerate()
+    {
+        let Some(ci) = ci else {
+            continue;
+        };
+        if let Some(border) = border.as_ref() {
+            border.eliminate_point(&mut m_mat, &mut m_vec, x, ci, g_point, b_for_j);
+        }
+        let bc: Vec<(usize, SMatF64<6, 3>)> =
+            b_for_j.iter().map(|(i_loc, b)| (*i_loc, b * ci)).collect();
+
+        for (i_loc, bc_block) in &bc {
+            sub_from(&mut m_vec, i_loc * KF_DOF, &(bc_block * g_point));
+        }
+        for (i1_loc, bc1) in &bc {
+            for (i2_loc, b2) in b_for_j {
+                let s = bc1 * b2.transpose();
+                add_block(&mut m_mat, i1_loc * KF_DOF, i2_loc * KF_DOF, &-s);
+            }
+        }
+    }
+
+    // ── 3. IMU normal equations ───────────────────────────────────────
+    // Each edge contributes J_i^T Ω J_i, J_j^T Ω J_j (diagonal 15×15
+    // blocks) and J_i^T Ω J_j, J_j^T Ω J_i (off-diagonal 15×15 blocks).
+    let mut cost_imu = 0.0f64;
+
+    for (e, edge) in imu_edges_now.iter().enumerate() {
+        let i = edge.from_idx;
+        let j = edge.to_idx;
+        let li = kf_local[i];
+        let lj = kf_local[j];
+        if (li < 0 && lj < 0) || skip_edge(edge) {
+            continue;
+        }
+
+        let (res, ji, jj) = preintegration::residual_and_jacobians(
+            kfs[i].nav_state(),
+            kfs[j].nav_state(),
+            &edge.preintegrated,
+            &params.gravity,
+            imu_t_bc.as_ref(),
+        );
+
+        let omega_raw = imu_edge_information(edge, &kf_local, params);
+        // Huber robustification: down-weight edges whose nav-block Mahalanobis
+        // chi2 exceeds the threshold. This handles large residuals from rough
+        // post-init velocity estimates without a fixed weight compromise.
+        // Only the nav 9×9 sub-block (rows/cols 0-8) is scaled by `hw` — the
+        // bias-random-walk 6×6 sub-block (rows/cols 9-14) is a separate,
+        // uncorrelated measurement (see `imu_information_matrix`) that ORB-SLAM3
+        // robustifies independently (EdgeInertial vs EdgeGyroRW/EdgeAccRW are
+        // distinct g2o edges). Scaling it by the *nav* residual's outlier-ness
+        // was silencing the one thing meant to resist a bad nav window explaining
+        // itself away through bias, in exactly the windows where that matters.
+        let (hw, c_imu) = preintegration::weight_and_cost(
+            &res,
+            &omega_raw,
+            imu_huber_chi2(edge, &kf_local, params).unwrap_or(0.0),
+        );
+        cost_imu += c_imu;
+        let omega: Mat15F64 = {
+            let mut o = omega_raw;
+            let mut nav = o.fixed_view_mut::<9, 9>(0, 0);
+            nav *= hw;
+            o
+        };
+
+        if is_first_iter {
+            let [nr, nv, np, nbg, nba] = imu_residual_norms(&res);
+            let om_min = omega_raw
+                .iter()
+                .cloned()
+                .filter(|&x| x > 0.0)
+                .fold(f64::MAX, f64::min);
+            let om_max = omega_raw.iter().cloned().fold(f64::MIN, f64::max);
+            debug_eprintln!(
+                "[vi_ba] edge {i}→{j}  dt={:.3}s  |r_R|={nr:.4e}  |r_v|={nv:.4e}  \
+                    |r_p|={np:.4e}  |r_bg|={nbg:.4e}  |r_ba|={nba:.4e}  \
+                    Ω∈[{om_min:.2e},{om_max:.2e}]  hw={hw:.4}  boundary={}",
+                edge.preintegrated.dt,
+                is_boundary_edge(edge, &kf_local),
+            );
+        }
+
+        // Accumulate H_ii, g_i.
+        if li >= 0 {
+            let base_i = li as usize * KF_DOF;
+            accum_jt_omega_j(
+                &mut m_mat, &mut m_vec, base_i, base_i, &ji, &ji, &omega, &res, true,
+            );
+        }
+        // Accumulate H_jj, g_j.
+        if lj >= 0 {
+            let base_j = lj as usize * KF_DOF;
+            accum_jt_omega_j(
+                &mut m_mat, &mut m_vec, base_j, base_j, &jj, &jj, &omega, &res, true,
+            );
+        }
+        // Off-diagonal H_ij and H_ji (symmetric pair).
+        if li >= 0 && lj >= 0 {
+            let base_i = li as usize * KF_DOF;
+            let base_j = lj as usize * KF_DOF;
+            accum_jt_omega_j(
+                &mut m_mat, &mut m_vec, base_i, base_j, &ji, &jj, &omega, &res, false,
+            );
+            accum_jt_omega_j(
+                &mut m_mat, &mut m_vec, base_j, base_i, &jj, &ji, &omega, &res, false,
+            );
+        }
+        if let (Some(c), Some(border)) = (calibration, border.as_ref()) {
+            let columns = c.imu_columns(e, edge, &kfs, &calib, params);
+            border.add_imu(
+                &mut m_mat,
+                &mut m_vec,
+                &columns,
+                &res,
+                &omega,
+                [(li, &ji), (lj, &jj)],
+            );
+        }
+    }
+
+    // ── 3b. Accel-bias magnitude prior (unary, per free keyframe) ────────
+    // See ViBaParams::accel_bias_prior_weight doc. Deliberately not scaled
+    // by any Huber weight — this is the one bias regularizer that must
+    // hold even when nav residuals are bad.
+    let mut cost_bias_prior = 0.0f64;
+    if params.accel_bias_prior_weight > 0.0 {
+        let w = params.accel_bias_prior_weight;
+        for (i, kf) in kfs.iter().enumerate() {
+            let li = kf_local[i];
+            if li < 0 {
+                continue;
+            }
+            let base = li as usize * KF_DOF;
+            let ba = [kf.bias.accel.x, kf.bias.accel.y, kf.bias.accel.z];
+            for d in 0..3 {
+                m_mat[(base + 12 + d, base + 12 + d)] += w;
+                m_vec[base + 12 + d] -= w * ba[d];
+                cost_bias_prior += 0.5 * w * ba[d] * ba[d];
+            }
+        }
+    }
+
+    let cost_prior = prior.map_or(0.0, |(i, p)| {
+        accumulate_prior(
+            &mut m_mat,
+            &mut m_vec,
+            kf_local[i] as usize * KF_DOF,
+            p,
+            &kfs[i],
+        )
+    });
+
+    let cost_wheel = accumulate_wheel_edges(
+        &mut m_mat,
+        &mut m_vec,
+        &kfs,
+        &kf_local,
+        wheel_edges,
+        &wheel_info,
+    );
+
+    let cost_stationary = accumulate_stationary_edges(
+        &mut m_mat,
+        &mut m_vec,
+        &kfs,
+        &kf_local,
+        stationary_edges,
+        &stationary_info,
+    );
+
+    let mut cost =
+        cost_vis + cost_imu + cost_bias_prior + cost_prior + cost_wheel + cost_stationary;
+    if let (Some(c), Some(border)) = (calibration, border.as_ref()) {
+        let rows = online_prior_rows(&c.layout, &c.config, &calib, &c.previous);
+        cost += border.add_priors(&mut m_mat, &mut m_vec, &rows);
+    }
+    hold_inertial_state(&mut m_mat, &mut m_vec, keyframes, kf_local);
+    ReducedSystem {
+        m_mat,
+        m_vec,
+        vis,
+        c_inv,
+        border,
+        cost,
+    }
+}
+
+/// The undamped reduced system at `state`, the system whose inverse is the
+/// marginal covariance. A free point whose undamped C is rank-deficient (a
+/// depth-free landmark) is left out: it says nothing about the poses, and
+/// its inverse would be round-off.
+fn undamped_information(inputs: &SystemInputs<'_>, state: &SystemState<'_>) -> Mat<f64> {
+    let mut inliers = vec![false; inputs.observations.len()];
+    let system = build_reduced_system(inputs, state, 0.0, &mut inliers, false, &[]);
+    let rank_deficient: Vec<bool> = system
+        .vis
+        .c
+        .iter()
+        .map(|c| {
+            let eigenvalues = c.symmetric_eigenvalues();
+            eigenvalues.min() <= UNDAMPED_POINT_CONDITION * eigenvalues.max()
+        })
+        .collect();
+    if !rank_deficient.contains(&true) {
+        return system.m_mat;
+    }
+    build_reduced_system(inputs, state, 0.0, &mut inliers, false, &rank_deficient).m_mat
+}
+
 /// Visual-inertial bundle adjustment via dense Schur-complement reduction.
 ///
 /// Jointly optimises keyframe poses, velocities, and IMU biases (15 DOF each)
@@ -1987,7 +2399,25 @@ fn solve_vi_ba(
     );
     // Re-integrated at the current state, when a state needs it (D2).
     let mut cal_edges = calibration.and_then(|c| c.reintegrated_edges(imu_edges, &kfs, &calib));
-    let mut last_border_information: Option<Mat<f64>> = None;
+    let inputs = SystemInputs {
+        keyframes,
+        observations,
+        depth_on: &depth_on,
+        views,
+        camera,
+        params,
+        calibration,
+        kf_local: &kf_local,
+        point_local: &point_local,
+        n_free_kf,
+        n_free_pts,
+        n_cal,
+        prior,
+        wheel_edges,
+        wheel_info: &wheel_info,
+        stationary_edges,
+        stationary_info: &stationary_info,
+    };
 
     let mut lambda = params.initial_lambda;
     let mut iters_done = 0usize;
@@ -1999,313 +2429,38 @@ fn solve_vi_ba(
     // Whether each observation's reprojection is a Huber inlier at the
     // current linearization point (refreshed by every system build).
     let mut vis_inlier = vec![false; observations.len()];
-    // The undamped reduced system of the latest linearization, kept only when
-    // the newest keyframe's marginal is asked for.
-    let mut last_information: Option<Mat<f64>> = None;
 
     for _iter in 0..params.max_iterations {
         iters_done += 1;
         let is_first_iter = iters_done == 1;
 
-        // ── 1. Schur blocks for visual residuals ─────────────────────────
-        // The blocks of bundle_adjust_schur_with_priors, but A is 6×6 (pose
-        // only) and is scattered into the 15×15 keyframe slot when building
-        // m_mat.
-        let mut vis = VisualBlocks::new(n_free_kf, n_free_pts);
-        let mut cost_vis = 0.0f64;
-        // dim is 15*n_free_kf plus the calibration columns. Visual terms only
-        // touch the first 6 DOF of each 15-DOF block; IMU terms fill the rest.
-        let dim = n_free_kf * KF_DOF + n_cal;
-        let mut m_mat = Mat::<f64>::zeros(dim, dim);
-        let mut m_vec = vec![0.0f64; dim];
-        let mut border = (n_cal > 0).then(|| Border::new(cal_base, n_free_pts));
-        let imu_edges_now: &[ImuFactor] = cal_edges.as_deref().unwrap_or(imu_edges);
-        let imu_t_bc = calibration.map_or(params.imu_t_bc, |c| c.imu_t_bc(&calib, params));
-
-        for (o, ((obs, &depth_row), inlier)) in observations
-            .iter()
-            .zip(&depth_on)
-            .zip(vis_inlier.iter_mut())
-            .enumerate()
-        {
-            *inlier = false;
-            if obs.pose_idx >= n_kf || obs.point_idx >= n_pts {
-                continue;
-            }
-
-            let pose = &se3s[obs.pose_idx];
-            let point = &xyz[obs.point_idx];
-            let (obs_camera, obs_pose) = views.camera_pose(o, camera, pose);
-            let view = calibration.map(|c| {
-                CalibratedView::new(
-                    &c.layout,
-                    &calib,
-                    views.camera_index(o),
-                    obs_camera,
-                    obs_pose,
-                )
-            });
-            let (obs_camera, obs_pose) = view
-                .as_ref()
-                .map_or((obs_camera, obs_pose), |v| (&v.camera, v.pose));
-            // residual_and_jacobians is f32 internally; cast results to f64.
-            let (r_f32, jp_f32, jx_f32) =
-                residual_and_jacobians(&obs_pose, point, obs.pixel, obs_camera);
-
-            let inv_sigma = params
-                .observation_sigma_px
-                .get(o)
-                .map_or(1.0, |&sigma| 1.0 / f64::from(sigma));
-            let r_raw = SVecF64::<2>::from_fn(|i, _| f64::from(r_f32[i]) * inv_sigma);
-            let chi2_vis = r_raw.norm_squared();
-            *inlier = chi2_vis <= params.huber_reproj_px_sq;
-            let (hw_vis, c_vis) = visual_huber(chi2_vis, params.huber_reproj_px_sq);
-            cost_vis += c_vis;
-            let sqrt_hw_vis = hw_vis.sqrt();
-            let jp = SMatF64::<2, 6>::from_fn(|i, k| {
-                f64::from(jp_f32[i * 6 + k]) * inv_sigma * sqrt_hw_vis
-            });
-            let jx = SMatF64::<2, 3>::from_fn(|i, k| {
-                f64::from(jx_f32[i * 3 + k]) * inv_sigma * sqrt_hw_vis
-            });
-
-            let pli = usize::try_from(kf_local[obs.pose_idx]).ok();
-            let xli = usize::try_from(point_local[obs.point_idx]).ok();
-            let r_vis = r_raw * sqrt_hw_vis;
-            vis.add_rows(pli, xli, &jp, &jx, &r_vis);
-            if let (Some(border), Some(view)) = (border.as_mut(), view.as_ref()) {
-                let columns = view.rows(point, inv_sigma * sqrt_hw_vis);
-                border
-                    .add_observation(&mut m_mat, &mut m_vec, &columns, pli, xli, &jp, &jx, &r_vis);
-            }
-
-            // Depth residual (stereo metric anchor) — see
-            // depth_residual_and_jacobian for why this matters here.
-            if let Some(d_meas) = obs.depth_meas.filter(|_| depth_row) {
-                let sigma = (obs.depth_sigma as f64).max(1e-6);
-                let (r_z_raw, jpd_raw, jxd_raw) =
-                    depth_residual_and_jacobian(pose, point, d_meas as f64, sigma);
-                let chi2_depth = r_z_raw * r_z_raw;
-                let (hw_depth, c_depth) = visual_huber(chi2_depth, params.huber_depth_sigma_sq);
-                cost_vis += c_depth;
-                let sqrt_hw_depth = hw_depth.sqrt();
-                let jpd = SMatF64::<1, 6>::from_row_slice(&jpd_raw) * sqrt_hw_depth;
-                let jxd = SMatF64::<1, 3>::from_row_slice(&jxd_raw) * sqrt_hw_depth;
-                let r_z = SVecF64::<1>::new(r_z_raw * sqrt_hw_depth);
-                vis.add_rows(pli, xli, &jpd, &jxd, &r_z);
-            }
-        }
-
-        // ── 2. Invert C blocks, build Schur-reduced system ───────────────
-        // Scatter A blocks into the upper-left 6×6 of each 15×15 slot.
-        for (k, (ab, gp)) in vis.a.iter().zip(&vis.g_pose).enumerate() {
-            let base = k * KF_DOF;
-            add_block(&mut m_mat, base, base, ab);
-            m_vec[base..(6 + base)].copy_from_slice(gp.as_slice());
-        }
-
-        // Schur point elimination: M -= B C⁻¹ Bᵀ,  m -= B C⁻¹ g_point.
-        // Point back-substitution only needs the first 6 elements of each
-        // keyframe's delta (pose DOF), so the B blocks are 6×3 as before.
-
-        damp_point_blocks(&mut vis.c, lambda);
-        let c_inv: Vec<Option<SMatF64<3, 3>>> = vis.c.iter().map(invert_point_block).collect();
-
-        for (x, ((b_for_j, ci), g_point)) in vis
-            .b_by_point
-            .iter()
-            .zip(&c_inv)
-            .zip(&vis.g_point)
-            .enumerate()
-        {
-            let Some(ci) = ci else {
-                continue;
-            };
-            if let Some(border) = border.as_ref() {
-                border.eliminate_point(&mut m_mat, &mut m_vec, x, ci, g_point, b_for_j);
-            }
-            let bc: Vec<(usize, SMatF64<6, 3>)> =
-                b_for_j.iter().map(|(i_loc, b)| (*i_loc, b * ci)).collect();
-
-            for (i_loc, bc_block) in &bc {
-                sub_from(&mut m_vec, i_loc * KF_DOF, &(bc_block * g_point));
-            }
-            for (i1_loc, bc1) in &bc {
-                for (i2_loc, b2) in b_for_j {
-                    let s = bc1 * b2.transpose();
-                    add_block(&mut m_mat, i1_loc * KF_DOF, i2_loc * KF_DOF, &-s);
-                }
-            }
-        }
-
-        // ── 3. IMU normal equations ───────────────────────────────────────
-        // Each edge contributes J_i^T Ω J_i, J_j^T Ω J_j (diagonal 15×15
-        // blocks) and J_i^T Ω J_j, J_j^T Ω J_i (off-diagonal 15×15 blocks).
-        let mut cost_imu = 0.0f64;
-
-        for (e, edge) in imu_edges_now.iter().enumerate() {
-            let i = edge.from_idx;
-            let j = edge.to_idx;
-            let li = kf_local[i];
-            let lj = kf_local[j];
-            if (li < 0 && lj < 0) || skip_edge(edge) {
-                continue;
-            }
-
-            let (res, ji, jj) = preintegration::residual_and_jacobians(
-                kfs[i].nav_state(),
-                kfs[j].nav_state(),
-                &edge.preintegrated,
-                &params.gravity,
-                imu_t_bc.as_ref(),
-            );
-
-            let omega_raw = imu_edge_information(edge, &kf_local, params);
-            // Huber robustification: down-weight edges whose nav-block Mahalanobis
-            // chi2 exceeds the threshold. This handles large residuals from rough
-            // post-init velocity estimates without a fixed weight compromise.
-            // Only the nav 9×9 sub-block (rows/cols 0-8) is scaled by `hw` — the
-            // bias-random-walk 6×6 sub-block (rows/cols 9-14) is a separate,
-            // uncorrelated measurement (see `imu_information_matrix`) that ORB-SLAM3
-            // robustifies independently (EdgeInertial vs EdgeGyroRW/EdgeAccRW are
-            // distinct g2o edges). Scaling it by the *nav* residual's outlier-ness
-            // was silencing the one thing meant to resist a bad nav window explaining
-            // itself away through bias, in exactly the windows where that matters.
-            let (hw, c_imu) = preintegration::weight_and_cost(
-                &res,
-                &omega_raw,
-                imu_huber_chi2(edge, &kf_local, params).unwrap_or(0.0),
-            );
-            cost_imu += c_imu;
-            let omega: Mat15F64 = {
-                let mut o = omega_raw;
-                let mut nav = o.fixed_view_mut::<9, 9>(0, 0);
-                nav *= hw;
-                o
-            };
-
-            if is_first_iter {
-                let [nr, nv, np, nbg, nba] = imu_residual_norms(&res);
-                let om_min = omega_raw
-                    .iter()
-                    .cloned()
-                    .filter(|&x| x > 0.0)
-                    .fold(f64::MAX, f64::min);
-                let om_max = omega_raw.iter().cloned().fold(f64::MIN, f64::max);
-                debug_eprintln!(
-                    "[vi_ba] edge {i}→{j}  dt={:.3}s  |r_R|={nr:.4e}  |r_v|={nv:.4e}  \
-                        |r_p|={np:.4e}  |r_bg|={nbg:.4e}  |r_ba|={nba:.4e}  \
-                        Ω∈[{om_min:.2e},{om_max:.2e}]  hw={hw:.4}  boundary={}",
-                    edge.preintegrated.dt,
-                    is_boundary_edge(edge, &kf_local),
-                );
-            }
-
-            // Accumulate H_ii, g_i.
-            if li >= 0 {
-                let base_i = li as usize * KF_DOF;
-                accum_jt_omega_j(
-                    &mut m_mat, &mut m_vec, base_i, base_i, &ji, &ji, &omega, &res, true,
-                );
-            }
-            // Accumulate H_jj, g_j.
-            if lj >= 0 {
-                let base_j = lj as usize * KF_DOF;
-                accum_jt_omega_j(
-                    &mut m_mat, &mut m_vec, base_j, base_j, &jj, &jj, &omega, &res, true,
-                );
-            }
-            // Off-diagonal H_ij and H_ji (symmetric pair).
-            if li >= 0 && lj >= 0 {
-                let base_i = li as usize * KF_DOF;
-                let base_j = lj as usize * KF_DOF;
-                accum_jt_omega_j(
-                    &mut m_mat, &mut m_vec, base_i, base_j, &ji, &jj, &omega, &res, false,
-                );
-                accum_jt_omega_j(
-                    &mut m_mat, &mut m_vec, base_j, base_i, &jj, &ji, &omega, &res, false,
-                );
-            }
-            if let (Some(c), Some(border)) = (calibration, border.as_ref()) {
-                let columns = c.imu_columns(e, edge, &kfs, &calib, params);
-                border.add_imu(
-                    &mut m_mat,
-                    &mut m_vec,
-                    &columns,
-                    &res,
-                    &omega,
-                    [(li, &ji), (lj, &jj)],
-                );
-            }
-        }
-
-        // ── 3b. Accel-bias magnitude prior (unary, per free keyframe) ────────
-        // See ViBaParams::accel_bias_prior_weight doc. Deliberately not scaled
-        // by any Huber weight — this is the one bias regularizer that must
-        // hold even when nav residuals are bad.
-        let mut cost_bias_prior = 0.0f64;
-        if params.accel_bias_prior_weight > 0.0 {
-            let w = params.accel_bias_prior_weight;
-            for (i, kf) in kfs.iter().enumerate() {
-                let li = kf_local[i];
-                if li < 0 {
-                    continue;
-                }
-                let base = li as usize * KF_DOF;
-                let ba = [kf.bias.accel.x, kf.bias.accel.y, kf.bias.accel.z];
-                for d in 0..3 {
-                    m_mat[(base + 12 + d, base + 12 + d)] += w;
-                    m_vec[base + 12 + d] -= w * ba[d];
-                    cost_bias_prior += 0.5 * w * ba[d] * ba[d];
-                }
-            }
-        }
-
-        let cost_prior = prior.map_or(0.0, |(i, p)| {
-            accumulate_prior(
-                &mut m_mat,
-                &mut m_vec,
-                kf_local[i] as usize * KF_DOF,
-                p,
-                &kfs[i],
-            )
-        });
-
-        let cost_wheel = accumulate_wheel_edges(
-            &mut m_mat,
-            &mut m_vec,
-            &kfs,
-            &kf_local,
-            wheel_edges,
-            &wheel_info,
+        let state = SystemState {
+            kfs: &kfs,
+            se3s: &se3s,
+            xyz: &xyz,
+            calib: &calib,
+            imu_edges: cal_edges.as_deref().unwrap_or(imu_edges),
+        };
+        let ReducedSystem {
+            mut m_mat,
+            m_vec,
+            vis,
+            c_inv,
+            border,
+            cost: cost_f64,
+        } = build_reduced_system(
+            &inputs,
+            &state,
+            lambda,
+            &mut vis_inlier,
+            is_first_iter,
+            &[],
         );
-
-        let cost_stationary = accumulate_stationary_edges(
-            &mut m_mat,
-            &mut m_vec,
-            &kfs,
-            &kf_local,
-            stationary_edges,
-            &stationary_info,
-        );
-
-        let mut cost_f64 =
-            cost_vis + cost_imu + cost_bias_prior + cost_prior + cost_wheel + cost_stationary;
-        if let (Some(c), Some(border)) = (calibration, border.as_ref()) {
-            let rows = online_prior_rows(&c.layout, &c.config, &calib, &c.previous);
-            cost_f64 += border.add_priors(&mut m_mat, &mut m_vec, &rows);
-        }
+        let dim = m_vec.len();
         if initial_cost == f64::MAX {
             initial_cost = cost_f64;
         }
         let cost = cost_f64 as f32;
-        hold_inertial_state(&mut m_mat, &mut m_vec, keyframes, &kf_local);
-        if params.newest_marginal {
-            last_information = Some(m_mat.clone());
-        }
-        if n_cal > 0 && calibration.is_some_and(|c| c.marginal_sigma) {
-            last_border_information = Some(m_mat.clone());
-        }
 
         // ── 4. LM damping on full 15P system, then Cholesky ──────────────
         // Damping goes on AFTER IMU terms so every diagonal entry sees it.
@@ -2624,10 +2779,26 @@ fn solve_vi_ba(
     }
 
     let prior_residual_final = prior.and_then(|(i, p)| prior_velocity_residual(p, &kfs[i]));
-    let newest_marginal = last_information.and_then(|information| {
-        let newest = usize::try_from(*kf_local.last()?).ok()?;
-        newest_marginal_covariance(&information, newest * KF_DOF)
+    // The marginals are of the solution: the undamped system at the
+    // accepted state, not the last iteration's damped one before its step.
+    let border_sigma = n_cal > 0 && calibration.is_some_and(|c| c.marginal_sigma);
+    let information = (params.newest_marginal || border_sigma).then(|| {
+        let state = SystemState {
+            kfs: &kfs,
+            se3s: &se3s,
+            xyz: &xyz,
+            calib: &calib,
+            imu_edges: cal_edges.as_deref().unwrap_or(imu_edges),
+        };
+        undamped_information(&inputs, &state)
     });
+    let newest_marginal = information
+        .as_ref()
+        .filter(|_| params.newest_marginal)
+        .and_then(|information| {
+            let newest = usize::try_from(*kf_local.last()?).ok()?;
+            newest_marginal_covariance(information, newest * KF_DOF)
+        });
     if let Some((i, p)) = prior {
         let fmt = |x: Option<f64>| x.map_or("-".to_string(), |x| format!("{x:.4e}"));
         let sigma_v = p.velocity_mean_and_sigma().map(|(_, s)| s);
@@ -2702,8 +2873,10 @@ fn solve_vi_ba(
         values: calib,
         reintegrated,
         edges_without_samples,
-        marginal_sigma: last_border_information
-            .and_then(|information| border_marginal_sigma(&information, cal_base)),
+        marginal_sigma: information
+            .as_ref()
+            .filter(|_| border_sigma)
+            .and_then(|information| border_marginal_sigma(information, cal_base)),
     };
 
     Ok((
@@ -3201,6 +3374,130 @@ mod tests {
         assert_eq!(params.huber_depth_sigma_sq, 9.0);
         assert_eq!(visual_huber(4.0, 25.0), (1.0, 2.0));
         assert_eq!(visual_huber(100.0, 25.0), (0.5, 37.5));
+    }
+
+    /// Level keyframes cruising along x at 1 m/s, `EDGE_S` apart, the first
+    /// fixed. Free landmarks every keyframe sees start a few cm off; three
+    /// more only the newest keyframe sees (rank-2 C, depth-free).
+    fn cruise_window() -> (
+        Vec<ViBaKeyframe>,
+        Vec<Vec3F64>,
+        Vec<BaObservation>,
+        Vec<ImuFactor>,
+        PinholeCamera,
+    ) {
+        let camera = PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let gravity = ViBaParams::default().gravity;
+        let keyframes: Vec<ViBaKeyframe> = (0..5)
+            .map(|k| ViBaKeyframe {
+                pose: Pose3d::new(
+                    kornia_algebra::Mat3F64::IDENTITY,
+                    Vec3F64::new(-(k as f64) * EDGE_S, 0.0, 0.0),
+                ),
+                velocity: Vec3F64::new(1.0, 0.0, 0.0),
+                bias: ImuBias::default(),
+                fixed: k == 0,
+                inertial_fixed: false,
+            })
+            .collect();
+        let imu_edges: Vec<ImuFactor> = (0..4)
+            .map(|k| {
+                let mut preintegrated = PreintegratedImu::new(ImuBias::default(), spin_calib());
+                let n = (EDGE_S * IMU_HZ).round() as usize;
+                let sample = ImuMeasurement {
+                    timestamp: 0.0,
+                    gyro: Vec3F64::ZERO,
+                    accel: gravity * -1.0,
+                };
+                for _ in 0..n {
+                    preintegrated.integrate(&sample, EDGE_S / n as f64);
+                }
+                ImuFactor::new(k, k + 1, preintegrated)
+            })
+            .collect();
+        let pixel = |kf: &ViBaKeyframe, p: &Vec3F64| {
+            let pc = kf.pose.transform_point(p);
+            [
+                (camera.fx * pc.x / pc.z + camera.cx) as f32,
+                (camera.fy * pc.y / pc.z + camera.cy) as f32,
+            ]
+        };
+        let (mut points, mut observations) = (Vec::new(), Vec::new());
+        for ix in -3i32..=3 {
+            for iy in -2i32..=2 {
+                let truth = Vec3F64::new(
+                    0.4 + ix as f64 * 0.6,
+                    iy as f64 * 0.5,
+                    4.0 + ((ix + iy).rem_euclid(3)) as f64 * 2.0,
+                );
+                for (pose_idx, kf) in keyframes.iter().enumerate() {
+                    observations.push(BaObservation {
+                        pose_idx,
+                        point_idx: points.len(),
+                        pixel: pixel(kf, &truth),
+                        ..Default::default()
+                    });
+                }
+                let off = if (ix + iy) % 2 == 0 { 0.03 } else { -0.02 };
+                points.push(truth + Vec3F64::new(off, -off, 2.0 * off));
+            }
+        }
+        let newest = keyframes.len() - 1;
+        for k in 0..3 {
+            let truth = Vec3F64::new(0.8 + k as f64 * 0.3, 0.2, 5.0);
+            observations.push(BaObservation {
+                pose_idx: newest,
+                point_idx: points.len(),
+                pixel: pixel(&keyframes[newest], &truth),
+                ..Default::default()
+            });
+            points.push(truth);
+        }
+        (keyframes, points, observations, imu_edges, camera)
+    }
+
+    /// The newest marginal is the undamped system at the solution, so it does
+    /// not depend on where λ started or ended. Red on the old code
+    /// (2026-11-18): it kept the system the last iteration had built, with
+    /// that iteration's λ already on the point blocks and at the state before
+    /// the last step.
+    #[test]
+    fn newest_marginal_is_the_undamped_system_at_the_solution() {
+        let (keyframes, points, observations, imu_edges, camera) = cruise_window();
+        let position_sigma = |initial_lambda: f64| {
+            let params = ViBaParams {
+                initial_lambda,
+                newest_marginal: true,
+                ..ViBaParams::default()
+            };
+            let out = visual_inertial_bundle_adjust(
+                &keyframes,
+                &points,
+                &observations,
+                &imu_edges,
+                &[],
+                &[],
+                &camera,
+                &params,
+            )
+            .unwrap();
+            let covariance = out.newest_marginal.expect("newest marginal");
+            (0..3).map(|d| covariance[(d, d)]).sum::<f64>().sqrt()
+        };
+        let (low, high) = (position_sigma(1e-2), position_sigma(1.0));
+        assert!(
+            (low / high - 1.0).abs() < 0.01,
+            "sigma {low:.4e} m from λ 1e-2, {high:.4e} m from λ 1"
+        );
     }
 }
 
