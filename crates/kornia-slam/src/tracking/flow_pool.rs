@@ -35,6 +35,9 @@ pub enum FlowPoolError {
 /// How long the join spins on a worker before it parks (plan section 3).
 const JOIN_SPIN: Duration = Duration::from_micros(100);
 
+/// How long a new worker holds its first reply, so `spawn` blocks on it.
+const WARM_RECEIVE_DELAY: Duration = Duration::from_millis(2);
+
 /// One worker's reused job; moved to the worker and back every step.
 #[derive(Default)]
 struct FlowJob {
@@ -172,6 +175,12 @@ impl FlowWorker {
                 if ready_tx.send(pinned).is_err() || !pinned {
                     return;
                 }
+                // The first blocking receive on `done` grows std's waker
+                // list; spend it here, not in a warm step's join.
+                std::thread::sleep(WARM_RECEIVE_DELAY);
+                if outbox.send(FlowJob::default()).is_err() {
+                    return;
+                }
                 while let Ok(mut job) = inbox.recv() {
                     job.shard
                         .run(&job.previous, &job.current, &job.guess, &mut job.timings);
@@ -189,10 +198,11 @@ impl FlowWorker {
             Ok(false) => return Err(FlowPoolError::Pin(core.unwrap_or_default())),
             Err(_) => return Err(FlowPoolError::WorkerGone(n)),
         }
+        let job = done.recv().map_err(|_| FlowPoolError::WorkerGone(n))?;
         Ok(Self {
             jobs,
             done,
-            job: Some(FlowJob::default()),
+            job: Some(job),
             handle: Some(handle),
         })
     }
