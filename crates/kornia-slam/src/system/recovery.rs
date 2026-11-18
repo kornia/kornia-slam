@@ -75,32 +75,34 @@ impl Default for RecoveryConfig {
 /// keyframes tagged by the segment they were built in).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Segments {
-    /// First keyframe of each segment, ascending.
-    starts: Vec<usize>,
+    /// Ascending first keyframes, each with the segment the keyframes from it
+    /// on belong to: a new segment at each seed, an older one again after a
+    /// lost relocalization into it (G2).
+    starts: Vec<(usize, SegmentId)>,
+    /// Segments begun so far.
+    begun: SegmentId,
 }
 
 impl Segments {
     pub(crate) fn begin(&mut self, first_kf_idx: usize) {
-        self.starts.push(first_kf_idx);
+        self.starts.push((first_kf_idx, self.begun));
+        self.begun += 1;
+    }
+
+    /// Keyframes from `first_kf_idx` on belong to `segment` again.
+    pub(crate) fn resume(&mut self, first_kf_idx: usize, segment: SegmentId) {
+        self.starts.push((first_kf_idx, segment));
     }
 
     /// The segment keyframe `kf_idx` belongs to.
     pub(crate) fn of(&self, kf_idx: usize) -> SegmentId {
-        let segment = self
-            .starts
-            .partition_point(|&start| start <= kf_idx)
-            .saturating_sub(1);
-        segment as SegmentId
+        let after = self.starts.partition_point(|&(start, _)| start <= kf_idx);
+        after.checked_sub(1).map_or(0, |i| self.starts[i].1)
     }
 
     /// The newest segment: the one being tracked, or the one just given up.
     pub(crate) fn latest(&self) -> SegmentId {
-        self.starts.len().saturating_sub(1) as SegmentId
-    }
-
-    /// First keyframe of the newest segment; `None` before the first seed.
-    pub(crate) fn latest_start(&self) -> Option<usize> {
-        self.starts.last().copied()
+        self.starts.last().map_or(0, |&(_, segment)| segment)
     }
 }
 
@@ -337,7 +339,27 @@ pub(crate) mod tests {
             [0, 0, 1, 1, 2, 2]
         );
         assert_eq!(segments.latest(), 2);
-        assert_eq!(segments.latest_start(), Some(6866));
+    }
+
+    /// G2: after a give-up, a relocalization into segment 0 makes the
+    /// keyframes from that frame on segment 0's, not the given-up one's.
+    #[test]
+    fn keyframes_after_a_lost_relocalization_join_the_older_segment() {
+        let mut segments = Segments::default();
+        segments.begin(0);
+        segments.begin(131);
+        segments.resume(140, 0);
+        assert_eq!(
+            [130, 131, 139, 140, 200].map(|kf| segments.of(kf)),
+            [0, 1, 1, 0, 0]
+        );
+        assert_eq!(segments.latest(), 0);
+        segments.begin(300);
+        assert_eq!(
+            (segments.of(300), segments.latest()),
+            (2, 2),
+            "a new seed is new"
+        );
     }
 
     /// G3: a relocalization that turns the world 90° about z must turn the

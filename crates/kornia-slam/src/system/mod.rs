@@ -233,6 +233,9 @@ pub struct SlamSystem {
     gyro_rotation: Option<Mat3F64>,
     // The keyframe whose landmarks were last adopted (`adopt_landmarks`).
     adopted_keyframe: Option<usize>,
+    // First keyframe of the re-seeded segment the own window holds; cleared
+    // once it is full or a relocalization is adopted (G2).
+    window_segment_start: Option<usize>,
 }
 
 impl SlamSystem {
@@ -350,6 +353,7 @@ impl SlamSystem {
             rig_flow,
             flow,
             gyro_rotation: None,
+            window_segment_start: None,
             adopted_keyframe: None,
         }
     }
@@ -1481,6 +1485,7 @@ impl SlamSystem {
     /// A segment re-seeded with the inertial state kept tracks inertially at once.
     fn finish_bootstrap(&mut self, kf_idx: usize, timestamp_sec: f64) {
         self.segments.begin(kf_idx);
+        self.window_segment_start = (self.segments.latest() > 0).then_some(kf_idx);
         if self.segments_reported() {
             self.dbg(format!(
                 "[recover] segment {} begins at kf={kf_idx}",
@@ -1934,11 +1939,17 @@ impl SlamSystem {
         if status == TrackingStatus::Skipped && self.relocalization_due(timestamp_sec) {
             let only_while_lost =
                 self.relocalization.while_lost && self.imu_confident(timestamp_sec);
+            // The own window would hold out the older segment a candidate
+            // comes from; it is put back when nothing is found.
+            let window = self.seeded_window_start();
+            self.tracker.set_window_start(None);
             if self.relocalize(&frame, timestamp_sec, false) {
                 status = TrackingStatus::Tracked;
                 if only_while_lost {
                     self.counters.relocalizations_while_lost += 1;
                 }
+            } else {
+                self.tracker.set_window_start(window);
             }
         }
         if let Some(trace) = self.frame_trace.as_mut() {
@@ -2445,8 +2456,8 @@ impl SlamSystem {
     /// the newest segment holds fewer than `own_window_keyframes` keyframes.
     fn update_seeded_window(&mut self) {
         let own = self.recovery.own_window_keyframes;
-        let window = match self.segments.latest_start() {
-            Some(start) if own > 0 && self.segments.latest() > 0 => {
+        let window = match self.window_segment_start {
+            Some(start) if own > 0 => {
                 let held = self
                     .map
                     .lock()
@@ -2459,6 +2470,9 @@ impl SlamSystem {
             }
             _ => None,
         };
+        if window.is_none() {
+            self.window_segment_start = None;
+        }
         self.tracker.set_window_start(window);
     }
 
@@ -2709,19 +2723,44 @@ impl SlamSystem {
                 frame.idx, found.keyframe_idx, found.estimate.inliers
             )
         });
+        self.adopt_relocalization(
+            frame.idx,
+            timestamp_sec,
+            found.keyframe_idx,
+            found.estimate.pose,
+            lost,
+        );
+        true
+    }
+
+    /// Tracks on from a relocalized `pose` against keyframe `kf_idx`. After
+    /// a give-up into an older segment, the keyframes from this frame on
+    /// belong to that segment, and no own window holds it out (G2).
+    fn adopt_relocalization(
+        &mut self,
+        frame_idx: usize,
+        timestamp_sec: f64,
+        kf_idx: usize,
+        pose: Pose3d,
+        lost: bool,
+    ) {
         self.state.velocity_world = recovery::velocity_across_jump(
             &self.state.pose_world_to_cam,
-            &found.estimate.pose,
+            &pose,
             self.state.velocity_world,
         );
-        self.state.pose_world_to_cam = found.estimate.pose;
-        self.note_pose("reloc", frame.idx, &found.estimate.pose);
-        self.state.current_keyframe_idx = Some(found.keyframe_idx);
+        self.state.pose_world_to_cam = pose;
+        self.note_pose("reloc", frame_idx, &pose);
+        self.state.current_keyframe_idx = Some(kf_idx);
         self.state.velocity = None;
-        self.estimator.last_relocalization_frame = Some(frame.idx);
+        self.estimator.last_relocalization_frame = Some(frame_idx);
         self.estimator.last_relocalization_sec = Some(timestamp_sec);
         self.estimator.frame_prior = None;
-        true
+        let segment = self.segments.of(kf_idx);
+        if lost && segment != self.segments.latest() {
+            self.segments.resume(frame_idx, segment);
+        }
+        self.window_segment_start = None;
     }
 
     /// Whether to extend the map from this frame while coasting on the IMU:

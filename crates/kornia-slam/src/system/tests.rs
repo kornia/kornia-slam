@@ -852,6 +852,44 @@ mod pose_inertial_guards {
     }
 }
 
+mod own_window {
+    use super::*;
+    use crate::tracking::parallax::tests::frame_seeing_points;
+
+    /// G2: a give-up re-seeds segment 1 at keyframe 100 under a 3-keyframe
+    /// own window; a lost relocalization into segment 0 must open the window
+    /// and tag the next keyframes with segment 0.
+    #[test]
+    fn a_lost_relocalization_into_an_older_segment_lifts_the_own_window() {
+        let mut config = config(CameraSelection::Stereo, true, LoopClosingMode::Disabled);
+        let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+        orb.tracking_loss.reseed.own_window_keyframes = 3;
+        let mut system = SlamSystem::build(config, stereo_imu_rig()).unwrap();
+        let mut map = Map::new();
+        for idx in [0, 2, 100] {
+            map.insert_keyframe(Keyframe::from_frame(frame_seeing_points(
+                idx,
+                Pose3d::IDENTITY,
+                &[],
+            )))
+            .unwrap();
+        }
+        *system.map.lock().unwrap() = map;
+        system.finish_bootstrap(0, 0.0);
+        system.update_seeded_window();
+        assert_eq!(system.seeded_window_start(), None, "the first segment");
+        system.finish_bootstrap(100, 10.0);
+        system.update_seeded_window();
+        assert_eq!(system.seeded_window_start(), Some(100));
+
+        system.adopt_relocalization(105, 10.5, 2, Pose3d::IDENTITY, true);
+        system.update_seeded_window();
+        assert_eq!(system.seeded_window_start(), None);
+        assert_eq!(system.segment_of(106), 0);
+        assert_eq!(system.segment_of(100), 1);
+    }
+}
+
 mod inertial_origin {
     use super::*;
     use crate::tracking::local_map::LocalMapRules;
