@@ -96,7 +96,7 @@ use kornia_3d::ba::{BaError, BaObservation};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::ransac::{HuberKernel, RobustKernel};
-use kornia_sensors::imu::{ImuBias, ImuMeasurement, PreintegratedImu};
+use kornia_sensors::imu::{ImuBias, ImuMeasurement, PreintegratedImu, SampleInterpolation};
 
 const MIN_Z: f32 = 1e-3;
 
@@ -1508,7 +1508,9 @@ impl<'a> CalibratedSolve<'a> {
     /// correction and the clock offset of `values`: the camera interval
     /// `[t0, t1]` is `[t0 - td, t1 - td]` on the IMU clock, and the slice
     /// adds the nearest sample on each side, as the edge stores them. `None`
-    /// for an edge without samples.
+    /// for an edge without samples. With the clock state on it integrates
+    /// `Midpoint` whatever the edge's mode: a right Riemann sum lags by half
+    /// a sample, and `td` would absorb the lag (D3).
     fn reintegrate(
         &self,
         edge: &MapImuFactor,
@@ -1535,13 +1537,18 @@ impl<'a> CalibratedSolve<'a> {
         } else {
             slice
         };
+        let interpolation = if self.layout.clock().is_some() {
+            SampleInterpolation::Midpoint
+        } else {
+            edge.interpolation
+        };
         let mut preintegrated = PreintegratedImu::from_measurements_with(
             bias,
             edge.preintegrated.calib,
             samples,
             t0,
             t1,
-            edge.interpolation,
+            interpolation,
         );
         preintegrated.widen_bias_walk(edge.bias_walk_extra_s);
         Some(preintegrated)

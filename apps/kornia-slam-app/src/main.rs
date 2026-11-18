@@ -615,6 +615,7 @@ fn run_offline_ba(run: &RunConfig, args: &OfflineBaArgs) -> Result<(), Box<dyn s
         &dump,
         &local_ba.visual_information,
         local_ba.stereo_depth_sigma,
+        orb.inertial.sample_interpolation,
         &run.offline_ba,
     )?;
     eprint!("{}", result.report);

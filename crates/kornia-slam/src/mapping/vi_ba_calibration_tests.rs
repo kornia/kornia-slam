@@ -111,6 +111,20 @@ impl Motion {
             accel: (r_bw0 * dv) * (1.0 / SAMPLE_SEC),
         }
     }
+
+    /// The noise-free reading at camera time `τ`, stamped `τ − td`: body
+    /// rate and specific force at that instant, by central differences.
+    fn instantaneous_sample(&self, tau: f64, td: f64, gravity: Vec3F64) -> ImuMeasurement {
+        let h = 1e-5;
+        let r_bw = self.rotation_wb(tau).transpose();
+        let turn = self.rotation_wb(tau - h).transpose() * self.rotation_wb(tau + h);
+        let accel = (self.velocity(tau + h) - self.velocity(tau - h)) * (0.5 / h);
+        ImuMeasurement {
+            timestamp: tau - td,
+            gyro: SO3F64::from_matrix(&turn).log() * (0.5 / h),
+            accel: r_bw * (accel - gravity),
+        }
+    }
 }
 
 /// What a window injects; the solver gets the factory calibration.
@@ -128,6 +142,9 @@ struct Truth {
     /// Focal scale minus one of every camera.
     focal: f64,
     interpolation: SampleInterpolation,
+    /// Samples read at their stamps, as a real IMU reads them, rather than
+    /// the interval means `Hold` integrates exactly.
+    instantaneous: bool,
 }
 
 impl Default for Truth {
@@ -140,6 +157,7 @@ impl Default for Truth {
             secondary: None,
             focal: 0.0,
             interpolation: SampleInterpolation::Hold,
+            instantaneous: false,
         }
     }
 }
@@ -267,9 +285,12 @@ fn window(truth: &Truth) -> Window {
     let last = ((KEYFRAMES - 1) as f64 * EDGE_SEC / SAMPLE_SEC).round() as i64;
     let samples: Vec<ImuMeasurement> = (-100..=last + 100)
         .map(|k| {
-            truth
-                .motion
-                .sample(k as f64 * SAMPLE_SEC, truth.td, gravity)
+            let tau = k as f64 * SAMPLE_SEC;
+            if truth.instantaneous {
+                truth.motion.instantaneous_sample(tau, truth.td, gravity)
+            } else {
+                truth.motion.sample(tau, truth.td, gravity)
+            }
         })
         .collect();
     let map_edges: Vec<MapImuFactor> = (0..KEYFRAMES - 1)
@@ -451,9 +472,10 @@ fn assert_same_preintegration(a: &PreintegratedImu, b: &PreintegratedImu, what: 
     );
 }
 
-/// GT0: at `td = 0` and without the gyro state, the window-stream
-/// re-integration is `MapImuFactor::repreintegrate`, for `Hold` and
-/// `Midpoint`, on both window-end edges and an interior one.
+/// GT0: at the factory gyro and without the clock state (which integrates
+/// `Midpoint` whatever the edge), the window-stream re-integration is
+/// `MapImuFactor::repreintegrate`, for `Hold` and `Midpoint`, on both
+/// window-end edges and an interior one.
 #[test]
 fn window_reintegration_matches_repreintegrate() {
     for interpolation in [SampleInterpolation::Hold, SampleInterpolation::Midpoint] {
@@ -462,7 +484,7 @@ fn window_reintegration_matches_repreintegrate() {
             ..Truth::default()
         });
         let start = OnlineCalibrationState::default();
-        let input = input(&window, config(false, false, false, true), &start, ACTIVE);
+        let input = input(&window, config(false, false, true, false), &start, ACTIVE);
         let kf_local = free_keyframe_slots(
             &window.keyframes,
             &window.observations,
@@ -488,12 +510,17 @@ fn window_reintegration_matches_repreintegrate() {
 }
 
 /// GT1: a clock offset injected in the IMU stamps is recovered in one solve,
-/// with its sign; 2 ms reaches past the stream on a window-end edge.
+/// with its sign; 2 ms reaches past the stream on a window-end edge. The
+/// samples are read at their stamps and the edges `Hold`, as a run with the
+/// default integration records them: the clock state integrates `Midpoint`
+/// regardless (D3). Red on the old code (2026-11-18), whose `Hold` lags by
+/// half a sample: −5 ms came back as −4.43 ms.
 #[test]
 fn online_td_recovers_injected_offset() {
     for (td, tolerance) in [(5e-3, 0.5e-3), (-5e-3, 0.5e-3), (2e-3, 0.2e-3)] {
         let window = window(&Truth {
             td,
+            instantaneous: true,
             ..Truth::default()
         });
         let (result, state) = calibrated(

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use kornia_3d::pose::Pose3d;
-use kornia_sensors::imu::{GyroIntrinsics, PreintegratedImu};
+use kornia_sensors::imu::{GyroIntrinsics, PreintegratedImu, SampleInterpolation};
 
 use super::session::SessionDump;
 use super::visual_information::VisualInformation;
@@ -203,13 +203,15 @@ pub enum OfflineBaError {
 }
 
 /// Solves one global VI-BA over `session`, weighting observations as the
-/// online VI-BA does (`visual`, `stereo_depth_sigma`). Runs on one thread,
-/// so the result depends on the dump alone: it sets faer's global
-/// parallelism to sequential.
+/// online VI-BA does (`visual`, `stereo_depth_sigma`) and integrating the IMU
+/// as the run did (`interpolation`). Runs on one thread, so the result
+/// depends on the dump alone: it sets faer's global parallelism to
+/// sequential.
 pub fn offline_visual_inertial_ba(
     session: &SessionDump,
     visual: &VisualInformation,
     stereo_depth_sigma: StereoDepthSigma,
+    interpolation: SampleInterpolation,
     config: &OfflineBaConfig,
 ) -> Result<OfflineBaResult, OfflineBaError> {
     config.validate()?;
@@ -217,7 +219,7 @@ pub fn offline_visual_inertial_ba(
     let layout = Layout::new(&config.calibration, session.rig.cameras.len());
     let (problem, start) = Problem::new(session, *visual, stereo_depth_sigma, &layout)?;
     let (edges, gap_max_s) = build_edges(&problem, config.bridge_segments);
-    let imu = ImuModel::new(&problem, config.imu_kernel, &layout);
+    let imu = ImuModel::new(&problem, config.imu_kernel, &layout, interpolation);
     let slots = keyframe_slots(session);
     let mut report = OfflineBaReport {
         frames: session

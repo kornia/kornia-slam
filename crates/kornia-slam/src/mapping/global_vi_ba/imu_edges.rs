@@ -8,7 +8,9 @@ use kornia_factors::inertial::NavState;
 use kornia_factors::inertial::preintegration::{
     information, residual_and_jacobians, weight_and_cost,
 };
-use kornia_sensors::imu::{GyroIntrinsics, ImuBias, ImuMeasurement, PreintegratedImu};
+use kornia_sensors::imu::{
+    GyroIntrinsics, ImuBias, ImuMeasurement, PreintegratedImu, SampleInterpolation,
+};
 
 use super::OfflineImuKernel;
 use super::problem::{Problem, State};
@@ -73,14 +75,28 @@ pub(super) struct ImuModel<'p, 'a> {
     problem: &'p Problem<'a>,
     kernel: OfflineImuKernel,
     reintegrate: bool,
+    interpolation: SampleInterpolation,
 }
 
 impl<'p, 'a> ImuModel<'p, 'a> {
-    pub(super) fn new(problem: &'p Problem<'a>, kernel: OfflineImuKernel, layout: &Layout) -> Self {
+    /// Edges integrated as the run integrated them (`interpolation`), except
+    /// with the clock state on: a right Riemann sum lags by half a sample,
+    /// and `td` would absorb that lag instead of the device offset (D3).
+    pub(super) fn new(
+        problem: &'p Problem<'a>,
+        kernel: OfflineImuKernel,
+        layout: &Layout,
+        interpolation: SampleInterpolation,
+    ) -> Self {
         Self {
             problem,
             kernel,
             reintegrate: layout.reintegrates(),
+            interpolation: if layout.clock().is_some() {
+                SampleInterpolation::Midpoint
+            } else {
+                interpolation
+            },
         }
     }
 
@@ -100,7 +116,9 @@ impl<'p, 'a> ImuModel<'p, 'a> {
 
     /// `edge` integrated from the raw stream at `bias`, with the gyro
     /// correction and the clock offset `td`: the camera interval
-    /// `[t0, t1]` is `[t0 - td, t1 - td]` on the IMU clock.
+    /// `[t0, t1]` is `[t0 - td, t1 - td]` on the IMU clock. The slice adds
+    /// the nearest sample on each side, which `Midpoint` interpolates the
+    /// ends from and `Hold` leaves out (`vi_ba_schur.rs`, `reintegrate`).
     fn integrate(
         &self,
         edge: &ImuEdge,
@@ -110,8 +128,10 @@ impl<'p, 'a> ImuModel<'p, 'a> {
     ) -> PreintegratedImu {
         let samples = &self.problem.imu;
         let (t0, t1) = (edge.t0 - td, edge.t1 - td);
-        let lo = samples.partition_point(|s| s.t < t0);
-        let hi = samples.partition_point(|s| s.t <= t1).max(lo);
+        let lo = samples.partition_point(|s| s.t < t0).saturating_sub(1);
+        let hi = (samples.partition_point(|s| s.t <= t1) + 1)
+            .min(samples.len())
+            .max(lo);
         let raw: Vec<ImuMeasurement> = samples[lo..hi]
             .iter()
             .map(|s| ImuMeasurement {
@@ -121,7 +141,14 @@ impl<'p, 'a> ImuModel<'p, 'a> {
             })
             .collect();
         let measurements = corrected_samples(&raw, gyro);
-        PreintegratedImu::from_measurements(bias, self.problem.noise, &measurements, t0, t1)
+        PreintegratedImu::from_measurements_with(
+            bias,
+            self.problem.noise,
+            &measurements,
+            t0,
+            t1,
+            self.interpolation,
+        )
     }
 
     /// Every edge integrated at `state`'s biases and calibration.

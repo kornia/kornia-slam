@@ -1,5 +1,6 @@
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, Vec3F64};
+use kornia_sensors::imu::SampleInterpolation;
 
 use super::*;
 use crate::mapping::session::{
@@ -35,11 +36,28 @@ fn body_velocity(t: f64) -> [f64; 3] {
         .to_array()
 }
 
+/// How the synthetic IMU samples the specific force.
+#[derive(Clone, Copy)]
+enum Sampling {
+    /// Each sample the mean over the interval before it: exact for `Hold`.
+    IntervalMean,
+    /// Each sample the signal at its stamp, as a real IMU reads it.
+    Instantaneous,
+}
+
 /// A camera at the IMU accelerating past a wall of landmarks, with exact
 /// pixels and an exact IMU stream (specific force `a - g`, no rotation).
 /// `offset` moves the dumped landmarks and every keyframe but the first off
 /// the truth.
 fn synthetic_session(offset: f64) -> SessionDump {
+    sampled_session(offset, Sampling::IntervalMean)
+}
+
+fn body_acceleration(t: f64) -> Vec3F64 {
+    Vec3F64::from_array(ACCELERATION) + Vec3F64::from_array(WOBBLE) * (WOBBLE_RAD_S * t).sin()
+}
+
+fn sampled_session(offset: f64, sampling: Sampling) -> SessionDump {
     let landmarks: Vec<Vec3F64> = (0..5)
         .flat_map(|i| (0..3).flat_map(move |j| (0..2).map(move |k| (i, j, k))))
         .map(|(i, j, k)| Vec3F64::new(i as f64 - 1.0, j as f64 - 1.0, 4.0 + 2.0 * k as f64))
@@ -89,11 +107,14 @@ fn synthetic_session(offset: f64) -> SessionDump {
     let imu = (0..=400)
         .map(|i| {
             let t = i as f64 * DT;
-            let mean = if i == 0 {
-                Vec3F64::from_array(ACCELERATION)
-            } else {
-                (Vec3F64::from_array(body_velocity(t)) - Vec3F64::from_array(body_velocity(t - DT)))
-                    * (1.0 / DT)
+            let mean = match sampling {
+                Sampling::Instantaneous => body_acceleration(t),
+                Sampling::IntervalMean if i == 0 => Vec3F64::from_array(ACCELERATION),
+                Sampling::IntervalMean => {
+                    (Vec3F64::from_array(body_velocity(t))
+                        - Vec3F64::from_array(body_velocity(t - DT)))
+                        * (1.0 / DT)
+                }
             };
             ImuSample {
                 t,
@@ -143,10 +164,19 @@ fn synthetic_session(offset: f64) -> SessionDump {
 }
 
 fn solve(session: &SessionDump, config: &OfflineBaConfig) -> OfflineBaResult {
+    solve_with(session, SampleInterpolation::Hold, config)
+}
+
+fn solve_with(
+    session: &SessionDump,
+    interpolation: SampleInterpolation,
+    config: &OfflineBaConfig,
+) -> OfflineBaResult {
     offline_visual_inertial_ba(
         session,
         &VisualInformation::Unit,
         StereoDepthSigma::default(),
+        interpolation,
         config,
     )
     .unwrap()
@@ -246,7 +276,79 @@ fn an_older_dump_is_refused() {
         &session,
         &VisualInformation::Unit,
         StereoDepthSigma::default(),
+        SampleInterpolation::Hold,
         &OfflineBaConfig::default(),
     );
     assert!(matches!(error, Err(OfflineBaError::VersionMismatch(_))));
+}
+
+/// E10: a run that integrated with `Midpoint` gets `Midpoint` edges offline.
+/// On a stream read at the stamps, the trapezoid leaves `O(dt²)` of the
+/// start's IMU cost; the right Riemann sum lags half a sample. Red on the
+/// old code (2026-11-18), which always held: 1.47 against 2.1e-4.
+#[test]
+fn offline_edges_integrate_as_the_run_did() {
+    let session = sampled_session(0.0, Sampling::Instantaneous);
+    let config = OfflineBaConfig {
+        max_iterations: 0,
+        ..OfflineBaConfig::default()
+    };
+    let cost = |interpolation| {
+        solve_with(&session, interpolation, &config)
+            .report
+            .initial_cost
+    };
+    let (hold, midpoint) = (
+        cost(SampleInterpolation::Hold),
+        cost(SampleInterpolation::Midpoint),
+    );
+    assert!(
+        midpoint < 1e-2 * hold,
+        "start cost {midpoint:.3e} with Midpoint, {hold:.3e} with Hold"
+    );
+}
+
+/// D3: with the clock state on, the IMU cost at the true states, as a
+/// function of `td`, is least at the true offset (zero) on a stream read at
+/// the stamps. Red on the old code (2026-11-18): the right Riemann sum lags
+/// by half a sample, so the cost was least at +2.45 ms.
+#[test]
+fn the_clock_state_does_not_absorb_the_integration_lag() {
+    let session = sampled_session(0.0, Sampling::Instantaneous);
+    let calibration = OfflineCalibrationConfig {
+        clock_offset: Some(ClockOffsetPrior { sigma_ms: 2.0 }),
+        ..OfflineCalibrationConfig::default()
+    };
+    let layout = Layout::new(&calibration, 1);
+    let (problem, mut state) = Problem::new(
+        &session,
+        VisualInformation::Unit,
+        StereoDepthSigma::default(),
+        &layout,
+    )
+    .unwrap();
+    let (edges, _) = build_edges(&problem, false);
+    let imu = ImuModel::new(
+        &problem,
+        OfflineImuKernel::None,
+        &layout,
+        SampleInterpolation::Hold,
+    );
+    let clock = layout.clock().unwrap();
+    let cost_at = |state: &mut State, td_ms: f64| {
+        state.calibration.values[clock] = td_ms * 1e-3;
+        let pims = imu.integrate_all(&edges, state, &layout);
+        edges
+            .iter()
+            .zip(&pims)
+            .map(|(edge, pim)| imu.cost(edge, pim, state))
+            .sum::<f64>()
+    };
+    let (best_ms, _) = (-50..=50)
+        .map(|k| k as f64 * 0.1)
+        .map(|td_ms| (td_ms, cost_at(&mut state, td_ms)))
+        .fold((f64::NAN, f64::INFINITY), |best, (td, c)| {
+            if c < best.1 { (td, c) } else { best }
+        });
+    assert!(best_ms.abs() < 0.2, "IMU cost least at td {best_ms:.2} ms");
 }
