@@ -855,6 +855,7 @@ fn run_local_inertial_ba_inner(
             boundary_under_calibration(params, input, e, edge, kfs[edge.from_idx].bias)
         })
     };
+    let mut keep_map_prior = false;
     if let (BoundaryPrior::Marginal(sigma), Some(e)) = (params.boundary, boundary) {
         let calibrated =
             calibrated_boundary(calibration_input.as_ref(), e, &vi_keyframes, &vi_params);
@@ -864,9 +865,15 @@ fn run_local_inertial_ba_inner(
         let carried = carried_prior(snapshot, &vi_keyframes, edge, prior_params, sigma);
         vi_params.prior = match carried {
             Ok(prior) => Some(prior),
-            Err(reason) => {
+            Err(NoPrior::Fallback(reason)) => {
                 debug_eprintln!("[vi_ba] PRIOR fallback: {reason}");
                 update.outcome.prior_fallback = true;
+                None
+            }
+            Err(NoPrior::Keep(reason)) => {
+                debug_eprintln!("[vi_ba] PRIOR fallback, map prior kept: {reason}");
+                update.outcome.prior_fallback = true;
+                keep_map_prior = true;
                 None
             }
         };
@@ -943,7 +950,9 @@ fn run_local_inertial_ba_inner(
     update.newest_marginal = vi_result
         .newest_marginal
         .map(|marginal| (snapshot.keyframes()[n_kfs - 1].frame.idx, marginal));
-    if let (BoundaryPrior::Marginal(sigma), Some(e)) = (params.boundary, boundary) {
+    if let (BoundaryPrior::Marginal(sigma), Some(e), false) =
+        (params.boundary, boundary, keep_map_prior)
+    {
         // A solve that fell back starts the chain from its own result.
         update.next_prior = vi_params.prior.take().or_else(|| {
             let frozen = &vi_result.keyframes;
@@ -1038,50 +1047,104 @@ fn debug_window_line(
     );
 }
 
+/// Why a window has no carried boundary prior; either way the solve falls
+/// back to the scaled edge.
+enum NoPrior {
+    /// The solve's own result starts a new chain.
+    Fallback(String),
+    /// The boundary is older than the map's prior, which stays (D4).
+    Keep(String),
+}
+
 /// The boundary prior for the window whose boundary IMU edge is `edge`:
 /// the map's prior if it is already on the edge's active keyframe, or moved
-/// onto it by eliminating the edge's frozen keyframe. `Err` says why there
-/// is none, and the solve falls back to the scaled edge.
+/// onto it by eliminating the frozen keyframes from the prior's up to the
+/// edge's, along the snapshot's IMU edges (a skipped job, or a smaller
+/// window after a large one, leaves it several behind: D4).
 fn carried_prior(
     snapshot: &BaSnapshot,
     keyframes: &[ViBaKeyframe],
     edge: &preintegration::ImuFactor,
     params: &ViBaParams,
     sigma: FrozenPoseSigma,
-) -> Result<MarginalPrior, String> {
+) -> Result<MarginalPrior, NoPrior> {
     let (from, to) = (edge.from_idx, edge.to_idx);
     let frame = |slot: usize| snapshot.keyframes()[slot].frame.idx;
+    let slot_of = |idx: usize| {
+        snapshot
+            .keyframes()
+            .iter()
+            .position(|kf| kf.frame.idx == idx)
+    };
     let stored = snapshot
         .marginal_prior()
         .filter(|prior| prior.world_epoch == snapshot.world_epoch())
-        .ok_or("no prior")?;
+        .ok_or_else(|| NoPrior::Fallback("no prior".into()))?;
+    let stale = |prior: &MarginalPrior, slot: usize| {
+        prior
+            .is_stale(&keyframes[slot])
+            .then(|| NoPrior::Fallback(format!("stale on kf {}", prior.frame_idx)))
+    };
     if stored.frame_idx == frame(to) {
-        if stored.is_stale(&keyframes[to]) {
-            return Err(format!("stale on kf {}", stored.frame_idx));
-        }
-        return Ok(stored.clone());
+        return match stale(stored, to) {
+            Some(reason) => Err(reason),
+            None => Ok(stored.clone()),
+        };
     }
-    if stored.frame_idx != frame(from) {
-        return Err(format!(
+    let mismatch = || {
+        format!(
             "prior on kf {}, boundary {} -> {}",
             stored.frame_idx,
             frame(from),
             frame(to)
-        ));
+        )
+    };
+    let mut slot = match slot_of(stored.frame_idx) {
+        Some(slot) if slot <= from => slot,
+        Some(slot) if slot > to => return Err(NoPrior::Keep(mismatch())),
+        _ => return Err(NoPrior::Fallback(mismatch())),
+    };
+    let eliminate =
+        |prior: &MarginalPrior, frozen: usize, next: usize, edge: &preintegration::ImuFactor| {
+            if let Some(reason) = stale(prior, frozen) {
+                return Err(reason);
+            }
+            marginalize_frozen(
+                Some(prior),
+                &keyframes[frozen],
+                &keyframes[next],
+                edge,
+                params,
+                sigma,
+            )
+            .map(|prior| stamped(prior, snapshot, next))
+            .map_err(|e| NoPrior::Fallback(e.to_string()))
+        };
+    let mut chained: Option<MarginalPrior> = None;
+    while slot < from {
+        let next_edge = snapshot
+            .imu_factors()
+            .iter()
+            .find(|f| f.prev_kf_idx == frame(slot))
+            .and_then(|f| {
+                let next = slot_of(f.curr_kf_idx).filter(|&next| next > slot && next <= from)?;
+                Some(preintegration::ImuFactor::new(
+                    slot,
+                    next,
+                    f.preintegrated.clone(),
+                ))
+            })
+            .ok_or_else(|| NoPrior::Fallback(format!("no edge on from kf {}", frame(slot))))?;
+        let prior = eliminate(
+            chained.as_ref().unwrap_or(stored),
+            slot,
+            next_edge.to_idx,
+            &next_edge,
+        )?;
+        slot = next_edge.to_idx;
+        chained = Some(prior);
     }
-    if stored.is_stale(&keyframes[from]) {
-        return Err(format!("stale on kf {}", stored.frame_idx));
-    }
-    marginalize_frozen(
-        Some(stored),
-        &keyframes[from],
-        &keyframes[to],
-        edge,
-        params,
-        sigma,
-    )
-    .map(|prior| stamped(prior, snapshot, to))
-    .map_err(|e| e.to_string())
+    eliminate(chained.as_ref().unwrap_or(stored), from, to, edge)
 }
 
 /// `prior` as the prior on snapshot slot `slot`, in the snapshot's epoch.

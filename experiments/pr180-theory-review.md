@@ -58,6 +58,7 @@ Lane M (mapping, VI-BA and calibration):
 - E13: no test; documentation only. The `LargeWindow::Enabled` doc now says this solver's λ scales diag(H), so 1e-2 is not g2o's damping and about 1e-6 is nearer it. The `configs/pr180-*.ron` value is lane F's file and is left unchanged.
 - D9: `a_marginal_prior_is_never_negative`, `crates/kornia-slam/src/mapping/marginalization.rs`. Red at 8f23e47: the least value of a three-edge chained prior was −15.6. `MarginalPrior` gains `constant`, the joint cost at linearization minus ½ m₁ᵀH₁₁⁻¹m₁, carried through the chain.
 - D10: `the_prior_gradient_is_its_cost_derivative`, `crates/kornia-slam/src/mapping/marginalization.rs`. Red at 8f23e47: at a 10° tangent the system gradient on ρ_x was 2.644 against a cost derivative of 2.665. `accumulate_prior` now applies `blkdiag(J_r⁻¹(d), I₉)` to the gradient and to H (kornia-algebra's `SE3F64::right_jacobian_inverse`).
+- D4: `an_older_prior_is_chained_onto_the_boundary` and `a_boundary_older_than_the_prior_keeps_the_prior`, `crates/kornia-slam/src/mapping/bundle_adjustment_tests.rs`. Red at 8f23e47: a prior two keyframes behind the boundary fell back (`prior_fallback`), and a boundary older than the prior replaced it with a fresh one (`next_prior` set). The chain walks the snapshot's IMU edges between captured keyframes; a prior whose keyframe is not captured, or an edge missing between, still falls back. Under online calibration the intermediate edges keep their stored preintegration (only the boundary edge is re-integrated, D1).
 
 # E estimator
 

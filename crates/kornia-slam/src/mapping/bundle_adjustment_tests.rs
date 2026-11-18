@@ -935,11 +935,11 @@ fn the_large_window_applies_above_its_inlier_threshold() {
     assert_eq!(LocalBaParams::default().large(), LocalBaParams::default());
 }
 
-/// Five level keyframes cruising along x at 2 m/s, 0.1 s apart, the
+/// `count` level keyframes cruising along x at 2 m/s, 0.1 s apart, the
 /// landmarks of `fixture` imaged exactly, and IMU edges measured by a body
 /// whose true extrinsic is the factory one (identity) turned by the
 /// primary rotation offset `theta`: `T_bc = Exp(−θ)`.
-fn cruise_map(gravity: Vec3F64, theta: Vec3F64) -> Map {
+fn cruise_map(gravity: Vec3F64, theta: Vec3F64, count: usize) -> Map {
     const EDGE_SEC: f64 = 0.1;
     const SPEED: f64 = 2.0;
     let points: Vec<_> = (0..12)
@@ -952,7 +952,7 @@ fn cruise_map(gravity: Vec3F64, theta: Vec3F64) -> Map {
         })
         .collect();
     let mut map = Map::new();
-    for id in 0..5 {
+    for id in 0..count {
         let mut frame = test_frame(id, vec![[0; 32]; 12]);
         let x = SPEED * EDGE_SEC * id as f64;
         for (feature, point) in points.iter().enumerate() {
@@ -976,7 +976,7 @@ fn cruise_map(gravity: Vec3F64, theta: Vec3F64) -> Map {
                 },
             })
             .unwrap();
-        for kf in 1..5 {
+        for kf in 1..count {
             map.link_observation(kf, feature, id).unwrap();
         }
     }
@@ -987,7 +987,7 @@ fn cruise_map(gravity: Vec3F64, theta: Vec3F64) -> Map {
         accel_bias_noise: 3e-3,
     };
     let accel = SO3F64::exp(theta * -1.0) * (gravity * -1.0);
-    let imu_factors = (0..4)
+    let imu_factors = (0..count - 1)
         .map(|k| {
             let t0 = EDGE_SEC * k as f64;
             let samples: Vec<ImuMeasurement> = (0..=20)
@@ -1035,7 +1035,7 @@ fn the_boundary_prior_is_formed_at_the_calibrated_extrinsic() {
 
     let gravity = Vec3F64::new(0.0, 9.81, 0.0);
     let theta = Vec3F64::new(0.2f64.to_radians(), 0.0, 0.0);
-    let map = cruise_map(gravity, theta);
+    let map = cruise_map(gravity, theta, 5);
     let config = OnlineCalibrationConfig {
         camera_rotation: Some(RotationSlicePrior {
             step_sigma_deg: 0.05,
@@ -1078,7 +1078,7 @@ fn the_boundary_prior_is_formed_at_the_calibrated_extrinsic() {
 #[test]
 fn a_window_as_large_as_the_map_fixes_its_oldest_keyframe() {
     let gravity = Vec3F64::new(0.0, 9.81, 0.0);
-    let mut map = cruise_map(gravity, Vec3F64::ZERO);
+    let mut map = cruise_map(gravity, Vec3F64::ZERO, 5);
     map.edit_keyframes_for_test(|_, kf| kf.frame.pose_world_to_cam.translation.y += 0.01);
     let oldest = map.keyframes()[0].frame.pose_world_to_cam;
     let params = LocalBaParams {
@@ -1099,4 +1099,59 @@ fn a_window_as_large_as_the_map_fixes_its_oldest_keyframe() {
     let (_, marginal) = update.newest_marginal.expect("the newest marginal");
     let sigma_m = (0..3).map(|d| marginal[(d, d)]).sum::<f64>().sqrt();
     assert!(sigma_m < 0.05, "newest position sigma {sigma_m:.3e} m");
+}
+
+/// One Marginal solve of `map` with `active_keyframes`, applied.
+fn marginal_job(map: &mut Map, gravity: Vec3F64, active_keyframes: usize) -> BaUpdate {
+    let params = LocalBaParams {
+        active_keyframes,
+        boundary: BoundaryPrior::Marginal(FrozenPoseSigma::default()),
+        ..LocalBaParams::default()
+    };
+    run_local_inertial_ba_with(
+        map.ba_snapshot(&local_window_of(map, active_keyframes, [])),
+        &camera(),
+        None,
+        gravity,
+        &[],
+        &[],
+        &params,
+    )
+}
+
+/// D4: a stored prior older than the window's boundary (a job skipped, or a
+/// smaller window after a large one) is chained onto it over the fixed
+/// keyframes between. Red on the old code (2026-11-18): the solve fell back
+/// and a fresh, rank-deficient prior replaced the chain.
+#[test]
+fn an_older_prior_is_chained_onto_the_boundary() {
+    let gravity = Vec3F64::new(0.0, 9.81, 0.0);
+    let mut map = cruise_map(gravity, Vec3F64::ZERO, 7);
+    // Active 2..=6: the prior lands on keyframe 2.
+    let first = marginal_job(&mut map, gravity, 5);
+    map.apply_ba_update(first).unwrap();
+    let stored = map.full_ba_snapshot();
+    assert_eq!(stored.marginal_prior().map(|p| p.frame_idx), Some(2));
+    // Active 4..=6: boundary 3 -> 4, two keyframes past the prior.
+    let update = marginal_job(&mut map, gravity, 3);
+    assert!(!update.outcome.prior_fallback);
+    assert_eq!(update.next_prior.as_ref().map(|p| p.frame_idx), Some(4));
+}
+
+/// D4: a window whose boundary is older than the stored prior falls back to
+/// the scaled edge and leaves the map's prior alone. Red on the old code
+/// (2026-11-18): it replaced the chain with a fresh prior.
+#[test]
+fn a_boundary_older_than_the_prior_keeps_the_prior() {
+    let gravity = Vec3F64::new(0.0, 9.81, 0.0);
+    let mut map = cruise_map(gravity, Vec3F64::ZERO, 7);
+    // Active 4..=6: the prior lands on keyframe 4.
+    let first = marginal_job(&mut map, gravity, 3);
+    map.apply_ba_update(first).unwrap();
+    let stored = map.full_ba_snapshot();
+    assert_eq!(stored.marginal_prior().map(|p| p.frame_idx), Some(4));
+    // Active 2..=6: boundary 1 -> 2, older than the prior.
+    let update = marginal_job(&mut map, gravity, 5);
+    assert!(update.outcome.prior_fallback);
+    assert!(update.next_prior.is_none());
 }
