@@ -966,6 +966,41 @@ mod windowed_tracks {
         assert!(system.insert_keyframe(&frame, 0.2, &[], 0, KeyframeRole::Anchor));
         assert_eq!(positions(&system), moved);
     }
+
+    /// T9: an anchor does not become the last keyframe, whose landmarks are
+    /// adopted, so it must not replace that keyframe's kept frames.
+    #[test]
+    fn an_anchor_keeps_the_last_keyframes_frames_for_adoption() {
+        let mut system = system();
+        system.flow.adopt_landmarks = true;
+        let image = textured(0);
+        let mut timings = TrackingTimings::default();
+        let mut prepare = |system: &mut SlamSystem, frame_idx: u64| {
+            system
+                .rig_flow
+                .as_mut()
+                .unwrap()
+                .prepare(&[&image], frame_idx, &mut timings)
+                .unwrap();
+        };
+        prepare(&mut system, 3);
+        let tracked = frame_seeing_points(3, Pose3d::IDENTITY, &[]);
+        assert!(system.insert_keyframe(&tracked, 0.15, &[], 0, KeyframeRole::Tracked));
+        prepare(&mut system, 4);
+        let anchor = frame_seeing_points(4, Pose3d::IDENTITY, &[]);
+        assert!(system.insert_keyframe(&anchor, 0.2, &[], 0, KeyframeRole::Anchor));
+        assert_eq!(system.state.last_keyframe_idx, Some(3));
+        let pixel = [188.0, 120.0];
+        assert!(
+            system
+                .rig_flow
+                .as_mut()
+                .unwrap()
+                .adopt(3, 0, pixel, pixel)
+                .is_some(),
+            "keyframe 3's frames are still kept"
+        );
+    }
 }
 
 mod gyro_guess {

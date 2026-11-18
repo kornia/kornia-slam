@@ -2951,15 +2951,6 @@ impl SlamSystem {
         }
 
         self.state.current_keyframe_idx = Some(frame.idx);
-        if self.flow.adopt_landmarks
-            && let Some(rig_flow) = self.rig_flow.as_mut()
-            && let Err(error) = rig_flow.keep_keyframe()
-        {
-            self.dbg(format!(
-                "[flow] frame={} keyframe frames not kept: {error}",
-                frame.idx
-            ));
-        }
         if anchor {
             // The IMU chain, its sample buffer and the next keyframe's edge
             // stay at the last tracked keyframe.
@@ -2968,6 +2959,17 @@ impl SlamSystem {
             self.inertial.last_keyframe_timestamp_sec = Some(timestamp_sec);
             self.state.last_keyframe_idx = Some(frame.idx);
             self.note_wheel_keyframe(prev_keyframe, frame.idx, timestamp_sec);
+            // Only the last keyframe's landmarks are adopted, so an anchor
+            // keeps its frames (T9).
+            if self.flow.adopt_landmarks
+                && let Some(rig_flow) = self.rig_flow.as_mut()
+                && let Err(error) = rig_flow.keep_keyframe()
+            {
+                self.dbg(format!(
+                    "[flow] frame={} keyframe frames not kept: {error}",
+                    frame.idx
+                ));
+            }
         }
 
         // Optional mapping work the accepted keyframe earns: grow against the
