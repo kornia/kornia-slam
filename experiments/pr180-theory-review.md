@@ -59,6 +59,9 @@ Lane M (mapping, VI-BA and calibration):
 - D9: `a_marginal_prior_is_never_negative`, `crates/kornia-slam/src/mapping/marginalization.rs`. Red at 8f23e47: the least value of a three-edge chained prior was −15.6. `MarginalPrior` gains `constant`, the joint cost at linearization minus ½ m₁ᵀH₁₁⁻¹m₁, carried through the chain.
 - D10: `the_prior_gradient_is_its_cost_derivative`, `crates/kornia-slam/src/mapping/marginalization.rs`. Red at 8f23e47: at a 10° tangent the system gradient on ρ_x was 2.644 against a cost derivative of 2.665. `accumulate_prior` now applies `blkdiag(J_r⁻¹(d), I₉)` to the gradient and to H (kornia-algebra's `SE3F64::right_jacobian_inverse`).
 - D4: `an_older_prior_is_chained_onto_the_boundary` and `a_boundary_older_than_the_prior_keeps_the_prior`, `crates/kornia-slam/src/mapping/bundle_adjustment_tests.rs`. Red at 8f23e47: a prior two keyframes behind the boundary fell back (`prior_fallback`), and a boundary older than the prior replaced it with a fresh one (`next_prior` set). The chain walks the snapshot's IMU edges between captured keyframes; a prior whose keyframe is not captured, or an edge missing between, still falls back. Under online calibration the intermediate edges keep their stored preintegration (only the boundary edge is re-integrated, D1).
+- D7: not fixed. Four injected-state offline tests were written (gyro y scale 0.3 %, td 3 ms, camera rotation 0.3° about x, focal +0.5 %; one state on, one slice, on the rotating walk of D2, td on the instantaneous walk). All four fail at the lane-M head, and not for a solver defect that was found: each converges to a low cost with the state held near its prior (gyro 0.037 % for 0.3 %, final cost 2.2e-2; td 0.10 ms for 3 ms, cost 6.2e-3; rotation (0.10, −0.11, −0.01)°; focal 0.389 %). The synthetic walk does not excite these states enough to beat their priors, so a fixture with real excitation (faster rotation, longer span) is needed before these tests can pass; that is fixture design, not the review's fix. Draft tests: `/tmp/claude-1000/-home-edgar/978f5be7-3122-4eb6-bf8e-8ea40ff0cac6/scratchpad/D7-injected-state-tests.patch`. GT3's online part is not touched.
+- D11: not fixed. The re-anchoring needs a fixture where a 3 px drop splits a component. Two attempts (one and three link landmarks, 5 and 8 px off, segments unbridged) did not split: the second part's free position and yaw, and the links' depths along nearly collinear rays, absorbed the offsets (final cost 2.0e-3, nothing dropped). Draft test: `/tmp/claude-1000/-home-edgar/978f5be7-3122-4eb6-bf8e-8ea40ff0cac6/scratchpad/D11-draft-test.patch`.
+- D13: not fixed. Samples beyond a window-end edge's ends must be stored when the edge is made (`crates/kornia-slam/src/inertial/mod.rs`) or read from the IMU buffer the system holds (`system/mod.rs`); both are outside lane M's files, and the newest edge's later samples do not exist when it is made, so it needs a design choice (deferred extension or a buffer handed to the mapping job).
 
 # E estimator
 
@@ -212,6 +215,8 @@ Review complete: 14 findings, 1 high. Read-only; no files written, no cargo. Num
   - Rotation: generate pixels through `Exp(θ)`.
   - Focal: scale the true focal.
 
+**Lane M (2026-11-18): not fixed.** See "Tests that catch each finding": the injected-state tests fail on weak excitation, not on a found defect.
+
 ### D8
 
 **8. low | certain | `crates/kornia-slam/src/mapping/global_vi_ba/mod.rs:351-398`**
@@ -239,6 +244,8 @@ Review complete: 14 findings, 1 high. Read-only; no files written, no cargo. Num
 - **Wrong:** Gauge anchors are computed once, after the 10 px drop. A 3 px drop that splits a component leaves the new part with no position or yaw anchor. Only LM damping holds its 4 free directions.
 - **Fix:** Recompute `observers()` and `gauge_anchors()` after any tight drop with `dropped > 0`. Anchor new roots at their current pose.
 
+**Lane M (2026-11-18): not fixed.** No fixture yet in which a 3 px drop splits a component; see "Tests that catch each finding".
+
 ### D12
 
 **12. low | certain | `crates/kornia-slam/src/mapping/global_vi_ba/report.rs:91-92`; `session.rs:61-62`; card D P15**
@@ -253,6 +260,8 @@ Review complete: 14 findings, 1 high. Read-only; no files written, no cargo. Num
 - **Wrong:** Once td is carried, every solve holds the last sample over `|td|` past the stream on a window-end edge. For td < 0 that is the newest edge.
 - **Size:** The error is `ω̇·td²/2`. At 5 ms and 10 rad/s² it is 1.25e-4 rad, about 1σ(ΔR), and it repeats every solve. Card G bounds this only for |td| ≤ 2 ms.
 - **Fix:** Store raw samples out to `±3·sigma_ms` beyond each edge end, or read the IMU buffer for the window.
+
+**Lane M (2026-11-18): not fixed.** Needs samples past the edge ends from outside lane M's files; see "Tests that catch each finding".
 
 ### D14
 
