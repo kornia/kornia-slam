@@ -270,6 +270,60 @@ impl TrackSet {
         rewritten
     }
 
+    /// Gives map point `map_point_idx` at `position` to the unassociated
+    /// track of `camera` nearest `pixel`, within `max_distance_px`; keeps its
+    /// identity, so its shard and template. Returns whether one was found.
+    pub(crate) fn associate_nearest(
+        &mut self,
+        pixel: [f32; 2],
+        camera: usize,
+        max_distance_px: f32,
+        map_point_idx: usize,
+        position: Vec3F64,
+    ) -> bool {
+        let distance = |track: &Track| (track.pixel[0] - pixel[0]).hypot(track.pixel[1] - pixel[1]);
+        let nearest = self
+            .tracks
+            .iter_mut()
+            .filter(|track| track.map_point_idx.is_none() && track.camera() == camera)
+            .filter(|track| distance(track) <= max_distance_px)
+            .min_by(|a, b| distance(a).total_cmp(&distance(b)));
+        let Some(track) = nearest else {
+            return false;
+        };
+        track.map_point_idx = Some(map_point_idx);
+        track.position = Some(position);
+        true
+    }
+
+    /// The tracks without a map point that `survivors` advance, one frame on,
+    /// for [`Self::restore`] after a reconcile drops them.
+    pub(crate) fn advanced_unassociated(&self, survivors: &[FlowSurvivor]) -> Vec<Track> {
+        let unassociated: HashMap<TrackId, Track> = self
+            .tracks
+            .iter()
+            .filter(|track| track.map_point_idx.is_none())
+            .map(|track| (track.id, *track))
+            .collect();
+        survivors
+            .iter()
+            .filter_map(|survivor| {
+                let previous = unassociated.get(&survivor.track_id)?;
+                Some(Track {
+                    pixel: survivor.pixel,
+                    age: previous.age.saturating_add(1),
+                    ..*previous
+                })
+            })
+            .collect()
+    }
+
+    /// Adds back tracks of [`Self::advanced_unassociated`]; their identities
+    /// predate any reconcile, so they cannot collide with its new ones.
+    pub(crate) fn restore(&mut self, tracks: Vec<Track>) {
+        self.tracks.extend(tracks);
+    }
+
     /// Whether some track follows map point `map_point_idx`.
     pub(crate) fn follows(&self, map_point_idx: usize) -> bool {
         self.tracks

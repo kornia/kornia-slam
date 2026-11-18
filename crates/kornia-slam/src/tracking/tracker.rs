@@ -39,6 +39,10 @@ use crate::tracking::relocalization::{
 use crate::tracking::timings::TrackingTimings;
 use crate::upstream::kornia_3d::refine_analytic::refine_pose_analytic;
 
+/// How far from an adopted landmark a refill track may be to take its map
+/// point: the keypoint snap radius.
+const ADOPTION_RADIUS_PX: f32 = 3.0;
+
 /// A flow frame, its `(keypoint, map point)` seeds and each seed's world point.
 pub(crate) type FlowFrame = (Frame, Vec<(usize, usize)>, Vec<kornia_algebra::Vec3F64>);
 
@@ -409,7 +413,8 @@ impl Tracker {
     }
 
     /// Spawns the latest flow step's refill corners, once this frame's
-    /// tracks are settled; they join the map at the next keyframe.
+    /// tracks are settled; they join the map when a keyframe's landmark is
+    /// adopted next to them.
     pub(crate) fn spawn_refills(&mut self) {
         for &(camera, pixel) in &self.pending_spawns {
             self.track_set.spawn_on(pixel, camera);
@@ -418,8 +423,9 @@ impl Tracker {
         self.pending_spawns.clear();
     }
 
-    /// Spawns a track already following map point `map_point_idx` at
-    /// `position`, seen at `pixel` in `camera` (`adopt_landmarks`).
+    /// Gives map point `map_point_idx` at `position`, seen at `pixel` in
+    /// `camera`, to the nearest refill track, or spawns a track on it
+    /// (`adopt_landmarks`).
     pub(crate) fn adopt(
         &mut self,
         pixel: [f32; 2],
@@ -427,10 +433,19 @@ impl Tracker {
         map_point_idx: usize,
         position: kornia_algebra::Vec3F64,
     ) {
-        if !self.track_set.follows(map_point_idx) {
-            self.track_set
-                .spawn_associated(pixel, camera, map_point_idx, position);
+        if self.track_set.follows(map_point_idx)
+            || self.track_set.associate_nearest(
+                pixel,
+                camera,
+                ADOPTION_RADIUS_PX,
+                map_point_idx,
+                position,
+            )
+        {
+            return;
         }
+        self.track_set
+            .spawn_associated(pixel, camera, map_point_idx, position);
     }
 
     /// Rewrites every track's map-point position after a map change; returns
@@ -797,8 +812,9 @@ impl Tracker {
     }
 
     /// Re-associates the tracks with `frame`'s accepted matches: the primary
-    /// camera's, or every camera's under rig flow.
-    fn reconcile(&mut self, matches: &[(usize, usize)], frame: &Frame) {
+    /// camera's, or every camera's under rig flow. Returns whether the set
+    /// survived; it is cleared otherwise.
+    fn reconcile(&mut self, matches: &[(usize, usize)], frame: &Frame) -> bool {
         let keypoints = match self.rig {
             Some(_) => &frame.features.keypoints_xy[..],
             None => &frame.features.keypoints_xy[frame.camera_range(0)],
@@ -823,6 +839,7 @@ impl Tracker {
             self.reconcile_clears += 1;
             self.track_set.clear();
         }
+        reconciled.is_ok()
     }
 
     /// The flow survivors snapped to `frame`'s ORB keypoints of their own
@@ -914,7 +931,9 @@ impl Tracker {
     }
 
     /// Reconciles the tracks with an accepted estimate, or advances them onto
-    /// the flow survivors of a rejected one.
+    /// the flow survivors of a rejected one. On `WindowedU8` the refill
+    /// tracks that survived flow outlive the reconcile, as on a flow-only
+    /// frame, since no match can carry them.
     fn settle(
         &mut self,
         result: Result<Estimate, MapProjectionRejectReason>,
@@ -923,7 +942,15 @@ impl Tracker {
     ) -> Result<Estimate, MapProjectionRejectReason> {
         match result {
             Ok(estimate) => {
-                self.reconcile(&estimate.matches, frame);
+                let carried = match &klt_survivors {
+                    Some(survivors) if self.windowed() => {
+                        self.track_set.advanced_unassociated(survivors)
+                    }
+                    _ => Vec::new(),
+                };
+                if self.reconcile(&estimate.matches, frame) {
+                    self.track_set.restore(carried);
+                }
                 Ok(estimate)
             }
             Err(reason) => {
@@ -1224,6 +1251,55 @@ mod tests {
             None,
             "no reference without an inertial prediction"
         );
+    }
+
+    /// T2 (a): a refill track near an adopted landmark takes its map point
+    /// and keeps its identity, so refill tracks can join the map.
+    #[test]
+    fn adoption_associates_the_nearest_refill_track() {
+        let (mut tracker, _map) = tracked_map(5);
+        let refill = *tracker.tracks().last().unwrap();
+        assert_eq!(refill.map_point_idx(), None);
+        let position = Vec3F64::new(1.0, 2.0, 5.0);
+        let tracks_before = tracker.tracks().len();
+
+        tracker.adopt([7.0, 6.0], 0, 99, position);
+
+        assert_eq!(tracker.tracks().len(), tracks_before);
+        let adopted = tracker
+            .tracks()
+            .iter()
+            .find(|track| track.id() == refill.id())
+            .unwrap();
+        assert_eq!(adopted.map_point_idx(), Some(99));
+        assert_eq!(adopted.position(), Some(position));
+        assert_eq!(adopted.pixel(), refill.pixel());
+    }
+
+    /// T2 (b): on `WindowedU8` an ORB frame keeps the refill tracks that
+    /// survived flow, as a flow-only frame does.
+    #[test]
+    fn an_orb_frame_keeps_the_refill_survivors_on_windowed_flow() {
+        let (tracker, _map) = tracked_map(5);
+        let mut tracker = tracker.with_lk_kernel(LkKernel::WindowedU8);
+        let refill = *tracker.tracks().last().unwrap();
+        let survivors = survivors_of(&tracker);
+        let frame = test_frame(1, vec![[0; 32]; 5]);
+
+        assert!(
+            tracker
+                .settle(Ok(estimate_at(Pose3d::IDENTITY)), Some(survivors), &frame)
+                .is_ok()
+        );
+
+        let kept = tracker
+            .tracks()
+            .iter()
+            .find(|track| track.id() == refill.id())
+            .unwrap();
+        assert_eq!(kept.pixel(), [refill.pixel()[0] + 1.0, refill.pixel()[1]]);
+        assert_eq!(kept.age(), refill.age() + 1);
+        assert_eq!(kept.map_point_idx(), None);
     }
 
     #[test]
