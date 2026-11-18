@@ -88,8 +88,8 @@ impl fmt::Display for OfflineBaReport {
                 joined(&shear)
             )?;
         }
-        if let Some(td) = self.td_ms {
-            writeln!(f, "[offline_ba] td_ms={td:.4}")?;
+        if let (Some(td), Some(total)) = (self.td_ms, self.td_total_ms) {
+            writeln!(f, "[offline_ba] td_ms={td:.4} td_total_ms={total:.4}")?;
         }
         Ok(())
     }

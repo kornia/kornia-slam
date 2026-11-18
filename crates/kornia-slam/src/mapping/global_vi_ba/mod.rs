@@ -180,7 +180,11 @@ pub struct OfflineBaReport {
     pub gyro_scale_pct: Option<[f64; 3]>,
     /// Shear xy, xz, yz (mrad).
     pub gyro_shear_mrad: Option<[f64; 3]>,
+    /// The residual clock offset on top of the one the dump already applied.
     pub td_ms: Option<f64>,
+    /// The offset to apply next: the dump's `imu_time_offset_ns` plus `td_ms`,
+    /// both with the sign of an offset added to the IMU stamps.
+    pub td_total_ms: Option<f64>,
 }
 
 pub struct OfflineBaResult {
@@ -265,6 +269,9 @@ pub fn offline_visual_inertial_ba(
     report.bridge_rot_whitened = imu.mean_rotation_whitened(&edges, &pims, &state, |e| e.bridged);
     let calibration = state.calibration.estimate(&layout);
     report.record_calibration(&calibration);
+    report.td_total_ms = report
+        .td_ms
+        .map(|td| session.rig.imu_time_offset_ns as f64 * 1e-6 + td);
     Ok(OfflineBaResult {
         body_poses: problem.dump_body_poses(session, &state),
         calibration,

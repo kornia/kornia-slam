@@ -492,3 +492,29 @@ fn a_perturbed_rotating_start_converges_to_the_truth() {
         );
     }
 }
+
+/// D12: the solved `td` is a residual on top of the offset the dump already
+/// applied, so the report also prints their sum, the offset to apply next.
+/// The old code (2026-11-18) printed the residual alone, and
+/// `imu_time_offset_ns` was never read.
+#[test]
+fn the_report_adds_the_applied_clock_offset() {
+    let mut session = synthetic_session(0.0);
+    session.rig.imu_time_offset_ns = 2_000_000;
+    let config = OfflineBaConfig {
+        max_iterations: 0,
+        calibration: OfflineCalibrationConfig {
+            clock_offset: Some(ClockOffsetPrior { sigma_ms: 2.0 }),
+            ..OfflineCalibrationConfig::default()
+        },
+        ..OfflineBaConfig::default()
+    };
+    let report = solve(&session, &config).report;
+    let td = report.td_ms.unwrap();
+    assert_eq!(report.td_total_ms, Some(2.0 + td));
+    assert!(
+        report
+            .to_string()
+            .contains(&format!("td_ms={td:.4} td_total_ms={:.4}", 2.0 + td))
+    );
+}

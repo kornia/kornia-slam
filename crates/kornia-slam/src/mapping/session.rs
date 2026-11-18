@@ -58,7 +58,8 @@ pub struct SessionRig {
     pub camera_to_body: SessionPose,
     /// `[gyro_noise, accel_noise, gyro_bias_noise, accel_bias_noise]`, as `ImuCalib`.
     pub imu_noise: [f64; 4],
-    /// Already applied to [`SessionDump::imu`]; recorded for the report.
+    /// Already applied to [`SessionDump::imu`]; the offline report adds its
+    /// residual `td` to it.
     pub imu_time_offset_ns: i64,
     /// Baseline (m) behind the stereo depths: the rectified pair's, or the
     /// primary-to-camera-1 distance of a rig; `None` without stereo.
