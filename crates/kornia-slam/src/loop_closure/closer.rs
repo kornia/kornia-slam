@@ -6,7 +6,7 @@
 //! to its own tracking state through [`LoopClosingOutcome`] rather than
 //! reaching into it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use kornia_3d::camera::PinholeCamera;
@@ -20,9 +20,9 @@ use crate::loop_closure::place_recognition::{
 use crate::loop_closure::pose_graph::{max_gravity_alignment_error, unusable_reason};
 use crate::loop_closure::worker::{LoopSolveJob, LoopSolveOutcome, LoopSolver, WorkerStopped};
 use crate::loop_closure::{
-    Correction, DriftModel, GateDecision, GraphManifold, InertialPgoContext, LoopCorrection,
-    LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker, LoopFusionConfig, LoopGate,
-    LoopMeasurement, LoopOdometryGate, LoopProposal, LoopTemporalConsistency,
+    Correction, DriftModel, GateDecision, GraphManifold, InertialPgoContext, KeyframeLink,
+    LoopCorrection, LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker, LoopFusionConfig,
+    LoopGate, LoopMeasurement, LoopOdometryGate, LoopProposal, LoopTemporalConsistency,
     LoopVerificationConfig, OdometryConsistencyGate, PgoConfig, PgoError, PgoResult, PoseGraph,
     PoseGraphConfig, PoseGraphError, RejectAll, TemporalConsistencyGate, VerifiedLoopEdge,
     fuse_verified_loop, verify_loop_candidate,
@@ -59,6 +59,17 @@ pub struct LoopGraphSettings {
     /// loops that touch it keep constraining the map. `false` builds the graph from the map's
     /// keyframes at each solve and refuses a loop whose keyframe left the map.
     pub persistent: bool,
+}
+
+/// How a keyframe joins the one before it in map order when tracked odometry does not.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum KeyframeGap {
+    /// Relocalised against `found_kf` after a loss: a loop edge from it at the loop sigmas, and
+    /// no odometry edge across the jump, which nothing measured.
+    Relocalized { found_kf: usize },
+    /// Re-seeded after a loss at a pose this uncertain relative to the keyframe before it; the
+    /// edge keeps at least the drift sigmas.
+    Reseeded { sigma_m: f64, sigma_rad: f64 },
 }
 
 /// The information odometry and loop edges carry in the pose graph.
@@ -228,6 +239,7 @@ impl LoopCloser {
     pub(crate) fn forget_keyframes(&mut self, removed: impl IntoIterator<Item = usize>) {
         for kf_idx in removed {
             self.kf_database.erase(kf_idx);
+            self.acceptance.gaps.remove(&kf_idx);
         }
     }
 
@@ -243,6 +255,11 @@ impl LoopCloser {
             kf_database: KeyFrameDatabase::new(),
             acceptance: LoopAcceptance::new(config, require_imu_initialized),
         }
+    }
+
+    /// The pose graph joins `kf_idx` to the keyframe before it through `gap`.
+    pub(crate) fn note_keyframe_gap(&mut self, kf_idx: usize, gap: KeyframeGap) {
+        self.acceptance.gaps.insert(kf_idx, gap);
     }
 
     /// Keyframes of `map` that look like the given descriptors, best first,
@@ -438,6 +455,8 @@ struct LoopAcceptance {
     graph: PoseGraph<()>,
     /// Verified loops whose edge is in `graph`.
     loops_in_graph: HashSet<(usize, usize)>,
+    /// Keyframes of the map that tracked odometry does not join to the one before them.
+    gaps: HashMap<usize, KeyframeGap>,
     map_from_odometry: Pose3d,
     correction_epoch: u64,
     solver: LoopSolver,
@@ -477,6 +496,7 @@ impl LoopAcceptance {
             verified_loop_pairs: HashSet::new(),
             graph,
             loops_in_graph: HashSet::new(),
+            gaps: HashMap::new(),
             map_from_odometry: Pose3d::IDENTITY,
             correction_epoch: 0,
             solver: LoopSolver::Synchronous,
@@ -667,6 +687,7 @@ impl LoopAcceptance {
         LoopSolveJob {
             world_epoch: map.world_epoch(),
             keyframe_poses: keyframe_poses(map),
+            gaps: self.gaps.clone(),
             loops,
             graph: self.graph.clone(),
             optimizer: self.config.optimizer.clone(),
@@ -1109,6 +1130,7 @@ pub(super) fn optimize_through_graph(
     solve_in_graph(
         &mut graph,
         &keyframe_poses(map),
+        &HashMap::new(),
         verified_loops,
         config,
         settings,
@@ -1134,6 +1156,7 @@ pub(super) fn keyframe_poses(map: &Map) -> Vec<(usize, Pose3d)> {
 pub(super) fn solve_in_graph(
     graph: &mut PoseGraph<()>,
     keyframes: &[(usize, Pose3d)],
+    gaps: &HashMap<usize, KeyframeGap>,
     loops: &[VerifiedLoopEdge],
     config: &PgoConfig,
     settings: LoopGraphSettings,
@@ -1147,19 +1170,16 @@ pub(super) fn solve_in_graph(
     let Some((new_loop, earlier)) = loops.split_last() else {
         return Err(PgoError::MissingLoopKeyframe);
     };
-    let new_world = sync_graph(graph, keyframes, settings.persistent).map_err(solver)?;
+    let (sigma_m, sigma_rad) = loop_sigmas(config, information);
+    let new_world = sync_graph(
+        graph,
+        keyframes,
+        gaps,
+        (sigma_m, sigma_rad),
+        settings.persistent,
+    )
+    .map_err(solver)?;
     graph.set_manifold(snapshot_graph_config(config, information, inertial).manifold);
-    let (sigma_m, sigma_rad) = match information {
-        LoopGraphInformation::ScalarWeights => {
-            let sigma = 1.0 / f64::from(config.loop_edge_weight);
-            (sigma, sigma)
-        }
-        LoopGraphInformation::Drift {
-            loop_sigma_m,
-            loop_sigma_rad,
-            ..
-        } => (loop_sigma_m, loop_sigma_rad),
-    };
     let known = |kf: usize| graph.node_of_keyframe(kf).is_some();
     let held = |edge: &VerifiedLoopEdge| known(edge.query_kf_idx) && known(edge.candidate_kf_idx);
     if !settings.persistent && !earlier.iter().all(held) {
@@ -1204,22 +1224,40 @@ pub(super) fn solve_in_graph(
     Ok((result, new_world))
 }
 
+/// The loop edges' `(sigma_m, sigma_rad)` at `information`.
+fn loop_sigmas(config: &PgoConfig, information: LoopGraphInformation) -> (f64, f64) {
+    match information {
+        LoopGraphInformation::ScalarWeights => {
+            let sigma = 1.0 / f64::from(config.loop_edge_weight);
+            (sigma, sigma)
+        }
+        LoopGraphInformation::Drift {
+            loop_sigma_m,
+            loop_sigma_rad,
+            ..
+        } => (loop_sigma_m, loop_sigma_rad),
+    }
+}
+
 /// Makes `graph`'s live keyframes the map's, in map order, at the map's poses: keyframes the map
-/// dropped are forgotten where the graph last placed them, new ones are appended. A map sharing
+/// dropped are forgotten where the graph last placed them, new ones are appended, joined across
+/// `gaps` as each says (a relocalisation's loop edge at `loop_sigmas`). A map sharing
 /// no keyframe with the graph is a new world, and the graph starts over (`true`); a graph that
 /// does not persist starts over every time.
 pub(super) fn sync_graph(
     graph: &mut PoseGraph<()>,
     keyframes: &[(usize, Pose3d)],
+    gaps: &HashMap<usize, KeyframeGap>,
+    loop_sigmas: (f64, f64),
     persistent: bool,
 ) -> Result<bool, PoseGraphError> {
-    let in_map: HashSet<usize> = keyframes.iter().map(|&(kf, _)| kf).collect();
+    let in_map: HashMap<usize, Pose3d> = keyframes.iter().copied().collect();
     let (live, _, _) = graph.poses_before_after();
-    let new_world = !live.is_empty() && !live.iter().any(|kf| in_map.contains(kf));
+    let new_world = !live.is_empty() && !live.iter().any(|kf| in_map.contains_key(kf));
     if new_world || !persistent {
         graph.reset();
     } else {
-        for &kf in live.iter().filter(|kf| !in_map.contains(kf)) {
+        for &kf in live.iter().filter(|kf| !in_map.contains_key(kf)) {
             let node = graph
                 .node_of_keyframe(kf)
                 .ok_or(PoseGraphError::UnknownKeyframe(kf))?;
@@ -1237,8 +1275,19 @@ pub(super) fn sync_graph(
         }
     }
     for &(kf, pose) in keyframes {
-        if graph.node_of_keyframe(kf).is_none() {
-            graph.add_keyframe(kf, 0.0, pose, (), &mut RejectAll)?;
+        if graph.node_of_keyframe(kf).is_some() {
+            continue;
+        }
+        let link = gaps
+            .get(&kf)
+            .and_then(|gap| gap_link(graph, &in_map, gap, &pose, loop_sigmas));
+        match link {
+            Some(link) => {
+                graph.add_linked_keyframe(kf, 0.0, pose, (), link)?;
+            }
+            None => {
+                graph.add_keyframe(kf, 0.0, pose, (), &mut RejectAll)?;
+            }
         }
     }
     for &(kf, pose) in keyframes {
@@ -1251,6 +1300,30 @@ pub(super) fn sync_graph(
         ));
     }
     Ok(new_world)
+}
+
+/// The edge `gap` makes into a keyframe at `pose`; `None` chains odometry as usual, for a
+/// relocalisation whose keyframe left the map.
+fn gap_link(
+    graph: &PoseGraph<()>,
+    in_map: &HashMap<usize, Pose3d>,
+    gap: &KeyframeGap,
+    pose: &Pose3d,
+    (sigma_m, sigma_rad): (f64, f64),
+) -> Option<KeyframeLink> {
+    match *gap {
+        KeyframeGap::Reseeded { sigma_m, sigma_rad } => {
+            Some(KeyframeLink::Bridged { sigma_m, sigma_rad })
+        }
+        KeyframeGap::Relocalized { found_kf } => Some(KeyframeLink::Jump {
+            from: graph.node_of_keyframe(found_kf)?,
+            measurement: LoopMeasurement {
+                candidate_to_query: Pose3d::between(in_map.get(&found_kf)?, pose),
+                sigma_m,
+                sigma_rad,
+            },
+        }),
+    }
 }
 
 /// Every keyframe a node. Scalar weights put `sigma = 1 / w = 1` on odometry edges; `Drift` makes

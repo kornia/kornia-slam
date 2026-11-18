@@ -817,7 +817,7 @@ mod recovery_after_loss {
             timestamp_sec: 10.0,
         };
 
-        system.publish_bridge(anchor, 141, 15.0);
+        let gap = system.publish_bridge(anchor, 141, 15.0);
 
         let plain = system
             .inertial
@@ -836,6 +836,25 @@ mod recovery_after_loss {
         );
         let replayed = bridge.repreintegrate(bridge.preintegrated.bias);
         assert_eq!(replayed.covariance, bridge.preintegrated.covariance);
+        // G1: the graph gap is the largest one-sigma axis of the position and
+        // rotation blocks, between the largest variance and the trace.
+        let covariance = &bridge.preintegrated.covariance;
+        let bounds = |base: usize| {
+            let diagonal = (base..base + 3).map(|i| covariance[(i, i)]);
+            (
+                diagonal.clone().fold(0.0, f64::max).sqrt(),
+                diagonal.sum::<f64>().sqrt(),
+            )
+        };
+        let Some(crate::loop_closure::KeyframeGap::Reseeded { sigma_m, sigma_rad }) = gap else {
+            panic!("a published bridge gives a re-seed gap, got {gap:?}");
+        };
+        for (sigma, (low, high)) in [(sigma_m, bounds(6)), (sigma_rad, bounds(0))] {
+            assert!(
+                low - 1e-12 <= sigma && sigma <= high + 1e-12,
+                "{sigma} outside [{low}, {high}]"
+            );
+        }
     }
 
     /// A system re-seeding after a plausible give-up at t = 15 s, with level

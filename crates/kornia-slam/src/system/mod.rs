@@ -69,7 +69,8 @@ use crate::initialization::bootstrap::{
 };
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{
-    Correction, LoopCloser, LoopClosingContext, LoopClosingOutcome, LoopClosureEvent, LoopTiming,
+    Correction, KeyframeGap, LoopCloser, LoopClosingContext, LoopClosingOutcome, LoopClosureEvent,
+    LoopTiming,
 };
 use crate::mapping::bundle_adjustment::LocalBaParams;
 use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
@@ -82,7 +83,7 @@ use crate::mapping::{GrowthNeighbours, KeyframeJob, LocalMapping, SegmentId};
 use crate::pose_conversion::{RIGID_TOLERANCE, apply_reference_pose_correction};
 use build::SystemSettings;
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat3F64, Vec3F64};
+use kornia_algebra::{Mat3F64, Mat9F64, Vec3F64};
 use kornia_image::Image;
 use kornia_sensors::SensorRig;
 use kornia_sensors::imu::{ImuMeasurement, SampleInterpolation};
@@ -195,6 +196,8 @@ pub struct SlamSystem {
     // Place recognition for every keyframe, and loop closing when configured.
     loop_closer: Option<LoopCloser>,
     loop_closure_events: Vec<LoopClosureEvent>,
+    // How the next keyframe joins the pose graph after tracking resumed across a jump.
+    pending_graph_gap: Option<KeyframeGap>,
     state: SystemState,
     frontend: OrbFrontend,
     // The last processed image, for optical-flow tracks into the next frame.
@@ -328,6 +331,7 @@ impl SlamSystem {
             ),
             loop_closer,
             loop_closure_events: Vec::new(),
+            pending_graph_gap: None,
             frontend,
             previous_image: None,
             previous_secondary: Vec::new(),
@@ -1155,6 +1159,10 @@ impl SlamSystem {
         self.state.bridge_anchor = None;
         self.inertial.last_keyframe_timestamp_sec = Some(timestamp_sec);
         self.runaway.clear();
+        self.pending_graph_gap = self
+            .state
+            .current_keyframe_idx
+            .map(|found_kf| KeyframeGap::Relocalized { found_kf });
     }
 
     /// Carries the pose over a frame of a stalled re-seed on the kept inertial
@@ -1264,8 +1272,12 @@ impl SlamSystem {
              pose_defect={:.1e}",
             self.state.pose_world_to_cam.rotation_defect(),
         ));
-        if let Some(anchor) = bridge_anchor {
-            self.publish_bridge(anchor, curr_idx, timestamp_sec);
+        let bridged =
+            bridge_anchor.and_then(|anchor| self.publish_bridge(anchor, curr_idx, timestamp_sec));
+        if self.state.reseeding() {
+            let gap = bridged.unwrap_or_else(|| self.unbridged_reseed_gap(timestamp_sec));
+            self.pending_graph_gap = None;
+            self.note_graph_gap(curr_idx, gap);
         }
         self.state.bridge_anchor = None;
 
@@ -2544,8 +2556,14 @@ impl SlamSystem {
     }
 
     /// Publishes the IMU edge from the last keyframe before a give-up to the
-    /// next segment's first, with the covariance inflated for the coast.
-    fn publish_bridge(&mut self, anchor: BridgeAnchor, kf_idx: usize, timestamp_sec: f64) {
+    /// next segment's first, with the covariance inflated for the coast, and
+    /// returns the pose-graph gap at its position and rotation sigmas.
+    fn publish_bridge(
+        &mut self,
+        anchor: BridgeAnchor,
+        kf_idx: usize,
+        timestamp_sec: f64,
+    ) -> Option<KeyframeGap> {
         let noise =
             recovery::inflated_noise(self.rig.imu_noise(), self.recovery.bridge_covariance_scale);
         let Some(edge) = self.inertial.keyframe_edge(
@@ -2555,21 +2573,48 @@ impl SlamSystem {
             anchor.timestamp_sec,
             timestamp_sec,
         ) else {
-            return;
+            return None;
         };
+        let gap = bridge_gap(&edge.preintegrated.covariance);
         let published = self.map.lock().unwrap().apply_insertion(MapInsertion {
             imu_factors: vec![edge],
             ..Default::default()
         });
-        let message = match published {
-            Ok(_) => format!(
-                "[recover] frame={kf_idx} bridged from kf={} over {:.2}s",
-                anchor.kf_idx,
-                timestamp_sec - anchor.timestamp_sec
+        let (message, gap) = match published {
+            Ok(_) => (
+                format!(
+                    "[recover] frame={kf_idx} bridged from kf={} over {:.2}s",
+                    anchor.kf_idx,
+                    timestamp_sec - anchor.timestamp_sec
+                ),
+                Some(gap),
             ),
-            Err(error) => format!("[recover] frame={kf_idx} bridge rejected: {error}"),
+            Err(error) => (
+                format!("[recover] frame={kf_idx} bridge rejected: {error}"),
+                None,
+            ),
         };
         self.dbg(message);
+        gap
+    }
+
+    /// A re-seed without a bridge (held, levelled or starved) is placed only to
+    /// within the coast speed over the time since the last tracked keyframe.
+    fn unbridged_reseed_gap(&self, timestamp_sec: f64) -> KeyframeGap {
+        let gap_sec = self
+            .inertial
+            .last_keyframe_timestamp_sec
+            .map_or(0.0, |t| (timestamp_sec - t).max(0.0));
+        KeyframeGap::Reseeded {
+            sigma_m: self.recovery.max_coast_speed_mps * gap_sec,
+            sigma_rad: 0.0,
+        }
+    }
+
+    fn note_graph_gap(&mut self, kf_idx: usize, gap: KeyframeGap) {
+        if let Some(loop_closer) = self.loop_closer.as_mut() {
+            loop_closer.note_keyframe_gap(kf_idx, gap);
+        }
     }
 
     /// Recovers the pose against the map from place-recognition candidates
@@ -2786,6 +2831,9 @@ impl SlamSystem {
                 frame.idx
             ));
             return false;
+        }
+        if let Some(gap) = self.pending_graph_gap.take() {
+            self.note_graph_gap(frame.idx, gap);
         }
         if self.stereo_close_depth.is_some() && is_stereo {
             self.dbg(format!(
@@ -3130,6 +3178,24 @@ fn rig_flow_cameras(
             camera: rig.camera.clone(),
             camera_from_primary: None,
         }],
+    }
+}
+
+/// A bridged re-seed's gap: the one-sigma bounds of the preintegrated position
+/// and rotation blocks (navigation order rot, vel, pos), largest axis.
+fn bridge_gap(covariance: &Mat9F64) -> KeyframeGap {
+    let sigma = |base: usize| {
+        covariance
+            .fixed_view::<3, 3>(base, base)
+            .into_owned()
+            .symmetric_eigenvalues()
+            .max()
+            .max(0.0)
+            .sqrt()
+    };
+    KeyframeGap::Reseeded {
+        sigma_m: sigma(6),
+        sigma_rad: sigma(0),
     }
 }
 

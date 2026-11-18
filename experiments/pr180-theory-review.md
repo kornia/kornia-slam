@@ -24,6 +24,8 @@ Cross-lane: E1, E7, G3 are one design in lane S (velocity and bias from the orig
 
 (Lanes fill this in, one line per finding ID: test name and file.)
 
+- G1: `a_lost_relocalisation_joins_by_a_loop_edge_not_odometry`, `a_reseeded_keyframe_edge_takes_the_gap_sigmas` (`crates/kornia-slam/src/loop_closure/tests.rs`); the bridge sigmas in `the_bridge_edge_spans_the_gap_with_an_inflated_covariance` (`system/tests.rs`). Both graph tests failed against a stub `sync_graph` that ignored the gaps (today's chaining). Deviation: a relocalisation whose keyframe has left the map (snapshot graph) or the graph falls back to the ordinary odometry edge, since a loop edge needs both ends.
+
 # E estimator
 
 Review complete: 14 findings, three high. The core math is right; the bugs are in what feeds it and what reads it. Line numbers are at HEAD `79c04bb`, paths under `/home/edgar/dev/split/kornia-slam-graph/crates/`. Two numpy checks ran in memory with no files written, because plan mode barred creating `review-A/`.

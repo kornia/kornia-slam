@@ -6,6 +6,7 @@
 //! in flight and loops accepted meanwhile wait for the next job, which takes
 //! them all; an in-flight solve is never aborted.
 
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant};
 use kornia_3d::pose::Pose3d;
 
 use crate::loop_closure::VerifiedLoopEdge;
-use crate::loop_closure::closer::{LoopGraphSettings, solve_in_graph};
+use crate::loop_closure::closer::{KeyframeGap, LoopGraphSettings, solve_in_graph};
 use crate::loop_closure::fusion_plan::{FusionOp, FusionSnapshot};
 use crate::loop_closure::{InertialPgoContext, PgoConfig, PgoError, PgoResult, PoseGraph};
 
@@ -22,6 +23,7 @@ pub(crate) struct LoopSolveJob {
     pub world_epoch: u64,
     /// Map order, world-to-camera.
     pub keyframe_poses: Vec<(usize, Pose3d)>,
+    pub gaps: HashMap<usize, KeyframeGap>,
     /// Verified loops not yet in `graph`; the last is the newest.
     pub loops: Vec<VerifiedLoopEdge>,
     pub graph: PoseGraph<()>,
@@ -53,6 +55,7 @@ impl LoopSolveJob {
         let solved = solve_in_graph(
             &mut graph,
             &self.keyframe_poses,
+            &self.gaps,
             &self.loops,
             &self.optimizer,
             self.settings,
@@ -242,6 +245,7 @@ mod tests {
         LoopSolveJob {
             world_epoch: 7,
             keyframe_poses: Vec::new(),
+            gaps: Default::default(),
             loops: Vec::new(),
             graph: PoseGraph::new(Default::default()),
             optimizer: PgoConfig::default(),

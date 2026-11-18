@@ -140,6 +140,8 @@ pub enum PoseGraphError {
     DuplicateKeyframe(usize),
     #[error("keyframe {0} has no node")]
     UnknownKeyframe(usize),
+    #[error("node {0} does not exist")]
+    UnknownNode(usize),
     #[error("a loop edge needs two distinct nodes")]
     SelfLoop,
     #[error("pose-graph solve failed: {0}")]
@@ -195,6 +197,20 @@ struct Anchor {
     path_m: f64,
     turn_rad: f64,
     t_s: f64,
+}
+
+/// How [`PoseGraph::add_linked_keyframe`] joins a keyframe across a gap in tracked odometry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KeyframeLink {
+    /// An odometry edge from the anchor at no less than these sigmas: a pose carried across the
+    /// gap, such as a coast on the IMU.
+    Bridged { sigma_m: f64, sigma_rad: f64 },
+    /// No odometry edge, since nothing measured the jump from the anchor: a loop edge from `from`
+    /// instead, and the path restarts at the new node.
+    Jump {
+        from: NodeId,
+        measurement: LoopMeasurement,
+    },
 }
 
 /// What one keyframe did to the graph.
@@ -468,6 +484,69 @@ impl<P> PoseGraph<P> {
             }
         }
         Ok(KeyframeOutcome::NewNode(new_node))
+    }
+
+    /// A node for `keyframe`, joined by `link` instead of the drift odometry edge, without a loop
+    /// search or a solve. The first keyframe ignores `link`.
+    ///
+    /// # Errors
+    /// The keyframe already has a node, or a jump's `from` node does not exist.
+    pub fn add_linked_keyframe(
+        &mut self,
+        keyframe: usize,
+        t_s: f64,
+        odometry: Pose3d,
+        payload: P,
+        link: KeyframeLink,
+    ) -> Result<NodeId, PoseGraphError> {
+        if self.by_keyframe.contains_key(&keyframe) {
+            return Err(PoseGraphError::DuplicateKeyframe(keyframe));
+        }
+        let Some(anchor) = self.anchor else {
+            let node = self.push_node(keyframe, t_s, odometry, odometry, payload);
+            self.anchor = Some(self.anchor_at_node(node, t_s));
+            self.last_odometry = Some(odometry);
+            return Ok(node);
+        };
+        let to = match link {
+            KeyframeLink::Bridged { sigma_m, sigma_rad } => {
+                self.advance_path(&odometry);
+                let estimate = self.estimate(&odometry);
+                let (measurement, drift_m, drift_rad) = self.odometry_since_anchor(&odometry);
+                let to = self.push_node(keyframe, t_s, odometry, estimate, payload);
+                self.insert_edge(Edge {
+                    from: anchor.node,
+                    to,
+                    measurement,
+                    sigma_m: sigma_m.max(drift_m),
+                    sigma_rad: sigma_rad.max(drift_rad),
+                    kind: EdgeKind::Odometry,
+                });
+                to
+            }
+            KeyframeLink::Jump { from, measurement } => {
+                let from_pose = self
+                    .nodes
+                    .get(from.0)
+                    .ok_or(PoseGraphError::UnknownNode(from.0))?
+                    .pose;
+                // The jump is not distance travelled.
+                self.last_odometry = Some(odometry);
+                let estimate = measurement.candidate_to_query.compose(&from_pose);
+                let to = self.push_node(keyframe, t_s, odometry, estimate, payload);
+                self.insert_edge(Edge {
+                    from,
+                    to,
+                    measurement: measurement.candidate_to_query,
+                    sigma_m: measurement.sigma_m,
+                    sigma_rad: measurement.sigma_rad,
+                    kind: EdgeKind::Loop,
+                });
+                to
+            }
+        };
+        self.anchor = Some(self.anchor_at_node(to, t_s));
+        Ok(to)
     }
 
     /// Add verified loops between keyframes that own nodes, then solve once.

@@ -11,6 +11,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 use kornia_image::ImageSize;
 use kornia_imgproc::features::OrbFeatures;
+use std::collections::HashMap;
 
 fn camera() -> PinholeCamera {
     PinholeCamera {
@@ -1077,6 +1078,7 @@ fn persistent_graph_keeps_a_loop_whose_keyframe_was_culled() {
     let (result, new_world) = solve_in_graph(
         &mut graph,
         &keyframe_poses(&map),
+        &HashMap::new(),
         std::slice::from_ref(&first),
         &config,
         settings,
@@ -1094,6 +1096,7 @@ fn persistent_graph_keeps_a_loop_whose_keyframe_was_culled() {
     let (result, _) = solve_in_graph(
         &mut graph,
         &keyframe_poses(&map),
+        &HashMap::new(),
         std::slice::from_ref(&second),
         &config,
         settings,
@@ -1237,6 +1240,7 @@ fn persistent_graph_starts_over_on_a_new_world() {
     let (_, new_world) = solve_in_graph(
         &mut graph,
         &keyframe_poses(&lap_map(0)),
+        &HashMap::new(),
         std::slice::from_ref(&old_loop),
         &config,
         settings,
@@ -1249,6 +1253,7 @@ fn persistent_graph_starts_over_on_a_new_world() {
     let (result, new_world) = solve_in_graph(
         &mut graph,
         &keyframe_poses(&reset),
+        &HashMap::new(),
         &[old_loop, loop_from(100, 0, 22)],
         &config,
         settings,
@@ -1298,6 +1303,7 @@ fn path_after_a_correction_starts_at_the_corrected_keyframe() {
     let (result, _) = solve_in_graph(
         &mut graph,
         &keyframe_poses(&map),
+        &HashMap::new(),
         &[edge],
         &config,
         settings,
@@ -1327,7 +1333,14 @@ fn path_after_a_correction_starts_at_the_corrected_keyframe() {
         .unwrap();
     }
 
-    sync_graph(&mut graph, &keyframe_poses(&map), true).unwrap();
+    sync_graph(
+        &mut graph,
+        &keyframe_poses(&map),
+        &HashMap::new(),
+        (1.0, 1.0),
+        true,
+    )
+    .unwrap();
     let edge = graph
         .edges()
         .find(|edge| edge.kind == EdgeKind::Odometry && edge.to == NodeId(20))
@@ -1387,6 +1400,7 @@ fn forgotten_node_edges_measure_from_its_solved_pose() {
         let (result, _) = solve_in_graph(
             graph,
             &keyframe_poses(map),
+            &HashMap::new(),
             &[edge],
             &config,
             settings,
@@ -1408,7 +1422,14 @@ fn forgotten_node_edges_measure_from_its_solved_pose() {
     let forgotten = NodeId(12);
     assert_eq!(graph.nodes()[forgotten.0].keyframe, None);
 
-    sync_graph(&mut graph, &keyframe_poses(&map), true).unwrap();
+    sync_graph(
+        &mut graph,
+        &keyframe_poses(&map),
+        &HashMap::new(),
+        (1.0, 1.0),
+        true,
+    )
+    .unwrap();
     let at_forgotten: Vec<_> = graph
         .edges()
         .filter(|edge| {
@@ -1985,4 +2006,82 @@ fn a_background_correction_follows_the_landmarks_the_camera_sees() {
             .length()
             < 1e-6
     );
+}
+
+/// Keyframes 0-9 one metre apart, 10-14 a given-up segment drifted 10 m on, then 15 and 16 back
+/// near keyframe 3. World-to-camera, camera centres on the x axis.
+fn jumped_map() -> Map {
+    let centred = |x: f64| Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(-x, 0.0, 0.0));
+    let mut map = Map::new();
+    let centres = (0..10)
+        .map(|kf| (kf, kf as f64))
+        .chain((10..15).map(|kf| (kf, 10.0 + kf as f64)))
+        .chain([(15, 3.2), (16, 4.2)]);
+    for (kf, x) in centres {
+        map.insert_keyframe(Keyframe::from_frame(frame(kf, centred(x), &[], Vec::new())))
+            .unwrap();
+    }
+    map
+}
+
+fn synced_jumped_graph(gaps: &HashMap<usize, KeyframeGap>) -> (Map, PoseGraph<()>) {
+    let map = jumped_map();
+    let information = LoopGraphInformation::drift();
+    let mut graph = PoseGraph::new(snapshot_graph_config(
+        &PgoConfig::default(),
+        information,
+        None,
+    ));
+    sync_graph(&mut graph, &keyframe_poses(&map), gaps, (0.05, 0.01), false).unwrap();
+    (map, graph)
+}
+
+/// G1: a lost relocalisation into an older segment joins the next keyframe to the keyframe it
+/// relocalised against by a loop edge at the loop sigmas, and no odometry edge spans the jump.
+/// Before, the jump from the given-up segment was an odometry edge at drift sigmas that measured
+/// the accumulated drift as motion.
+#[test]
+fn a_lost_relocalisation_joins_by_a_loop_edge_not_odometry() {
+    let gaps = HashMap::from([(15, KeyframeGap::Relocalized { found_kf: 3 })]);
+    let (map, graph) = synced_jumped_graph(&gaps);
+    let node = |kf| graph.node_of_keyframe(kf).unwrap();
+    let into_15: Vec<_> = graph.edges().filter(|edge| edge.to == node(15)).collect();
+    assert_eq!(into_15.len(), 1, "{into_15:?}");
+    let edge = into_15[0];
+    assert_eq!((edge.from, edge.kind), (node(3), EdgeKind::Loop));
+    let pose = |kf| map.get_keyframe(kf).unwrap().frame.pose_world_to_cam;
+    let expected = Pose3d::between(&pose(3), &pose(15));
+    assert!((edge.measurement.translation - expected.translation).length() < 1e-12);
+    assert_eq!((edge.sigma_m, edge.sigma_rad), (0.05, 0.01));
+    assert!(
+        graph.edges().any(|edge| edge.from == node(15)
+            && edge.to == node(16)
+            && edge.kind == EdgeKind::Odometry),
+        "tracking after the jump chains from the relocalised keyframe"
+    );
+}
+
+/// G1: a re-seed carried across a loss keeps its odometry edge at the gap's sigmas, never below
+/// the drift ones. Before, the edge had the drift sigmas of an ordinary keyframe step.
+#[test]
+fn a_reseeded_keyframe_edge_takes_the_gap_sigmas() {
+    let (_, plain) = synced_jumped_graph(&HashMap::new());
+    let into = |graph: &PoseGraph<()>, kf| {
+        let to = graph.node_of_keyframe(kf).unwrap();
+        *graph.edges().find(|edge| edge.to == to).unwrap()
+    };
+    let drift = into(&plain, 10);
+    let gaps = HashMap::from([(
+        10,
+        KeyframeGap::Reseeded {
+            sigma_m: 2.0,
+            sigma_rad: 0.0,
+        },
+    )]);
+    let (_, graph) = synced_jumped_graph(&gaps);
+    let edge = into(&graph, 10);
+    assert_eq!(edge.kind, EdgeKind::Odometry);
+    assert_eq!(edge.measurement, drift.measurement);
+    assert!(drift.sigma_m < 2.0);
+    assert_eq!((edge.sigma_m, edge.sigma_rad), (2.0, drift.sigma_rad));
 }
