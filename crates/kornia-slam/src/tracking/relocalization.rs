@@ -10,7 +10,7 @@
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pnp::{PnPMethod, RansacParams, solve_pnp_ransac};
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Vec2F32, Vec3AF32};
+use kornia_algebra::{Vec2F32, Vec3AF32, Vec3F64};
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
 use crate::Frame;
@@ -304,16 +304,22 @@ fn rig_ransac_pose(
         .map(|&i| {
             let (mp, kp) = correspondences[i];
             let pixel = pixel_of(kp);
-            let ((origin, direction), pixel_scale) = match frame.secondary_view(kp) {
-                Some(view) => (view.ray(pixel), view.camera.fx),
+            let ((origin, direction), axis, pixel_scale) = match frame.secondary_view(kp) {
+                Some(view) => (
+                    view.ray(pixel),
+                    view.primary_from_camera.rotation * Vec3F64::new(0.0, 0.0, 1.0),
+                    view.camera.fx,
+                ),
                 None => (
                     kornia_sensors::camera_ray(camera, &Pose3d::IDENTITY, pixel),
+                    Vec3F64::new(0.0, 0.0, 1.0),
                     camera.fx,
                 ),
             };
             RayMatch {
                 origin,
                 direction,
+                axis,
                 point_world: map.map_points()[mp].position,
                 pixel_scale,
             }

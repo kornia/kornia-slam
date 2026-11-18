@@ -12,8 +12,10 @@ pub struct RayMatch {
     pub origin: Vec3F64,
     /// Unit.
     pub direction: Vec3F64,
+    /// The camera's unit optical axis.
+    pub axis: Vec3F64,
     pub point_world: Vec3F64,
-    /// Pixels per unit of tangent-plane error (the camera's fx): residuals come out in px².
+    /// Pixels per unit of image-plane error (the camera's fx): residuals come out in px².
     pub pixel_scale: f64,
 }
 
@@ -99,15 +101,15 @@ fn rotation_taking_to_z(axis: Vec3F64) -> Mat3F64 {
     Mat3F64::from_cols(x, y, z).transpose()
 }
 
-/// `(pixel_scale · tan∠(p, d))²` with `p = R X + t − origin`; `f64::INFINITY` when `p·d ≤ 0`.
+/// The pixel error on the camera's image plane, `(pixel_scale · |p/(p·a) − d/(d·a)|)²` with
+/// `p = R X + t − origin` and `a` the optical axis; `f64::INFINITY` behind the camera.
 pub fn ray_residual_sq(pose_world_to_rig: &Pose3d, m: &RayMatch) -> f64 {
     let p = pose_world_to_rig.transform_point(&m.point_world) - m.origin;
-    let along = p.dot(m.direction);
-    if along <= 0.0 {
+    let (depth, along) = (p.dot(m.axis), m.direction.dot(m.axis));
+    if depth <= 0.0 || along <= 0.0 {
         return f64::INFINITY;
     }
-    let tangent = p.cross(m.direction).length() / along;
-    (m.pixel_scale * tangent).powi(2)
+    (m.pixel_scale * (p / depth - m.direction / along).length()).powi(2)
 }
 
 /// [`ap3p_lifted`] as a RANSAC estimator.
@@ -239,6 +241,7 @@ mod tests {
         RayMatch {
             origin: primary_from_camera.translation,
             direction: primary_from_camera.rotation * p_camera.normalize(),
+            axis: primary_from_camera.rotation * Vec3F64::new(0.0, 0.0, 1.0),
             point_world: truth().inverse().transform_point(&p_rig),
             pixel_scale: FX,
         }
@@ -275,6 +278,26 @@ mod tests {
         }
     }
 
+    /// G5: the residual is the pixel error on the camera's image plane. A 4 px error at 45 deg
+    /// off the axis of the side camera reads 4 px radially and tangentially.
+    #[test]
+    fn an_off_axis_error_reads_in_pixels() {
+        let camera = side_camera();
+        let m = ray_match(&camera, Vec3F64::new(4.0, 0.0, 4.0));
+        for offset in [
+            Vec3F64::new(4.0 / FX, 0.0, 0.0),
+            Vec3F64::new(0.0, 4.0 / FX, 0.0),
+        ] {
+            let observed = Vec3F64::new(1.0, 0.0, 1.0) + offset;
+            let m = RayMatch {
+                direction: camera.rotation * observed.normalize(),
+                ..m
+            };
+            let px = ray_residual_sq(&truth(), &m).sqrt();
+            assert!((px - 4.0).abs() < 1e-9, "{px} px for {offset:?}");
+        }
+    }
+
     #[test]
     fn rays_from_two_origins_are_not_lifted() {
         let matches = [
@@ -294,6 +317,13 @@ mod tests {
             ..m
         };
         assert_eq!(ray_residual_sq(&truth(), &behind), f64::INFINITY);
+        let behind_camera = RayMatch {
+            point_world: truth()
+                .inverse()
+                .transform_point(&Vec3F64::new(-0.1, -0.2, -3.0)),
+            ..m
+        };
+        assert_eq!(ray_residual_sq(&truth(), &behind_camera), f64::INFINITY);
     }
 
     #[test]
