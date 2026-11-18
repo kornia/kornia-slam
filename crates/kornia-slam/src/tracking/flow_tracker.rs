@@ -521,6 +521,13 @@ impl FlowShard {
             SUBPIX_MAX_ITER,
             SUBPIX_EPSILON,
         );
+        // Sub-pixel can move a corner up to its half window, past the
+        // survivor filter's border, where its first step would drop it.
+        let margin = SurvivorFilterConfig::default().border_margin_px;
+        let size = frame.plane().size();
+        let (max_x, max_y) = (size.width as f32 - margin, size.height as f32 - margin);
+        self.corners
+            .retain(|&[x, y]| (margin..=max_x).contains(&x) && (margin..=max_y).contains(&y));
         self.spawned
             .extend(self.corners.iter().map(|&corner| (camera, corner)));
         timings.flow_refill += started.elapsed();
@@ -1257,5 +1264,71 @@ mod tests {
 
         assert!(distance(adopted, [92.0, 70.0]) < 0.05, "{adopted:?}");
         assert_eq!(flow.adopt(1, 0, pixel, pixel), None);
+    }
+
+    /// Bright squares whose left or top edge lies between pixels 9 and 10,
+    /// and one well inside.
+    fn squares_at_the_border() -> Image<u8, 1> {
+        let inside = |x: usize, y: usize| {
+            let left = (10..30).contains(&x) && (y % 40) >= 20 && (y % 40) < 36 && y < 140;
+            let top = (10..26).contains(&y) && (x % 40) >= 20 && (x % 40) < 36 && x > 40;
+            let centre = (100..130).contains(&x) && (70..100).contains(&y);
+            left || top || centre
+        };
+        let data = (0..WIDTH * HEIGHT)
+            .map(|i| {
+                if inside(i % WIDTH, i / WIDTH) {
+                    220
+                } else {
+                    30
+                }
+            })
+            .collect();
+        Image::new(
+            ImageSize {
+                width: WIDTH,
+                height: HEIGHT,
+            },
+            data,
+        )
+        .unwrap()
+    }
+
+    /// T11: a refill corner `corner_sub_pix` moved inside the survivor
+    /// filter's border would die on its first step, so it is not spawned.
+    #[test]
+    fn refill_spawns_no_corner_the_survivor_filter_would_drop() {
+        let current = [Arc::new(
+            LkFrame::new(&squares_at_the_border(), 11, 0).unwrap(),
+        )];
+        let guess = ShardGuess {
+            refill: refill(),
+            refill_camera: Some(0),
+            ..guess()
+        };
+        let mut shard = FlowShard::default();
+        let mut timings = ShardTimings::default();
+
+        shard.refill(&current, &guess, &mut timings);
+
+        let margin = SurvivorFilterConfig::default().border_margin_px;
+        let (w, h) = (WIDTH as f32, HEIGHT as f32);
+        assert!(
+            shard
+                .spawned
+                .iter()
+                .filter(|(_, [x, y])| *x > 90.0 && *y > 60.0)
+                .count()
+                >= 4,
+            "{:?}",
+            shard.spawned
+        );
+        for &(_, [x, y]) in &shard.spawned {
+            assert!(
+                x >= margin && y >= margin && x <= w - margin && y <= h - margin,
+                "({x}, {y}) of {:?}",
+                shard.spawned
+            );
+        }
     }
 }
