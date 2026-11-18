@@ -92,3 +92,28 @@ Each prediction is checked over 3 runs per config on the 800-frame windows.
 ### Result log
 
 - **2026-11-18:** `configs/pr180-full.ron` sets `pose_inertial: Off` until this card is scored.
+- **2026-11-18, first scoring:**
+  - **Setup:** binary 6a6a64b, 800-frame windows, `--debug`, 3 runs per config. "Tracked" is the app's `[summary]` count.
+  - **Measurements:** P1 comes from `[pose_inertial]` and `[predgap]` lines on frames that end in a `LowPnpInliers` reject. R_11 ATE covers only the frames that have pseudo-dense ground truth.
+
+| P/K | Prediction | Baseline | Measured (each repeat) | Verdict |
+|---|---|---|---|---|
+| P1 | solve / visual-PnP inliers ≤ 0.1 on rejected frames | n/a | R_01 OrbSlam3: 0.090 (n 91). R_01 LastKeyframe: 0.113, 0.088, 0.117. R_11 OrbSlam3: 0.488, 0.505, 0.541 | as predicted on R_01; missed on R_11 |
+| P2 (H2) | LastKeyframe: `LowPnpInliers` ≤ 20, tracked ≥ 98 %, ATE 0.10-0.13 m | OrbSlam3: 97, 90 %, 0.17-0.18 m | `LowPnpInliers` 124, 217, 118; tracked 667, 554, 680 / 800; ATE 0.308, 0.816, 0.262 m | missed; worse than OrbSlam3 |
+| P3 (H1) | R_11 (rectified IMU): tracked within 2 % of the base, `coast_inertial` ≤ 10 | base 667, 669, 668; `coast_inertial` 9-11 | tracked 647, 647, 643 (−3.3 %); `coast_inertial` 31, 31, 35; ATE 0.158-0.167 m against base 0.158-0.239 m | missed, but the loss is a third of R_01's (−3 % against −10 %) |
+| P4 (H3) | PnP-inlier chi2 median ≤ 2 | n/a | not measured: no log line prints it | open |
+| K2 | none of P2-P4 holds | n/a | strictly it fires | see the reading below |
+
+- **H2 is refuted.** With no chained prior, the solve does worse. `LastKeyframe` holds the keyframe's inertial state fixed, and that state is itself poor, so the runaway prior is not the cause.
+- **H1 is supported in part.** On R_11, whose IMU is rectified from the factory calibration, the collapse is much smaller:
+  - the solve keeps about half the visual inliers on rejected frames, not a tenth;
+  - the loss is −3 % against −10 % on R_01.
+
+  The two windows are different sequences, so this is not yet a clean test.
+- **Combined reading:** the solve is as good as the inertial state it is tied to. On R_01 that state (keyframe velocity and bias, from an unrectified IMU) is wrong enough to gate the image out.
+- **Next:**
+  - test H1 on one sequence: add an IMU information scale knob (default 1.0) and run R_01 at 0.1 and 0.01;
+  - log the anchor velocity against ground truth (K2).
+- **Owner target (100 % tracking on easy and medium sequences):**
+  - R_01 base already tracks 800/800.
+  - R_11 base tracks about 668/800. The loss is not this solve: 122 frames are skipped in bootstrap, after 3 give-ups before a map exists (frames 3, 75 and 78).
