@@ -137,7 +137,7 @@ Predictions (numbers, each tied to a measurement):
     - mean whitened IMU rotation residual per edge falls 10-50 %;
     - CP change per scored sequence -5 to +5.
     measured by: `[offline_ba] gyro_scale_pct= gyro_shear_mrad= imu_rot_whitened0= imu_rot_whitened=` and the CP runner.
-  P15 Clock, on top of core plus bridge: `td` within ±2 ms of the dump's applied offset on all 5 sequences. The 4 sequences of 1WM093701G1276 agree within 0.7 ms. The CP change lies inside the 3-sample band of the solve without `td`.   measured by: `[offline_ba] td_ms=` and the CP runner.
+  P15 Clock, on top of core plus bridge: `|td| ≤ 2 ms` on all 5 sequences (the reported `td_ms` is the residual on top of the offset the dump already applied; `td_total_ms` = applied offset + `td_ms` is the new offset; theory review D12). The 4 sequences of 1WM093701G1276 agree within 0.7 ms (compare `td_total_ms`). The CP change lies inside the 3-sample band of the solve without `td`.   measured by: `[offline_ba] td_ms=` and the CP runner.
   Mechanism counters: the P7 scale share, the P8 component count, and the calibration estimates in P12-P15. If the theory is right, each must move as predicted before its score prediction counts.
 
 Kill rules:

@@ -360,7 +360,7 @@ ORB-SLAM3 runs 10 iterations, or 4 when large (`ORB/Optimizer.cc:2388,2392,2843`
 - `initial_lambda` 1.0 (`mapping/vi_ba_schur.rs:336`) against 1e-2 when large only (`ORB/Optimizer.cc:2516`). A2 carries the large value.
 - `accel_bias_prior_weight` 1e2 (`vi_ba_schur.rs:229,356`); ORB-SLAM3's `LocalInertialBA` has no bias prior (`EdgePriorAcc` appears only at `ORB/Optimizer.cc:579,3105,3279`).
 - Visual information: invSigma2 per octave with Huber √5.991 (`ORB/Optimizer.cc:2690-2693,2752-2753`) against our 1 px and 5 px. The existing knob is `visual_information: OctaveScaled`.
-- Tracking outliers are nulled before keyframe insertion (`ORB/Tracking.cc:3011-3023`). The existing knob is `mapping.keyframe_observations: PnpInliers`.
+- Tracking outliers stay in the keyframe observations, as in ORB-SLAM3 (`ORB/Tracking.cc:2259-2267`); the `Tracking.cc:3011-3023` lines are not an outlier null. Corrected 2026-11-18 (theory review, E-lane "checked and found correct"). `mapping.keyframe_observations: PnpInliers` is a deliberate difference from ORB-SLAM3, not a match to it.
 - At most 200 fixed covisible keyframes (`ORB/Optimizer.cc:2481`); ours has no cap.
 
 ## Experiment T: IMU covariance trust

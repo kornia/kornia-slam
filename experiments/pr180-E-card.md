@@ -94,7 +94,7 @@ Predictions (numbers, each tied to a measurement):
   P12 R_11 frames 4850-6866: 0 frames in Bootstrap (KLT-first rig, `3d84baf`: 2,016).   measured by: per-frame status in the trajectory log.
   P13 R_11 tracked share: within -1 to +3 points of `pr180/S` (mean of 3 samples).   measured by: `tracked / frames` in `[summary]`.
   P14 `flow_pose_fallbacks`: 0.5-3 % of flow frames.   measured by: the counter over `flow_frames`.
-  P15 `flow_reconcile_clears` = 0 on R_11 and MH_01; `flow_template_rebuilds` at most 2 % of track-frames after warm-up.   measured by: the counters.
+  P15 `flow_reconcile_clears` = 0 on R_11 and MH_01; `flow_template_rebuilds` at most 2 % of track-frames after warm-up, plus one rebuild per track whose pixel an ORB frame rewrote (T1 recuts when the source pixel differs from the cached one, so post-ORB frames rebuild by design; the 2 % bound is read net of those).   measured by: the counters.
   P16 Keyframe latency under `keyframe_orb: Mapping`: a deferred keyframe is inserted 1-2 frames after it was due (median 1), and the deferred queue never holds more than 3.   measured by: `deferred_keyframe_lag_frames` (sum) and `deferred_keyframe_queue_max`.
   P17 With `flow_pose: AnalyticGn` and `flow_bookkeeping: KeyframesOnly`: `flow_map_wait` = 0 on every `FlowOnly::Tracked` frame (the flow path takes no map lock).   measured by: the `flow_map_wait` column of the bench CSV, on those frames.
   Mechanism counters: P8, P9, P10 and P11. If the theory is right, each must move as predicted before P13 counts.
@@ -233,7 +233,7 @@ All of these are fields of `OrbFrontendConfig` (`system/config/mod.rs:124-141`, 
 | `flow_refill_spawns` | tracks spawned by refill | P5 off-nominal |
 | `flow_anchor_drops` | tracks dropped by the anchor guard | T13 |
 | `flow_pose_fallbacks` | AnalyticGn frames that fell back to RANSAC PnP | P14, K6 |
-| `flow_template_rebuilds` | templates re-extracted because the cached one had another frame index | P15 |
+| `flow_template_rebuilds` | templates re-extracted because the cached one had another frame index or another source pixel (T1) | P15 |
 | `flow_reconcile_clears` | silent track-set clears in `reconcile` (`tracker.rs:409-415`) | P15 |
 | `flow_position_refreshes` | track positions rewritten after a local-mapping result or a loop or map correction (step 8) | step 8 |
 | `deferred_keyframe_lag_frames` | frames between a deferred keyframe being due and its insert, summed | P16 |

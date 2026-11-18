@@ -36,6 +36,8 @@
                 keyframe_orb: Tracking,
             )),
             mapping: ( execution: Asynchronous ),
+            // G11: the analytic refine never adopts an uphill LM step.
+            tracking: ( refine_monotone: true ),
         )),
     ),
 )

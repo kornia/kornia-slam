@@ -51,7 +51,8 @@
                 growth_neighbours: OrbSlam3(covisible: 10),
             ),
             inertial: ( sample_interpolation: Midpoint ),
-            tracking: ( pose_inertial: OrbSlam3, local_map: OrbSlam3 ),
+            // G11: `refine_monotone` makes the analytic refine never adopt an uphill step.
+            tracking: ( pose_inertial: OrbSlam3, local_map: OrbSlam3, refine_monotone: true ),
             keyframes: ( rules: OrbSlam3(max_frames: 10) ),
             loop_closing: Enabled(vocabulary: "../weights/ORBvoc.txt"),
             // Card B recovery knobs. `keep_inertial` is required by the

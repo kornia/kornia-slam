@@ -21,16 +21,58 @@ Newest first, one entry per working day. "main" means a merged PR; "#180" means 
 `feat/global-pose-graph` branch (PR #180), which is not merged. Unless marked validated, branch work
 sits behind config knobs that default to the old behaviour, and nothing in it has been benchmarked yet.
 
+### 2026-11-18
+- **#180, theory review.** Four read-only reviews (estimator, offline BA and calibration, geometry and recovery, frontend): 52 findings (5 high, 21 medium, 26 low), all in knob-gated code. The always-on review fixes were found equivalent to what they replaced. Findings and the test for each: `experiments/pr180-theory-review.md`.
+- **#180, fixes per lane** (one commit per finding or group, each with a test that fails on the old code; knobs off, not validated):
+  - estimator and system:
+    - E1/E7/G3: velocity and bias come from the origin keyframe, and velocity is rotated on a pose jump;
+    - E2: pixel sigma from the camera-centre covariance;
+    - E4/E5: pose-inertial guards, and a solve with too few inliers is rejected and counted;
+    - E6: 2-dof gates for every pixel row;
+    - E9/E12: stereo evidence counts twice, and the prior gradient is its cost derivative;
+    - G2/G7: a lost relocalisation into an older segment lifts the own window, and the coast speed spans the gap;
+    - G12: inertial knobs are refused without an IMU;
+    - T3/T5/T7: track positions refresh on a keyframe, the gyro guess spans one frame, and the evidence lock wait is timed;
+    - T9: an anchor keeps the last keyframe's frames.
+  - mapping, VI-BA and calibration:
+    - E3: the newest marginal is the undamped system at the solution;
+    - D1/D4/D9/D10: the boundary prior at the calibrated extrinsic, chained older priors, a prior that keeps its constant, and its gradient through J_r^-1;
+    - E8: a window as large as the map fixes its oldest keyframe;
+    - E10/D3: offline edges integrate as the run did, and the clock state is not lag-biased;
+    - D5/D6/D14/D8/D2/D12/E13: stereo depth rows are off under a camera state, the clock test motion, the yaw gauge row, the 3 px stage after early convergence, an observable offline walk, a `td_total_ms` report, and the large-window lambda doc.
+  - frontend:
+    - T1: the LK template is recut when ORB moved the track;
+    - T2/T6/T8/T11: refill tracks reach a map point, the WindowedU8 tracks are capped at the refill budget, occupancy is at the tracks' start pixels, and no border corner is spawned that the filter would drop;
+    - T4: the analytic flow pose rejects outliers;
+    - T9: landmarks are adopted without waiting for a mapping result;
+    - T10: stronger flow tests.
+  - geometry, loop closing and sensors:
+    - G1: a lost relocalisation joins by a loop edge, not an odometry edge;
+    - G4/G5: gPnP prefix search and a true pixel residual;
+    - G6/G8: loop-edge gravity projection and recentred solve, robust graphs only;
+    - G9/G10: rig extrinsic checks and a reflection check;
+    - G11: monotone analytic-refine steps behind `tracking.refine_monotone` (off by default; on in both `configs/pr180-*.ron` presets);
+    - E14: Midpoint extrapolates past the last IMU sample;
+    - E11: the covariance propagation test.
+- **#180, not fixed:**
+  - G13: unreachable (`node_spacing: Some` only, and `correction()` has no non-test caller);
+  - D13: deferred design item (the window-end edge needs samples that do not exist yet when it is made);
+  - D7, D11: fixture work, the code was not shown wrong (draft tests are not in the branch);
+  - the rest of E11: tests for `solve_pose_inertial`, `marginal_information`, `pixel_sigma`, the G29 counter and `newest_marginal_covariance`, which sit in lane S and M files.
+- **#180, still unvalidated:** no eval or benchmark has run. The robot test and the validation workflow come next.
+- **2026-11-17 lines corrected:** the estimator-round line now notes that the stereo pose-inertial gates were 3-dof until E6, and the recovery line notes the G1/G2 detach.
+- **Card text corrected:** card A (outliers stay in keyframe observations, as in ORB-SLAM3), card D P15 (`|td| ≤ 2 ms`, `td_total_ms`), card E P15 (post-ORB recuts by design), card G (the boundary prior is formed at the calibrated values since D1).
+
 ### 2026-11-17
 - **#180, rebased onto main.** No merge commits. kornia-rs is pinned to main `4ada5a7`. Reviewer comments applied:
   - `rotation_defect`, `HuberKernel`, `CauchyKernel` and `Mat6F64::cholesky` from kornia-rs;
   - one `camera_centre` helper;
   - the `keyframes_while_lost` source-of-truth fix and validation.
 - **#180, estimator round** (cards A-D; knobs off, not validated):
-  - ORB-SLAM3 estimator port: window 10/25, bias at the window boundary, Huber placement, IMU sample interpolation, per-frame pose-inertial solve (idea from #195), keyframe and local-map rules;
+  - ORB-SLAM3 estimator port: window 10/25, bias at the window boundary, Huber placement and pose-inertial gates (the stereo gates were 3-dof until 2026-11-18, E6), IMU sample interpolation, per-frame pose-inertial solve (idea from #195), keyframe and local-map rules;
   - IMU covariance trust;
   - G29 snap-back counter;
-  - recovery: G19 global rig PnP while lost, and a G28 re-seed with its own window;
+  - recovery: G19 global rig PnP while lost, and a G28 re-seed with its own window (a lost relocalisation into an older segment detaches and joins by a loop edge since 2026-11-18, G1/G2);
   - generic rig calibration and rays;
   - analytic pose refine, and the PGO moved to `upstream/`;
   - offline global VI-BA with calibration states, plus a `--session-out` dump.
