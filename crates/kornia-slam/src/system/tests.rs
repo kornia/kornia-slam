@@ -1124,7 +1124,7 @@ mod recovery_after_loss {
         system.state.last_keyframe_idx = Some(40);
         system.state.current_keyframe_idx = Some(40);
         system.inertial.last_keyframe_timestamp_sec = Some(10.0);
-        system.state.mark_lost(10.0, centred_at(1.0));
+        system.state.mark_lost(10.0, centred_at(1.0), 9.95);
         system.state.pose_world_to_cam = centred_at(coast_x);
         system.state.velocity_world = Vec3F64::new(1.2, 0.0, 0.0);
         system
@@ -1182,6 +1182,17 @@ mod recovery_after_loss {
                 timestamp_sec: 10.0
             })
         );
+    }
+
+    /// G7: the last tracked pose is one frame (50 ms) before the loss, so a
+    /// 2.1 m coast given up 0.5 s into the loss spans 0.55 s: 3.8 m/s, under
+    /// the 4 m/s limit, not the 4.2 m/s of the loss time alone.
+    #[test]
+    fn the_coast_speed_spans_the_gap_from_the_last_tracked_frame() {
+        let mut system = lost_metric_system(3.1);
+        system.give_up(&stereo_frame(140), 0.5);
+        assert_eq!(system.state.pose_world_to_cam, centred_at(3.1), "plausible");
+        assert!(system.state.bridge_anchor.is_some());
     }
 
     #[test]

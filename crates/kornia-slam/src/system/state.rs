@@ -59,6 +59,9 @@ pub(crate) struct SystemState {
     /// Pose at the end of the last frame tracked before `lost_since_sec`: the
     /// last one with visual support.
     pub pose_before_loss: Option<Pose3d>,
+    /// Timestamp (sec) of that last tracked frame, a frame before
+    /// `lost_since_sec`.
+    pub pose_before_loss_sec: Option<f64>,
     /// Timestamp (sec) of the newest anchor of the current loss; spaces
     /// anchors, which leave the last keyframe timestamp alone.
     pub last_anchor_timestamp_sec: Option<f64>,
@@ -93,6 +96,7 @@ impl SystemState {
             last_keyframe_idx: None,
             lost_since_sec: None,
             pose_before_loss: None,
+            pose_before_loss_sec: None,
             last_anchor_timestamp_sec: None,
             bootstrap_low_match_rejections: 0,
             bootstrap_frame: None,
@@ -111,6 +115,7 @@ impl SystemState {
         self.velocity = None;
         self.lost_since_sec = None;
         self.pose_before_loss = None;
+        self.pose_before_loss_sec = None;
         self.last_anchor_timestamp_sec = None;
         self.bootstrap_low_match_rejections = 0;
         self.bootstrap_frame = None;
@@ -123,10 +128,17 @@ impl SystemState {
     }
 
     /// Starts the lost clock at the first failed frame of a run, remembering
-    /// `pose_before` (that frame's starting pose); returns when the run began.
-    pub(crate) fn mark_lost(&mut self, timestamp_sec: f64, pose_before: Pose3d) -> f64 {
+    /// `pose_before` (that frame's starting pose, the previous frame's at
+    /// `prev_timestamp_sec`); returns when the run began.
+    pub(crate) fn mark_lost(
+        &mut self,
+        timestamp_sec: f64,
+        pose_before: Pose3d,
+        prev_timestamp_sec: f64,
+    ) -> f64 {
         if self.lost_since_sec.is_none() {
             self.pose_before_loss = Some(pose_before);
+            self.pose_before_loss_sec = Some(prev_timestamp_sec);
         }
         *self.lost_since_sec.get_or_insert(timestamp_sec)
     }
@@ -134,6 +146,7 @@ impl SystemState {
     pub(crate) fn mark_tracked(&mut self) {
         self.lost_since_sec = None;
         self.pose_before_loss = None;
+        self.pose_before_loss_sec = None;
         self.last_anchor_timestamp_sec = None;
     }
 
@@ -244,9 +257,13 @@ mod tests {
     #[test]
     fn a_reset_after_loss_seeds_the_last_tracked_pose_not_the_coasted_one() {
         let mut state = SystemState::new();
-        assert_eq!(state.mark_lost(10.0, at(1.0)), 10.0);
+        assert_eq!(state.mark_lost(10.0, at(1.0), 9.95), 10.0);
         state.pose_world_to_cam = at(2.0);
-        assert_eq!(state.mark_lost(10.5, at(2.0)), 10.0, "the run's start");
+        assert_eq!(
+            state.mark_lost(10.5, at(2.0), 10.45),
+            10.0,
+            "the run's start"
+        );
         state.pose_world_to_cam = at(-8.1e57);
 
         state.reset_after_loss();
@@ -259,9 +276,9 @@ mod tests {
     #[test]
     fn a_tracked_frame_ends_the_run_and_its_pose() {
         let mut state = SystemState::new();
-        state.mark_lost(10.0, at(1.0));
+        state.mark_lost(10.0, at(1.0), 9.95);
         state.mark_tracked();
-        state.mark_lost(12.0, at(3.0));
+        state.mark_lost(12.0, at(3.0), 11.95);
         state.pose_world_to_cam = at(4.0);
 
         state.reset_after_loss();
@@ -276,7 +293,7 @@ mod tests {
         state.imu_init_timestamp_sec = Some(3.0);
         state.mode = super::SystemMode::Tracking;
         state.current_keyframe_idx = Some(40);
-        state.mark_lost(10.0, at(1.0));
+        state.mark_lost(10.0, at(1.0), 9.95);
         let anchor = BridgeAnchor {
             kf_idx: 40,
             timestamp_sec: 14.8,

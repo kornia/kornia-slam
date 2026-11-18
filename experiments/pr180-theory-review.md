@@ -84,6 +84,7 @@ Cross-lane: E1, E7, G3 are one design in lane S (velocity and bias from the orig
 - T3: `a_keyframe_insertion_refreshes_the_track_positions` (`system/tests.rs`, mod `windowed_tracks`); covers the anchor return of `insert_keyframe`. The tracked return and `apply_inertial_initialization` get the same call; an `ImuInitResult` fixture is out of reach of a targeted test.
 - T5: `the_gyro_guess_spans_one_frame_on_a_keyframe_anchored_prediction` (`system/tests.rs`, mod `gyro_guess`); today 0.1745 rad (10°) for a 0.0349 rad frame at 30°/s, 15 Hz, keyframe 5 frames back. `predict_frame` was first extracted unchanged so the test ran on today's behaviour.
 - T7: `the_keyframe_evidence_reports_its_map_lock_wait` (`system/tests.rs`, mod `keyframe_evidence`); a lock held 60 ms must show as at least 40 ms of wait. It needs the new timed evidence, so it does not compile on today's code, where neither evidence lock was timed. The review's first option (time the waits); caching the evidence at insert is left.
+- G7: `the_coast_speed_spans_the_gap_from_the_last_tracked_frame` (`system/tests.rs`, mod `recovery_after_loss`); a 2.1 m coast over 0.55 s read 4.2 m/s over 0.5 s and was held.
 
 # E estimator
 

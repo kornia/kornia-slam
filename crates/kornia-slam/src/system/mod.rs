@@ -1968,7 +1968,9 @@ impl SlamSystem {
         if status == TrackingStatus::Skipped {
             let policy = &self.tracking_loss_recovery;
 
-            let lost_since = self.state.mark_lost(timestamp_sec, pose_before);
+            let lost_since = self
+                .state
+                .mark_lost(timestamp_sec, pose_before, prev_timestamp);
             let recently_lost_for = timestamp_sec - lost_since;
 
             let imu_confident = self.imu_confident(timestamp_sec);
@@ -2535,11 +2537,16 @@ impl SlamSystem {
         let give_up_sec = self.state.lost_since_sec.unwrap_or(0.0) + lost_for_sec;
         let coasted = self.state.pose_world_to_cam;
         let before = self.state.pose_before_loss.unwrap_or(coasted);
+        // The last tracked pose is a frame older than the loss (G7).
+        let coast_sec = self
+            .state
+            .pose_before_loss_sec
+            .map_or(lost_for_sec, |before_sec| give_up_sec - before_sec);
         let plausible = !self.runaway.runaway()
             && recovery::coast_is_plausible(
                 &before,
                 &coasted,
-                lost_for_sec,
+                coast_sec,
                 self.recovery.max_coast_speed_mps,
             );
         if !plausible {
