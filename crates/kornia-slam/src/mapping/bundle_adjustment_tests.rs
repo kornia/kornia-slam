@@ -1070,3 +1070,33 @@ fn the_boundary_prior_is_formed_at_the_calibrated_extrinsic() {
     let worst = prior.rhs.iter().fold(0.0f64, |m, x| m.max(x.abs()));
     assert!(worst < 1.0, "prior gradient {worst:.3e}");
 }
+
+/// E8: a window as large as the map still fixes its oldest keyframe
+/// (ORB-SLAM3 `Nd = min(KFs − 2, maxOpt)`), so the newest marginal is the
+/// gauge-fixed one and the oldest pose stays put. Red on the old code
+/// (2026-11-18): nothing was fixed, only damping held the gauge.
+#[test]
+fn a_window_as_large_as_the_map_fixes_its_oldest_keyframe() {
+    let gravity = Vec3F64::new(0.0, 9.81, 0.0);
+    let mut map = cruise_map(gravity, Vec3F64::ZERO);
+    map.edit_keyframes_for_test(|_, kf| kf.frame.pose_world_to_cam.translation.y += 0.01);
+    let oldest = map.keyframes()[0].frame.pose_world_to_cam;
+    let params = LocalBaParams {
+        active_keyframes: 5,
+        newest_marginal: true,
+        ..LocalBaParams::default()
+    };
+    let update = run_local_inertial_ba_with(
+        map.ba_snapshot(&local_window_of(&map, params.active_keyframes, [])),
+        &camera(),
+        None,
+        gravity,
+        &[],
+        &[],
+        &params,
+    );
+    assert_eq!(update.keyframes[0].pose_world_to_cam, oldest);
+    let (_, marginal) = update.newest_marginal.expect("the newest marginal");
+    let sigma_m = (0..3).map(|d| marginal[(d, d)]).sum::<f64>().sqrt();
+    assert!(sigma_m < 0.05, "newest position sigma {sigma_m:.3e} m");
+}

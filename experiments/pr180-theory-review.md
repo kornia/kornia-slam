@@ -46,6 +46,7 @@ Lane M (mapping, VI-BA and calibration):
 
 - E3: `newest_marginal_is_the_undamped_system_at_the_solution`, `crates/kornia-slam/src/mapping/vi_ba_schur.rs`. Red at 8f23e47: sigma 5.77e-3 m from λ 1e-2 against 6.24e-3 m from λ 1. The fix also takes the calibration `marginal_sigma` from the same undamped build, since `border_marginal_sigma` documents the same undamped system and had the same defect.
 - D1: `the_boundary_prior_is_formed_at_the_calibrated_extrinsic`, `crates/kornia-slam/src/mapping/bundle_adjustment_tests.rs`. Red at 8f23e47: fallback prior gradient 42.7 against 9.5e-3 fixed, data exact at θ = 0.2°. Covers the fallback path after the solve; the carried path before it goes through the same `boundary_under_calibration`.
+- E8: `a_window_as_large_as_the_map_fixes_its_oldest_keyframe`, `crates/kornia-slam/src/mapping/bundle_adjustment_tests.rs`. Red at 8f23e47: keyframe 0 moved in a 5-keyframe window of 5. The clamp acts only in the inertial solve and only when the snapshot has neither a fixed context keyframe nor an anchor; with the default window of 3 that needs a map of at most 3 keyframes after IMU init, which needs 10 (culling keeps 21), so knobs-off is unchanged.
 
 # E estimator
 

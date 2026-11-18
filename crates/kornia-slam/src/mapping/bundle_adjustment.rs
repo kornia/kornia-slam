@@ -297,6 +297,18 @@ pub(crate) fn active_start(keyframes: &[Keyframe], active: usize) -> usize {
         .map_or(0, |(slot, _)| slot)
 }
 
+/// [`active_start`] for a VI-BA window, which always fixes a keyframe: when
+/// the window would take every keyframe and none is an anchor, the oldest is
+/// fixed (ORB-SLAM3 `Nd = min(KFs − 2, maxOpt)`), or only damping would hold
+/// the 4-DOF gauge (E8).
+fn inertial_active_start(keyframes: &[Keyframe], active: usize) -> usize {
+    let start = active_start(keyframes, active);
+    if start > 0 || keyframes.iter().any(|kf| kf.anchor) {
+        return start;
+    }
+    active_start(keyframes, keyframes.len().saturating_sub(1))
+}
+
 /// Live landmark ids observed by `keyframes`, ascending.
 fn live_landmarks_of<'a>(
     map: &Map,
@@ -645,7 +657,7 @@ fn run_local_inertial_ba_inner(
         return update;
     }
 
-    let active_start = active_start(snapshot.keyframes(), params.active_keyframes);
+    let active_start = inertial_active_start(snapshot.keyframes(), params.active_keyframes);
     let active = snapshot.keyframes()[active_start..]
         .iter()
         .filter(|kf| !kf.anchor);
