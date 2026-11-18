@@ -33,8 +33,9 @@ use kornia_imgproc::features::hamming_distance;
 use super::pnp::{self, PnpConfig};
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
+use crate::features::ScalePyramid;
 use crate::frame::{Frame, is_finite_xy, undistort_keypoint};
-use crate::mapping::map::{Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
+use crate::mapping::map::{Keyframe, Map, MapPoint};
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 
 use super::Estimate;
@@ -409,6 +410,7 @@ impl MapProjectionEstimator {
         };
         let global_matches = self.match_by_projection(
             map.map_points(),
+            map.scale_pyramid(),
             &local_indices,
             curr_keypoints_undist,
             curr_descriptors,
@@ -515,6 +517,7 @@ impl MapProjectionEstimator {
         };
         let mut matches = self.match_by_projection(
             map.map_points(),
+            map.scale_pyramid(),
             candidates,
             &keypoints_undist,
             &frame.features.descriptors,
@@ -529,6 +532,7 @@ impl MapProjectionEstimator {
         if matches.len() < MIN_MATCHES_BEFORE_WIDE {
             matches = self.match_by_projection(
                 map.map_points(),
+                map.scale_pyramid(),
                 candidates,
                 &keypoints_undist,
                 &frame.features.descriptors,
@@ -551,6 +555,7 @@ impl MapProjectionEstimator {
     fn match_by_projection(
         &self,
         map_points: &[MapPoint],
+        pyramid: ScalePyramid,
         candidates: &[usize],
         keypoints_xy: &[[f32; 2]],
         descriptors: &[[u8; 32]],
@@ -589,10 +594,10 @@ impl MapProjectionEstimator {
                 if dist < mp.min_distance_invariance() || dist > mp.max_distance_invariance() {
                     continue;
                 }
-                let level = mp.predict_scale(dist, ORB_SCALE_FACTOR, ORB_N_LEVELS) as i32;
+                let level = mp.predict_scale(dist, pyramid) as i32;
                 let half = OCTAVE_WINDOW_HALF_WIDTH as i32;
                 let lo = (level - half).max(0) as u8;
-                let hi = (level + half).min(ORB_N_LEVELS as i32 - 1) as u8;
+                let hi = (level + half).min(pyramid.n_levels as i32 - 1) as u8;
                 Some((lo, hi))
             } else {
                 None
@@ -667,8 +672,8 @@ mod estimator_tests {
 #[cfg(test)]
 mod matching_tests {
     use super::*;
+    use crate::features::Features;
     use kornia_algebra::{Mat3F64, Vec3F64};
-    use kornia_imgproc::features::OrbFeatures;
 
     fn make_test_estimator() -> MapProjectionEstimator {
         MapProjectionEstimator::new(MapProjectionConfig::default())
@@ -691,7 +696,7 @@ mod matching_tests {
         let count = keypoints.len();
         Frame {
             idx: 0,
-            features: OrbFeatures {
+            features: Features {
                 keypoints_xy: keypoints.clone(),
                 orientations: vec![0.0; count],
                 descriptors: vec![[0; 32]; count],
@@ -835,6 +840,7 @@ mod matching_tests {
 
         let matches = estimator.match_by_projection(
             &map_points,
+            ScalePyramid::ORB,
             &[0],
             &keypoints_xy,
             &descriptors,
@@ -875,6 +881,7 @@ mod matching_tests {
 
         let matches = estimator.match_by_projection(
             &map_points,
+            ScalePyramid::ORB,
             &[0],
             &keypoints_xy,
             &[descriptor; 2],
@@ -916,6 +923,7 @@ mod matching_tests {
 
         let matches = estimator.match_by_projection(
             &map_points,
+            ScalePyramid::ORB,
             &[0],
             &keypoints_xy,
             &descriptors,
@@ -957,6 +965,7 @@ mod matching_tests {
 
         let matches = estimator.match_by_projection(
             &map_points,
+            ScalePyramid::ORB,
             &[0],
             &keypoints_xy,
             &descriptors,

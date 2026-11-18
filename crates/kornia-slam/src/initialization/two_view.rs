@@ -17,7 +17,9 @@ use kornia_3d::pose::Pose3d;
 pub use kornia_3d::pose::TwoViewError;
 use kornia_3d::pose::{TriangulationConfig, TwoViewEstimator, TwoViewModel, TwoViewResult};
 use kornia_algebra::{Vec2F64, Vec3F64};
-use kornia_imgproc::features::{OrbFeatures, OrbMatchConfig, match_orb_descriptors};
+use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
+
+use crate::features::Features;
 
 use crate::frame::undistorted_camera;
 use crate::tracking::pose_estimation::Estimate;
@@ -111,9 +113,9 @@ pub struct TwoViewEstimate {
 
 /// Attempt two-view initialization between a reference frame and the current frame.
 pub fn try_initialize_two_view(
-    ref_features: &OrbFeatures,
+    ref_features: &Features,
     ref_pose: &Pose3d,
-    curr_features: &OrbFeatures,
+    curr_features: &Features,
     camera: &PinholeCamera,
     config: &TwoViewInitConfig,
 ) -> Result<TwoViewEstimate, TwoViewRejectReason> {

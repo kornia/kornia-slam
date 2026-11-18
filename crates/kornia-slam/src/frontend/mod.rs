@@ -12,6 +12,7 @@ use kornia_imgproc::resize::resize_fast_mono;
 use kornia_sensors::SensorRig;
 
 use crate::Frame;
+use crate::features::Features;
 use crate::stereo::{StereoMatchConfig, StereoMatches, compute_stereo_matches};
 
 /// Fisheye keypoints beyond this incidence angle are dropped: a pinhole cannot
@@ -111,10 +112,11 @@ impl OrbFrontend {
         &mut self,
         idx: usize,
         image: &Image<u8, 1>,
-        mut features: OrbFeatures,
+        features: OrbFeatures,
         stereo: Option<StereoMatches>,
         start: Instant,
     ) -> Frame {
+        let mut features = Features::from(features);
         let stereo_matched = stereo.as_ref().map(StereoMatches::num_matched);
         let StereoMatches { u_right, depth } = stereo.unwrap_or_default();
 
@@ -181,7 +183,7 @@ struct FisheyeMapping {
 impl FisheyeMapping {
     /// Remaps keypoints in place and drops those beyond the incidence cap,
     /// keeping orientations, descriptors and octaves aligned.
-    fn map_keypoints(&self, features: &mut OrbFeatures) {
+    fn map_keypoints(&self, features: &mut Features) {
         let n = features.keypoints_xy.len();
         let mut keypoints_xy = Vec::with_capacity(n);
         let mut orientations = Vec::with_capacity(n);

@@ -3,19 +3,17 @@
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_image::ImageSize;
-use kornia_imgproc::features::OrbFeatures;
 
-/// `Frame` carries ORB features directly today.
-///
-/// If kornia-slam grows multiple frontend feature pipelines, this module is the
-/// place to introduce a higher-level abstraction above `OrbFeatures`.
-/// A camera observation: features extracted at a known pose.
+use crate::features::Features;
+
+/// A camera observation: features extracted at a known pose. `D` is the
+/// descriptor type; ORB's by default.
 #[derive(Debug, Clone)]
-pub struct Frame {
+pub struct Frame<D = [u8; 32]> {
     /// Frame index.
     pub idx: usize,
     /// Features extracted for this frame.
-    pub features: OrbFeatures,
+    pub features: Features<D>,
     /// Camera pose in world-to-camera convention.
     pub pose_world_to_cam: Pose3d,
     /// Image dimensions.
@@ -38,7 +36,7 @@ pub struct Frame {
     pub keypoints_undist: Vec<[f32; 2]>,
 }
 
-impl Frame {
+impl<D> Frame<D> {
     /// Whether this frame carries per-keypoint stereo depth.
     pub fn is_stereo(&self) -> bool {
         !self.depth.is_empty()
@@ -109,12 +107,12 @@ pub(crate) fn is_finite_xy(xy: &[f32; 2]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kornia_imgproc::features::OrbFeatures;
+    use crate::features::Features;
 
     fn empty_frame(u_right: Vec<f32>, depth: Vec<f32>) -> Frame {
         Frame {
             idx: 0,
-            features: OrbFeatures {
+            features: Features {
                 keypoints_xy: Vec::new(),
                 orientations: Vec::new(),
                 descriptors: Vec::new(),

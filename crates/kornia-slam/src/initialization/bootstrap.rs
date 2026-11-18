@@ -287,6 +287,7 @@ mod tests {
         stereo_initial_map, two_view_initial_map,
     };
     use crate::Frame;
+    use crate::features::Features;
     use crate::initialization::two_view::TwoViewEstimate;
     use crate::mapping::map::{Keyframe, LandmarkTarget};
     use crate::tracking::pose_estimation::Estimate;
@@ -294,12 +295,11 @@ mod tests {
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::Vec3F64;
     use kornia_image::ImageSize;
-    use kornia_imgproc::features::OrbFeatures;
 
     fn frame(idx: usize, keypoints: usize) -> Frame {
         Frame {
             idx,
-            features: OrbFeatures {
+            features: Features {
                 keypoints_xy: (0..keypoints).map(|i| [i as f32, i as f32]).collect(),
                 orientations: vec![0.0; keypoints],
                 descriptors: vec![[0u8; 32]; keypoints],

@@ -4,8 +4,7 @@
 //! map owns capture and writeback; the local-mapping worker owns scheduling.
 
 use crate::mapping::map::{
-    BaSnapshot, BaUpdate, BaUpdateError, BaWindow, Keyframe, LocalBaStats, Map, ORB_N_LEVELS,
-    ORB_SCALE_FACTOR,
+    BaSnapshot, BaUpdate, BaUpdateError, BaWindow, Keyframe, LocalBaStats, Map,
 };
 use crate::mapping::vi_ba_schur::ViBaKeyframe;
 use kornia_3d::ba::{BaObservation, BaParams};
@@ -228,7 +227,7 @@ pub fn run_initial_ba(
         && let Some(mp) = map.map_points().get(sample)
     {
         let normal_len = mp.mean_viewing_direction.length();
-        let predicted = mp.predict_scale(depth_after.max(1e-6), ORB_SCALE_FACTOR, ORB_N_LEVELS);
+        let predicted = mp.predict_scale(depth_after.max(1e-6), map.scale_pyramid());
         debug_eprintln!(
             "[init_ba] scale_state[mp{sample}]: min_dist={:.3} max_dist={:.3} normal_len={:.3} predict_scale@median={predicted}",
             mp.min_distance,

@@ -604,18 +604,18 @@ fn wheel_merge_through(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::Features;
     use crate::frame::Frame;
     use crate::mapping::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::Vec3F64;
     use kornia_image::ImageSize;
-    use kornia_imgproc::features::OrbFeatures;
 
     fn test_frame(idx: usize, descriptors: Vec<[u8; 32]>) -> Frame {
         let n = descriptors.len();
         Frame {
             idx,
-            features: OrbFeatures {
+            features: Features {
                 keypoints_xy: (0..n).map(|i| [i as f32, i as f32]).collect(),
                 orientations: vec![0.0; n],
                 descriptors,

@@ -466,7 +466,7 @@ mod tests {
         };
         let frame = Frame {
             idx: 0,
-            features: OrbFeatures {
+            features: crate::features::Features {
                 keypoints_xy: vec![[100.0, 0.0], [0.0, 200.0], [50.0, 50.0]],
                 orientations: vec![0.0; 3],
                 descriptors: vec![[0u8; 32]; 3],

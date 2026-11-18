@@ -1,9 +1,9 @@
 use super::*;
+use crate::features::Features;
 use crate::frame::Frame;
 use crate::mapping::map::{ImuFactor, MapInsertion};
 use kornia_algebra::Mat3F64;
 use kornia_image::ImageSize;
-use kornia_imgproc::features::OrbFeatures;
 use kornia_sensors::imu::{ImuCalib, ImuMeasurement};
 
 const RADIUS: f64 = 2.0;
@@ -53,7 +53,7 @@ fn synth_pose_world_to_cam(
 fn synth_frame(idx: usize, pose_world_to_cam: Pose3d) -> Frame {
     Frame {
         idx,
-        features: OrbFeatures {
+        features: Features {
             keypoints_xy: vec![],
             orientations: vec![],
             descriptors: vec![],

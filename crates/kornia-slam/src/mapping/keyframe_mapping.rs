@@ -230,12 +230,12 @@ pub(crate) fn grow_keyframe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::Features;
     use crate::frame::Frame;
     use crate::mapping::map::Keyframe;
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::Vec3F64;
     use kornia_image::ImageSize;
-    use kornia_imgproc::features::OrbFeatures;
 
     fn stereo_keyframe(idx: usize, depths: Vec<f32>) -> Keyframe {
         let mut frame = empty_frame(idx);
@@ -310,7 +310,7 @@ mod tests {
     fn empty_frame(idx: usize) -> Frame {
         Frame {
             idx,
-            features: OrbFeatures {
+            features: Features {
                 keypoints_xy: Vec::new(),
                 orientations: Vec::new(),
                 descriptors: Vec::new(),
@@ -338,7 +338,7 @@ mod tests {
         );
         Frame {
             idx,
-            features: OrbFeatures {
+            features: Features {
                 keypoints_xy: points
                     .iter()
                     .map(|p| {

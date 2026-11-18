@@ -3,9 +3,7 @@
 //! Canonical mutations maintain both sides of observation links and finalize
 //! affected landmark metadata. Batch insertion validates before its first write.
 
-use crate::mapping::map::{
-    ImuFactor, Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR, ObservationKey,
-};
+use crate::mapping::map::{ImuFactor, Keyframe, Map, MapPoint, ObservationKey};
 use kornia_algebra::Vec3F64;
 use std::collections::{HashMap, HashSet};
 
@@ -681,7 +679,7 @@ impl Map {
         if let Some(mp) = self.map_points.get_mut(landmark_idx) {
             mp.finalize_descriptor();
         }
-        self.update_map_point_geometry(landmark_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+        self.update_map_point_geometry(landmark_idx);
     }
 }
 

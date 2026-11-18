@@ -197,11 +197,11 @@ fn ransac_pose(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::Features;
     use crate::mapping::map::{LandmarkSeed, ObservationKey};
     use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
     use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
     use kornia_image::ImageSize;
-    use kornia_imgproc::features::OrbFeatures;
 
     const LANDMARKS: usize = 80;
 
@@ -243,7 +243,7 @@ mod tests {
             .collect();
         Frame {
             idx,
-            features: OrbFeatures {
+            features: Features {
                 keypoints_xy: pixels.clone(),
                 orientations: vec![0.0; LANDMARKS],
                 descriptors,

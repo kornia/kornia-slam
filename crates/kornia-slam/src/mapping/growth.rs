@@ -9,8 +9,7 @@
 
 use crate::frame::{Frame, undistorted_camera};
 use crate::mapping::map::{
-    LandmarkSeed, LandmarkTarget, Map, MapInsertion, ORB_SCALE_FACTOR, ObservationKey,
-    ObservationLink,
+    LandmarkSeed, LandmarkTarget, Map, MapInsertion, ObservationKey, ObservationLink,
 };
 use crate::stereo::unproject_stereo;
 use kornia_3d::camera::PinholeCamera;
@@ -83,6 +82,7 @@ pub fn pair_growth_request(
 ) -> Option<MapInsertion> {
     let prev_kf = map.get_keyframe(prev_kf_idx)?;
     let curr_kf = map.get_keyframe(curr_kf_idx)?;
+    let scale_factor = map.scale_pyramid().factor;
 
     // Only features without a landmark in either keyframe. Matching the full
     // arrays and filtering afterwards discards almost everything once the
@@ -188,7 +188,7 @@ pub fn pair_growth_request(
         if let Some(e) = epipole_px {
             let dx = q.x - e.x;
             let dy = q.y - e.y;
-            if dx * dx + dy * dy < 100.0 * ORB_SCALE_FACTOR.powi(octave as i32) {
+            if dx * dx + dy * dy < 100.0 * scale_factor.powi(octave as i32) {
                 continue;
             }
         }
@@ -199,7 +199,7 @@ pub fn pair_growth_request(
             continue;
         }
         let d = l.x * q.x + l.y * q.y + l.z;
-        let sigma_sq = ORB_SCALE_FACTOR.powi(2 * octave as i32);
+        let sigma_sq = scale_factor.powi(2 * octave as i32);
         if d * d > EPIPOLAR_CHI2 * sigma_sq * line_norm_sq {
             continue;
         }
@@ -402,10 +402,10 @@ pub fn accepted_pair_claims(candidates: &[(usize, usize)]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::Features;
     use crate::mapping::map::Keyframe;
     use kornia_3d::camera::CameraModel;
     use kornia_image::ImageSize;
-    use kornia_imgproc::features::OrbFeatures;
 
     fn camera() -> PinholeCamera {
         PinholeCamera {
@@ -424,7 +424,7 @@ mod tests {
         let n = descriptors.len();
         Frame {
             idx,
-            features: OrbFeatures {
+            features: Features {
                 keypoints_xy: (0..n).map(|i| [i as f32, i as f32]).collect(),
                 orientations: vec![0.0; n],
                 descriptors,

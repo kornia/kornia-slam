@@ -97,10 +97,10 @@ impl Map {
     }
 }
 
+use crate::features::Features;
 use crate::frame::Frame;
 use kornia_3d::pose::Pose3d;
 use kornia_image::ImageSize;
-use kornia_imgproc::features::OrbFeatures;
 use std::collections::HashSet;
 
 pub(crate) fn test_frame(idx: usize, descriptors: Vec<[u8; 32]>) -> Frame {
@@ -111,7 +111,7 @@ pub(crate) fn test_frame_with_pose(idx: usize, descriptors: Vec<[u8; 32]>, pose:
     let n = descriptors.len();
     Frame {
         idx,
-        features: OrbFeatures {
+        features: Features {
             keypoints_xy: (0..n).map(|i| [i as f32, i as f32]).collect(),
             orientations: vec![0.0; n],
             descriptors,
