@@ -150,15 +150,16 @@ const NO_TEMPLATE: u64 = u64::MAX;
 /// Frame id of a slot whose template moved to the aligned list.
 const TAKEN: u64 = u64::MAX - 1;
 
-/// Templates keyed by track and the frame they were cut from. Templates of
-/// dropped tracks go to a spare list and are reused, so once the track count
-/// has peaked nothing allocates.
+/// Templates keyed by track, the frame they were cut from and the pixel they
+/// were cut at, since ORB can move a track's pixel between frames. Templates
+/// of dropped tracks go to a spare list and are reused, so once the track
+/// count has peaked nothing allocates.
 #[derive(Debug, Default)]
 struct TemplateCache {
     /// Sorted by track id between frames; aligned with the shard's tracks
     /// during one.
-    entries: Vec<(TrackId, u64, LkTemplate)>,
-    scratch: Vec<(TrackId, u64, LkTemplate)>,
+    entries: Vec<(TrackId, u64, [f32; 2], LkTemplate)>,
+    scratch: Vec<(TrackId, u64, [f32; 2], LkTemplate)>,
     spare: Vec<LkTemplate>,
 }
 
@@ -168,20 +169,24 @@ impl TemplateCache {
     fn align(&mut self, tracks: &[Track]) {
         self.scratch.clear();
         for track in tracks {
-            let (frame_id, template) = match self
+            let (frame_id, source, template) = match self
                 .entries
                 .binary_search_by_key(&track.id(), |entry| entry.0)
             {
                 Ok(k) => {
                     let entry = &mut self.entries[k];
                     let frame_id = std::mem::replace(&mut entry.1, TAKEN);
-                    (frame_id, std::mem::take(&mut entry.2))
+                    (frame_id, entry.2, std::mem::take(&mut entry.3))
                 }
-                Err(_) => (NO_TEMPLATE, self.spare.pop().unwrap_or_default()),
+                Err(_) => (
+                    NO_TEMPLATE,
+                    [f32::NAN; 2],
+                    self.spare.pop().unwrap_or_default(),
+                ),
             };
-            self.scratch.push((track.id(), frame_id, template));
+            self.scratch.push((track.id(), frame_id, source, template));
         }
-        for (_, frame_id, template) in self.entries.drain(..) {
+        for (_, frame_id, _, template) in self.entries.drain(..) {
             if frame_id != TAKEN {
                 self.spare.push(template);
             }
@@ -309,7 +314,8 @@ impl FlowShard {
     }
 
     /// The forward solve of `track` from its cached template, recut when
-    /// it came from another frame; `None` when it fails the survivor filter.
+    /// it came from another frame or another pixel; `None` when it fails the
+    /// survivor filter.
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &mut self,
@@ -323,9 +329,10 @@ impl FlowShard {
     ) -> Option<LkTrack> {
         let started = Instant::now();
         let start = start_pixel(track, model, guess);
-        let (_, frame_id, template) = &mut self.templates.entries[slot];
-        if *frame_id != previous.frame_id() {
+        let (_, frame_id, source, template) = &mut self.templates.entries[slot];
+        if *frame_id != previous.frame_id() || *source != track.pixel() {
             self.template_rebuilds += u32::from(*frame_id != NO_TEMPLATE);
+            *source = track.pixel();
             *frame_id = if extract_template(previous, track.pixel(), 0, guess.window, template) {
                 previous.frame_id()
             } else {
@@ -359,7 +366,7 @@ impl FlowShard {
                 start = coarse.pixel;
             }
         }
-        let template = &self.templates.entries[slot].2;
+        let template = &self.templates.entries[slot].3;
         let result = track_template(template, current, start, guess.max_iter, guess.epsilon);
         timings.flow_forward += started.elapsed();
         let size = current.plane().size();
@@ -393,7 +400,7 @@ impl FlowShard {
         else {
             return true;
         };
-        let (_, frame_id, anchor) = &mut self.anchors.entries[slot];
+        let (_, frame_id, _, anchor) = &mut self.anchors.entries[slot];
         if *frame_id == NO_TEMPLATE {
             if extract_template(previous, track.pixel(), 0, guess.window, anchor) {
                 *frame_id = previous.frame_id();
@@ -426,9 +433,10 @@ impl FlowShard {
         // The template at the forward result is the next frame's forward
         // template, and the backward solve's, so a track costs one cut per
         // frame.
-        let (_, frame_id, template) = &mut self.templates.entries[slot];
+        let (_, frame_id, source, template) = &mut self.templates.entries[slot];
         let cut = extract_template(current, result.pixel, 0, guess.window, template);
         *frame_id = if cut { current.frame_id() } else { NO_TEMPLATE };
+        *source = result.pixel;
         timings.flow_template += started.elapsed();
 
         if let ForwardBackward::Enabled {
@@ -440,10 +448,12 @@ impl FlowShard {
             && due(guess.frame_idx, every_n_frames)
         {
             let started = Instant::now();
-            let template = &self.templates.entries[slot].2;
+            let template = &self.templates.entries[slot].3;
             let back = track_template(template, previous, track.pixel(), max_iter, guess.epsilon);
             timings.flow_backward += started.elapsed();
             if !back.status || distance(back.pixel, track.pixel()) > max_round_trip_px {
+                // A re-matched track must not start from the rejected patch.
+                self.templates.entries[slot].1 = NO_TEMPLATE;
                 self.fb_rejects += 1;
                 return;
             }
@@ -1034,5 +1044,107 @@ impl RigFlow {
             self.output.cameras.push(camera);
             self.output.undistorted.push(undistorted);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kornia_image::ImageSize;
+
+    use super::*;
+    use crate::tracking::optical_flow::TrackSet;
+
+    const WIDTH: usize = 200;
+    const HEIGHT: usize = 160;
+
+    /// Smooth texture, so LK converges anywhere, moved right by `shift` px.
+    fn textured(shift: f32) -> Image<u8, 1> {
+        let data = (0..WIDTH * HEIGHT)
+            .map(|i| {
+                let x = (i % WIDTH) as f32 - shift;
+                let y = (i / WIDTH) as f32;
+                let v = 128.0
+                    + 50.0 * (x / 5.0).sin() * (y / 7.0).cos()
+                    + 40.0 * ((x + 2.0 * y) / 9.0).sin();
+                v.round() as u8
+            })
+            .collect();
+        Image::new(
+            ImageSize {
+                width: WIDTH,
+                height: HEIGHT,
+            },
+            data,
+        )
+        .unwrap()
+    }
+
+    fn frame(shift: f32, frame_id: u64) -> Arc<LkFrame> {
+        Arc::new(LkFrame::new(&textured(shift), 11, frame_id).unwrap())
+    }
+
+    fn pinhole() -> PinholeCamera {
+        PinholeCamera {
+            fx: 200.0,
+            fy: 200.0,
+            cx: 100.0,
+            cy: 80.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        }
+    }
+
+    /// One camera, level 0 only, round trip at the preset's 0.6 px.
+    fn guess() -> ShardGuess {
+        ShardGuess {
+            cameras: vec![FlowCamera {
+                camera: pinhole(),
+                camera_from_primary: None,
+                gyro_rotation: None,
+            }],
+            max_level: 0,
+            max_iter: 20,
+            epsilon: 0.01,
+            window: 11,
+            forward_backward: ForwardBackward::Enabled {
+                max_round_trip_px: 0.6,
+                max_iter: 10,
+                every_n_frames: 1,
+            },
+            ..ShardGuess::default()
+        }
+    }
+
+    /// T1: ORB rewrites a track's pixel on a keyframe frame; the next
+    /// frame's template must be cut there, not at the old flow pixel. The
+    /// review's numbers: flow (100.4, 80.7), keypoint (101, 80), 0.92 px.
+    #[test]
+    fn a_track_rewritten_between_frames_survives_its_round_trip() {
+        let frames = [frame(0.0, 0), frame(2.0, 1), frame(4.0, 2)];
+        let guess = guess();
+        let mut timings = ShardTimings::default();
+        let mut tracks = TrackSet::new();
+        tracks.spawn([98.4, 80.7]);
+        let mut shard = FlowShard::default();
+        shard.tracks = tracks.tracks().to_vec();
+        shard.run(&frames[0..1], &frames[1..2], &guess, &mut timings);
+        let flow = shard.survivors[0];
+        assert!(distance(flow.pixel, [100.4, 80.7]) < 0.05, "{flow:?}");
+
+        let keypoint = [101.0, 80.0];
+        assert!(distance(flow.pixel, keypoint) > 0.9);
+        tracks
+            .advance(vec![FlowSurvivor {
+                pixel: keypoint,
+                ..flow
+            }])
+            .unwrap();
+        shard.tracks = tracks.tracks().to_vec();
+        shard.run(&frames[1..2], &frames[2..3], &guess, &mut timings);
+        assert_eq!(shard.fb_rejects, 0);
+        assert_eq!(shard.survivors.len(), 1);
+        assert!(distance(shard.survivors[0].pixel, [103.0, 80.0]) < 0.05);
     }
 }
