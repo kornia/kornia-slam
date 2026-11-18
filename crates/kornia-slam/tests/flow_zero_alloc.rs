@@ -1,5 +1,5 @@
 //! Card E, K8: a `RigFlow` step allocates nothing once warm, and its
-//! survivors do not depend on the flow thread count.
+//! survivors and refill corners do not depend on the flow thread count.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
@@ -11,7 +11,7 @@ use kornia_image::{Image, ImageSize};
 use kornia_slam::system::{AnchorGuard, ForwardBackward, GyroGuess, KltRetry, TrackRefill};
 use kornia_slam::tracking::TrackingTimings;
 use kornia_slam::tracking::optical_flow::{
-    FlowStepInput, FlowSurvivor, RigFlow, RigFlowCamera, RigFlowSettings, TrackSet,
+    FlowOutput, FlowStepInput, RigFlow, RigFlowCamera, RigFlowSettings, TrackSet,
 };
 
 /// Counts allocations on every thread while `COUNTING` is set.
@@ -149,10 +149,42 @@ fn tracks(threads: usize) -> TrackSet {
     tracks
 }
 
+/// The preset's knobs: refill on, a coarse-level retry and the round trip.
+fn preset_settings(threads: usize) -> RigFlowSettings {
+    RigFlowSettings {
+        retry: KltRetry::CoarseLevel { max_level: 1 },
+        refill: TrackRefill::Enabled {
+            per_camera: 64,
+            min_spacing_px: 23.0,
+            refill_below: 0.8,
+            border_px: 9,
+        },
+        ..settings(threads)
+    }
+}
+
+/// [`shift`] with a 6 px jump on every eighth frame, past level 0's reach,
+/// so those frames retry.
+fn jumpy_shift(frame: usize) -> [i64; 2] {
+    let [x, y] = shift(frame);
+    if frame % 8 == 4 {
+        [x + 6, y + 3]
+    } else {
+        [x, y]
+    }
+}
+
 /// Replays `frames` frames on `threads` flow threads, counting allocations
-/// inside each step after the warm-up; `after_step` sees every survivor list.
-fn replay(threads: usize, frames: usize, mut after_step: impl FnMut(usize, &[FlowSurvivor])) {
-    let mut flow = RigFlow::new(settings(threads), cameras()).expect("flow workers start");
+/// inside each step after the warm-up; `after_step` sees every step's
+/// output, and its refill corners join the tracks.
+fn replay(
+    settings: RigFlowSettings,
+    shift: fn(usize) -> [i64; 2],
+    frames: usize,
+    mut after_step: impl FnMut(usize, &FlowOutput),
+) {
+    let threads = settings.threads;
+    let mut flow = RigFlow::new(settings, cameras()).expect("flow workers start");
     let mut tracks = tracks(threads);
     let mut timings = TrackingTimings::default();
     for frame in 0..frames {
@@ -175,9 +207,12 @@ fn replay(threads: usize, frames: usize, mut after_step: impl FnMut(usize, &[Flo
         COUNTING.store(false, Ordering::SeqCst);
         let survivors = flow.output().survivors.clone();
         assert_eq!(survivors.len(), survivors_len);
-        after_step(frame, &survivors);
+        after_step(frame, flow.output());
         if tracks.advance(survivors).is_err() {
             panic!("flow survivors must be tracks of the set");
+        }
+        for &(camera, pixel) in &flow.output().spawned {
+            tracks.spawn_on(pixel, camera);
         }
     }
 }
@@ -189,7 +224,7 @@ fn a_warm_flow_step_does_not_allocate() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for threads in 1..=3 {
         ALLOCATIONS.store(0, Ordering::SeqCst);
-        replay(threads, WARM_UP + COUNTED, |_, _| {});
+        replay(settings(threads), shift, WARM_UP + COUNTED, |_, _| {});
         assert_eq!(
             ALLOCATIONS.load(Ordering::SeqCst),
             0,
@@ -203,13 +238,28 @@ fn survivors_do_not_depend_on_the_thread_count() {
     let _serial = SERIAL
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Refill, retries, the template lookup after the sort and the coarse
+    // levels rebuilt after a join are the paths the split could change.
     let run = |threads| {
         let mut all = Vec::new();
-        replay(threads, 30, |_, survivors| all.push(survivors.to_vec()));
-        all
+        let mut retries = 0;
+        replay(preset_settings(threads), jumpy_shift, 30, |_, output| {
+            all.push((output.survivors.clone(), output.spawned.clone()));
+            retries += output.counts.retries;
+        });
+        (all, retries)
     };
-    let one = run(1);
-    assert!(one.iter().any(|frame| !frame.is_empty()), "nothing tracked");
-    assert_eq!(run(2), one);
-    assert_eq!(run(3), one);
+    let (one, retries) = run(1);
+    assert!(retries > 0, "no frame retried");
+    assert!(
+        one.iter().any(|(_, spawned)| !spawned.is_empty()),
+        "nothing refilled"
+    );
+    assert!(
+        one.last()
+            .is_some_and(|(survivors, _)| !survivors.is_empty()),
+        "nothing tracked on the last frame"
+    );
+    assert_eq!(run(2).0, one);
+    assert_eq!(run(3).0, one);
 }

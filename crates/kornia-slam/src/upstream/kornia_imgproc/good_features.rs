@@ -556,8 +556,16 @@ mod tests {
                 {
                     (a, b, c) = (a + gx * gx, b + gx * gy, c + gy * gy);
                 }
-                let want = min_eigen(a as f32, b as f32, c as f32);
-                assert_eq!(scratch.response[y * w + x], want, "({x}, {y})");
+                // The smaller root of l^2 - (a + c) l + (a c - b^2), in f64,
+                // against f32 rounding at the trace's magnitude.
+                let (a, b, c) = (f64::from(a), f64::from(b), f64::from(c));
+                let want = 0.5 * ((a + c) - ((a - c).powi(2) + 4.0 * b * b).sqrt());
+                let got = f64::from(scratch.response[y * w + x]);
+                let tolerance = 8.0 * f64::from(f32::EPSILON) * (a + c).max(1.0);
+                assert!(
+                    (got - want).abs() <= tolerance,
+                    "({x}, {y}): {got} vs {want}"
+                );
             }
         }
     }

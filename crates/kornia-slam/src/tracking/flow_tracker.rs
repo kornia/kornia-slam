@@ -1217,4 +1217,45 @@ mod tests {
             assert_eq!(*occupied, start);
         }
     }
+
+    /// T10: a camera yawing by +5 degrees about its y axis (towards +x) sees
+    /// a point ahead move to `cx - f tan 5°`, whatever the formula inside.
+    #[test]
+    fn a_yaw_moves_the_ray_by_f_tan_yaw_against_the_turn() {
+        let yaw = 5f64.to_radians();
+        let (sin, cos) = yaw.sin_cos();
+        // R_cur_prev = R_y(yaw)^T for R_wc_cur = R_wc_prev R_y(yaw).
+        let cur_from_prev = Mat3F64::from_cols(
+            kornia_algebra::Vec3F64::new(cos, 0.0, sin),
+            kornia_algebra::Vec3F64::new(0.0, 1.0, 0.0),
+            kornia_algebra::Vec3F64::new(-sin, 0.0, cos),
+        );
+        let camera = pinhole();
+        let centre = [camera.cx as f32, camera.cy as f32];
+
+        let moved = rotated_ray_pixel(&camera, &cur_from_prev, centre).unwrap();
+
+        let want = camera.cx - camera.fx * yaw.tan();
+        assert!((f64::from(moved[0]) - want).abs() < 1e-3, "{moved:?}");
+        assert!((f64::from(moved[1]) - camera.cy).abs() < 1e-3, "{moved:?}");
+    }
+
+    /// T10: an adopted landmark is tracked from the kept keyframe into the
+    /// previous frame, which the tracks' pixels refer to, and only from the
+    /// keyframe it was seen in.
+    #[test]
+    fn adoption_tracks_a_landmark_from_its_keyframe_into_the_previous_frame() {
+        let mut flow = rig_flow(GyroGuess::Off);
+        let mut timings = TrackingTimings::default();
+        flow.prepare(&[&textured(0.0)], 0, &mut timings).unwrap();
+        flow.keep_keyframe().unwrap();
+        flow.prepare(&[&textured(2.0)], 1, &mut timings).unwrap();
+        flow.prepare(&[&textured(4.0)], 2, &mut timings).unwrap();
+        let pixel = [90.0, 70.0];
+
+        let adopted = flow.adopt(0, 0, pixel, [93.0, 70.5]).unwrap();
+
+        assert!(distance(adopted, [92.0, 70.0]) < 0.05, "{adopted:?}");
+        assert_eq!(flow.adopt(1, 0, pixel, pixel), None);
+    }
 }
