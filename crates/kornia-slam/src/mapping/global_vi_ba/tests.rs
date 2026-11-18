@@ -1,5 +1,5 @@
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat3F64, Vec3F64};
+use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 use kornia_sensors::imu::SampleInterpolation;
 
 use super::*;
@@ -12,10 +12,11 @@ const FX: f64 = 400.0;
 const CX: f64 = 320.0;
 const CY: f64 = 240.0;
 const GRAVITY: [f64; 3] = [0.0, 9.81, 0.0];
-/// Start velocity (m/s) of the synthetic walk, which never rotates, and its
-/// acceleration `A + W sin(ω t)` (m/s², rad/s). A constant acceleration alone
-/// would leave scale, roll and pitch to the free accel bias: `b_a = (1 - s) A`
-/// fits a world scaled by `s` exactly. The varying part makes them observable.
+/// Start velocity (m/s) of the synthetic walk and its acceleration
+/// `A + W sin(ω t)` (m/s², rad/s). A constant acceleration alone would leave
+/// scale to the free accel bias: `b_a = (1 - s) A` fits a world scaled by `s`
+/// exactly. The varying part makes scale observable; roll, pitch and gravity
+/// need the body to turn too ([`Sampling::Rotating`]).
 const VELOCITY: [f64; 3] = [0.5, 0.0, 0.0];
 const ACCELERATION: [f64; 3] = [0.4, 0.0, 0.2];
 const WOBBLE: [f64; 3] = [0.3, 0.2, -0.3];
@@ -43,6 +44,23 @@ enum Sampling {
     IntervalMean,
     /// Each sample the signal at its stamp, as a real IMU reads it.
     Instantaneous,
+    /// Interval means, and the body turns about two axes: without rotation
+    /// a world tilted by `R_δ` and the bias `b_a = R_δᵀg − g` fit as well as
+    /// the truth, so neither roll, pitch nor gravity's sign is observed (D2).
+    Rotating,
+}
+
+/// `R_wb(t)` of the rotating walk: `Exp(α e_x) · Exp(0.7 α e_y)`,
+/// `α = 0.25 (1 − cos 2t)` rad; the identity otherwise.
+fn body_rotation(t: f64, sampling: Sampling) -> Mat3F64 {
+    match sampling {
+        Sampling::Rotating => {
+            let a = 0.25 * (1.0 - (2.0 * t).cos());
+            SO3F64::exp(Vec3F64::new(a, 0.0, 0.0)).matrix()
+                * SO3F64::exp(Vec3F64::new(0.0, 0.7 * a, 0.0)).matrix()
+        }
+        _ => Mat3F64::IDENTITY,
+    }
 }
 
 /// A camera at the IMU accelerating past a wall of landmarks, with exact
@@ -66,11 +84,12 @@ fn sampled_session(offset: f64, sampling: Sampling) -> SessionDump {
         .map(|k| {
             let t = 0.25 * k as f64;
             let p = body_position(t);
+            let r_bw = body_rotation(t, sampling).transpose();
             let observations = landmarks
                 .iter()
                 .enumerate()
                 .map(|(l, x)| {
-                    let c = *x - p;
+                    let c = r_bw * (*x - p);
                     SessionObservation {
                         landmark: l as u32,
                         camera: 0,
@@ -89,7 +108,7 @@ fn sampled_session(offset: f64, sampling: Sampling) -> SessionDump {
             SessionKeyframe {
                 kf_idx: 10 * k as u64,
                 timestamp_sec: t,
-                pose_cw: SessionPose::from_pose(&Pose3d::new(Mat3F64::IDENTITY, -(p + shift))),
+                pose_cw: SessionPose::from_pose(&Pose3d::new(r_bw, r_bw * -(p + shift))),
                 velocity_world: body_velocity(t),
                 bias_gyro: [0.0; 3],
                 bias_accel: [0.0; 3],
@@ -107,8 +126,23 @@ fn sampled_session(offset: f64, sampling: Sampling) -> SessionDump {
     let imu = (0..=400)
         .map(|i| {
             let t = i as f64 * DT;
+            if let Sampling::Rotating = sampling {
+                // Held over `(t − dt, t]` and turned by the rotation at its
+                // start, as the `Hold` integrator applies it.
+                let (r_wb0, r_wb1) = (body_rotation(t - DT, sampling), body_rotation(t, sampling));
+                let dv = Vec3F64::from_array(body_velocity(t))
+                    - Vec3F64::from_array(body_velocity(t - DT))
+                    - Vec3F64::from_array(GRAVITY) * DT;
+                return ImuSample {
+                    t,
+                    gyro: (SO3F64::from_matrix(&(r_wb0.transpose() * r_wb1)).log() * (1.0 / DT))
+                        .to_array(),
+                    accel: ((r_wb0.transpose() * dv) * (1.0 / DT)).to_array(),
+                };
+            }
             let mean = match sampling {
                 Sampling::Instantaneous => body_acceleration(t),
+                Sampling::Rotating => unreachable!(),
                 Sampling::IntervalMean if i == 0 => Vec3F64::from_array(ACCELERATION),
                 Sampling::IntervalMean => {
                     (Vec3F64::from_array(body_velocity(t))
@@ -414,4 +448,47 @@ fn the_tight_stage_runs_even_after_an_early_convergence() {
     assert!(report.iterations < 50, "{} iterations", report.iterations);
     assert_eq!(report.dropped_outlier, 0);
     assert_eq!(report.dropped_tight_outlier, 1);
+}
+
+/// D2: the solve observes gravity. Told the wrong sign, it cannot reach the
+/// cost of the truth on a rotating walk. Red on the walk that never turns
+/// (2026-11-18): `b_a = −2g` absorbed the flip, cost 1.14e-8 against
+/// 1.13e-8 at the truth; turning, 6.5e2 against 1.5e-8.
+#[test]
+fn a_flipped_gravity_is_not_absorbed_by_the_accel_bias() {
+    let config = OfflineBaConfig {
+        tighten_from_iteration: 100,
+        ..OfflineBaConfig::default()
+    };
+    let truth = solve(&sampled_session(0.0, Sampling::Rotating), &config).report;
+    let mut flipped = sampled_session(0.0, Sampling::Rotating);
+    flipped.gravity_world = GRAVITY.map(|g| -g);
+    let flipped = solve(&flipped, &config).report;
+    assert!(
+        flipped.final_cost > 1e3 * truth.final_cost.max(1e-6),
+        "final cost {:.3e} with gravity flipped, {:.3e} at the truth",
+        flipped.final_cost,
+        truth.final_cost
+    );
+}
+
+/// D2: from a perturbed start the rotating walk converges to the truth.
+#[test]
+fn a_perturbed_rotating_start_converges_to_the_truth() {
+    let session = sampled_session(0.03, Sampling::Rotating);
+    let config = OfflineBaConfig {
+        tighten_from_iteration: 100,
+        ..OfflineBaConfig::default()
+    };
+    let result = solve(&session, &config);
+    assert!(result.report.final_cost < 1e-6 * result.report.initial_cost);
+    for (pose, kf) in result.body_poses.iter().zip(&session.keyframes) {
+        let truth = body_position(kf.timestamp_sec);
+        let error = (pose.inverse().translation - truth).length();
+        assert!(
+            error < 1e-4,
+            "keyframe at {} s off by {error} m",
+            kf.timestamp_sec
+        );
+    }
 }
