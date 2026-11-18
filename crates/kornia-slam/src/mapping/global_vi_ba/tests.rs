@@ -397,3 +397,21 @@ fn the_yaw_gauge_row_is_its_residual_derivative() {
         );
     }
 }
+
+/// D8: a solve that converges before `tighten_from_iteration` still runs
+/// the 3 px stage. Red on the old code (2026-11-18): it broke out first, and
+/// a 5 px outlier stayed in.
+#[test]
+fn the_tight_stage_runs_even_after_an_early_convergence() {
+    let mut session = synthetic_session(0.03);
+    session.keyframes[4].observations[7].u += 5.0;
+    let config = OfflineBaConfig {
+        relative_cost_tolerance: 1e-4,
+        tighten_from_iteration: 50,
+        ..OfflineBaConfig::default()
+    };
+    let report = solve(&session, &config).report;
+    assert!(report.iterations < 50, "{} iterations", report.iterations);
+    assert_eq!(report.dropped_outlier, 0);
+    assert_eq!(report.dropped_tight_outlier, 1);
+}

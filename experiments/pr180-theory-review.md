@@ -52,6 +52,7 @@ Lane M (mapping, VI-BA and calibration):
 - D6: `online_td_recovers_from_the_gyro_alone`, `crates/kornia-slam/src/mapping/vi_ba_calibration_tests.rs` (GT1 with translation off). Red at the old 1 Hz motion: 3 ms came back 0.93 ms. The card G motion is now 0.7 Hz (`FREQ`), so keyframes no longer sit at zero rate and zero acceleration; GT0-GT7 still pass.
 - D5: `stereo_depths_do_not_hold_the_focal_at_the_factory_value`, `crates/kornia-slam/src/mapping/vi_ba_calibration_tests.rs`. Red at 8f23e47: a true +0.5 % focal came back +0.413 % with quarter-pixel stereo depths measured at the factory focal; fixed, +0.495 %. Depth rows are dropped whenever a rotation or focal state is on (`Layout::camera_states`), online and offline, gated or not; the gyro and clock states keep them. The offline filter has no separate test.
 - D14: `the_yaw_gauge_row_is_its_residual_derivative`, `crates/kornia-slam/src/mapping/global_vi_ba/tests.rs`. Red at 8f23e47: at a 0.4 rad tilt the row's ω_x entry was 0 against a central difference of −1.47e3.
+- D8: `the_tight_stage_runs_even_after_an_early_convergence`, `crates/kornia-slam/src/mapping/global_vi_ba/tests.rs`. Red at 8f23e47: a 5 px outlier, solve converged before iteration 50, `dropped_tight_outlier` 0; fixed, 1. A solve that stops at `max_iterations` before `tighten_from_iteration` still skips the stage, as the review's fix specifies (convergence and `Ok(None)` only).
 
 # E estimator
 

@@ -339,7 +339,8 @@ impl Solve<'_, '_> {
 
     /// Levenberg-Marquardt from `state`: observations past `outlier_px` were
     /// dropped before, those past `tight_outlier_px` go from
-    /// `tighten_from_iteration` on (visloc's two stages).
+    /// `tighten_from_iteration` on (visloc's two stages), or once the solve
+    /// stops before then: the tight stage always runs (D8).
     fn run(
         &self,
         pattern: &Pattern,
@@ -350,16 +351,21 @@ impl Solve<'_, '_> {
         let config = self.config;
         let mut cost = report.initial_cost;
         let mut lambda = LAMBDA_START;
+        let mut tightened = false;
+        let mut tighten = |state: &State, pims: &[PreintegratedImu], cost: &mut f64| {
+            let dropped = self
+                .problem
+                .drop_outliers(state, self.layout, config.tight_outlier_px);
+            if dropped > 0 {
+                report.dropped_tight_outlier += dropped;
+                *cost = self.cost(state, pims);
+            }
+        };
         for iteration in 1..=config.max_iterations {
             let started = Instant::now();
             if iteration >= config.tighten_from_iteration {
-                let dropped =
-                    self.problem
-                        .drop_outliers(&state, self.layout, config.tight_outlier_px);
-                if dropped > 0 {
-                    report.dropped_tight_outlier += dropped;
-                    cost = self.cost(&state, &pims);
-                }
+                tighten(&state, &pims, &mut cost);
+                tightened = true;
             }
             let imu: Vec<_> = self
                 .edges
@@ -382,21 +388,28 @@ impl Solve<'_, '_> {
             report
                 .iteration_ms
                 .push(started.elapsed().as_secs_f64() * 1e3);
-            let (candidate, candidate_pims, candidate_cost) = match step {
-                Ok(Some(accepted)) => accepted,
-                Ok(None) => break,
+            let converged = match step {
+                Ok(Some((candidate, candidate_pims, candidate_cost))) => {
+                    report.iterations = iteration;
+                    let decrease = (cost - candidate_cost) / cost.max(f64::MIN_POSITIVE);
+                    state = candidate;
+                    if let Some(candidate_pims) = candidate_pims {
+                        pims = candidate_pims;
+                    }
+                    cost = candidate_cost;
+                    decrease < config.relative_cost_tolerance
+                }
+                Ok(None) => true,
                 Err(error) if iteration == 1 => return Err(error),
                 Err(_) => break,
             };
-            report.iterations = iteration;
-            let decrease = (cost - candidate_cost) / cost.max(f64::MIN_POSITIVE);
-            state = candidate;
-            if let Some(candidate_pims) = candidate_pims {
-                pims = candidate_pims;
-            }
-            cost = candidate_cost;
-            if decrease < config.relative_cost_tolerance {
-                break;
+            if converged {
+                if tightened {
+                    break;
+                }
+                tighten(&state, &pims, &mut cost);
+                tightened = true;
+                lambda = LAMBDA_START;
             }
         }
         report.final_cost = cost;
