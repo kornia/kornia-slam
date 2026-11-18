@@ -572,6 +572,9 @@ impl<'a> Problem<'a> {
         let up = self.gravity.normalize();
         let phi = SO3F64::from_matrix(&(anchor.rotation_bw.transpose() * pose.rotation)).log();
         let wy = 1.0 / GAUGE_YAW_SIGMA;
+        // `Log(R₀ᵀ R Exp(ω)) ≈ φ + J_r⁻¹(φ) ω`, so the row is `J_r⁻ᵀ(φ) up`:
+        // off a tilted start, `up` alone is wrong by about `½|φ|` (D14).
+        let row = SO3F64::right_jacobian(phi).inverse().transpose() * up;
         (
             anchor.keyframe,
             [
@@ -580,7 +583,7 @@ impl<'a> Problem<'a> {
                 (dp.z, [0.0, 0.0, -w, -t.y * w, t.x * w, 0.0]),
                 (
                     up.dot(phi) * wy,
-                    [0.0, 0.0, 0.0, up.x * wy, up.y * wy, up.z * wy],
+                    [0.0, 0.0, 0.0, row.x * wy, row.y * wy, row.z * wy],
                 ),
             ],
         )

@@ -352,3 +352,48 @@ fn the_clock_state_does_not_absorb_the_integration_lag() {
         });
     assert!(best_ms.abs() < 0.2, "IMU cost least at td {best_ms:.2} ms");
 }
+
+/// D14: the yaw gauge row is the derivative of `up · Log(R₀ᵀ R)` under the
+/// solver's right perturbation, `J_r⁻ᵀ(φ) up`, also at a tilted keyframe
+/// (roll and pitch are free). Red on the old code (2026-11-18), whose row was
+/// `up`: its ω_x entry was 0 against a derivative of −1.47e3 (0.15 of
+/// `1/σ_yaw`) at a 0.4 rad tilt.
+#[test]
+fn the_yaw_gauge_row_is_its_residual_derivative() {
+    let session = synthetic_session(0.0);
+    let layout = Layout::new(&OfflineCalibrationConfig::default(), 1);
+    let (problem, start) = Problem::new(
+        &session,
+        VisualInformation::Unit,
+        StereoDepthSigma::default(),
+        &layout,
+    )
+    .unwrap();
+    let observers = problem.observers();
+    let anchors = problem.gauge_anchors(&[], &observers, &start);
+    let anchor = &anchors[0];
+    let step = |d: usize, h: f64| {
+        let mut dx = vec![0.0; 15 * start.keyframes.len()];
+        dx[d] = h;
+        dx
+    };
+    let landmarks = vec![Vec3F64::ZERO; start.landmarks.len()];
+    let mut tilt = step(3, 0.4);
+    tilt[4..6].copy_from_slice(&[0.1, -0.3]);
+    let tilted = start.retracted(&tilt, &landmarks, &[]);
+    let (_, rows) = problem.gauge_rows(anchor, &tilted);
+    let h = 1e-6;
+    for d in 3..6 {
+        let at = |h: f64| {
+            let state = tilted.retracted(&step(d, h), &landmarks, &[]);
+            problem.gauge_rows(anchor, &state).1[3].0
+        };
+        let numeric = (at(h) - at(-h)) / (2.0 * h);
+        let analytic = rows[3].1[d];
+        assert!(
+            (numeric - analytic).abs() <= 1e-4 * numeric.abs().max(1.0),
+            "ω{}: numeric {numeric:.6e}, row {analytic:.6e}",
+            d - 3
+        );
+    }
+}
