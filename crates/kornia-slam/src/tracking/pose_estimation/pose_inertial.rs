@@ -211,6 +211,23 @@ impl FrameNavState {
         delta
     }
 
+    /// The Jacobian of `self ⊟ mean` (`r`) under `self ⊞ δ`:
+    /// `blkdiag(R_meanᵀR, Jr⁻¹(r_ω), I₉)`, as ORB-SLAM3's prior edge (E12).
+    fn minus_jacobian(&self, mean: &Self, r: &SVecF64<15>) -> Mat15F64 {
+        let to_block = |m: kornia_algebra::Mat3F64| {
+            let c = m.to_cols_array();
+            SMatF64::<3, 3>::new(c[0], c[3], c[6], c[1], c[4], c[7], c[2], c[5], c[8])
+        };
+        let r_omega = Vec3F64::new(r[3], r[4], r[5]);
+        let mut j = Mat15F64::identity();
+        j.fixed_view_mut::<3, 3>(0, 0).copy_from(&to_block(
+            mean.pose_cw.rotation.transpose() * self.pose_cw.rotation,
+        ));
+        j.fixed_view_mut::<3, 3>(3, 3)
+            .copy_from(&to_block(SO3F64::right_jacobian(r_omega).inverse()));
+        j
+    }
+
     fn is_finite(&self) -> bool {
         let finite = |v: Vec3F64| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
         self.pose_cw
@@ -355,10 +372,12 @@ impl Problem<'_> {
             let chi2 = r.dot(&(prior.information * r));
             let weight = HuberKernel.weight(chi2, HUBER_PRIOR_CHI2);
             cost += 0.5 * HuberKernel.rho(chi2, HUBER_PRIOR_CHI2);
+            let j = states.previous.minus_jacobian(&prior.mean, &r);
+            let jt_information = j.transpose() * prior.information;
             let mut block = hessian.fixed_view_mut::<15, 15>(0, 0);
-            block += prior.information * weight;
+            block += jt_information * j * weight;
             let mut rows = gradient.fixed_rows_mut::<15>(0);
-            rows += prior.information * r * weight;
+            rows += jt_information * r * weight;
         }
 
         for (o, observation) in self.observations.iter().enumerate() {
@@ -557,5 +576,63 @@ mod tests {
             !solution.inliers[outlier],
             "χ² ≈ 6.6 is past the 2-dof 5 % gate"
         );
+    }
+
+    /// E12: the prior's gradient is the derivative of its cost under the
+    /// previous frame's `⊞`, with `blkdiag(R_meanᵀR, Jr⁻¹(r_ω), I₉)` as the
+    /// Jacobian of `⊟`; identity misses it by O(|r|).
+    #[test]
+    fn the_prior_gradient_is_the_derivative_of_the_prior_cost() {
+        let mut mean = at_rest();
+        mean.pose_cw = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.1, -0.2, 0.3)).matrix(),
+            Vec3F64::new(0.2, 0.1, -0.1),
+        );
+        let prior = NavPrior {
+            mean,
+            information: Mat15F64::identity(),
+        };
+        let edge = still_edge();
+        let camera = camera();
+        let problem = Problem {
+            prior: Some(&prior),
+            preintegrated: &edge,
+            information: information(&edge, 1.0).omega,
+            gravity: Vec3F64::ZERO,
+            t_bc: None,
+            cameras: &[],
+            primary: &camera,
+            observations: &[],
+        };
+        let mut previous = at_rest();
+        previous.pose_cw = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.5, 0.3, -0.4)).matrix(),
+            Vec3F64::new(-0.3, 0.4, 0.2),
+        );
+        // The current frame where the edge puts it: only the prior pulls.
+        let states = States {
+            previous,
+            current: previous,
+        };
+        let none = [];
+        let system = problem.build(&states, &none, false);
+        let h = 1e-6;
+        for d in 0..6 {
+            let cost_at = |sign: f64| {
+                let mut delta = SVecF64::<15>::zeros();
+                delta[d] = sign * h;
+                let moved = States {
+                    previous: states.previous.plus(&delta),
+                    current: states.current,
+                };
+                problem.build(&moved, &none, false).cost
+            };
+            let numeric = (cost_at(1.0) - cost_at(-1.0)) / (2.0 * h);
+            let analytic = system.gradient[d];
+            assert!(
+                (numeric - analytic).abs() < 1e-5 * numeric.abs().max(1.0),
+                "d={d}: numeric {numeric} analytic {analytic}"
+            );
+        }
     }
 }
