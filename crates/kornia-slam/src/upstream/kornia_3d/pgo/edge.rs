@@ -8,7 +8,7 @@ use kornia_algebra::SE3F32;
 use super::{RESIDUAL_DIM, SparsePgoError, pose_to_se3, validate_se3};
 
 /// A relative-pose edge with a full 6x6 square-root information `S`. Its residual is
-/// `S * log(t_ab_meas^-1 * T_b * T_a^-1)`, ordered (translation, rotation), in camera `b`.
+/// `S * log(t_ab_meas^-1 * T_b * T_a^-1)`, ordered (translation, rotation), in camera `a`.
 #[derive(Debug, Clone, Copy)]
 pub struct InformationEdge {
     pub pose_a: usize,

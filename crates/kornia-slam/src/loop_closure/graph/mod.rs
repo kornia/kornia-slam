@@ -883,19 +883,31 @@ impl<P> PoseGraph<P> {
     }
 
     fn information_edge(&self, edge: &Edge) -> Result<InformationEdge, PoseGraphError> {
-        let mut sqrt_information = [[0.0f32; 6]; 6];
-        for (row, values) in sqrt_information.iter_mut().enumerate() {
-            let sigma = if row < 3 {
-                edge.sigma_m
-            } else {
-                edge.sigma_rad
-            };
-            values[row] = (1.0 / sigma) as f32;
-        }
         let cauchy_scale = match (edge.kind, self.config.loop_cauchy_scale) {
             (EdgeKind::Loop, Some(scale)) => Some(scale as f32),
             _ => None,
         };
+        let mut sqrt_information = [[0.0f32; 6]; 6];
+        for (row, values) in sqrt_information.iter_mut().enumerate().take(3) {
+            values[row] = (1.0 / edge.sigma_m) as f32;
+        }
+        let rotation = match (self.config.manifold, cauchy_scale) {
+            // Every node keeps `R·g`, so a robust edge's weight would see the roll and pitch of its
+            // measurement that no state can meet: it compares only the twist about gravity, in
+            // camera `from` (the residual's frame). Least squares keeps the full block, which is
+            // `optimize_pose_graph`'s.
+            (GraphManifold::Gravity(gravity), Some(_)) => {
+                let up = self.nodes[edge.from.0].pose.rotation * gravity.normalize();
+                Mat3F64::from_cols(up * up.x, up * up.y, up * up.z)
+            }
+            _ => Mat3F64::IDENTITY,
+        };
+        for row in 0..3 {
+            for col in 0..3 {
+                sqrt_information[3 + row][3 + col] =
+                    (rotation.col(col)[row] / edge.sigma_rad) as f32;
+            }
+        }
         let t_ab_meas = pose_to_se3(&edge.measurement);
         Ok(InformationEdge {
             pose_a: edge.from.0,

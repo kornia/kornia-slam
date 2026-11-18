@@ -268,3 +268,43 @@ fn random_walk_odometry_composes_independently_of_keyframe_spacing() {
     let floored = |spacing| chain_variance_m2(config(), spacing);
     assert!(floored(0.1) > 4.0 * floored(0.5));
 }
+
+/// The loop residual after a solve of a 30-keyframe arc closed by `measurement` from 0 to 29.
+fn loop_residual_after(measurement: Pose3d, sigma_rad: f64) -> f64 {
+    let mut graph = PoseGraph::new(PoseGraphConfig {
+        node_spacing: None,
+        loop_max_candidates: 0,
+        ..config()
+    });
+    for (index, pose) in odometry_trajectory(30).into_iter().enumerate() {
+        graph
+            .add_keyframe(index, t_s(index), pose, (), &mut RejectAll)
+            .unwrap();
+    }
+    let measurement = LoopMeasurement {
+        candidate_to_query: measurement,
+        sigma_m: 0.05,
+        sigma_rad,
+    };
+    graph
+        .add_loop_edge(0, 29, measurement)
+        .unwrap()
+        .loop_residual_after
+}
+
+/// G6: every node keeps `R·g` on the gravity manifold, so a loop measurement tilted in roll by
+/// 3 sigma cannot be met. The tilt left at least 3 whitened sigmas on the loop, and the Cauchy
+/// weight at or below 0.5, for good; now only the rotation about gravity is compared.
+#[test]
+fn a_tilted_loop_measurement_leaves_no_residual_on_the_gravity_manifold() {
+    let sigma_rad = 0.01;
+    let measured = truth(29).inverse().compose(&truth(0));
+    let roll = SO3F64::exp(Vec3F64::new(3.0 * sigma_rad, 0.0, 0.0)).matrix();
+    let tilted = Pose3d::new(roll * measured.rotation, measured.translation);
+    let plain = loop_residual_after(measured, sigma_rad);
+    let tilted = loop_residual_after(tilted, sigma_rad);
+    assert!(
+        (tilted - plain).abs() < 0.1,
+        "tilted {tilted} against {plain} sigmas"
+    );
+}
