@@ -656,6 +656,125 @@ mod anchors {
         assert!((v.x - expected).abs() < 1e-9, "{v:?} vs {expected}");
         assert!(v.y.abs() < 1e-12 && v.z.abs() < 1e-12);
     }
+
+    /// E7: against an anchor, a keyframe-origin prediction re-integrates
+    /// `[t_kf, t]` every coast frame. It must start from the keyframe's
+    /// velocity, `v_kf + a (t - t_kf)`, not from the propagated one, which
+    /// adds the whole window again each frame.
+    #[test]
+    fn a_keyframe_origin_prediction_starts_from_the_keyframe_velocity() {
+        let mut system = system();
+        system.tracking_config.pose_inertial = PoseInertial::OrbSlam3;
+        let t_kf = 0.1;
+        system.inertial.last_keyframe_timestamp_sec = Some(t_kf);
+        system
+            .map
+            .lock()
+            .unwrap()
+            .edit_keyframes_for_test(|_, kf| kf.velocity_world = Vec3F64::new(1.0, 0.0, 0.0));
+        assert!(system.insert_keyframe(&frame(4), 0.2, &[], 0, KeyframeRole::Anchor));
+        system.state.velocity_world = Vec3F64::new(1.0 + ACCEL_X * (0.2 - t_kf), 0.0, 0.0);
+
+        let dt = 0.05;
+        let mut pose = Pose3d::IDENTITY;
+        let mut prev = 0.2;
+        let mut t = prev;
+        for i in 0..10 {
+            let idx = 5 + i;
+            if !system.frame_state_carried(idx) {
+                system.refresh_reference_inertial_state();
+            }
+            t = 0.2 + (i + 1) as f64 * dt;
+            let (from, from_sec) = system.prediction_origin(idx, pose, prev);
+            assert_eq!(from_sec, t_kf, "keyframe-anchored without a frame prior");
+            (pose, _) = system.predict_frame_pose(from, from_sec, t);
+            prev = t;
+        }
+        let expected = 1.0 + ACCEL_X * (t - t_kf);
+        let v = system.state.velocity_world;
+        assert!((v.x - expected).abs() < 1e-9, "{v:?} vs {expected}");
+    }
+}
+
+mod inertial_origin {
+    use super::*;
+    use crate::tracking::local_map::LocalMapRules;
+    use crate::tracking::parallax::tests::{frame_seeing_points, map_with_keyframe_at};
+
+    fn stale() -> Vec3F64 {
+        Vec3F64::new(-5.0, 0.0, 0.0)
+    }
+
+    fn propagated() -> Vec3F64 {
+        Vec3F64::new(1.0, 0.0, 0.0)
+    }
+
+    /// A monocular-inertial system whose last keyframe is 1 and whose
+    /// tracking reference is the older keyframe 0, with a stale velocity and
+    /// bias on keyframe 0.
+    /// The knob is set after the build: relocalization needs a vocabulary.
+    fn system(configure: impl FnOnce(&mut SlamSystem)) -> SlamSystem {
+        let config = config(CameraSelection::Mono, true, LoopClosingMode::Disabled);
+        let rig = SensorRig::new(camera()).with_imu(Pose3d::IDENTITY);
+        let mut system = SlamSystem::build(config, rig).unwrap();
+        configure(&mut system);
+        let mut map = map_with_keyframe_at(Pose3d::IDENTITY);
+        map.insert_keyframe(Keyframe::from_frame(frame_seeing_points(
+            1,
+            Pose3d::IDENTITY,
+            &[],
+        )))
+        .unwrap();
+        map.edit_keyframes_for_test(|_, kf| {
+            if kf.frame.idx == 0 {
+                kf.velocity_world = stale();
+                kf.imu_bias.accel = Vec3F64::new(1.0, 0.0, 0.0);
+            } else {
+                kf.velocity_world = Vec3F64::new(2.0, 0.0, 0.0);
+                kf.imu_bias.accel = Vec3F64::new(0.5, 0.0, 0.0);
+            }
+        });
+        *system.map.lock().unwrap() = map;
+        system.state.imu_initialized = true;
+        system.state.current_keyframe_idx = Some(0);
+        system.state.last_keyframe_idx = Some(1);
+        system.state.velocity_world = propagated();
+        system
+    }
+
+    fn assert_kept_with_the_last_bias(system: &SlamSystem) {
+        assert_eq!(system.state.velocity_world, propagated());
+        assert_eq!(system.inertial.bias.accel, Vec3F64::new(0.5, 0.0, 0.0));
+    }
+
+    /// E1: A8's most-voted reference is older than the last keyframe; its
+    /// velocity is `v(t_ref)`, so the propagated velocity stays, with the
+    /// last keyframe's bias.
+    #[test]
+    fn a_most_voted_reference_leaves_the_inertial_state_to_the_last_keyframe() {
+        let mut system =
+            system(|system| system.tracking_config.local_map = LocalMapRules::OrbSlam3);
+        system.refresh_reference_inertial_state();
+        assert_kept_with_the_last_bias(&system);
+    }
+
+    /// G3: a relocalization while lost makes an old keyframe the reference;
+    /// its velocity and bias can be minutes old.
+    #[test]
+    fn a_relocalized_reference_leaves_the_inertial_state_to_the_last_keyframe() {
+        let mut system = system(|system| system.relocalization.while_lost = true);
+        system.refresh_reference_inertial_state();
+        assert_kept_with_the_last_bias(&system);
+    }
+
+    /// Without those knobs the reference's state is copied, as before.
+    #[test]
+    fn without_the_knobs_the_reference_state_is_copied() {
+        let mut system = system(|_| {});
+        system.refresh_reference_inertial_state();
+        assert_eq!(system.state.velocity_world, stale());
+        assert_eq!(system.inertial.bias.accel, Vec3F64::new(1.0, 0.0, 0.0));
+    }
 }
 
 mod recovery_after_loss {

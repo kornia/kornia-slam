@@ -473,8 +473,10 @@ impl SlamSystem {
 
     /// Where this frame's motion prediction starts: the last keyframe after
     /// the map changed (`Tracking.cc:1746-1761`), otherwise the last frame.
+    /// From the keyframe, the window re-integrates from its velocity and
+    /// bias, which the frame takes (E1, E7).
     pub(super) fn prediction_origin(
-        &self,
+        &mut self,
         frame_idx: usize,
         pose_before: Pose3d,
         prev_timestamp: f64,
@@ -493,9 +495,14 @@ impl SlamSystem {
             .and_then(|kf_sec| {
                 let map = self.map.lock().unwrap();
                 let kf = map.get_keyframe(self.state.last_keyframe_idx?)?;
-                Some((kf.frame.pose_world_to_cam, kf_sec))
+                Some((KeyframeNav::of(kf), kf_sec))
             });
-        origin.unwrap_or((pose_before, prev_timestamp))
+        let Some((kf, kf_sec)) = origin else {
+            return (pose_before, prev_timestamp);
+        };
+        self.state.velocity_world = kf.velocity;
+        self.inertial.bias = kf.bias;
+        (kf.pose_cw, kf_sec)
     }
 
     /// The tracked matches as reprojection rows: undistorted pixels weighted

@@ -46,7 +46,7 @@ use crate::tracking::{
 
 use crate::tracking::TrackingTimings;
 use crate::tracking::flow_tracker::{FlowStepInput, RigFlow, RigFlowCamera, RigFlowSettings};
-use crate::tracking::local_map::select_local_map_points;
+use crate::tracking::local_map::{LocalMapRules, select_local_map_points};
 use crate::tracking::motion::{InertialPrediction, body_to_world, predict_pose};
 use crate::tracking::optical_flow::{FlowSurvivor, LkKernel};
 use crate::tracking::pose_estimation::Estimate;
@@ -975,6 +975,11 @@ impl SlamSystem {
         if !results.is_empty() {
             self.refresh_track_positions();
         }
+        let inertial_idx = if self.inertial_state_from_last_keyframe() {
+            self.state.last_keyframe_idx
+        } else {
+            Some(reference_idx)
+        };
         for result in results {
             if let Some(marginal) = result.newest_marginal {
                 self.estimator.newest_marginal = Some(marginal);
@@ -988,27 +993,29 @@ impl SlamSystem {
                     self.counters.nonrigid_keyframes += 1;
                 }
             }
-            let Some(correction) = result
-                .keyframe_corrections
-                .iter()
-                .find(|correction| correction.kf_idx == reference_idx)
-            else {
-                continue;
+            let correction_of = |kf_idx: usize| {
+                result
+                    .keyframe_corrections
+                    .iter()
+                    .find(|correction| correction.kf_idx == kf_idx)
             };
-
-            self.state.pose_world_to_cam = apply_reference_pose_correction(
-                self.state.pose_world_to_cam,
-                correction.pose_before,
-                correction.pose_after,
-            );
-            let pose = self.state.pose_world_to_cam;
-            self.note_pose(
-                "ba_correction",
-                self.next_frame_idx.saturating_sub(1),
-                &pose,
-            );
-            self.state.velocity_world = correction.velocity_world;
-            self.inertial.bias = correction.imu_bias;
+            if let Some(correction) = correction_of(reference_idx) {
+                self.state.pose_world_to_cam = apply_reference_pose_correction(
+                    self.state.pose_world_to_cam,
+                    correction.pose_before,
+                    correction.pose_after,
+                );
+                let pose = self.state.pose_world_to_cam;
+                self.note_pose(
+                    "ba_correction",
+                    self.next_frame_idx.saturating_sub(1),
+                    &pose,
+                );
+            }
+            if let Some(correction) = inertial_idx.and_then(correction_of) {
+                self.state.velocity_world = correction.velocity_world;
+                self.inertial.bias = correction.imu_bias;
+            }
         }
     }
 
@@ -1652,30 +1659,43 @@ impl SlamSystem {
     }
 
     /// Local BA updates keyframe state asynchronously, so the cached IMU
-    /// state is refreshed from the reference keyframe. An anchor is never
-    /// optimised: its velocity is the stale seed, so the propagated one stays,
-    /// with the last tracked keyframe's bias.
+    /// state is refreshed from the reference keyframe. A reference other than
+    /// the last keyframe (an anchor, or one a knob of
+    /// [`Self::inertial_state_from_last_keyframe`] chose) holds an older
+    /// velocity than the propagated one, which stays, with the last
+    /// keyframe's bias (E1, G3).
     fn refresh_reference_inertial_state(&mut self) {
         let Some(kf_idx) = self.state.current_keyframe_idx else {
             return;
         };
         let map = self.map.lock().unwrap();
-        match map.get_keyframe(kf_idx) {
-            Some(kf) if kf.anchor => {
-                if let Some(tracked) = self
-                    .state
-                    .last_keyframe_idx
-                    .and_then(|ki| map.get_keyframe(ki))
-                {
-                    self.inertial.bias = tracked.imu_bias;
-                }
-            }
-            Some(kf) => {
-                self.state.velocity_world = kf.velocity_world;
-                self.inertial.bias = kf.imu_bias;
-            }
-            None => {}
+        let Some(kf) = map.get_keyframe(kf_idx) else {
+            return;
+        };
+        let decoupled = Some(kf_idx) != self.state.last_keyframe_idx
+            && (kf.anchor || self.inertial_state_from_last_keyframe());
+        if !decoupled {
+            self.state.velocity_world = kf.velocity_world;
+            self.inertial.bias = kf.imu_bias;
+            return;
         }
+        if let Some(last) = self
+            .state
+            .last_keyframe_idx
+            .and_then(|ki| map.get_keyframe(ki))
+        {
+            self.inertial.bias = last.imu_bias;
+        }
+    }
+
+    /// Whether a knob lets the tracking reference differ from the last
+    /// keyframe: A8's most-voted reference, or a relocalization while lost or
+    /// after a give-up. The frame's velocity and bias then come from the last
+    /// keyframe, ORB-SLAM3's `mpLastKeyFrame`; off, from the reference as before.
+    fn inertial_state_from_last_keyframe(&self) -> bool {
+        self.tracking_config.local_map == LocalMapRules::OrbSlam3
+            || self.relocalization.while_lost
+            || self.recovery.relocalize_when_lost
     }
 
     fn tracking_step(
@@ -2683,6 +2703,11 @@ impl SlamSystem {
                 frame.idx, found.keyframe_idx, found.estimate.inliers
             )
         });
+        self.state.velocity_world = recovery::velocity_across_jump(
+            &self.state.pose_world_to_cam,
+            &found.estimate.pose,
+            self.state.velocity_world,
+        );
         self.state.pose_world_to_cam = found.estimate.pose;
         self.note_pose("reloc", frame.idx, &found.estimate.pose);
         self.state.current_keyframe_idx = Some(found.keyframe_idx);

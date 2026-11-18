@@ -119,6 +119,17 @@ pub(crate) fn relocalization_adopted(
     jump_m <= max_jump_m || (lost && segments.of(kf_idx) != segments.latest())
 }
 
+/// The world velocity after the camera's world-to-camera pose jumps from
+/// `before` to `after`, with the camera-frame velocity kept:
+/// `R_after v_after = R_before v_before` (G3, as the loop closer rotates it).
+pub(crate) fn velocity_across_jump(
+    before: &Pose3d,
+    after: &Pose3d,
+    velocity_world: Vec3F64,
+) -> Vec3F64 {
+    after.inverse().compose(before).rotation * velocity_world
+}
+
 /// The keyframe a bridge edge starts from: the last one before a give-up.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct BridgeAnchor {
@@ -327,6 +338,27 @@ pub(crate) mod tests {
         );
         assert_eq!(segments.latest(), 2);
         assert_eq!(segments.latest_start(), Some(6866));
+    }
+
+    /// G3: a relocalization that turns the world 90° about z must turn the
+    /// world velocity with it, so the camera still moves forward.
+    #[test]
+    fn a_pose_jump_keeps_the_camera_frame_velocity() {
+        let yaw = |angle: f64| {
+            Pose3d::new(
+                kornia_algebra::SO3F64::exp(Vec3F64::new(0.0, 0.0, angle)).matrix(),
+                Vec3F64::new(0.3, -0.2, 1.0),
+            )
+        };
+        let (before, after) = (yaw(0.0), yaw(std::f64::consts::FRAC_PI_2));
+        let velocity = Vec3F64::new(1.0, 0.5, 0.0);
+        let rotated = velocity_across_jump(&before, &after, velocity);
+        let in_camera = |pose: &Pose3d, v: Vec3F64| pose.rotation * v;
+        assert!((in_camera(&after, rotated) - in_camera(&before, velocity)).length() < 1e-12);
+        assert!(
+            (rotated - velocity).length() > 0.5,
+            "the world turned: {rotated:?}"
+        );
     }
 
     fn walk(detector: &mut RunawayDetector, from_sec: f64, to_sec: f64, speed: f64) {
