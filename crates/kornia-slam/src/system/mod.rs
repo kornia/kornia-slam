@@ -281,6 +281,7 @@ impl SlamSystem {
         let mut tracker = Tracker::new(settings.map_projection)
             .with_lk_kernel(settings.klt_kernel)
             .with_lk_window(flow.window)
+            .with_track_refill(flow.refill)
             .with_pose_gate(settings.pose_gate)
             .with_local_map_rules(settings.tracking.local_map)
             .with_relocalization_solver(settings.relocalization.solver);
@@ -1076,6 +1077,7 @@ impl SlamSystem {
                 self.tracker.adopt(pixel, camera, mp_idx, position);
             }
         }
+        self.tracker.thin_tracks();
     }
 
     /// A kept keyframe landmark's pixel in the previous frame (`WindowedU8`

@@ -20,6 +20,9 @@
         sensors: ( cameras: Rig, imu: true ),
         pipeline: OrbSlam((
             frontend: Orb((
+                // Half the 2 x 48 tracks `track_refill` caps a rig at; the
+                // default 80 would send most frames back to ORB.
+                klt_first: Enabled(min_tracks: 48),
                 flow_threads: 2,
                 klt_rig: AllCameras,
                 klt_kernel: WindowedU8,

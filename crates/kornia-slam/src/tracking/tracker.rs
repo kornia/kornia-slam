@@ -19,6 +19,7 @@ use crate::frame::RigFeatures;
 use crate::mapping::Map;
 use crate::pose_conversion::{mat3_to_f32, mat3_to_f64, vec3_to_f32, vec3_to_f64};
 use crate::rig::RigGeometry;
+use crate::system::TrackRefill;
 use crate::tracking::flow_tracker::{
     FlowOutput, FlowStepCounts, FlowStepInput, RigFlow, rotated_ray_pixel,
 };
@@ -115,6 +116,9 @@ pub(crate) struct Tracker {
     /// tracks are settled.
     pending_spawns: Vec<(usize, [f32; 2])>,
     refill_spawns: u64,
+    /// `(per_camera, min_spacing_px)` of `track_refill`, which also bounds
+    /// the tracks ORB and adoption add on `WindowedU8`.
+    track_cap: Option<(usize, f32)>,
 }
 
 impl Tracker {
@@ -136,7 +140,21 @@ impl Tracker {
             flow_counts: FlowStepCounts::default(),
             pending_spawns: Vec::new(),
             refill_spawns: 0,
+            track_cap: None,
         }
+    }
+
+    /// Caps the tracks per camera at `refill`'s budget and spacing.
+    pub(crate) fn with_track_refill(mut self, refill: TrackRefill) -> Self {
+        self.track_cap = match refill {
+            TrackRefill::Off => None,
+            TrackRefill::Enabled {
+                per_camera,
+                min_spacing_px,
+                ..
+            } => Some((per_camera, min_spacing_px)),
+        };
+        self
     }
 
     /// Tracks every camera of `rig` by optical flow, spreading new tracks
@@ -446,6 +464,14 @@ impl Tracker {
         }
         self.track_set
             .spawn_associated(pixel, camera, map_point_idx, position);
+    }
+
+    /// Drops the youngest tracks of a camera past the refill budget or
+    /// closer than its spacing to an older one (`WindowedU8` only).
+    pub(crate) fn thin_tracks(&mut self) {
+        if let (true, Some((per_camera, min_spacing_px))) = (self.windowed(), self.track_cap) {
+            self.track_set.thin(per_camera, min_spacing_px);
+        }
     }
 
     /// Rewrites every track's map-point position after a map change; returns
@@ -962,6 +988,7 @@ impl Tracker {
                 if self.reconcile(&estimate.matches, frame) {
                     self.track_set.restore(carried);
                 }
+                self.thin_tracks();
                 Ok(estimate)
             }
             Err(reason) => {
@@ -1344,6 +1371,81 @@ mod tests {
         frame.keypoints_undist = pixels;
         let seeded = (0..points.len()).map(|k| (k, k)).collect();
         (frame, seeded, points, camera)
+    }
+
+    fn capped(tracker: Tracker) -> Tracker {
+        tracker
+            .with_lk_kernel(LkKernel::WindowedU8)
+            .with_track_refill(TrackRefill::Enabled {
+                per_camera: 3,
+                min_spacing_px: 23.0,
+                refill_below: 0.8,
+                border_px: 9,
+            })
+    }
+
+    /// T6: an ORB frame's reconcile adds one track per match; on
+    /// `WindowedU8` the refill budget and spacing bound them.
+    #[test]
+    fn an_orb_frame_keeps_the_tracks_within_the_refill_budget() {
+        let (tracker, _map) = tracked_map(5);
+        let mut tracker = capped(tracker);
+        let survivors = survivors_of(&tracker);
+        let frame = test_frame(1, vec![[0; 32]; 5]);
+        let estimate = Estimate {
+            matches: (0..5).map(|i| (i, i)).collect(),
+            ..estimate_at(Pose3d::IDENTITY)
+        };
+        // Keypoints 0-3 are within 4 px; 0, 4 and the refill track 30+ apart.
+        let mut frame = frame;
+        frame.features.keypoints_xy = vec![
+            [40.0, 40.0],
+            [42.0, 41.0],
+            [41.0, 39.0],
+            [43.0, 43.0],
+            [80.0, 40.0],
+        ];
+
+        assert!(
+            tracker
+                .settle(Ok(estimate), Some(survivors), &frame)
+                .is_ok()
+        );
+
+        let pixels: Vec<[f32; 2]> = tracker.tracks().iter().map(|t| t.pixel()).collect();
+        assert!(pixels.len() <= 3, "{pixels:?}");
+        for (i, a) in pixels.iter().enumerate() {
+            for b in &pixels[i + 1..] {
+                assert!((a[0] - b[0]).hypot(a[1] - b[1]) >= 23.0, "{pixels:?}");
+            }
+        }
+    }
+
+    /// T6: adoption adds a track per new landmark; thinning keeps the
+    /// budget, oldest first.
+    #[test]
+    fn thinning_keeps_the_oldest_tracks_within_the_budget() {
+        let mut tracker = capped(Tracker::new(MapProjectionConfig::default()));
+        for k in 0..3 {
+            tracker.track_set.spawn([30.0 + 40.0 * k as f32, 30.0]);
+        }
+        let survivors = survivors_of(&tracker)
+            .into_iter()
+            .map(|s| FlowSurvivor {
+                pixel: [s.pixel[0] - 1.0, s.pixel[1]],
+                ..s
+            })
+            .collect();
+        tracker.track_set.advance(survivors).unwrap();
+        let old: Vec<TrackId> = tracker.tracks().iter().map(|t| t.id()).collect();
+        for k in 0..3 {
+            tracker.adopt([30.0 + 40.0 * k as f32, 90.0], 0, 10 + k, Vec3F64::ZERO);
+        }
+
+        tracker.thin_tracks();
+
+        let kept: Vec<TrackId> = tracker.tracks().iter().map(|t| t.id()).collect();
+        assert_eq!(kept, old);
     }
 
     /// T4: the analytic flow pose keeps only its inliers as matches, and

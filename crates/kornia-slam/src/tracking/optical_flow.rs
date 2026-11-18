@@ -324,6 +324,30 @@ impl TrackSet {
         self.tracks.extend(tracks);
     }
 
+    /// Keeps per camera at most `per_camera` tracks, each `min_spacing_px`
+    /// from every kept one, oldest first; the kept tracks stay in order.
+    pub(crate) fn thin(&mut self, per_camera: usize, min_spacing_px: f32) {
+        let mut by_age: Vec<usize> = (0..self.tracks.len()).collect();
+        by_age
+            .sort_unstable_by_key(|&k| (std::cmp::Reverse(self.tracks[k].age), self.tracks[k].id));
+        let mut keep = vec![false; self.tracks.len()];
+        let mut kept: Vec<Track> = Vec::with_capacity(self.tracks.len());
+        for k in by_age {
+            let track = self.tracks[k];
+            let mut same_camera = kept.iter().filter(|t| t.camera == track.camera);
+            let full = same_camera.clone().count() >= per_camera;
+            let crowded = same_camera.any(|t| {
+                (t.pixel[0] - track.pixel[0]).hypot(t.pixel[1] - track.pixel[1]) < min_spacing_px
+            });
+            if !full && !crowded {
+                keep[k] = true;
+                kept.push(track);
+            }
+        }
+        let mut keep = keep.into_iter();
+        self.tracks.retain(|_| keep.next().unwrap_or(false));
+    }
+
     /// Whether some track follows map point `map_point_idx`.
     pub(crate) fn follows(&self, map_point_idx: usize) -> bool {
         self.tracks
