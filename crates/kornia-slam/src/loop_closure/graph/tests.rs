@@ -308,3 +308,45 @@ fn a_tilted_loop_measurement_leaves_no_residual_on_the_gravity_manifold() {
         "tilted {tilted} against {plain} sigmas"
     );
 }
+
+/// The solved camera centres of the 30-keyframe arc closed from 0 to 29, with the world origin
+/// moved `offset` away from it and moved back after.
+fn arc_centres_solved_at(offset: Vec3F64) -> Vec<Vec3F64> {
+    let shift = Pose3d::new(kornia_algebra::Mat3F64::IDENTITY, offset);
+    let mut graph = PoseGraph::new(PoseGraphConfig {
+        node_spacing: None,
+        loop_max_candidates: 0,
+        ..config()
+    });
+    for (index, pose) in odometry_trajectory(30).into_iter().enumerate() {
+        graph
+            .add_keyframe(index, t_s(index), pose.compose(&shift), (), &mut RejectAll)
+            .unwrap();
+    }
+    let measurement = LoopMeasurement {
+        candidate_to_query: truth(29).inverse().compose(&truth(0)),
+        sigma_m: 0.05,
+        sigma_rad: 0.01,
+    };
+    graph.add_loop_edge(0, 29, measurement).unwrap();
+    graph
+        .nodes()
+        .iter()
+        .map(|node| node.pose.inverse().translation + offset)
+        .collect()
+}
+
+/// G8: the f32 residual `t_b - R_b R_a^T t_a` cancels at the scale of the camera centre, so a
+/// graph 2 km from the world origin solved to other poses than the same graph at the origin.
+/// The solve now runs about node 0's centre.
+#[test]
+fn a_graph_far_from_the_origin_solves_as_at_the_origin() {
+    let near = arc_centres_solved_at(Vec3F64::ZERO);
+    let far = arc_centres_solved_at(Vec3F64::new(2000.0, -1500.0, 30.0));
+    let largest = near
+        .iter()
+        .zip(&far)
+        .map(|(a, b)| (*a - *b).length())
+        .fold(0.0, f64::max);
+    assert!(largest < 1e-4, "solved centres differ by up to {largest} m");
+}

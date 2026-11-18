@@ -841,7 +841,19 @@ impl<P> PoseGraph<P> {
 
     /// Solve over every node, the first fixed.
     fn solve(&self, new_loop: &Edge) -> Result<(Vec<Pose3d>, SolveReport), PoseGraphError> {
-        let poses: Vec<Pose3d> = self.nodes.iter().map(|node| node.pose).collect();
+        // The f32 residual `t_b - R_b R_a^T t_a` cancels at the scale of the camera centres, so a
+        // robust solve runs about node 0's centre: `T_b W (T_a W)^-1 = T_b T_a^-1`, and the gravity
+        // retraction commutes with a translation. Least squares keeps `optimize_pose_graph`'s.
+        let origin = self
+            .config
+            .loop_cauchy_scale
+            .and(self.nodes.first())
+            .map(|first| camera_centre(&first.pose));
+        let poses: Vec<Pose3d> = self
+            .nodes
+            .iter()
+            .map(|node| origin.map_or(node.pose, |origin| about(&node.pose, origin)))
+            .collect();
         // Odometry then loops, each in insertion order: the f32 normal equations then sum in the
         // order `optimize_pose_graph` uses, which LM's accept path is sensitive to.
         let mut slots: Vec<&Slot> = self.edges.values().collect();
@@ -879,7 +891,15 @@ impl<P> PoseGraph<P> {
             loop_residual_after: whitened_squared(&result.poses, &new_loop)
                 .map_or(f64::NAN, f64::sqrt),
         };
-        Ok((result.poses, report))
+        let solved = match origin {
+            Some(origin) => result
+                .poses
+                .iter()
+                .map(|pose| about(pose, -origin))
+                .collect(),
+            None => result.poses,
+        };
+        Ok((solved, report))
     }
 
     fn information_edge(&self, edge: &Edge) -> Result<InformationEdge, PoseGraphError> {
@@ -917,6 +937,11 @@ impl<P> PoseGraph<P> {
             cauchy_scale,
         })
     }
+}
+
+/// World-to-camera `pose` in a world whose origin is at `origin`.
+fn about(pose: &Pose3d, origin: Vec3F64) -> Pose3d {
+    Pose3d::new(pose.rotation, pose.translation + pose.rotation * origin)
 }
 
 /// `0.5 * sum rho(|S r|^2)` in f64 over f32 whitened residuals, the solver's own cost.
