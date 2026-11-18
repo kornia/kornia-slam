@@ -79,6 +79,7 @@ Cross-lane: E1, E7, G3 are one design in lane S (velocity and bias from the orig
 - E12: `the_prior_gradient_is_the_derivative_of_the_prior_cost` (`tracking/pose_estimation/pose_inertial.rs`); central differences of the prior cost under `⊞`; the identity Jacobian was off 2x on ρ_x at a 0.8 rad prior offset.
 - E9: `a_stereo_observation_counts_twice_toward_the_reference_points` (`system/tests.rs`, mod `keyframe_evidence`); 9 landmarks seen by two stereo keyframes counted 0 against the floor of 3.
 - E4: `the_solve_waits_after_a_relocalization_and_skips_a_long_fixed_window` (`system/tests.rs`, mod `pose_inertial_guards`). The guard is `max_frames` frames under the OrbSlam3 keyframe rules (the review's fix) and 1 s otherwise, as `mMaxFrames` is the camera rate and the Kornia rules carry no rate. A `Fixed` window over 1 s skips the solve (the review's first option).
+- E5: `a_solve_with_too_few_inliers_rejects_the_frame` (`system/tests.rs`, mod `pose_inertial_guards`). On today's code it does not compile: the silent keep had no return value and no counter, which is the finding. The frame is now rejected as `LowPnpInliers` and coasts on the prediction; `RunCounters::pose_inertial_rejects` counts it. The app summary line (`apps/kornia-slam-app/src/summary.rs`, outside lane S) and the kill rules KG4 / A6 still need to point at the counter.
 
 # E estimator
 

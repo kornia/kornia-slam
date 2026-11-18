@@ -784,6 +784,11 @@ mod pose_inertial_guards {
 
     /// Whether frame `idx` at `t` ran the pose-inertial solve.
     fn solved(system: &mut SlamSystem, idx: usize, t: f64) -> bool {
+        refine(system, idx, t).0
+    }
+
+    /// Whether frame `idx` at `t` ran the solve, and whether it was kept.
+    fn refine(system: &mut SlamSystem, idx: usize, t: f64) -> (bool, bool) {
         let points: Vec<Vec3F64> =
             system.with_map_points(|mps| mps.iter().map(|mp| mp.position).collect());
         let frame = frame_seeing_points(idx, Pose3d::IDENTITY, &points);
@@ -794,11 +799,29 @@ mod pose_inertial_guards {
             most_voted_keyframe: None,
         };
         system.drain_debug_messages();
-        system.refine_pose_inertial(&frame, &mut estimate, t - 0.05, t);
-        system
+        let kept = system.refine_pose_inertial(&frame, &mut estimate, t - 0.05, t);
+        let ran = system
             .drain_debug_messages()
             .iter()
-            .any(|m| m.starts_with("[pose_inertial]"))
+            .any(|m| m.starts_with("[pose_inertial]"));
+        (ran, kept)
+    }
+
+    /// E5: a solve that keeps fewer than `min_inliers` (9 of 50 here) fails
+    /// the frame, as ORB-SLAM3 does, and is counted; it no longer keeps the
+    /// visual pose silently.
+    #[test]
+    fn a_solve_with_too_few_inliers_rejects_the_frame() {
+        let mut system = system();
+        assert_eq!(refine(&mut system, 10, 0.5), (true, false));
+        assert_eq!(system.counters.pose_inertial_rejects, 1);
+        assert_eq!(system.counters.pose_inertial_solves, 0);
+        system.tracking_config.pose_inertial = PoseInertial::Off;
+        assert_eq!(
+            refine(&mut system, 11, 0.55),
+            (false, true),
+            "no solve, kept"
+        );
     }
 
     /// E4: ORB-SLAM3 stays visual for `mMaxFrames` frames after a

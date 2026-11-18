@@ -351,26 +351,28 @@ impl SlamSystem {
 
     /// Under `tracking.pose_inertial`, refines a tracked `estimate` with the
     /// pose-inertial solve and takes the frame's velocity and bias from it.
-    /// The visual estimate stays when the solve keeps too few inliers.
+    /// Returns `false` when the solve keeps fewer than `min_inliers`: the
+    /// frame is rejected, as ORB-SLAM3 fails it (E5). Without a solve the
+    /// visual estimate stays.
     pub(super) fn refine_pose_inertial(
         &mut self,
         frame: &Frame,
         estimate: &mut Estimate,
         prev_timestamp: f64,
         timestamp_sec: f64,
-    ) {
+    ) -> bool {
         let mode = self.pose_inertial_mode();
         self.estimator.anchor_next_frame = false;
         if mode == PoseInertial::Off || !self.state.imu_initialized {
-            return;
+            return true;
         }
         if self.recently_relocalized(frame.idx, timestamp_sec) {
             self.estimator.frame_prior = None;
-            return;
+            return true;
         }
         let Some(anchor) = self.solve_anchor(mode, frame.idx) else {
             self.estimator.frame_prior = None;
-            return;
+            return true;
         };
         let (start_sec, keyframe_anchored) = match &anchor {
             SolveAnchor::Keyframe(_, kf_sec) => (*kf_sec, true),
@@ -382,7 +384,7 @@ impl SlamSystem {
         if preintegrated.dt <= 0.0 || (keyframe_anchored && preintegrated.dt > MAX_FIXED_WINDOW_SEC)
         {
             self.estimator.frame_prior = None;
-            return;
+            return true;
         }
         let observations = self.pose_inertial_observations(frame, &estimate.matches);
         let initial = FrameNavState {
@@ -414,7 +416,8 @@ impl SlamSystem {
         ));
         if inliers < min_inliers {
             self.estimator.frame_prior = None;
-            return;
+            self.counters.pose_inertial_rejects += 1;
+            return false;
         }
 
         self.counters.pose_inertial_solves += 1;
@@ -431,6 +434,7 @@ impl SlamSystem {
         let epoch = self.map.lock().unwrap().world_epoch();
         self.estimator.frame_prior = solution.prior.map(|prior| (frame.idx, epoch, prior));
         self.estimator.map_changed = false;
+        true
     }
 
     /// Whether the frame falls in the visual-only stretch after the last

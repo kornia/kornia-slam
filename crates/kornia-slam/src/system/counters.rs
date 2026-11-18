@@ -78,6 +78,9 @@ pub struct RunCounters {
     pub pose_inertial_keyframe_anchored: u64,
     /// Frame priors dropped because their marginal was not positive definite.
     pub pose_inertial_prior_dropped: u64,
+    /// Frames rejected because the pose-inertial solve kept fewer than
+    /// `min_inliers` (ORB-SLAM3 fails them too).
+    pub pose_inertial_rejects: u64,
     /// Transitions of the IMU prediction from trusted to untrusted.
     pub imu_trust_lost: u64,
     /// Midpoint preintegrations that held the last sample to the frame stamp.

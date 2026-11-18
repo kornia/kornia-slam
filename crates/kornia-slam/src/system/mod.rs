@@ -1799,9 +1799,15 @@ impl SlamSystem {
 
         self.tracker.spawn_refills();
 
+        let result = match result {
+            Ok(mut estimate) => self
+                .refine_pose_inertial(&frame, &mut estimate, prev_timestamp, timestamp_sec)
+                .then_some(estimate)
+                .ok_or(MapProjectionRejectReason::LowPnpInliers),
+            Err(reason) => Err(reason),
+        };
         let (mut status, matches, tracked_inliers, reject_reason) = match result {
-            Ok(mut estimate) => {
-                self.refine_pose_inertial(&frame, &mut estimate, prev_timestamp, timestamp_sec);
+            Ok(estimate) => {
                 self.note_tracked_step(&candidate_pose, &estimate.pose);
                 self.state.pose_world_to_cam = estimate.pose;
                 self.note_pose("tracked", frame_idx, &estimate.pose);
