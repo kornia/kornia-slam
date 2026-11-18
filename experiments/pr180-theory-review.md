@@ -36,6 +36,7 @@ Cross-lane: E1, E7, G3 are one design in lane S (velocity and bias from the orig
 - E14: `midpoint_extrapolates_past_the_last_sample` (`crates/kornia-sensors/src/imu.rs`); a linear gyro rate to a stamp 2.5 ms past the last sample read 0.155 rad against 0.15503 exact before the fix (3.1e-5 rad held away). `Midpoint` only, so `Hold` (the default) is unchanged. The `imu_tail_holds` counter (`system/mod.rs`, lane S) now counts extrapolated tails; its doc still says "held".
 - T1: `a_track_rewritten_between_frames_survives_its_round_trip`, `crates/kornia-slam/src/tracking/flow_tracker.rs` (the review's numbers: flow (100.4, 80.7), keypoint (101, 80)). Card E's P15 re-statement is left to the docs stage.
 - T2: `adoption_associates_the_nearest_refill_track` (fix a) and `an_orb_frame_keeps_the_refill_survivors_on_windowed_flow` (fix b), `crates/kornia-slam/src/tracking/tracker.rs`. Fixes (a) and (b) are applied, so the interim `track_refill: Off` is not.
+- T4: `the_analytic_flow_pose_drops_its_outliers`, `crates/kornia-slam/src/tracking/tracker.rs` (the review's 80 inliers and 16 coherent outliers; inlier shift 1.012 px before the fix, bound 0.7 px; mono path, so `outlier_rounds: 2` is exercised only on a rig).
 
 # E estimator
 

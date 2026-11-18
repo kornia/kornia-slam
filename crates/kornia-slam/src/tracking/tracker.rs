@@ -647,9 +647,13 @@ impl Tracker {
         let frame = input.frame;
         let mut config = self.estimator.config().pnp.clone();
         config.lm_max_iterations = max_iter;
-        config.outlier_rounds = 1;
+        // No RANSAC here: a Huber delta at the 2-dof chi-square 95 % level
+        // (ORB-SLAM3's 2.45 px) and one outlier round bound what wrong
+        // depths and moving objects can pull.
+        config.robust_scale_sq = 5.991;
+        config.outlier_rounds = 2;
         let mut observations = Vec::with_capacity(seeded.len());
-        let mut matches = Vec::with_capacity(seeded.len());
+        let mut pairs = Vec::with_capacity(seeded.len());
         for (&(mp_idx, kp_idx), &point_world) in seeded.iter().zip(points) {
             let Some(&pixel) = frame
                 .keypoints_undist
@@ -667,7 +671,7 @@ impl Tracker {
                 // Level-0 tracks: octave 0's unit information.
                 sigma_px: 1.0,
             });
-            matches.push((mp_idx, kp_idx));
+            pairs.push((mp_idx, kp_idx));
         }
         let start = input.candidate_pose;
         let pose = if frame.is_rig() {
@@ -685,7 +689,14 @@ impl Tracker {
                 .reprojection_error_sq_cam(&p_camera, o.pixel[0], o.pixel[1])
                 .is_some_and(|e| e <= final_sq)
         };
-        let inliers = observations.iter().filter(|o| inlier(o)).count();
+        // Only inliers go on as matches, so the outliers' tracks end here.
+        let matches: Vec<(usize, usize)> = observations
+            .iter()
+            .zip(&pairs)
+            .filter(|(o, _)| inlier(o))
+            .map(|(_, &pair)| pair)
+            .collect();
+        let inliers = matches.len();
         if inliers < config.min_inliers {
             return None;
         }
@@ -1300,6 +1311,71 @@ mod tests {
         assert_eq!(kept.pixel(), [refill.pixel()[0] + 1.0, refill.pixel()[1]]);
         assert_eq!(kept.age(), refill.age() + 1);
         assert_eq!(kept.map_point_idx(), None);
+    }
+
+    /// 80 exact observations and 16 coherent outliers 10 px off, all inside
+    /// the 25 px prior gate, as a `FlowPose::AnalyticGn` frame sees them.
+    fn analytic_flow_frame() -> (Frame, Vec<(usize, usize)>, Vec<Vec3F64>, PinholeCamera) {
+        let camera = PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let mut points = Vec::new();
+        let mut pixels = Vec::new();
+        for k in 0..96 {
+            let (i, j) = (k % 12, k / 12);
+            let point = Vec3F64::new(
+                (i as f64 - 5.5) * 0.35,
+                (j as f64 - 3.5) * 0.35,
+                4.0 + ((i + j) % 3) as f64 * 0.5,
+            );
+            let uv = camera.project_to_pixel(&point, 1e-6).unwrap();
+            let offset = if k % 6 == 5 { 10.0 } else { 0.0 };
+            points.push(point);
+            pixels.push([(uv.x + offset) as f32, uv.y as f32]);
+        }
+        let mut frame = test_frame(1, vec![[0; 32]; points.len()]);
+        frame.keypoints_undist = pixels;
+        let seeded = (0..points.len()).map(|k| (k, k)).collect();
+        (frame, seeded, points, camera)
+    }
+
+    /// T4: the analytic flow pose keeps only its inliers as matches, and
+    /// coherent outliers move it less than the 5 px Huber delta allowed
+    /// (about 5 * 16 / 80 = 1 px at the inliers).
+    #[test]
+    fn the_analytic_flow_pose_drops_its_outliers() {
+        let (frame, seeded, points, camera) = analytic_flow_frame();
+        let mut tracker = Tracker::new(MapProjectionConfig::default());
+        let mut input = input_at(&frame, Pose3d::IDENTITY);
+        input.trusted_prediction = false;
+        input.gate = None;
+
+        let (estimate, _) = tracker
+            .estimate_flow_analytic(input, seeded, &points, &camera, 3)
+            .unwrap()
+            .unwrap();
+
+        let shift: f64 = (0..points.len())
+            .filter(|kp| kp % 6 != 5)
+            .map(|kp| {
+                let uv = camera
+                    .project_to_pixel(&estimate.pose.transform_point(&points[kp]), 1e-6)
+                    .unwrap();
+                uv.x - frame.keypoints_undist[kp][0] as f64
+            })
+            .sum::<f64>()
+            / 80.0;
+        assert!(shift.abs() < 0.7, "inlier shift {shift:.3} px");
+        assert_eq!(estimate.matches.len(), 80);
+        assert_eq!(estimate.inliers, 80);
+        assert!(estimate.matches.iter().all(|&(_, kp)| kp % 6 != 5));
     }
 
     #[test]
