@@ -1629,6 +1629,8 @@ impl SlamSystem {
         self.state.adopt_inertial_initialization(applied.aligned);
         let pose = self.state.pose_world_to_cam;
         self.note_pose("imu_init", self.next_frame_idx.saturating_sub(1), &pose);
+        // The alignment rescaled and rotated the landmarks under the tracks (T3).
+        self.refresh_track_positions();
         Ok(applied)
     }
 
@@ -2942,6 +2944,7 @@ impl SlamSystem {
         self.report_growth(frame.idx, &growth);
         if anchor {
             self.enforce_map_bound();
+            self.refresh_track_positions();
             return true;
         }
 
@@ -2967,6 +2970,9 @@ impl SlamSystem {
 
         self.register_place_recognition(frame.idx);
         self.enforce_map_bound();
+        // Growth, fusion and an inertial refinement moved landmarks; an
+        // asynchronous result refreshes only when it arrives (T3).
+        self.refresh_track_positions();
 
         true
     }

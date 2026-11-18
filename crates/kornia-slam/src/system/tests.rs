@@ -890,6 +890,63 @@ mod own_window {
     }
 }
 
+mod windowed_tracks {
+    use super::*;
+    use crate::tracking::parallax::tests::{frame_seeing_points, map_with_keyframe_at};
+
+    /// A stereo system on the `WindowedU8` kernels whose tracks follow the
+    /// 9 landmarks of keyframe 0.
+    fn system() -> SlamSystem {
+        let mut config = config(CameraSelection::Stereo, true, LoopClosingMode::Disabled);
+        let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+        orb.frontend = FrontendConfig::Orb(OrbFrontendConfig {
+            klt_kernel: LkKernel::WindowedU8,
+            klt_window: 11,
+            ..OrbFrontendConfig::default()
+        });
+        let mut system = SlamSystem::build(config, stereo_imu_rig()).unwrap();
+        *system.map.lock().unwrap() = map_with_keyframe_at(Pose3d::IDENTITY);
+        system.state.current_keyframe_idx = Some(0);
+        system.state.last_keyframe_idx = Some(0);
+        let landmarks: Vec<Vec3F64> =
+            system.with_map_points(|mps| mps.iter().map(|mp| mp.position).collect());
+        for (i, position) in landmarks.into_iter().enumerate() {
+            system
+                .tracker
+                .adopt([10.0 * i as f32, 20.0], 0, i, position);
+        }
+        system
+    }
+
+    fn positions(system: &SlamSystem) -> Vec<Option<Vec3F64>> {
+        system
+            .tracker
+            .tracks()
+            .iter()
+            .map(|t| t.position())
+            .collect()
+    }
+
+    /// T3: a keyframe insertion that moved the map (here the whole map
+    /// shifted, as an inertial alignment rescales and rotates it) must leave
+    /// the tracks' stored positions on the new landmarks, not the old ones.
+    #[test]
+    fn a_keyframe_insertion_refreshes_the_track_positions() {
+        let mut system = system();
+        let shifted = Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            Vec3F64::new(0.3, 0.0, 0.0),
+        );
+        *system.map.lock().unwrap() = map_with_keyframe_at(shifted);
+        let moved: Vec<Option<Vec3F64>> =
+            system.with_map_points(|mps| mps.iter().map(|mp| Some(mp.position)).collect());
+        assert_ne!(positions(&system), moved);
+        let frame = frame_seeing_points(4, Pose3d::IDENTITY, &[]);
+        assert!(system.insert_keyframe(&frame, 0.2, &[], 0, KeyframeRole::Anchor));
+        assert_eq!(positions(&system), moved);
+    }
+}
+
 mod inertial_origin {
     use super::*;
     use crate::tracking::local_map::LocalMapRules;
