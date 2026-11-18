@@ -407,6 +407,60 @@ mod keyframe_evidence {
             "not measured unless the policy reads it"
         );
     }
+    /// E9: ORB-SLAM3 counts a stereo observation twice (`MapPoint.cc:162-165`),
+    /// so a landmark seen by two stereo keyframes passes the 3-observation
+    /// floor of a map with more than two keyframes.
+    #[test]
+    fn a_stereo_observation_counts_twice_toward_the_reference_points() {
+        use crate::mapping::map::{LandmarkSeed, ObservationKey};
+        use crate::tracking::KeyframeRules;
+        let points: Vec<Vec3F64> = (0..9)
+            .map(|i| Vec3F64::new((i % 3) as f64 * 0.5 - 0.5, (i / 3) as f64 * 0.4 - 0.4, 4.0))
+            .collect();
+        let stereo = |idx: usize| {
+            let mut frame = frame_seeing_points(idx, Pose3d::IDENTITY, &points);
+            frame.depth = vec![4.0; points.len()];
+            frame
+        };
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(stereo(0)))
+            .unwrap();
+        for (i, &position) in points.iter().enumerate() {
+            map.insert_landmark(LandmarkSeed {
+                position,
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx: i,
+                },
+            })
+            .unwrap();
+        }
+        map.insert_keyframe(Keyframe::from_frame(stereo(1)))
+            .unwrap();
+        for i in 0..points.len() {
+            map.link_observation(1, i, i).unwrap();
+        }
+        map.insert_keyframe(Keyframe::from_frame(frame_seeing_points(
+            2,
+            Pose3d::IDENTITY,
+            &[],
+        )))
+        .unwrap();
+
+        let mut system = SlamSystem::build(mono(), SensorRig::new(camera())).unwrap();
+        system.keyframe_policy.rules = KeyframeRules::OrbSlam3 { max_frames: 20 };
+        *system.map.lock().unwrap() = map;
+        system.state.current_keyframe_idx = Some(0);
+        let evidence = system.with_orb_slam3_evidence(
+            KeyframeEvidence::default(),
+            &frame_seeing_points(3, Pose3d::IDENTITY, &[]),
+            &[],
+            0.0,
+        );
+        assert_eq!(evidence.ref_points_min_obs, 9);
+    }
+
     /// A parked camera earns no keyframe from the motion policy; the time
     /// bound still forces one, measured from the last keyframe's timestamp.
     #[test]

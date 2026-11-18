@@ -16,6 +16,7 @@ use crate::Frame;
 use crate::inertial::trust::{ImuTrust, ImuTrustMode};
 use crate::mapping::Keyframe;
 use crate::mapping::map::ORB_SCALE_FACTOR;
+use crate::mapping::map::{Map, MapPoint};
 use crate::mapping::vi_ba_schur::RigObservationCamera;
 use crate::tracking::pose_estimation::Estimate;
 use crate::tracking::pose_estimation::pose_inertial::{
@@ -117,7 +118,7 @@ impl SlamSystem {
                         .flatten()
                         .filter(|&&mp_idx| {
                             map.map_points().get(mp_idx).is_some_and(|mp| {
-                                !mp.culled && mp.observer_keyframes().count() >= min_observers
+                                !mp.culled && orb_slam3_observations(&map, mp) >= min_observers
                             })
                         })
                         .count()
@@ -574,6 +575,30 @@ impl SlamSystem {
             step.length(),
         ));
     }
+}
+
+/// ORB-SLAM3's observation count of `mp` (`MapPoint.cc:162-165`): 2 for a
+/// keyframe whose feature has stereo depth, 1 otherwise; a rig keyframe
+/// counts once (E9).
+fn orb_slam3_observations(map: &Map, mp: &MapPoint) -> usize {
+    let observations = mp.observations();
+    observations
+        .iter()
+        .enumerate()
+        .filter(|(i, o)| {
+            !observations[..*i]
+                .iter()
+                .any(|p| p.key.keyframe_idx == o.key.keyframe_idx)
+        })
+        .map(|(_, o)| match map.get_keyframe(o.key.keyframe_idx) {
+            Some(kf)
+                if !kf.frame.is_rig() && kf.frame.stereo_depth(o.key.feature_idx).is_some() =>
+            {
+                2
+            }
+            _ => 1,
+        })
+        .sum()
 }
 
 /// One-sigma reprojection spread, px: `f · √(σ_θ² + (σ_c / z)²)` from the
