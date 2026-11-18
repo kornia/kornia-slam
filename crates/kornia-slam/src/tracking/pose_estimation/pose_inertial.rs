@@ -17,10 +17,11 @@ use crate::upstream::kornia_3d::refine_analytic::pose_jacobian_2x6;
 /// (`Optimizer.cc:4698-4712`).
 const ROUNDS: usize = 4;
 const ITERATIONS_PER_ROUND: usize = 10;
-/// Visual chi² gates per round: `LastKeyFrame` monocular and stereo, and
-/// `LastFrame` monocular (`Optimizer.cc:4700-4701, 5097-5098`).
+/// Visual chi² gates per round: `LastKeyFrame` and `LastFrame` monocular
+/// (`Optimizer.cc:4700-4701, 5097-5098`). Every row is a 2-dof pixel
+/// residual, so a stereo frame takes them too: the 3-dof stereo gates
+/// belong to a row with the right-image u, which this solve has not (E6).
 const CHI2_KEYFRAME_MONO: [f64; ROUNDS] = [12.0, 7.5, 5.991, 5.991];
-const CHI2_STEREO: [f64; ROUNDS] = [15.6, 9.8, 7.815, 7.815];
 const CHI2_FRAME_MONO: [f64; ROUNDS] = [5.991; ROUNDS];
 /// Points tracked closer than this get 1.5x the gate (`Optimizer.cc:4720-4737`).
 const CLOSE_DEPTH_M: f64 = 10.0;
@@ -33,7 +34,6 @@ const HUBER_PRIOR_CHI2: f64 = 25.0;
 /// (`Optimizer.cc:4796-4822`).
 const RESCUE_BELOW_INLIERS: usize = 30;
 const RESCUE_CHI2_MONO: f64 = 18.0;
-const RESCUE_CHI2_STEREO: f64 = 24.0;
 /// Pixel rows behind this depth are outliers.
 const MIN_DEPTH_M: f64 = 1e-3;
 
@@ -97,7 +97,6 @@ pub(crate) fn solve_pose_inertial(
     primary: &PinholeCamera,
     initial: FrameNavState,
     observations: &[PoseInertialObservation],
-    monocular: bool,
 ) -> PoseInertialSolution {
     let (previous, prior) = match anchor {
         Anchor::Fixed(state) => (*state, None),
@@ -113,10 +112,9 @@ pub(crate) fn solve_pose_inertial(
         primary,
         observations,
     };
-    let gates = match (&anchor, monocular) {
-        (_, false) => CHI2_STEREO,
-        (Anchor::Fixed(_), true) => CHI2_KEYFRAME_MONO,
-        (Anchor::Prior(_), true) => CHI2_FRAME_MONO,
+    let gates = match anchor {
+        Anchor::Fixed(_) => CHI2_KEYFRAME_MONO,
+        Anchor::Prior(_) => CHI2_FRAME_MONO,
     };
 
     let mut states = States {
@@ -139,15 +137,10 @@ pub(crate) fn solve_pose_inertial(
         }
     }
     if inliers.iter().filter(|&&inlier| inlier).count() < RESCUE_BELOW_INLIERS {
-        let rescue = if monocular {
-            RESCUE_CHI2_MONO
-        } else {
-            RESCUE_CHI2_STEREO
-        };
         for (o, inlier) in inliers.iter_mut().enumerate() {
             *inlier |= problem
                 .chi2_and_depth(o, &states.current)
-                .is_some_and(|(chi2, _)| chi2 < rescue);
+                .is_some_and(|(chi2, _)| chi2 < RESCUE_CHI2_MONO);
         }
     }
 
@@ -467,4 +460,102 @@ struct ReprojectionRow {
     residual: SVecF64<2>,
     jacobian: SMatF64<2, 6>,
     depth: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kornia_sensors::imu::{ImuCalib, ImuMeasurement};
+
+    fn camera() -> PinholeCamera {
+        PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        }
+    }
+
+    fn at_rest() -> FrameNavState {
+        FrameNavState {
+            pose_cw: Pose3d::IDENTITY,
+            velocity: Vec3F64::ZERO,
+            bias: ImuBias::default(),
+        }
+    }
+
+    /// 50 ms at rest without gravity, with loose noise.
+    fn still_edge() -> PreintegratedImu {
+        let calib = ImuCalib {
+            gyro_noise: 1.0,
+            accel_noise: 1.0,
+            gyro_bias_noise: 1.0,
+            accel_bias_noise: 1.0,
+        };
+        let mut preintegrated = PreintegratedImu::new(ImuBias::default(), calib);
+        for _ in 0..10 {
+            let sample = ImuMeasurement {
+                timestamp: 0.0,
+                gyro: Vec3F64::ZERO,
+                accel: Vec3F64::ZERO,
+            };
+            preintegrated.integrate(&sample, 0.005);
+        }
+        preintegrated
+    }
+
+    /// 40 points 12 m ahead, past the close depth, seen exactly from the
+    /// identity pose, and one row `offset_px` off.
+    fn rows(offset_px: f64) -> Vec<PoseInertialObservation> {
+        let camera = camera();
+        let mut rows: Vec<_> = (0..40)
+            .map(|k| {
+                let point_w =
+                    Vec3F64::new((k % 8) as f64 * 1.5 - 5.0, (k / 8) as f64 * 1.5 - 3.0, 12.0);
+                PoseInertialObservation {
+                    point_w,
+                    pixel: Vec2F64::new(
+                        camera.fx * point_w.x / point_w.z + camera.cx,
+                        camera.fy * point_w.y / point_w.z + camera.cy,
+                    ),
+                    information: 1.0,
+                    view: 0,
+                }
+            })
+            .collect();
+        let mut outlier = rows[17];
+        outlier.point_w.x += 0.4;
+        outlier.pixel.x = camera.fx * outlier.point_w.x / outlier.point_w.z + camera.cx + offset_px;
+        rows.push(outlier);
+        rows
+    }
+
+    /// E6: every row is a 2-dof pixel residual, so a stereo frame takes the
+    /// monocular gates too. A row at χ² ≈ 6.6 lies inside the 3-dof 7.815
+    /// and outside the 2-dof 5.991 (5 % of inliers past it, not 2 %).
+    #[test]
+    fn a_stereo_frame_gates_its_pixel_rows_with_two_dof_thresholds() {
+        let anchor = at_rest();
+        let observations = rows(6.9f64.sqrt());
+        let solution = solve_pose_inertial(
+            Anchor::Fixed(&anchor),
+            &still_edge(),
+            Vec3F64::ZERO,
+            None,
+            &[],
+            &camera(),
+            at_rest(),
+            &observations,
+        );
+        let outlier = observations.len() - 1;
+        assert_eq!(solution.inliers.iter().filter(|&&i| i).count(), 40);
+        assert!(
+            !solution.inliers[outlier],
+            "χ² ≈ 6.6 is past the 2-dof 5 % gate"
+        );
+    }
 }

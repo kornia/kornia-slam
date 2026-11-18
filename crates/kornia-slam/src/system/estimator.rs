@@ -387,7 +387,6 @@ impl SlamSystem {
             &self.rig.camera,
             initial,
             &observations,
-            !frame.is_metric(),
         );
         let inliers = solution.inliers.iter().filter(|&&inlier| inlier).count();
         let min_inliers = self.tracker.map_projection_config().pnp.min_inliers;

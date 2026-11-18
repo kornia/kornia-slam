@@ -75,6 +75,7 @@ Cross-lane: E1, E7, G3 are one design in lane S (velocity and bias from the orig
 - E7: `a_keyframe_origin_prediction_starts_from_the_keyframe_velocity` (`system/tests.rs`, mod `anchors`).
 - G3: `a_relocalized_reference_leaves_the_inertial_state_to_the_last_keyframe` (`system/tests.rs`, mod `inertial_origin`) and `a_pose_jump_keeps_the_camera_frame_velocity` (`system/recovery.rs`).
 - E2: `the_pixel_sigma_does_not_grow_with_the_distance_from_the_origin` (`system/estimator.rs`); encodes the review's 1.20 px at 0 / 8.5 / 85 m (today: 2.86 px at 8.5 m).
+- E6: `a_stereo_frame_gates_its_pixel_rows_with_two_dof_thresholds` (`tracking/pose_estimation/pose_inertial.rs`); a row at χ² ≈ 6.6 was an inlier under the 3-dof 7.815 gate.
 
 # E estimator
 
