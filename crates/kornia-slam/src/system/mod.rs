@@ -231,9 +231,7 @@ pub struct SlamSystem {
     // The primary camera's `R_cur_prev` from this frame's preintegrated gyro
     // (`GyroGuess::RotatedRay`).
     gyro_rotation: Option<Mat3F64>,
-    // A local-mapping result was applied since the last adoption, and the
-    // keyframe whose landmarks were last adopted (`adopt_landmarks`).
-    mapping_result_applied: bool,
+    // The keyframe whose landmarks were last adopted (`adopt_landmarks`).
     adopted_keyframe: Option<usize>,
 }
 
@@ -352,7 +350,6 @@ impl SlamSystem {
             rig_flow,
             flow,
             gyro_rotation: None,
-            mapping_result_applied: false,
             adopted_keyframe: None,
         }
     }
@@ -976,7 +973,6 @@ impl SlamSystem {
 
         let results = self.local_mapping.drain_results();
         if !results.is_empty() {
-            self.mapping_result_applied = true;
             self.refresh_track_positions();
         }
         for result in results {
@@ -1026,20 +1022,16 @@ impl SlamSystem {
         self.counters.flow_position_refreshes += self.tracker.refresh_positions(&map);
     }
 
-    /// Spawns tracks on the landmarks the latest keyframe created, once a
-    /// mapping result is applied after it (`adopt_landmarks`). Tracks refer
-    /// to the previous frame here: a landmark of that very frame starts at
-    /// its keypoint; an older keyframe's is tracked into it from the kept
+    /// Spawns tracks on the landmarks the latest keyframe created, on the
+    /// frame after its insertion, when `grow_keyframe` has made them; a later
+    /// mapping result only moves them (`adopt_landmarks`). Tracks refer to
+    /// the previous frame here: a landmark of that very frame starts at its
+    /// keypoint; an older keyframe's is tracked into it from the kept
     /// keyframe frames, starting at its projection.
     fn adopt_landmarks(&mut self) {
-        let (true, true, Some(kf_idx)) = (
-            self.flow.adopt_landmarks,
-            self.mapping_result_applied,
-            self.state.last_keyframe_idx,
-        ) else {
+        let (true, Some(kf_idx)) = (self.flow.adopt_landmarks, self.state.last_keyframe_idx) else {
             return;
         };
-        self.mapping_result_applied = false;
         if self.adopted_keyframe == Some(kf_idx) {
             return;
         }

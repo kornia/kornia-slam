@@ -1077,3 +1077,28 @@ mod recovery_after_loss {
         assert_eq!(system.counters.reseeds, 1);
     }
 }
+
+mod adoption {
+    use super::*;
+    use crate::tracking::parallax::tests::map_with_keyframe_at;
+
+    /// T9: with asynchronous mapping no result is back on the frame after a
+    /// keyframe; its landmarks are adopted then anyway, from its keypoints.
+    #[test]
+    fn landmarks_are_adopted_without_waiting_for_a_mapping_result() {
+        let mut system = SlamSystem::build(mono(), SensorRig::new(camera())).unwrap();
+        system.flow.adopt_landmarks = true;
+        *system.map.lock().unwrap() = map_with_keyframe_at(Pose3d::IDENTITY);
+        system.state.last_keyframe_idx = Some(0);
+        // Frame 1 is being processed, so tracks refer to keyframe 0's frame.
+        system.next_frame_idx = 2;
+
+        system.adopt_landmarks();
+
+        let landmarks = system.map.lock().unwrap().num_active_map_points();
+        let tracks = system.tracker.tracks();
+        assert!(landmarks > 0);
+        assert_eq!(tracks.len(), landmarks);
+        assert!(tracks.iter().all(|track| track.map_point_idx().is_some()));
+    }
+}

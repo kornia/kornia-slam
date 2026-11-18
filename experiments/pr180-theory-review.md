@@ -39,6 +39,7 @@ Cross-lane: E1, E7, G3 are one design in lane S (velocity and bias from the orig
 - T4: `the_analytic_flow_pose_drops_its_outliers`, `crates/kornia-slam/src/tracking/tracker.rs` (the review's 80 inliers and 16 coherent outliers; inlier shift 1.012 px before the fix, bound 0.7 px; mono path, so `outlier_rounds: 2` is exercised only on a rig).
 - T6: `an_orb_frame_keeps_the_tracks_within_the_refill_budget` and `thinning_keeps_the_oldest_tracks_within_the_budget`, `crates/kornia-slam/src/tracking/tracker.rs`. The cap reaches the tracker by `Tracker::with_track_refill` in `SlamSystem::assemble`, and `thin_tracks` runs at the end of `adopt_landmarks`: two one-line hunks in `system/mod.rs` (lane S's file) the plan did not list. Spacing is an exact distance check, not a grid. Both presets set `klt_first: Enabled(min_tracks: 48)`, half the 2 x 48 cap; the review left the value open.
 - T8: `refill_occupancy_is_where_the_tracks_start`, `crates/kornia-slam/src/tracking/flow_tracker.rs` (7 degrees of yaw, about 25 px of flow at f = 200 px).
+- T9 (adopt without waiting, lane F): `landmarks_are_adopted_without_waiting_for_a_mapping_result`, `crates/kornia-slam/src/system/tests.rs`. The wait sits in `SlamSystem::adopt_landmarks` (`system/mod.rs`), not in `flow_tracker.rs` as the plan's split says, so this part is a `system/mod.rs` hunk: the `mapping_result_applied` gate and field are removed. The `keep_keyframe` part stays with lane S.
 
 # E estimator
 
