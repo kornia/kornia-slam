@@ -91,3 +91,15 @@ Status: written 2026-11-18, before any code.
   1. the frame-0 map dying at frames 2-4 on every sequence;
   2. VIBA0's sensitivity to the start frame on R_03;
   3. card F (raw fisheye), for the overlap.
+- **2026-11-19, gap 1 (the frame-0 map dies at frames 2-4).** Traced with temporary projection-stage counters (not committed). The cause differs by sequence.
+  - **R_01 and R_03: the camera's auto-exposure ramp.**
+    - Mean cam0 intensity goes 254 → 239 → 129 → 75 on R_01, in steps every 2 frames; frames 0-1 are 99 % saturated. On R_03 it goes 151 → 66.
+    - At each step, the projection search finds keypoints near every projected point, but no descriptor within `max_hamming`: 65 of 67 points fail on Hamming distance. The predicted pose, the map points and the descriptors are unchanged.
+    - This is a property of the data, and it is cheap: a new map is seeded in the same frame.
+  - **R_11: not exposure.** Exposure is steady (mean 66-71) and so is sharpness.
+    - The device rotates 0.8-1.8 deg per frame from frame 0. The estimated poses follow the gyro (0.76 and 0.82 deg against 1.15 and 0.81 deg).
+    - At frame 3, the projection still predicts the pose well, yet 35 of 90 points have no keypoint within 15 px, and 47 more fail on Hamming distance. The stereo overlap drops from 90 to 38 triangulations in the same frame, which points to the view moving off the frame-0 structure.
+    - The cost on R_11 is the stereo-point starvation after the reset, not the reset itself.
+  - **Next:**
+    - make VIBA0 robust to its start frame, which would let `min_cold_start_points: 20` ship;
+    - card F (raw fisheye), for the overlap.
