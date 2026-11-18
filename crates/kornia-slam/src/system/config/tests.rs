@@ -1837,7 +1837,8 @@ fn knobs_that_read_the_imu_are_refused_without_it() {
         set(orb_mut(&mut config));
         config.validate()
     };
-    let knobs: [(&str, &dyn Fn(&mut OrbSlamPipeline)); 3] = [
+    type SetKnob<'a> = &'a dyn Fn(&mut OrbSlamPipeline);
+    let knobs: [(&str, SetKnob); 3] = [
         ("mapping.local_ba.lost_keyframes", &|orb| {
             orb.mapping.local_ba.lost_keyframes = LostKeyframes::FixedInertial
         }),

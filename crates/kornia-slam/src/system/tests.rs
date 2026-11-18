@@ -1007,7 +1007,7 @@ mod gyro_guess {
     use super::*;
     use crate::tracking::parallax::tests::map_with_keyframe_at;
 
-    const RATE: f64 = 0.5236; // 30°/s
+    const RATE: f64 = std::f64::consts::FRAC_PI_6; // 30°/s
     const DT: f64 = 1.0 / 15.0;
     const T_KF: f64 = 0.1;
 

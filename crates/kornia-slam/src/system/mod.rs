@@ -2642,15 +2642,13 @@ impl SlamSystem {
     ) -> Option<KeyframeGap> {
         let noise =
             recovery::inflated_noise(self.rig.imu_noise(), self.recovery.bridge_covariance_scale);
-        let Some(edge) = self.inertial.keyframe_edge(
+        let edge = self.inertial.keyframe_edge(
             noise,
             anchor.kf_idx,
             kf_idx,
             anchor.timestamp_sec,
             timestamp_sec,
-        ) else {
-            return None;
-        };
+        )?;
         let gap = bridge_gap(&edge.preintegrated.covariance);
         let published = self.map.lock().unwrap().apply_insertion(MapInsertion {
             imu_factors: vec![edge],
