@@ -19,9 +19,11 @@ const KEYFRAMES: usize = 5;
 const EDGE_SEC: f64 = 0.5;
 const ACTIVE: usize = 4;
 const SAMPLE_SEC: f64 = 1e-3;
-/// `α(t) = (A / 2πf)(1 − cos 2πf t)`, A = 1 rad/s, f = 1 Hz.
+/// `α(t) = (A / 2πf)(1 − cos 2πf t)`, A = 1 rad/s, f = 0.7 Hz. Not 1 Hz:
+/// keyframes every 0.5 s would then sit where `α̇ = 0` and `p̈ = 0`, and
+/// `ΔR`, `Δv` would not see `td` to first order (D6).
 const RATE: f64 = 1.0;
-const FREQ: f64 = 1.0;
+const FREQ: f64 = 0.7;
 /// Forward speed (m/s) and sway amplitude (m): the speed stays above the gate.
 const V0: f64 = 0.5;
 const SWAY: f64 = 0.05;
@@ -57,6 +59,11 @@ impl Motion {
     };
     const PURE_ROTATION: Self = Self {
         two_axis: false,
+        v0: 0.0,
+        sway: 0.0,
+    };
+    const ROTATION_ONLY: Self = Self {
+        two_axis: true,
         v0: 0.0,
         sway: 0.0,
     };
@@ -538,6 +545,31 @@ fn online_td_recovers_injected_offset() {
             estimate * 1e3
         );
     }
+}
+
+/// GT1 on the gyro alone (D6): no translation, so `td` is seen only through
+/// `ΔR`, whose derivative is `ω(t0) − ω(t1)`; that needs the rate to differ
+/// at the keyframes. Red on the old timing (2026-11-18): keyframes every
+/// half period of the 1 Hz motion sit where the rate is zero, and 3 ms came
+/// back as 0.93 ms.
+#[test]
+fn online_td_recovers_from_the_gyro_alone() {
+    let td = 3e-3;
+    let window = window(&Truth {
+        motion: Motion::ROTATION_ONLY,
+        td,
+        instantaneous: true,
+        ..Truth::default()
+    });
+    // No translation: the gate would hold the states.
+    let (_, outcome, layout) = solve_window(&window, config(false, false, false, true), true);
+    let estimate = outcome.values.clock_offset(&layout);
+    assert!(
+        (estimate - td).abs() <= 0.3e-3,
+        "td {:.3} ms estimated {:.4} ms",
+        td * 1e3,
+        estimate * 1e3
+    );
 }
 
 /// GT2: the rotation offsets, each a single solve from 0. The secondary
