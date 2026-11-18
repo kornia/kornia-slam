@@ -934,3 +934,139 @@ fn the_large_window_applies_above_its_inlier_threshold() {
     );
     assert_eq!(LocalBaParams::default().large(), LocalBaParams::default());
 }
+
+/// Five level keyframes cruising along x at 2 m/s, 0.1 s apart, the
+/// landmarks of `fixture` imaged exactly, and IMU edges measured by a body
+/// whose true extrinsic is the factory one (identity) turned by the
+/// primary rotation offset `theta`: `T_bc = Exp(−θ)`.
+fn cruise_map(gravity: Vec3F64, theta: Vec3F64) -> Map {
+    const EDGE_SEC: f64 = 0.1;
+    const SPEED: f64 = 2.0;
+    let points: Vec<_> = (0..12)
+        .map(|i| {
+            Vec3F64::new(
+                (i % 4) as f64 * 0.4 - 0.6,
+                (i / 4) as f64 * 0.3 - 0.3,
+                4.0 + (i % 3) as f64 * 0.5,
+            )
+        })
+        .collect();
+    let mut map = Map::new();
+    for id in 0..5 {
+        let mut frame = test_frame(id, vec![[0; 32]; 12]);
+        let x = SPEED * EDGE_SEC * id as f64;
+        for (feature, point) in points.iter().enumerate() {
+            frame.features.keypoints_xy[feature] = [
+                (200.0 * (point.x - x) / point.z + 320.0) as f32,
+                (200.0 * point.y / point.z + 240.0) as f32,
+            ];
+        }
+        frame.pose_world_to_cam.translation.x = -x;
+        map.insert_keyframe(Keyframe::from_frame(frame)).unwrap();
+    }
+    map.edit_keyframes_for_test(|_, kf| kf.velocity_world = Vec3F64::new(SPEED, 0.0, 0.0));
+    for (feature, point) in points.into_iter().enumerate() {
+        let id = map
+            .insert_landmark(LandmarkSeed {
+                position: point,
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx: feature,
+                },
+            })
+            .unwrap();
+        for kf in 1..5 {
+            map.link_observation(kf, feature, id).unwrap();
+        }
+    }
+    let calib = ImuCalib {
+        gyro_noise: 1.7e-4,
+        accel_noise: 2e-3,
+        gyro_bias_noise: 2e-5,
+        accel_bias_noise: 3e-3,
+    };
+    let accel = SO3F64::exp(theta * -1.0) * (gravity * -1.0);
+    let imu_factors = (0..4)
+        .map(|k| {
+            let t0 = EDGE_SEC * k as f64;
+            let samples: Vec<ImuMeasurement> = (0..=20)
+                .map(|s| ImuMeasurement {
+                    timestamp: t0 + EDGE_SEC * s as f64 / 20.0,
+                    gyro: Vec3F64::ZERO,
+                    accel,
+                })
+                .collect();
+            ImuFactor {
+                prev_kf_idx: k,
+                curr_kf_idx: k + 1,
+                preintegrated: PreintegratedImu::from_measurements(
+                    ImuBias::default(),
+                    calib,
+                    &samples,
+                    t0,
+                    t0 + EDGE_SEC,
+                ),
+                raw_samples: samples,
+                t0,
+                t1: t0 + EDGE_SEC,
+                bias_walk_extra_s: 0.0,
+                interpolation: SampleInterpolation::Hold,
+            }
+        })
+        .collect();
+    map.apply_insertion(MapInsertion {
+        imu_factors,
+        ..Default::default()
+    })
+    .unwrap();
+    map
+}
+
+/// D1: with the primary rotation state on, the solve reads the extrinsic
+/// `T_bc · Exp(−θ)`, so the boundary prior must be formed there too. The
+/// data are exact at θ = 0.2°, so that prior's gradient at the solved state
+/// is round-off: 9.5e-3 (2026-11-18). Red on the old code: formed at the
+/// factory extrinsic, the velocity residual `g·θ·dt` made it 42.7.
+#[test]
+fn the_boundary_prior_is_formed_at_the_calibrated_extrinsic() {
+    use crate::mapping::calibration_states::{Calibration, Layout};
+    use crate::mapping::global_vi_ba::RotationSlicePrior;
+
+    let gravity = Vec3F64::new(0.0, 9.81, 0.0);
+    let theta = Vec3F64::new(0.2f64.to_radians(), 0.0, 0.0);
+    let map = cruise_map(gravity, theta);
+    let config = OnlineCalibrationConfig {
+        camera_rotation: Some(RotationSlicePrior {
+            step_sigma_deg: 0.05,
+            value_sigma_deg: 1.0,
+        }),
+        ..OnlineCalibrationConfig::default()
+    };
+    let start = OnlineCalibrationState::default().advanced(
+        &config,
+        &Layout::online(&config, 1),
+        &Calibration {
+            values: theta.to_array().to_vec(),
+        },
+        false,
+    );
+    let params = LocalBaParams {
+        boundary: BoundaryPrior::Marginal(FrozenPoseSigma::default()),
+        online_calibration: config,
+        ..LocalBaParams::default()
+    };
+    let update = run_local_inertial_ba_calibrated(
+        map.ba_snapshot(&local_window(&map)),
+        &camera(),
+        None,
+        gravity,
+        &[],
+        &[],
+        &params,
+        &start,
+    );
+    let prior = update.next_prior.expect("the fallback prior");
+    let worst = prior.rhs.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    assert!(worst < 1.0, "prior gradient {worst:.3e}");
+}

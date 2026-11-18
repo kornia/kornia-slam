@@ -1343,6 +1343,35 @@ pub(crate) fn visual_inertial_bundle_adjust_calibrated(
     Ok((result, next))
 }
 
+/// `params` and the boundary `edge` (entry `e` of the solve's IMU edges)
+/// under the calibration `input.start` carries: the extrinsic with its
+/// primary rotation offset, the edge re-integrated at its gyro and clock
+/// states. A calibrated solve reads the edge there, so the marginal prior
+/// that stands in for it is formed there too (D1).
+pub(crate) fn boundary_under_calibration(
+    params: &ViBaParams,
+    input: &OnlineCalibrationInput<'_>,
+    e: usize,
+    edge: &ImuFactor,
+    bias: ImuBias,
+) -> (ViBaParams, ImuFactor) {
+    let solve = CalibratedSolve::new(&[], &[], params, input);
+    let values = &solve.previous;
+    let preintegrated = input
+        .map_edges
+        .get(e)
+        .filter(|_| solve.layout.imu_reintegrates())
+        .and_then(|map_edge| solve.reintegrate(map_edge, bias, values))
+        .unwrap_or_else(|| edge.preintegrated.clone());
+    (
+        ViBaParams {
+            imu_t_bc: solve.imu_t_bc(values, params),
+            ..params.clone()
+        },
+        ImuFactor::new(edge.from_idx, edge.to_idx, preintegrated),
+    )
+}
+
 /// Slot of each free keyframe among the free ones, `-1` for a fixed one. A
 /// keyframe is free if it is not marked fixed and appears in at least one
 /// observation, IMU, wheel or stationary edge (otherwise it has no gradient,
@@ -1995,20 +2024,17 @@ fn build_reduced_system(
         let (hw_vis, c_vis) = visual_huber(chi2_vis, params.huber_reproj_px_sq);
         cost_vis += c_vis;
         let sqrt_hw_vis = hw_vis.sqrt();
-        let jp = SMatF64::<2, 6>::from_fn(|i, k| {
-            f64::from(jp_f32[i * 6 + k]) * inv_sigma * sqrt_hw_vis
-        });
-        let jx = SMatF64::<2, 3>::from_fn(|i, k| {
-            f64::from(jx_f32[i * 3 + k]) * inv_sigma * sqrt_hw_vis
-        });
+        let jp =
+            SMatF64::<2, 6>::from_fn(|i, k| f64::from(jp_f32[i * 6 + k]) * inv_sigma * sqrt_hw_vis);
+        let jx =
+            SMatF64::<2, 3>::from_fn(|i, k| f64::from(jx_f32[i * 3 + k]) * inv_sigma * sqrt_hw_vis);
 
         let pli = usize::try_from(kf_local[obs.pose_idx]).ok();
         let r_vis = r_raw * sqrt_hw_vis;
         vis.add_rows(pli, xli, &jp, &jx, &r_vis);
         if let (Some(border), Some(view)) = (border.as_mut(), view.as_ref()) {
             let columns = view.rows(point, inv_sigma * sqrt_hw_vis);
-            border
-                .add_observation(&mut m_mat, &mut m_vec, &columns, pli, xli, &jp, &jx, &r_vis);
+            border.add_observation(&mut m_mat, &mut m_vec, &columns, pli, xli, &jp, &jx, &r_vis);
         }
 
         // Depth residual (stereo metric anchor) — see
@@ -2448,14 +2474,7 @@ fn solve_vi_ba(
             c_inv,
             border,
             cost: cost_f64,
-        } = build_reduced_system(
-            &inputs,
-            &state,
-            lambda,
-            &mut vis_inlier,
-            is_first_iter,
-            &[],
-        );
+        } = build_reduced_system(&inputs, &state, lambda, &mut vis_inlier, is_first_iter, &[]);
         let dim = m_vec.len();
         if initial_cost == f64::MAX {
             initial_cost = cost_f64;

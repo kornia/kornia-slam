@@ -634,7 +634,8 @@ fn run_local_inertial_ba_inner(
     update.state_envelope = params.state_envelope;
     let snapshot = &update.snapshot;
     use crate::mapping::vi_ba_schur::{
-        visual_inertial_bundle_adjust, visual_inertial_bundle_adjust_calibrated,
+        boundary_under_calibration, visual_inertial_bundle_adjust,
+        visual_inertial_bundle_adjust_calibrated,
     };
 
     const MIN_OBSERVATIONS: usize = 8;
@@ -819,11 +820,35 @@ fn run_local_inertial_ba_inner(
         observation_sigma_px,
         ..ViBaParams::default()
     };
+    let calibration_input = calibration.map(|(start, config)| OnlineCalibrationInput {
+        config: *config,
+        start,
+        map_edges,
+        active_keyframes: params.active_keyframes,
+    });
     let boundary = imu_edges
         .iter()
-        .find(|e| e.from_idx < active_start && e.to_idx >= active_start);
-    if let (BoundaryPrior::Marginal(sigma), Some(edge)) = (params.boundary, boundary) {
-        vi_params.prior = match carried_prior(snapshot, &vi_keyframes, edge, &vi_params, sigma) {
+        .position(|e| e.from_idx < active_start && e.to_idx >= active_start);
+    // A calibrated solve reads the boundary edge under its calibration, so
+    // the prior is formed there: the carried values before the solve, the
+    // solved ones for the fallback after it (D1).
+    let calibrated_boundary = |input: Option<&OnlineCalibrationInput<'_>>,
+                               e: usize,
+                               kfs: &[ViBaKeyframe],
+                               params: &ViBaParams| {
+        let edge = &imu_edges[e];
+        input.map(|input| {
+            boundary_under_calibration(params, input, e, edge, kfs[edge.from_idx].bias)
+        })
+    };
+    if let (BoundaryPrior::Marginal(sigma), Some(e)) = (params.boundary, boundary) {
+        let calibrated =
+            calibrated_boundary(calibration_input.as_ref(), e, &vi_keyframes, &vi_params);
+        let (prior_params, edge) = calibrated
+            .as_ref()
+            .map_or((&vi_params, &imu_edges[e]), |(p, edge)| (p, edge));
+        let carried = carried_prior(snapshot, &vi_keyframes, edge, prior_params, sigma);
+        vi_params.prior = match carried {
             Ok(prior) => Some(prior),
             Err(reason) => {
                 debug_eprintln!("[vi_ba] PRIOR fallback: {reason}");
@@ -832,7 +857,7 @@ fn run_local_inertial_ba_inner(
             }
         };
     }
-    let solved = match calibration {
+    let solved = match &calibration_input {
         None => visual_inertial_bundle_adjust(
             &vi_keyframes,
             &window.positions,
@@ -844,7 +869,7 @@ fn run_local_inertial_ba_inner(
             &vi_params,
         )
         .map(|result| (result, None)),
-        Some((start, config)) => visual_inertial_bundle_adjust_calibrated(
+        Some(input) => visual_inertial_bundle_adjust_calibrated(
             &vi_keyframes,
             &window.positions,
             &observations,
@@ -853,12 +878,7 @@ fn run_local_inertial_ba_inner(
             &stationary_edges,
             camera,
             &vi_params,
-            &OnlineCalibrationInput {
-                config: *config,
-                start,
-                map_edges,
-                active_keyframes: params.active_keyframes,
-            },
+            input,
         )
         .map(|(result, state)| (result, Some(state))),
     };
@@ -909,12 +929,25 @@ fn run_local_inertial_ba_inner(
     update.newest_marginal = vi_result
         .newest_marginal
         .map(|marginal| (snapshot.keyframes()[n_kfs - 1].frame.idx, marginal));
-    if let (BoundaryPrior::Marginal(sigma), Some(edge)) = (params.boundary, boundary) {
+    if let (BoundaryPrior::Marginal(sigma), Some(e)) = (params.boundary, boundary) {
         // A solve that fell back starts the chain from its own result.
         update.next_prior = vi_params.prior.take().or_else(|| {
-            let (from, to) = (edge.from_idx, edge.to_idx);
             let frozen = &vi_result.keyframes;
-            marginalize_frozen(None, &frozen[from], &frozen[to], edge, &vi_params, sigma)
+            let solved_input = calibration_input
+                .as_ref()
+                .zip(online_calibration.as_ref())
+                .map(|(input, solved)| OnlineCalibrationInput {
+                    config: input.config,
+                    start: solved,
+                    map_edges: input.map_edges.clone(),
+                    active_keyframes: input.active_keyframes,
+                });
+            let calibrated = calibrated_boundary(solved_input.as_ref(), e, frozen, &vi_params);
+            let (prior_params, edge) = calibrated
+                .as_ref()
+                .map_or((&vi_params, &imu_edges[e]), |(p, edge)| (p, edge));
+            let (from, to) = (edge.from_idx, edge.to_idx);
+            marginalize_frozen(None, &frozen[from], &frozen[to], edge, prior_params, sigma)
                 .ok()
                 .map(|prior| stamped(prior, snapshot, to))
         });
