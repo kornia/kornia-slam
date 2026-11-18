@@ -74,6 +74,7 @@ Cross-lane: E1, E7, G3 are one design in lane S (velocity and bias from the orig
 - E1: `a_most_voted_reference_leaves_the_inertial_state_to_the_last_keyframe` (`system/tests.rs`, mod `inertial_origin`); prediction part shared with E7. Deviation: with the reference not the last keyframe, the refresh keeps the propagated velocity and takes the last keyframe's bias (G3's rule, one design for E1/E7/G3) instead of copying the last keyframe's velocity; the BA write-back copy at `:1009` reads the last keyframe's correction as E1 says. Both are gated on the knobs that let the reference differ (`local_map: OrbSlam3`, `relocalization.while_lost`, `reseed.relocalize_when_lost`): a default relocalization (loop closing on, IMU not yet trusted) still copies the reference's state, as before; `without_the_knobs_the_reference_state_is_copied` pins it.
 - E7: `a_keyframe_origin_prediction_starts_from_the_keyframe_velocity` (`system/tests.rs`, mod `anchors`).
 - G3: `a_relocalized_reference_leaves_the_inertial_state_to_the_last_keyframe` (`system/tests.rs`, mod `inertial_origin`) and `a_pose_jump_keeps_the_camera_frame_velocity` (`system/recovery.rs`).
+- E2: `the_pixel_sigma_does_not_grow_with_the_distance_from_the_origin` (`system/estimator.rs`); encodes the review's 1.20 px at 0 / 8.5 / 85 m (today: 2.86 px at 8.5 m).
 
 # E estimator
 

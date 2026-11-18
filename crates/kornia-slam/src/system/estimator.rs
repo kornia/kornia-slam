@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat15F64, Vec2F64, Vec3F64};
+use kornia_algebra::{Mat15F64, SMatF64, Vec2F64, Vec3F64};
 use kornia_factors::inertial::NavState;
 use kornia_factors::inertial::preintegration::propagate_state_covariance;
 use kornia_sensors::imu::ImuBias;
@@ -231,7 +231,7 @@ impl SlamSystem {
         let Some(covariance) = self.predicted_covariance(timestamp_sec, predicted_pose) else {
             return by_time;
         };
-        let Some(pixel_sigma) = self.pixel_sigma(&covariance) else {
+        let Some(pixel_sigma) = self.pixel_sigma(&covariance, predicted_pose) else {
             return by_time;
         };
         let config = self.tracker.map_projection_config();
@@ -306,21 +306,16 @@ impl SlamSystem {
         Some(covariance)
     }
 
-    /// One-sigma reprojection spread, px: `f · √(σ_θ² + (σ_p / z)²)` from the
-    /// largest rotation and translation variances and the reference
-    /// keyframe's median landmark depth `z`.
-    fn pixel_sigma(&self, covariance: &Mat15F64) -> Option<f64> {
-        let largest = |base: usize| {
-            covariance
-                .fixed_view::<3, 3>(base, base)
-                .into_owned()
-                .symmetric_eigenvalues()
-                .max()
-                .max(0.0)
-        };
+    /// [`pixel_sigma_px`] at `predicted_pose` and the reference keyframe's
+    /// median landmark depth.
+    fn pixel_sigma(&self, covariance: &Mat15F64, predicted_pose: &Pose3d) -> Option<f64> {
         let depth = self.reference_median_depth()?;
-        let spread = self.rig.camera.fx * (largest(3) + largest(0) / (depth * depth)).sqrt();
-        spread.is_finite().then_some(spread)
+        pixel_sigma_px(
+            covariance,
+            camera_centre(predicted_pose),
+            self.rig.camera.fx,
+            depth,
+        )
     }
 
     /// Median camera-frame depth of the reference keyframe's landmarks.
@@ -582,6 +577,27 @@ impl SlamSystem {
     }
 }
 
+/// One-sigma reprojection spread, px: `f · √(σ_θ² + (σ_c / z)²)` from the
+/// largest rotation and camera-centre variances at landmark depth `z`.
+/// Under `T_cw·Exp(ρ, ω)` the centre `c` moves by `δc = −ρ + [c]×ω`, so its
+/// covariance is `A Σ Aᵀ` with `A = [−I | [c]×]`; the ρ block alone grows
+/// with the distance from the world origin (E2).
+fn pixel_sigma_px(covariance: &Mat15F64, centre: Vec3F64, fx: f64, depth: f64) -> Option<f64> {
+    let largest = |block: SMatF64<3, 3>| block.symmetric_eigenvalues().max().max(0.0);
+    let mut a = SMatF64::<3, 6>::zeros();
+    a.fixed_view_mut::<3, 3>(0, 0)
+        .copy_from(&-SMatF64::<3, 3>::identity());
+    a.fixed_view_mut::<3, 3>(0, 3)
+        .copy_from(&SMatF64::<3, 3>::new(
+            0.0, -centre.z, centre.y, centre.z, 0.0, -centre.x, -centre.y, centre.x, 0.0,
+        ));
+    let pose: SMatF64<6, 6> = covariance.fixed_view::<6, 6>(0, 0).into_owned();
+    let centre_covariance = a * pose * a.transpose();
+    let rotation = covariance.fixed_view::<3, 3>(3, 3).into_owned();
+    let spread = fx * (largest(rotation) + largest(centre_covariance) / (depth * depth)).sqrt();
+    spread.is_finite().then_some(spread)
+}
+
 /// The secondary cameras of `frame`'s rig, in rig order after the primary;
 /// empty outside a rig.
 fn rig_observation_cameras(frame: &Frame) -> Vec<RigObservationCamera> {
@@ -601,4 +617,51 @@ fn rig_observation_cameras(frame: &Frame) -> Vec<RigObservationCamera> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `[c]×`, the cross-product matrix of `c`.
+    fn hat(c: Vec3F64) -> SMatF64<3, 3> {
+        SMatF64::<3, 3>::new(0.0, -c.z, c.y, c.z, 0.0, -c.x, -c.y, c.x, 0.0)
+    }
+
+    /// The state covariance of a camera centred at `centre` with isotropic
+    /// centre and rotation sigmas, in `T_cw·Exp(ρ, ω)` coordinates:
+    /// `ρ = [c]×ω − δc`.
+    fn covariance_at(centre: Vec3F64, sigma_c: f64, sigma_theta: f64) -> Mat15F64 {
+        let c = hat(centre);
+        let omega = SMatF64::<3, 3>::identity() * sigma_theta.powi(2);
+        let mut covariance = Mat15F64::identity() * 1e-6;
+        covariance.fixed_view_mut::<3, 3>(0, 0).copy_from(
+            &(SMatF64::<3, 3>::identity() * sigma_c.powi(2) + c * omega * c.transpose()),
+        );
+        covariance
+            .fixed_view_mut::<3, 3>(0, 3)
+            .copy_from(&(c * omega));
+        covariance
+            .fixed_view_mut::<3, 3>(3, 0)
+            .copy_from(&(omega * c.transpose()));
+        covariance.fixed_view_mut::<3, 3>(3, 3).copy_from(&omega);
+        covariance
+    }
+
+    /// E2: σ_θ 2 mrad, σ_c 5 mm, z 3 m, f 458 give 1.20 px wherever the
+    /// camera is; the ρ block read as the centre's gave 2.87 px at 8.5 m and
+    /// 26.06 px at 85 m.
+    #[test]
+    fn the_pixel_sigma_does_not_grow_with_the_distance_from_the_origin() {
+        for distance in [0.0, 8.5, 85.0] {
+            let centre = Vec3F64::new(
+                distance / 3f64.sqrt(),
+                distance / 3f64.sqrt(),
+                -distance / 3f64.sqrt(),
+            );
+            let sigma =
+                pixel_sigma_px(&covariance_at(centre, 5e-3, 2e-3), centre, 458.0, 3.0).unwrap();
+            assert!((sigma - 1.192).abs() < 5e-3, "{sigma} px at {distance} m");
+        }
+    }
 }
