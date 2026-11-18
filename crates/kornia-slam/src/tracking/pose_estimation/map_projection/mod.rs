@@ -153,7 +153,7 @@ pub enum MapProjectionRejectReason {
 /// Map-projection-based pose estimator.
 ///
 /// Estimates the camera pose by projecting map points into the current frame,
-/// matching via ORB descriptors, and solving PnP.
+/// matching their descriptors, and solving PnP.
 pub struct MapProjectionEstimator<D: Descriptor = [u8; 32]> {
     config: MapProjectionConfig<D>,
 }

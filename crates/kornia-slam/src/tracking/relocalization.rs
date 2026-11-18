@@ -102,8 +102,7 @@ pub fn relocalize<D: Descriptor>(
 }
 
 // TODO: adapt for global descriptors (e.g. NetVLAD/DINO) — retrieve candidate
-// keyframes by global embedding instead of ORB/BoW, and make local matching
-// descriptor-agnostic.
+// keyframes by global embedding instead of BoW.
 /// `(map_point_idx, keypoint_idx)` pairs from descriptor matches against the
 /// keyframe's associated landmarks.
 fn keyframe_correspondences<D: Descriptor>(
