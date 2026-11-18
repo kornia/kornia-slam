@@ -7,6 +7,7 @@ Four read-only reviews (E estimator, D offline BA and calibration, G geometry an
 - G13: skipped, not fixed. Unreachable: only with `node_spacing: Some`, and `correction()` has no non-test caller.
 - G5: the rig relocalisation residual becomes a true pixel residual. `RayMatch` gains the optical axis; the residual is on the image plane and `INFINITY` behind the camera. Test with a 4 px off-axis error.
 - G1: a lost relocalisation detaches. No odometry edge across the jump; add an `EdgeKind::Loop` edge from `found.keyframe_idx` to the new keyframe with loop sigmas (coasted re-seed: sigmas from the bridge covariance; held re-seed: `sigma_m = max_coast_speed_mps * gap_sec`). Merging that segment later stays a roadmap item.
+- G4: `a_mediocre_pose_does_not_cut_the_prefix_search_short` (`crates/kornia-slam/src/upstream/kornia_3d/gpnp.rs`); found the truth in 4 of 40 seeds before the fix (predicted about 11 %), needs 24.
 - Rest: fix all findings, each with a test that fails on today's code.
 
 ## Lane assignment

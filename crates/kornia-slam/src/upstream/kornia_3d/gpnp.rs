@@ -175,7 +175,8 @@ impl Sampler for PrefixSampler {
 }
 
 /// RANSAC (`kornia_3d::ransac::run`, `ThresholdConsensus`): hypotheses from
-/// `matches[..hypothesis_count]`, scored on all matches. Returns the pose and the inlier mask.
+/// `matches[..hypothesis_count]`, scored on all matches, for all `max_iterations` draws.
+/// Returns the pose and the inlier mask.
 pub fn ransac_lifted_ap3p(
     matches: &[RayMatch],
     hypothesis_count: usize,
@@ -188,9 +189,12 @@ pub fn ransac_lifted_ap3p(
         return None;
     }
     let threshold_sq = threshold_px * threshold_px;
+    // No adaptive stop: kornia's cap counts support over all matches, but only the prefix is
+    // drawn from, so a pose carried by the other cameras would end the search early.
     let config = RansacConfig {
         max_iters: max_iterations,
         inlier_threshold: threshold_sq,
+        confidence: 1.0,
         ..RansacConfig::default()
     };
     let result = run(
@@ -328,6 +332,53 @@ mod tests {
         assert!((pose.translation - truth.translation).length() < 1e-3);
         assert_eq!(inliers.iter().filter(|&&b| b).count(), 26 + 30);
         assert!(inliers[40..].iter().all(|&b| b));
+    }
+
+    /// G4: a mediocre pose whose support is mostly the other camera must not end the search
+    /// before a clean triple of the hypothesis camera is drawn. The prefix holds 8 true and 32
+    /// matches of a pose 0.5 m off; 100 distant points fit both poses and 60 near ones only the
+    /// truth. The off pose (132 of 200) capped the loop at 21 draws over the whole population,
+    /// so the truth (8 of 40 in the prefix, 0.57 % per draw) came out in about 11 % of seeds;
+    /// 300 draws find it in about 82 %.
+    #[test]
+    fn a_mediocre_pose_does_not_cut_the_prefix_search_short() {
+        let side = side_camera();
+        let truth = truth();
+        let off = Pose3d::new(
+            truth.rotation,
+            truth.translation + Vec3F64::new(0.5, 0.0, 0.0),
+        );
+        let seen_by = |pose: &Pose3d, camera: &Pose3d, p_camera: Vec3F64| RayMatch {
+            point_world: pose
+                .inverse()
+                .transform_point(&camera.transform_point(&p_camera)),
+            ..ray_match(camera, p_camera)
+        };
+        let grid = |i: usize, z: f64| {
+            Vec3F64::new(
+                ((i % 7) as f64 * 0.37 - 1.1) * z / 4.0,
+                ((i / 7 % 6) as f64 * 0.29 - 0.7) * z / 4.0,
+                z + (i % 3) as f64 * 0.4,
+            )
+        };
+        let mut matches = Vec::new();
+        for i in 0..40 {
+            let pose = if i % 5 == 0 { &truth } else { &off };
+            matches.push(seen_by(pose, &side, grid(i, 4.0)));
+        }
+        for i in 0..100 {
+            matches.push(seen_by(&truth, &Pose3d::IDENTITY, grid(i, 100.0)));
+        }
+        for i in 0..60 {
+            matches.push(seen_by(&truth, &Pose3d::IDENTITY, grid(i, 5.0)));
+        }
+        let found = (0..40)
+            .filter(|&seed| {
+                ransac_lifted_ap3p(&matches, 40, 4.0, 300, seed)
+                    .is_some_and(|(pose, _)| (pose.translation - truth.translation).length() < 0.05)
+            })
+            .count();
+        assert!(found >= 24, "the truth in {found} of 40 seeds");
     }
 
     #[test]
