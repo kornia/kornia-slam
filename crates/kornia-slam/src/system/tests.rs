@@ -452,13 +452,34 @@ mod keyframe_evidence {
         system.keyframe_policy.rules = KeyframeRules::OrbSlam3 { max_frames: 20 };
         *system.map.lock().unwrap() = map;
         system.state.current_keyframe_idx = Some(0);
-        let evidence = system.with_orb_slam3_evidence(
+        let (evidence, _) = system.with_orb_slam3_evidence(
             KeyframeEvidence::default(),
             &frame_seeing_points(3, Pose3d::IDENTITY, &[]),
             &[],
             0.0,
         );
         assert_eq!(evidence.ref_points_min_obs, 9);
+    }
+
+    /// T7: a flow frame's keyframe evidence locks the map, once more under
+    /// the OrbSlam3 keyframe rules; `flow_map_wait` (P17) must see those
+    /// waits, so a held lock shows up in it.
+    #[test]
+    fn the_keyframe_evidence_reports_its_map_lock_wait() {
+        let mut system = system_tracked_at(None, Pose3d::IDENTITY);
+        system.keyframe_policy.rules = crate::tracking::KeyframeRules::OrbSlam3 { max_frames: 20 };
+        let frame = frame_seeing_points(7, Pose3d::IDENTITY, &[]);
+        let map = Arc::clone(&system.map);
+        let (locked, held) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = map.lock().unwrap();
+            locked.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(60));
+        });
+        held.recv().unwrap();
+        let (_, waited) = system.timed_keyframe_evidence(&frame, 0, &[], 0.0);
+        holder.join().unwrap();
+        assert!(waited >= Duration::from_millis(40), "{waited:?}");
     }
 
     /// A parked camera earns no keyframe from the motion policy; the time

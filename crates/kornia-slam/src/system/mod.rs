@@ -2253,8 +2253,13 @@ impl SlamSystem {
         };
 
         let started = Instant::now();
-        let evidence =
-            self.keyframe_evidence(&frame, estimate.inliers, &estimate.matches, timestamp_sec);
+        let (evidence, map_wait) = self.timed_keyframe_evidence(
+            &frame,
+            estimate.inliers,
+            &estimate.matches,
+            timestamp_sec,
+        );
+        self.tracking_timings.flow_map_wait += map_wait;
         if self.keyframe_due(&evidence, timestamp_sec) {
             self.tracking_timings.flow_bookkeeping += started.elapsed();
             self.dbg(format!(
@@ -2379,7 +2384,22 @@ impl SlamSystem {
         matches: &[(usize, usize)],
         timestamp_sec: f64,
     ) -> KeyframeEvidence {
+        self.timed_keyframe_evidence(frame, tracked_inliers, matches, timestamp_sec)
+            .0
+    }
+
+    /// [`Self::keyframe_evidence`] and how long it waited for the map lock,
+    /// which a flow frame's `flow_map_wait` includes (T7).
+    fn timed_keyframe_evidence(
+        &self,
+        frame: &Frame,
+        tracked_inliers: usize,
+        matches: &[(usize, usize)],
+        timestamp_sec: f64,
+    ) -> (KeyframeEvidence, Duration) {
+        let waited = Instant::now();
         let map = self.map.lock().unwrap();
+        let map_wait = waited.elapsed();
         let n_ref_map_points = self
             .state
             .current_keyframe_idx
@@ -2410,7 +2430,9 @@ impl SlamSystem {
             median_parallax_px,
             ..KeyframeEvidence::default()
         };
-        self.with_orb_slam3_evidence(evidence, frame, matches, timestamp_sec)
+        let (evidence, orb_slam3_wait) =
+            self.with_orb_slam3_evidence(evidence, frame, matches, timestamp_sec);
+        (evidence, map_wait + orb_slam3_wait)
     }
 
     /// The policy's decision, or `max_interval_sec` elapsed since the last

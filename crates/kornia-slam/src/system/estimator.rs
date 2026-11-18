@@ -5,6 +5,7 @@
 //! the G29 counter only counts.
 
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat15F64, SMatF64, Vec2F64, Vec3F64};
@@ -102,20 +103,24 @@ impl KeyframeNav {
 }
 
 impl SlamSystem {
-    /// `evidence` with what ORB-SLAM3's keyframe rules read; unchanged under
-    /// the default rules, which ignore it.
+    /// `evidence` with what ORB-SLAM3's keyframe rules read, and how long it
+    /// waited for the map lock; unchanged under the default rules, which
+    /// ignore it.
     pub(super) fn with_orb_slam3_evidence(
         &self,
         evidence: KeyframeEvidence,
         frame: &Frame,
         matches: &[(usize, usize)],
         timestamp_sec: f64,
-    ) -> KeyframeEvidence {
+    ) -> (KeyframeEvidence, Duration) {
         if self.keyframe_policy.rules == KeyframeRules::Kornia {
-            return evidence;
+            return (evidence, Duration::ZERO);
         }
+        let waited = Instant::now();
+        let mut map_wait = Duration::ZERO;
         let ref_points_min_obs = {
             let map = self.map.lock().unwrap();
+            map_wait += waited.elapsed();
             // `Tracking.cc:3097-3100`.
             let min_observers = if map.keyframes().len() <= 2 { 2 } else { 3 };
             self.state
@@ -134,7 +139,7 @@ impl SlamSystem {
                 })
         };
         let (tracked_close, untracked_close) = self.close_point_counts(frame, matches);
-        KeyframeEvidence {
+        let evidence = KeyframeEvidence {
             ref_points_min_obs,
             tracked_close,
             untracked_close,
@@ -151,7 +156,8 @@ impl SlamSystem {
                 .last_relocalization_frame
                 .map(|reloc| frame.idx.saturating_sub(reloc)),
             ..evidence
-        }
+        };
+        (evidence, map_wait)
     }
 
     /// Primary-camera keypoints with a stereo depth closer than the close
