@@ -460,19 +460,24 @@ impl PreintegratedImu {
 
 /// Gyro and accelerometer readings at `t` from time-sorted, non-empty
 /// `sorted`: linear between the two samples that bracket it, held at the
-/// nearest sample outside them.
+/// first sample before them, and past the last sample extrapolated along the
+/// last two (ORB-SLAM3 `Tracking.cc:1700-1712`), held when there is only one.
 fn reading_at(sorted: &[ImuMeasurement], t: f64) -> (Vec3F64, Vec3F64) {
     let after = sorted.partition_point(|m| m.timestamp < t);
+    let line = |a: &ImuMeasurement, b: &ImuMeasurement| {
+        let f = (t - a.timestamp) / (b.timestamp - a.timestamp);
+        (
+            a.gyro + (b.gyro - a.gyro) * f,
+            a.accel + (b.accel - a.accel) * f,
+        )
+    };
     match (after.checked_sub(1).map(|i| &sorted[i]), sorted.get(after)) {
-        (Some(a), Some(b)) => {
-            let f = (t - a.timestamp) / (b.timestamp - a.timestamp);
-            (
-                a.gyro + (b.gyro - a.gyro) * f,
-                a.accel + (b.accel - a.accel) * f,
-            )
-        }
+        (Some(a), Some(b)) => line(a, b),
         (None, Some(b)) => (b.gyro, b.accel),
-        (Some(a), None) => (a.gyro, a.accel),
+        (Some(b), None) => match after.checked_sub(2).map(|i| &sorted[i]) {
+            Some(a) if b.timestamp > a.timestamp => line(a, b),
+            _ => (b.gyro, b.accel),
+        },
         (None, None) => (Vec3F64::ZERO, Vec3F64::ZERO),
     }
 }
@@ -711,6 +716,36 @@ mod tests {
                 "diagonal {i} should not decrease"
             );
         }
+    }
+
+    /// E14: past the last sample the midpoint signal goes on along the last
+    /// two samples, as ORB-SLAM3 extrapolates (`Tracking.cc:1700-1712`). A
+    /// gyro rate linear in time then integrates exactly to a frame stamp
+    /// 2.5 ms after the last sample; holding the last sample lost 3.1e-5 rad.
+    #[test]
+    fn midpoint_extrapolates_past_the_last_sample() {
+        let samples: Vec<ImuMeasurement> = (0..=20)
+            .map(|k| {
+                let t = k as f64 * 0.005;
+                ImuMeasurement {
+                    timestamp: t,
+                    gyro: Vec3F64::new(0.0, 0.0, 1.0 + 10.0 * t),
+                    accel: Vec3F64::ZERO,
+                }
+            })
+            .collect();
+        let t1 = 0.1025;
+        let pre = PreintegratedImu::from_measurements_with(
+            ImuBias::default(),
+            default_calib(),
+            &samples,
+            0.0,
+            t1,
+            SampleInterpolation::Midpoint,
+        );
+        let angle = SO3F64::from_matrix(&pre.delta_rotation).log().z;
+        let exact = t1 + 5.0 * t1 * t1;
+        assert!((angle - exact).abs() < 1e-9, "{angle} vs {exact}");
     }
 
     /// Card A U1: ω = sin(2πt) about z at 200 Hz, frames every 50 ms offset
