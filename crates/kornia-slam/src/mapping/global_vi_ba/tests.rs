@@ -417,13 +417,12 @@ fn the_yaw_gauge_row_is_its_residual_derivative() {
     let tilted = start.retracted(&tilt, &landmarks, &[]);
     let (_, rows) = problem.gauge_rows(anchor, &tilted);
     let h = 1e-6;
-    for d in 3..6 {
+    for (d, &analytic) in rows[3].1.iter().enumerate().skip(3) {
         let at = |h: f64| {
             let state = tilted.retracted(&step(d, h), &landmarks, &[]);
             problem.gauge_rows(anchor, &state).1[3].0
         };
         let numeric = (at(h) - at(-h)) / (2.0 * h);
-        let analytic = rows[3].1[d];
         assert!(
             (numeric - analytic).abs() <= 1e-4 * numeric.abs().max(1.0),
             "ω{}: numeric {numeric:.6e}, row {analytic:.6e}",

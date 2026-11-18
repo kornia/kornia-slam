@@ -1985,7 +1985,7 @@ fn build_reduced_system(
     let mut m_mat = Mat::<f64>::zeros(dim, dim);
     let mut m_vec = vec![0.0f64; dim];
     let mut border = (n_cal > 0).then(|| Border::new(cal_base, n_free_pts));
-    let imu_t_bc = calibration.map_or(params.imu_t_bc, |c| c.imu_t_bc(&calib, params));
+    let imu_t_bc = calibration.map_or(params.imu_t_bc, |c| c.imu_t_bc(calib, params));
 
     for (o, ((obs, &depth_row), inlier)) in observations
         .iter()
@@ -2008,7 +2008,7 @@ fn build_reduced_system(
         let view = calibration.map(|c| {
             CalibratedView::new(
                 &c.layout,
-                &calib,
+                calib,
                 views.camera_index(o),
                 obs_camera,
                 obs_pose,
@@ -2125,7 +2125,7 @@ fn build_reduced_system(
             imu_t_bc.as_ref(),
         );
 
-        let omega_raw = imu_edge_information(edge, &kf_local, params);
+        let omega_raw = imu_edge_information(edge, kf_local, params);
         // Huber robustification: down-weight edges whose nav-block Mahalanobis
         // chi2 exceeds the threshold. This handles large residuals from rough
         // post-init velocity estimates without a fixed weight compromise.
@@ -2139,7 +2139,7 @@ fn build_reduced_system(
         let (hw, c_imu) = preintegration::weight_and_cost(
             &res,
             &omega_raw,
-            imu_huber_chi2(edge, &kf_local, params).unwrap_or(0.0),
+            imu_huber_chi2(edge, kf_local, params).unwrap_or(0.0),
         );
         cost_imu += c_imu;
         let omega: Mat15F64 = {
@@ -2162,7 +2162,7 @@ fn build_reduced_system(
                     |r_p|={np:.4e}  |r_bg|={nbg:.4e}  |r_ba|={nba:.4e}  \
                     Ω∈[{om_min:.2e},{om_max:.2e}]  hw={hw:.4}  boundary={}",
                 edge.preintegrated.dt,
-                is_boundary_edge(edge, &kf_local),
+                is_boundary_edge(edge, kf_local),
             );
         }
 
@@ -2192,7 +2192,7 @@ fn build_reduced_system(
             );
         }
         if let (Some(c), Some(border)) = (calibration, border.as_ref()) {
-            let columns = c.imu_columns(e, edge, &kfs, &calib, params);
+            let columns = c.imu_columns(e, edge, kfs, calib, params);
             border.add_imu(
                 &mut m_mat,
                 &mut m_vec,
@@ -2239,25 +2239,25 @@ fn build_reduced_system(
     let cost_wheel = accumulate_wheel_edges(
         &mut m_mat,
         &mut m_vec,
-        &kfs,
-        &kf_local,
+        kfs,
+        kf_local,
         wheel_edges,
-        &wheel_info,
+        wheel_info,
     );
 
     let cost_stationary = accumulate_stationary_edges(
         &mut m_mat,
         &mut m_vec,
-        &kfs,
-        &kf_local,
+        kfs,
+        kf_local,
         stationary_edges,
-        &stationary_info,
+        stationary_info,
     );
 
     let mut cost =
         cost_vis + cost_imu + cost_bias_prior + cost_prior + cost_wheel + cost_stationary;
     if let (Some(c), Some(border)) = (calibration, border.as_ref()) {
-        let rows = online_prior_rows(&c.layout, &c.config, &calib, &c.previous);
+        let rows = online_prior_rows(&c.layout, &c.config, calib, &c.previous);
         cost += border.add_priors(&mut m_mat, &mut m_vec, &rows);
     }
     hold_inertial_state(&mut m_mat, &mut m_vec, keyframes, kf_local);
