@@ -38,7 +38,9 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
     - J4 keeps the keyframes inserted while lost out of the VIBA windows;
     - J1 gates outlier velocity edges per edge;
     - both are refuted as fixes (the error is systematic, not a few edges), and are harmless on R_01, R_11 and the R_03 base.
-  - **Next:** J3 (a VIBA window that starts after the exposure ramp), then J2 (ORB-SLAM3's `FullInertialBA` after each VIBA, kornia-slam#51).
+  - **J3 cancelled before code:** under `min_cold_start_points: 20`, the R_03 visual trajectory is at about 1/5 scale for frames 25-250 (step length ours/GT 0.13-0.23; base 1.00). Rotation matches ground truth to about 0.1°. Stereo VIBA fixes scale at 1, so its velocity residuals are systematic, which explains VIBA0's error and the VIBA2 reject.
+  - **Ruled out:** LK (frames 3-45 are tracked by ORB map projection; KLT starts at frame 46), the ORB stereo seed (both configs: 63 points, median 0.80 m), and tracks surviving the reset.
+  - **Next:** measure the suspect, pair-growth triangulation across a near-zero baseline while the device is still (frames 0-32). The only guard is `|t| > 1e-8` (`mapping/growth.rs:233`); ORB-SLAM3's `CreateNewMapPoints` skips pairs below the stereo baseline. Then J2 (`FullInertialBA`, kornia-slam#51).
 - **#180, still unvalidated.** No preset changed except `pr180-full` (`pose_inertial: Off`). The validation workflow in `experiments/pr180-validation-handoff.md` has not run. The status and how to take over are in `experiments/pr180-status-2026-11-19.md`.
 
 ### 2026-11-18
