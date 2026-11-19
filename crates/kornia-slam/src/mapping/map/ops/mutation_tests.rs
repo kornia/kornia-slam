@@ -157,6 +157,24 @@ fn scale_geometry_distance_invariants() {
     assert!((mp.max_distance_invariance() - 1.2 * mp.max_distance).abs() < 1e-12);
 }
 
+#[test]
+fn scale_geometry_follows_the_map_pyramid() {
+    let mut map = Map::with_scale_pyramid(ScalePyramid {
+        factor: 2.0,
+        n_levels: 4,
+    });
+    let mut kf = Keyframe::from_frame(test_frame(0, vec![[0u8; 32]]));
+    kf.frame.features.octaves = vec![2];
+    map.insert_keyframe(kf).unwrap();
+
+    let mp_idx = map.insert_landmark(seed(0, 0, 5.0)).unwrap();
+    map.update_map_point_geometry(mp_idx);
+
+    let mp = &map.map_points()[mp_idx];
+    assert!((mp.max_distance - 20.0).abs() < 1e-9);
+    assert!((mp.min_distance - 2.5).abs() < 1e-9);
+}
+
 /// T1c: mean viewing direction is the average of unit (point - cam_center)
 /// over observing keyframes; ‖normal‖ <= 1, and for a single forward-facing
 /// observation it's exactly (point - cam_center) normalized.

@@ -20,6 +20,8 @@ pub trait Descriptor: Copy + Debug + PartialEq + Send + Sync + 'static {
     /// test (ORB-SLAM3's `ORBmatcher::TH_LOW`).
     const TH_LOW: Self::Distance;
 
+    /// Must never be NaN or otherwise unordered: matchers keep the first
+    /// best candidate and compare thresholds with `<` and `>`.
     fn distance(&self, other: &Self) -> Self::Distance;
 
     /// Unguided matching of `query` against `candidates`: at most one
@@ -47,6 +49,18 @@ impl Descriptor for [u8; 32] {
         candidates: DescriptorSet<'_, Self>,
         config: &OrbMatchConfig,
     ) -> Vec<(usize, usize)> {
+        if query.orientations.is_empty() || candidates.orientations.is_empty() {
+            return match_orb_descriptors(
+                &vec![0.0; query.descriptors.len()],
+                query.descriptors,
+                &vec![0.0; candidates.descriptors.len()],
+                candidates.descriptors,
+                OrbMatchConfig {
+                    check_orientation: false,
+                    ..*config
+                },
+            );
+        }
         match_orb_descriptors(
             query.orientations,
             query.descriptors,
@@ -233,6 +247,24 @@ mod tests {
         // Upper medians: 9.6, 0.4, 0.5, 0.5.
         let set = [Scalar(10.0), Scalar(0.4), Scalar(0.0), Scalar(0.5)];
         assert_eq!(most_distinctive(&set, |d| d), Some(1));
+    }
+
+    #[test]
+    fn orb_matching_accepts_sets_without_orientations() {
+        let candidates = [orb(0), orb(40)];
+        let query = DescriptorSet {
+            orientations: &[],
+            descriptors: &[orb(0)],
+        };
+        let candidates = DescriptorSet {
+            orientations: &[0.0, 1.0],
+            descriptors: &candidates,
+        };
+        let config = OrbMatchConfig::default();
+        assert_eq!(
+            <[u8; 32]>::match_sets(query, candidates, &config),
+            vec![(0, 0)]
+        );
     }
 
     #[test]
