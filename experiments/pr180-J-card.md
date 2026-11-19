@@ -88,3 +88,53 @@ Status: written 2026-11-19. Diagnosis step J0 has its predictions here before an
   - **J4: keep coast keyframes out of the VIBA windows.** Their poses carry no visual information. This is not ORB-SLAM3's choice: with an IMU, ORB-SLAM3 also inserts keyframes while `RECENTLY_LOST` (`Tracking.cc`, `mInsertKFsLost`). It does not need to exclude them, because its `FullInertialBA` after each VIBA moves those poses as well, which is (b) again. VINS-Fusion initialises once, over a window of frames that are tracked visually. J4 is our own stop-gap for the missing (b). It is cheap, and it addresses the VIBA2 reject directly.
   - **J1: gate the velocity block per edge**, for the start-up edges of VIBA1.
   - The predictions for J4 and J1 are written before code, in the next entry.
+
+## Steps J4 and J1: predictions (written 2026-11-19, before code)
+
+- **One more fact from the d-runs:** Ib-d2 rejected VIBA2 at frame 305 *before* its first loss, at frame 322. Its window held no coast keyframe, yet |ba| was 2.51. So J4 alone cannot fix every Ib run, and J1 is needed for the rest.
+
+### Knobs (in `inertial`, `InertialConfig`; the defaults keep today's behaviour)
+
+- **`viba_window: VibaWindow`, default `All`.** `VisualOnly` leaves out of every VIBA solve the keyframes with `inserted_while_lost` (J4). Their velocities stay as they are, and the alignment still moves them with the map.
+- **`viba_velocity_gate: f64`, default `0.0` (off).** With `k > 0`, after the solve, each edge's velocity residual is normalised by its preintegration velocity covariance. An edge whose cost is above `k` × the median edge cost is dropped, and the problem is solved once more. At most 25 % of the edges are dropped, the worst first (J1). The test runs use `k = 10`.
+- **Debug line:** `[imu_init] gate dropped N of M edges: a->b, ...`, the mechanism counter.
+
+### Configs (3 runs each, `--debug`, `KORNIA_SLAM_DEBUG=1`)
+
+| Name | Base config | Knobs |
+|---|---|---|
+| J4 | r03-Ib | `viba_window: VisualOnly` |
+| J1 | r03-Ib | `viba_velocity_gate: 10.0` |
+| J41 | r03-Ib | both |
+| J41-I0 | r03-I0 | both |
+| J41-R01 | r01-Ib | both |
+| J41-R11 | r11-Ib | both |
+
+### Predictions
+
+- **P1, J4 on R_03:**
+  - in each run lost before VIBA2, VIBA2 cost ≤ 3e6 (Ib 1.3-2.4e7) and VIBA2 is accepted;
+  - `coast_inertial` ≤ 60 in each run (Ib band 53-459).
+- **P2, J1 on R_03, mechanism:**
+  - the gate drops 2-8 VIBA1 edges, all with a keyframe in frames 40-86;
+  - VIBA1's gravity correction is ≤ 1.2° (Ib 3.4°, I0 0.47°);
+  - VIBA1 |ba| is ≤ 0.40 m/s² (Ib 0.76, I0 0.22).
+- **P3, J41 on R_03:**
+  - VIBA2 accepted in 3/3 runs;
+  - tracked ≥ 777 (I0 band 777-786, Ib band 341-747);
+  - ATE SE3 ≤ 0.25 m (I0 band 0.207-0.211 m).
+- **P4, J41 on the other configs:** each stays inside its base band.
+  - J41-I0: tracked ≥ 777, ATE ≤ 0.23 m.
+  - J41-R01: 800/800, ATE 0.097-0.12 m.
+  - J41-R11: 800/800, ATE ≤ 0.33 m, scale 0.95-1.16 (Ib band 1.08-1.16).
+
+### Kill rules
+
+- **K1, mechanism moved, score did not:** P2 holds, but J41 R_03 runs are still lost around frames 250-290. Then the loss is not caused by the IMU state. Next, look at the visual tracking at frame 250.
+- **K2, score moved, mechanism did not:** tracking improves, but the gate drops 0 edges and the VIBA costs stay in the Ib band. That is luck or another cause, and the knob does not ship.
+- **K3:** J41-I0 or J41-R01 leaves its base band. Then the knobs hurt the configs that work, and do not ship in a preset.
+- **K4:** the gate hits its 25 % cap in any VIBA. Then it is over-firing and the threshold or the normalisation is wrong; it does not ship.
+
+### Ship rule
+
+If P3 and P4 hold, `pr180-frontend-1ms` gets `min_cold_start_points: 20` together with J4 and J1. That would give R_11 800/800 without breaking R_03, which is card I's goal.
