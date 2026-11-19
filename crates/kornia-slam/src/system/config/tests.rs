@@ -125,6 +125,35 @@ fn display_describes_the_pipeline() {
 }
 
 #[test]
+fn the_viba_knobs_default_off_and_the_gate_is_range_checked() {
+    assert_eq!(
+        InertialConfig::default(),
+        InertialConfig {
+            sample_interpolation: SampleInterpolation::Hold,
+            viba_window: VibaWindow::All,
+            viba_velocity_gate: 0.0,
+        }
+    );
+    let gate = |viba_velocity_gate| {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).inertial.viba_velocity_gate = viba_velocity_gate;
+        config.validate()
+    };
+    assert_eq!(gate(0.0), Ok(()));
+    assert_eq!(gate(10.0), Ok(()));
+    for value in [-1.0, f64::NAN, f64::INFINITY] {
+        assert!(
+            matches!(
+                gate(value),
+                Err(ConfigError::InvalidSetting { setting, .. })
+                    if setting == "inertial.viba_velocity_gate"
+            ),
+            "gate {value}"
+        );
+    }
+}
+
+#[test]
 fn frontend_and_keyframe_settings_are_range_checked() {
     let keypoints = |n_keypoints| {
         let mut config = SystemConfig::default();
@@ -1285,6 +1314,21 @@ mod ron_files {
     /// are compared through their serialized form.
     fn ron(config: &SystemConfig) -> String {
         config.to_ron_string().unwrap()
+    }
+
+    #[test]
+    fn the_viba_knobs_parse_and_round_trip() {
+        let config = parse(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((inertial: \
+             (viba_window: VisualOnly, viba_velocity_gate: 10.0))))",
+        )
+        .unwrap();
+        assert_eq!(orb(&config).inertial.viba_window, VibaWindow::VisualOnly);
+        assert_eq!(orb(&config).inertial.viba_velocity_gate, 10.0);
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+
+        let default = parse("(version: 1)").unwrap();
+        assert_eq!(orb(&default).inertial, InertialConfig::default());
     }
 
     #[test]

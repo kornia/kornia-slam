@@ -4,6 +4,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::inertial::VibaWindow;
 use crate::inertial::trust::ImuTrustMode;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{LoopClosingConfig, LoopGraphInformation, LoopGraphSettings};
@@ -495,12 +496,17 @@ pub enum SnapbackFix {
     AnchorNextFrame,
 }
 
-/// How IMU samples are integrated.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// How IMU samples are integrated, and what the VIBA solves cover.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct InertialConfig {
     pub sample_interpolation: SampleInterpolation,
+    /// Keyframes the VIBA solves cover (card J4).
+    pub viba_window: VibaWindow,
+    /// Multiple of the median edge velocity cost above which a VIBA edge is
+    /// dropped and the solve repeated (card J1); `0.0` is off.
+    pub viba_velocity_gate: f64,
 }
 
 /// Local mapping (keyframe insertion, culling and local BA / VI-BA).

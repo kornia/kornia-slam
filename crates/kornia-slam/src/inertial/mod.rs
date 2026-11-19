@@ -10,7 +10,7 @@ pub mod trust;
 
 pub use initialization::{
     AlignedTrackingState, ImuInitConfig, ImuInitResult, ImuInitializer, ImuWindowStats,
-    StationaryInitError,
+    StationaryInitError, VibaWindow,
 };
 pub(crate) use schedule::{InertialInitSchedule, viba0_accel_bias_prior};
 
@@ -58,6 +58,8 @@ impl InertialState {
                 min_keyframes: 10,
                 min_time_sec: 1.0,
                 min_motion: 0.05,
+                viba_window: VibaWindow::All,
+                viba_velocity_gate: 0.0,
             }),
             schedule: InertialInitSchedule::default(),
             pending_samples: VecDeque::new(),
@@ -71,6 +73,13 @@ impl InertialState {
             sample_interpolation: interpolation,
             ..Self::new()
         }
+    }
+
+    /// Sets which keyframes VIBA solves cover and its velocity gate (card J).
+    pub(crate) fn with_viba(mut self, window: VibaWindow, velocity_gate: f64) -> Self {
+        self.initializer.config.viba_window = window;
+        self.initializer.config.viba_velocity_gate = velocity_gate;
+        self
     }
 
     /// Inserts samples in time order, then drops those more than
@@ -242,7 +251,9 @@ pub(crate) struct AppliedInitialization {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImuInitResult, InertialAlignmentError, InertialState, MAX_BUFFERED_SEC, Map};
+    use super::{
+        ImuInitResult, InertialAlignmentError, InertialState, MAX_BUFFERED_SEC, Map, VibaWindow,
+    };
     use kornia_algebra::Vec3F64;
     use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement};
 
@@ -376,6 +387,20 @@ mod tests {
         assert_eq!(edge.raw_samples.len(), 3);
     }
 
+    #[test]
+    fn the_viba_knobs_default_off_and_with_viba_sets_both() {
+        let config = &InertialState::new().initializer.config;
+        assert_eq!(config.min_keyframes, 10);
+        assert_eq!(config.min_time_sec, 1.0);
+        assert_eq!(config.min_motion, 0.05);
+        assert_eq!(config.viba_window, VibaWindow::All);
+        assert_eq!(config.viba_velocity_gate, 0.0);
+
+        let state = InertialState::new().with_viba(VibaWindow::VisualOnly, 10.0);
+        assert_eq!(state.initializer.config.viba_window, VibaWindow::VisualOnly);
+        assert_eq!(state.initializer.config.viba_velocity_gate, 10.0);
+    }
+
     /// A refused alignment must not be reported as applied, nor change the
     /// bias and gravity estimates.
     #[test]
@@ -385,11 +410,12 @@ mod tests {
         let init = ImuInitResult {
             scale: 0.0,
             gravity_world: Vec3F64::new(0.0, 0.0, -9.81),
-            velocities_world: Vec::new(),
+            keyframe_velocities: Vec::new(),
             bias: ImuBias {
                 gyro: Vec3F64::new(0.01, 0.02, 0.03),
                 accel: Vec3F64::new(0.1, 0.2, 0.3),
             },
+            gated_edges: Vec::new(),
         };
 
         let result = inertial.apply_initialization(&mut Map::new(), init, 0);

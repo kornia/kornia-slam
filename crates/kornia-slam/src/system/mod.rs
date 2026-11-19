@@ -330,6 +330,10 @@ impl SlamSystem {
             state: SystemState::new(),
             inertial: InertialState::with_sample_interpolation(
                 settings.inertial.sample_interpolation,
+            )
+            .with_viba(
+                settings.inertial.viba_window,
+                settings.inertial.viba_velocity_gate,
             ),
             loop_closer,
             loop_closure_events: Vec::new(),

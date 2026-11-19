@@ -136,6 +136,11 @@ impl OrbSlamPipeline {
         validate_pose_gate(&self.tracking_loss.pose_gate, sensors.imu)?;
         validate_lost_relocalization(&self.tracking_loss, &self.loop_closing)?;
         validate_estimator(&self.tracking, sensors.imu)?;
+        check(
+            "inertial.viba_velocity_gate",
+            self.inertial.viba_velocity_gate,
+            NON_NEGATIVE,
+        )?;
         if let GrowthNeighbours::OrbSlam3 { covisible } = self.mapping.growth_neighbours {
             check(
                 "mapping.growth_neighbours.covisible",

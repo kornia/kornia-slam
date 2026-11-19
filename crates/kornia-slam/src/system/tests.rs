@@ -136,6 +136,25 @@ fn build_restricts_the_rig_to_selected_sensors() {
 }
 
 #[test]
+fn build_plumbs_the_viba_knobs_to_the_initializer() {
+    let stereo_imu = || config(CameraSelection::Stereo, true, LoopClosingMode::Disabled);
+    let mut knobs = stereo_imu();
+    let PipelineDefinition::OrbSlam(orb) = &mut knobs.pipeline;
+    orb.inertial.viba_window = crate::inertial::VibaWindow::VisualOnly;
+    orb.inertial.viba_velocity_gate = 10.0;
+
+    let system = SlamSystem::build(knobs, stereo_imu_rig()).unwrap();
+    let init = &system.inertial.initializer.config;
+    assert_eq!(init.viba_window, crate::inertial::VibaWindow::VisualOnly);
+    assert_eq!(init.viba_velocity_gate, 10.0);
+
+    let system = SlamSystem::build(stereo_imu(), stereo_imu_rig()).unwrap();
+    let init = &system.inertial.initializer.config;
+    assert_eq!(init.viba_window, crate::inertial::VibaWindow::All);
+    assert_eq!(init.viba_velocity_gate, 0.0);
+}
+
+#[test]
 fn build_reports_a_missing_vocabulary() {
     let missing = PathBuf::from("/nonexistent/ORBvoc.bin");
     let enabled = config(

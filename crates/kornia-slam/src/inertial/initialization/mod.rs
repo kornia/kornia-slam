@@ -5,6 +5,7 @@
 //! optimization itself is in `solve`, and its factors in [`factor`].
 
 pub mod factor;
+mod gate;
 mod solve;
 mod stationary;
 
@@ -55,6 +56,26 @@ fn in_window(kf: &Keyframe, start_idx: usize) -> bool {
     kf.frame.idx >= start_idx && !kf.anchor
 }
 
+/// Which keyframes a VIBA solve covers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum VibaWindow {
+    /// Every keyframe of the initialization window.
+    #[default]
+    All,
+    /// The window without the keyframes inserted while tracking was lost.
+    VisualOnly,
+}
+
+impl VibaWindow {
+    fn admits(self, kf: &Keyframe) -> bool {
+        match self {
+            Self::All => true,
+            Self::VisualOnly => !kf.inserted_while_lost,
+        }
+    }
+}
+
 /// A keyframe window is monocular unless its first keyframe carries metric
 /// depth (stereo, or a rig's overlap points).
 fn window_is_mono(kfs: &[&Keyframe]) -> bool {
@@ -70,14 +91,21 @@ pub struct ImuInitConfig {
     pub min_keyframes: usize,
     pub min_time_sec: f64,
     pub min_motion: f64,
+    pub viba_window: VibaWindow,
+    /// Drops edges whose velocity cost exceeds this multiple of the median,
+    /// then solves again; `0.0` is off.
+    pub viba_velocity_gate: f64,
 }
 
 #[derive(Debug, Clone)]
 pub struct ImuInitResult {
     pub scale: f64,
     pub gravity_world: Vec3F64,
-    pub velocities_world: Vec<Vec3F64>,
+    pub keyframe_velocities: Vec<KeyframeVelocity>,
     pub bias: ImuBias,
+    /// `(prev, curr)` keyframe indices of the edges the velocity gate left
+    /// out, worst first; empty with the gate off.
+    pub gated_edges: Vec<(usize, usize)>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -93,6 +121,10 @@ impl ImuInitializer {
         Self { config }
     }
 
+    fn in_solve_window(&self, kf: &Keyframe, start_idx: usize) -> bool {
+        in_window(kf, start_idx) && self.config.viba_window.admits(kf)
+    }
+
     // ── readiness gate ────────────────────────────────────────────────────────
 
     pub fn ready(&self, map: &Map, start_idx: Option<usize>) -> bool {
@@ -103,7 +135,7 @@ impl ImuInitializer {
         let kfs: Vec<&Keyframe> = map
             .keyframes()
             .iter()
-            .filter(|kf| in_window(kf, start_idx))
+            .filter(|kf| self.in_solve_window(kf, start_idx))
             .collect();
         if kfs.len() < self.config.min_keyframes {
             return false;
@@ -178,26 +210,15 @@ impl ImuInitializer {
             init.gravity_world.z
         );
 
-        // 1–3. Scale to metric, rotate gravity onto +Y, and write each
-        // keyframe's velocity and bias, as one validated map correction.
-        // Velocities pair with the window's keyframes in map order, as the
-        // solver produced them, but are published by keyframe identity.
+        // 1–3. Scale to metric, rotate gravity onto +Y, and write each solved
+        // keyframe's velocity and bias, by keyframe identity, as one validated
+        // map correction.
         let g_norm = init.gravity_world / init.gravity_world.length();
         let rwg = rotation_from_to(g_norm, Vec3F64::new(0.0, 1.0, 0.0));
-        let keyframe_velocities: Vec<KeyframeVelocity> = map
-            .keyframes()
-            .iter()
-            .filter(|kf| in_window(kf, start_idx))
-            .zip(init.velocities_world)
-            .map(|(kf, velocity_world)| KeyframeVelocity {
-                keyframe_idx: kf.frame.idx,
-                velocity_world,
-            })
-            .collect();
         if let Err(error) = map.apply_inertial_alignment(InertialAlignment {
             scale: init.scale,
             rotation: rwg,
-            keyframe_velocities,
+            keyframe_velocities: init.keyframe_velocities,
             bias: init.bias,
         }) {
             debug_eprintln!("[imu_init] alignment refused, map left unchanged: {error}");

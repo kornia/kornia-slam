@@ -123,7 +123,30 @@ fn synth_map(s_true: f64, r_arb: Mat3F64) -> Map {
     )
 }
 
+fn initializer(viba_window: VibaWindow, viba_velocity_gate: f64) -> ImuInitializer {
+    ImuInitializer::new(ImuInitConfig {
+        min_keyframes: 10,
+        min_time_sec: 1.0,
+        min_motion: 0.1,
+        viba_window,
+        viba_velocity_gate,
+    })
+}
+
 fn synth_map_with_calib(s_true: f64, r_arb: Mat3F64, calib: ImuCalib, omega: f64) -> Map {
+    synth_map_filtered(s_true, r_arb, calib, omega, &|_| true, &|_, _| true)
+}
+
+/// [`synth_map_with_calib`] with only the kept keyframes, and only the edges
+/// `keep_edge` admits between two kept ones.
+fn synth_map_filtered(
+    s_true: f64,
+    r_arb: Mat3F64,
+    calib: ImuCalib,
+    omega: f64,
+    keep_keyframe: &dyn Fn(usize) -> bool,
+    keep_edge: &dyn Fn(usize, usize) -> bool,
+) -> Map {
     let bias_gyro_true = Vec3F64::new(0.01, -0.02, 0.005);
     let bias_accel_true = Vec3F64::new(0.05, -0.03, 0.02);
     let gravity_true = Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0);
@@ -136,9 +159,11 @@ fn synth_map_with_calib(s_true: f64, r_arb: Mat3F64, calib: ImuCalib, omega: f64
         let t = k as f64 * kf_dt;
         let (p_true, _, _, r_wb_true) = circular_trajectory(t, omega);
         let pose = synth_pose_world_to_cam(r_arb, s_true, p_true, r_wb_true);
-        map.insert_keyframe(Keyframe::from_frame(synth_frame(k, pose)))
-            .unwrap();
-        if k > 0 {
+        if keep_keyframe(k) {
+            map.insert_keyframe(Keyframe::from_frame(synth_frame(k, pose)))
+                .unwrap();
+        }
+        if k > 0 && keep_keyframe(k - 1) && keep_keyframe(k) && keep_edge(k - 1, k) {
             let pim = integrate_true_imu(
                 t - kf_dt,
                 t,
@@ -172,11 +197,7 @@ fn synth_map_with_calib(s_true: f64, r_arb: Mat3F64, calib: ImuCalib, omega: f64
 #[test]
 fn viba0_scale_is_invariant_to_vision_map_scale() {
     let r_arb = SO3F64::exp(Vec3F64::new(0.3, -0.5, 0.2)).matrix();
-    let initializer = ImuInitializer::new(ImuInitConfig {
-        min_keyframes: 10,
-        min_time_sec: 1.0,
-        min_motion: 0.1,
-    });
+    let initializer = initializer(VibaWindow::All, 0.0);
 
     let mut products = Vec::new();
     for s_true in [0.25, 0.5, 1.0, 2.0, 4.0] {
@@ -226,11 +247,7 @@ fn viba2_accel_bias_stays_bounded_under_pose_inconsistency() {
         gyro_bias_noise: 1.9393e-5,
         accel_bias_noise: 3.0e-3,
     };
-    let initializer = ImuInitializer::new(ImuInitConfig {
-        min_keyframes: 10,
-        min_time_sec: 1.0,
-        min_motion: 0.1,
-    });
+    let initializer = initializer(VibaWindow::All, 0.0);
 
     // Add deterministic millimetre-scale front-end noise.
     let mut map = synth_map_with_calib(0.5, r_arb, euroc_calib, WEAK_YAW_RATE);
@@ -364,11 +381,7 @@ fn recovers_scale_bias_gravity_from_synthetic_trajectory() {
         }
     }
 
-    let initializer = ImuInitializer::new(ImuInitConfig {
-        min_keyframes: 10,
-        min_time_sec: 1.0,
-        min_motion: 0.1,
-    });
+    let initializer = initializer(VibaWindow::All, 0.0);
 
     // `try_initialize` now does exactly one joint solve per call (mirrors
     // ORB-SLAM3's `InitializeIMU`/`InertialOptimization` one-call-per-
@@ -452,8 +465,10 @@ fn recovers_scale_bias_gravity_from_synthetic_trajectory() {
     // map, but before this call's own residual scale correction (that
     // correction is only reflected in `result.scale`, applied to the map
     // by a subsequent apply_initialization — not folded back into
-    // `result.velocities_world` here).
-    for (k, &velocity) in result.velocities_world[..n_keyframes].iter().enumerate() {
+    // `result.keyframe_velocities` here).
+    for (k, kv) in result.keyframe_velocities[..n_keyframes].iter().enumerate() {
+        assert_eq!(kv.keyframe_idx, k);
+        let velocity = kv.velocity_world;
         let t = k as f64 * kf_dt;
         let (_, v_true, _, _) = circular_trajectory(t, OMEGA);
         let expected_v = rwg_viba0 * ((r_arb * v_true) * s_true * viba0_scale);
@@ -470,11 +485,7 @@ fn recovers_scale_bias_gravity_from_synthetic_trajectory() {
 #[test]
 fn an_anchor_leaves_the_initialization_unchanged() {
     let r_arb = SO3F64::exp(Vec3F64::new(0.3, -0.5, 0.2)).matrix();
-    let initializer = ImuInitializer::new(ImuInitConfig {
-        min_keyframes: 10,
-        min_time_sec: 1.0,
-        min_motion: 0.1,
-    });
+    let initializer = initializer(VibaWindow::All, 0.0);
     let solve = |map: &Map| {
         initializer
             .try_initialize(
@@ -499,4 +510,235 @@ fn an_anchor_leaves_the_initialization_unchanged() {
         format!("{:?}", solve(&with_anchor)),
         format!("{:?}", solve(&map))
     );
+}
+
+fn calib() -> ImuCalib {
+    ImuCalib {
+        gyro_noise: 1e-3,
+        accel_noise: 1e-2,
+        gyro_bias_noise: 1e-5,
+        accel_bias_noise: 1e-4,
+    }
+}
+
+fn r_arb() -> Mat3F64 {
+    SO3F64::exp(Vec3F64::new(0.3, -0.5, 0.2)).matrix()
+}
+
+fn viba0(initializer: &ImuInitializer, map: &Map) -> Option<ImuInitResult> {
+    initializer.try_initialize(
+        map,
+        Some(Pose3d::IDENTITY),
+        ImuBias::default(),
+        0,
+        1e2,
+        1e10,
+        false,
+    )
+}
+
+/// Moves keyframe `idx`'s camera centre by `delta`, keeping its rotation.
+fn shift_centre(map: &mut Map, idx: usize, delta: Vec3F64) {
+    map.edit_keyframes_for_test(|_, kf| {
+        if kf.frame.idx == idx {
+            let cam_to_world = kf.frame.pose_world_to_cam.inverse();
+            kf.frame.pose_world_to_cam =
+                Pose3d::new(cam_to_world.rotation, cam_to_world.translation + delta).inverse();
+        }
+    });
+}
+
+/// Marks the keyframes `lost` admits as inserted while lost, with a sentinel
+/// velocity per keyframe.
+fn mark_lost(map: &mut Map, lost: impl Fn(usize) -> bool) {
+    map.edit_keyframes_for_test(|_, kf| {
+        if lost(kf.frame.idx) {
+            kf.inserted_while_lost = true;
+            kf.velocity_world = sentinel(kf.frame.idx);
+        }
+    });
+}
+
+fn sentinel(idx: usize) -> Vec3F64 {
+    Vec3F64::new(7.0, 8.0, 9.0 + idx as f64)
+}
+
+const CORRUPT_KF: usize = 15;
+fn corrupt_shift() -> Vec3F64 {
+    Vec3F64::new(0.05, 0.0, 0.03)
+}
+
+/// With the defaults, or with knobs that change nothing on this map, the
+/// solve is today's to the last bit.
+#[test]
+fn the_default_window_and_gate_leave_the_solve_unchanged() {
+    let mut map = synth_map(0.5, r_arb());
+    shift_centre(&mut map, CORRUPT_KF, corrupt_shift());
+    let solve = |window, gate| format!("{:?}", viba0(&initializer(window, gate), &map).unwrap());
+    let default = solve(VibaWindow::All, 0.0);
+    assert_eq!(solve(VibaWindow::VisualOnly, 0.0), default);
+    assert_eq!(solve(VibaWindow::All, 1e300), default);
+}
+
+#[test]
+fn visual_only_solves_as_if_the_lost_keyframe_were_absent() {
+    let mut lost = synth_map(0.5, r_arb());
+    mark_lost(&mut lost, |k| k == 12);
+    let absent = synth_map_filtered(0.5, r_arb(), calib(), OMEGA, &|k| k != 12, &|_, _| true);
+    let visual_only = initializer(VibaWindow::VisualOnly, 0.0);
+    let all = initializer(VibaWindow::All, 0.0);
+
+    let init = viba0(&visual_only, &lost).unwrap();
+    assert_eq!(
+        format!("{init:?}"),
+        format!("{:?}", viba0(&all, &absent).unwrap())
+    );
+    assert_eq!(
+        init.keyframe_velocities
+            .iter()
+            .map(|kv| kv.keyframe_idx)
+            .collect::<Vec<_>>(),
+        (0..30).filter(|&k| k != 12).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        visual_only.ready(&lost, Some(0)),
+        all.ready(&absent, Some(0))
+    );
+}
+
+/// Lost keyframes keep their velocity and bias, and tracking still resumes at
+/// the newest window keyframe, lost or not.
+#[test]
+fn visual_only_writes_velocities_by_keyframe_and_resumes_at_the_newest() {
+    let mut map = synth_map(0.5, r_arb());
+    mark_lost(&mut map, |k| k == 12 || k == 29);
+    let pose_12 = map.get_keyframe(12).unwrap().frame.pose_world_to_cam;
+    let initializer = initializer(VibaWindow::VisualOnly, 0.0);
+    let init = viba0(&initializer, &map).unwrap();
+    let listed = init.keyframe_velocities.clone();
+    let rotation = rotation_from_to(
+        init.gravity_world / init.gravity_world.length(),
+        Vec3F64::new(0.0, 1.0, 0.0),
+    );
+
+    let mut bias = ImuBias::default();
+    let mut gravity_world = Vec3F64::ZERO;
+    let resume = initializer
+        .apply_initialization(&mut map, &mut bias, &mut gravity_world, init, 0)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(listed.len(), 28);
+    for kv in &listed {
+        assert!(kv.keyframe_idx != 12 && kv.keyframe_idx != 29);
+        let written = map.get_keyframe(kv.keyframe_idx).unwrap().velocity_world;
+        assert!(
+            (written - rotation * kv.velocity_world).length() < 1e-9,
+            "keyframe {}",
+            kv.keyframe_idx
+        );
+    }
+    for k in [12, 29] {
+        assert_eq!(map.get_keyframe(k).unwrap().velocity_world, sentinel(k));
+    }
+    assert!(
+        format!(
+            "{:?}",
+            map.get_keyframe(12).unwrap().frame.pose_world_to_cam
+        ) != format!("{pose_12:?}")
+    );
+    let newest = map.get_keyframe(29).unwrap();
+    assert_eq!(
+        format!("{:?}", resume.pose_world_to_cam),
+        format!("{:?}", newest.frame.pose_world_to_cam)
+    );
+    assert_eq!(resume.velocity_world, sentinel(29));
+}
+
+#[test]
+fn visual_only_does_not_count_lost_keyframes() {
+    let mut map = synth_map(0.5, r_arb());
+    mark_lost(&mut map, |k| k >= 9);
+    let visual_only = initializer(VibaWindow::VisualOnly, 0.0);
+    assert!(!visual_only.ready(&map, Some(0)));
+    assert!(viba0(&visual_only, &map).is_none());
+    assert!(initializer(VibaWindow::All, 0.0).ready(&map, Some(0)));
+}
+
+fn gravity_angle(init: &ImuInitResult) -> f64 {
+    let want = r_arb() * Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0);
+    init.gravity_world
+        .normalize()
+        .dot(want.normalize())
+        .clamp(-1.0, 1.0)
+        .acos()
+}
+
+#[test]
+fn the_velocity_gate_drops_the_edges_of_a_corrupted_pose() {
+    let mut map = synth_map(1.0, r_arb());
+    shift_centre(&mut map, CORRUPT_KF, corrupt_shift());
+    let gated = viba0(&initializer(VibaWindow::All, 10.0), &map).unwrap();
+    let ungated = viba0(&initializer(VibaWindow::All, 0.0), &map).unwrap();
+    assert!(
+        gated.gated_edges.contains(&(14, 15)),
+        "{:?}",
+        gated.gated_edges
+    );
+    assert!(
+        gated.gated_edges.contains(&(15, 16)),
+        "{:?}",
+        gated.gated_edges
+    );
+    assert!(gated.gated_edges.len() <= 7);
+    assert!(
+        gravity_angle(&gated) < gravity_angle(&ungated),
+        "gated {} vs ungated {}",
+        gravity_angle(&gated),
+        gravity_angle(&ungated)
+    );
+
+    // VIBA0 seeds velocities and gravity from every window edge, so the
+    // gated equality is checked on a refinement, whose seed is the map's.
+    let aligned = |mut map: Map| {
+        let (mut bias, mut gravity_world) = (ImuBias::default(), Vec3F64::ZERO);
+        initializer(VibaWindow::All, 0.0)
+            .apply_initialization(&mut map, &mut bias, &mut gravity_world, ungated.clone(), 0)
+            .unwrap();
+        (map, bias)
+    };
+    let refine = |gate, (map, bias): &(Map, ImuBias)| {
+        initializer(VibaWindow::All, gate)
+            .try_initialize(map, Some(Pose3d::IDENTITY), *bias, 0, 0.0, 0.0, true)
+            .unwrap()
+    };
+    let gated = refine(10.0, &aligned(map));
+    assert!(
+        gated.gated_edges.contains(&(14, 15)),
+        "{:?}",
+        gated.gated_edges
+    );
+    assert!(
+        gated.gated_edges.contains(&(15, 16)),
+        "{:?}",
+        gated.gated_edges
+    );
+    let gated_pairs = gated.gated_edges.clone();
+    let mut without = synth_map_filtered(1.0, r_arb(), calib(), OMEGA, &|_| true, &|a, b| {
+        !gated_pairs.contains(&(a, b))
+    });
+    shift_centre(&mut without, CORRUPT_KF, corrupt_shift());
+    let expected = refine(0.0, &aligned(without));
+    let solved = |init: &ImuInitResult| {
+        format!(
+            "{:?}",
+            (
+                init.scale,
+                init.gravity_world,
+                init.bias,
+                &init.keyframe_velocities
+            )
+        )
+    };
+    assert_eq!(solved(&gated), solved(&expected));
 }
