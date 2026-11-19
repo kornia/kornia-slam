@@ -259,8 +259,7 @@ impl ImuInitializer {
         let first = solve_edges(&inputs, &edges)?;
 
         let k = self.config.viba_velocity_gate;
-        #[allow(clippy::neg_cmp_op_on_partial_ord)]
-        if !(k > 0.0) {
+        if k.is_nan() || k <= 0.0 {
             return Some((first, Vec::new()));
         }
         let costs: Vec<Option<f64>> = edges

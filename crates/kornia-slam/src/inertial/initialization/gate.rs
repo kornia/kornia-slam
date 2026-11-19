@@ -26,8 +26,7 @@ pub(super) fn velocity_cost(ev: Vec3F64, pim: &PreintegratedImu) -> Option<f64> 
 /// at most a quarter of `costs`. Edges without a cost are never dropped; a
 /// `k` that is not positive drops nothing.
 pub(super) fn outlier_edges(costs: &[Option<f64>], k: f64) -> Vec<usize> {
-    #[allow(clippy::neg_cmp_op_on_partial_ord)]
-    if !(k > 0.0) {
+    if k.is_nan() || k <= 0.0 {
         return Vec::new();
     }
     let cap = (costs.len() as f64 * MAX_DROPPED_FRACTION).floor() as usize;
