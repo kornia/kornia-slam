@@ -237,3 +237,31 @@ If P3 and P4 hold, `pr180-frontend-1ms` gets `min_cold_start_points: 20` togethe
 ### Ship rule
 
 If P2 and P4 hold, `pr180-frontend-1ms` gets `min_cold_start_points: 20` and `viba_window_delay_sec: 1.0`.
+
+## J3 cancelled before code: the visual trajectory is at 1/5 scale (2026-11-19)
+
+The owner asked to make sure the gap is not an LK or ORB issue. Comparing our per-step motion with ground truth (`relmotion.py`, `scaleprof.py`, `stepwise.py` over the card J run dirs) answered it before J3 was built. The planner was stopped and J3 has no code.
+
+- **Rotation is right.** Over frames 16-120, the median per-step rotation error is 0.04-0.12° in I0 and in Ib's frames 16-40. The gyro agrees with ground truth to 0.03-0.06°.
+- **Translation is shrunk under Ib.** Median ratio of our step length to ground truth, per 25-frame bin:
+
+| Run | 25 | 50 | 75-125 | 150-250 | after the re-seed (~270) |
+|---|---|---|---|---|---|
+| I0-j0 | 0.75 | 1.01 | 1.00 | 0.99-1.00 | 1.00 |
+| Ib-j0 | 0.13 | 0.18 | 0.18 | 0.20-0.23 | 0.98-1.00 |
+| Ib-d2 | 0.13 | 0.21 | 0.17-0.19 | 0.19-0.23 | 1.0 (after 400) |
+
+- **The VIBA errors follow from this.** For stereo, VIBA fixes the scale at 1, and the finite-difference velocities are then about 1/5 of the IMU's. The velocity residuals are systematic, which is why the edge gate (J1) found nothing and VIBA2 fits a large tilt and bias. G32 is a symptom, not the gap.
+- **Not LK.** Under Ib, frames 3-45 are all tracked by ORB map projection (`[track] ok`, 160-230 matches and inliers, no `[klt-first]` line until frame 46). When the device starts to move at frame ~33 (ground-truth steps 0.3-1.2 cm), our steps are 0.03-0.14 cm. I0 runs `klt-first` from frame 27, and its steps match the ground truth.
+- **Not the ORB stereo seed.** Both maps are seeded from the same stereo overlap: 63 points, median depth 0.80 m, at frames 2 and 3. The per-frame overlap depth stays at 0.79-0.80 m.
+- **Not stale tracks across the reset.** The 53 flow tracks at frame 2 ran before the reset; frame 3 starts with 20 fresh tracks.
+- **Suspect: map points triangulated across a near-zero baseline.**
+  - The device is almost static for frames 0-32 (ground-truth steps < 1 mm). Under Ib, keyframes 5, 16, 24 and 32 grow 26-51 points each by pair triangulation (`mapping/growth.rs`).
+  - The only baseline guard is `|t| > 1e-8` (`growth.rs:233`). ORB-SLAM3's `CreateNewMapPoints` skips a pair whose baseline is below the stereo baseline (stereo) or 1 % of the median depth (mono).
+  - Points that are too close make a real translation look 1/5 as large, with rotation unaffected, which is what the trajectory shows.
+  - This is a mapping (triangulation) gate, not the LK or ORB frontend. It is not yet measured.
+- **Next diagnosis (temporary print, before any card):**
+  - print, per keyframe from 2 to 60, the median depth of its map points against the median stereo depth of the same frame, for I0 and Ib;
+  - print the source of each grown point (stereo, or a pair with its baseline).
+
+  If the Ib map points are about 5× closer than the stereo depth and come from pairs with a sub-millimetre baseline, the fix is ORB-SLAM3's baseline gate behind a knob.
