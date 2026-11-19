@@ -1,8 +1,9 @@
 use super::{
     ImuFactor, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError, ObservationLink,
 };
+use crate::features::ScalePyramid;
 use crate::mapping::map::{
-    Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR, ObservationKey,
+    Keyframe, Map, ObservationKey,
     tests::{assert_map_consistent, test_frame, test_frame_with_pose},
 };
 use kornia_3d::pose::Pose3d;
@@ -144,18 +145,34 @@ fn scale_geometry_distance_invariants() {
     // Point referenced to KF 0, world (0,0,5). The octave comes from the
     // referenced feature now, as production does.
     let mp_idx = map.insert_landmark(seed(0, 0, 5.0)).unwrap();
-    map.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+    map.update_map_point_geometry(mp_idx);
 
     let mp = &map.map_points()[mp_idx];
-    let expected_max = 5.0 * ORB_SCALE_FACTOR.powi(2);
+    let ScalePyramid { factor, n_levels } = map.scale_pyramid();
+    let expected_max = 5.0 * factor.powi(2);
     assert!((mp.max_distance - expected_max).abs() < 1e-9);
-    assert!(
-        (mp.max_distance / mp.min_distance - ORB_SCALE_FACTOR.powi(ORB_N_LEVELS as i32 - 1)).abs()
-            < 1e-9
-    );
+    assert!((mp.max_distance / mp.min_distance - factor.powi(n_levels as i32 - 1)).abs() < 1e-9);
     // Margined bounds carry the 0.8 / 1.2 factors.
     assert!((mp.min_distance_invariance() - 0.8 * mp.min_distance).abs() < 1e-12);
     assert!((mp.max_distance_invariance() - 1.2 * mp.max_distance).abs() < 1e-12);
+}
+
+#[test]
+fn scale_geometry_follows_the_map_pyramid() {
+    let mut map = Map::with_scale_pyramid(ScalePyramid {
+        factor: 2.0,
+        n_levels: 4,
+    });
+    let mut kf = Keyframe::from_frame(test_frame(0, vec![[0u8; 32]]));
+    kf.frame.features.octaves = vec![2];
+    map.insert_keyframe(kf).unwrap();
+
+    let mp_idx = map.insert_landmark(seed(0, 0, 5.0)).unwrap();
+    map.update_map_point_geometry(mp_idx);
+
+    let mp = &map.map_points()[mp_idx];
+    assert!((mp.max_distance - 20.0).abs() < 1e-9);
+    assert!((mp.min_distance - 2.5).abs() < 1e-9);
 }
 
 /// T1c: mean viewing direction is the average of unit (point - cam_center)
@@ -168,7 +185,7 @@ fn mean_viewing_direction_averages_observations() {
         .unwrap();
 
     let mp_idx = map.insert_landmark(seed(0, 0, 5.0)).unwrap();
-    map.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+    map.update_map_point_geometry(mp_idx);
 
     // Single observation from the origin looking at (0,0,5): normal = +z.
     let n0 = map.map_points()[mp_idx].mean_viewing_direction;
@@ -186,7 +203,7 @@ fn mean_viewing_direction_averages_observations() {
     ));
     map.insert_keyframe(kf1).unwrap();
     map.link_observation(1, 0, mp_idx).unwrap();
-    map.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+    map.update_map_point_geometry(mp_idx);
 
     let n = map.map_points()[mp_idx].mean_viewing_direction;
     // Average of (0,0,1) and (point-(1,0,0)) normalized = (-1,0,5)/sqrt(26).

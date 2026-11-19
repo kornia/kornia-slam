@@ -1,5 +1,6 @@
 use super::*;
 use crate::Frame;
+use crate::features::Features;
 use crate::loop_closure::sparse_pgo::{Se3Manifold, sparse_pose_graph_optimize};
 use crate::mapping::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
 use crate::pose_conversion::pose_to_se3;
@@ -9,7 +10,6 @@ use kornia_3d::pnp::RansacParams;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 use kornia_image::ImageSize;
-use kornia_imgproc::features::OrbFeatures;
 
 fn camera() -> PinholeCamera {
     PinholeCamera {
@@ -27,7 +27,7 @@ fn camera() -> PinholeCamera {
 fn frame(idx: usize, pose: Pose3d, points: &[[f32; 2]], descriptors: Vec<[u8; 32]>) -> Frame {
     Frame {
         idx,
-        features: OrbFeatures {
+        features: Features {
             keypoints_xy: points.to_vec(),
             orientations: vec![0.0; points.len()],
             descriptors,

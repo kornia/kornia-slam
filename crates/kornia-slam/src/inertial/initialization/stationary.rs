@@ -258,11 +258,11 @@ impl ImuInitializer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::Features;
     use crate::frame::Frame;
     use crate::mapping::map::{ImuFactor, MapInsertion};
     use kornia_algebra::{Mat3F64, SO3F64};
     use kornia_image::ImageSize;
-    use kornia_imgproc::features::OrbFeatures;
     use kornia_sensors::imu::{ImuCalib, PreintegratedImu};
 
     const RATE_HZ: f64 = 200.0;
@@ -324,7 +324,7 @@ mod tests {
     fn stereo_frame(idx: usize, pose_world_to_cam: Pose3d) -> Frame {
         Frame {
             idx,
-            features: OrbFeatures {
+            features: Features {
                 keypoints_xy: vec![[10.0, 10.0]],
                 orientations: vec![0.0],
                 descriptors: vec![[0u8; 32]],

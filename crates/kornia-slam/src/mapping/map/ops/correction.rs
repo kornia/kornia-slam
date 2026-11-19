@@ -7,6 +7,7 @@
 //! derived geometry stale. Finalizing that geometry is `ops::geometry`.
 
 use super::snapshot::KeyframeBaState;
+use crate::features::Descriptor;
 use crate::mapping::map::{BaUpdate, Map};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{SO3F64, Vec3F64};
@@ -98,7 +99,7 @@ pub enum InertialAlignmentError {
     InvalidBias,
 }
 
-impl Map {
+impl<D: Descriptor> Map<D> {
     /// Atomically applies a pose-graph snapshot and transports landmarks through
     /// their reference keyframes so their reference-camera coordinates stay fixed.
     pub fn apply_pose_graph_correction(
@@ -414,7 +415,7 @@ pub struct LocalBaMergeResult {
     pub map_points_updated: usize,
 }
 
-impl Map {
+impl<D: Descriptor> Map<D> {
     /// Applies solver-changed geometry from a BA update.
     ///
     /// Only captured entities are written; anything outside the window or
@@ -428,7 +429,7 @@ impl Map {
     /// unchanged but valid update is still a successful completion.
     pub fn apply_ba_update(
         &mut self,
-        update: BaUpdate,
+        update: BaUpdate<D>,
     ) -> Result<LocalBaMergeResult, BaUpdateError> {
         let snapshot = &update.snapshot;
         if self.world_epoch != snapshot.world_epoch {
@@ -592,8 +593,8 @@ pub(super) fn valid_preintegration(preintegrated: &kornia_sensors::imu::Preinteg
         && preintegrated.d_position_d_bias_accel.is_finite()
 }
 
-fn keyframe_ba_state_changed(
-    before: &crate::mapping::map::Keyframe,
+fn keyframe_ba_state_changed<D>(
+    before: &crate::mapping::map::Keyframe<D>,
     after: &KeyframeBaState,
 ) -> bool {
     before.frame.pose_world_to_cam != after.pose_world_to_cam

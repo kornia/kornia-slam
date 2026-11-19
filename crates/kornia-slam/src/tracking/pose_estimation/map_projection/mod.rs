@@ -28,13 +28,12 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::{Pose3d, RansacParams, ransac_fundamental_8point};
 use kornia_algebra::{Vec2F32, Vec2F64};
 use kornia_image::ImageSize;
-use kornia_imgproc::features::hamming_distance;
 
 use super::pnp::{self, PnpConfig};
-use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
+use crate::features::{Descriptor, ScalePyramid};
 use crate::frame::{Frame, is_finite_xy, undistort_keypoint};
-use crate::mapping::map::{Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
+use crate::mapping::map::{Keyframe, Map, MapPoint};
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 
 use super::Estimate;
@@ -47,13 +46,13 @@ const OCTAVE_WINDOW_HALF_WIDTH: usize = 2;
 
 /// Tunable parameters for projection-guided matching.
 #[derive(Debug, Clone, Copy)]
-pub struct ProjectionMatchConfig {
+pub struct ProjectionMatchConfig<T = u32> {
     /// Reject projected points with depth `<= min_depth`.
     pub min_depth: f64,
     /// Keypoint search radius around each projected pixel.
     pub search_radius: f32,
-    /// Maximum Hamming distance to accept a descriptor match.
-    pub max_hamming: u32,
+    /// Maximum descriptor distance to accept a match.
+    pub max_distance: T,
 }
 
 impl Default for ProjectionMatchConfig {
@@ -61,22 +60,22 @@ impl Default for ProjectionMatchConfig {
         Self {
             min_depth: 0.0,
             search_radius: 15.0,
-            max_hamming: 50,
+            max_distance: 50,
         }
     }
 }
 
 /// Map-projection tracking thresholds.
 #[derive(Debug, Clone)]
-pub struct MapProjectionConfig {
-    /// ORB descriptor matcher settings for tracking against reference observations.
-    pub match_config: OrbMatchConfig,
+pub struct MapProjectionConfig<D: Descriptor = [u8; 32]> {
+    /// Descriptor matcher settings for tracking against reference observations.
+    pub match_config: D::MatchConfig,
     /// PnP pose-estimation thresholds.
     pub pnp: PnpConfig,
     /// Projection matching config for initial tracking.
-    pub projection: ProjectionMatchConfig,
+    pub projection: ProjectionMatchConfig<D::Distance>,
     /// Projection matching config for local-map refinement (wider search).
-    pub local_projection: ProjectionMatchConfig,
+    pub local_projection: ProjectionMatchConfig<D::Distance>,
     /// Upper bound on `search_scale`, reached at once when the prediction is
     /// inertial (see `search_scale_for`).
     pub lost_search_scale: f32,
@@ -93,7 +92,7 @@ pub struct MapProjectionConfig {
 impl Default for MapProjectionConfig {
     fn default() -> Self {
         Self {
-            match_config: OrbMatchConfig {
+            match_config: kornia_imgproc::features::OrbMatchConfig {
                 nn_ratio: 0.6,
                 th_low: 50,
                 check_orientation: true,
@@ -103,7 +102,7 @@ impl Default for MapProjectionConfig {
             projection: ProjectionMatchConfig::default(),
             local_projection: ProjectionMatchConfig {
                 search_radius: 30.0,
-                max_hamming: 60,
+                max_distance: 60,
                 ..ProjectionMatchConfig::default()
             },
             lost_search_scale: 4.0,
@@ -114,7 +113,7 @@ impl Default for MapProjectionConfig {
     }
 }
 
-impl MapProjectionConfig {
+impl<D: Descriptor> MapProjectionConfig<D> {
     /// `search_scale` to pass to `MapProjectionEstimator::estimate_pose` given
     /// how long tracking has been failing.
     ///
@@ -154,17 +153,17 @@ pub enum MapProjectionRejectReason {
 /// Map-projection-based pose estimator.
 ///
 /// Estimates the camera pose by projecting map points into the current frame,
-/// matching via ORB descriptors, and solving PnP.
-pub struct MapProjectionEstimator {
-    config: MapProjectionConfig,
+/// matching their descriptors, and solving PnP.
+pub struct MapProjectionEstimator<D: Descriptor = [u8; 32]> {
+    config: MapProjectionConfig<D>,
 }
 
-impl MapProjectionEstimator {
-    pub fn new(config: MapProjectionConfig) -> Self {
+impl<D: Descriptor> MapProjectionEstimator<D> {
+    pub fn new(config: MapProjectionConfig<D>) -> Self {
         Self { config }
     }
 
-    pub fn config(&self) -> &MapProjectionConfig {
+    pub fn config(&self) -> &MapProjectionConfig<D> {
         &self.config
     }
 
@@ -175,10 +174,10 @@ impl MapProjectionEstimator {
     #[allow(clippy::too_many_arguments)]
     pub fn estimate_pose(
         &self,
-        frame: &Frame,
+        frame: &Frame<D>,
         candidate_pose: &Pose3d,
         pose_before_tracking: &Pose3d,
-        map: &Map,
+        map: &Map<D>,
         camera: &PinholeCamera,
         current_keyframe_idx: Option<usize>,
         search_scale: f32,
@@ -255,7 +254,7 @@ impl MapProjectionEstimator {
             })
         };
 
-        if let Some(seeded) = Self::eligible_pre_seeded(pre_seeded, pnp.min_correspondences)
+        if let Some(seeded) = eligible_pre_seeded(pre_seeded, pnp.min_correspondences)
             && let Ok(estimate) = try_track_and_refine(seeded, candidate_pose)
         {
             return Ok(estimate);
@@ -276,12 +275,10 @@ impl MapProjectionEstimator {
             return Err(last_reject);
         };
 
-        let ref_matches = match_orb_descriptors(
-            &current_kf.frame.features.orientations,
-            &current_kf.frame.features.descriptors,
-            &frame.features.orientations,
-            &frame.features.descriptors,
-            self.config.match_config,
+        let ref_matches = D::match_sets(
+            current_kf.frame.features.descriptor_set(),
+            frame.features.descriptor_set(),
+            &self.config.match_config,
         );
 
         const MIN_REF_MATCHES: usize = 15;
@@ -305,18 +302,11 @@ impl MapProjectionEstimator {
         try_track_and_refine(ref_correspondences, pose_before_tracking)
     }
 
-    fn eligible_pre_seeded(
-        pre_seeded: Option<Vec<(usize, usize)>>,
-        min_correspondences: usize,
-    ) -> Option<Vec<(usize, usize)>> {
-        pre_seeded.filter(|correspondences| correspondences.len() >= min_correspondences)
-    }
-
     /// Reject matches that disagree with reference-to-current epipolar geometry.
     /// Matches without a reference-keyframe observation remain unfiltered.
     fn geometric_consistency_filter(
         &self,
-        current_kf: Option<&Keyframe>,
+        current_kf: Option<&Keyframe<D>>,
         correspondences: &[(usize, usize)],
         curr_keypoints_undist: &[[f32; 2]],
         camera: &PinholeCamera,
@@ -379,11 +369,11 @@ impl MapProjectionEstimator {
     #[allow(clippy::too_many_arguments)]
     fn refine_with_local_map(
         &self,
-        map: &Map,
+        map: &Map<D>,
         current_kf_idx: Option<usize>,
         tracked_matches: &[(usize, usize)],
         curr_keypoints_undist: &[[f32; 2]],
-        curr_descriptors: &[[u8; 32]],
+        curr_descriptors: &[D],
         curr_octaves: &[u8],
         grid: &KeypointGrid,
         image_size: ImageSize,
@@ -409,6 +399,7 @@ impl MapProjectionEstimator {
         };
         let global_matches = self.match_by_projection(
             map.map_points(),
+            map.scale_pyramid(),
             &local_indices,
             curr_keypoints_undist,
             curr_descriptors,
@@ -446,7 +437,7 @@ impl MapProjectionEstimator {
     /// actually accepts the solution is unaffected.
     fn solve_pnp(
         &self,
-        map_points: &[MapPoint],
+        map_points: &[MapPoint<D>],
         correspondences: &[(usize, usize)],
         keypoints_undist: &[[f32; 2]],
         camera: &PinholeCamera,
@@ -477,9 +468,9 @@ impl MapProjectionEstimator {
     /// with narrow-to-wide fallback over the candidate map-point indices.
     fn match_map_to_frame(
         &self,
-        map: &Map,
+        map: &Map<D>,
         candidates: &[usize],
-        frame: &Frame,
+        frame: &Frame<D>,
         pose: &Pose3d,
         camera: &PinholeCamera,
         search_scale: f32,
@@ -515,6 +506,7 @@ impl MapProjectionEstimator {
         };
         let mut matches = self.match_by_projection(
             map.map_points(),
+            map.scale_pyramid(),
             candidates,
             &keypoints_undist,
             &frame.features.descriptors,
@@ -529,6 +521,7 @@ impl MapProjectionEstimator {
         if matches.len() < MIN_MATCHES_BEFORE_WIDE {
             matches = self.match_by_projection(
                 map.map_points(),
+                map.scale_pyramid(),
                 candidates,
                 &keypoints_undist,
                 &frame.features.descriptors,
@@ -550,16 +543,17 @@ impl MapProjectionEstimator {
     #[allow(clippy::too_many_arguments)]
     fn match_by_projection(
         &self,
-        map_points: &[MapPoint],
+        map_points: &[MapPoint<D>],
+        pyramid: ScalePyramid,
         candidates: &[usize],
         keypoints_xy: &[[f32; 2]],
-        descriptors: &[[u8; 32]],
+        descriptors: &[D],
         octaves: &[u8],
         grid: &KeypointGrid,
         camera: &PinholeCamera,
         pose_world_to_cam: &Pose3d,
         image_size: ImageSize,
-        config: ProjectionMatchConfig,
+        config: ProjectionMatchConfig<D::Distance>,
     ) -> Vec<(usize, usize)> {
         let mut matched_kp = vec![false; keypoints_xy.len()];
         let mut matches = Vec::new();
@@ -589,18 +583,17 @@ impl MapProjectionEstimator {
                 if dist < mp.min_distance_invariance() || dist > mp.max_distance_invariance() {
                     continue;
                 }
-                let level = mp.predict_scale(dist, ORB_SCALE_FACTOR, ORB_N_LEVELS) as i32;
+                let level = mp.predict_scale(dist, pyramid) as i32;
                 let half = OCTAVE_WINDOW_HALF_WIDTH as i32;
                 let lo = (level - half).max(0) as u8;
-                let hi = (level + half).min(ORB_N_LEVELS as i32 - 1) as u8;
+                let hi = (level + half).min(pyramid.n_levels as i32 - 1) as u8;
                 Some((lo, hi))
             } else {
                 None
             };
 
             let candidates = grid.query_radius(u, v, config.search_radius, keypoints_xy);
-            let mut best_dist = u32::MAX;
-            let mut best_kp = usize::MAX;
+            let mut best: Option<(D::Distance, usize)> = None;
 
             for kp_idx in candidates {
                 if matched_kp[kp_idx] {
@@ -612,14 +605,15 @@ impl MapProjectionEstimator {
                         continue;
                     }
                 }
-                let dist = hamming_distance(&mp.descriptor, &descriptors[kp_idx]);
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_kp = kp_idx;
+                let dist = mp.descriptor.distance(&descriptors[kp_idx]);
+                if best.is_none_or(|(best_dist, _)| dist < best_dist) {
+                    best = Some((dist, kp_idx));
                 }
             }
 
-            if best_dist <= config.max_hamming && best_kp != usize::MAX {
+            if let Some((best_dist, best_kp)) = best
+                && best_dist <= config.max_distance
+            {
                 matched_kp[best_kp] = true;
                 matches.push((mp_idx, best_kp));
             }
@@ -627,6 +621,13 @@ impl MapProjectionEstimator {
 
         matches
     }
+}
+
+fn eligible_pre_seeded(
+    pre_seeded: Option<Vec<(usize, usize)>>,
+    min_correspondences: usize,
+) -> Option<Vec<(usize, usize)>> {
+    pre_seeded.filter(|correspondences| correspondences.len() >= min_correspondences)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -667,8 +668,8 @@ mod estimator_tests {
 #[cfg(test)]
 mod matching_tests {
     use super::*;
+    use crate::features::Features;
     use kornia_algebra::{Mat3F64, Vec3F64};
-    use kornia_imgproc::features::OrbFeatures;
 
     fn make_test_estimator() -> MapProjectionEstimator {
         MapProjectionEstimator::new(MapProjectionConfig::default())
@@ -691,7 +692,7 @@ mod matching_tests {
         let count = keypoints.len();
         Frame {
             idx: 0,
-            features: OrbFeatures {
+            features: Features {
                 keypoints_xy: keypoints.clone(),
                 orientations: vec![0.0; count],
                 descriptors: vec![[0; 32]; count],
@@ -801,15 +802,9 @@ mod matching_tests {
     fn klt_source_is_eligible_at_minimum_size() {
         let seeded = vec![(0, 0), (1, 1), (2, 2), (3, 3)];
 
-        assert_eq!(
-            MapProjectionEstimator::eligible_pre_seeded(Some(seeded.clone()), 4),
-            Some(seeded)
-        );
-        assert_eq!(
-            MapProjectionEstimator::eligible_pre_seeded(Some(vec![(0, 0); 3]), 4),
-            None
-        );
-        assert_eq!(MapProjectionEstimator::eligible_pre_seeded(None, 4), None);
+        assert_eq!(eligible_pre_seeded(Some(seeded.clone()), 4), Some(seeded));
+        assert_eq!(eligible_pre_seeded(Some(vec![(0, 0); 3]), 4), None);
+        assert_eq!(eligible_pre_seeded(None, 4), None);
     }
 
     #[test]
@@ -835,6 +830,7 @@ mod matching_tests {
 
         let matches = estimator.match_by_projection(
             &map_points,
+            ScalePyramid::ORB,
             &[0],
             &keypoints_xy,
             &descriptors,
@@ -849,7 +845,7 @@ mod matching_tests {
             ProjectionMatchConfig {
                 min_depth: 0.0,
                 search_radius: 15.0,
-                max_hamming: 50,
+                max_distance: 50,
             },
         );
 
@@ -875,6 +871,7 @@ mod matching_tests {
 
         let matches = estimator.match_by_projection(
             &map_points,
+            ScalePyramid::ORB,
             &[0],
             &keypoints_xy,
             &[descriptor; 2],
@@ -889,7 +886,7 @@ mod matching_tests {
             ProjectionMatchConfig {
                 min_depth: 0.0,
                 search_radius: 15.0,
-                max_hamming: 50,
+                max_distance: 50,
             },
         );
 
@@ -916,6 +913,7 @@ mod matching_tests {
 
         let matches = estimator.match_by_projection(
             &map_points,
+            ScalePyramid::ORB,
             &[0],
             &keypoints_xy,
             &descriptors,
@@ -930,7 +928,7 @@ mod matching_tests {
             ProjectionMatchConfig {
                 min_depth: 0.0,
                 search_radius: 15.0,
-                max_hamming: 50,
+                max_distance: 50,
             },
         );
 
@@ -957,6 +955,7 @@ mod matching_tests {
 
         let matches = estimator.match_by_projection(
             &map_points,
+            ScalePyramid::ORB,
             &[0],
             &keypoints_xy,
             &descriptors,
@@ -971,7 +970,7 @@ mod matching_tests {
             ProjectionMatchConfig {
                 min_depth: 0.0,
                 search_radius: 15.0,
-                max_hamming: 50,
+                max_distance: 50,
             },
         );
 

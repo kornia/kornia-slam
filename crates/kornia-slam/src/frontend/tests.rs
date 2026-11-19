@@ -107,9 +107,9 @@ fn hilti_mapping() -> FisheyeMapping {
 }
 
 /// Features whose orientation, descriptor and octave all encode their index.
-fn indexed_features(keypoints_xy: Vec<[f32; 2]>) -> OrbFeatures {
+fn indexed_features(keypoints_xy: Vec<[f32; 2]>) -> Features {
     let n = keypoints_xy.len();
-    OrbFeatures {
+    Features {
         keypoints_xy,
         orientations: (0..n).map(|i| i as f32 * 0.01).collect(),
         descriptors: (0..n)

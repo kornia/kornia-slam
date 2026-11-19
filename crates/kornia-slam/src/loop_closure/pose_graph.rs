@@ -5,6 +5,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use thiserror::Error;
 
+use crate::features::Descriptor;
 use crate::loop_closure::sparse_pgo::{
     GravityManifold, Se3Manifold, sparse_pose_graph_optimize, weighted_relative_residual,
 };
@@ -63,8 +64,8 @@ pub enum PgoError {
 }
 
 /// Optimize a read-only keyframe snapshot for safe live-map writeback.
-pub fn optimize_pose_graph(
-    map: &Map,
+pub fn optimize_pose_graph<D: Descriptor>(
+    map: &Map<D>,
     verified_loops: &[VerifiedLoopEdge],
     config: &PgoConfig,
     inertial: Option<InertialPgoContext>,
