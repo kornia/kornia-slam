@@ -178,3 +178,62 @@ If P3 and P4 hold, `pr180-frontend-1ms` gets `min_cold_start_points: 20` togethe
   1. **J3:** start the VIBA window ≥ 1 s after the seed, past the exposure ramp. This tests whether frames 2-20 are what make VIBA0 wrong. It is cheap, and one knob in `ImuInitializer::in_solve_window`.
   2. **J2:** ORB-SLAM3's `FullInertialBA` after each VIBA (theory b, kornia-slam#51). It is the larger change, and it is also the one reference mechanism the pipeline lacks.
   3. **Why VIBA2 fits a 14° tilt:** compare the VIBA2 window's visual trajectory with ground truth around frames 176-307. Also check how much of it is the unrectified IMU: R_03 has no factory calibration, and R_11, which has one, never hit this reject.
+
+## Step J3: a VIBA window that starts after the exposure ramp (written 2026-11-19, before code)
+
+- **Gap:** G32. **Base:** 46376a8 (binary c21243f plus J3), configs from `experiments/quick-eval/make_config.sh`.
+- **Mechanism, restated:**
+  - Under Ib, the R_03 map is seeded at frame 2, in the auto-exposure ramp (card I gap 1: mean intensity 151 → 66 over the first frames, in steps every 2 frames).
+  - VIBA0 then solves over frames 2-63 and is 3.4° off, as VIBA1 measures. I0's window starts at frame 3 and is 0.47° off.
+  - J1 showed that the error is not a few outlier edges: nothing in the window stands out against its median.
+- **Theory:**
+  - The poses of the first keyframes are biased together: they are tracked on a map seeded under a changing exposure, from 45-63 points.
+  - A biased start block shifts the finite-difference velocities and the gravity seed coherently (`solve.rs`, the `!already_initialized` branch), and no per-edge gate sees a coherent shift.
+  - VINS-Fusion initialises over a sliding window of the latest frames (`Estimator::initialStructure`), so the first frames of a run fall out of its window. ORB-SLAM3 uses all the map's keyframes, but its map does not start inside a ramp with a 1-frame-old seed.
+  - Starting the window after the ramp removes the biased block, and the solve sees only poses tracked under steady exposure.
+- **Knob:** `inertial.viba_window_delay_sec: f64`, default `0.0`.
+  - The VIBA window (VIBA0, VIBA1 and VIBA2, and `ready()`) starts at the first keyframe whose accumulated IMU-factor time since `start_idx` is ≥ the delay.
+  - IMU time is used because a `Keyframe` has no timestamp.
+  - The resume keyframe and the alignment are unchanged: the whole map is still aligned.
+  - Debug line: `[imu_init] window starts at keyframe N (delay D s)`.
+
+### Configs (3 runs each)
+
+| Name | Base | Knob |
+|---|---|---|
+| J3 | r03 + `min_cold_start_points: 20` (Ib) | `viba_window_delay_sec: 1.0` |
+| J3b | Ib | `viba_window_delay_sec: 2.0` |
+| J3-I0 | r03 base (I0) | `1.0` |
+| J3-R01 | r01 Ib | `1.0` |
+| J3-R11 | r11 Ib | `1.0` |
+
+### Predictions
+
+- **P1, J3 on R_03, mechanism:**
+  - the VIBA0 window starts at a keyframe in frames 20-26;
+  - VIBA1's gravity correction is ≤ 1.2° (Ib 3.4°, I0 0.47°), and VIBA1 |ba| ≤ 0.40 m/s² (Ib 0.76).
+- **P2, J3 on R_03:**
+  - VIBA2 accepted 3/3, with |ba| ≤ 1.0 (Ib rejected 10/10 at 2.3-2.7);
+  - tracked ≥ 777 (I0 band 777-788; Ib 341-747);
+  - ATE SE3 ≤ 0.25 m (I0 0.179-0.211 m).
+- **P3, J3b on R_03:** as P1 and P2. If J3 misses and J3b holds, the ramp effect lasts longer than 1 s.
+- **P4, J3 on the configs that work:**
+  - J3-I0: tracked ≥ 777, ATE ≤ 0.23 m;
+  - J3-R01: 800/800, ATE 0.097-0.125 m;
+  - J3-R11: ≥ 797/800, ATE ≤ 0.33 m, scale 0.95-1.16.
+
+### Kill rules
+
+- **K1, mechanism moved, score did not:** VIBA1's correction is ≤ 1.2°, but VIBA2 is still rejected or tracking is still lost at frames 170-310. Then the start block was one cause, and the systematic VIBA2 tilt has another. Next, J2, and the unrectified-IMU check.
+- **K2, score moved, mechanism did not:** R_03 tracks ≥ 777, but VIBA1's correction stays > 2°. That is luck, for example because a later VIBA0 changes the tracking path, and the knob does not ship.
+- **K3:** J3-I0, J3-R01 or J3-R11 leaves its band. The knob does not ship in a preset.
+- **K4:** VIBA1's correction is still ≥ 3° under both 1.0 and 2.0 s. Then the theory is refuted: the error is not in the first seconds but in the whole Ib trajectory.
+
+### Bit-identity and noise
+
+- **Identity:** default `0.0` gives an effective start equal to `start_idx`. A unit test, and a knobs-off run whose VIBA numbers repeat the Ib ones, check that nothing else changes.
+- **Noise:** 3 runs per config. The Ib VIBA numbers repeat to 3 digits, so the mechanism counters are not noisy; tracking and ATE are.
+
+### Ship rule
+
+If P2 and P4 hold, `pr180-frontend-1ms` gets `min_cold_start_points: 20` and `viba_window_delay_sec: 1.0`.
