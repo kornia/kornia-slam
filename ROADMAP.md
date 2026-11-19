@@ -194,6 +194,12 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 
 We are working toward top results on the [LaMAria](https://github.com/cvg/lamaria) egocentric benchmark ([#78](https://github.com/kornia/kornia-slam/issues/78)), using the Aria rig and IMU and no GPS. The work is sequenced by where the benchmark score is lost: each change states its theory and predictions first, ships behind a config knob that defaults to the old behaviour, and is compared window by window against ORB-SLAM3 in the same harness.
 
+Next, start-up and scale (2026-11-19, from cards I and J; in this order):
+- [ ] **Baseline and parallax gate on new map points.** Skip a keyframe pair whose baseline is below the stereo baseline (stereo) or 1 % of median depth (mono), and reject points whose rays are near-parallel (cos > 0.9998), as ORB-SLAM3 `CreateNewMapPoints` does. Today `mapping/growth.rs:233` checks only `|t| > 1e-8`. Suspected cause of the 1/5-scale R_03 start (G32); first confirm with the map-point depth diagnosis in `experiments/pr180-status-2026-11-19.md`.
+- [ ] **Raw fisheye images instead of the pinhole crop (card F).** Basalt, OKVIS2, ORB-SLAM3 (`KannalaBrandt8`) and Aria's own SLAM run on the full fisheye view; the wider stereo overlap removes the R_11 start-up starvation (G31) at its source.
+- [ ] **Still-device handling.** Detect no motion; skip keyframes or apply a zero-velocity update, and initialise gravity and bias from the still period, as OpenVINS and Basalt do.
+- [ ] **IMU carries tracking through visual gaps.** Keep the young map and propagate with the IMU when a frame has too few matches, instead of resetting it at its first lost frame (Basalt, OKVIS2, VINS); ORB-SLAM3 keeps old maps in its Atlas and merges them later.
+
 Losses and recovery:
 - [x] Keep every pose rigid at the source; rotation scale crept in through repeated pose corrections
 - [ ] Lost-mode keyframes as fixed anchors (built, knob `keyframes_while_lost`, not yet validated; no gain on its own)
