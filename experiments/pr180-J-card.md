@@ -22,7 +22,8 @@ Status: written 2026-11-19. Diagnosis step J0 has its predictions here before an
 - **Tilt and bias trade off.** 3.4° of tilt is 9.8 · sin 3.4° = 0.58 m/s² of horizontal specific force. VIBA1's extra `ba_y` in Ib is 0.68 m/s². The solve explains the residual with both.
 - **The window carries far more cost under Ib.** VIBA1 cost is 9× I0's and VIBA2 cost is 60-100× I0's, on windows of similar length. With `PRIOR_A` = 1e5 (`inertial/schedule.rs:28`), a bias of 1.5 m/s² costs only 2.4e5 of the 2.4e7. The edges dominate, and the bias goes wherever they push it.
 - **The losses follow.** Ib-d2 is lost from frame 322, 17 frames after the VIBA2 reject, and coasts 101 frames. Ib-d1 is lost from frame 269, before VIBA2, and coasts 459 frames.
-- **A plausible accelerometer bias is small.** R_03 uses the factory-rectified IMU. Even I0's VIBA2 |ba| of 0.52 m/s² is large for an Aria IMU.
+- **The accelerometer bias is large.** Even I0's VIBA2 |ba| of 0.52 m/s² is large for an Aria IMU.
+  - *Corrected 2026-11-19:* this line first said R_03 uses the factory-rectified IMU. It does not. LaMAria has factory calibration only for R_11 and the `sequence_*` sequences, so R_03 and R_01 run on the unrectified IMU, as in card H. An unrectified accelerometer (scale and misalignment) can account for part of the bias, and that is a candidate cause of the systematic VIBA2 tilt.
 
 ### Theory
 
@@ -138,3 +139,42 @@ Status: written 2026-11-19. Diagnosis step J0 has its predictions here before an
 ### Ship rule
 
 If P3 and P4 hold, `pr180-frontend-1ms` gets `min_cold_start_points: 20` together with J4 and J1. That would give R_11 800/800 without breaking R_03, which is card I's goal.
+
+## Result log, J4 and J1 (2026-11-19)
+
+- **Setup:**
+  - binary c21243f (knobs from 846bdf2), configs in `cardJ/cfg/`, run dirs `cardJ/out/<config>-r{1,2,3}`;
+  - `--debug` and `KORNIA_SLAM_DEBUG=1`, 3 runs per config, 3 at once on the laptop;
+  - ATE is SE3 against pseudo-dense ground truth (`ate.py`); tracked and `coast_inertial` come from `[summary]`.
+- **Knobs-off identity:** the app is not deterministic run to run, so trajectory `cmp` cannot pass. As the proxy, `r03-Ib-off` (new binary, knobs off) repeats the Ib VIBA0 and VIBA1 numbers to all printed digits:
+  - gravity `(9.796,0.399,0.350)`, then `(0.026,9.792,-0.588)`;
+  - VIBA1 ba `(0.248,0.681,0.218)`.
+
+  The unit tests and the implementer's golden dump also showed the solve bit-identical with the knobs off.
+- **Implementation note:** the gated VIBA0 re-solve starts from the same seed, and that seed (finite-difference velocities and the summed gravity direction) is built from every edge, including the dropped ones. On the refinement solves the seed does not depend on the edges.
+
+| P/K | Prediction | Baseline | Measured (each run) | Verdict |
+|---|---|---|---|---|
+| P1, J4 R_03 | VIBA2 cost ≤ 3e6 and accepted in runs lost first; coast ≤ 60 | VIBA2 cost 1.3-2.4e7, rejected; coast 53-459 | every run was lost first (frames 247-272). VIBA2 cost 8.6e6, 6.7e6, 1.05e7; rejected ×3, \|ba\| 2.38, 2.43, 2.32. Coast 44, 476, 458 | missed |
+| P2, J1 R_03 | gate drops 2-8 VIBA1 edges in frames 40-86; VIBA1 correction ≤ 1.2°; VIBA1 \|ba\| ≤ 0.40 | 3.4°, 0.76 | gate dropped **0** edges in VIBA0 and VIBA1 in all 6 Ib-based runs (J1, J41). VIBA1 gravity `(0.026,9.792,-0.588)` = 3.4° ×6; ba 0.76 ×6. It fired only in VIBA2, on frames 183-307 | missed |
+| P3, J41 R_03 | VIBA2 accepted 3/3, tracked ≥ 777, ATE ≤ 0.25 m | Ib tracked 341-747 | VIBA2 rejected ×3 (\|ba\| 2.70, 2.70, 2.47); tracked 365, 668, 657; ATE 77.4, 1.44, 4.22 m | missed |
+| P4, J41-I0 | tracked ≥ 777, ATE ≤ 0.23 m | 777-786, 0.179-0.211 m | 788, 784, 788; 0.210, 0.198, 0.205 m. Gate drops 3→6 and 18→26 in VIBA0 and VIBA1 | as predicted |
+| P4, J41-R01 | 800/800, ATE 0.097-0.12 m | 800 ×3, 0.105-0.111 m | 800 ×3; 0.102, 0.121, 0.119 m | inside noise (r2 0.001 m over the bound) |
+| P4, J41-R11 | 800/800, ATE ≤ 0.33 m, scale 0.95-1.16 | 800 ×3, 0.214-0.333 m, 1.08-1.16 | 800, 800, 797; 0.230, 0.312, 0.221 m; scale 1.09-1.14 | as predicted, except r3 at 797 |
+| K1 | P2 holds, loss remains | | P2 did not hold | not fired |
+| K2 | score moves, mechanism does not | | no score moved on R_03 | not fired |
+| K3 | J41-I0 or J41-R01 leave their band | | both inside | not fired |
+| K4 | gate hits its 25 % cap | | at most 5 of 70 edges | not fired |
+
+- **Theory (a) is refuted.** The Ib start-up edges are not outliers against the window median. At k = 10, the gate finds nothing in VIBA0 or VIBA1 under Ib, while it does find the two I0 rotation-heavy edges (3→6, 18→26). The whole early Ib window carries a high velocity cost, so its error is systematic, not a few bad edges.
+- **Theory (c) is only part of it.** Without the coast keyframes, the VIBA2 cost falls about 40 %, from 1.3-2.4e7 to 0.67-1.05e7. VIBA2 is still rejected in all 9 Ib-based runs.
+- **The VIBA2 reject is systematic.** The rejected `ba` points the same way in every one of the 10 Ib runs, whatever the knobs: `(≈0, 1.55-1.94, 1.52-2.00)`, |ba| 2.3-2.7 m/s². 9.8 · sin 14° = 2.4 m/s², so the solve is fitting a gravity tilt of about 14° that its `prior_g = 0` re-solve cannot reach through gravity. Robust gating cannot fix a systematic misfit.
+- **What is known now:**
+  - The R_03 Ib collapse starts at VIBA0: its 3.4° error, measured by VIBA1, is reproduced to 3 digits in every run.
+  - Tracking is then lost at frames 176-272, and VIBA2 meets an inconsistent window.
+  - The only difference from I0 is the seed one frame earlier (frame 2 against 3), inside the auto-exposure ramp (card I, gap 1).
+- **Outcome:** neither knob ships in a preset. Both stay in the code, off by default. They are harmless on I0, R_01 and R_11, and R_11 holds 800/800 in 2 of 3 runs with `min_cold_start_points: 20`. The card I ship rule stays unmet: `min_cold_start_points: 20` still breaks R_03.
+- **Next gaps, in order:**
+  1. **J3:** start the VIBA window ≥ 1 s after the seed, past the exposure ramp. This tests whether frames 2-20 are what make VIBA0 wrong. It is cheap, and one knob in `ImuInitializer::in_solve_window`.
+  2. **J2:** ORB-SLAM3's `FullInertialBA` after each VIBA (theory b, kornia-slam#51). It is the larger change, and it is also the one reference mechanism the pipeline lacks.
+  3. **Why VIBA2 fits a 14° tilt:** compare the VIBA2 window's visual trajectory with ground truth around frames 176-307. Also check how much of it is the unrectified IMU: R_03 has no factory calibration, and R_11, which has one, never hit this reject.

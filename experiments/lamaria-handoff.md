@@ -1,5 +1,7 @@
 # LaMAria sprint: handoff (2026-11-17, updated for the PR #180 round; first written 2026-11-15)
 
+> **2026-11-19:** the newest status (quick evaluation, cards H, I and J, the next experiments, and how to rerun) is in `experiments/pr180-status-2026-11-19.md`. This note is kept for the earlier context.
+
 The 2026-11-17 round rebased the branch on main, and built the estimator, recovery, rig and offline-BA changes below behind knobs. Nothing from that round has been compiled beyond `cargo check`, run or scored; every number in this note predates it. See `experiments/pr180-validation-handoff.md`.
 
 This note is for whoever picks up the LaMAria accuracy work on this branch (PR #180). It says where the score stands, what we learned, why progress has been slow, and what we recommend doing next.

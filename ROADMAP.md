@@ -21,6 +21,26 @@ Newest first, one entry per working day. "main" means a merged PR; "#180" means 
 `feat/global-pose-graph` branch (PR #180), which is not merged. Unless marked validated, branch work
 sits behind config knobs that default to the old behaviour, and nothing in it has been benchmarked yet.
 
+### 2026-11-19
+- **#180, first quick evaluation** (2026-11-18, LaMAria 800-frame windows, `--no-pace`, 3 runs per config). This is not the validation protocol; it is a few-minute check on three sequences.
+  - EuRoC with the knobs off matches the 79c04bb base.
+  - `pr180-frontend-1ms` beats `lamaria-rig-imu` on R_01: ATE 0.10 m against 0.59 m.
+  - The full R_01 sequence tracks 100 %, but with ATE 1.18 m and scale 1.136 (drift).
+- **#180, card H** (`experiments/pr180-H-card.md`). A bisect of `pr180-full` put its scale collapse on `tracking.pose_inertial: OrbSlam3`, the per-frame solve from card A6 and PR #195. The solve gates the visual matches out: solve inliers / visual inliers are 0.09-0.12 on rejected frames. `pr180-full` now ships it off (f55e997), and is then 3/3 at 100 % tracked on R_01, 0.110-0.122 m. H2 (the `LastKeyframe` variant) is refuted.
+- **#180, card I** (`experiments/pr180-I-card.md`), knobs `tracking_loss.reseed.young_map_grace_sec` and `min_cold_start_points`, both off.
+  - R_11 loses 132 of 800 frames at start-up: the frame-0 map is reset at frame 3, then the cold start starves below 50 stereo points.
+  - `min_cold_start_points: 20` gives R_11 800/800 ×3, but breaks R_03.
+  - The grace knob does not help: a held young map does not re-track.
+  - The frame-0 map dies at frames 2-4, from the auto-exposure ramp on R_01 and R_03, and from the view moving off the first structure on R_11.
+- **#180, card J** (`experiments/pr180-J-card.md`), knobs `inertial.viba_window` and `inertial.viba_velocity_gate`, both off.
+  - **Why R_03 breaks:** with the map seeded one frame earlier, VIBA0 is 3.4° off, as measured by VIBA1, against 0.47° in the base. VIBA2 then fits a systematic tilt of about 14° (|ba| 2.3-2.7 m/s²) and is rejected in 10/10 runs, and tracking is lost.
+  - **The two fixes:**
+    - J4 keeps the keyframes inserted while lost out of the VIBA windows;
+    - J1 gates outlier velocity edges per edge;
+    - both are refuted as fixes (the error is systematic, not a few edges), and are harmless on R_01, R_11 and the R_03 base.
+  - **Next:** J3 (a VIBA window that starts after the exposure ramp), then J2 (ORB-SLAM3's `FullInertialBA` after each VIBA, kornia-slam#51).
+- **#180, still unvalidated.** No preset changed except `pr180-full` (`pose_inertial: Off`). The validation workflow in `experiments/pr180-validation-handoff.md` has not run. The status and how to take over are in `experiments/pr180-status-2026-11-19.md`.
+
 ### 2026-11-18
 - **#180, theory review.** Four read-only reviews (estimator, offline BA and calibration, geometry and recovery, frontend): 52 findings (5 high, 21 medium, 26 low), all in knob-gated code. The always-on review fixes were found equivalent to what they replaced. Findings and the test for each: `experiments/pr180-theory-review.md`.
 - **#180, fixes per lane** (one commit per finding or group, each with a test that fails on the old code; knobs off, not validated):
