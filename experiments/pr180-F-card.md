@@ -1,6 +1,19 @@
 # PR #180 card F: raw Aria fisheye on both rig cameras
 
-DEFERRED by the owner on 2026-11-17 to its own round; blocking decisions D1-D6 below stay open.
+DEFERRED by the owner on 2026-11-17 to its own round. **Resumed 2026-11-20** (roadmap item "raw fisheye images instead of the pinhole crop"), with D1-D6 decided by the owner:
+
+- **D1:** (a). `Fisheye624Camera` lives in kornia-sensors (`kornia-sensors/src/camera_fisheye624.rs`), marked for kornia-3d later.
+- **D2:** (c). The in-view test is done in raw pixels: project through `Fisheye624Camera` and test against 640×480 (ORB-SLAM3's `KannalaBrandt8` path). There is no virtual canvas, and `Frame::image_size` is unchanged.
+- **D3:**
+  - (i) a model-aware method, `Fisheye624Camera::pinhole_magnification(&self, theta)`;
+  - (ii) one scalar per observation, the geometric mean `sqrt(radial · tangential)`.
+- **D4:**
+  - `BundleAdjustmentParams` gains `fisheye_weight`, applied at the local-BA sigma site (`mapping/bundle_adjustment.rs`);
+  - relocalisation, PnP refine and the offline BA keep unit weight. They are not in scope this round, and this card records it.
+- **D5:** `match_overlap` reads the undistortion cache. `ensure_undistorted` moves ahead of it in `prepare_rig`.
+- **D6:** the raw images come from an ASL-layout extraction made with LaMAria's own `tools/vrs_to_asl_folder.py` (projectaria_tools), from the raw `.vrs` files. R_01, R_03 and R_11 were downloaded on 2026-11-20 (0.94, 1.14 and 2.82 GB). `RawFisheye` points at that extraction as its own image root.
+
+The base is now `feat/global-pose-graph` (df45adf or later), not the `pr180b/K` skeleton named below. The lane and skeleton wording below is from the 2026-11-17 plan; the new plan replaces it.
 
 Plan: `/home/edgar/.claude/plans/pr180-frontend-1ms.md`, Lane F (section 9), knobs from section 8, defaults from section 14. The roadmap and `lamaria-handoff.md:116,187` call this item "A9". Card A already uses A9 for `mapping.growth_neighbours` (`pr180-A-card.md:47,346`), so this card uses the id **F** and the gap id **G12**.
 
