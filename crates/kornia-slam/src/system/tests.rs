@@ -155,6 +155,18 @@ fn build_plumbs_the_viba_knobs_to_the_initializer() {
 }
 
 #[test]
+fn build_plumbs_the_growth_baseline_ratio() {
+    let mut knobs = mono();
+    let PipelineDefinition::OrbSlam(orb) = &mut knobs.pipeline;
+    orb.mapping.growth_min_baseline_ratio = 0.0175;
+    let system = SlamSystem::build(knobs, SensorRig::new(camera())).unwrap();
+    assert_eq!(system.growth_min_baseline_ratio, 0.0175);
+
+    let system = SlamSystem::build(mono(), SensorRig::new(camera())).unwrap();
+    assert_eq!(system.growth_min_baseline_ratio, 0.0);
+}
+
+#[test]
 fn build_reports_a_missing_vocabulary() {
     let missing = PathBuf::from("/nonexistent/ORBvoc.bin");
     let enabled = config(

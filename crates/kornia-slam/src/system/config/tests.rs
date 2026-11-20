@@ -154,6 +154,39 @@ fn the_viba_knobs_default_off_and_the_gate_is_range_checked() {
 }
 
 #[test]
+fn the_growth_baseline_ratio_defaults_off_and_is_range_checked() {
+    assert_eq!(MappingConfig::default().growth_min_baseline_ratio, 0.0);
+    let ratio = |growth_min_baseline_ratio| {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).mapping.growth_min_baseline_ratio = growth_min_baseline_ratio;
+        config.validate()
+    };
+    assert_eq!(ratio(0.0), Ok(()));
+    assert_eq!(ratio(0.0175), Ok(()));
+    for value in [-1.0, f64::NAN, f64::INFINITY] {
+        assert!(
+            matches!(
+                ratio(value),
+                Err(ConfigError::InvalidSetting { setting, .. })
+                    if setting == "mapping.growth_min_baseline_ratio"
+            ),
+            "ratio {value}"
+        );
+    }
+}
+
+#[test]
+fn display_names_the_growth_baseline_ratio_only_when_set() {
+    let mut config = SystemConfig::default();
+    orb_mut(&mut config).mapping.growth_min_baseline_ratio = 0.0175;
+    assert!(
+        config
+            .to_string()
+            .contains("  growth: pairs under baseline/depth 0.0175 skipped\n")
+    );
+}
+
+#[test]
 fn frontend_and_keyframe_settings_are_range_checked() {
     let keypoints = |n_keypoints| {
         let mut config = SystemConfig::default();
@@ -1329,6 +1362,19 @@ mod ron_files {
 
         let default = parse("(version: 1)").unwrap();
         assert_eq!(orb(&default).inertial, InertialConfig::default());
+    }
+
+    #[test]
+    fn the_growth_baseline_ratio_parses_and_round_trips() {
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((mapping: (growth_min_baseline_ratio: 0.0175))))",
+        )
+        .unwrap();
+        assert_eq!(orb(&config).mapping.growth_min_baseline_ratio, 0.0175);
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+
+        let default = parse("(version: 1)").unwrap();
+        assert_eq!(orb(&default).mapping.growth_min_baseline_ratio, 0.0);
     }
 
     #[test]

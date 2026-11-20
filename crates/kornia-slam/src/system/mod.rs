@@ -167,6 +167,7 @@ pub struct SlamSystem {
     relocalization: LostRelocalization,
     tracking_config: TrackingConfig,
     growth_neighbours: GrowthNeighbours,
+    growth_min_baseline_ratio: f64,
     sample_interpolation: SampleInterpolation,
     // Keyframes a map bound evicted, copied while a session is recorded.
     session_recording: bool,
@@ -313,6 +314,7 @@ impl SlamSystem {
             relocalization: settings.relocalization,
             tracking_config: settings.tracking,
             growth_neighbours: settings.growth_neighbours,
+            growth_min_baseline_ratio: settings.growth_min_baseline_ratio,
             sample_interpolation: settings.inertial.sample_interpolation,
             session_recording: false,
             evicted_keyframes: Vec::new(),
@@ -2995,6 +2997,7 @@ impl SlamSystem {
             &self.rig.camera,
             self.two_view_init_config.match_config,
             &self.two_view_init_config.triangulation_config,
+            self.growth_min_baseline_ratio,
         );
         self.report_growth(frame.idx, &growth);
         if anchor {

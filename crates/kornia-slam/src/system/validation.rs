@@ -141,6 +141,11 @@ impl OrbSlamPipeline {
             self.inertial.viba_velocity_gate,
             NON_NEGATIVE,
         )?;
+        check(
+            "mapping.growth_min_baseline_ratio",
+            self.mapping.growth_min_baseline_ratio,
+            NON_NEGATIVE,
+        )?;
         if let GrowthNeighbours::OrbSlam3 { covisible } = self.mapping.growth_neighbours {
             check(
                 "mapping.growth_neighbours.covisible",

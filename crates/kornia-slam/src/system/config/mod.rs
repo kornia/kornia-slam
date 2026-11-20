@@ -523,6 +523,8 @@ pub struct MappingConfig {
     pub keyframe_observations: KeyframeObservations,
     /// Which keyframes a new keyframe triangulates and fuses against.
     pub growth_neighbours: GrowthNeighbours,
+    /// Smallest baseline, as a fraction of the new keyframe's median scene depth, from which a keyframe pair grows map points (card K); `0.0` is off.
+    pub growth_min_baseline_ratio: f64,
 }
 
 /// The local BA / VI-BA window and its error model. The defaults are the
@@ -800,6 +802,13 @@ impl fmt::Display for SystemConfig {
                 f,
                 "  keyframe observations: {:?}",
                 orb.mapping.keyframe_observations
+            )?;
+        }
+        if orb.mapping.growth_min_baseline_ratio > 0.0 {
+            writeln!(
+                f,
+                "  growth: pairs under baseline/depth {} skipped",
+                orb.mapping.growth_min_baseline_ratio
             )?;
         }
         let ba = &orb.mapping.local_ba;

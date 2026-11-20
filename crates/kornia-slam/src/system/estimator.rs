@@ -337,22 +337,7 @@ impl SlamSystem {
     /// Median camera-frame depth of the reference keyframe's landmarks.
     fn reference_median_depth(&self) -> Option<f64> {
         let map = self.map.lock().unwrap();
-        let kf = map.get_keyframe(self.state.current_keyframe_idx?)?;
-        let mut depths: Vec<f64> = kf
-            .map_point_by_desc_idx
-            .iter()
-            .flatten()
-            .filter_map(|&mp_idx| map.map_points().get(mp_idx))
-            .filter(|mp| !mp.culled)
-            .map(|mp| kf.frame.pose_world_to_cam.transform_point(&mp.position).z)
-            .filter(|z| z.is_finite() && *z > 0.0)
-            .collect();
-        if depths.is_empty() {
-            return None;
-        }
-        let mid = depths.len() / 2;
-        let (_, median, _) = depths.select_nth_unstable_by(mid, f64::total_cmp);
-        Some(*median)
+        map.scene_median_depth(self.state.current_keyframe_idx?)
     }
 
     /// Under `tracking.pose_inertial`, refines a tracked `estimate` with the

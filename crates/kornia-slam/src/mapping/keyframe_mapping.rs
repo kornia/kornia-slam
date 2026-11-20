@@ -323,6 +323,7 @@ pub(crate) fn grow_keyframe(
     camera: &PinholeCamera,
     match_config: OrbMatchConfig,
     triangulation_config: &TriangulationConfig,
+    min_baseline_ratio: f64,
 ) -> KeyframeGrowthResult {
     let mut result = KeyframeGrowthResult {
         neighbor_count: plan.triangulation_neighbours.len(),
@@ -338,6 +339,7 @@ pub(crate) fn grow_keyframe(
             match_config,
             triangulation_config,
             camera,
+            min_baseline_ratio,
         ) else {
             continue;
         };
@@ -393,7 +395,7 @@ pub(crate) fn grow_keyframe(
 mod tests {
     use super::*;
     use crate::frame::Frame;
-    use crate::mapping::map::Keyframe;
+    use crate::mapping::map::{Keyframe, LandmarkSeed};
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::Vec3F64;
     use kornia_image::ImageSize;
@@ -536,6 +538,7 @@ mod tests {
             &camera(),
             OrbMatchConfig::default(),
             &TriangulationConfig::default(),
+            0.0,
         )
     }
 
@@ -666,6 +669,46 @@ mod tests {
         );
         // The accepted keyframe is untouched by the skip.
         assert!(map.lock().unwrap().get_keyframe(30).is_some());
+    }
+
+    /// Keyframe 30 is 1 m from keyframe 10 and holds one landmark 5 m deep, so
+    /// its pair's baseline/depth is 0.2: a 0.25 ratio skips it, 0.15 grows it.
+    #[test]
+    fn the_baseline_ratio_reaches_each_pair() {
+        let added = |ratio: f64| {
+            let mut points = grid();
+            let mut map = Map::new();
+            map.insert_keyframe(Keyframe::from_frame(observing_frame(10, 0.0, &points)))
+                .unwrap();
+            points.push(Vec3F64::new(1.0, 0.0, 5.0));
+            map.insert_keyframe(Keyframe::from_frame(observing_frame(30, 1.0, &points)))
+                .unwrap();
+            map.insert_landmark(LandmarkSeed {
+                position: points[20],
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 30,
+                    feature_idx: 20,
+                },
+            })
+            .unwrap();
+            let plan = KeyframeGrowthPlan {
+                keyframe_idx: 30,
+                triangulation_neighbours: vec![10],
+                fusion_neighbours: vec![],
+            };
+            grow_keyframe(
+                &Mutex::new(map),
+                plan,
+                &camera(),
+                OrbMatchConfig::default(),
+                &TriangulationConfig::default(),
+                ratio,
+            )
+            .landmarks_added
+        };
+        assert_eq!(added(0.25), 0);
+        assert_eq!(added(0.15), 20);
     }
 
     /// Fusion runs after growth and over the same neighbour list, so it sees

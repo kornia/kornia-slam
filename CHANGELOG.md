@@ -95,6 +95,11 @@ has been scored on a benchmark sequence yet.
   **Breaking (library):** `ImuInitResult::velocities_world` is now
   `keyframe_velocities` plus `gated_edges`; `ImuInitConfig` gains two fields;
   `InertialConfig` loses `Eq`; `ImuInitializer::inertial_optimizer` is private.
+- `mapping.growth_min_baseline_ratio` (`0.0`, off): a keyframe pair grows no map
+  points when its baseline is under this fraction of the new keyframe's median
+  scene depth, as ORB-SLAM3's `CreateNewMapPoints` (card K).
+  **Breaking (library):** `growth::pair_growth_request` takes the ratio;
+  `MappingConfig` gains a field.
 - `keyframes.rules` (`Kornia`): `OrbSlam3(max_frames)` inserts keyframes by
   ORB-SLAM3's `NeedNewKeyFrame`.
 - `tracking_loss.relocalization.while_lost` (`false`): relocalize on every lost

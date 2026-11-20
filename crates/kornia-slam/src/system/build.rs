@@ -62,6 +62,7 @@ pub(crate) struct SystemSettings {
     pub inertial: InertialConfig,
     pub relocalization: LostRelocalization,
     pub growth_neighbours: GrowthNeighbours,
+    pub growth_min_baseline_ratio: f64,
 }
 
 /// The 1 ms frontend knobs the tracking path reads.
@@ -219,6 +220,7 @@ impl SystemConfig {
             inertial: orb.inertial,
             relocalization: orb.tracking_loss.relocalization,
             growth_neighbours: orb.mapping.growth_neighbours,
+            growth_min_baseline_ratio: orb.mapping.growth_min_baseline_ratio,
         }
     }
 
