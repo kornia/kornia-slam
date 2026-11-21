@@ -165,12 +165,18 @@ impl MapPoint {
     }
 
     /// Observing keyframe ids, each once, in insertion order.
+    ///
+    /// A keyframe appears at most once per rig camera, so with every record
+    /// from camera 0 (outside a rig) the records are already one per keyframe
+    /// and are returned as they are. Only a landmark some secondary camera
+    /// observes pays for the prefix scan that drops repeats.
     pub fn observer_keyframes(&self) -> impl Iterator<Item = usize> + '_ {
+        let rig = self.observations.iter().any(|o| o.camera != 0);
         self.observations
             .iter()
             .enumerate()
-            .filter(|(i, o)| {
-                !self.observations[..*i]
+            .filter(move |(i, o)| {
+                !rig || !self.observations[..*i]
                     .iter()
                     .any(|p| p.key.keyframe_idx == o.key.keyframe_idx)
             })
@@ -374,5 +380,40 @@ mod tests {
             mp.add_observation(key(kf, 0), 0, [kf as u8; 32]);
         }
         assert_eq!(mp.observer_keyframes().collect::<Vec<_>>(), vec![5, 2, 9]);
+    }
+
+    /// R-B2: the camera-0 fast path returns what the prefix dedupe returned,
+    /// for camera-0 records and for rig records in any interleaving.
+    #[test]
+    fn observer_keyframes_matches_the_prefix_dedupe() {
+        let prefix_dedupe = |mp: &MapPoint| -> Vec<usize> {
+            let obs = mp.observations();
+            obs.iter()
+                .enumerate()
+                .filter(|(i, o)| {
+                    !obs[..*i]
+                        .iter()
+                        .any(|p| p.key.keyframe_idx == o.key.keyframe_idx)
+                })
+                .map(|(_, o)| o.key.keyframe_idx)
+                .collect()
+        };
+        let records: [&[(usize, u8)]; 4] = [
+            &[(5, 0), (2, 0), (9, 0), (1, 0)],
+            &[(5, 0), (5, 1), (2, 0), (9, 1), (2, 1)],
+            &[(3, 1), (3, 0), (4, 2), (1, 0), (4, 0), (1, 1)],
+            &[(7, 1)],
+        ];
+        for case in records {
+            let mut mp = point();
+            for (i, &(kf, camera)) in case.iter().enumerate() {
+                assert!(mp.add_observation(key(kf, i), camera, [i as u8; 32]));
+            }
+            assert_eq!(
+                mp.observer_keyframes().collect::<Vec<_>>(),
+                prefix_dedupe(&mp),
+                "{case:?}"
+            );
+        }
     }
 }
