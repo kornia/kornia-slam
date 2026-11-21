@@ -190,3 +190,63 @@ Q0a's 0.575 m, while still asynchronous. r1 does not (2.241 m, 12 large solves).
 iterations and smaller damping cut the absorbed keyframes from 4.5-4.8 to 1.3-1.5. The
 crossing edge still starts at 0.6-0.8 m/s, so the seed (b1) is still wrong on the solves that
 absorb two or more.
+
+## Ablation (step 7, 2026-11-21)
+
+Binary r-knobs (md5 b19062dd3defb4d2875ed6957a67e85d). Async, 10 active, 50 iterations, λ 1.0
+(the slow solve), full R_01, 2 jobs at a time, load average 2.9-40.0 (p50 26.6). Baseline: card M
+M1 r1-r3 (same config, knobs absent): ATE SE3 3.96, 1.63, 4.77 m; 33-60 solves > 30 cm; shift p50
+7.7-13.6 cm; 848-857 keyframes; crossing r_v p50 1.36-1.65 m/s.
+
+| Run | ATE SE3 / Sim3 | Scale | Tracked | Keyframes | > 30 cm | Shift p50 | n_new | Crossing r_v / r_p p50 | New r_v / r_p p50 | Stale / carried | ms per solve |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| seed r1 | 5.930 / 5.448 m | 0.717 | 2790 | 813 | 58 | 6.9 cm | 3.53 | 1.242 / 0.055 | 0.000 / 0.278 | 801 / 0 | 1840 |
+| seed r2 | 1.774 / 1.728 m | 0.951 | 2877 | 792 | 29 | 4.9 cm | 3.05 | 2.209 / 0.045 | 0.000 / 0.434 | 768 / 0 | 1692 |
+| seed r3 | 5.849 / 5.178 m | 0.697 | 2885 | 872 | 65 | 17.7 cm | 4.62 | 7.990 / 0.154 | 0.000 / 1.265 | 851 / 0 | 1613 |
+| merge r1 | 0.908 / 0.883 m | 1.028 | 2885 | 847 | 13 | 5.3 cm | 4.62 | 0.000 / 0.021 | 0.000 / 0.018 | 829 / 829 | 1436 |
+| merge r2 | 0.739 / 0.731 m | 1.014 | 2874 | 855 | 24 | 6.4 cm | 4.64 | 0.000 / 0.022 | 0.000 / 0.022 | 836 / 836 | 1458 |
+| merge r3 | 0.989 / 0.974 m | 1.022 | 2887 | 856 | 16 | 5.2 cm | 4.69 | 0.000 / 0.020 | 0.000 / 0.020 | 836 / 836 | 1473 |
+| both r1 | 1.877 / 1.865 m | 1.027 | 2896 | 866 | 20 | 6.0 cm | 4.90 | 0.000 / 0.021 | 0.000 / 0.021 | 843 / 843 | 1475 |
+| both r2 | 1.086 / 1.081 m | 1.012 | 2885 | 854 | 25 | 4.5 cm | 4.86 | 0.000 / 0.022 | 0.000 / 0.021 | 833 / 833 | 1465 |
+| both r3 | 0.826 / 0.815 m | 1.017 | 2876 | 838 | 15 | 4.2 cm | 4.45 | 0.000 / 0.018 | 0.000 / 0.016 | 818 / 818 | 863 |
+
+Sync 10 active with `merge: PropagateToNewer` (one run): trajectory `cmp`-identical to
+`cardQ/out/r01full-Q0a-r1/traj.txt`, `ba_stale_keyframes=0`.
+
+W8 (synthetic chain, `vi_ba_window_tests.rs`, uncommitted with W7): 10 active, mono, 0.5 px,
+50 windows; a solve absorbing 1 or 5 keyframes.
+
+| Absorbed | Seed | Merge | ATE | Scale | Shift p50 |
+|---|---|---|---|---|---|
+| 1 | ReferenceVelocity | either | 20.42 mm | 1.00099 | 2.62 mm |
+| 1 | ImuPropagated | either | 19.73 mm | 1.00089 | 2.55 mm |
+| 5 | ReferenceVelocity | SnapshotOnly | 282.87 mm | 0.95391 | 2598.76 mm |
+| 5 | ReferenceVelocity | PropagateToNewer | 19.52 mm | 1.00119 | 213.14 mm |
+| 5 | ImuPropagated | SnapshotOnly | 19.25 mm | 1.00115 | 89.80 mm |
+| 5 | ImuPropagated | PropagateToNewer | 20.55 mm | 1.00130 | 8.30 mm |
+
+### Verdicts
+
+| P/K | Prediction | Baseline | Measured | Verdict |
+|---|---|---|---|---|
+| seed: crossing r_v p50 | <= 0.3 m/s | 1.37-1.65 | 1.24, 2.21, 7.99 | missed |
+| seed: new-edge r_p p50 | <= 0.05 m | 0.20-0.30 | 0.28, 0.43, 1.26 | missed |
+| seed: solves > 30 cm | 10-30 | 33-85 | 58, 29, 65 | missed in 2/3 |
+| K3 | seed alone <= 5 solves > 30 cm | - | 58, 29, 65 | not fired |
+| merge: crossing r_v p50 | <= 0.05 m/s | 1.37-1.65 | 0.000 x3 | as predicted |
+| merge: solves > 30 cm | <= 8 | 33-85 | 13, 24, 16 | missed |
+| merge: shift p50 | <= 4 cm | 7.7-13.6 | 5.3, 6.4, 5.2 | missed |
+| merge: keyframes | <= 700 | 848-857 | 847, 855, 856 | missed |
+| sync 10, merge on | `cmp`-identical to Q0a | - | identical | as predicted |
+
+The seed alone is harmful on R_01. It makes the new edges agree with each other (r_v 0.000) but
+seeds them from the snapshot's newest keyframe before its solve lands; the merge then moves that
+keyframe's velocity and the whole correction sits on the crossing edge (1.2-8.0 m/s) and on the
+positions of the new keyframes (r_p 0.28-1.27 m). In W8 the same seed is harmless (19.25 mm)
+because the synthetic poses are IMU-predicted, not tracked against the moving map.
+
+The merge does what it was built for: every crossing and new edge starts at r_v 0.000 and r_p
+about 2 cm, and ATE SE3 falls from 1.63-4.77 m to 0.74-0.99 m with scale 1.01-1.03. Solves
+over 30 cm stay at 13-24 and n_new at 4.6: the remaining large shifts come from the slow solve
+itself, not from its start state. Seed and merge together are no better than merge alone
+(0.83-1.88 m).
