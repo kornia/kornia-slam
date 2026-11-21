@@ -935,14 +935,11 @@ fn the_large_window_applies_above_its_inlier_threshold() {
     assert_eq!(LocalBaParams::default().large(), LocalBaParams::default());
 }
 
-/// `count` level keyframes cruising along x at 2 m/s, 0.1 s apart, the
-/// landmarks of `fixture` imaged exactly, and IMU edges measured by a body
-/// whose true extrinsic is the factory one (identity) turned by the
-/// primary rotation offset `theta`: `T_bc = Exp(−θ)`.
-fn cruise_map(gravity: Vec3F64, theta: Vec3F64, count: usize) -> Map {
-    const EDGE_SEC: f64 = 0.1;
-    const SPEED: f64 = 2.0;
-    let points: Vec<_> = (0..12)
+const CRUISE_EDGE_SEC: f64 = 0.1;
+const CRUISE_SPEED: f64 = 2.0;
+
+fn cruise_points() -> Vec<Vec3F64> {
+    (0..12)
         .map(|i| {
             Vec3F64::new(
                 (i % 4) as f64 * 0.4 - 0.6,
@@ -950,21 +947,72 @@ fn cruise_map(gravity: Vec3F64, theta: Vec3F64, count: usize) -> Map {
                 4.0 + (i % 3) as f64 * 0.5,
             )
         })
+        .collect()
+}
+
+/// Cruise keyframe `id` imaging `points` exactly on its first features, of
+/// `features` in all.
+fn cruise_keyframe(id: usize, points: &[Vec3F64], features: usize) -> Keyframe {
+    let mut frame = test_frame(id, vec![[0; 32]; features]);
+    let x = CRUISE_SPEED * CRUISE_EDGE_SEC * id as f64;
+    for (feature, point) in points.iter().enumerate() {
+        frame.features.keypoints_xy[feature] = [
+            (200.0 * (point.x - x) / point.z + 320.0) as f32,
+            (200.0 * point.y / point.z + 240.0) as f32,
+        ];
+    }
+    frame.pose_world_to_cam.translation.x = -x;
+    let mut keyframe = Keyframe::from_frame(frame);
+    keyframe.velocity_world = Vec3F64::new(CRUISE_SPEED, 0.0, 0.0);
+    keyframe
+}
+
+/// The IMU edge from cruise keyframe `k` to `k + 1`.
+fn cruise_edge(k: usize, gravity: Vec3F64, theta: Vec3F64) -> ImuFactor {
+    let calib = ImuCalib {
+        gyro_noise: 1.7e-4,
+        accel_noise: 2e-3,
+        gyro_bias_noise: 2e-5,
+        accel_bias_noise: 3e-3,
+    };
+    let accel = SO3F64::exp(theta * -1.0) * (gravity * -1.0);
+    let t0 = CRUISE_EDGE_SEC * k as f64;
+    let samples: Vec<ImuMeasurement> = (0..=20)
+        .map(|s| ImuMeasurement {
+            timestamp: t0 + CRUISE_EDGE_SEC * s as f64 / 20.0,
+            gyro: Vec3F64::ZERO,
+            accel,
+        })
         .collect();
+    ImuFactor {
+        prev_kf_idx: k,
+        curr_kf_idx: k + 1,
+        preintegrated: PreintegratedImu::from_measurements(
+            ImuBias::default(),
+            calib,
+            &samples,
+            t0,
+            t0 + CRUISE_EDGE_SEC,
+        ),
+        raw_samples: samples,
+        t0,
+        t1: t0 + CRUISE_EDGE_SEC,
+        bias_walk_extra_s: 0.0,
+        interpolation: SampleInterpolation::Hold,
+    }
+}
+
+/// `count` level keyframes cruising along x at 2 m/s, 0.1 s apart, the
+/// landmarks of `fixture` imaged exactly, and IMU edges measured by a body
+/// whose true extrinsic is the factory one (identity) turned by the
+/// primary rotation offset `theta`: `T_bc = Exp(−θ)`.
+fn cruise_map(gravity: Vec3F64, theta: Vec3F64, count: usize) -> Map {
+    let points = cruise_points();
     let mut map = Map::new();
     for id in 0..count {
-        let mut frame = test_frame(id, vec![[0; 32]; 12]);
-        let x = SPEED * EDGE_SEC * id as f64;
-        for (feature, point) in points.iter().enumerate() {
-            frame.features.keypoints_xy[feature] = [
-                (200.0 * (point.x - x) / point.z + 320.0) as f32,
-                (200.0 * point.y / point.z + 240.0) as f32,
-            ];
-        }
-        frame.pose_world_to_cam.translation.x = -x;
-        map.insert_keyframe(Keyframe::from_frame(frame)).unwrap();
+        map.insert_keyframe(cruise_keyframe(id, &points, 12))
+            .unwrap();
     }
-    map.edit_keyframes_for_test(|_, kf| kf.velocity_world = Vec3F64::new(SPEED, 0.0, 0.0));
     for (feature, point) in points.into_iter().enumerate() {
         let id = map
             .insert_landmark(LandmarkSeed {
@@ -980,43 +1028,10 @@ fn cruise_map(gravity: Vec3F64, theta: Vec3F64, count: usize) -> Map {
             map.link_observation(kf, feature, id).unwrap();
         }
     }
-    let calib = ImuCalib {
-        gyro_noise: 1.7e-4,
-        accel_noise: 2e-3,
-        gyro_bias_noise: 2e-5,
-        accel_bias_noise: 3e-3,
-    };
-    let accel = SO3F64::exp(theta * -1.0) * (gravity * -1.0);
-    let imu_factors = (0..count - 1)
-        .map(|k| {
-            let t0 = EDGE_SEC * k as f64;
-            let samples: Vec<ImuMeasurement> = (0..=20)
-                .map(|s| ImuMeasurement {
-                    timestamp: t0 + EDGE_SEC * s as f64 / 20.0,
-                    gyro: Vec3F64::ZERO,
-                    accel,
-                })
-                .collect();
-            ImuFactor {
-                prev_kf_idx: k,
-                curr_kf_idx: k + 1,
-                preintegrated: PreintegratedImu::from_measurements(
-                    ImuBias::default(),
-                    calib,
-                    &samples,
-                    t0,
-                    t0 + EDGE_SEC,
-                ),
-                raw_samples: samples,
-                t0,
-                t1: t0 + EDGE_SEC,
-                bias_walk_extra_s: 0.0,
-                interpolation: SampleInterpolation::Hold,
-            }
-        })
-        .collect();
     map.apply_insertion(MapInsertion {
-        imu_factors,
+        imu_factors: (0..count - 1)
+            .map(|k| cruise_edge(k, gravity, theta))
+            .collect(),
         ..Default::default()
     })
     .unwrap();
@@ -1220,5 +1235,198 @@ fn raw_fisheye_magnification_scales_the_local_ba_sigma() {
     assert_eq!(
         sigmas(VisualInformation::OctaveScaled, FisheyeWeight::Uniform),
         vec![VisualInformation::OctaveScaled.sigma_px(2), 1.0]
+    );
+}
+
+/// Card R: a cruise map solved over keyframes 0..=4, its newest 2 cm off in
+/// y so the solve moves it, and keyframes 5 and 6 inserted during that solve
+/// tracked from it, at a seed 0.3 m/s fast, with one landmark of their own
+/// (referenced by 5).
+/// Returns the live map, the solve, and that landmark.
+fn stale_cruise(merge: LocalBaMerge, anchor_five: bool) -> (Map, BaUpdate, usize) {
+    let gravity = Vec3F64::new(0.0, 9.81, 0.0);
+    let mut map = cruise_map(gravity, Vec3F64::ZERO, 5);
+    map.edit_keyframes_for_test(|_, kf| {
+        if kf.frame.idx == 4 {
+            kf.frame.pose_world_to_cam.translation.y += 0.02;
+        }
+    });
+    let params = LocalBaParams {
+        merge,
+        ..LocalBaParams::default()
+    };
+    let update = run_local_inertial_ba_with(
+        map.ba_snapshot(&local_window_of(&map, params.active_keyframes, [])),
+        &camera(),
+        None,
+        gravity,
+        &[],
+        &[],
+        &params,
+    );
+    let points = cruise_points();
+    let landmarks = map.map_points().len();
+    for id in [5, 6] {
+        let mut kf = cruise_keyframe(id, &points, 13);
+        kf.frame.pose_world_to_cam.translation.y += 0.02;
+        kf.velocity_world = Vec3F64::new(CRUISE_SPEED + 0.3, 0.0, 0.0);
+        kf.anchor = anchor_five && id == 5;
+        map.insert_keyframe(kf).unwrap();
+        for landmark in 0..landmarks {
+            map.link_observation(id, landmark, landmark).unwrap();
+        }
+    }
+    let own = map
+        .insert_landmark(LandmarkSeed {
+            position: Vec3F64::new(0.9, 0.05, 4.2),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 5,
+                feature_idx: 12,
+            },
+        })
+        .unwrap();
+    map.link_observation(6, 12, own).unwrap();
+    map.apply_insertion(MapInsertion {
+        imu_factors: vec![
+            cruise_edge(4, gravity, Vec3F64::ZERO),
+            cruise_edge(5, gravity, Vec3F64::ZERO),
+        ],
+        ..Default::default()
+    })
+    .unwrap();
+    (map, update, own)
+}
+
+/// Pose, velocity and bias `[b_g b_a]` of live keyframe `idx`.
+fn live_state(map: &Map, idx: usize) -> (Pose3d, Vec3F64, [Vec3F64; 2]) {
+    let kf = map.get_keyframe(idx).unwrap();
+    let bias = [kf.imu_bias.gyro, kf.imu_bias.accel];
+    (kf.frame.pose_world_to_cam, kf.velocity_world, bias)
+}
+
+fn assert_pose_near(a: &Pose3d, b: &Pose3d, tolerance: f64) {
+    let rotation = a
+        .rotation
+        .to_cols_array()
+        .iter()
+        .zip(b.rotation.to_cols_array())
+        .fold(0.0f64, |m, (x, y)| m.max((x - y).abs()));
+    let translation = (a.translation - b.translation).length();
+    assert!(
+        rotation < tolerance && translation < tolerance,
+        "rotation {rotation:.3e} translation {translation:.3e}"
+    );
+}
+
+/// Knob off, the keyframes inserted during the solve are left exactly as
+/// they were, and the merge counts them.
+#[test]
+fn a_snapshot_only_merge_leaves_newer_keyframes_untouched() {
+    let (mut map, update, own) = stale_cruise(LocalBaMerge::SnapshotOnly, false);
+    let before = [live_state(&map, 5), live_state(&map, 6)];
+    let landmark = map.map_points()[own].position;
+    let result = map.apply_ba_update(update).unwrap();
+    assert_eq!(result.newer_keyframes, 2);
+    assert_eq!(result.propagated_keyframes, 0);
+    assert!(result.keyframe_corrections.iter().all(|c| !c.propagated));
+    assert_eq!([live_state(&map, 5), live_state(&map, 6)], before);
+    assert_eq!(map.map_points()[own].position, landmark);
+}
+
+/// Knob on, the correction of keyframe 4 is carried to 5 and 6: their
+/// tracked pose relative to 4 is kept, the crossing edge starts with no
+/// velocity residual, the bias is 4's, and 5's own landmark moves with it.
+#[test]
+fn a_propagating_merge_carries_the_correction_to_newer_keyframes() {
+    let gravity = Vec3F64::new(0.0, 9.81, 0.0);
+    let (mut map, update, own) = stale_cruise(LocalBaMerge::PropagateToNewer, false);
+    let (four_before, ..) = live_state(&map, 4);
+    let (five_before, ..) = live_state(&map, 5);
+    let landmark_in_five = five_before.transform_point(&map.map_points()[own].position);
+    let result = map.apply_ba_update(update).unwrap();
+
+    let (four, v4, b4) = live_state(&map, 4);
+    let (five, v5, b5) = live_state(&map, 5);
+    assert!((four.translation - four_before.translation).length() > 1e-4);
+    assert_pose_near(
+        &Pose3d::between(&four, &five),
+        &Pose3d::between(&four_before, &five_before),
+        1e-12,
+    );
+    let edge = &map
+        .imu_factors()
+        .iter()
+        .find(|f| f.prev_kf_idx == 4 && f.curr_kf_idx == 5)
+        .unwrap()
+        .preintegrated;
+    let (res, _, _) = preintegration::residual_and_jacobians(
+        kornia_factors::inertial::NavState {
+            pose_cw: &four,
+            velocity: v4,
+            bias: ImuBias {
+                gyro: b4[0],
+                accel: b4[1],
+            },
+        },
+        kornia_factors::inertial::NavState {
+            pose_cw: &five,
+            velocity: v5,
+            bias: ImuBias {
+                gyro: b5[0],
+                accel: b5[1],
+            },
+        },
+        edge,
+        &gravity,
+        None,
+    );
+    let r_v = res.fixed_rows::<3>(3).norm();
+    assert!(r_v < 1e-9, "crossing r_v {r_v:.3e} m/s");
+    assert_eq!(b5, b4);
+    assert_eq!(live_state(&map, 6).2, b4);
+    let moved = five.transform_point(&map.map_points()[own].position);
+    assert!((moved - landmark_in_five).length() < 1e-9);
+    assert_eq!(result.propagated_keyframes, 2);
+    let carried: Vec<usize> = result
+        .keyframe_corrections
+        .iter()
+        .filter(|c| c.propagated)
+        .map(|c| c.kf_idx)
+        .collect();
+    assert_eq!(carried, [5, 6]);
+}
+
+/// An anchor among the newer keyframes stops the propagation before it.
+#[test]
+fn a_propagating_merge_does_not_cross_an_anchor() {
+    let (mut map, update, _) = stale_cruise(LocalBaMerge::PropagateToNewer, true);
+    let before = [live_state(&map, 5), live_state(&map, 6)];
+    let result = map.apply_ba_update(update).unwrap();
+    assert_eq!(result.propagated_keyframes, 0);
+    assert_eq!([live_state(&map, 5), live_state(&map, 6)], before);
+}
+
+/// A snapshot from another world frame is still refused wholesale.
+#[test]
+fn a_propagating_merge_still_rejects_another_world_epoch() {
+    let (mut map, update, _) = stale_cruise(LocalBaMerge::PropagateToNewer, false);
+    map.advance_world_epoch_for_test();
+    let before = [
+        live_state(&map, 4),
+        live_state(&map, 5),
+        live_state(&map, 6),
+    ];
+    assert!(matches!(
+        map.apply_ba_update(update),
+        Err(BaUpdateError::ObsoleteWorldFrame)
+    ));
+    assert_eq!(
+        [
+            live_state(&map, 4),
+            live_state(&map, 5),
+            live_state(&map, 6)
+        ],
+        before
     );
 }

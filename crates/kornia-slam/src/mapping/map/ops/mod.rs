@@ -9,7 +9,7 @@ mod snapshot;
 
 pub use correction::{
     BaUpdateError, GraphCorrectionResult, InertialAlignment, InertialAlignmentError,
-    KeyframeBaCorrection, KeyframePoseChange, KeyframeVelocity, LocalBaMergeResult,
+    KeyframeBaCorrection, KeyframePoseChange, KeyframeVelocity, LocalBaMerge, LocalBaMergeResult,
     PoseGraphCorrectionError, PoseGraphCorrectionResult, StateEnvelope, StateEnvelopeLimits,
 };
 pub use mutation::{

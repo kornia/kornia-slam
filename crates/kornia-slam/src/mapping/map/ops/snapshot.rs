@@ -3,7 +3,7 @@
 //! Capture has no window or solver policy: mapping chooses a [`BaWindow`], the
 //! map copies exactly those entities, and correction applies the numeric result.
 
-use super::correction::StateEnvelope;
+use super::correction::{LocalBaMerge, StateEnvelope};
 use crate::mapping::map::{ImuFactor, Keyframe, Map, MapPoint};
 use crate::mapping::marginalization::MarginalPrior;
 use crate::mapping::online_calibration::OnlineCalibrationState;
@@ -61,6 +61,12 @@ pub struct BaUpdate {
     pub(crate) next_prior: Option<MarginalPrior>,
     /// Checked by [`Map::apply_ba_update`] before any write.
     pub(crate) state_envelope: StateEnvelope,
+    /// Whether [`Map::apply_ba_update`] carries the result to keyframes
+    /// inserted after the snapshot.
+    pub(crate) merge: LocalBaMerge,
+    /// Gravity and `T_bc` of a VI-BA solve, with which that merge re-predicts
+    /// their velocities.
+    pub(crate) merge_inertial: Option<(Vec3F64, Option<Pose3d>)>,
     pub(crate) outcome: BaOutcome,
     /// The newest keyframe's id and marginal covariance, when the solve was
     /// asked for it.
@@ -197,6 +203,8 @@ impl BaSnapshot {
             solve_stats: None,
             next_prior: None,
             state_envelope: StateEnvelope::Off,
+            merge: LocalBaMerge::SnapshotOnly,
+            merge_inertial: None,
             outcome: BaOutcome::default(),
             newest_marginal: None,
             online_calibration: None,

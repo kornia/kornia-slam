@@ -12,7 +12,7 @@ use crate::mapping::bundle_adjustment::{LargeWindow, LostKeyframes, VisualKernel
 use crate::mapping::global_vi_ba::{
     ClockOffsetPrior, FocalSlicePrior, GyroIntrinsicsPrior, RotationSlicePrior,
 };
-use crate::mapping::map::StateEnvelope;
+use crate::mapping::map::{LocalBaMerge, StateEnvelope};
 use crate::mapping::marginalization::BoundaryPrior;
 use crate::mapping::vi_ba_schur::ImuHuber;
 use crate::mapping::visual_information::{FisheyeWeight, VisualInformation};
@@ -560,6 +560,8 @@ pub struct LocalBaConfig {
     pub visual_information: VisualInformation,
     /// Refuse a VI-BA result whose velocity or bias leaves these bounds.
     pub state_envelope: StateEnvelope,
+    /// Whether a merge also corrects the keyframes inserted during the solve.
+    pub merge: LocalBaMerge,
     pub lost_keyframes: LostKeyframes,
     /// The visual-only local BA's kernel; VI-BA is always robust.
     pub visual_kernel: VisualKernel,
@@ -604,6 +606,7 @@ impl Default for LocalBaConfig {
             stereo_depth_sigma: StereoDepthSigma::default(),
             visual_information: VisualInformation::default(),
             state_envelope: StateEnvelope::Off,
+            merge: LocalBaMerge::SnapshotOnly,
             lost_keyframes: LostKeyframes::Free,
             visual_kernel: VisualKernel::L2,
             large_window: LargeWindow::Off,
@@ -842,6 +845,9 @@ impl fmt::Display for SystemConfig {
                 ba.lost_keyframes,
                 ba.visual_kernel,
             )?;
+        }
+        if ba.merge != LocalBaMerge::default() {
+            writeln!(f, "  local BA merge: {:?}", ba.merge)?;
         }
         if ba.online_calibration.is_enabled() {
             writeln!(f, "  online calibration: {:?}", ba.online_calibration)?;

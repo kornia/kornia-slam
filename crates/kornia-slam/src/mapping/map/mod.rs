@@ -67,7 +67,7 @@ pub(crate) use ops::{BaOutcome, BaSolve};
 pub use ops::{
     BaSnapshot, BaUpdate, BaUpdateError, BaWindow, GraphCorrectionResult, InertialAlignment,
     InertialAlignmentError, KeyframeBaCorrection, KeyframePoseChange, KeyframeVelocity,
-    LocalBaMergeResult, LocalBaStats, MapPointMergeResult, PoseGraphCorrectionError,
+    LocalBaMerge, LocalBaMergeResult, LocalBaStats, MapPointMergeResult, PoseGraphCorrectionError,
     PoseGraphCorrectionResult, StateEnvelope, StateEnvelopeLimits,
 };
 pub use ops::{

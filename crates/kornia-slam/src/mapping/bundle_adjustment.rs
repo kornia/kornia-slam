@@ -5,7 +5,7 @@
 
 use crate::mapping::map::{
     BaSnapshot, BaSolve, BaUpdate, BaUpdateError, BaWindow, ImuFactor as MapImuFactor, Keyframe,
-    LocalBaStats, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR, StateEnvelope,
+    LocalBaMerge, LocalBaStats, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR, StateEnvelope,
 };
 use crate::mapping::marginalization::{
     BoundaryPrior, FrozenPoseSigma, MarginalPrior, marginalize_frozen,
@@ -58,6 +58,7 @@ pub struct LocalBaParams {
     pub fisheye_weight: FisheyeWeight,
     /// Bounds a VI-BA result must stay inside to be written back.
     pub state_envelope: StateEnvelope,
+    pub merge: LocalBaMerge,
     pub lost_keyframes: LostKeyframes,
     pub visual_kernel: VisualKernel,
     pub large_window: LargeWindow,
@@ -128,6 +129,7 @@ impl Default for LocalBaParams {
             visual_information: VisualInformation::Unit,
             fisheye_weight: FisheyeWeight::Uniform,
             state_envelope: StateEnvelope::Off,
+            merge: LocalBaMerge::SnapshotOnly,
             lost_keyframes: LostKeyframes::Free,
             visual_kernel: VisualKernel::L2,
             large_window: LargeWindow::Off,
@@ -474,6 +476,7 @@ pub fn run_local_ba_with(
     params: &LocalBaParams,
 ) -> BaUpdate {
     let mut update = snapshot.into_update();
+    update.merge = params.merge;
     let snapshot = &update.snapshot;
     const MIN_OBSERVATIONS: usize = 8;
 
@@ -649,6 +652,8 @@ fn run_local_inertial_ba_inner(
 ) -> BaUpdate {
     let mut update = snapshot.into_update();
     update.state_envelope = params.state_envelope;
+    update.merge = params.merge;
+    update.merge_inertial = Some((gravity_world, imu_t_bc));
     let snapshot = &update.snapshot;
     use crate::mapping::vi_ba_schur::{
         boundary_under_calibration, visual_inertial_bundle_adjust,

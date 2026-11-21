@@ -1002,7 +1002,13 @@ impl SlamSystem {
             if let Some(marginal) = result.newest_marginal {
                 self.estimator.newest_marginal = Some(marginal);
             }
-            if let Some(newest) = result.keyframe_corrections.iter().max_by_key(|c| c.kf_idx) {
+            // A propagated keyframe was not solved: the shift counter stays the solve's.
+            if let Some(newest) = result
+                .keyframe_corrections
+                .iter()
+                .filter(|c| !c.propagated)
+                .max_by_key(|c| c.kf_idx)
+            {
                 self.estimator.map_changed = true;
                 self.note_ba_shift(newest.kf_idx, &newest.pose_before, &newest.pose_after);
             }
