@@ -104,3 +104,17 @@ The three Q0a runs are identical: the synchronous path is deterministic.
 | Iterations, damping | 50, `lambda diag(H)` from 1.0 | 10 (4 if large), g2o LM | 7, `lambda diag(H)` from 1e-4, stop at `f_diff < 1e-6` or step < 1e-4 |
 
 ORB-SLAM3 and Basalt disagree on the past (fixed edge against marginal prior), on the IMU kernel (boundary Huber against none), on outlier erasure (each solve against none in VIO) and on iterations (10 against 7) and initial damping (1.0 against 1e-4).
+
+## Owner-session review of stage 1 (2026-11-21)
+
+- **Re-scored independently:**
+  - Q0a: ATE SE3 0.575 m, Sim3 0.519 m, scale 0.970, identical in 3/3 runs;
+  - Q0b: 6.46, 17.98 and 16.28 m;
+  - Q0c base online: 1.058 m.
+- **C3 is confirmed as a cause of the slide, not as the whole drift.** Commit 66968bd's subject ("the slide is the async merge") is stronger than the evidence:
+  - Q0a does not separate newer keyframes left stale by the merge from a slow solve absorbing many keyframes at once.
+  - Q0a's Sim3 0.52 m is still about 8× ORB-SLAM3's 0.05-0.07 m on the same data.
+- **Synchronous is not a fix: it is not real time.**
+  - Q0a takes 985 ms per VI-BA solve (532 s over 540 solves), with frame time p90 1051 ms and p99 1778 ms.
+  - The base (asynchronous, 3 active) takes 120 ms per solve, with frame time p90 108 ms.
+- **Next:** a fix plan for C3, taking the best of ORB-SLAM3 (re-predict from the corrected keyframe; insert only while the mapper is idle) and Basalt (one-thread window with a marginal prior). It also has to make the 10-keyframe solve real time. A 3-active synchronous run separates the two C3 readings.
