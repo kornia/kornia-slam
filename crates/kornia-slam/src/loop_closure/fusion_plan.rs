@@ -53,6 +53,9 @@ struct SnapshotKeyframe {
     pose: Pose3d,
     image_size: ImageSize,
     keypoints: Vec<Option<[f32; 2]>>,
+    /// Per feature: whether a primary-camera feature, the only sources
+    /// `fuse_loop_direction` searches from.
+    primary: Vec<bool>,
     descriptors: Vec<[u8; 32]>,
     slots: Vec<Option<usize>>,
 }
@@ -133,11 +136,15 @@ impl FusionSnapshot {
                 // Fusion projects with the primary camera: a rig's other
                 // cameras' features take no part.
                 keypoints: features
+                    .clone()
                     .map(|feature| {
                         (keyframe.frame.camera_of(feature) == 0)
                             .then(|| keyframe.frame.undistorted_xy(feature, &self.camera))
                             .flatten()
                     })
+                    .collect(),
+                primary: features
+                    .map(|feature| keyframe.frame.camera_of(feature) == 0)
                     .collect(),
                 descriptors: keyframe.frame.features.descriptors.clone(),
                 slots: keyframe.map_point_by_desc_idx.clone(),
@@ -220,7 +227,9 @@ impl Search<'_> {
                 continue;
             };
             for (feature, &landmark) in source.slots.iter().enumerate() {
+                // E-7: as `fuse_loop_direction`, a rig's other cameras are no source.
                 if let Some(landmark) = landmark
+                    && source.primary[feature]
                     && seen.insert(landmark)
                 {
                     source_points.push((landmark, source_kf, feature));
