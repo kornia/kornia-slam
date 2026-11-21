@@ -121,3 +121,19 @@ pair is SE3 -0.121, +0.057, +0.046 m. Both members of pair r2 sit above the know
 at load 7.2, so the K3 trip is within run-to-run noise as far as n = 3 can tell; it is recorded as
 fired, not explained away. Accel wander (ba SD, step) barely moved: the zero-mean prior (stage B)
 and the visual side remain the suspects for accel, as the W6 diagnosis above showed in the fixture.
+
+## Diagnosis: why card S missed (2026-11-21, read-only, existing runs)
+
+Scripts: `$S/diagS/` (dec.py, along.py, imufit.py, biascorr.py, vel.py, imuedge.py, toff.py, clockpred.py, diverge.py). Inputs: the 6 card S runs, the F1 runs, ORB-SLAM3 mono-inertial r01-mono-r{1,2}.
+
+- **The R_01 error is along-track scale, not heading.** Accumulated along-track 0.55-0.79 m, cross-track 0.06-0.19 m, vertical 0.07-0.14 m (ORB-SLAM3: 0.05-0.15 / 0.06-0.11 / 0.02 m). Yaw SD 0.35-0.65 deg, unchanged by card S.
+- **It is deterministic, not async noise.** 1 s along-track errors correlate 0.53-0.78 between any two of our runs (BASE and S1 alike), -0.10 to +0.02 with ORB-SLAM3. The shared part integrates to 0.58 m RMS; the run-specific part is 0.09-0.42 m. Same shape every run: speed 3-8 % low at 60-85 s, 3-8 % high at 95-135 s.
+- **The VI-BA velocity follows the wrong scale** (|v| / GT speed 0.92-1.08), so the IMU is not holding the scale.
+- **The accel-bias wander is tilt compensation, not a free walk.** The true bias is constant (GT fit (0.234, 0.203, 0.361) m/s^2, moves < 0.01 between 10 s windows; no accelerometer scale error visible). The wander sits on the horizontal axes and correlates -0.46 to -0.78 with the bias the tilt error predicts. Tying the walk cannot remove it; the zero-mean prior does not bias the mean.
+- **Suspected cause (hypothesis, not run-tested): camera-IMU clock offset not applied, plus Huber on every interior IMU edge.** Gyro against GT rate: 0.048 rad/s RMS at offset 0, 0.0077 at +5 ms; our runs log `offset 0 ns`. Interior IMU edge chi2 p90 865-1150, 34-41 % of edges Huber-downweighted (p10 weight 0.12-0.14); |r_R| correlates 0.87-0.88 with the clock-predicted error |w(t1)-w(t0)| x 5 ms. The downweighted edges are the high-dynamics ones carrying the most scale information. ORB-SLAM3 LocalInertialBA puts no robust kernel on interior inertial edges. This may also explain the ledger's "more IMU weight makes it worse" (cards O2, Q0b removed Huber with the clock still wrong).
+- **Run-to-run spread** starts at the first IMU init (frame 45-61, keyframe lists split by one frame from async timing) and is amplified by the weakly observable along-track scale.
+- **Not like for like with ORB-SLAM3:** it closes a loop per run and writes its refined trajectory; we close none and write online poses. ORB-SLAM3's local VIO still holds scale before its loop.
+
+What the theory got wrong: it assumed heading and a free bias walk; the error is scale, the bias wander is tilt-coupled, and the IMU model (clock, kernel layout) was not checked.
+
+Next card (proposed): clock offset first (`imu_time_offset_ns`, sign to verify; prediction: interior chi2 p90 under 50, downweighted share under 5 %), then ORB-SLAM3's kernel layout (`imu_huber` boundary-only; prediction: 1 s along SD 55-65 -> <= 35 mm, Sim3 < 0.30 m in 3/3). Kill: chi2 clean but along SD > 50 mm means the scale is set by the visual side (next: keyframe span about 4 s per 10 keyframes, loop closure).
