@@ -1,6 +1,7 @@
 //! Analytic walks with exact IMU streams, shared by the solver tests.
 
 use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
+use kornia_sensors::imu::ImuMeasurement;
 
 /// Start velocity (m/s) of the synthetic walk and its acceleration
 /// `A + W sin(ω t)` (m/s², rad/s). A constant acceleration alone would leave
@@ -108,5 +109,99 @@ impl Gauss {
 
     pub(crate) fn vec3(&mut self, sigma: f64) -> Vec3F64 {
         Vec3F64::new(self.normal(), self.normal(), self.normal()) * sigma
+    }
+}
+
+/// IMU sample period of [`HeadWalk`], seconds (1 kHz, as LaMAria's).
+pub(crate) const HEAD_WALK_IMU_DT: f64 = 1e-3;
+
+/// A head-mounted walk in the gravity-on-+Y world: 1.2 m/s forward on a
+/// 0.2 rad/s yaw (a 6 m circle), 4 cm lateral sway at 0.9 Hz, 2 cm vertical
+/// bob at 1.8 Hz, and pitch and roll nods of 2° and 1.5°, so tilt, scale and
+/// the accel bias are all observable. The body frame looks along +Z.
+pub(crate) struct HeadWalk {
+    pub(crate) origin: Vec3F64,
+    pub(crate) accel_bias: Vec3F64,
+    pub(crate) gyro_bias: Vec3F64,
+}
+
+/// One body state of a [`HeadWalk`]: `R_wb`, the body origin and its
+/// velocity in the world.
+#[derive(Clone, Copy)]
+pub(crate) struct BodyState {
+    pub(crate) r_wb: Mat3F64,
+    pub(crate) position: Vec3F64,
+    pub(crate) velocity: Vec3F64,
+}
+
+impl HeadWalk {
+    const SPEED: f64 = 1.2;
+    const YAW_RATE: f64 = 0.2;
+
+    fn yaw(t: f64) -> f64 {
+        Self::YAW_RATE * t
+    }
+
+    fn guide_position(t: f64) -> Vec3F64 {
+        let (psi, radius) = (Self::yaw(t), Self::SPEED / Self::YAW_RATE);
+        let lateral = Vec3F64::new(psi.cos(), 0.0, -psi.sin());
+        Vec3F64::new(radius * (1.0 - psi.cos()), 0.0, radius * psi.sin())
+            + lateral * (0.04 * (std::f64::consts::TAU * 0.9 * t).sin())
+            + Vec3F64::new(0.0, 0.02 * (std::f64::consts::TAU * 1.8 * t).sin(), 0.0)
+    }
+
+    fn guide_rotation(t: f64) -> Mat3F64 {
+        let pitch = 2f64.to_radians() * (std::f64::consts::TAU * 0.5 * t + 0.3).sin();
+        let roll = 1.5f64.to_radians() * (std::f64::consts::TAU * 0.9 * t).sin();
+        SO3F64::exp(Vec3F64::new(0.0, Self::yaw(t), 0.0)).matrix()
+            * SO3F64::exp(Vec3F64::new(pitch, 0.0, 0.0)).matrix()
+            * SO3F64::exp(Vec3F64::new(0.0, 0.0, roll)).matrix()
+    }
+
+    /// `steps + 1` states at `i · HEAD_WALK_IMU_DT` and the `steps` readings
+    /// between them, reading `i` stamped at the end of interval `i` and held
+    /// over it. The states are the readings integrated as the `Hold`
+    /// preintegration does, so an edge at the true bias is exact to round-off.
+    pub(crate) fn simulate(
+        &self,
+        steps: usize,
+        gravity: Vec3F64,
+    ) -> (Vec<BodyState>, Vec<ImuMeasurement>) {
+        let dt = HEAD_WALK_IMU_DT;
+        let stamp = |i: usize| i as f64 * dt;
+        let guide_accel = |t: f64| {
+            (Self::guide_position(t + dt) - Self::guide_position(t) * 2.0
+                + Self::guide_position(t - dt))
+                * (1.0 / (dt * dt))
+        };
+        let mut state = BodyState {
+            r_wb: Self::guide_rotation(0.0),
+            position: self.origin + Self::guide_position(0.0),
+            velocity: (Self::guide_position(dt) - Self::guide_position(-dt)) * (0.5 / dt),
+        };
+        let mut states = vec![state];
+        let mut readings = Vec::with_capacity(steps);
+        for i in 0..steps {
+            let (t0, t1) = (stamp(i), stamp(i + 1));
+            let h = t1 - t0;
+            let omega = SO3F64::from_matrix(
+                &(Self::guide_rotation(t0).transpose() * Self::guide_rotation(t1)),
+            )
+            .log()
+                * (1.0 / h);
+            let accel_world = guide_accel(t0);
+            let specific = state.r_wb.transpose() * (accel_world - gravity);
+            readings.push(ImuMeasurement {
+                timestamp: t1,
+                gyro: omega + self.gyro_bias,
+                accel: specific + self.accel_bias,
+            });
+            let a = state.r_wb * specific + gravity;
+            state.position = state.position + state.velocity * h + a * (0.5 * h * h);
+            state.velocity += a * h;
+            state.r_wb *= SO3F64::exp(omega * h).matrix();
+            states.push(state);
+        }
+        (states, readings)
     }
 }

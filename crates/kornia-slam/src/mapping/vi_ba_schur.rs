@@ -3663,3 +3663,7 @@ mod prior_tests;
 #[cfg(test)]
 #[path = "vi_ba_calibration_tests.rs"]
 mod calibration_tests;
+
+#[cfg(test)]
+#[path = "vi_ba_window_tests.rs"]
+mod window_tests;
