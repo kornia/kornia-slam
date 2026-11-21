@@ -134,3 +134,33 @@ All four trajectories are `cmp`-identical, to each other and to `cardR/out/r01fu
   iteration (3.8 ms), the next cost if one is needed.
 - **Not tested:** a truly loaded laptop (P4 ran at load 2-4.5, caused by the two runs themselves).
 - **Next:** phase 2 with `RAYON_NUM_THREADS=1`. The code knob (`dense_parallelism`) gets its own plan.
+
+- **2026-11-21, phase 2.** Same binary, `RAYON_NUM_THREADS=1`, 2 jobs, load p50 2.9 (max 4.4). Configs
+  `cardT/cfg/{r03-T,r11-T,r01full-Tam,r01full-Tmono}.ron`; run dirs `cardT/out2`. R_03 and R_11 are
+  800-frame windows; R_01 is the full 2898 frames. Synchronous runs are identical in 3/3.
+
+| Config | ATE SE3 (each run) | Scale | Tracked | Coasted | Solves > 30 cm | Solve p50 |
+|---|---|---|---|---|---|---|
+| r03-T (S10-7) | 0.110 m ×3 | 1.034 | 776 | 24 | - | 52.6 ms |
+| r11-T (S10-7) | 0.145 m ×3 | 0.961 | 800 | 0 | - | - |
+| Tam (A10-7 + merge, async) | 0.398, 0.462, 0.404 m | 0.967-0.982 | 2898 ×3 | 0 | 0, 0, 1 | 79.4 ms |
+| Tmono (S10-7, Mono) | 0.760 m ×3 | 1.048 | 2796 | 68 | - | - |
+
+| P/K | Prediction | Baseline | Measured | Verdict |
+|---|---|---|---|---|
+| P7 mono | ATE SE3 ≤ 1.5 m | Q0a-mono 4.95 m; base mono 3.54-4.39 m | 0.760 m ×3, scale 1.048 | as predicted (the "likely miss" note was wrong) |
+| P8 Tam | ATE ≤ 0.6 m 3/3, solves > 30 cm ≤ 5 | A10-7 2.24/0.36/0.28 m, 12/4/1 | 0.398/0.462/0.404 m, 0/0/1 | as predicted |
+| P9 R_03 | tracked 784-798, ATE ≤ 0.194-0.202 m | card K | 776, 0.110 m | ATE as predicted; tracked missed |
+| P9 R_11 | tracked 798-800, ATE ≤ 0.136-0.170 m | card K | 800, 0.145 m | as predicted |
+| K4 | R_03 tracked below card K's band | 784-798 | 776 | kill fired |
+| K5 | Tam ATE holds but > 5 large solves | - | 0-1 | not fired |
+
+- **Reading.** Ten active keyframes, 7 iterations and λ 1e-4 fix the drift on every input tested:
+  R_01 stereo 1.11-1.23 m to 0.384 m, R_01 mono 3.5-4.4 m to 0.760 m, R_03 0.19-0.20 m to 0.110 m.
+  The async version with the merge knob holds too (0.40-0.46 m, 0-1 jumps), at 79 ms p50 per solve,
+  so it is a real-time candidate.
+- **K4 fired on R_03 tracking:** 776 visually tracked against 784-798, with 24 frames carried by the
+  IMU, so `--trajectory-include-coasted` (card L) still writes 800. Per the kill rule, 10 active
+  keyframes are not yet proven on short windows. The cause of the extra coasting is not looked at.
+- **Next:** R_03 coasting (which frames, and why the 10-active window loses them), then the code knob
+  for the sequential solve, then a preset candidate for the validation workflow.
