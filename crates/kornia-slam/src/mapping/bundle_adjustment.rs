@@ -999,6 +999,7 @@ fn run_local_inertial_ba_inner(
         points_reseeded: vi_result.points_reseeded,
         cheirality_rejections: vi_result.cheirality_rejections,
         cheirality_points_held: vi_result.cheirality_points_held,
+        rejected_steps: vi_result.rejected_steps,
         points_rejected,
         calibration_gated: vi_result.calibration_gated,
         calibration_columns: vi_result.calibration_columns,

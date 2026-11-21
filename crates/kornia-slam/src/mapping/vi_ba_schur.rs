@@ -433,6 +433,9 @@ pub struct ViBaResult {
     /// Landmark steps held back (the landmark kept its position for that
     /// step) because they would have moved it behind an observing camera.
     pub cheirality_points_held: usize,
+    /// Iterations whose step was refused (Cholesky failure, cheirality or a
+    /// cost increase); each counts against `max_iterations`, as in Basalt.
+    pub rejected_steps: usize,
     /// `Marginal` was asked for, but no prior could replace the boundary edge.
     pub fallback: bool,
     /// Distance (m/s) of the prior keyframe's velocity from the prior's mean
@@ -3121,6 +3124,7 @@ fn solve_vi_ba(
             points_reseeded,
             cheirality_rejections,
             cheirality_points_held,
+            rejected_steps: time.rejects,
             fallback,
             prior_residual_first,
             prior_residual_final,

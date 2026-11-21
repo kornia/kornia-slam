@@ -17,7 +17,7 @@ use crate::mapping::keyframe_mapping::{
     DeferredKeyframe, DeferredKeyframeContext, DeferredKeyframeResult,
 };
 use crate::mapping::map::{
-    BaOutcome, BaSnapshot, BaSolve, BaUpdate, BaUpdateError, LocalBaMergeResult, Map,
+    BaOutcome, BaSnapshot, BaSolve, BaUpdate, BaUpdateError, LocalBaMergeResult, LocalBaStats, Map,
 };
 use crate::mapping::online_calibration::OnlineCalibrationState;
 
@@ -124,6 +124,8 @@ pub(crate) struct LocalMappingCounts {
     pub vi_ba_base_solves: u64,
     pub vi_ba_base_iterations: u64,
     pub vi_ba_iterations_max: u64,
+    pub vi_ba_rejected_steps: u64,
+    pub vi_ba_solves_3plus_rejects: u64,
     pub ba_stale_keyframes: u64,
     pub ba_propagated_keyframes: u64,
     pub ba_propagations_stopped_at_bridge: u64,
@@ -142,18 +144,20 @@ struct LocalMappingCounters {
     vi_ba_base_solves: AtomicU64,
     vi_ba_base_iterations: AtomicU64,
     vi_ba_iterations_max: AtomicU64,
+    vi_ba_rejected_steps: AtomicU64,
+    vi_ba_solves_3plus_rejects: AtomicU64,
     ba_stale_keyframes: AtomicU64,
     ba_propagated_keyframes: AtomicU64,
     ba_propagations_stopped_at_bridge: AtomicU64,
 }
 
 impl LocalMappingCounters {
-    /// `iterations` is the solver's count when it ran (VI-BA only).
+    /// `stats` is what the solver reported when it ran (VI-BA only).
     fn record_solve(
         &self,
         job: &KeyframeJob,
         outcome: BaOutcome,
-        iterations: Option<usize>,
+        stats: Option<&LocalBaStats>,
         started: Instant,
     ) {
         let add = |counter: &AtomicU64, n: u64| counter.fetch_add(n, Ordering::Relaxed);
@@ -168,9 +172,14 @@ impl LocalMappingCounters {
             add(&self.large_window_solves, 1);
         }
         if job.imu_initialized
-            && let Some(iterations) = iterations
+            && let Some(stats) = stats
         {
-            let iterations = u64::try_from(iterations).unwrap_or(u64::MAX);
+            let iterations = u64::try_from(stats.iterations).unwrap_or(u64::MAX);
+            let rejected = u64::try_from(stats.rejected_steps).unwrap_or(u64::MAX);
+            add(&self.vi_ba_rejected_steps, rejected);
+            if rejected >= 3 {
+                add(&self.vi_ba_solves_3plus_rejects, 1);
+            }
             self.vi_ba_iterations_max
                 .fetch_max(iterations, Ordering::Relaxed);
             if !job.large_window() {
@@ -224,6 +233,8 @@ impl LocalMappingCounters {
             vi_ba_base_solves: read(&self.vi_ba_base_solves),
             vi_ba_base_iterations: read(&self.vi_ba_base_iterations),
             vi_ba_iterations_max: read(&self.vi_ba_iterations_max),
+            vi_ba_rejected_steps: read(&self.vi_ba_rejected_steps),
+            vi_ba_solves_3plus_rejects: read(&self.vi_ba_solves_3plus_rejects),
             ba_stale_keyframes: read(&self.ba_stale_keyframes),
             ba_propagated_keyframes: read(&self.ba_propagated_keyframes),
             ba_propagations_stopped_at_bridge: read(&self.ba_propagations_stopped_at_bridge),
@@ -241,8 +252,7 @@ fn solve_counted(
 ) -> BaUpdate {
     let started = Instant::now();
     let update = solve_snapshot(snapshot, camera, job, calibration);
-    let iterations = update.solve_stats().map(|stats| stats.iterations);
-    counters.record_solve(job, update.outcome, iterations, started);
+    counters.record_solve(job, update.outcome, update.solve_stats(), started);
     update
 }
 
@@ -654,7 +664,7 @@ mod tests {
     /// solves with the base settings, and the counters book it as a base solve.
     #[test]
     fn a_zero_inlier_vi_job_solves_with_the_base_budget_and_is_counted() {
-        use super::{BaOutcome, BaSolve, LocalMappingCounters};
+        use super::{BaOutcome, BaSolve, LocalBaStats, LocalMappingCounters};
         use crate::mapping::bundle_adjustment::LargeWindow;
         use std::time::Instant;
 
@@ -692,9 +702,14 @@ mod tests {
             solve: BaSolve::Solved,
             prior_fallback: false,
         };
-        counters.record_solve(&job(0), solved, Some(5), Instant::now());
-        counters.record_solve(&job(0), solved, Some(7), Instant::now());
-        counters.record_solve(&job(1), solved, Some(4), Instant::now());
+        let stats = |iterations, rejected_steps| LocalBaStats {
+            iterations,
+            rejected_steps,
+            ..LocalBaStats::default()
+        };
+        counters.record_solve(&job(0), solved, Some(&stats(5, 0)), Instant::now());
+        counters.record_solve(&job(0), solved, Some(&stats(7, 3)), Instant::now());
+        counters.record_solve(&job(1), solved, Some(&stats(4, 2)), Instant::now());
         counters.record_solve(&visual_job(), solved, None, Instant::now());
         let counts = counters.counts();
         assert_eq!(counts.vi_ba_base_solves, 2);
@@ -702,6 +717,9 @@ mod tests {
         assert_eq!(counts.vi_ba_iterations_max, 7);
         assert_eq!(counts.large_window_solves, 1);
         assert_eq!(counts.ba_solves, 4);
+        // S0-A4: rejected steps from every VI solve, base and large window.
+        assert_eq!(counts.vi_ba_rejected_steps, 5);
+        assert_eq!(counts.vi_ba_solves_3plus_rejects, 1);
     }
 
     #[test]

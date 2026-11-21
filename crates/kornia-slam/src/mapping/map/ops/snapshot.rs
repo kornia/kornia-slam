@@ -119,6 +119,9 @@ pub struct LocalBaStats {
     /// Landmark steps held back because they would have moved the landmark
     /// behind an observing camera.
     pub cheirality_points_held: usize,
+    /// Iterations whose LM step was refused; each used one of
+    /// `max_iterations`.
+    pub rejected_steps: usize,
     /// Landmarks whose optimized position was not written back: behind an
     /// observing keyframe, or flung far from every observer.
     pub points_rejected: usize,
