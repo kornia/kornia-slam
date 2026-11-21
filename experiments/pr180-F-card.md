@@ -72,6 +72,34 @@ This card stops here for a decision. Six points in Lane F cannot be built as the
 
 Minor point, settled by the plan's struct: `Fisheye624Camera` has one `f`, and the Aria JSON has `fx` and `fy` (equal on R_11: 241.6048925567284 for both). The loader rejects `|fx − fy| > 1e-9 · fx`.
 
+## Plan notes and corrected citations (2026-11-21)
+
+Plan: `/home/edgar/.claude/plans/pr180-card-F.md`. Read at b083ae0; card K (92acd29..60bfb1a) shifted some line numbers below by a few lines.
+
+- **JPEG images.** `vrs_to_asl_folder.py` writes `<out>/aria/{cam0,cam1}/data/<ts>.jpg`, with `data.csv` rows `ts,<ts>.jpg`. The loader read PNG only (`apps/kornia-slam-app/src/source/lamaria.rs:214-220`), so `read_gray` dispatches on the extension.
+- **KLT reads raw pixels as pinhole pixels** (`tracking/flow_tracker.rs:463-466,564`, `tracking/tracker.rs:1078-1090`). A raw rig with `klt_first: Enabled` is rejected at validation. RawFisheye runs only on ORB-every-frame configs such as `lamaria-rig-imu.ron`.
+- **FP1 and FP2 as worded cannot pass** (amendment below).
+- **`T_b_s` and `imu0` are bit-equal** between the Aria and pinhole JSONs on R_03_easy and the other 7 local sequences. `fx == fy`, and Aria `f` equals the pinhole `f` bit-for-bit. The cam1 pinhole size is 757x569, not 758x572.
+- **Parameter order**: `[fx, fy, cx, cy, k0..k5, p0, p1, s0..s3]` (`lamaria/utils/aria.py:163-167`).
+- **No reusable Fisheye624 in kornia-rs 4ada5a7.** `FisheyeCamera` is 4-coefficient Kannala-Brandt with private root helpers. Its patterns are reused and it serves as a test oracle (`kornia-3d/src/camera/fisheye.rs:155-262`).
+- **More in-view sites than F lists**: `tracking/local_map.rs:289-331` (visibility counters) is fixed here. `mapping/growth.rs` and `loop_closure/fusion*.rs` keep a central 640x480 virtual window, which under-counts but is never wrong; `growth.rs` moves to `project_in_view` in a follow-up.
+- **Moved citations**: the sigma site is in `observations_with_views` (`mapping/bundle_adjustment.rs`); the params type is `LocalBaParams`, not `BundleAdjustmentParams`; `validate_rig` is in `system/validation.rs`; `prepare_rig` in `frontend/mod.rs`; `match_by_projection` in `map_projection/mod.rs`.
+
+**FP1/FP2 amendment (2026-11-21, accepted by the owner).** FP1 and FP2 above are kept as written; these are the bands the tests use.
+- FP1: f32 raw keypoints quantise at about 3e-5 px (1.3e-7 rad), about 1e-3 px after the 35x magnification at 79 deg. The f64 round trip holds 1e-9 rad. The f32 plumbing test uses `5e-4 + 1e-4 * radial_magnification` px.
+- FP2: the theta-only magnification deviates up to 2.7e-3 relative from the full model (tangential and thin-prism terms). It holds 1e-4 relative on the radial-only copy (`p = s = 0`); the full model is checked over 16 azimuths within 5e-3.
+
+**Owner answers to the plan's open questions (2026-11-21).**
+1. KLT: reject a raw rig with `klt_first` at validation; raw-aware flow is a later card.
+2. D5: the overlap reads the undistortion cache on raw rigs only; pinhole rigs are unchanged (FP0).
+3. With `fisheye_weight: Magnification`, the overlap's epipolar band and reprojection gate scale by the same per-observation scale as the BA sigma, on raw views only.
+4. The FP1/FP2 amendment above is accepted.
+5. Search stays in virtual pixels with the radius scaled by the radial magnification (F4).
+6. The projectaria oracle fixture is added as a test once the extraction lane writes its numbers.
+7. The FP5 per-incidence-bin chi-square dump of the last local-BA iteration is added behind the debug switch; no criterion bench.
+8. `vrs` through `pixi exec` (extraction lane).
+9. `experiments/quick-eval/make_config.sh` gains an optional raw-image line.
+
 ## Experiment: F, raw Aria fisheye
 Gap tested: **G12**, "pinhole crop of about 110-116° instead of the 150° fisheye" (`slam-viba/audit/gap-ledger.md:38`, status suspected, score at stake unknown). The row is not yet in `experiments/gap-ledger.md`. The docs step should add it.
 Base: kornia-slam@`pr180b/K` (the skeleton commit, not yet tagged; today `c0a1dc3`), kornia-rs@`4ada5a7`.   Binary tag: `pr180b/L-F`.
