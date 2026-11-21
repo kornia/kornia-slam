@@ -140,3 +140,31 @@ keyframe (a relocalization, :2857). The IMU samples before the last keyframe are
 falls back to KeyframeVelocity there.
 
 ## Result log
+
+- **2026-11-21, stage 0 (config only).**
+  - **Setup:** binary `cardT/bin/kornia-slam-t-seq` (md5 32b6d5506ebeaa18fba296abac1e8a4d), configs
+    `cardV/cfg/{r03-T-fixed,r03-T-anchor,r03-W-fixed}.ron`, runs in `cardV/out0`. Synchronous runs with
+    `RAYON_NUM_THREADS=1` as in `cardT/out2`; W runs as in `cardT/out3`. 2 jobs, load p50 4.44.
+  - **Control:** `r03-T` on the same binary (`cardV/out0c/r03-T-r1`) is `cmp`-identical to
+    `cardT/out2/r03-T-r1`, so the synchronous S0a run differs from the baseline by the knob alone.
+
+| Run | Tracked | ATE SE3 | Scale | Gaps around the turn | predgap after the first recovery |
+|---|---|---|---|---|---|
+| r03-T (base) | 776 | 0.110 m | 1.034 | 371-387, 395-401 | 1.6, 2.1, 3.3, 5.4, 7.6, 9.5 cm (389-394) |
+| S0a r03-T-fixed | 712 | 3.118 m | 0.432 | 371-412, 414-422, 425-437, 439-462 | none: 414 is lost again |
+| S0a r03-W-fixed r1 / r2 / r3 | 545 / 717 / 584 | 32.9 / 1.29 / 26.9 m | 0.044 / 0.737 / 0.067 | 374-398, many after / 374-387, 392-412, ... / 349-367, 371-379, 382-414, ... | r1 9.0, 8.4, 7.8, 7.2, 5.9 cm (400-404); r2 8.9, 8.8, 8.5 cm (389-391); r3 16.8 cm then lost |
+| S0b r03-T-anchor | 751 | 0.740 m | 0.950 | 371-412, 416-422 | 4.9, 5.2 cm (414-415) |
+
+| P/K | Prediction | Measured | Verdict |
+|---|---|---|---|
+| P0a | under S0a, predgap/dt under 0.3 m/s over the 6 frames after the recovery, and 395-401 tracked | sync: no 6 tracked frames after the recovery, 395-401 inside the 371-412 gap. W: 1.0-6.2 m/s on the frames read after the turn-gap recoveries in the table (lowest elsewhere: r2 frame 424, after 414-422, 0.66 m/s), 395-401 lost in 3/3 | refuted |
+| P0b | under S0a, predgap grows at least 3x from the first to the sixth frame after the recovery, slope 2.5-7 m/s^2, resets at each keyframe | sync: no 6-frame stretch. W r1 falls 9.0 -> 5.9 cm, r2 flat 8.9 -> 8.5 cm | refuted (not testable as stated: S0a lost the stretch it was to be read on) |
+| K5 | P0a holds | P0a refuted | did not fire: card U proceeds |
+
+  - **Reading.** S0a does not isolate the two causes: holding the lost keyframes' inertial state fixed
+    makes R_03 lose track for 40-90 more frames and collapses the scale (0.04-0.74) in every run, so the
+    stretch where staleness was to be read does not exist under it. Neither hypothesis gained support. The
+    BA-written velocity is not shown to be the cause (K5 did not fire), so the plan goes on to U1.
+  - **Side finding, not scored by any prediction:** `local_ba.lost_keyframes: FixedInertial` is harmful on
+    R_03 with this preset (ATE 1.3-33 m against 0.085-0.112 m). S0b, an upper bound only, also loses the
+    395-401 stretch.
