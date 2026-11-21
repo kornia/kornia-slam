@@ -59,6 +59,8 @@ pub enum RigCalibrationError {
     NotFinite { camera: usize },
     #[error("camera {camera}: the rotation is a reflection")]
     Reflection { camera: usize },
+    #[error("camera_to_body: {0}")]
+    CameraToBody(Box<RigCalibrationError>),
 }
 
 /// Largest [`Pose3d::rotation_defect`] a written transform may have: the
@@ -131,22 +133,12 @@ impl RigCalibration {
             return Err(RigCalibrationError::NoCameras);
         };
         for (camera, calibration) in self.cameras.iter().enumerate() {
-            let transform = &calibration.primary_from_camera;
-            if transform[3] != [0.0, 0.0, 0.0, 1.0] {
-                return Err(RigCalibrationError::NotHomogeneous { camera });
-            }
-            if transform.iter().flatten().any(|v| !v.is_finite()) {
-                return Err(RigCalibrationError::NotFinite { camera });
-            }
-            let pose = pose_of(transform);
-            let defect = pose.rotation_defect();
-            if defect > MAX_ROTATION_DEFECT {
-                return Err(RigCalibrationError::NotRigid { camera, defect });
-            }
-            // `RᵀR = I` holds for a reflection too, which would mirror every ray.
-            if pose.rotation.determinant() <= 0.0 {
-                return Err(RigCalibrationError::Reflection { camera });
-            }
+            check_rigid(&calibration.primary_from_camera, camera)?;
+        }
+        // D-8: `camera_to_body` enters every IMU residual; it gets the same checks.
+        if let Some(camera_to_body) = &self.camera_to_body {
+            check_rigid(camera_to_body, 0)
+                .map_err(|e| RigCalibrationError::CameraToBody(Box::new(e)))?;
         }
         if pose_of(&primary.primary_from_camera) != Pose3d::IDENTITY {
             return Err(RigCalibrationError::PrimaryNotIdentity);
@@ -204,6 +196,27 @@ fn matrix_of(pose: &Pose3d) -> [[f64; 4]; 4] {
         [r[2], r[5], r[8], t.z],
         [0.0, 0.0, 0.0, 1.0],
     ]
+}
+
+/// Refuses a transform that is not a finite, homogeneous, proper rigid
+/// motion; `camera` names it in the error.
+fn check_rigid(transform: &[[f64; 4]; 4], camera: usize) -> Result<(), RigCalibrationError> {
+    if transform[3] != [0.0, 0.0, 0.0, 1.0] {
+        return Err(RigCalibrationError::NotHomogeneous { camera });
+    }
+    if transform.iter().flatten().any(|v| !v.is_finite()) {
+        return Err(RigCalibrationError::NotFinite { camera });
+    }
+    let pose = pose_of(transform);
+    let defect = pose.rotation_defect();
+    if defect > MAX_ROTATION_DEFECT {
+        return Err(RigCalibrationError::NotRigid { camera, defect });
+    }
+    // `RᵀR = I` holds for a reflection too, which would mirror every ray.
+    if pose.rotation.determinant() <= 0.0 {
+        return Err(RigCalibrationError::Reflection { camera });
+    }
+    Ok(())
 }
 
 fn pose_of(m: &[[f64; 4]; 4]) -> Pose3d {
@@ -421,6 +434,56 @@ mod tests {
             ..good
         };
         assert_eq!(apply(&empty), Err(RigCalibrationError::NoCameras));
+    }
+
+    #[test]
+    fn a_non_rigid_camera_to_body_is_refused() {
+        let good = RigCalibration::from_sensor_rig(&yawed_rig());
+        let apply = |calibration: &RigCalibration| calibration.apply_to(yawed_rig()).map(|_| ());
+        assert_eq!(apply(&good), Ok(()));
+        let refused = |edit: fn(&mut [[f64; 4]; 4])| {
+            let mut c = good.clone();
+            edit(c.camera_to_body.as_mut().unwrap());
+            apply(&c).unwrap_err()
+        };
+
+        let mirrored = refused(|m| {
+            for v in &mut m[2][..3] {
+                *v = -*v;
+            }
+        });
+        assert_eq!(
+            mirrored,
+            RigCalibrationError::CameraToBody(Box::new(RigCalibrationError::Reflection {
+                camera: 0
+            }))
+        );
+        let not_finite = refused(|m| m[0][3] = f64::NAN);
+        assert_eq!(
+            not_finite,
+            RigCalibrationError::CameraToBody(Box::new(RigCalibrationError::NotFinite {
+                camera: 0
+            }))
+        );
+        let projective = refused(|m| m[3][0] = 1e-3);
+        assert_eq!(
+            projective,
+            RigCalibrationError::CameraToBody(Box::new(RigCalibrationError::NotHomogeneous {
+                camera: 0
+            }))
+        );
+        let scaled = refused(|m| {
+            for row in &mut m[..3] {
+                for v in &mut row[..3] {
+                    *v *= 1.0 + 5e-4;
+                }
+            }
+        });
+        assert!(matches!(
+            scaled,
+            RigCalibrationError::CameraToBody(inner)
+                if matches!(*inner, RigCalibrationError::NotRigid { .. })
+        ));
     }
 
     #[test]
