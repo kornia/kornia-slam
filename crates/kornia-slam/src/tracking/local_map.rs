@@ -322,8 +322,8 @@ pub fn landmarks_in_frame_frustum(
     visible
 }
 
-/// `raw` is the camera's raw fisheye model, when its images are raw
-/// ([`crate::rig::project_in_view`]).
+/// `raw` is the camera's raw fisheye model, when its images are raw (see
+/// `rig::project_in_view`).
 pub fn landmarks_in_frustum(
     map: &Map,
     candidates: &[usize],
