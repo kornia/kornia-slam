@@ -87,4 +87,12 @@ All runs: 3 per config, full R_01 (2898 frames). M1 and M2 are also run on the 8
 
 ### Result log
 
-(empty)
+- **2026-11-21, scoring (stopped early, P4 decisive).** Full R_01, binary md5 7d09a8c6.
+  - **M1 (10 active):** ATE SE3 3.962, 1.634 and 4.769 m; Sim3 scale 0.814, 1.013 and 0.817; tracked 2877, 2896 and 2753; every window `active=10`.
+  - **M2 (large window):** run 1 has ATE 31.3 m and scale 0.047, with `|v|` reaching 6-8 m/s. Runs 2 and 3 were partial and are discarded.
+  - **M0 and M3:** not run here. M3's question is answered by card O's O3 (1.51-2.75 m).
+  - **Verdicts:**
+    - P1: as predicted (the window is longer);
+    - P2-P4: missed, worse than the base;
+    - K1 fired: the window is longer but the scale does not hold. Window size alone is not the cause.
+  - **Next:** the window solve drifts in its gauge when it gets longer (card O evidence). Cards N, O and P test what anchors it.

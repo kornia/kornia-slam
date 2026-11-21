@@ -79,4 +79,12 @@ Our `boundary_imu_info_scale: 1e-2` is the departure.
 
 ### Result log
 
-(empty)
+- **2026-11-21, scoring.** Full R_01, 3 runs per config.
+
+| Config | Solves moving > 30 cm | Median shift | ATE SE3 | Scale |
+|---|---|---|---|---|
+| O1 | 57, 85, 60 | 15.3, 20.3, 13.3 cm | 6.68, 7.07, 8.28 m | 0.62, 0.61, 0.47 |
+| O2 | 86, 65, 83 | 25.0, 16.6, 19.0 cm | 5.54, 7.66, 17.20 m | 0.74, 0.54, 0.12 |
+| O3 | 8, 10, 3 | 1.9-2.1 cm | 2.64, 2.75, 1.51 m | 0.98, 0.96, 1.09 |
+
+- **Verdict:** P1-P4 missed, all worse. A full-weight boundary edge makes the drift worse, not better, so a weak anchor is not the cause.

@@ -63,4 +63,17 @@ ORB-SLAM3 weights a stereo observation as a third image coordinate `uR`, with th
 
 ### Result log
 
-(empty)
+- **2026-11-21, scoring.** Full R_01.
+
+| Config | ATE SE3 | Sim3 ATE | Scale | Spread | Jumps > 30 cm |
+|---|---|---|---|---|---|
+| P1 | 1.077, 1.207, 0.988 m | 0.75, 0.97, 0.69 m | 1.10 ×3 | 0.19, 0.17, 0.18 | 0 |
+| P2 | 7.76, 6.88, 5.96 m | 4.5-5.8 m | 0.51-0.65 | 1.0-5.0 | 60-79 |
+| P3 (no IMU) | 3.74, 4.94 m | 3.7, 4.8 m | 0.92, 0.85 | 0.64, 0.69 | 0 |
+
+- **Verdicts:**
+  - P1-P3: missed;
+  - P4: missed (the far bins still run short, 0.84-0.93);
+  - P5: as predicted (spread 0.64-0.69 ≤ 0.6 missed by a hair).
+- **Disparity weighting is not the drift cause.**
+- **Reference found the same day:** ORB-SLAM3 mono-inertial on the same data gives R_01 full ATE 0.068 and 0.247 m, scale 1.00-1.03. Our mono-inertial gives 3.5-4.4 m. The bug is in our local VI-BA (gap G35).

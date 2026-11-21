@@ -71,4 +71,15 @@ Status: written 2026-11-21, before any run. Config only (a calibration copy), no
 
 ### Result log
 
-(empty)
+- **2026-11-21, scoring.** Full R_01, 3 runs per config (N0 has the card M evidence run plus 2 new runs).
+
+| P/K | Prediction | Measured | Verdict |
+|---|---|---|---|
+| P1 | interior IMU χ² median falls ≥ 10× (N1) | 3.8 to 5.7, 6.4 and 6.4 | missed (rose) |
+| P2 | spread ≤ 0.12 (N1), ≤ 0.10 (N2) | N1 0.167, 0.134, 0.147; N2 4.15, 1.15, 0.72 | missed |
+| P3 | scale 0.95-1.05 (N1) | 0.940, 0.975, 0.963 | as predicted (2 of 3 inside) |
+| P4 | ATE ≤ 0.8 m (N1), ≤ 0.6 m (N2) | N1 1.661, 1.355, 1.536 m; N2 6.696, 0.806, 4.184 m; N0 1.227, 1.227, 1.111 m | missed |
+| P5 | N2 below N1 in 2 of 3 | 1 of 3 | missed |
+| K2 | ATE better but the window still hurts | ATE worse, and the window still hurts | the window issue confirmed |
+
+- **Overconfidence is not the main cause.** Inflated noise moves the scale toward 1 but makes ATE worse, and the longer window still blows up.
