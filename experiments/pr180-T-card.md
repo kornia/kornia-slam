@@ -164,3 +164,21 @@ All four trajectories are `cmp`-identical, to each other and to `cardR/out/r01fu
   keyframes are not yet proven on short windows. The cause of the extra coasting is not looked at.
 - **Next:** R_03 coasting (which frames, and why the 10-active window loses them), then the code knob
   for the sequential solve, then a preset candidate for the validation workflow.
+
+- **2026-11-21, K4 follow-up: where R_03 loses frames.** `[track] reject` and `[predgap]` lines
+  from `cardT/out2/r03-T-r1` (all 3 runs are identical, so this is one sample), against card K
+  (`cardK/out/r03-KA-r{1,2,3}`) and card L (`cardL/out/r03-L-r{1,2,3}`), both 3 active, async.
+  - **Same place as the base.** The 3-active runs lose 0-18 frames (tracked 782-800 over 6 runs) at the
+    known fast turn, frames 371-387, and once at 327-334. The 10-active run loses 371-387 too.
+  - **One extra gap, frames 395-401 (7 frames).** After the first gap is bridged (frame 388: rotation
+    error 1.93°, translation error 0.159 m), the IMU prediction drifts from the tracked pose by
+    1.5-2.5 cm per frame: `predgap trans` reads 0.016, 0.021, 0.033, 0.054, 0.076 and 0.095 m over
+    frames 389-394, which is about 0.4 m/s of velocity error. Map projection then fails at 395
+    (`local=251 matched=25 LowPnpInliers(4)`). Recovery at 402 shows 0.507 m of translation error.
+  - **The base has the same drift.** KA-r3 grows 0.007 to 0.116 m over frames 389-397 and survives,
+    then the error drops to 0.027 m at 398. KA-r1 grows 0.025 to 0.082 m after its gap.
+  - **Reading (not proven).** The cause is the velocity state after a gap bridged by keyframes
+    inserted at the inertial prediction. It is shared with 3 active, and 10 active crossed the loss
+    threshold in this sample. Card L's K1 and card I's young-map item point at it. K4 stands as written,
+    but the tracking loss is not a 10-active mechanism. The next card should measure the post-gap
+    velocity against ground truth.
