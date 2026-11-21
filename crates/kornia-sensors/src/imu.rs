@@ -461,7 +461,9 @@ impl PreintegratedImu {
 /// Gyro and accelerometer readings at `t` from time-sorted, non-empty
 /// `sorted`: linear between the two samples that bracket it, held at the
 /// first sample before them, and past the last sample extrapolated along the
-/// last two (ORB-SLAM3 `Tracking.cc:1700-1712`), held when there is only one.
+/// last two (ORB-SLAM3 `Tracking.cc:1700-1712`) for at most one sample period
+/// of those two; further out, or with only one sample, the last sample is held
+/// (D-9: an unbounded line amplifies sample noise across an IMU gap).
 fn reading_at(sorted: &[ImuMeasurement], t: f64) -> (Vec3F64, Vec3F64) {
     let after = sorted.partition_point(|m| m.timestamp < t);
     let line = |a: &ImuMeasurement, b: &ImuMeasurement| {
@@ -475,7 +477,12 @@ fn reading_at(sorted: &[ImuMeasurement], t: f64) -> (Vec3F64, Vec3F64) {
         (Some(a), Some(b)) => line(a, b),
         (None, Some(b)) => (b.gyro, b.accel),
         (Some(b), None) => match after.checked_sub(2).map(|i| &sorted[i]) {
-            Some(a) if b.timestamp > a.timestamp => line(a, b),
+            Some(a)
+                if b.timestamp > a.timestamp
+                    && t - b.timestamp <= b.timestamp - a.timestamp =>
+            {
+                line(a, b)
+            }
             _ => (b.gyro, b.accel),
         },
         (None, None) => (Vec3F64::ZERO, Vec3F64::ZERO),
@@ -746,6 +753,28 @@ mod tests {
         let angle = SO3F64::from_matrix(&pre.delta_rotation).log().z;
         let exact = t1 + 5.0 * t1 * t1;
         assert!((angle - exact).abs() < 1e-9, "{angle} vs {exact}");
+    }
+
+    /// D-9: across an IMU gap the reading past the last sample is no longer
+    /// a line through the last two samples. Within one period it still is;
+    /// beyond it the last sample is held, so a 0.5 s gap at 200 Hz does not
+    /// scale the last sample step by 100.
+    #[test]
+    fn reading_past_the_last_sample_holds_after_one_period() {
+        let samples = [0.0, 0.005].map(|t| ImuMeasurement {
+            timestamp: t,
+            gyro: Vec3F64::new(0.0, 0.0, 1.0 + 10.0 * t),
+            accel: Vec3F64::new(2.0 * t, 0.0, 0.0),
+        });
+        let (gyro, accel) = reading_at(&samples, 0.0075);
+        assert!((gyro.z - 1.075).abs() < 1e-12, "{}", gyro.z);
+        assert!((accel.x - 0.015).abs() < 1e-12, "{}", accel.x);
+        let (gyro, accel) = reading_at(&samples, 0.0099);
+        assert!((gyro.z - 1.099).abs() < 1e-12, "{}", gyro.z);
+        assert!((accel.x - 0.0198).abs() < 1e-12, "{}", accel.x);
+        let (gyro, accel) = reading_at(&samples, 0.505);
+        assert_eq!(gyro, samples[1].gyro);
+        assert_eq!(accel, samples[1].accel);
     }
 
     /// Card A U1: ω = sin(2πt) about z at 200 Hz, frames every 50 ms offset
