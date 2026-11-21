@@ -125,3 +125,68 @@ Every 10-active asynchronous run at 50 iterations absorbs 4.0-4.8 keyframes per 
 0.14-0.81 m, with Huber weight 1e-4-1e-3 (O2 and Q0b turn the IMU Huber off: hw 1.0). Q0b,
 async at 10 iterations, absorbs 1.97-2.10 and still starts the crossing edge at 1.40-1.55 m/s.
 Every 3-active or synchronous run absorbs 1.00-1.02, with crossing r_v 0.20-0.30 m/s.
+
+## Stage 1 result log (2026-11-21)
+
+Binary r-base: kornia-slam@b159925 (= 3fcdd32 code), md5 2ef78735af6b28e155b0d99d03b3fc7b.
+Full R_01, `MAX_FRAMES=2898`, 2 jobs at a time, load average 4.4-35.3 (p50 17.9; other
+users' processes on the laptop). Configs: `cardQ/cfg/r01full-Q0a.ron` with the `mapping:` line
+edited; Q0a-mono from `mono/cfg/r01full-mono.ron`. Synchronous runs are identical in 3/3.
+
+| Run | ATE SE3 / Sim3 | Scale | Tracked | Solves > 30 cm | Shift p50 | n_new mean | Crossing r_v p50 (n_new >= 2) | ms per solve | Frame p50 / p90 ms |
+|---|---|---|---|---|---|---|---|---|---|
+| Q0a-mono (sync, 10, Mono) x3 | 4.948 / 3.889 m | 0.694 | 2708 | 20 | 3.0 cm | 1.00 | 0.210 (-) | 827-894 | 6.4-6.6 / 793-890 |
+| S3 (sync, 3) x3 | 1.168 / 0.989 m | 1.084 | 2897 | 0 | 0.9 cm | 1.00 | 0.194 (-) | 96-100 | 11.3-11.5 / 204-208 |
+| A10-7 r1 (async, 10, 7 it., λ 1e-4) | 2.241 / 2.213 m | 0.957 | 2895 | 12 | 2.8 cm | 1.53 | 0.784 (0.796) | 382 | 15.5 / 108 |
+| A10-7 r2 | 0.360 / 0.343 m | 1.014 | 2895 | 4 | 2.1 cm | 1.32 | 0.563 (0.607) | 425 | 17.9 / 137 |
+| A10-7 r3 | 0.281 / 0.281 m | 0.999 | 2898 | 1 | 2.1 cm | 1.28 | 0.585 (0.750) | 439 | 20.1 / 144 |
+| S10-7 (sync, 10, 7 it., λ 1e-4) x3 | 0.384 / 0.301 m | 0.971 | 2898 | 0 | 1.2 cm | 1.00 | - | 405-502 | 17.7-18.5 / 670-687 |
+
+A10-7 and S10-7 run every solve in `large_window` (443 of 453 in A10-7 r1), as the card expected.
+
+### Profile (step 2), one Q0a-config run, single job
+
+Binary r-knobs: kornia-slam@8314bb0 (time split, counters, both knobs, all off), md5
+b19062dd3defb4d2875ed6957a67e85d. Its trajectory is `cmp`-identical to
+`cardQ/out/r01full-Q0a-r1/traj.txt`. Load average 10.4-19.5 (p50 15.1): no other job of
+mine, but the laptop was not idle.
+
+| Item | Value |
+|---|---|
+| Solves, observations mean | 531 TIME lines, 10950 |
+| Iterations p50 / mean, rejected steps mean | 20 / 21.1, 1.01 per solve |
+| Iteration loop per solve p50 / p90 / mean | 1116 / 1596 / 1161 ms (wall 1158 ms mean) |
+| Per iteration p50 / mean | 54.7 / 55.1 ms |
+| schur (visual blocks + Schur) | 20.4 % |
+| imu (IMU terms and the rest) | 0.5 % |
+| chol (damping, symmetrize, LLT, solve) | 71.7 % |
+| trial (back-substitution, retraction, trial cost) | 7.4 % |
+| ba_stale_keyframes, ba_propagated_keyframes | 0, 0 |
+
+### Verdicts
+
+| P/K | Prediction | Baseline | Measured | Verdict |
+|---|---|---|---|---|
+| S3 | ATE 1.0-1.25 m, scale 1.07-1.12, 0-1 large | base 1.06-1.23 m | 1.168 m, 1.084, 0 (x3) | as predicted |
+| K6 | S3 <= 0.7 m re-plans the base | - | 1.168 m | not fired |
+| A10-7 n_new | 2.0-2.5 | 4.5-4.8 | 1.53, 1.32, 1.28 | missed (fewer absorbed than predicted) |
+| A10-7 shift p50 | 2-5 cm | 7.7-13.6 cm | 2.8, 2.1, 2.1 cm | as predicted |
+| A10-7 large | 5-25 | 33-85 | 12, 4, 1 | missed in 2/3 (below the band) |
+| A10-7 crossing r_v (n_new >= 2) | >= 1.0 m/s | 1.27-1.65 | 0.80, 0.61, 0.75 | missed |
+| S10-7 time | 300-400 ms per solve | 985 ms | 405-502 ms, 2 jobs, load ~18 | missed (load not matched) |
+| S10-7 ATE | 0.50-0.70 m; > 0.8 m: 10 iterations | 0.575 m | 0.384 m x3 | missed (better than the band) |
+| S10-7 large | 0 | 0 | 0 | as predicted |
+| T1 | schur >= 75 % of iteration time | - | 20.4 % | kill fired: K4 |
+
+**K4 fired.** The Schur pair loop is 20 % of a 10-active iteration; 72 % is the `chol` phase.
+Its dense part is small (10 free keyframes, dim 150; fixed keyframes have no slot,
+`free_keyframe_slots`), so 39 ms per LLT of a 150x150 matrix is not arithmetic. Unverified
+reading: faer's default global parallelism (rayon) on a loaded 12-core laptop; only the global
+VI-BA sets `faer::Par::Seq` (`global_vi_ba/mod.rs:222`). Per the card, step 5b (Schur blocks per
+keyframe) is not built, and work stops before it.
+
+A10-7 is the strongest stage 1 result: r2 and r3 land at 0.360 and 0.281 m ATE SE3, below
+Q0a's 0.575 m, while still asynchronous. r1 does not (2.241 m, 12 large solves). Fewer
+iterations and smaller damping cut the absorbed keyframes from 4.5-4.8 to 1.3-1.5. The
+crossing edge still starts at 0.6-0.8 m/s, so the seed (b1) is still wrong on the solves that
+absorb two or more.
