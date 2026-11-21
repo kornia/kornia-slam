@@ -130,6 +130,7 @@ mod tests {
             },
             size: ImageSize { width, height },
             primary_from_camera: kornia_3d::pose::Pose3d::IDENTITY,
+            raw_model: None,
         };
         let cameras = [camera(8, 6), camera(7, 5)];
         let (first, second) = (image(8, 6), image(7, 5));

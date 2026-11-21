@@ -258,11 +258,13 @@ mod tests {
                 camera: camera(),
                 size,
                 primary_from_camera: Pose3d::IDENTITY,
+                raw_model: None,
             },
             RigCamera {
                 camera: camera(),
                 size,
                 primary_from_camera: Pose3d::new(yaw, Vec3F64::new(0.11, 0.0, 0.0)),
+                raw_model: None,
             },
         ];
         RigGeometry::from_rig(&SensorRig::new(camera()).with_rig_cameras(cameras)).unwrap()

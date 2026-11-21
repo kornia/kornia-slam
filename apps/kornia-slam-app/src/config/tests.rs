@@ -270,6 +270,7 @@ fn a_rig_calibration_file_resolves_and_must_match_the_source() {
                     height: 480,
                 },
                 primary_from_camera,
+                raw_model: None,
             })
             .to_vec(),
     );

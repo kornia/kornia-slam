@@ -1,6 +1,7 @@
 //! Fixed calibration of a camera rig with optional stereo, IMU and wheel
 //! odometry, independent of any estimated state.
 
+use crate::camera_fisheye624::Fisheye624Camera;
 use crate::imu::ImuCalib;
 use crate::wheel::{DifferentialDrive, WheelNoise};
 use kornia_3d::camera::{FisheyeCamera, PinholeCamera};
@@ -43,6 +44,10 @@ pub struct RigCamera {
     /// `T_PC`: `X_primary = T_PC * X_camera`, where the primary camera is
     /// [`SensorRig::camera`]. Identity for the primary itself.
     pub primary_from_camera: Pose3d,
+    /// Fisheye624 model of raw fisheye images, in image pixels; `camera` is
+    /// then the virtual pinhole keypoints map into and `size` the raw size.
+    /// `None` when the images are already in `camera`'s coordinates.
+    pub raw_model: Option<Fisheye624Camera>,
 }
 
 /// Ray through an undistorted pixel of `camera`, in the primary-camera frame:
@@ -252,11 +257,13 @@ mod tests {
                 camera: test_camera(),
                 size,
                 primary_from_camera: Pose3d::IDENTITY,
+                raw_model: None,
             },
             RigCamera {
                 camera: test_camera(),
                 size,
                 primary_from_camera: Pose3d::new(yaw, Vec3F64::new(0.11, 0.0, 0.0)),
+                raw_model: None,
             },
         ])
     }

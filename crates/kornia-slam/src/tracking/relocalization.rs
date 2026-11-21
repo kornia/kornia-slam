@@ -718,11 +718,13 @@ mod tests {
                 camera: camera(),
                 size,
                 primary_from_camera: Pose3d::IDENTITY,
+                raw_model: None,
             },
             RigCamera {
                 camera: camera(),
                 size,
                 primary_from_camera: Pose3d::new(yaw, Vec3F64::new(0.11, 0.0, 0.0)),
+                raw_model: None,
             },
         ]);
         Arc::new(RigGeometry::from_rig(&rig).unwrap())

@@ -281,6 +281,7 @@ fn a_rig_frame_splits_features_per_camera_and_keeps_depth_empty() {
         camera: camera.clone(),
         size,
         primary_from_camera,
+        raw_model: None,
     };
     // A pure 11 cm sideways baseline: the synthetic pair's 8 px shift.
     let rig = SensorRig::new(camera.clone()).with_rig_cameras(vec![
@@ -335,6 +336,7 @@ fn secondary_cameras_take_their_own_keypoint_budget() {
         camera: camera.clone(),
         size,
         primary_from_camera,
+        raw_model: None,
     };
     let rig = SensorRig::new(camera.clone()).with_rig_cameras(vec![
         view(Pose3d::IDENTITY),

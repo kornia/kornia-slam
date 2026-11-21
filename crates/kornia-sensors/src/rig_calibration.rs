@@ -97,10 +97,16 @@ impl RigCalibration {
     /// selection belongs to the system config.
     pub fn apply_to(&self, mut rig: SensorRig) -> Result<SensorRig, RigCalibrationError> {
         self.validate()?;
+        // The file holds pinhole geometry only; a raw model stays with its
+        // camera so raw images are never read as pinhole ones.
         let cameras: Vec<RigCamera> = self
             .cameras
             .iter()
-            .map(RigCameraCalibration::rig_camera)
+            .enumerate()
+            .map(|(c, calibration)| RigCamera {
+                raw_model: rig.cameras.get(c).and_then(|camera| camera.raw_model),
+                ..calibration.rig_camera()
+            })
             .collect();
         let Some(primary) = cameras.first() else {
             return Err(RigCalibrationError::NoCameras);
@@ -183,6 +189,7 @@ impl RigCameraCalibration {
                 height: self.height,
             },
             primary_from_camera: pose_of(&self.primary_from_camera),
+            raw_model: None,
         }
     }
 }
@@ -232,6 +239,7 @@ pub fn rig_cameras_from_body_extrinsics(
                 } else {
                     primary_from_body.compose(camera_to_body)
                 },
+                raw_model: None,
             }
         })
         .collect()
@@ -268,11 +276,13 @@ mod tests {
                 camera: camera(241.9),
                 size,
                 primary_from_camera: Pose3d::IDENTITY,
+                raw_model: None,
             },
             RigCamera {
                 camera: camera(243.1),
                 size,
                 primary_from_camera: Pose3d::new(yaw, Vec3F64::new(0.11, 0.0013, -0.0021)),
+                raw_model: None,
             },
         ]);
         rig.imu = Some(ImuCalibration {
@@ -327,6 +337,24 @@ mod tests {
         let reread = RigCalibration::from_sensor_rig(&applied);
         assert_eq!(bits(&reread), bits(&written));
         assert_eq!(applied.camera.fx.to_bits(), written.cameras[0].fx.to_bits());
+    }
+
+    #[test]
+    fn a_calibration_keeps_each_cameras_raw_model() {
+        let raw = crate::Fisheye624Camera {
+            f: 241.6,
+            cx: 322.9,
+            cy: 240.4,
+            k: [-0.025, 0.096, -0.063, 0.0062, 0.0035, -0.00073],
+            p: [0.0009, 0.00036],
+            s: [-0.0014, -0.0001, -0.00046, -0.0001],
+        };
+        let calibration = RigCalibration::from_sensor_rig(&yawed_rig());
+        let mut rig = yawed_rig();
+        rig.cameras[1].raw_model = Some(raw);
+        let applied = calibration.apply_to(rig).unwrap();
+        assert_eq!(applied.cameras[0].raw_model, None);
+        assert_eq!(applied.cameras[1].raw_model, Some(raw));
     }
 
     #[test]

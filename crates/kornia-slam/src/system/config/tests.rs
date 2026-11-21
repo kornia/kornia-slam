@@ -1137,6 +1137,7 @@ mod runtime_settings {
                 height: 480,
             },
             primary_from_camera,
+            raw_model: None,
         };
         let two_cameras = rig().with_rig_cameras(vec![
             view(Pose3d::IDENTITY),
@@ -1280,6 +1281,7 @@ mod runtime_settings {
                 height: 480,
             },
             primary_from_camera,
+            raw_model: None,
         };
         let two_cameras = rig().with_rig_cameras(vec![
             view(Pose3d::IDENTITY),
