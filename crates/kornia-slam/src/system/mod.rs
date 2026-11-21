@@ -1148,10 +1148,11 @@ impl SlamSystem {
         // Stereo frames carry metric per-keypoint depth, so we can build a
         // metric map from a single keyframe (ORB-SLAM3's StereoInitialization)
         // instead of waiting for two-view parallax.
+        let mut carried = false;
         let result = if curr_frame.is_metric() {
             let reseeding = self.state.reseeding();
             if reseeding {
-                self.coast_while_reseeding(curr_frame.idx, timestamp_sec);
+                carried = self.coast_while_reseeding(curr_frame.idx, timestamp_sec);
                 if self.recovery.relocalize_when_lost {
                     // No segment is tracked while re-seeding, so no own window applies.
                     self.tracker.set_window_start(None);
@@ -1170,7 +1171,11 @@ impl SlamSystem {
             self.bootstrap_mono(curr_frame, timestamp_sec)
         };
         if result.status == TrackingStatus::Skipped {
-            self.last_skip = Some(SkipKind::Bootstrap);
+            self.last_skip = Some(if carried {
+                SkipKind::Reseeding
+            } else {
+                SkipKind::Bootstrap
+            });
         }
         result
     }
@@ -1194,10 +1199,12 @@ impl SlamSystem {
     /// state, so the segment starts where the camera is. A runaway, or a
     /// stall past `max_bridge_sec`, holds the translation at rest instead and
     /// drops the bridge; the attitude keeps following the gyro either way.
-    fn coast_while_reseeding(&mut self, frame_idx: usize, timestamp_sec: f64) {
+    /// Returns whether the pose was carried on an inertial prediction.
+    fn coast_while_reseeding(&mut self, frame_idx: usize, timestamp_sec: f64) -> bool {
         let pose_before = self.state.pose_world_to_cam;
         let prev_timestamp = self.state.last_frame_timestamp_sec;
-        let (coasted, _) = self.predict_frame_pose(pose_before, prev_timestamp, timestamp_sec);
+        let (coasted, inertial) =
+            self.predict_frame_pose(pose_before, prev_timestamp, timestamp_sec);
         self.record_tilt(&coasted, prev_timestamp, timestamp_sec);
         self.state.last_frame_timestamp_sec = timestamp_sec;
         if !self.reseed_held {
@@ -1206,7 +1213,7 @@ impl SlamSystem {
             let starved = timestamp_sec - self.reseed_coast_from_sec > self.recovery.max_bridge_sec;
             if !self.runaway.runaway() && !starved {
                 self.state.pose_world_to_cam = coasted;
-                return;
+                return inertial.is_some();
             }
             self.dbg(if starved {
                 format!(
@@ -1226,6 +1233,7 @@ impl SlamSystem {
         }
         self.state.velocity_world = Vec3F64::ZERO;
         self.state.pose_world_to_cam = recovery::held_at(&coasted, &pose_before);
+        false
     }
 
     /// Adds the IMU window `[t0, t1]` of a frame at `pose_world_to_cam` to the

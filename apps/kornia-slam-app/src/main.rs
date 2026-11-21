@@ -662,13 +662,15 @@ fn is_inertial_coast(skip: Option<SkipKind>) -> bool {
 }
 
 /// Whether a frame's pose goes to --trajectory-out: every tracked frame, plus
-/// the inertial coasts when they are included.
+/// the inertial coasts and the re-seed frames carried on the IMU when they
+/// are included.
 fn writes_scored_pose(
     status: kornia_slam::TrackingStatus,
     skip: Option<SkipKind>,
     include_coasted: bool,
 ) -> bool {
-    status != kornia_slam::TrackingStatus::Skipped || (include_coasted && is_inertial_coast(skip))
+    status != kornia_slam::TrackingStatus::Skipped
+        || (include_coasted && (is_inertial_coast(skip) || skip == Some(SkipKind::Reseeding)))
 }
 
 #[cfg(test)]
@@ -753,8 +755,15 @@ mod cli_tests {
             true
         ));
         assert!(!writes_scored_pose(Skipped, None, true));
+        let reseeding = Some(SkipKind::Reseeding);
+        assert!(writes_scored_pose(Skipped, reseeding, true));
+        assert!(!writes_scored_pose(Skipped, reseeding, false));
+        assert!(
+            !is_inertial_coast(reseeding),
+            "--trajectory-coasted keeps the coasts only"
+        );
         for status in [Tracked, KeyframeAccepted] {
-            for skip in [None, inertial, visual, Some(SkipKind::Bootstrap)] {
+            for skip in [None, inertial, visual, Some(SkipKind::Bootstrap), reseeding] {
                 assert!(writes_scored_pose(status, skip, false));
                 assert!(writes_scored_pose(status, skip, true));
             }

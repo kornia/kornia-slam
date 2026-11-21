@@ -1415,6 +1415,23 @@ mod recovery_after_loss {
         assert_eq!(system.state.bridge_anchor, None);
     }
 
+    /// T-3: only a frame carried on the IMU is reported as a carried re-seed
+    /// frame; a held one stays a bootstrap skip, and both count as one.
+    #[test]
+    fn a_carried_reseed_frame_is_told_apart_from_a_held_one() {
+        let mut carried = reseeding_system();
+        assert!(carried.coast_while_reseeding(141, 15.05));
+        let mut held = reseeding_system();
+        held.runaway.record(14.0, Vec3F64::new(-100.0, 0.0, 0.0));
+        assert!(!held.coast_while_reseeding(141, 15.05));
+        assert!(!held.coast_while_reseeding(142, 15.1), "still held");
+
+        let mut counters = RunCounters::default();
+        counters.record_frame(TrackingStatus::Skipped, Some(SkipKind::Reseeding));
+        counters.record_frame(TrackingStatus::Skipped, Some(SkipKind::Bootstrap));
+        assert_eq!(counters.skipped_bootstrap, 2);
+    }
+
     #[test]
     fn a_bridge_older_than_max_bridge_sec_is_dropped() {
         let mut system = lost_metric_system(7.0);

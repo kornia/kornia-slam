@@ -11,6 +11,9 @@ pub enum SkipKind {
     /// Tracking failed and the pose was carried on the motion prediction:
     /// the IMU when `inertial`, otherwise the constant-velocity model.
     Coasting { inertial: bool },
+    /// A re-seed is waiting for its map, and the pose was carried on the kept
+    /// inertial state rather than held.
+    Reseeding,
 }
 
 /// Tallies since [`SlamSystem::build`](super::SlamSystem::build). Every frame
@@ -158,7 +161,8 @@ impl RunCounters {
             (TrackingStatus::Skipped, Some(SkipKind::Coasting { inertial: false })) => {
                 self.coast_visual += 1;
             }
-            (TrackingStatus::Skipped, Some(SkipKind::Bootstrap) | None) => {
+            // A carried re-seed frame is still a bootstrap skip in the summary.
+            (TrackingStatus::Skipped, Some(SkipKind::Bootstrap | SkipKind::Reseeding) | None) => {
                 self.skipped_bootstrap += 1;
             }
         }
