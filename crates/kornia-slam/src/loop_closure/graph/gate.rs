@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn odometry_gate_rejects_beyond_drift_and_logs_each_decision() {
         let edge = edge();
-        let mut gate = OdometryConsistencyGate(LoopOdometryGate::default());
+        let mut gate = OdometryConsistencyGate(LoopOdometryGate::sim_fitted());
         let mut log = Vec::new();
         assert!(matches!(
             gate.decide(&proposal(&edge, 6.0, 40), &mut log),

@@ -52,14 +52,23 @@ impl DriftModel {
 
 /// Rejects a verified loop whose correction exceeds `k_sigma` drift-model σ
 /// in translation or yaw.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Off by default (E-1): the drift model is fitted on one 61 m sim run, and
+/// a gate on it refuses the large true loops of a drifting sequence. Presets
+/// that want it use [`LoopOdometryGate::sim_fitted`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum LoopOdometryGate {
+    #[default]
     Disabled,
-    Enabled { drift: DriftModel, k_sigma: f64 },
+    Enabled {
+        drift: DriftModel,
+        k_sigma: f64,
+    },
 }
 
-impl Default for LoopOdometryGate {
-    fn default() -> Self {
+impl LoopOdometryGate {
+    /// The gate at 3σ of [`DriftModel::default`], the default before E-1.
+    pub fn sim_fitted() -> Self {
         Self::Enabled {
             drift: DriftModel::default(),
             k_sigma: 3.0,
@@ -377,16 +386,32 @@ mod tests {
     /// translation bound there is under 1.5 m, while 0.5 m of drift passes.
     #[test]
     fn default_gate_rejects_false_loop_and_keeps_drift_sized_correction() {
-        let gate = LoopOdometryGate::default();
+        let gate = LoopOdometryGate::sim_fitted();
         let false_loop = gate.judge(&correction(6.0, -2.0, 21.0)).unwrap();
         assert!(!false_loop.accepted);
         assert!(3.0 * false_loop.sigma_t_m < 1.5);
         assert!(gate.judge(&correction(0.5, 1.0, 21.0)).unwrap().accepted);
     }
 
+    /// E-1: the default closer has no odometry gate, as on main.
+    #[test]
+    fn the_default_gate_is_disabled() {
+        assert_eq!(LoopOdometryGate::default(), LoopOdometryGate::Disabled);
+        assert_eq!(
+            crate::loop_closure::LoopClosingConfig::default().odometry_gate,
+            LoopOdometryGate::Disabled
+        );
+        assert_eq!(
+            LoopOdometryGate::sim_fitted()
+                .judge(&correction(0.0, 0.0, 1.0))
+                .map(|v| v.k_sigma),
+            Some(3.0)
+        );
+    }
+
     #[test]
     fn gate_rejects_on_yaw_alone() {
-        let gate = LoopOdometryGate::default();
+        let gate = LoopOdometryGate::sim_fitted();
         let verdict = gate.judge(&correction(0.05, 10.0, 5.0)).unwrap();
         assert!(!verdict.accepted);
         assert!(gate.judge(&correction(0.05, -2.0, 5.0)).unwrap().accepted);

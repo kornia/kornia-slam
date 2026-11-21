@@ -1458,7 +1458,7 @@ fn forgotten_node_edges_measure_from_its_solved_pose() {
 #[test]
 fn loop_closer_gate_rejects_correction_beyond_odometry_drift() {
     let config = LoopClosingConfig {
-        odometry_gate: LoopOdometryGate::default(),
+        odometry_gate: LoopOdometryGate::sim_fitted(),
         ..closing_config()
     };
     let (mut closer, mut map) = closing_fixture(config, false);
@@ -1532,7 +1532,7 @@ fn false_loop_edge_distorts_pose_graph_and_gate_rejects_it() {
         .fold(0.0, f64::max);
     assert!(largest_shift > 3.0, "shift {largest_shift}");
 
-    let gate = LoopOdometryGate::default();
+    let gate = LoopOdometryGate::sim_fitted();
     let false_correction = LoopCorrection::measure(candidate, query, path(), &false_edge, None);
     assert!((false_correction.path_m - (17.0 + 1.25_f64.sqrt())).abs() < 1e-9);
     assert!((false_correction.translation_m() - 5.92).abs() < 0.01);
@@ -1581,7 +1581,7 @@ fn false_loop_is_gated_and_cauchy_bounds_the_map_when_the_gate_is_off() {
         query_order: map.keyframes().len() - 1,
         candidate_order: 0,
     };
-    let mut gate = OdometryConsistencyGate(LoopOdometryGate::default());
+    let mut gate = OdometryConsistencyGate(LoopOdometryGate::sim_fitted());
     assert!(matches!(
         gate.decide(&proposal, &mut Vec::new()),
         GateDecision::Reject(_)
