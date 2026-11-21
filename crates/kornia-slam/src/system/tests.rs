@@ -910,6 +910,59 @@ mod anchors {
         }
     }
 
+    /// R-C9: with gravity, a rotated keyframe and a rotated, offset `T_bc`,
+    /// the propagated velocity is the true one: the specific force measured
+    /// in the body frame is rotated to the world and gravity is added back.
+    /// A sign or frame error in any of the three breaks the match.
+    #[test]
+    fn the_frame_velocity_follows_gravity_and_the_lever_arm() {
+        use kornia_algebra::SO3F64;
+        let camera_to_world = SO3F64::exp(Vec3F64::new(0.3, -0.5, 0.8)).matrix();
+        let centre = Vec3F64::new(1.0, 2.0, 3.0);
+        let kf_pose = Pose3d::new(
+            camera_to_world.transpose(),
+            -(camera_to_world.transpose() * centre),
+        );
+        let camera_to_body_rotation = SO3F64::exp(Vec3F64::new(0.0, 0.4, -0.2)).matrix();
+        let camera_to_body = Pose3d::new(camera_to_body_rotation, Vec3F64::new(0.05, -0.1, 0.02));
+        let body_to_world = camera_to_world * camera_to_body_rotation.transpose();
+        let gravity = Vec3F64::new(0.0, 0.0, -9.81);
+        let accel_world = Vec3F64::new(0.3, -0.2, 0.1);
+        let specific_force = body_to_world.transpose() * (accel_world - gravity);
+
+        let mut config = config(CameraSelection::Mono, true, LoopClosingMode::Disabled);
+        let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+        orb.tracking.frame_velocity = FrameVelocity::PropagatedFromKeyframe;
+        let rig = SensorRig::new(camera()).with_imu(camera_to_body);
+        let mut system = SlamSystem::build(config, rig).unwrap();
+        let mut map = map_with_keyframe_at(kf_pose);
+        map.edit_keyframes_for_test(|_, kf| kf.velocity_world = v_kf());
+        *system.map.lock().unwrap() = map;
+        system.state.current_keyframe_idx = Some(0);
+        system.state.last_keyframe_idx = Some(0);
+        system.state.imu_initialized = true;
+        system.inertial.last_keyframe_timestamp_sec = Some(0.0);
+        system.inertial.gravity_world = gravity;
+        let samples: Vec<ImuMeasurement> = (0..=400)
+            .map(|i| ImuMeasurement {
+                timestamp: i as f64 * 0.005,
+                gyro: Vec3F64::ZERO,
+                accel: specific_force,
+            })
+            .collect();
+        system.process_imu(&samples);
+
+        for k in 1..=6 {
+            let t_prev = k as f64 * 0.05;
+            let v = refreshed_velocity(&mut system, t_prev);
+            let expected = v_kf() + accel_world * t_prev;
+            assert!(
+                (v - expected).length() < 1e-9,
+                "frame {k}: {v:?} vs {expected:?}"
+            );
+        }
+    }
+
     /// The propagation integrates with the keyframe's bias, not the one left
     /// in the inertial state.
     #[test]
