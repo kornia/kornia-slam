@@ -22,6 +22,10 @@ Status: written 2026-11-21, before any run. Config only (a calibration copy), no
   - `acc_noise_density` is 7.8e-4 m/s²/√Hz, and the position block of a 0.15 s edge reaches Ω ≈ 5.8e9 (σ ≈ 13 µm; `[vi_ba]` lines).
   - The fit shows up to 1.2 % scale and cross-axis error: R_01 and R_03 have no factory rectification. On gravity that is about 0.1 m/s², which changes with head orientation, so a constant bias cannot absorb it.
 
+- **LaMAria's own ground-truth pipeline adds integration noise** (found after the predictions were written, before any result).
+  - `lamaria/pipeline/optim/imu.py:85-105` and `defaults.yaml:41-43` use the same white-noise densities as ours: accelerometer 0.8e-4·g = 7.8e-4 m/s²/√Hz, gyro 1e-2 °/s/√Hz.
+  - They add `integration_noise_density: 0.05` to COLMAP's IMU preintegration. That is about 64× our accelerometer density, and our preintegration has no such term.
+
 ### Mechanism
 
 - `information()` (`kornia-factors/src/inertial/preintegration.rs:187`) inverts the preintegration covariance, which comes only from the white-noise densities.
