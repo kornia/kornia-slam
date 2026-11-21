@@ -208,6 +208,14 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 
 We are working toward top results on the [LaMAria](https://github.com/cvg/lamaria) egocentric benchmark ([#78](https://github.com/kornia/kornia-slam/issues/78)), using the Aria rig and IMU and no GPS. The work is sequenced by where the benchmark score is lost: each change states its theory and predictions first, ships behind a config knob that defaults to the old behaviour, and is compared window by window against ORB-SLAM3 in the same harness.
 
+General purpose, not tuned per deployment (owner, 2026-11-21). A new rig or dataset should need its sensor model only: calibration, IMU noise and frame rate. Knobs are how a change lands and is measured; after each validation round a cleanup card makes the winners the code default and deletes the refuted or redundant knobs.
+- [ ] **Cleanup after the first validation run.**
+  - **Make the fixes the only path:** `dense_parallelism: Sequential`, `merge: PropagateToNewer` (with the stop at a re-seed), `frame_velocity: PropagatedFromKeyframe` (card U), and the coasted-pose output.
+  - **Make the reference constants the code defaults:** 10 active keyframes, 7 iterations from λ 1e-4 (Basalt), `growth_min_baseline_ratio` tan 1° (ORB-SLAM3).
+  - **Delete the refuted or redundant knobs:** `keyframe_seed` (card R), the full-weight boundary edge (card O), `SnapshotOnly`.
+  - **Shrink `pr180-window10`** to dataset and sensor settings.
+- [ ] **Derive the remaining hand-set thresholds from the sensor model and the estimate's uncertainty:** depth sigma from f·baseline and disparity, gates from covariance, coast caps from the propagated IMU covariance, `min_cold_start_points` from the pose covariance of the cold start.
+
 Next, start-up and scale (2026-11-19, from cards I and J; in this order):
 - [x] **Baseline and parallax gate on new map points** (card K, 2026-11-21: built, knob `mapping.growth_min_baseline_ratio`; at 0.0175 (tan 1°) with `min_cold_start_points: 20`, R_03 784-798/800, R_11 798-800/800, R_01 800/800; shipped in `pr180-frontend-1ms`).
 - [ ] **Raw fisheye images instead of the pinhole crop (card F).** Basalt, OKVIS2, ORB-SLAM3 (`KannalaBrandt8`) and Aria's own SLAM run on the full fisheye view; the wider stereo overlap removes the R_11 start-up starvation (G31) at its source.
