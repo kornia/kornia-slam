@@ -41,7 +41,8 @@ impl TrajectoryWriter {
     }
 }
 
-/// `--trajectory-smoothed`: each tracked frame re-anchored at shutdown to
+/// `--trajectory-smoothed`: each frame of `--trajectory-out` (tracked, plus
+/// the inertial coasts under `--trajectory-include-coasted`) re-anchored at shutdown to
 /// its reference keyframe's final pose, ORB-SLAM3's `SaveTrajectoryEuRoC`.
 /// A keyframe culled by then stands in through its parent, the reference
 /// keyframe it replaced, as ORB-SLAM3 walks `GetParent`.
@@ -63,7 +64,7 @@ struct SmoothedFrame {
 }
 
 impl SmoothedTrajectory {
-    /// Records a tracked frame against its reference keyframe `reference_kf`
+    /// Records a scored frame against its reference keyframe `reference_kf`
     /// at that keyframe's current `T_cw`.
     pub fn record(
         &mut self,
@@ -242,6 +243,20 @@ mod tests {
             vec![(0.0, 10, 0.5), (0.1, 10, 1.5), (0.2, 10, 2.5)]
         );
         assert_eq!(smoothed.anchored_frames(|kf| kf == 99).count(), 0);
+    }
+
+    /// A coast is recorded against the keyframe it coasts from, and the
+    /// session dump sees it like a tracked frame.
+    #[test]
+    fn a_recorded_coast_is_an_anchored_frame() {
+        let mut smoothed = SmoothedTrajectory::default();
+        smoothed.record(0.0, &translation(1.5), 10, &translation(1.0));
+        smoothed.record(0.1, &translation(1.9), 10, &translation(1.0));
+        let anchored: Vec<_> = smoothed
+            .anchored_frames(|kf| kf == 10)
+            .map(|(t, kf, _)| (t, kf))
+            .collect();
+        assert_eq!(anchored, vec![(0.0, 10), (0.1, 10)]);
     }
 
     #[test]

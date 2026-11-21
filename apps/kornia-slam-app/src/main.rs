@@ -114,8 +114,9 @@ struct Args {
     #[argh(option)]
     write_rig_calibration: Option<String>,
 
-    /// record the session (keyframes, landmarks, IMU samples and tracked
-    /// frames) and write it at shutdown to this file (CBOR), for `offline-ba`
+    /// record the session (keyframes, landmarks, IMU samples and the frames
+    /// of --trajectory-out) and write it at shutdown to this file (CBOR), for
+    /// `offline-ba`
     #[argh(option)]
     session_out: Option<String>,
 
@@ -483,8 +484,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             writer.write(timestamp_sec, &result.pose_world_to_cam)?;
         }
+        // Gated as --trajectory-out, so the session dump and offline-ba see
+        // the same frames that are scored.
         if let Some(smoothed) = smoothed.as_mut()
-            && result.status != kornia_slam::TrackingStatus::Skipped
+            && writes_scored_pose(
+                result.status,
+                system.last_skip(),
+                args.trajectory_include_coasted,
+            )
             && let Some(reference_kf) = system.current_keyframe_idx()
             && let Some(reference_pose) = system.keyframe_pose(reference_kf)
         {
@@ -734,7 +741,7 @@ mod cli_tests {
 
     #[test]
     fn coasted_poses_reach_the_scored_trajectory_only_when_included() {
-        use kornia_slam::TrackingStatus::Skipped;
+        use kornia_slam::TrackingStatus::{KeyframeAccepted, Skipped, Tracked};
         let inertial = Some(SkipKind::Coasting { inertial: true });
         let visual = Some(SkipKind::Coasting { inertial: false });
         assert!(!writes_scored_pose(Skipped, inertial, false));
@@ -746,6 +753,12 @@ mod cli_tests {
             true
         ));
         assert!(!writes_scored_pose(Skipped, None, true));
+        for status in [Tracked, KeyframeAccepted] {
+            for skip in [None, inertial, visual, Some(SkipKind::Bootstrap)] {
+                assert!(writes_scored_pose(status, skip, false));
+                assert!(writes_scored_pose(status, skip, true));
+            }
+        }
         assert!(
             parse(&["--config", "r.ron", "--trajectory-include-coasted"])
                 .unwrap()
