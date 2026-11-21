@@ -174,10 +174,10 @@ fn refreshed_geometry(
         .map_or(0, |o| o.camera);
     let ref_center = centre(mp.keyframe_idx, ref_camera)?;
     let dist = (position - ref_center).length();
-    let level_scale = scale_factor.powi(mp.reference_octave as i32);
+    let level_scale = scale_power(scale_factor, mp.reference_octave as usize);
     let max_dist = dist * level_scale;
     let min_dist = if n_levels > 0 {
-        max_dist / scale_factor.powi(n_levels as i32 - 1)
+        max_dist / scale_power(scale_factor, n_levels - 1)
     } else {
         max_dist
     };
@@ -186,4 +186,11 @@ fn refreshed_geometry(
         max_distance: max_dist,
         min_distance: min_dist,
     })
+}
+
+/// `scale^exp` by repeated multiplication. `powi` may be evaluated at compile
+/// time for constant arguments and at run time otherwise, and the two can
+/// differ in the last bit; this keeps every caller bit-identical.
+fn scale_power(scale: f64, exp: usize) -> f64 {
+    (0..exp).fold(1.0, |acc, _| acc * scale)
 }
