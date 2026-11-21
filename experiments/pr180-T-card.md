@@ -204,3 +204,20 @@ All four trajectories are `cmp`-identical, to each other and to `cardR/out/r01fu
   against 0.12 ms for T1, solve p50 39.8 ms against 38.0 ms. The default still uses faer's pool (40.5 %
   chol), so the knob is wired and the default is unchanged. Tglobal is slower than T0 (57.7 against
   52.2 ms p50); load reached 3.2 during that run, so the gap is not attributed to the code.
+
+- **2026-11-21, preset `configs/pr180-window10.ron` (async, 10 active, 7 iterations, λ 1e-4,
+  `dense_parallelism: Sequential`, `merge: PropagateToNewer`).** Binary `cardT/bin/kornia-slam-t-seq`
+  (c3d19d0, md5 32b6d5506ebeaa18fba296abac1e8a4d), no `RAYON_NUM_THREADS`, 2 jobs, load p50 4.2
+  (max 5.1). Configs `cardT/cfg/{r03-W,r11-W,r01full-W}.ron`; run dirs `cardT/out3`.
+
+| Sequence | ATE SE3 (r1, r2, r3) | Scale | Tracked | Coasted | Base (pr180-frontend-1ms, cards K and L) |
+|---|---|---|---|---|---|
+| R_01 full | 0.296, 0.399, 0.311 m | 0.969-0.990 | 2898 ×3 | 0 | 1.11-1.23 m |
+| R_03, 800 frames | 0.112, 0.109, 0.085 m | 1.023-1.036 | 762, 775, 789 | 38, 25, 11 | 0.190-0.202 m; tracked 782-800 |
+| R_11, 800 frames | 0.165, 0.151, 0.165 m | 0.949-0.957 | 800, 799, 799 | 0, 1, 1 | 0.136-0.170 m; tracked 798-800 |
+
+  - R_01: no solve moves more than 30 cm in any run; solve p50 96.6 ms (async, loaded); frame p90
+    56.8-84.5 ms.
+  - R_03 tracking is below the base in 2 of 3 runs (K4 again). These are the post-gap velocity losses
+    above. With `--trajectory-include-coasted` every frame still gets a pose. ATE is about half the base.
+  - R_11 is inside the base band.
