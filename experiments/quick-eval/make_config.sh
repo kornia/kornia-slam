@@ -2,15 +2,23 @@
 # Derive an 800-frame LaMAria run config from a shipped preset, with optional knob lines.
 #   make_config.sh PRESET SEQ OUT.ron ['knob line inside OrbSlam((...))' ...]
 # Env: LAMARIA_DATA (root holding <seq>/asl/<seq> and <seq>/pinhole_calibrations),
-#      LAMARIA_FACTORY (dir with <seq>.factory.json, optional), VOCAB (ORBvoc.txt path),
+#      LAMARIA_FACTORY (dir with <seq>.factory.json; when set, a missing <seq>.factory.json is an error
+#      unless ALLOW_RAW_IMU=1, which runs the sequence on the raw IMU and says so on stderr), VOCAB (ORBvoc.txt path),
 #      MAX_FRAMES (default 800), RAW_FISHEYE=1 (read the raw Aria fisheye images from
 #      <seq>/asl_raw/<seq> with <seq>/aria_calibrations/<seq>.json; needs a Rig, ORB-only preset).
 set -euo pipefail
 preset=$1 seq=$2 out=$3; shift 3
 : "${LAMARIA_DATA:?set LAMARIA_DATA}" "${VOCAB:?set VOCAB to ORBvoc.txt}"
 factory=""
-if [ -n "${LAMARIA_FACTORY:-}" ] && [ -f "$LAMARIA_FACTORY/$seq.factory.json" ]; then
-  factory="        factory_calib: \"$LAMARIA_FACTORY/$seq.factory.json\","
+if [ -n "${LAMARIA_FACTORY:-}" ]; then
+  if [ -f "$LAMARIA_FACTORY/$seq.factory.json" ]; then
+    factory="        factory_calib: \"$LAMARIA_FACTORY/$seq.factory.json\","
+  elif [ "${ALLOW_RAW_IMU:-0}" = 1 ]; then
+    echo "make_config.sh: WARNING $seq: no $LAMARIA_FACTORY/$seq.factory.json, config uses the raw IMU (ALLOW_RAW_IMU=1)" >&2
+  else
+    echo "make_config.sh: ERROR $seq: no $LAMARIA_FACTORY/$seq.factory.json; the run would use the raw IMU. Extract the calibration, or set ALLOW_RAW_IMU=1 and mark the row raw-IMU." >&2
+    exit 2
+  fi
 fi
 raw=""
 if [ "${RAW_FISHEYE:-0}" = 1 ]; then
