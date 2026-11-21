@@ -42,7 +42,10 @@ for line in open(f"{run}/stderr.txt"):
                  int(round(float(m.group(7)) * 1e9)), m.group(8)))
 if not rows: sys.exit(f"no [vel] lines in {run}/stderr.txt")
 t = np.array([r[3] for r in rows]); gi, gok = nearest(tg, t)
+# The central difference needs a neighbour on both sides: clip the index, then re-check the 10 ms association
+# against the clipped sample, so a stamp past either end of the GT is dropped, not matched to a moved sample.
 gi = gi.clip(1, len(tg) - 2)
+gok = gok & (np.abs(tg[gi] - t) < 10_000_000)
 vgt = (pg[gi + 1] - pg[gi - 1]) / ((tg[gi + 1] - tg[gi - 1])[:, None] * 1e-9)
 
 def bin_of(age_s):
@@ -54,7 +57,7 @@ groups = {}
 for (lost, age_s, v, _, src), g, good in zip(rows, vgt, gok):
     if not good: continue
     groups.setdefault((lost, src), []).append((bin_of(age_s), age_s, np.linalg.norm(R @ v - g)))
-print(f"== {run.rstrip('/').split('/')[-1]} frames {lo}:{hi}, {len(rows)} [vel] lines")
+print(f"== {run.rstrip('/').split('/')[-1]} frames {lo}:{hi}, {len(rows)} [vel] lines, {int((~gok).sum())} without GT within 10 ms")
 print("ref_lost src     " + "".join(f"{b:>16}" for b in ("1", "2", "3-4", "5+", "nan")) + "   slope (m/s per s)")
 for (lost, src), items in sorted(groups.items()):
     cells = []
