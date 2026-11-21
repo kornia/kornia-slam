@@ -188,6 +188,14 @@ pub fn pair_growth_request(
             )
         };
         let baseline_m = Pose3d::between(&prev_pose, &curr_pose).translation.length();
+        if let Some(mixed) = scene_depth_m.filter(|_| crate::debug_enabled()) {
+            // S0-B7: the gate uses the camera-0 median for every camera.
+            let own = map.camera_median_depth(curr_kf_idx, c, &curr_pose);
+            debug_eprintln!(
+                "[growth] baseline_depth kf={curr_kf_idx} cam={c} mixed={mixed:.3} own={}",
+                own.map_or("-".to_string(), |d| format!("{d:.3}"))
+            );
+        }
         if !baseline_admitted(baseline_m, min_baseline_ratio, scene_depth_m) {
             continue;
         }
