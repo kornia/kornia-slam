@@ -637,9 +637,14 @@ mod anchors {
     /// t = 0), with an initialized IMU and 2 s of constant-acceleration
     /// samples buffered.
     fn system() -> SlamSystem {
+        system_with(SampleInterpolation::Hold)
+    }
+
+    fn system_with(interpolation: SampleInterpolation) -> SlamSystem {
         let mut config = config(CameraSelection::Mono, true, LoopClosingMode::Disabled);
         let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
         orb.tracking_loss.keyframes_while_lost = KeyframesWhileLost::Anchor;
+        orb.inertial.sample_interpolation = interpolation;
         let rig = SensorRig::new(camera()).with_imu(Pose3d::IDENTITY);
         let mut system = SlamSystem::build(config, rig).unwrap();
         *system.map.lock().unwrap() = map_with_keyframe_at(Pose3d::IDENTITY);
@@ -800,6 +805,129 @@ mod anchors {
         let expected = 1.0 + ACCEL_X * (t - t_kf);
         let v = system.state.velocity_world;
         assert!((v.x - expected).abs() < 1e-9, "{v:?} vs {expected}");
+    }
+
+    const V_KF_X: f64 = 1.0;
+
+    fn v_kf() -> Vec3F64 {
+        Vec3F64::new(V_KF_X, 0.0, 0.0)
+    }
+
+    /// `system_with(interpolation)` with keyframe 0 at `v_kf()`, the knob set
+    /// to `frame_velocity`.
+    fn propagating(
+        interpolation: SampleInterpolation,
+        frame_velocity: FrameVelocity,
+    ) -> SlamSystem {
+        let mut system = system_with(interpolation);
+        system.tracking_config.frame_velocity = frame_velocity;
+        system
+            .map
+            .lock()
+            .unwrap()
+            .edit_keyframes_for_test(|_, kf| kf.velocity_world = v_kf());
+        system
+    }
+
+    /// The velocity the refresh leaves before a prediction from `t_prev`; a
+    /// prediction then overwrites it, as on a real frame.
+    fn refreshed_velocity(system: &mut SlamSystem, t_prev: f64) -> Vec3F64 {
+        system.state.last_frame_timestamp_sec = t_prev;
+        system.refresh_reference_inertial_state();
+        let v = system.state.velocity_world;
+        system.predict_frame_pose(Pose3d::IDENTITY, t_prev, t_prev + 0.05);
+        v
+    }
+
+    /// Card U: with the knob on, the frame velocity is the keyframe's
+    /// propagated to the previous frame, `v_kf + a (t_prev - t_kf)`.
+    #[test]
+    fn the_frame_velocity_is_propagated_from_the_keyframe_to_the_previous_frame() {
+        let mut system = propagating(
+            SampleInterpolation::Hold,
+            FrameVelocity::PropagatedFromKeyframe,
+        );
+        for k in 1..=6 {
+            let t_prev = k as f64 * 0.05;
+            let v = refreshed_velocity(&mut system, t_prev);
+            let expected = V_KF_X + ACCEL_X * t_prev;
+            assert!(
+                (v.x - expected).abs() < 1e-9,
+                "frame {k}: {v:?} vs {expected}"
+            );
+            assert!(v.y.abs() < 1e-12 && v.z.abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn the_knob_off_resets_the_frame_velocity_to_the_keyframes() {
+        let mut system = propagating(SampleInterpolation::Hold, FrameVelocity::KeyframeVelocity);
+        for k in 1..=6 {
+            assert_eq!(refreshed_velocity(&mut system, k as f64 * 0.05), v_kf());
+        }
+    }
+
+    /// The knob is read only with `pose_inertial: Off` and a reference that is
+    /// the last keyframe; otherwise the result is the knob-off one, bit for bit.
+    #[test]
+    fn a_pose_inertial_mode_or_an_older_reference_keeps_the_keyframe_velocity() {
+        let mut orbslam3 = propagating(
+            SampleInterpolation::Hold,
+            FrameVelocity::PropagatedFromKeyframe,
+        );
+        orbslam3.tracking_config.pose_inertial = PoseInertial::OrbSlam3;
+        assert_eq!(refreshed_velocity(&mut orbslam3, 0.2), v_kf());
+
+        let older_reference = |frame_velocity| {
+            let mut system = propagating(SampleInterpolation::Hold, frame_velocity);
+            assert!(system.insert_keyframe(&frame(8), 0.4, &[], 0, KeyframeRole::Tracked));
+            system.state.current_keyframe_idx = Some(0);
+            refreshed_velocity(&mut system, 0.5)
+        };
+        let on = older_reference(FrameVelocity::PropagatedFromKeyframe);
+        assert_eq!(on, older_reference(FrameVelocity::KeyframeVelocity));
+        assert_eq!(on, v_kf());
+    }
+
+    /// Samples before the keyframe are pruned every frame; the window starts
+    /// at the keyframe, so the result is unchanged under either interpolation.
+    #[test]
+    fn the_propagation_survives_pruning_before_the_keyframe() {
+        for interpolation in [SampleInterpolation::Hold, SampleInterpolation::Midpoint] {
+            let mut system = propagating(interpolation, FrameVelocity::PropagatedFromKeyframe);
+            let t_kf = 0.1;
+            system.inertial.last_keyframe_timestamp_sec = Some(t_kf);
+            system.prune_imu_before(t_kf);
+            for k in 1..=6 {
+                let t_prev = t_kf + k as f64 * 0.05;
+                let v = refreshed_velocity(&mut system, t_prev);
+                let expected = V_KF_X + ACCEL_X * (t_prev - t_kf);
+                assert!(
+                    (v.x - expected).abs() < 1e-9,
+                    "{interpolation:?} frame {k}: {v:?} vs {expected}"
+                );
+            }
+        }
+    }
+
+    /// The propagation integrates with the keyframe's bias, not the one left
+    /// in the inertial state.
+    #[test]
+    fn the_propagation_uses_the_keyframes_bias() {
+        let mut system = propagating(
+            SampleInterpolation::Hold,
+            FrameVelocity::PropagatedFromKeyframe,
+        );
+        let accel_bias = 0.1;
+        system.map.lock().unwrap().edit_keyframes_for_test(|_, kf| {
+            kf.imu_bias.accel = Vec3F64::new(accel_bias, 0.0, 0.0)
+        });
+        system.inertial.bias.accel = Vec3F64::new(2.0, 0.0, 0.0);
+        let t_prev = 0.3;
+        let v = refreshed_velocity(&mut system, t_prev);
+        let expected = V_KF_X + (ACCEL_X - accel_bias) * t_prev;
+        assert!((v.x - expected).abs() < 1e-9, "{v:?} vs {expected}");
+        assert_eq!(system.inertial.bias.accel.x, accel_bias);
     }
 }
 

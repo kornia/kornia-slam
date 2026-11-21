@@ -471,6 +471,7 @@ pub struct TrackingConfig {
     /// The analytic pose refine adopts its last LM step only when the step does
     /// not raise the cost; `false` keeps the generic solver's rule.
     pub refine_monotone: bool,
+    pub frame_velocity: FrameVelocity,
 }
 
 /// A pose-inertial solve per frame (the idea of PR #195, credit Astik):
@@ -488,6 +489,21 @@ pub enum PoseInertial {
     /// 15×15 prior; `...LastKeyFrame` on the first frame after the map changed
     /// (`Tracking.cc:2970-2992`).
     OrbSlam3,
+}
+
+/// The velocity a frame's prediction starts from when the reference is the
+/// last keyframe. Read only with [`PoseInertial::Off`]; the pose-inertial
+/// modes carry their own frame state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum FrameVelocity {
+    /// The keyframe's velocity, at the keyframe's timestamp, every frame.
+    #[default]
+    KeyframeVelocity,
+    /// The keyframe's velocity propagated on the IMU over `[t_kf, t_prev]`
+    /// with the keyframe's bias, so a one-frame prediction from the previous
+    /// frame starts at that frame's velocity (ORB-SLAM3 `Tracking.cc:1746-1758`).
+    PropagatedFromKeyframe,
 }
 
 /// What follows a local-BA write-back that moved the reference keyframe.
@@ -826,6 +842,9 @@ impl fmt::Display for SystemConfig {
         }
         if orb.mapping.keyframe_seed != KeyframeSeed::default() {
             writeln!(f, "  keyframe seed: {:?}", orb.mapping.keyframe_seed)?;
+        }
+        if orb.tracking.frame_velocity != FrameVelocity::default() {
+            writeln!(f, "  frame velocity: {:?}", orb.tracking.frame_velocity)?;
         }
         let ba = &orb.mapping.local_ba;
         if *ba != LocalBaConfig::default() {

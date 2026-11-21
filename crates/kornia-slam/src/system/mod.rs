@@ -19,13 +19,13 @@ pub mod wheel;
 
 pub use build::BuildError;
 pub use config::{
-    AnchorGuard, CameraSelection, FlowBookkeeping, FlowPose, ForwardBackward, FrontendConfig,
-    GyroGuess, InertialConfig, KeyframeOrb, KltFirst, KltPrediction, KltRetry, KltRig,
-    LocalBaConfig, LoopClosingExecution, LoopClosingMode, LostRelocalization, MAX_FLOW_THREADS,
-    MappingConfig, OnlineCalibrationConfig, OrbFrontendConfig, OrbSlamPipeline, OrbTuning,
-    PipelineDefinition, PoseInertial, SYSTEM_CONFIG_VERSION, SensorSelection, SnapbackFix,
-    StereoCloseDepth, StereoDepthSigma, StereoPyramid, SystemConfig, TrackRefill, TrackingConfig,
-    TrackingLossConfig,
+    AnchorGuard, CameraSelection, FlowBookkeeping, FlowPose, ForwardBackward, FrameVelocity,
+    FrontendConfig, GyroGuess, InertialConfig, KeyframeOrb, KltFirst, KltPrediction, KltRetry,
+    KltRig, LocalBaConfig, LoopClosingExecution, LoopClosingMode, LostRelocalization,
+    MAX_FLOW_THREADS, MappingConfig, OnlineCalibrationConfig, OrbFrontendConfig, OrbSlamPipeline,
+    OrbTuning, PipelineDefinition, PoseInertial, SYSTEM_CONFIG_VERSION, SensorSelection,
+    SnapbackFix, StereoCloseDepth, StereoDepthSigma, StereoPyramid, SystemConfig, TrackRefill,
+    TrackingConfig, TrackingLossConfig,
 };
 pub use counters::{RunCounters, SkipKind};
 #[cfg(feature = "serde")]
@@ -139,6 +139,27 @@ enum KeyframeRole {
     /// Inserted at the inertial prediction while lost and held fixed
     /// ([`KeyframesWhileLost::Anchor`]).
     Anchor,
+}
+
+/// Where a frame's starting velocity came from, for the `[vel]` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameVelocitySource {
+    /// The reference keyframe's velocity.
+    Keyframe,
+    /// [`FrameVelocity::PropagatedFromKeyframe`].
+    Propagated,
+    /// Left as the previous frame's prediction wrote it.
+    Carried,
+}
+
+impl FrameVelocitySource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Keyframe => "kf",
+            Self::Propagated => "prop",
+            Self::Carried => "carried",
+        }
+    }
 }
 
 /// What tracking a deferred frame from its flow survivors alone gave.
@@ -1711,20 +1732,30 @@ impl SlamSystem {
     /// [`Self::inertial_state_from_last_keyframe`] chose) holds an older
     /// velocity than the propagated one, which stays, with the last
     /// keyframe's bias (E1, G3).
-    fn refresh_reference_inertial_state(&mut self) {
+    fn refresh_reference_inertial_state(&mut self) -> FrameVelocitySource {
         let Some(kf_idx) = self.state.current_keyframe_idx else {
-            return;
+            return FrameVelocitySource::Carried;
         };
         let map = self.map.lock().unwrap();
         let Some(kf) = map.get_keyframe(kf_idx) else {
-            return;
+            return FrameVelocitySource::Carried;
         };
         let decoupled = Some(kf_idx) != self.state.last_keyframe_idx
             && (kf.anchor || self.inertial_state_from_last_keyframe());
         if !decoupled {
-            self.state.velocity_world = kf.velocity_world;
+            // The propagation reads `inertial.bias`, so it must be the
+            // keyframe's first.
             self.inertial.bias = kf.imu_bias;
-            return;
+            return match self.propagated_frame_velocity(kf, kf_idx) {
+                Some(velocity_world) => {
+                    self.state.velocity_world = velocity_world;
+                    FrameVelocitySource::Propagated
+                }
+                None => {
+                    self.state.velocity_world = kf.velocity_world;
+                    FrameVelocitySource::Keyframe
+                }
+            };
         }
         if let Some(last) = self
             .state
@@ -1733,6 +1764,68 @@ impl SlamSystem {
         {
             self.inertial.bias = last.imu_bias;
         }
+        FrameVelocitySource::Carried
+    }
+
+    /// Under [`FrameVelocity::PropagatedFromKeyframe`], the velocity at the
+    /// previous frame: the reference keyframe's propagated over
+    /// `[t_kf, t_prev]` (ORB-SLAM3 `Tracking.cc:1746-1758`). `None` keeps the
+    /// keyframe's: the knob off, a pose-inertial mode, no IMU, or a reference
+    /// that is not the last keyframe, whose samples are already pruned.
+    fn propagated_frame_velocity(&self, kf: &Keyframe, kf_idx: usize) -> Option<Vec3F64> {
+        if self.tracking_config.frame_velocity != FrameVelocity::PropagatedFromKeyframe
+            || self.tracking_config.pose_inertial != PoseInertial::Off
+            || !self.state.imu_initialized
+            || Some(kf_idx) != self.state.last_keyframe_idx
+        {
+            return None;
+        }
+        let t_kf = self.inertial.last_keyframe_timestamp_sec?;
+        let t_prev = self.state.last_frame_timestamp_sec;
+        if t_prev <= t_kf {
+            return None;
+        }
+        let (preintegrated, _) =
+            self.inertial
+                .preintegrate_window(self.rig.imu_noise(), t_kf, t_prev);
+        (preintegrated.dt > 0.0).then(|| {
+            propagate_keyframe_velocity(
+                kf.frame.pose_world_to_cam,
+                kf.velocity_world,
+                self.inertial.gravity_world,
+                &preintegrated,
+                self.rig.camera_to_body(),
+            )
+        })
+    }
+
+    /// `[vel]`: the velocity this frame's prediction starts from, for
+    /// `experiments/quick-eval/velgt.py`.
+    fn report_frame_velocity(&mut self, frame_idx: usize, source: FrameVelocitySource) {
+        let Some(kf_idx) = self.state.current_keyframe_idx else {
+            return;
+        };
+        let ref_lost = self
+            .map
+            .lock()
+            .unwrap()
+            .get_keyframe(kf_idx)
+            .is_some_and(|kf| kf.inserted_while_lost);
+        let t_prev = self.state.last_frame_timestamp_sec;
+        let age_s = match self.inertial.last_keyframe_timestamp_sec {
+            Some(t_kf) if Some(kf_idx) == self.state.last_keyframe_idx => t_prev - t_kf,
+            _ => f64::NAN,
+        };
+        let v = self.state.velocity_world;
+        self.dbg(format!(
+            "[vel] frame={frame_idx} ref_kf={kf_idx} ref_lost={} age_s={age_s:.4} \
+             v=({:.4},{:.4},{:.4}) t={t_prev:.9} src={}",
+            u8::from(ref_lost),
+            v.x,
+            v.y,
+            v.z,
+            source.label(),
+        ));
     }
 
     /// Under [`KeyframeSeed::ImuPropagated`], a tracked keyframe's velocity: the
@@ -1789,8 +1882,13 @@ impl SlamSystem {
         let pose_before = self.state.pose_world_to_cam;
         let prev_timestamp = self.state.last_frame_timestamp_sec;
 
-        if !self.frame_state_carried(frame_idx) {
-            self.refresh_reference_inertial_state();
+        let velocity_source = if self.frame_state_carried(frame_idx) {
+            FrameVelocitySource::Carried
+        } else {
+            self.refresh_reference_inertial_state()
+        };
+        if self.debug {
+            self.report_frame_velocity(frame_idx, velocity_source);
         }
         self.update_seeded_window();
 

@@ -1520,6 +1520,30 @@ mod ron_files {
     }
 
     #[test]
+    fn the_frame_velocity_parses_and_round_trips() {
+        let default = parse("(version: 1)").unwrap();
+        assert_eq!(
+            orb(&default).tracking.frame_velocity,
+            FrameVelocity::KeyframeVelocity
+        );
+
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((tracking: (frame_velocity: PropagatedFromKeyframe))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).tracking.frame_velocity,
+            FrameVelocity::PropagatedFromKeyframe
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+        assert_eq!(config.validate(), Ok(()));
+        assert!(matches!(
+            parse_error("(version: 1, pipeline: OrbSlam((tracking: (frame_velocity: Bogus))))"),
+            ron::Error::NoSuchEnumVariant { found, .. } if found == "Bogus"
+        ));
+    }
+
+    #[test]
     fn the_fisheye_weight_parses_and_round_trips() {
         let config = parse(
             "(version: 1, pipeline: OrbSlam((frontend: Orb((fisheye_weight: Magnification)))))",
