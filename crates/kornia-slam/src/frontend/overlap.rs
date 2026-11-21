@@ -11,6 +11,7 @@ use kornia_3d::pose::triangulate_n_view_linear;
 use kornia_algebra::{Vec2F64, Vec3F64};
 use kornia_imgproc::features::{OrbFeatures, hamming_distance};
 
+use crate::frame::is_finite_xy;
 use crate::rig::RigGeometry;
 
 /// Search band around the epipolar line at octave 0, in pixels (ORB-SLAM3:
@@ -48,9 +49,12 @@ impl OverlapMatches {
 
 /// Matches primary-camera features (`ranges[0]`) with those of camera 1
 /// (`ranges[1]`) where both cameras see the same scene. Feature indices are
-/// those of the concatenated `features`.
+/// those of the concatenated `features`. The overlap boxes test raw
+/// `keypoints_xy`; the epipolar search and triangulation read `pixels`, the
+/// pinhole coordinates parallel to them (non-finite entries are skipped).
 pub fn match_overlap(
     features: &OrbFeatures,
+    pixels: &[[f32; 2]],
     ranges: &[Range<usize>],
     rig: &RigGeometry,
 ) -> OverlapMatches {
@@ -72,7 +76,10 @@ pub fn match_overlap(
         return out;
     };
     let kps = &features.keypoints_xy;
-    let right_candidates: Vec<usize> = right.clone().filter(|&j| box1.contains(kps[j])).collect();
+    let right_candidates: Vec<usize> = right
+        .clone()
+        .filter(|&j| box1.contains(kps[j]) && is_finite_xy(&pixels[j]))
+        .collect();
     if right_candidates.is_empty() {
         return out;
     }
@@ -96,10 +103,10 @@ pub fn match_overlap(
     let mut claimed: Vec<Option<(u32, usize)>> = vec![None; right.len()];
     let mut proposals: Vec<(usize, usize, u32)> = Vec::new();
     for i in left.clone() {
-        if !box0.contains(kps[i]) {
+        if !box0.contains(kps[i]) || !is_finite_xy(&pixels[i]) {
             continue;
         }
-        let line = fundamental * Vec3F64::new(kps[i][0] as f64, kps[i][1] as f64, 1.0);
+        let line = fundamental * Vec3F64::new(pixels[i][0] as f64, pixels[i][1] as f64, 1.0);
         let norm = (line.x * line.x + line.y * line.y).sqrt();
         if norm < 1e-12 {
             continue;
@@ -113,7 +120,7 @@ pub fn match_overlap(
                 continue;
             }
             let distance_px =
-                (line.x * kps[j][0] as f64 + line.y * kps[j][1] as f64 + line.z).abs() / norm;
+                (line.x * pixels[j][0] as f64 + line.y * pixels[j][1] as f64 + line.z).abs() / norm;
             if distance_px > EPIPOLAR_BAND_PX * ORB_SCALE_FACTOR.powi(octave_j) {
                 continue;
             }
@@ -141,8 +148,8 @@ pub fn match_overlap(
             continue;
         }
         let Some(point) = triangulate(
-            kps[i],
-            kps[j],
+            pixels[i],
+            pixels[j],
             &projection0,
             &projection1,
             &right_from_left,
@@ -309,13 +316,66 @@ mod tests {
             descriptors,
             octaves: vec![0; 2 * n],
         };
-        let matches = match_overlap(&features, &[0..n, n..2 * n], &rig);
+        let matches = match_overlap(&features, &features.keypoints_xy, &[0..n, n..2 * n], &rig);
         assert_eq!(matches.num_matched(), n);
         for (i, p) in scene.iter().enumerate() {
             assert_eq!(matches.left_to_right[i], Some(n + i));
             let got = matches.points[i].unwrap();
             assert!((got - *p).length() < 0.05 * p.z, "{got:?} vs {p:?}");
         }
+    }
+
+    /// Raw fisheye pair: the overlap triangulates virtual-pinhole pixels, and
+    /// reading the raw pixels as pinhole ones recovers none of the points.
+    #[test]
+    fn raw_fisheye_overlap_triangulates_virtual_pixels() {
+        let rig = crate::rig::tests::raw_two_camera_rig(40.0);
+        let (view0, view1) = (rig.view(0).unwrap(), rig.view(1).unwrap());
+        let right_from_left = rig.b_from_a(0, 1).unwrap();
+        let scene = [
+            Vec3F64::new(3.0, -0.3, 2.0),
+            Vec3F64::new(2.0, 0.4, 3.0),
+            Vec3F64::new(1.2, 0.1, 6.0),
+            Vec3F64::new(2.5, 0.8, 1.5),
+        ];
+        let mut left_xy = Vec::new();
+        let mut right_xy = Vec::new();
+        for p in &scene {
+            left_xy.push(view0.project_raw(*p).unwrap());
+            right_xy.push(
+                view1
+                    .project_raw(right_from_left.transform_point(p))
+                    .unwrap(),
+            );
+        }
+        let n = scene.len();
+        left_xy.extend(right_xy);
+        let virtual_xy: Vec<[f32; 2]> = left_xy
+            .iter()
+            .enumerate()
+            .map(|(k, &raw)| {
+                let view = if k < n { view0 } else { view1 };
+                view.raw_to_virtual(raw).unwrap()
+            })
+            .collect();
+        let descriptors: Vec<[u8; 32]> = (0..n as u8).chain(0..n as u8).map(descriptor).collect();
+        let features = OrbFeatures {
+            keypoints_xy: left_xy,
+            orientations: vec![0.0; 2 * n],
+            descriptors,
+            octaves: vec![0; 2 * n],
+        };
+        let ranges = [0..n, n..2 * n];
+        let recovered = |pixels: &[[f32; 2]]| {
+            let matches = match_overlap(&features, pixels, &ranges, &rig);
+            scene
+                .iter()
+                .zip(&matches.points)
+                .filter(|(p, got)| got.is_some_and(|got| (got - **p).length() < 1e-3 * p.length()))
+                .count()
+        };
+        assert_eq!(recovered(&virtual_xy), n);
+        assert_eq!(recovered(&features.keypoints_xy), 0);
     }
 
     #[test]
@@ -333,7 +393,7 @@ mod tests {
             descriptors: vec![[0u8; 32], [0xFFu8; 32]],
             octaves: vec![0; 2],
         };
-        let matches = match_overlap(&features, &[0..1, 1..2], &rig);
+        let matches = match_overlap(&features, &features.keypoints_xy, &[0..1, 1..2], &rig);
         assert_eq!(matches.num_matched(), 0);
     }
 }

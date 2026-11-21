@@ -245,6 +245,20 @@ impl SystemConfig {
         frontend.validate_flow_threads(rig.cameras.len())
     }
 
+    /// Rejects `frontend.klt_first` on raw fisheye rig cameras: the flow
+    /// tracker reads raw pixels as pinhole pixels.
+    pub(crate) fn validate_raw_fisheye(&self, rig: &SensorRig) -> Result<(), ConfigError> {
+        let FrontendConfig::Orb(frontend) = self.orb().frontend;
+        let raw = rig.cameras.iter().any(|camera| camera.raw_model.is_some());
+        if raw && frontend.klt_first.min_tracks().is_some() {
+            return Err(ConfigError::FrontendKnobNeeds {
+                knob: "klt_first",
+                needs: "pinhole rig images",
+            });
+        }
+        Ok(())
+    }
+
     /// Feature extractor settings for the configured frontend.
     pub(crate) fn orb_detector(&self) -> OrbDetector {
         let FrontendConfig::Orb(frontend) = self.orb().frontend;

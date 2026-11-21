@@ -255,19 +255,13 @@ impl OrbFrontend {
             features.octaves.extend(camera_features.octaves);
             camera_ranges.push(begin..features.keypoints_xy.len());
         }
-        let overlap_start = Instant::now();
-        let matches = overlap::match_overlap(&features, &camera_ranges, &rig);
-        self.observation.overlap = overlap_start.elapsed();
-
         self.observation.keypoints_xy.clear();
         if let Some(range) = camera_ranges.first() {
             self.observation
                 .keypoints_xy
                 .extend_from_slice(&features.keypoints_xy[range.clone()]);
         }
-        self.observation.stereo_matched = Some(matches.num_matched());
-        self.observation.duration = start.elapsed();
-        Ok(Frame {
+        let mut frame = Frame {
             idx,
             features,
             pose_world_to_cam: Pose3d::IDENTITY,
@@ -277,12 +271,32 @@ impl OrbFrontend {
             depth: Vec::new(),
             keypoints_undist: Vec::new(),
             rig: RigFeatures {
-                geometry: Some(rig),
+                geometry: Some(rig.clone()),
                 camera_ranges,
-                left_to_right: matches.left_to_right,
-                stereo_points: matches.points,
+                left_to_right: Vec::new(),
+                stereo_points: Vec::new(),
             },
-        })
+        };
+        // Raw fisheye pixels are not pinhole pixels: the overlap's epipolar
+        // geometry and triangulation need the virtual-pinhole cache (D5).
+        // Pinhole rigs keep reading raw keypoints.
+        if let (true, Some(view0)) = (rig.has_raw_views(), rig.view(0)) {
+            frame.ensure_undistorted(&view0.camera);
+        }
+        let pixels = if frame.keypoints_undist.is_empty() {
+            &frame.features.keypoints_xy
+        } else {
+            &frame.keypoints_undist
+        };
+        let overlap_start = Instant::now();
+        let matches =
+            overlap::match_overlap(&frame.features, pixels, &frame.rig.camera_ranges, &rig);
+        self.observation.overlap = overlap_start.elapsed();
+        self.observation.stereo_matched = Some(matches.num_matched());
+        frame.rig.left_to_right = matches.left_to_right;
+        frame.rig.stereo_points = matches.points;
+        self.observation.duration = start.elapsed();
+        Ok(frame)
     }
 
     /// ORB on one image, its time appended to `orb_per_camera`.

@@ -29,6 +29,7 @@ use kornia_3d::pose::{Pose3d, RansacParams, ransac_fundamental_8point};
 use kornia_algebra::{Vec2F32, Vec2F64, Vec3F64};
 use kornia_image::ImageSize;
 use kornia_imgproc::features::hamming_distance;
+use kornia_sensors::Fisheye624Camera;
 
 use super::pnp::{self, PnpConfig};
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
@@ -36,6 +37,7 @@ use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 use crate::frame::{Frame, is_finite_xy, undistort_keypoint};
 use crate::mapping::map::{Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
 use crate::mapping::visual_information::VisualInformation;
+use crate::rig::project_in_view;
 use crate::tracking::local_map::{LocalMapRules, LocalMapSelectionConfig, select_local_map_points};
 use crate::tracking::timings::{TrackingTimings, timed};
 
@@ -53,6 +55,8 @@ struct ViewGrid {
     /// `None` for the primary camera, whose pose is the tracked one.
     camera_from_primary: Option<Pose3d>,
     image_size: ImageSize,
+    /// Raw fisheye model of this camera; `image_size` is then the raw size.
+    raw: Option<Fisheye624Camera>,
     grid: KeypointGrid,
 }
 
@@ -908,10 +912,13 @@ impl MapProjectionEstimator {
             let mut best_kp = usize::MAX;
             for (view, (pose_world_to_cam, camera_center)) in grids.iter().zip(&poses) {
                 let p_cam = pose_world_to_cam.transform_point(&mp.position);
-                let Ok(pixel) =
-                    view.camera
-                        .project_to_image(&p_cam, config.min_depth, view.image_size)
-                else {
+                let Some(pixel) = project_in_view(
+                    &view.camera,
+                    view.raw.as_ref(),
+                    view.image_size,
+                    &p_cam,
+                    config.min_depth,
+                ) else {
                     continue;
                 };
                 let u = pixel.x as f32;
@@ -1035,6 +1042,7 @@ fn view_grids(
             camera: camera.clone(),
             camera_from_primary: None,
             image_size: frame.image_size,
+            raw: None,
             grid: grid(0..keypoints_undist.len(), frame.image_size),
         }];
     };
@@ -1054,6 +1062,7 @@ fn view_grids(
             },
             camera_from_primary: (c > 0).then_some(view.camera_from_primary),
             image_size: if c == 0 { frame.image_size } else { view.size },
+            raw: view.raw_model,
             grid: grid(
                 range.clone(),
                 if c == 0 { frame.image_size } else { view.size },
@@ -1113,6 +1122,7 @@ mod matching_tests {
                 width: 640,
                 height: 480,
             },
+            raw: None,
             grid,
         }
     }
@@ -1266,6 +1276,48 @@ mod matching_tests {
             None
         );
         assert_eq!(MapProjectionEstimator::eligible_pre_seeded(None, 4), None);
+    }
+
+    /// A point 70° off-axis projects far outside the 640x480 virtual window:
+    /// a raw fisheye view sees it, a pinhole view does not. The query centre
+    /// lies outside the grid, so this also covers the border-cell clamp.
+    #[test]
+    fn raw_fisheye_projection_search_sees_wide_points() {
+        let estimator = make_test_estimator();
+        let camera = test_camera();
+        let desc_a = [0u8; 32];
+        let (s, c) = 70f64.to_radians().sin_cos();
+        let position = Vec3F64::new(s, 0.0, c) * 4.0;
+        let map_points = vec![MapPoint::new(position, desc_a, 0, [0; 3], 0)];
+        let virtual_px = camera.project_to_pixel(&position, 0.0).unwrap();
+        assert!(virtual_px.x > 640.0);
+        let keypoints_xy = vec![[virtual_px.x as f32, virtual_px.y as f32]];
+        let descriptors = vec![desc_a];
+        let octaves = vec![0u8];
+        let pose = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::ZERO);
+        let raw = kornia_sensors::Fisheye624Camera {
+            f: camera.fx,
+            ..crate::rig::tests::raw_model()
+        };
+        let search = |raw: Option<kornia_sensors::Fisheye624Camera>| {
+            let grid = KeypointGrid::new(&keypoints_xy, 640.0, 480.0, 64.0);
+            let view = ViewGrid {
+                raw,
+                ..single_view(grid, &camera, keypoints_xy.len())
+            };
+            estimator.match_by_projection(
+                &map_points,
+                &[0],
+                &keypoints_xy,
+                &descriptors,
+                &octaves,
+                &[view],
+                &pose,
+                ProjectionMatchConfig::default(),
+            )
+        };
+        assert_eq!(search(Some(raw)), vec![(0, 0)]);
+        assert!(search(None).is_empty());
     }
 
     #[test]

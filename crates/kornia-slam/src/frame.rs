@@ -95,6 +95,13 @@ impl Frame {
         self.rig.geometry.as_ref()?.view(camera)
     }
 
+    /// The rig view of feature `i` when its camera supplies raw fisheye
+    /// images, camera 0 included; `None` otherwise.
+    pub fn raw_view(&self, i: usize) -> Option<&RigView> {
+        let view = self.rig.geometry.as_ref()?.view(self.camera_of(i))?;
+        view.is_raw().then_some(view)
+    }
+
     /// Camera model and world-to-camera pose that observe feature `i`:
     /// `primary` and `pose` unless `i` belongs to a secondary rig camera.
     pub fn observing<'a>(
@@ -126,7 +133,8 @@ impl Frame {
 
     /// Computes and caches undistorted keypoint coordinates (no-op when
     /// already computed for the current keypoint set). A rig camera's
-    /// features use that camera's model.
+    /// features use that camera's model; a raw fisheye camera's map into its
+    /// virtual pinhole.
     pub fn ensure_undistorted(&mut self, camera: &PinholeCamera) {
         if self.keypoints_undist.len() == self.features.keypoints_xy.len() {
             return;
@@ -137,6 +145,9 @@ impl Frame {
             .iter()
             .enumerate()
             .map(|(i, kp)| {
+                if let Some(view) = self.raw_view(i) {
+                    return raw_keypoint(view, kp);
+                }
                 let camera = self.secondary_view(i).map_or(camera, |view| &view.camera);
                 undistort_keypoint(camera, kp)
             })
@@ -154,7 +165,10 @@ impl Frame {
         self.features
             .keypoints_xy
             .get(i)
-            .map(|kp| undistort_keypoint(camera, kp))
+            .map(|kp| match self.raw_view(i) {
+                Some(view) => raw_keypoint(view, kp),
+                None => undistort_keypoint(camera, kp),
+            })
             .filter(is_finite_xy)
     }
 
@@ -173,6 +187,11 @@ pub(crate) fn undistort_keypoint(camera: &PinholeCamera, kp: &[f32; 2]) -> [f32;
     camera
         .undistort(kp[0] as f64, kp[1] as f64)
         .map_or([f32::NAN; 2], |p| [p.x as f32, p.y as f32])
+}
+
+/// Virtual-pinhole pixel of a raw fisheye keypoint, NaN past the 80° cap.
+fn raw_keypoint(view: &RigView, kp: &[f32; 2]) -> [f32; 2] {
+    view.raw_to_virtual(*kp).unwrap_or([f32::NAN; 2])
 }
 
 /// The camera that images undistorted keypoints: `camera`'s intrinsics with
@@ -195,6 +214,7 @@ pub(crate) fn is_finite_xy(xy: &[f32; 2]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kornia_3d::camera::CameraModel;
     use kornia_imgproc::features::OrbFeatures;
 
     fn empty_frame(u_right: Vec<f32>, depth: Vec<f32>) -> Frame {
@@ -216,6 +236,54 @@ mod tests {
             depth,
             keypoints_undist: Vec::new(),
             rig: RigFeatures::default(),
+        }
+    }
+
+    /// FP1 plumbing (amended 2026-11-21): raw f32 keypoints of 2000 bearings
+    /// map to their virtual-pinhole pixels; slots past 80° are NaN.
+    #[test]
+    fn raw_fisheye_keypoints_map_to_the_virtual_pinhole() {
+        let rig = crate::rig::tests::raw_two_camera_rig(75.0);
+        let view = rig.view(0).unwrap().clone();
+        let mut bearings: Vec<(f64, Vec3F64)> = (0..2000)
+            .map(|i| {
+                let theta = 79f64.to_radians() * (i as f64 / 1999.0);
+                let phi = i as f64 * 2.399_963_229_728_653;
+                let (s, c) = theta.sin_cos();
+                (theta, Vec3F64::new(s * phi.cos(), s * phi.sin(), c))
+            })
+            .collect();
+        for degrees in [80.5, 85.0] {
+            let theta = f64::to_radians(degrees);
+            bearings.push((theta, Vec3F64::new(theta.sin(), 0.0, theta.cos())));
+        }
+        let mut frame = empty_frame(Vec::new(), Vec::new());
+        frame.features.keypoints_xy = bearings
+            .iter()
+            .map(|(_, ray)| {
+                let raw = view.raw_model.as_ref().unwrap().project(ray).unwrap();
+                [raw.x as f32, raw.y as f32]
+            })
+            .collect();
+        let n = bearings.len();
+        frame.rig = RigFeatures {
+            geometry: Some(Arc::new(rig)),
+            camera_ranges: vec![0..n, n..n],
+            ..RigFeatures::default()
+        };
+        frame.ensure_undistorted(&view.camera);
+        assert_eq!(frame.keypoints_undist.len(), n);
+        for (i, (theta, ray)) in bearings.iter().enumerate() {
+            let got = frame.keypoints_undist[i];
+            if theta.to_degrees() >= crate::rig::RAW_MAX_INCIDENCE_DEG {
+                assert!(got[0].is_nan() && got[1].is_nan(), "{i}: {got:?}");
+                assert_eq!(frame.undistorted_xy(i, &view.camera), None);
+                continue;
+            }
+            let expected = view.camera.project_to_pixel(ray, 0.0).unwrap();
+            let (radial, _) = view.pinhole_magnification(*theta).unwrap();
+            let error = (got[0] as f64 - expected.x).hypot(got[1] as f64 - expected.y);
+            assert!(error < 5e-4 + 1e-4 * radial, "θ {theta}: {error} px");
         }
     }
 

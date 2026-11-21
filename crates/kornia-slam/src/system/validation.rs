@@ -62,6 +62,8 @@ pub enum ConfigError {
     MissingSensor(&'static str),
     #[error("stereo cameras need rectified images; the source supplies raw fisheye images")]
     FisheyeStereo,
+    #[error("raw fisheye rig cameras need the `Rig` camera selection")]
+    RawFisheyeOutsideRig,
     #[error(
         "mapping.local_ba.lost_keyframes FixedInertial has no effect with \
          tracking_loss.keyframes_while_lost {0:?}: it acts only on lost keyframes inserted as \
@@ -998,6 +1000,12 @@ impl SensorSelection {
             if rig.fisheye.is_some() {
                 return Err(ConfigError::FisheyeStereo);
             }
+        }
+        // Any other selection would run the raw images as pinhole ones.
+        if self.cameras != CameraSelection::Rig
+            && rig.cameras.iter().any(|camera| camera.raw_model.is_some())
+        {
+            return Err(ConfigError::RawFisheyeOutsideRig);
         }
         if self.imu && rig.imu.is_none() {
             return Err(ConfigError::MissingSensor("an IMU"));

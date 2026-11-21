@@ -697,6 +697,79 @@ fn stereo_rejects_raw_fisheye_images() {
     assert_eq!(SensorSelection::default().validate_rig(&rig), Ok(()));
 }
 
+fn raw_fisheye_rig() -> SensorRig {
+    let primary = rig().camera;
+    let view = |primary_from_camera| kornia_sensors::RigCamera {
+        camera: primary.clone(),
+        size: kornia_image::ImageSize {
+            width: 640,
+            height: 480,
+        },
+        primary_from_camera,
+        raw_model: Some(kornia_sensors::Fisheye624Camera {
+            f: primary.fx,
+            cx: primary.cx,
+            cy: primary.cy,
+            k: [-0.025, 0.096, -0.063, 0.0062, 0.0035, -0.00073],
+            p: [0.0009, 0.00036],
+            s: [-0.0014, -0.0001, -0.00046, -0.0001],
+        }),
+    };
+    rig().with_rig_cameras(vec![
+        view(Pose3d::IDENTITY),
+        view(Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            kornia_algebra::Vec3F64::new(0.1, 0.0, 0.0),
+        )),
+    ])
+}
+
+#[test]
+fn raw_fisheye_rig_cameras_need_the_rig_selection() {
+    let rig = raw_fisheye_rig();
+    for cameras in [CameraSelection::Mono, CameraSelection::Stereo] {
+        let rig = rig.clone().with_stereo_baseline(0.11);
+        assert_eq!(
+            sensors(cameras, false).validate_rig(&rig),
+            Err(ConfigError::RawFisheyeOutsideRig)
+        );
+    }
+    assert_eq!(
+        sensors(CameraSelection::Rig, false).validate_rig(&rig),
+        Ok(())
+    );
+}
+
+#[test]
+fn raw_fisheye_rig_rejects_klt_first() {
+    let selected = sensors(CameraSelection::Rig, false)
+        .select_rig(raw_fisheye_rig())
+        .unwrap();
+    let with_klt = |klt_first| {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
+            klt_first,
+            ..OrbFrontendConfig::default()
+        });
+        config
+    };
+    assert_eq!(
+        with_klt(KltFirst::default()).validate_raw_fisheye(&selected),
+        Err(ConfigError::FrontendKnobNeeds {
+            knob: "klt_first",
+            needs: "pinhole rig images",
+        })
+    );
+    assert_eq!(
+        with_klt(KltFirst::Disabled).validate_raw_fisheye(&selected),
+        Ok(())
+    );
+    assert_eq!(
+        with_klt(KltFirst::default()).validate_raw_fisheye(&rig()),
+        Ok(())
+    );
+}
+
 /// The Orin preset of card E: 2 threads with 48 tracks per camera, or 3
 /// with 64 (`configs/lamaria-rig-imu-orin{2,3}.ron`).
 fn orin_preset(threads: usize, per_camera: usize) -> SystemConfig {

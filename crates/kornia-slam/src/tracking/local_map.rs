@@ -10,8 +10,10 @@ use std::collections::{HashMap, HashSet};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_image::ImageSize;
+use kornia_sensors::Fisheye624Camera;
 
 use crate::mapping::{Keyframe, Map};
+use crate::rig::project_in_view;
 
 /// Bounds on the local-map search. The defaults are the values this system has
 /// been running, lifted out of the function body unchanged.
@@ -293,14 +295,25 @@ pub fn landmarks_in_frame_frustum(
     pose_world_to_cam: &Pose3d,
     frame: &crate::Frame,
 ) -> HashSet<usize> {
-    let mut visible =
-        landmarks_in_frustum(map, candidates, camera, pose_world_to_cam, frame.image_size);
-    if let Some(rig) = frame.rig.geometry.as_ref().filter(|_| frame.is_rig()) {
+    let rig = frame.rig.geometry.as_ref().filter(|_| frame.is_rig());
+    let primary_raw = rig
+        .and_then(|rig| rig.view(0))
+        .and_then(|view| view.raw_model.as_ref());
+    let mut visible = landmarks_in_frustum(
+        map,
+        candidates,
+        camera,
+        primary_raw,
+        pose_world_to_cam,
+        frame.image_size,
+    );
+    if let Some(rig) = rig {
         for view in rig.views().iter().skip(1) {
             visible.extend(landmarks_in_frustum(
                 map,
                 candidates,
                 &view.camera,
+                view.raw_model.as_ref(),
                 &view.pose(pose_world_to_cam),
                 view.size,
             ));
@@ -309,10 +322,13 @@ pub fn landmarks_in_frame_frustum(
     visible
 }
 
+/// `raw` is the camera's raw fisheye model, when its images are raw
+/// ([`crate::rig::project_in_view`]).
 pub fn landmarks_in_frustum(
     map: &Map,
     candidates: &[usize],
     camera: &PinholeCamera,
+    raw: Option<&Fisheye624Camera>,
     pose_world_to_cam: &Pose3d,
     image_size: ImageSize,
 ) -> HashSet<usize> {
@@ -325,7 +341,7 @@ pub fn landmarks_in_frustum(
             continue;
         }
         let p_cam = pose_world_to_cam.transform_point(&mp.position);
-        if camera.project_to_image(&p_cam, 0.0, image_size).is_ok() {
+        if project_in_view(camera, raw, image_size, &p_cam, 0.0).is_some() {
             visible.insert(mp_idx);
         }
     }
@@ -381,6 +397,49 @@ mod tests {
         }
         map.link_observation(5, 0, 1).unwrap();
         map
+    }
+
+    #[test]
+    fn raw_fisheye_frustum_counts_wide_points() {
+        let mut map = Map::new();
+        map.insert_keyframe(keyframe(0, 2)).unwrap();
+        let (s, c) = 70f64.to_radians().sin_cos();
+        for (feature_idx, position) in [
+            kornia_algebra::Vec3F64::new(0.0, 0.0, 5.0),
+            kornia_algebra::Vec3F64::new(s, 0.0, c) * 5.0,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            map.insert_landmark(LandmarkSeed {
+                position,
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx,
+                },
+            })
+            .unwrap();
+        }
+        let raw = crate::rig::tests::raw_model();
+        let camera = PinholeCamera {
+            fx: raw.f,
+            fy: raw.f,
+            cx: raw.cx,
+            cy: raw.cy,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let size = ImageSize {
+            width: 640,
+            height: 480,
+        };
+        let visible =
+            |raw| landmarks_in_frustum(&map, &[0, 1], &camera, raw, &Pose3d::IDENTITY, size);
+        assert_eq!(visible(None), HashSet::from([0]));
+        assert_eq!(visible(Some(&raw)), HashSet::from([0, 1]));
     }
 
     #[test]

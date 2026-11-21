@@ -247,6 +247,7 @@ impl SlamSystem {
         config.validate()?;
         let rig = config.sensors.select_rig(rig)?;
         config.validate_flow_threads(&rig)?;
+        config.validate_raw_fisheye(&rig)?;
         let settings = config.settings(&rig);
         if let Some(knob) = settings.frontend_flow.unbuilt_knob() {
             todo!("lane T: frontend.{knob}");

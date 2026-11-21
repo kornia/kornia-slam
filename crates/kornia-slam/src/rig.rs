@@ -271,7 +271,7 @@ fn overlap_box(views: &[RigView], c: usize) -> Option<PixelBox> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use kornia_algebra::Mat3F64;
     use kornia_sensors::RigCamera;
@@ -342,7 +342,7 @@ mod tests {
         }
     }
 
-    fn raw_two_camera_rig(yaw_deg: f64) -> RigGeometry {
+    pub(crate) fn raw_two_camera_rig(yaw_deg: f64) -> RigGeometry {
         let raw = |primary_from_camera| RigCamera {
             raw_model: Some(raw_model()),
             ..rig_camera(primary_from_camera)
