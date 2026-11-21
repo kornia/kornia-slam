@@ -224,11 +224,21 @@ fn a_warm_flow_step_does_not_allocate() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for threads in 1..=3 {
         ALLOCATIONS.store(0, Ordering::SeqCst);
-        replay(settings(threads), shift, WARM_UP + COUNTED, |_, _| {});
+        // F-7: the count means nothing if every track died in the warm-up.
+        let mut fewest_survivors = usize::MAX;
+        replay(settings(threads), shift, WARM_UP + COUNTED, |frame, output| {
+            if frame >= WARM_UP {
+                fewest_survivors = fewest_survivors.min(output.survivors.len());
+            }
+        });
         assert_eq!(
             ALLOCATIONS.load(Ordering::SeqCst),
             0,
             "allocations in {COUNTED} warm steps with {threads} flow threads"
+        );
+        assert!(
+            fewest_survivors > 0 && fewest_survivors != usize::MAX,
+            "a counted step had no survivors with {threads} flow threads"
         );
     }
 }
