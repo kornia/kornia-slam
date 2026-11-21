@@ -10,7 +10,8 @@ pub enum SkipKind {
     Bootstrap,
     /// Tracking failed and the pose was carried on the motion prediction:
     /// the IMU when `inertial`, otherwise the constant-velocity model.
-    Coasting { inertial: bool },
+    /// `trusted` when the IMU was confident and the coast was not a runaway.
+    Coasting { inertial: bool, trusted: bool },
     /// A re-seed is waiting for its map, and the pose was carried on the kept
     /// inertial state rather than held.
     Reseeding,
@@ -155,10 +156,15 @@ impl RunCounters {
                 self.keyframes += 1;
             }
             (TrackingStatus::Tracked, _) => self.tracked += 1,
-            (TrackingStatus::Skipped, Some(SkipKind::Coasting { inertial: true })) => {
+            (TrackingStatus::Skipped, Some(SkipKind::Coasting { inertial: true, .. })) => {
                 self.coast_inertial += 1;
             }
-            (TrackingStatus::Skipped, Some(SkipKind::Coasting { inertial: false })) => {
+            (
+                TrackingStatus::Skipped,
+                Some(SkipKind::Coasting {
+                    inertial: false, ..
+                }),
+            ) => {
                 self.coast_visual += 1;
             }
             // A carried re-seed frame is still a bootstrap skip in the summary.

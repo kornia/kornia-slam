@@ -115,6 +115,12 @@ has been scored on a benchmark sequence yet.
 - App: `--trajectory-include-coasted` (off) also writes the frames coasted on
   the IMU prediction to `--trajectory-out`, so it has one pose per frame through
   visual gaps; a `[summary] poses_written=` line counts the rows (card L).
+  Only trusted coasts are written: a coast before the IMU is confident, or one
+  the runaway check flags, is left out, so the rows no longer match card L's
+  runs. A stalled re-seed carried on the IMU (new `SkipKind::Reseeding`) is
+  written too. `--trajectory-smoothed` and `--session-out` record the same
+  frames as `--trajectory-out`.
+  **Breaking (library):** `SkipKind::Coasting` gains `trusted`.
 - `keyframes.rules` (`Kornia`): `OrbSlam3(max_frames)` inserts keyframes by
   ORB-SLAM3's `NeedNewKeyFrame`.
 - `tracking_loss.relocalization.while_lost` (`false`): relocalize on every lost

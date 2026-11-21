@@ -1195,6 +1195,18 @@ impl SlamSystem {
             .map(|found_kf| KeyframeGap::Relocalized { found_kf });
     }
 
+    /// Marks this frame's coast trusted when the IMU is confident and the
+    /// coasted pose is not a runaway.
+    fn settle_coast_trust(&mut self, imu_confident: bool) {
+        if let Some(SkipKind::Coasting { inertial, .. }) = self.last_skip {
+            let runaway = self.recovery.keep_inertial && self.runaway.runaway();
+            self.last_skip = Some(SkipKind::Coasting {
+                inertial,
+                trusted: imu_confident && !runaway,
+            });
+        }
+    }
+
     /// Carries the pose over a frame of a stalled re-seed on the kept inertial
     /// state, so the segment starts where the camera is. A runaway, or a
     /// stall past `max_bridge_sec`, holds the translation at rest instead and
@@ -1910,8 +1922,11 @@ impl SlamSystem {
                 // compounding a single bad frame into a full tracking loss.
                 self.state.pose_world_to_cam = candidate_pose;
                 self.note_pose("coast", frame_idx, &candidate_pose);
+                // `trusted` is settled in the lost branch below, once the
+                // runaway check has seen this pose.
                 self.last_skip = Some(SkipKind::Coasting {
                     inertial: predicted_velocity.is_some(),
+                    trusted: false,
                 });
                 (TrackingStatus::Skipped, Vec::new(), 0, Some(reason))
             }
@@ -2026,14 +2041,14 @@ impl SlamSystem {
             self.record_tilt(&pose, prev_timestamp, timestamp_sec);
         }
         if status == TrackingStatus::Skipped {
-            let policy = &self.tracking_loss_recovery;
-
             let lost_since = self
                 .state
                 .mark_lost(timestamp_sec, pose_before, prev_timestamp);
             let recently_lost_for = timestamp_sec - lost_since;
 
             let imu_confident = self.imu_confident(timestamp_sec);
+            self.settle_coast_trust(imu_confident);
+            let policy = &self.tracking_loss_recovery;
             let grace_period_sec = policy.grace_period_sec(imu_confident);
             let map_established =
                 self.map.lock().unwrap().keyframes().len() > policy.min_keyframes_for_grace;

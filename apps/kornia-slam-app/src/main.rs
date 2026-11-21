@@ -64,7 +64,8 @@ struct Args {
     #[argh(option)]
     trajectory_coasted: Option<String>,
 
-    /// also write the frames coasted on the IMU prediction to
+    /// also write the trusted, non-runaway frames coasted on the IMU
+    /// prediction, and the re-seed frames carried on it, to
     /// --trajectory-out, so it has one pose per frame through visual gaps
     /// (card L)
     #[argh(switch)]
@@ -658,19 +659,26 @@ fn run_offline_ba(run: &RunConfig, args: &OfflineBaArgs) -> Result<(), Box<dyn s
 /// Bootstrap skips hold the pose from before the loss and a visual coast has
 /// no metric motion, so only an inertial coast is a usable estimate.
 fn is_inertial_coast(skip: Option<SkipKind>) -> bool {
-    skip == Some(SkipKind::Coasting { inertial: true })
+    matches!(skip, Some(SkipKind::Coasting { inertial: true, .. }))
 }
 
 /// Whether a frame's pose goes to --trajectory-out: every tracked frame, plus
-/// the inertial coasts and the re-seed frames carried on the IMU when they
-/// are included.
+/// the trusted inertial coasts and the re-seed frames carried on the IMU when
+/// they are included. An untrusted or runaway coast is never scored.
 fn writes_scored_pose(
     status: kornia_slam::TrackingStatus,
     skip: Option<SkipKind>,
     include_coasted: bool,
 ) -> bool {
     status != kornia_slam::TrackingStatus::Skipped
-        || (include_coasted && (is_inertial_coast(skip) || skip == Some(SkipKind::Reseeding)))
+        || (include_coasted
+            && matches!(
+                skip,
+                Some(SkipKind::Coasting {
+                    inertial: true,
+                    trusted: true
+                }) | Some(SkipKind::Reseeding)
+            ))
 }
 
 #[cfg(test)]
@@ -731,12 +739,16 @@ mod cli_tests {
                 .is_none()
         );
 
-        assert!(is_inertial_coast(Some(SkipKind::Coasting {
-            inertial: true
-        })));
-        assert!(!is_inertial_coast(Some(SkipKind::Coasting {
-            inertial: false
-        })));
+        for trusted in [false, true] {
+            assert!(is_inertial_coast(Some(SkipKind::Coasting {
+                inertial: true,
+                trusted
+            })));
+            assert!(!is_inertial_coast(Some(SkipKind::Coasting {
+                inertial: false,
+                trusted
+            })));
+        }
         assert!(!is_inertial_coast(Some(SkipKind::Bootstrap)));
         assert!(!is_inertial_coast(None));
     }
@@ -744,11 +756,25 @@ mod cli_tests {
     #[test]
     fn coasted_poses_reach_the_scored_trajectory_only_when_included() {
         use kornia_slam::TrackingStatus::{KeyframeAccepted, Skipped, Tracked};
-        let inertial = Some(SkipKind::Coasting { inertial: true });
-        let visual = Some(SkipKind::Coasting { inertial: false });
+        let inertial = Some(SkipKind::Coasting {
+            inertial: true,
+            trusted: true,
+        });
+        let untrusted = Some(SkipKind::Coasting {
+            inertial: true,
+            trusted: false,
+        });
+        let visual = Some(SkipKind::Coasting {
+            inertial: false,
+            trusted: true,
+        });
         assert!(!writes_scored_pose(Skipped, inertial, false));
         assert!(writes_scored_pose(Skipped, inertial, true));
         assert!(!writes_scored_pose(Skipped, visual, true));
+        assert!(
+            !writes_scored_pose(Skipped, untrusted, true),
+            "an untrusted or runaway coast is not scored"
+        );
         assert!(!writes_scored_pose(
             Skipped,
             Some(SkipKind::Bootstrap),
@@ -763,7 +789,14 @@ mod cli_tests {
             "--trajectory-coasted keeps the coasts only"
         );
         for status in [Tracked, KeyframeAccepted] {
-            for skip in [None, inertial, visual, Some(SkipKind::Bootstrap), reseeding] {
+            for skip in [
+                None,
+                inertial,
+                untrusted,
+                visual,
+                Some(SkipKind::Bootstrap),
+                reseeding,
+            ] {
                 assert!(writes_scored_pose(status, skip, false));
                 assert!(writes_scored_pose(status, skip, true));
             }

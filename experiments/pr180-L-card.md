@@ -80,3 +80,8 @@ Status: written 2026-11-21, before any code. This is roadmap item "IMU carries t
 | K1-K3 | | none fired | |
 
 - **Outcome.** The IMU-carried poses fill the visual gaps at no accuracy cost. `--trajectory-include-coasted` should be on for benchmark runs. It is an app flag, so the scoring scripts pass it.
+
+- **2026-11-21, later: the flag's meaning changed (card V, T-4).** `--trajectory-include-coasted` no longer
+  writes a coast taken while the IMU is not confident, or one the runaway check flags. It now also writes a
+  stalled re-seed frame carried on the IMU (T-3). Runs scored with the flag after this change are not
+  comparable row for row with the results above.

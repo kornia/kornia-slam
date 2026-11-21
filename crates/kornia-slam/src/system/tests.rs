@@ -1415,6 +1415,40 @@ mod recovery_after_loss {
         assert_eq!(system.state.bridge_anchor, None);
     }
 
+    /// T-4: a coast is trusted only with a confident IMU and no runaway.
+    #[test]
+    fn a_coast_is_trusted_only_when_confident_and_not_a_runaway() {
+        let coast = |inertial| {
+            Some(SkipKind::Coasting {
+                inertial,
+                trusted: false,
+            })
+        };
+        let mut system = lost_metric_system(7.0);
+        system.last_skip = coast(true);
+        system.settle_coast_trust(true);
+        assert_eq!(
+            system.last_skip,
+            Some(SkipKind::Coasting {
+                inertial: true,
+                trusted: true
+            })
+        );
+        system.last_skip = coast(true);
+        system.settle_coast_trust(false);
+        assert_eq!(system.last_skip, coast(true), "the IMU is not confident");
+
+        system.runaway.record(3.0, Vec3F64::ZERO);
+        system.runaway.record(13.0, Vec3F64::new(60.0, 0.0, 0.0));
+        assert!(system.runaway.runaway());
+        system.settle_coast_trust(true);
+        assert_eq!(system.last_skip, coast(true), "a runaway");
+
+        system.last_skip = Some(SkipKind::Bootstrap);
+        system.settle_coast_trust(true);
+        assert_eq!(system.last_skip, Some(SkipKind::Bootstrap));
+    }
+
     /// T-3: only a frame carried on the IMU is reported as a carried re-seed
     /// frame; a held one stays a bootstrap skip, and both count as one.
     #[test]
