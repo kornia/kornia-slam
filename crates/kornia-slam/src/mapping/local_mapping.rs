@@ -349,19 +349,17 @@ impl LocalMapping {
     /// job); `false` without [`Self::with_deferred`].
     #[allow(dead_code)] // skeleton: lane T calls it
     pub(crate) fn submit_deferred(&self, _job: DeferredKeyframe) -> bool {
-        if !self.has_deferred_context() {
-            return false;
+        // Lane T builds the queue; until then nothing is accepted.
+        if self.has_deferred_context() {
+            debug_eprintln!("[local_mapping] deferred keyframe refused: path not built");
         }
-        todo!("lane T: queue a deferred keyframe")
+        false
     }
 
     /// The deferred keyframes finished since the last call, in queue order.
     #[allow(dead_code)] // skeleton: lane T calls it
     pub(crate) fn drain_deferred(&self) -> Vec<DeferredKeyframeResult> {
-        if !self.has_deferred_context() {
-            return Vec::new();
-        }
-        todo!("lane T: deferred keyframe results")
+        Vec::new()
     }
 
     fn has_deferred_context(&self) -> bool {
@@ -516,12 +514,13 @@ impl LocalMappingHandle {
                         if state.shutdown {
                             break;
                         }
-                        // Queued only with a context (`submit_deferred`), and
-                        // taken before `latest`.
-                        if let Some(_deferred) = state.deferred.pop_front() {
-                            todo!("lane T: deferred keyframe ORB, overlap, search and insert");
-                        }
-                        state.latest.take().expect("pending job disappeared")
+                        // `submit_deferred` queues nothing until lane T builds
+                        // the path; nothing would serve a deferred entry.
+                        state.deferred.clear();
+                        let Some(job) = state.latest.take() else {
+                            continue;
+                        };
+                        job
                     };
 
                     // The gate makes compound keyframe publication atomic to local
