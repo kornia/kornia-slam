@@ -513,6 +513,13 @@ fn settings_are_range_checked() {
         ),
         (
             LocalBaConfig {
+                initial_lambda: 0.0,
+                ..LocalBaConfig::default()
+            },
+            "mapping.local_ba.initial_lambda",
+        ),
+        (
+            LocalBaConfig {
                 boundary: BoundaryPrior::Marginal(FrozenPoseSigma {
                     frozen_pose_sigma_m: 0.0,
                     ..FrozenPoseSigma::default()
@@ -1355,6 +1362,7 @@ mod runtime_settings {
             stereo_depth_sigma: StereoDepthSigma::Disparity { px: 1.0 },
             visual_information: VisualInformation::OctaveScaled,
             dense_parallelism: DenseParallelism::Sequential,
+            initial_lambda: 1e-4,
             ..LocalBaConfig::default()
         };
         let settings = config.settings(&selected);
@@ -1367,6 +1375,9 @@ mod runtime_settings {
         assert_eq!(local_ba.active_keyframes, 10);
         assert_eq!(local_ba.max_iterations, 10);
         assert_eq!(local_ba.dense_parallelism, DenseParallelism::Sequential);
+        assert_eq!(local_ba.initial_lambda, 1e-4);
+        assert_eq!(LocalBaConfig::default().initial_lambda, 1.0);
+        assert_eq!(LocalBaParams::default().initial_lambda, 1.0);
         let fb = selected.camera.fx * 0.11;
         assert_eq!(
             local_ba.depth_sigma,
@@ -1493,6 +1504,20 @@ mod ron_files {
 
         let default = parse("(version: 1)").unwrap();
         assert_eq!(orb(&default).mapping.growth_min_baseline_ratio, 0.0);
+    }
+
+    #[test]
+    fn the_initial_lambda_parses_and_round_trips() {
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((mapping: (local_ba: (max_iterations: 7, initial_lambda: 1e-4)))))",
+        )
+        .unwrap();
+        assert_eq!(orb(&config).mapping.local_ba.initial_lambda, 1e-4);
+        assert_eq!(orb(&config).mapping.local_ba.max_iterations, 7);
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+        assert_eq!(config.validate(), Ok(()));
+        let default = parse("(version: 1)").unwrap();
+        assert_eq!(orb(&default).mapping.local_ba.initial_lambda, 1.0);
     }
 
     #[test]

@@ -563,6 +563,7 @@ fn validate_local_ba(config: &LocalBaConfig) -> Result<(), ConfigError> {
         config.max_iterations as f64,
         AT_LEAST_ONE,
     )?;
+    check(at("initial_lambda"), config.initial_lambda, POSITIVE)?;
     if let BoundaryPrior::Marginal(sigma) = config.boundary {
         check(at("boundary"), sigma.frozen_pose_sigma_m, POSITIVE)?;
         check(at("boundary"), sigma.frozen_pose_sigma_rad, POSITIVE)?;

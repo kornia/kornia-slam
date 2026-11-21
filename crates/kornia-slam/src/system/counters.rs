@@ -76,6 +76,12 @@ pub struct RunCounters {
     pub ba_snapbacks: u64,
     /// VI-BA solves run with the large window.
     pub large_window_solves: u64,
+    /// VI-BA solves run with the base settings, and their iterations summed
+    /// (card V: a 0-inlier job never takes the large window).
+    pub vi_ba_base_solves: u64,
+    pub vi_ba_base_iterations: u64,
+    /// Most iterations of any VI-BA solve.
+    pub vi_ba_iterations_max: u64,
     /// Keyframes inserted while a local BA solved, summed over its merges:
     /// the merge found them newer than its snapshot (card R).
     pub ba_stale_keyframes: u64,

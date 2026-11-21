@@ -121,6 +121,9 @@ pub(crate) struct LocalMappingCounts {
     pub ba_solves: u64,
     pub ba_solve_ns: u64,
     pub large_window_solves: u64,
+    pub vi_ba_base_solves: u64,
+    pub vi_ba_base_iterations: u64,
+    pub vi_ba_iterations_max: u64,
     pub ba_stale_keyframes: u64,
     pub ba_propagated_keyframes: u64,
 }
@@ -135,12 +138,22 @@ struct LocalMappingCounters {
     ba_solves: AtomicU64,
     ba_solve_ns: AtomicU64,
     large_window_solves: AtomicU64,
+    vi_ba_base_solves: AtomicU64,
+    vi_ba_base_iterations: AtomicU64,
+    vi_ba_iterations_max: AtomicU64,
     ba_stale_keyframes: AtomicU64,
     ba_propagated_keyframes: AtomicU64,
 }
 
 impl LocalMappingCounters {
-    fn record_solve(&self, job: &KeyframeJob, outcome: BaOutcome, started: Instant) {
+    /// `iterations` is the solver's count when it ran (VI-BA only).
+    fn record_solve(
+        &self,
+        job: &KeyframeJob,
+        outcome: BaOutcome,
+        iterations: Option<usize>,
+        started: Instant,
+    ) {
         let add = |counter: &AtomicU64, n: u64| counter.fetch_add(n, Ordering::Relaxed);
         if outcome.prior_fallback {
             add(&self.prior_fallbacks, 1);
@@ -151,6 +164,17 @@ impl LocalMappingCounters {
         add(&self.ba_solves, 1);
         if job.large_window() {
             add(&self.large_window_solves, 1);
+        }
+        if job.imu_initialized
+            && let Some(iterations) = iterations
+        {
+            let iterations = u64::try_from(iterations).unwrap_or(u64::MAX);
+            self.vi_ba_iterations_max
+                .fetch_max(iterations, Ordering::Relaxed);
+            if !job.large_window() {
+                add(&self.vi_ba_base_solves, 1);
+                add(&self.vi_ba_base_iterations, iterations);
+            }
         }
         let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         add(&self.ba_solve_ns, elapsed_ns);
@@ -191,6 +215,9 @@ impl LocalMappingCounters {
             ba_solves: read(&self.ba_solves),
             ba_solve_ns: read(&self.ba_solve_ns),
             large_window_solves: read(&self.large_window_solves),
+            vi_ba_base_solves: read(&self.vi_ba_base_solves),
+            vi_ba_base_iterations: read(&self.vi_ba_base_iterations),
+            vi_ba_iterations_max: read(&self.vi_ba_iterations_max),
             ba_stale_keyframes: read(&self.ba_stale_keyframes),
             ba_propagated_keyframes: read(&self.ba_propagated_keyframes),
         }
@@ -207,7 +234,8 @@ fn solve_counted(
 ) -> BaUpdate {
     let started = Instant::now();
     let update = solve_snapshot(snapshot, camera, job, calibration);
-    counters.record_solve(job, update.outcome, started);
+    let iterations = update.solve_stats().map(|stats| stats.iterations);
+    counters.record_solve(job, update.outcome, iterations, started);
     update
 }
 
@@ -614,6 +642,60 @@ mod tests {
             wheel_factors: Vec::new(),
             tracked_inliers: 0,
         }
+    }
+
+    /// Card V (E-1): a 0-inlier VI job never takes the large window, so it
+    /// solves with the base settings, and the counters book it as a base solve.
+    #[test]
+    fn a_zero_inlier_vi_job_solves_with_the_base_budget_and_is_counted() {
+        use super::{BaOutcome, BaSolve, LocalMappingCounters};
+        use crate::mapping::bundle_adjustment::LargeWindow;
+        use std::time::Instant;
+
+        let local_ba = LocalBaParams {
+            active_keyframes: 10,
+            max_iterations: 7,
+            initial_lambda: 1e-4,
+            large_window: LargeWindow::Enabled {
+                min_tracked_inliers: 0,
+                active_keyframes: 10,
+                max_iterations: 4,
+                initial_lambda: 1e-2,
+            },
+            ..LocalBaParams::default()
+        };
+        let job = |tracked_inliers| KeyframeJob {
+            imu_initialized: true,
+            local_ba,
+            tracked_inliers,
+            ..visual_job()
+        };
+        let base = job(0).ba_params();
+        assert_eq!(
+            (
+                base.active_keyframes,
+                base.max_iterations,
+                base.initial_lambda
+            ),
+            (10, 7, 1e-4)
+        );
+        assert_eq!(job(1).ba_params().max_iterations, 4, "the large window");
+
+        let counters = LocalMappingCounters::default();
+        let solved = BaOutcome {
+            solve: BaSolve::Solved,
+            prior_fallback: false,
+        };
+        counters.record_solve(&job(0), solved, Some(5), Instant::now());
+        counters.record_solve(&job(0), solved, Some(7), Instant::now());
+        counters.record_solve(&job(1), solved, Some(4), Instant::now());
+        counters.record_solve(&visual_job(), solved, None, Instant::now());
+        let counts = counters.counts();
+        assert_eq!(counts.vi_ba_base_solves, 2);
+        assert_eq!(counts.vi_ba_base_iterations, 12);
+        assert_eq!(counts.vi_ba_iterations_max, 7);
+        assert_eq!(counts.large_window_solves, 1);
+        assert_eq!(counts.ba_solves, 4);
     }
 
     #[test]

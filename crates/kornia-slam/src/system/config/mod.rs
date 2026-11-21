@@ -565,6 +565,9 @@ pub struct LocalBaConfig {
     /// Levenberg-Marquardt iteration cap of one VI-BA solve. ORB-SLAM3's
     /// `LocalInertialBA` runs 10.
     pub max_iterations: usize,
+    /// Levenberg-Marquardt damping a VI-BA solve starts from, outside
+    /// `large_window`. Basalt starts every solve at 1e-4 (`vio_config.cpp:78`).
+    pub initial_lambda: f64,
     /// Whether that scale also hits the edge's bias random-walk rows
     /// (ORB-SLAM3 leaves them at full weight).
     pub boundary_scales_bias_rows: bool,
@@ -619,6 +622,7 @@ impl Default for LocalBaConfig {
             active_keyframes: 3,
             boundary_imu_info_scale: 1e-2,
             max_iterations: 50,
+            initial_lambda: 1.0,
             boundary_scales_bias_rows: true,
             boundary: BoundaryPrior::ScaledEdge,
             imu_huber: ImuHuber::AllEdges,
@@ -850,10 +854,13 @@ impl fmt::Display for SystemConfig {
         if *ba != LocalBaConfig::default() {
             writeln!(
                 f,
-                "  local BA: {} active keyframes, boundary IMU scale {} (bias rows {}), \
+                "  local BA: {} active keyframes, {} iterations from lambda {}, \
+                 boundary IMU scale {} (bias rows {}), \
                  boundary {:?}, IMU Huber {:?}, depth sigma {:?}, visual information {:?}, \
                  state envelope {:?}, lost keyframes {:?}, visual kernel {:?}",
                 ba.active_keyframes,
+                ba.max_iterations,
+                ba.initial_lambda,
                 ba.boundary_imu_info_scale,
                 if ba.boundary_scales_bias_rows {
                     "scaled"

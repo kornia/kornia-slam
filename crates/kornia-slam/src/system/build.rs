@@ -173,7 +173,7 @@ impl LocalBaConfig {
             visual_kernel: self.visual_kernel,
             large_window: self.large_window,
             online_calibration: self.online_calibration,
-            initial_lambda: LocalBaParams::default().initial_lambda,
+            initial_lambda: self.initial_lambda,
             recently_initialized: false,
             newest_marginal: false,
             dense_parallelism: self.dense_parallelism,
