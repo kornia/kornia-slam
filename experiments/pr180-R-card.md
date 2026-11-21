@@ -250,3 +250,25 @@ about 2 cm, and ATE SE3 falls from 1.63-4.77 m to 0.74-0.99 m with scale 1.01-1.
 over 30 cm stay at 13-24 and n_new at 4.6: the remaining large shifts come from the slow solve
 itself, not from its start state. Seed and merge together are no better than merge alone
 (0.83-1.88 m).
+
+## Profile re-measured on an idle laptop; 5a (2026-11-21)
+
+The stage 1 profile ran at load average 10-19 (other users' processes). Re-run, same binary
+r-knobs, same config, single job, load average 3.1-7.4 (p50 4.9); and the 5a binary r-5a
+(kornia-slam@2fad071, md5 22ef5566cdcf170ac14d967e9f5e15a3), load 2.0-5.4 (p50 2.7). Both
+trajectories are `cmp`-identical to `cardQ/out/r01full-Q0a-r1/traj.txt`.
+
+| Run | Load p50 | Solve p50 / p90 / mean | Per iteration p50 / mean | schur | imu | chol | trial |
+|---|---|---|---|---|---|---|---|
+| r-knobs, loaded (stage 1) | 15.1 | 1116 / 1596 / 1161 ms | 54.7 / 55.1 ms | 20.4 % | 0.5 % | 71.7 % | 7.4 % |
+| r-knobs, idle | 4.9 | 161 / 361 / 197 ms | 8.1 / 9.4 ms | 50.3 % | 1.2 % | 28.4 % | 20.1 % |
+| r-5a, idle | 2.7 | 170 / 387 / 206 ms | 8.4 / 9.8 ms | 49.0 % | 1.1 % | 30.3 % | 19.7 % |
+
+- Load, not arithmetic, made the 985-1158 ms solves: idle, the same solve is 161 ms p50. The
+  `chol` phase is what load inflates (39 ms against 2.7 ms per iteration). Q0a's 985 ms and
+  this card's P5 baseline are load-inflated by the same mechanism.
+- T1 on the valid (idle) sample: schur 50.3 %. T1 (>= 75 %) misses; K4 (< 50 %) sits on its
+  boundary and does not fire on this sample, but fired on the loaded one. Step 5b is not built:
+  work stops here for the owner's call.
+- 5a is bit-identical (W1/W3 fingerprints, `cmp` above) and gives no measurable gain: 1.01
+  rejected steps per solve out of 21.1 iterations.
