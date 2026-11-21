@@ -22,6 +22,12 @@ Newest first, one entry per working day. "main" means a merged PR; "#180" means 
 sits behind config knobs that default to the old behaviour, and nothing in it has been benchmarked yet.
 
 ### 2026-11-21
+- **#180, cards Q, R and T: the full-sequence drift (G35) is fixed behind knobs.**
+  - **Cause:** with 10 active keyframes, the slow asynchronous solve absorbed 4-5 new keyframes each, starting them from a stale state (crossing velocity error 1.4-1.6 m/s), so the window slid 8-14 cm per solve. A 3-keyframe window avoids the slide but cannot hold the scale.
+  - **Fix:** 7 iterations from λ 1e-4 in the 10-keyframe window, `merge: PropagateToNewer` (each solve's correction carried to the keyframes inserted while it ran), and `dense_parallelism: Sequential`. faer's default thread pool made a 150×150 factorisation 3.4 ms idle and 39 ms loaded; on one thread it is 0.12 ms, bit-identical.
+  - **Result, full R_01:** ATE 1.11-1.23 m to 0.30-0.40 m (async preset), 0.384 m (sync), mono 3.5-4.4 m to 0.760 m. R_03 800 frames 0.19-0.20 to 0.085-0.112 m, but 762-789 tracked (base 782-800, post-gap velocity drift). R_11 unchanged. Solve 38 ms p50 (sync, idle).
+  - **New preset `configs/pr180-window10.ron`.** Code defaults stay off.
+- **#180, card L:** `--trajectory-include-coasted` writes the IMU-carried poses into the scored trajectory; R_03 800/800 at the same ATE.
 - **#180, card K (`experiments/pr180-K-card.md`).** The R_03 failure under `min_cold_start_points: 20` (G32) is fixed behind a knob.
   - **Cause:** while the device is still, keyframe pairs a few millimetres apart grew map points. Only wrong matches can pass the 1° parallax gate from such a short baseline, so the points landed at 2-25 cm instead of 0.8 m and shrank the trajectory to about 1/5 scale.
   - **Fix:** `mapping.growth_min_baseline_ratio` skips a pair whose baseline is below that fraction of the keyframe's median depth (ORB-SLAM3 `CreateNewMapPoints`, mono rule). At 0.0175 (tan 1°): near points 2394 to 11-13, step ratio 1.01, VIBA2 accepted 3/3.
