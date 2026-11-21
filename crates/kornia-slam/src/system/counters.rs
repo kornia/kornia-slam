@@ -124,6 +124,11 @@ pub struct RunCounters {
     pub seeded_window_dropped_points: u64,
     /// Frames tracked from optical flow alone.
     pub flow_frames: u64,
+    /// Coasted frames the runaway check flagged, so not trusted (S0-C1b).
+    pub coast_runaway_frames: u64,
+    /// Lost keyframes inserted while the runaway check flagged the coast;
+    /// only without `reseed.keep_inertial` (S0-C1b).
+    pub lost_keyframes_at_runaway: u64,
     /// Flow survivors with a map point, summed over flow frames.
     pub flow_seeds: u64,
     /// Pose inliers on flow frames.

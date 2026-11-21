@@ -1224,11 +1224,22 @@ impl SlamSystem {
             .map(|found_kf| KeyframeGap::Relocalized { found_kf });
     }
 
+    /// Adds this frame's pose over `[t0, t1]` to the runaway check, which
+    /// settles coast trust whatever the recovery knobs (R-C1), and to the tilt
+    /// check, which only a kept inertial state reads.
+    fn record_frame_pose(&mut self, t0: f64, t1: f64) {
+        let pose = self.state.pose_world_to_cam;
+        self.runaway.record(t1, recovery::camera_centre(&pose));
+        self.record_tilt(&pose, t0, t1);
+    }
+
     /// Marks this frame's coast trusted when the IMU is confident and the
-    /// coasted pose is not a runaway.
+    /// coasted pose is not a runaway. The runaway check is fed on every
+    /// frame, so this holds without `keep_inertial` too (R-C1).
     fn settle_coast_trust(&mut self, imu_confident: bool) {
         if let Some(SkipKind::Coasting { inertial, .. }) = self.last_skip {
-            let runaway = self.recovery.keep_inertial && self.runaway.runaway();
+            let runaway = self.runaway.runaway();
+            self.counters.coast_runaway_frames += u64::from(runaway);
             self.last_skip = Some(SkipKind::Coasting {
                 inertial,
                 trusted: imu_confident && !runaway,
@@ -2139,14 +2150,7 @@ impl SlamSystem {
             trace.tracked = status != TrackingStatus::Skipped;
             trace.keyframe = status == TrackingStatus::KeyframeAccepted;
         }
-        if self.recovery.keep_inertial {
-            self.runaway.record(
-                timestamp_sec,
-                recovery::camera_centre(&self.state.pose_world_to_cam),
-            );
-            let pose = self.state.pose_world_to_cam;
-            self.record_tilt(&pose, prev_timestamp, timestamp_sec);
-        }
+        self.record_frame_pose(prev_timestamp, timestamp_sec);
         if status == TrackingStatus::Skipped {
             let lost_since = self
                 .state
@@ -2200,6 +2204,8 @@ impl SlamSystem {
                 && let Some(role) = role
                 && self.insert_keyframe(&frame, timestamp_sec, &[], 0, role)
             {
+                // Only without `keep_inertial` does a runaway get this far (S0-C1b).
+                self.counters.lost_keyframes_at_runaway += u64::from(self.runaway.runaway());
                 let idx = frame.idx;
                 self.dbg(match role {
                     KeyframeRole::Anchor => {

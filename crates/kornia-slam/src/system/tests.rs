@@ -1630,6 +1630,43 @@ mod recovery_after_loss {
         assert_eq!(system.last_skip, Some(SkipKind::Bootstrap));
     }
 
+    /// R-C1: every frame's pose feeds the runaway check, so a runaway coast is
+    /// untrusted with the preset's `keep_inertial: false` too, and counted.
+    #[test]
+    fn a_runaway_coast_is_untrusted_without_keep_inertial() {
+        let coast = |trusted| {
+            Some(SkipKind::Coasting {
+                inertial: true,
+                trusted,
+            })
+        };
+        let mut system = lost_metric_system(7.0);
+        system.recovery.keep_inertial = false;
+        system.state.pose_world_to_cam = centred_at(0.0);
+        system.record_frame_pose(2.95, 3.0);
+        system.last_skip = coast(false);
+        system.settle_coast_trust(true);
+        assert_eq!(system.last_skip, coast(true), "one centre is no runaway");
+        assert_eq!(system.counters.coast_runaway_frames, 0);
+
+        system.state.pose_world_to_cam = centred_at(60.0);
+        system.record_frame_pose(12.95, 13.0);
+        assert!(system.runaway.runaway(), "6 m/s over 10 s");
+        system.last_skip = coast(false);
+        system.settle_coast_trust(true);
+        assert_eq!(system.last_skip, coast(false), "a runaway");
+        assert_eq!(system.counters.coast_runaway_frames, 1);
+
+        let mut diverged = lost_metric_system(7.0);
+        diverged.recovery.keep_inertial = false;
+        diverged.record_frame_pose(9.95, 10.0);
+        diverged.state.pose_world_to_cam = centred_at(f64::NAN);
+        diverged.record_frame_pose(10.0, 10.05);
+        diverged.last_skip = coast(false);
+        diverged.settle_coast_trust(true);
+        assert_eq!(diverged.last_skip, coast(false), "a non-finite coast");
+    }
+
     /// T-3: only a frame carried on the IMU is reported as a carried re-seed
     /// frame; a held one stays a bootstrap skip, and both count as one.
     #[test]
