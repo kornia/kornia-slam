@@ -168,3 +168,44 @@ falls back to KeyframeVelocity there.
   - **Side finding, not scored by any prediction:** `local_ba.lost_keyframes: FixedInertial` is harmful on
     R_03 with this preset (ATE 1.3-33 m against 0.085-0.112 m). S0b, an upper bound only, also loses the
     395-401 stretch.
+
+- **2026-11-21, scoring (U0 = W with the new binary, U1 = U).**
+  - **Setup:** `feat/global-pose-graph` @ f57c13a, binary `cardV/bin/kornia-slam-v`
+    (md5 975ce3b7802abbd03f7540e53ec59604), configs `cardV/cfg/{r03,r11,r01full}-{W,U,ALL}.ron`, runs in
+    `cardV/out`, `RUN_FLAGS` empty, 3 runs each, 2 jobs. Load p50 over the batch 6.77 (per run 2.2-12.6; only
+    W r1/r2 under 5), so no timing verdict is drawn. Velocity error from `quick-eval/velgt.py`.
+  - **Identity gate:** `cardR/cfg/r01full-S10-7.ron` with this binary is `cmp`-identical to
+    `cardT/out/T1/r01full-S10-7-r1/traj.txt` (md5 d4f77b567b912b5a4caa2af6085a35b1).
+
+| Run | Tracked | ATE SE3 | Scale | predgap 1 / 2 / 3-4 / 5+ (cm) | velocity error 1 / 5+ frames (m/s, ref_lost=0) |
+|---|---|---|---|---|---|
+| R_03 U0 r1 / r2 / r3 | 765 / 772 / 770 | 0.111 / 0.112 / 0.108 m | 1.032 / 1.031 / 1.033 | 0.79 / 1.24 / 1.77 / 5.46; 0.82 / 1.26 / 1.79 / 5.85; 0.83 / 1.22 / 1.75 / 5.79 | 0.086 / 0.703; 0.079 / 0.799; 0.084 / 0.801 |
+| R_03 U1 r1 / r2 / r3 | 781 / 779 / 780 | 0.092 / 0.094 / 0.114 m | 1.030 / 1.026 / 1.037 | 0.54 / 0.55 / 0.53 / 0.40; 0.52 / 0.53 / 0.52 / 0.44; 0.56 / 0.61 / 0.53 / 0.43 | 0.062 / 0.066; 0.059 / 0.064; 0.071 / 0.072 |
+| R_11 U1 r1 / r2 / r3 | 800 / 800 / 798 | 0.145 / 0.184 / 0.189 m | 0.961 / 0.939 / 0.937 | 0.53 / 0.39 / 0.48 / 0.40; 0.65 / 0.51 / 0.55 / 0.45; 0.57 / 0.50 / 0.55 / 0.47 | |
+| R_11 U0 (`cardT/out3`, old binary) | 800 / 799 / 799 | 0.165 / 0.151 / 0.165 m | 0.949 / 0.957 / 0.949 | 1.08 / 1.62 / 2.17 / 3.08 (r1) | |
+| R_01 full U1 r1 / r2 / r3 | 2898 / 2897 / 2898 | 0.399 / 0.411 / 0.498 m | 0.983 / 0.979 / 0.988 | 0.95 / 0.63 / 0.81 / 0.77 (r1) | |
+| R_01 full U0 (`cardT/out3`, old binary) | 2898 ×3 | 0.296 / 0.399 / 0.311 m | 0.990 / 0.978 / 0.969 | 1.49 / 1.21 / 1.54 / 2.01 (r1) | |
+| R_03 ALL (U1 + card V1) r1 / r2 / r3 | 786 / 782 / 783 | 0.111 / 0.101 / 0.115 m | 1.035 / 1.030 / 1.037 | 0.57 / 0.55 / 0.52 / 0.46 (r1) | |
+| R_11 ALL r1 / r2 / r3 | 798 / 800 / 800 | 0.190 / 0.149 / 0.183 m | 0.936 / 0.958 / 0.939 | | |
+| R_01 full ALL r1 / r2 / r3 | 2898 ×3 | 0.322 / 0.384 / 0.332 m | 0.970 / 0.981 / 0.972 | | |
+
+| P/K | Prediction | Measured | Verdict |
+|---|---|---|---|
+| P1 | U0: velocity error at 5+ frames at least 3x the 1-frame error on R_03; at least 0.3 m/s over 389-394 | 8.2x, 10.1x, 9.5x; 0.85-1.79 m/s over 389-394 in 3/3 | as predicted |
+| P2 | U1: R_03 5+ predgap bin at most 2.0 cm and at most 1.5x the 1-frame bin; velocity error at 5+ at most 1.5x the 1-frame | 0.40 / 0.44 / 0.43 cm (0.74x, 0.85x, 0.77x the 1-frame bin); velocity 1.06x, 1.08x, 1.01x | as predicted |
+| P3 | U1: R_03 tracked 790-800 in 3/3, and 395-401 gone where 371-387 occurs | 781 / 779 / 780; no U1 run has a 395-401 gap (the turn gap is 371-379 to 371-382) | refuted (tracked under the band) |
+| P4 | U1: R_03 ATE at most 0.11 m; R_11 0.136-0.170 m; R_01 at most 0.40 m; scale 0.95-1.05 | R_03 0.114 in r3; R_11 0.184 and 0.189, scale 0.939 and 0.937; R_01 0.411 and 0.498 | refuted on all three sequences |
+| P5 | U1: frame p50 within 1 ms of U0 | R_03 U0 14.3-15.4 ms, U1 14.7-15.3 ms, but load p50 5.7-9.9 | not scored (load p50 > 5) |
+| K1 | P1 fails | P1 holds | did not fire |
+| K2 | P2 holds but P3 fails | P2 holds, P3 refuted | **fired** |
+| K3 | P3 holds but P2 fails | | did not fire |
+| K4 | R_01 ATE above 0.45 m in any run, or scale outside 0.95-1.05 | U1 r3 0.498 m | **fired** |
+| K6 | P2 holds but the error at age 1 after a recovery stays above 0.3 m/s | ref_lost=1, bin 1: 0.077-0.111 m/s (U0: 0.72-1.26 m/s) | did not fire |
+
+  - **Reading.** The mechanism is confirmed: the stale keyframe velocity is the source of the per-age
+    prediction error, and propagating it removes the growth (predgap flat at about 0.5 cm on R_03 and R_11,
+    velocity error flat at 0.06-0.07 m/s). Tracking on R_03 rises from 765-772 to 779-781 but not into the
+    band, so the prediction was not the whole cause of the turn losses (K2: look at map projection after the
+    turn). U alone hurts full R_01 (K4: 0.399-0.498 m against 0.296-0.399 m), as card R's
+    `keyframe_seed: ImuPropagated` did alone; with card V1 (ALL) full R_01 is 0.322-0.384 m. Per K4, check
+    the keyframe velocity against card R's crossing r_v before U ships. Do not ship U alone.

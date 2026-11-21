@@ -123,3 +123,46 @@ Runs: W and V1 on the R_03 800-frame window, 3 each, 2 jobs. All knobs on (with 
 - T-4: a coast is written under the flag only when the prediction is trusted and not a runaway.
 
 ## Result log
+
+- **2026-11-21, scoring.**
+  - **Setup:** `feat/global-pose-graph` @ f57c13a, binary `cardV/bin/kornia-slam-v`
+    (md5 975ce3b7802abbd03f7540e53ec59604), configs `cardV/cfg/{r03-W,r03-V1,r03-ALL,r11-ALL,r01full-ALL}.ron`
+    (ALL = V1 plus card U's `frame_velocity: PropagatedFromKeyframe`), runs in `cardV/out`, `RUN_FLAGS` empty,
+    3 runs each, 2 jobs. Load p50 over the batch 6.77; V1 runs 11.8-12.6, ALL runs 5.8-11.8, so no timing
+    verdict is drawn. W here is the new binary with the knobs off; `cardT/out3` is the old-binary baseline.
+  - **K4 (identity):** `cardR/cfg/r01full-S10-7.ron`, synchronous, `RAYON_NUM_THREADS=1`: `cmp`-identical to
+    `cardT/out/T1/r01full-S10-7-r1/traj.txt` (md5 d4f77b567b912b5a4caa2af6085a35b1). Did not fire.
+
+| Run | Tracked | ATE SE3 | Scale | VI solves over 7 it. | Most iterations | Slowest solve | base solves / iterations |
+|---|---|---|---|---|---|---|---|
+| R_03 W r1 / r2 / r3 | 765 / 772 / 770 | 0.111 / 0.112 / 0.108 m | 1.032 / 1.031 / 1.033 | 8 / 4 / 7 | 23 / 16 / 17 | 702 / 326 / 291 ms | 8 / 127, 4 / 54, 7 / 102 |
+| R_03 V1 r1 / r2 / r3 | 776 / 788 / 781 | 0.103 / 0.114 / 0.103 m | 1.033 / 1.037 / 1.032 | 0 / 0 / 0 | 7 / 7 / 7 | 328 / 343 / 137 ms | 6 / 42, 4 / 24, 3 / 19 |
+| R_03 ALL r1 / r2 / r3 | 786 / 782 / 783 | 0.111 / 0.101 / 0.115 m | 1.035 / 1.030 / 1.037 | 0 / 0 / 0 | 7 / 7 / 7 | 144 / 150 / 130 ms | 5 / 32, 6 / 39, 5 / 33 |
+| R_11 ALL r1 / r2 / r3 | 798 / 800 / 800 | 0.190 / 0.149 / 0.183 m | 0.936 / 0.958 / 0.939 | 0 / 0 / 0 | 7 / 7 / 7 | 90 / 89 / 100 ms | 2 / 14, 1 / 7, 0 / 0 |
+| R_01 full ALL r1 / r2 / r3 | 2898 ×3 | 0.322 / 0.384 / 0.332 m | 0.970 / 0.981 / 0.972 | 0 / 0 / 0 | 7 / 7 / 7 | 279 / 284 / 348 ms | 0 / 0 ×3 |
+
+  VIBA1 and VIBA2 were accepted in every run. `reseeds=0` and `ba_propagations_stopped_at_bridge=0` in every
+  run of the batch (24 runs).
+
+| P/K | Prediction | Measured | Verdict |
+|---|---|---|---|
+| P1 | max iterations 7 on R_03, R_11, R_01; VI solves over 7 iterations 0 on R_03 and R_11 | 7 and 0 in every V1 and ALL run (W on this binary: 16-23 and 4-8 on R_03) | as predicted |
+| P2 | R_03 slowest solve at most 300 ms; R_11 at most 150 ms | R_03 V1 328 / 343 / 137 ms, ALL 130-150 ms; R_11 ALL 89-100 ms; load p50 5.8-12.6 | not scored (load p50 > 5) |
+| P3 | VIBA1 and VIBA2 accepted as in W; R_11 tracked 798-800 | accepted in every run; R_11 ALL 798 / 800 / 800 | as predicted |
+| P4 | R_03 ATE at most 0.12 m, tracked at least 762, scale 1.02-1.04 | 0.103-0.114 m, 776-788, 1.032-1.037 | as predicted |
+| P5 | `ba_propagations_stopped_at_bridge` = 0 in every run | 0 in all 24 runs | as predicted (no exposure; the unit test `a_propagating_merge_stops_at_a_bridged_segment_start` is the proof) |
+| K1 | P1 holds, and R_03 ATE above 0.13 m or tracked under 762 in 2/3, or R_11 tracked under 798, or a VIBA2 rejected | none | did not fire |
+| K2 | V1 alone: R_03 tracked 790+ in 3/3 or ATE under 0.08 m in 3/3 | 776-788; 0.103-0.114 m | did not fire |
+| K3 | `ba_propagations_stopped_at_bridge` above 0 in a scoring run | 0 | did not fire |
+| K4 | identity run not `cmp`-identical | identical | did not fire |
+
+  - **Matrix rows for ALL:** R_11 ATE 0.136-0.170 m predicted, measured 0.190 / 0.149 / 0.183 m (2/3 outside);
+    R_01 full at most 0.40 m, no run above 0.45 m, scale 0.95-1.05, tracked 2898: as predicted. The R_01
+    contingency (U alone) was run anyway under card U's run list; see card U (K4 fired for U alone).
+  - **Reading.** E-1 does what the theory says and no more: every VI-BA solve is capped at 7 iterations and
+    the start-up and accuracy are unchanged within the W band. The bound on solve time is not verified: the
+    batch ran at load p50 above 5.
+  - **Trajectory fixes (verification step 8, T-1):** one R_03 run with `--trajectory-include-coasted
+    --session-out` (`cardV/t1/on`): `poses_written=800`, 0 frames without a dumped keyframe, `offline-ba`
+    wrote 800 rows. Flag off (`cardV/t1/off`): tracked 785, session and `offline-ba` 785 rows, 0 frames without
+    a dumped keyframe.
