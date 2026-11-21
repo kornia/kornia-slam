@@ -121,6 +121,8 @@ pub(crate) struct LocalMappingCounts {
     pub ba_solves: u64,
     pub ba_solve_ns: u64,
     pub large_window_solves: u64,
+    pub ba_stale_keyframes: u64,
+    pub ba_propagated_keyframes: u64,
 }
 
 // Atomics because the asynchronous worker writes them while tracking reads.
@@ -133,6 +135,8 @@ struct LocalMappingCounters {
     ba_solves: AtomicU64,
     ba_solve_ns: AtomicU64,
     large_window_solves: AtomicU64,
+    ba_stale_keyframes: AtomicU64,
+    ba_propagated_keyframes: AtomicU64,
 }
 
 impl LocalMappingCounters {
@@ -162,9 +166,18 @@ impl LocalMappingCounters {
         }
     }
 
-    fn record_merge<T>(&self, merged: &Result<T, BaUpdateError>) {
-        if merged.is_err() {
-            self.ba_updates_rejected.fetch_add(1, Ordering::Relaxed);
+    fn record_merge(&self, merged: &Result<LocalBaMergeResult, BaUpdateError>) {
+        let add = |counter: &AtomicU64, n: usize| {
+            counter.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed)
+        };
+        match merged {
+            Ok(result) => {
+                add(&self.ba_stale_keyframes, result.newer_keyframes);
+                add(&self.ba_propagated_keyframes, result.propagated_keyframes);
+            }
+            Err(_) => {
+                add(&self.ba_updates_rejected, 1);
+            }
         }
     }
 
@@ -178,6 +191,8 @@ impl LocalMappingCounters {
             ba_solves: read(&self.ba_solves),
             ba_solve_ns: read(&self.ba_solve_ns),
             large_window_solves: read(&self.large_window_solves),
+            ba_stale_keyframes: read(&self.ba_stale_keyframes),
+            ba_propagated_keyframes: read(&self.ba_propagated_keyframes),
         }
     }
 }

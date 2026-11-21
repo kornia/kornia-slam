@@ -629,6 +629,11 @@ pub struct LocalBaMergeResult {
     /// The newest keyframe's id and marginal covariance, layout
     /// `[ρ ω v b_g b_a]`, when the solve was asked for it.
     pub newest_marginal: Option<(usize, Mat15F64)>,
+    /// Live keyframes inserted after the snapshot's newest, which the solve
+    /// did not see (card R).
+    pub newer_keyframes: usize,
+    /// Of those, keyframes the merge carried the correction to.
+    pub propagated_keyframes: usize,
 }
 
 impl Map {
@@ -701,8 +706,14 @@ impl Map {
             }
         }
 
+        let snapshot_newest = snapshot.keyframes.iter().map(|kf| kf.frame.idx).max();
         let mut result = LocalBaMergeResult {
             newest_marginal: update.newest_marginal,
+            newer_keyframes: self
+                .keyframes
+                .iter()
+                .filter(|kf| snapshot_newest.is_some_and(|newest| kf.frame.idx > newest))
+                .count(),
             ..LocalBaMergeResult::default()
         };
         // Which estimates to publish is decided against the capture baseline;

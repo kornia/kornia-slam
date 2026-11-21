@@ -66,6 +66,7 @@
 //! which catches a fling but not a slow walk.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use faer::Mat;
 use faer::prelude::Solve;
@@ -1893,6 +1894,17 @@ fn border_marginal_sigma(information: &Mat<f64>, base: usize) -> Option<Vec<f64>
     sigma.iter().all(|s| s.is_finite()).then_some(sigma)
 }
 
+/// Where one VI-BA solve's iterations spent their time, milliseconds in the
+/// `[vi_ba] TIME` line, and how many steps were rejected.
+#[derive(Default)]
+struct SolveTime {
+    schur: Duration,
+    imu: Duration,
+    chol: Duration,
+    trial: Duration,
+    rejects: usize,
+}
+
 /// What a build of the reduced system reads and never changes.
 #[derive(Clone, Copy)]
 struct SystemInputs<'a> {
@@ -1936,6 +1948,9 @@ struct ReducedSystem {
     cost: f64,
     /// Visual, IMU, accel-bias prior and boundary prior terms of `cost`.
     split: [f64; 4],
+    /// Wall time of the visual blocks with the Schur elimination, and of the
+    /// IMU and remaining terms (card R profile).
+    time: [Duration; 2],
 }
 
 /// Builds the reduced system at `state`, the point blocks damped by
@@ -1979,6 +1994,7 @@ fn build_reduced_system(
     let (n_kf, n_pts) = (keyframes.len(), xyz.len());
     let cal_base = n_free_kf * KF_DOF;
     let skip_edge = |edge: &ImuFactor| prior.is_some() && is_boundary_edge(edge, kf_local);
+    let started = Instant::now();
 
     // ── 1. Schur blocks for visual residuals ─────────────────────────
     // The blocks of bundle_adjust_schur_with_priors, but A is 6×6 (pose
@@ -2109,6 +2125,8 @@ fn build_reduced_system(
             }
         }
     }
+
+    let schur_time = started.elapsed();
 
     // ── 3. IMU normal equations ───────────────────────────────────────
     // Each edge contributes J_i^T Ω J_i, J_j^T Ω J_j (diagonal 15×15
@@ -2276,6 +2294,7 @@ fn build_reduced_system(
         border,
         cost,
         split: [cost_vis, cost_imu, cost_bias_prior, cost_prior],
+        time: [schur_time, started.elapsed() - schur_time],
     }
 }
 
@@ -2475,6 +2494,7 @@ fn solve_vi_ba(
     // Whether each observation's reprojection is a Huber inlier at the
     // current linearization point (refreshed by every system build).
     let mut vis_inlier = vec![false; observations.len()];
+    let mut time = SolveTime::default();
 
     for _iter in 0..params.max_iterations {
         iters_done += 1;
@@ -2495,7 +2515,11 @@ fn solve_vi_ba(
             border,
             cost: cost_f64,
             split,
+            time: [schur_time, imu_time],
         } = build_reduced_system(&inputs, &state, lambda, &mut vis_inlier, is_first_iter, &[]);
+        time.schur += schur_time;
+        time.imu += imu_time;
+        let chol_started = Instant::now();
         let dim = m_vec.len();
         if initial_cost == f64::MAX {
             initial_cost = cost_f64;
@@ -2538,6 +2562,8 @@ fn solve_vi_ba(
         let chol = match m_mat.llt(faer::Side::Lower) {
             Ok(c) => c,
             Err(e) => {
+                time.chol += chol_started.elapsed();
+                time.rejects += 1;
                 lambda *= 10.0;
                 if lambda > 1e10 {
                     return Err(ViBaError::CholeskyFailed(format!("{e:?}")));
@@ -2549,6 +2575,8 @@ fn solve_vi_ba(
         let m_col = Mat::<f64>::from_fn(dim, 1, |i, _| m_vec[i]);
         let d_full_col = chol.solve(&m_col);
         let d_full: Vec<f64> = (0..dim).map(|i| d_full_col[(i, 0)]).collect();
+        time.chol += chol_started.elapsed();
+        let trial_started = Instant::now();
 
         // ── 5. Point back-substitution (uses pose-DOF slice only) ────────
         let mut d_point = vec![SVecF64::<3>::zeros(); n_free_pts];
@@ -2636,6 +2664,8 @@ fn solve_vi_ba(
         );
         cheirality_points_held += cheirality.points_held;
         if cheirality.refuse {
+            time.trial += trial_started.elapsed();
+            time.rejects += 1;
             cheirality_rejections += 1;
             lambda *= 10.0;
             if lambda > 1e10 {
@@ -2740,6 +2770,7 @@ fn solve_vi_ba(
             new_cost_f64 += prior_cost(c, &calib_trial);
         }
         let new_cost = new_cost_f64 as f32;
+        time.trial += trial_started.elapsed();
 
         // ── 8. LM accept / reject ─────────────────────────────────────────
         if new_cost < cost {
@@ -2766,12 +2797,22 @@ fn solve_vi_ba(
                 break;
             }
         } else {
+            time.rejects += 1;
             lambda *= 10.0;
             if lambda > 1e10 {
                 break;
             }
         }
     }
+    debug_eprintln!(
+        "[vi_ba] TIME obs={} schur={:.2} imu={:.2} chol={:.2} trial={:.2} iters={iters_done} rejects={}",
+        observations.len(),
+        time.schur.as_secs_f64() * 1e3,
+        time.imu.as_secs_f64() * 1e3,
+        time.chol.as_secs_f64() * 1e3,
+        time.trial.as_secs_f64() * 1e3,
+        time.rejects,
+    );
 
     // ── Post-convergence residual diagnostic ──────────────────────────────
     let [v0, i0, b0, p0] = first_split;

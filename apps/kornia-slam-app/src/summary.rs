@@ -25,7 +25,7 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
          prior_fallbacks={} ba_updates_rejected={} ba_solves={} ba_solve_ms={:.1} \
          nonrigid_poses={} nonrigid_keyframes={} reseeds={} reseeds_held={} tilt_relevels={} \
          bias_resets={} reseed_stall_frames={} gate_rejects_rotation={} \
-         gate_rejects_translation={}\n\
+         gate_rejects_translation={} ba_stale_keyframes={} ba_propagated_keyframes={}\n\
          [summary] frame_ms {}\n\
          [summary] frontend_ms {}\n\
          {}",
@@ -53,6 +53,8 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
         c.reseed_stall_frames,
         c.gate_rejects_rotation,
         c.gate_rejects_translation,
+        c.ba_stale_keyframes,
+        c.ba_propagated_keyframes,
         format_percentiles(&times.frame_ms),
         format_percentiles(&times.frontend_ms),
         format_estimator_recovery(c),
@@ -121,7 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn first_line_ends_with_the_rigidity_the_reseed_then_the_gate_counters() {
+    fn first_line_ends_with_the_rigidity_the_reseed_the_gate_then_the_merge_counters() {
         // `RunCounters` is non-exhaustive, so fields are set one by one.
         let mut counters = RunCounters::default();
         counters.ba_solve_ns = 2_500_000;
@@ -134,13 +136,16 @@ mod tests {
         counters.reseed_stall_frames = 140;
         counters.gate_rejects_rotation = 4;
         counters.gate_rejects_translation = 9;
+        counters.ba_stale_keyframes = 21;
+        counters.ba_propagated_keyframes = 5;
         let text = format(&counters, &FrameTimes::default());
         let first = text.lines().next().unwrap();
         assert!(
             first.ends_with(
                 "ba_solve_ms=2.5 nonrigid_poses=3 nonrigid_keyframes=1 reseeds=12 \
                  reseeds_held=2 tilt_relevels=1 bias_resets=0 reseed_stall_frames=140 \
-                 gate_rejects_rotation=4 gate_rejects_translation=9"
+                 gate_rejects_rotation=4 gate_rejects_translation=9 ba_stale_keyframes=21 \
+                 ba_propagated_keyframes=5"
             ),
             "{first}"
         );

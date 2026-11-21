@@ -72,6 +72,11 @@ pub struct RunCounters {
     pub ba_snapbacks: u64,
     /// VI-BA solves run with the large window.
     pub large_window_solves: u64,
+    /// Keyframes inserted while a local BA solved, summed over its merges:
+    /// the merge found them newer than its snapshot (card R).
+    pub ba_stale_keyframes: u64,
+    /// Of those, keyframes the merge carried the correction to.
+    pub ba_propagated_keyframes: u64,
     /// Frames tracked by the pose-inertial solve.
     pub pose_inertial_solves: u64,
     /// Of those, solves anchored at a keyframe rather than the previous frame.

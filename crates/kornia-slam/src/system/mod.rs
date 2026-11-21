@@ -525,6 +525,8 @@ impl SlamSystem {
             ba_solves: mapping.ba_solves,
             ba_solve_ns: mapping.ba_solve_ns,
             large_window_solves: mapping.large_window_solves,
+            ba_stale_keyframes: mapping.ba_stale_keyframes,
+            ba_propagated_keyframes: mapping.ba_propagated_keyframes,
             flow_reconcile_clears: self.tracker.reconcile_clears(),
             flow_tracks_tried: flow.tracks_tried,
             flow_fb_rejects: flow.fb_rejects,
