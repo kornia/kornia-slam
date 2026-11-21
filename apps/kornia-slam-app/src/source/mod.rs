@@ -13,6 +13,8 @@ pub mod uvc;
 use std::path::{Path, PathBuf};
 
 use kornia_image::Image;
+use kornia_imgproc::color::gray_from_rgb_u8;
+use kornia_io::jpeg::{decode_image_jpeg_layout, decode_image_jpeg_mono8, decode_image_jpeg_rgb8};
 use kornia_sensors::SensorRig;
 use kornia_sensors::imu::ImuMeasurement;
 use serde::Deserialize;
@@ -214,6 +216,30 @@ fn dataset_summary(total: usize, start: usize, n_frames: Option<usize>) -> Strin
 /// Datasets report missing ground truth as an empty list.
 fn non_empty(poses: Vec<GroundTruthPose>) -> Option<Vec<GroundTruthPose>> {
     (!poses.is_empty()).then_some(poses)
+}
+
+/// Decode a JPEG payload to a luma8 image. Mono JPEGs are decoded directly;
+/// RGB JPEGs (used by the `compressed` channel) are decoded then converted.
+fn decode_jpeg_to_luma(
+    jpeg_bytes: &[u8],
+) -> Result<Image<u8, 1>, Box<dyn std::error::Error + Send + Sync>> {
+    let layout = decode_image_jpeg_layout(jpeg_bytes)?;
+    let size = layout.image_size;
+    match layout.channels {
+        1 => {
+            let mut dst = Image::<u8, 1>::from_size_val(size, 0)?;
+            decode_image_jpeg_mono8(jpeg_bytes, &mut dst)?;
+            Ok(dst)
+        }
+        3 => {
+            let mut rgb = Image::<u8, 3>::from_size_val(size, 0)?;
+            decode_image_jpeg_rgb8(jpeg_bytes, &mut rgb)?;
+            let mut gray = Image::<u8, 1>::from_size_val(size, 0)?;
+            gray_from_rgb_u8(&rgb, &mut gray)?;
+            Ok(gray)
+        }
+        n => Err(format!("unsupported JPEG channel count: {n} (want 1 or 3)").into()),
+    }
 }
 
 /// Rectify a raw stereo pair into freshly allocated `(left, right)` images.

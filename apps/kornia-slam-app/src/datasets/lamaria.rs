@@ -1,5 +1,7 @@
 //! Reader for LaMAria sequences in the pinhole ASL export
-//! (`<seq>/aria/{cam0,cam1,imu0}`) with their `pinhole_calibrations/<seq>.json`.
+//! (`<seq>/aria/{cam0,cam1,imu0}`) with their `pinhole_calibrations/<seq>.json`,
+//! or with raw Aria fisheye images from an ASL extraction of the `.vrs` and
+//! their `aria_calibrations/<seq>.json`.
 //!
 //! The export ships raw Aria IMU samples. When the factory calibration record
 //! from the recording's `.vrs` header is supplied, samples are rectified as
@@ -11,6 +13,7 @@ use std::path::{Path, PathBuf};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
+use kornia_sensors::Fisheye624Camera;
 use kornia_sensors::imu::ImuCalib;
 use serde::Deserialize;
 
@@ -19,7 +22,11 @@ use super::euroc::{DatasetError, DatasetSample, ImuSample, read_camera_csv, read
 /// Factory IMU whose frame LaMAria's `imu0` stream and `T_b_s` extrinsics use.
 const FACTORY_IMU_LABEL: &str = "imu-right";
 
-/// One camera of the rig: an undistorted pinhole view of its own size.
+/// Aria fisheye model name in `aria_calibrations/<seq>.json`.
+const ARIA_FISHEYE_MODEL: &str = "RAD_TAN_THIN_PRISM_FISHEYE";
+
+/// One camera of the rig: an undistorted pinhole view of its own size, or
+/// with `raw` a virtual pinhole over raw fisheye images of that size.
 #[derive(Debug, Clone)]
 pub struct LamariaCamera {
     pub camera: PinholeCamera,
@@ -27,6 +34,16 @@ pub struct LamariaCamera {
     pub height: usize,
     /// `T_BC`: `X_imu = T_BC * X_cam`.
     pub camera_to_body: Pose3d,
+    /// Fisheye624 model of raw images; `None` for the pinhole export.
+    pub raw: Option<Fisheye624Camera>,
+}
+
+/// Raw Aria fisheye images: their calibration JSON and the extraction root
+/// holding `aria/{cam0,cam1}`.
+#[derive(Debug, Clone, Copy)]
+pub struct RawImages<'a> {
+    pub calib: &'a Path,
+    pub root: &'a Path,
 }
 
 /// Calibration of a sequence: both SLAM cameras and the `imu0` noise model.
@@ -79,18 +96,21 @@ pub struct LamariaDataset {
 
 impl LamariaDataset {
     /// Opens `root/aria` with the calibration JSON at `calibration`. With
-    /// `factory_calibration`, the IMU samples are rectified; `imu_time_offset_ns`
-    /// is added to every IMU timestamp.
+    /// `raw`, the images come from `raw.root/aria` and the cameras from
+    /// `raw.calib`; the IMU stays `root`'s. With `factory_calibration`, the IMU
+    /// samples are rectified; `imu_time_offset_ns` is added to every IMU timestamp.
     pub fn open(
         root: &Path,
         calibration: &Path,
+        raw: Option<RawImages<'_>>,
         factory_calibration: Option<&Path>,
         imu_time_offset_ns: i64,
     ) -> Result<Self, DatasetError> {
-        let calibration = read_calibration(calibration)?;
+        let calibration = read_calibration(calibration, raw.map(|raw| raw.calib))?;
         let aria = root.join("aria");
+        let image_aria = raw.map_or_else(|| aria.clone(), |raw| raw.root.join("aria"));
         let read_cam = |name: &str| {
-            let dir = aria.join(name);
+            let dir = image_aria.join(name);
             read_camera_csv(&dir.join("data.csv"), &dir.join("data"))
         };
         let cameras = [read_cam("cam0")?, read_cam("cam1")?];
@@ -169,10 +189,26 @@ struct ImuJson {
     gyro_bias_random_walk_sigma: f64,
 }
 
-fn read_calibration(path: &Path) -> Result<LamariaCalibration, DatasetError> {
+#[derive(Debug, Deserialize)]
+struct RawCalibrationJson {
+    cam0: CameraJson,
+    cam1: CameraJson,
+}
+
+fn read_calibration(path: &Path, raw: Option<&Path>) -> Result<LamariaCalibration, DatasetError> {
     let json: CalibrationJson = read_json(path)?;
+    let cameras = match raw {
+        None => [camera(json.cam0, path)?, camera(json.cam1, path)?],
+        Some(raw_path) => {
+            let raw: RawCalibrationJson = read_json(raw_path)?;
+            [
+                raw_camera(raw.cam0, &json.cam0.t_b_s, raw_path)?,
+                raw_camera(raw.cam1, &json.cam1.t_b_s, raw_path)?,
+            ]
+        }
+    };
     Ok(LamariaCalibration {
-        cameras: [camera(json.cam0, path)?, camera(json.cam1, path)?],
+        cameras,
         imu_noise: ImuCalib {
             gyro_noise: json.imu0.gyro_noise_density,
             accel_noise: json.imu0.acc_noise_density,
@@ -210,6 +246,82 @@ fn camera(json: CameraJson, path: &Path) -> Result<LamariaCamera, DatasetError> 
         width: json.resolution.width,
         height: json.resolution.height,
         camera_to_body: rigid(&json.t_b_s),
+        raw: None,
+    })
+}
+
+/// A raw Aria camera: params `[fx, fy, cx, cy, k0..k5, p0, p1, s0..s3]`
+/// (`lamaria/utils/aria.py`), and the virtual pinhole `(f, f, cx, cy)` over
+/// the raw resolution. `T_b_s` must be bit-equal to the pinhole export's, so
+/// the IMU extrinsics stay the ones the pinhole runs used.
+fn raw_camera(
+    json: CameraJson,
+    pinhole_t_b_s: &RigidJson,
+    path: &Path,
+) -> Result<LamariaCamera, DatasetError> {
+    let parse = |what: String| DatasetError::Parse(format!("{what} in {}", path.display()));
+    if json.model != ARIA_FISHEYE_MODEL {
+        return Err(parse(format!(
+            "unsupported camera model '{}', expected {ARIA_FISHEYE_MODEL}",
+            json.model
+        )));
+    }
+    let &[
+        fx,
+        fy,
+        cx,
+        cy,
+        k0,
+        k1,
+        k2,
+        k3,
+        k4,
+        k5,
+        p0,
+        p1,
+        s0,
+        s1,
+        s2,
+        s3,
+    ] = json.params.as_slice()
+    else {
+        return Err(parse(format!(
+            "expected 16 fisheye params, got {}",
+            json.params.len()
+        )));
+    };
+    // Fisheye624Camera has one focal length.
+    if (fx - fy).abs() > 1e-9 * fx.abs() {
+        return Err(parse(format!("fx {fx} and fy {fy} differ")));
+    }
+    let bits = |rigid: &RigidJson| (rigid.qvec.map(f64::to_bits), rigid.tvec.map(f64::to_bits));
+    if bits(&json.t_b_s) != bits(pinhole_t_b_s) {
+        return Err(parse(
+            "T_b_s differs from the pinhole calibration's".to_string(),
+        ));
+    }
+    Ok(LamariaCamera {
+        camera: PinholeCamera {
+            fx,
+            fy: fx,
+            cx,
+            cy,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        },
+        width: json.resolution.width,
+        height: json.resolution.height,
+        camera_to_body: rigid(&json.t_b_s),
+        raw: Some(Fisheye624Camera {
+            f: fx,
+            cx,
+            cy,
+            k: [k0, k1, k2, k3, k4, k5],
+            p: [p0, p1],
+            s: [s0, s1, s2, s3],
+        }),
     })
 }
 
@@ -312,6 +424,89 @@ mod tests {
             .clamp(-1.0, 1.0)
             .acos()
             .to_degrees()
+    }
+
+    const T_B_S: &str = r#"{"qvec": [0.7871966367212387, 0.08407781810505843, -0.05361927390966591, 0.6085863530369895], "tvec": [0.01678296927310889, -0.10892921838506506, 0.07605583988186104]}"#;
+
+    fn camera_json(model: &str, params: &[f64], t_b_s: &str) -> CameraJson {
+        serde_json::from_str(&format!(
+            r#"{{"model": "{model}", "params": {params:?}, "resolution": {{"width": 640, "height": 480}}, "T_b_s": {t_b_s}}}"#
+        ))
+        .unwrap()
+    }
+
+    fn pinhole_t_b_s() -> RigidJson {
+        serde_json::from_str(T_B_S).unwrap()
+    }
+
+    fn raw_params() -> Vec<f64> {
+        let mut params = vec![241.6, 241.6, 322.9, 240.4];
+        params.extend((1..=12).map(|i| i as f64 * 1e-3));
+        params
+    }
+
+    fn raw(params: &[f64], t_b_s: &str) -> Result<LamariaCamera, DatasetError> {
+        raw_camera(
+            camera_json(ARIA_FISHEYE_MODEL, params, t_b_s),
+            &pinhole_t_b_s(),
+            Path::new("aria.json"),
+        )
+    }
+
+    #[test]
+    fn raw_fisheye_params_follow_the_aria_order() {
+        let params = raw_params();
+        let camera = raw(&params, T_B_S).unwrap();
+        let model = camera.raw.unwrap();
+        assert_eq!((model.f, model.cx, model.cy), (241.6, 322.9, 240.4));
+        assert_eq!(model.k.as_slice(), &params[4..10]);
+        assert_eq!(model.p.as_slice(), &params[10..12]);
+        assert_eq!(model.s.as_slice(), &params[12..16]);
+        assert_eq!(
+            (
+                camera.camera.fx,
+                camera.camera.fy,
+                camera.camera.cx,
+                camera.camera.cy
+            ),
+            (241.6, 241.6, 322.9, 240.4)
+        );
+        assert_eq!((camera.width, camera.height), (640, 480));
+    }
+
+    #[test]
+    fn raw_fisheye_rejects_unequal_focal_lengths() {
+        let mut params = raw_params();
+        params[1] = 241.6 * (1.0 + 1e-8);
+        assert!(matches!(raw(&params, T_B_S), Err(DatasetError::Parse(_))));
+        params[1] = 241.6 * (1.0 + 1e-10);
+        assert!(raw(&params, T_B_S).is_ok());
+    }
+
+    #[test]
+    fn raw_fisheye_rejects_other_models_and_param_counts() {
+        let json = camera_json("PINHOLE", &raw_params(), T_B_S);
+        let path = Path::new("aria.json");
+        assert!(matches!(
+            raw_camera(json, &pinhole_t_b_s(), path),
+            Err(DatasetError::Parse(_))
+        ));
+        assert!(matches!(
+            raw(&raw_params()[..15], T_B_S),
+            Err(DatasetError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn raw_fisheye_rejects_a_one_ulp_extrinsics_mismatch() {
+        let tvec = 0.07605583988186104f64;
+        let nudged = f64::from_bits(tvec.to_bits() + 1);
+        let t_b_s = T_B_S.replace(&format!("{tvec:?}"), &format!("{nudged:?}"));
+        assert_ne!(t_b_s, T_B_S);
+        assert!(matches!(
+            raw(&raw_params(), &t_b_s),
+            Err(DatasetError::Parse(_))
+        ));
     }
 
     #[test]
