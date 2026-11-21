@@ -64,6 +64,12 @@ struct Args {
     #[argh(option)]
     trajectory_coasted: Option<String>,
 
+    /// also write the frames coasted on the IMU prediction to
+    /// --trajectory-out, so it has one pose per frame through visual gaps
+    /// (card L)
+    #[argh(switch)]
+    trajectory_include_coasted: bool,
+
     /// like --trajectory-out, written at shutdown with each frame re-anchored
     /// to its reference keyframe's final pose (ORB-SLAM3's SaveTrajectoryEuRoC)
     #[argh(option)]
@@ -278,6 +284,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .transpose()?;
+    let mut poses_written: u64 = 0;
     let mut trajectory_coasted = args
         .trajectory_coasted
         .as_deref()
@@ -462,9 +469,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if let Some(writer) = trajectory_out.as_mut()
-            && result.status != kornia_slam::TrackingStatus::Skipped
+            && writes_scored_pose(
+                result.status,
+                system.last_skip(),
+                args.trajectory_include_coasted,
+            )
         {
             writer.write(timestamp_sec, &result.pose_world_to_cam)?;
+            poses_written += 1;
         }
         if let Some(writer) = trajectory_coasted.as_mut()
             && is_inertial_coast(system.last_skip())
@@ -563,6 +575,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
     );
     eprintln!("{}", summary::format(&system.run_counters(), &frame_times));
+    if trajectory_out.is_some() {
+        eprintln!("[summary] poses_written={poses_written}");
+    }
     if let Some(writer) = trajectory_out {
         writer.finish()?;
     }
@@ -639,6 +654,16 @@ fn is_inertial_coast(skip: Option<SkipKind>) -> bool {
     skip == Some(SkipKind::Coasting { inertial: true })
 }
 
+/// Whether a frame's pose goes to --trajectory-out: every tracked frame, plus
+/// the inertial coasts when they are included.
+fn writes_scored_pose(
+    status: kornia_slam::TrackingStatus,
+    skip: Option<SkipKind>,
+    include_coasted: bool,
+) -> bool {
+    status != kornia_slam::TrackingStatus::Skipped || (include_coasted && is_inertial_coast(skip))
+}
+
 #[cfg(test)]
 mod cli_tests {
     use argh::FromArgs;
@@ -705,5 +730,31 @@ mod cli_tests {
         })));
         assert!(!is_inertial_coast(Some(SkipKind::Bootstrap)));
         assert!(!is_inertial_coast(None));
+    }
+
+    #[test]
+    fn coasted_poses_reach_the_scored_trajectory_only_when_included() {
+        use kornia_slam::TrackingStatus::Skipped;
+        let inertial = Some(SkipKind::Coasting { inertial: true });
+        let visual = Some(SkipKind::Coasting { inertial: false });
+        assert!(!writes_scored_pose(Skipped, inertial, false));
+        assert!(writes_scored_pose(Skipped, inertial, true));
+        assert!(!writes_scored_pose(Skipped, visual, true));
+        assert!(!writes_scored_pose(
+            Skipped,
+            Some(SkipKind::Bootstrap),
+            true
+        ));
+        assert!(!writes_scored_pose(Skipped, None, true));
+        assert!(
+            parse(&["--config", "r.ron", "--trajectory-include-coasted"])
+                .unwrap()
+                .trajectory_include_coasted
+        );
+        assert!(
+            !parse(&["--config", "r.ron"])
+                .unwrap()
+                .trajectory_include_coasted
+        );
     }
 }

@@ -108,6 +108,9 @@ has been scored on a benchmark sequence yet.
   scene depth, as ORB-SLAM3's `CreateNewMapPoints` (card K).
   **Breaking (library):** `growth::pair_growth_request` takes the ratio;
   `MappingConfig` gains a field.
+- App: `--trajectory-include-coasted` (off) also writes the frames coasted on
+  the IMU prediction to `--trajectory-out`, so it has one pose per frame through
+  visual gaps; a `[summary] poses_written=` line counts the rows (card L).
 - `keyframes.rules` (`Kornia`): `OrbSlam3(max_frames)` inserts keyframes by
   ORB-SLAM3's `NeedNewKeyFrame`.
 - `tracking_loss.relocalization.while_lost` (`false`): relocalize on every lost
