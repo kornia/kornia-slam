@@ -122,11 +122,22 @@ fn solve(session: &SessionDump, config: &OfflineBaConfig) -> OfflineBaResult {
     solve_with(session, SampleInterpolation::Hold, config)
 }
 
+/// Every solve in this module takes it, so the parallelism test reads a
+/// global no other solve is changing.
+static FAER_GLOBAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn faer_global() -> std::sync::MutexGuard<'static, ()> {
+    FAER_GLOBAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn solve_with(
     session: &SessionDump,
     interpolation: SampleInterpolation,
     config: &OfflineBaConfig,
 ) -> OfflineBaResult {
+    let _global = faer_global();
     offline_visual_inertial_ba(
         session,
         &VisualInformation::Unit,
@@ -227,6 +238,7 @@ fn a_calibration_state_on_exact_data_stays_near_zero() {
 fn an_older_dump_is_refused() {
     let mut session = synthetic_session(0.0);
     session.version = SESSION_DUMP_VERSION + 1;
+    let _global = faer_global();
     let error = offline_visual_inertial_ba(
         &session,
         &VisualInformation::Unit,
@@ -437,4 +449,39 @@ fn the_report_adds_the_applied_clock_offset() {
             .to_string()
             .contains(&format!("td_ms={td:.4} td_total_ms={:.4}", 2.0 + td))
     );
+}
+
+/// A-8: the solve runs sequential and leaves faer's global parallelism as
+/// it found it, on success and on an error. Red on the old code
+/// (2026-11-21): it stayed `Par::Seq`.
+#[test]
+fn offline_ba_restores_global_parallelism() {
+    let _global = faer_global();
+    let previous = faer::get_global_parallelism();
+    let threaded = faer::Par::rayon(3);
+    faer::set_global_parallelism(threaded);
+    let session = synthetic_session(0.03);
+    let solved = offline_visual_inertial_ba(
+        &session,
+        &VisualInformation::Unit,
+        StereoDepthSigma::default(),
+        SampleInterpolation::Hold,
+        &OfflineBaConfig::default(),
+    );
+    let after_solve = faer::get_global_parallelism();
+    let mut older = session;
+    older.version = SESSION_DUMP_VERSION + 1;
+    let refused = offline_visual_inertial_ba(
+        &older,
+        &VisualInformation::Unit,
+        StereoDepthSigma::default(),
+        SampleInterpolation::Hold,
+        &OfflineBaConfig::default(),
+    );
+    let after_error = faer::get_global_parallelism();
+    faer::set_global_parallelism(previous);
+    assert!(solved.is_ok());
+    assert!(refused.is_err());
+    assert_eq!(after_solve, threaded);
+    assert_eq!(after_error, threaded);
 }

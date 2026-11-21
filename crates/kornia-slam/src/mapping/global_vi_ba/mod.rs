@@ -206,11 +206,13 @@ pub enum OfflineBaError {
     InvalidConfig(#[from] ConfigError),
 }
 
-/// Solves one global VI-BA over `session`, weighting observations as the
-/// online VI-BA does (`visual`, `stereo_depth_sigma`) and integrating the IMU
-/// as the run did (`interpolation`). Runs on one thread, so the result
-/// depends on the dump alone: it sets faer's global parallelism to
-/// sequential.
+/// Solves one global VI-BA over `session`, weighting each observation by its
+/// octave's pixel sigma (`visual`) and its stereo depth by
+/// `stereo_depth_sigma`, and integrating the IMU as the run did
+/// (`interpolation`). Unlike the online VI-BA it applies no `fisheye_weight`,
+/// and it reads no keyframe's `anchor`, `evicted` or `inserted_while_lost`
+/// flag. Runs on one thread, so the result depends on the dump alone: faer's
+/// global parallelism is sequential during the solve and restored after it.
 pub fn offline_visual_inertial_ba(
     session: &SessionDump,
     visual: &VisualInformation,
@@ -219,7 +221,7 @@ pub fn offline_visual_inertial_ba(
     config: &OfflineBaConfig,
 ) -> Result<OfflineBaResult, OfflineBaError> {
     config.validate()?;
-    faer::set_global_parallelism(faer::Par::Seq);
+    let _sequential = SequentialFaer::enter();
     let layout = Layout::new(&config.calibration, session.rig.cameras.len());
     let (problem, start) = Problem::new(session, *visual, stereo_depth_sigma, &layout)?;
     let (edges, gap_max_s) = build_edges(&problem, config.bridge_segments);
@@ -299,6 +301,24 @@ pub fn reanchor_frames(session: &SessionDump, body_poses: &[Pose3d]) -> Vec<(f64
             Some((frame.timestamp_sec, body_from_kf_body.compose(pose_bw)))
         })
         .collect()
+}
+
+/// Holds faer's global parallelism at `Par::Seq` and restores the previous
+/// value on drop, on the error paths too.
+struct SequentialFaer(faer::Par);
+
+impl SequentialFaer {
+    fn enter() -> Self {
+        let previous = faer::get_global_parallelism();
+        faer::set_global_parallelism(faer::Par::Seq);
+        Self(previous)
+    }
+}
+
+impl Drop for SequentialFaer {
+    fn drop(&mut self) {
+        faer::set_global_parallelism(self.0);
+    }
 }
 
 /// Dump position of every keyframe by its id.
