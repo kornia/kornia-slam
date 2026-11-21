@@ -1938,13 +1938,11 @@ struct SystemState<'s> {
 }
 
 /// The reduced keyframe system of one linearization, before LM damping of
-/// the keyframe block, and what back-substitution needs from the points.
+/// the keyframe block, with its point blocks' inverses for back-substitution.
 struct ReducedSystem {
     m_mat: Mat<f64>,
     m_vec: Vec<f64>,
-    vis: VisualBlocks,
     c_inv: Vec<Option<SMatF64<3, 3>>>,
-    border: Option<Border>,
     cost: f64,
     /// Visual, IMU, accel-bias prior and boundary prior terms of `cost`.
     split: [f64; 4],
@@ -1953,17 +1951,43 @@ struct ReducedSystem {
     time: [Duration; 2],
 }
 
-/// Builds the reduced system at `state`, the point blocks damped by
-/// `lambda`. The observations of the free points `dropped_points` marks are
-/// left out.
-fn build_reduced_system(
+/// One IMU edge linearized: its free slots, residual, Jacobians, robust
+/// information and calibration columns.
+struct ImuTerm {
+    li: i64,
+    lj: i64,
+    res: Vec15F64,
+    ji: Mat15F64,
+    jj: Mat15F64,
+    omega: Mat15F64,
+    columns: Option<Vec<(usize, Vec15F64)>>,
+}
+
+/// The window linearized at one state: the undamped visual blocks, the
+/// calibration border's visual rows, and the IMU terms. A rejected LM step
+/// leaves the state, so the next damping reuses it (card R, 5a).
+struct Linearization {
+    vis: VisualBlocks,
+    cost_vis: f64,
+    /// Zero but for the border's visual rows.
+    m_mat: Mat<f64>,
+    m_vec: Vec<f64>,
+    border: Option<Border>,
+    imu: Vec<ImuTerm>,
+    cost_imu: f64,
+    /// Wall time of the visual and of the IMU linearization.
+    time: [Duration; 2],
+}
+
+/// Linearizes the window at `state`. The observations of the free points
+/// `dropped_points` marks are left out.
+fn linearize(
     inputs: &SystemInputs<'_>,
     state: &SystemState<'_>,
-    lambda: f64,
     vis_inlier: &mut [bool],
     is_first_iter: bool,
     dropped_points: &[bool],
-) -> ReducedSystem {
+) -> Linearization {
     const KF_DOF: usize = 15;
     let SystemInputs {
         keyframes,
@@ -1979,10 +2003,7 @@ fn build_reduced_system(
         n_free_pts,
         n_cal,
         prior,
-        wheel_edges,
-        wheel_info,
-        stationary_edges,
-        stationary_info,
+        ..
     } = *inputs;
     let SystemState {
         kfs,
@@ -2084,55 +2105,11 @@ fn build_reduced_system(
         }
     }
 
-    // ── 2. Invert C blocks, build Schur-reduced system ───────────────
-    // Scatter A blocks into the upper-left 6×6 of each 15×15 slot.
-    for (k, (ab, gp)) in vis.a.iter().zip(&vis.g_pose).enumerate() {
-        let base = k * KF_DOF;
-        add_block(&mut m_mat, base, base, ab);
-        m_vec[base..(6 + base)].copy_from_slice(gp.as_slice());
-    }
+    let visual_time = started.elapsed();
 
-    // Schur point elimination: M -= B C⁻¹ Bᵀ,  m -= B C⁻¹ g_point.
-    // Point back-substitution only needs the first 6 elements of each
-    // keyframe's delta (pose DOF), so the B blocks are 6×3 as before.
-
-    damp_point_blocks(&mut vis.c, lambda);
-    let c_inv: Vec<Option<SMatF64<3, 3>>> = vis.c.iter().map(invert_point_block).collect();
-
-    for (x, ((b_for_j, ci), g_point)) in vis
-        .b_by_point
-        .iter()
-        .zip(&c_inv)
-        .zip(&vis.g_point)
-        .enumerate()
-    {
-        let Some(ci) = ci else {
-            continue;
-        };
-        if let Some(border) = border.as_ref() {
-            border.eliminate_point(&mut m_mat, &mut m_vec, x, ci, g_point, b_for_j);
-        }
-        let bc: Vec<(usize, SMatF64<6, 3>)> =
-            b_for_j.iter().map(|(i_loc, b)| (*i_loc, b * ci)).collect();
-
-        for (i_loc, bc_block) in &bc {
-            sub_from(&mut m_vec, i_loc * KF_DOF, &(bc_block * g_point));
-        }
-        for (i1_loc, bc1) in &bc {
-            for (i2_loc, b2) in b_for_j {
-                let s = bc1 * b2.transpose();
-                add_block(&mut m_mat, i1_loc * KF_DOF, i2_loc * KF_DOF, &-s);
-            }
-        }
-    }
-
-    let schur_time = started.elapsed();
-
-    // ── 3. IMU normal equations ───────────────────────────────────────
-    // Each edge contributes J_i^T Ω J_i, J_j^T Ω J_j (diagonal 15×15
-    // blocks) and J_i^T Ω J_j, J_j^T Ω J_i (off-diagonal 15×15 blocks).
+    // ── 3. IMU edges ──────────────────────────────────────────────────
     let mut cost_imu = 0.0f64;
-
+    let mut imu = Vec::with_capacity(imu_edges_now.len());
     for (e, edge) in imu_edges_now.iter().enumerate() {
         let i = edge.from_idx;
         let j = edge.to_idx;
@@ -2191,18 +2168,129 @@ fn build_reduced_system(
             );
         }
 
+        let columns = calibration
+            .filter(|_| border.is_some())
+            .map(|c| c.imu_columns(e, edge, kfs, calib, params));
+        imu.push(ImuTerm {
+            li,
+            lj,
+            res,
+            ji,
+            jj,
+            omega,
+            columns,
+        });
+    }
+    Linearization {
+        vis,
+        cost_vis,
+        m_mat,
+        m_vec,
+        border,
+        imu,
+        cost_imu,
+        time: [visual_time, started.elapsed() - visual_time],
+    }
+}
+
+/// The reduced system of `lin` at `state`, the point blocks damped by
+/// `lambda`.
+fn assemble(
+    inputs: &SystemInputs<'_>,
+    state: &SystemState<'_>,
+    lin: &Linearization,
+    lambda: f64,
+) -> ReducedSystem {
+    const KF_DOF: usize = 15;
+    let SystemInputs {
+        keyframes,
+        params,
+        calibration,
+        kf_local,
+        prior,
+        wheel_edges,
+        wheel_info,
+        stationary_edges,
+        stationary_info,
+        ..
+    } = *inputs;
+    let SystemState { kfs, calib, .. } = *state;
+    let started = Instant::now();
+    let (vis, border) = (&lin.vis, &lin.border);
+    let mut m_mat = lin.m_mat.clone();
+    let mut m_vec = lin.m_vec.clone();
+
+    // ── 2. Invert C blocks, build Schur-reduced system ───────────────
+    // Scatter A blocks into the upper-left 6×6 of each 15×15 slot.
+    for (k, (ab, gp)) in vis.a.iter().zip(&vis.g_pose).enumerate() {
+        let base = k * KF_DOF;
+        add_block(&mut m_mat, base, base, ab);
+        m_vec[base..(6 + base)].copy_from_slice(gp.as_slice());
+    }
+
+    // Schur point elimination: M -= B C⁻¹ Bᵀ,  m -= B C⁻¹ g_point.
+    // Point back-substitution only needs the first 6 elements of each
+    // keyframe's delta (pose DOF), so the B blocks are 6×3 as before.
+
+    let mut c = vis.c.clone();
+    damp_point_blocks(&mut c, lambda);
+    let c_inv: Vec<Option<SMatF64<3, 3>>> = c.iter().map(invert_point_block).collect();
+
+    for (x, ((b_for_j, ci), g_point)) in vis
+        .b_by_point
+        .iter()
+        .zip(&c_inv)
+        .zip(&vis.g_point)
+        .enumerate()
+    {
+        let Some(ci) = ci else {
+            continue;
+        };
+        if let Some(border) = border.as_ref() {
+            border.eliminate_point(&mut m_mat, &mut m_vec, x, ci, g_point, b_for_j);
+        }
+        let bc: Vec<(usize, SMatF64<6, 3>)> =
+            b_for_j.iter().map(|(i_loc, b)| (*i_loc, b * ci)).collect();
+
+        for (i_loc, bc_block) in &bc {
+            sub_from(&mut m_vec, i_loc * KF_DOF, &(bc_block * g_point));
+        }
+        for (i1_loc, bc1) in &bc {
+            for (i2_loc, b2) in b_for_j {
+                let s = bc1 * b2.transpose();
+                add_block(&mut m_mat, i1_loc * KF_DOF, i2_loc * KF_DOF, &-s);
+            }
+        }
+    }
+
+    let schur_time = started.elapsed();
+
+    // ── 3. IMU normal equations ───────────────────────────────────────
+    // Each edge contributes J_i^T Ω J_i, J_j^T Ω J_j (diagonal 15×15
+    // blocks) and J_i^T Ω J_j, J_j^T Ω J_i (off-diagonal 15×15 blocks).
+    for term in &lin.imu {
+        let ImuTerm {
+            li,
+            lj,
+            res,
+            ji,
+            jj,
+            omega,
+            ..
+        } = term;
+        let (li, lj) = (*li, *lj);
         // Accumulate H_ii, g_i.
         if li >= 0 {
             let base_i = li as usize * KF_DOF;
             accum_jt_omega_j(
-                &mut m_mat, &mut m_vec, base_i, base_i, &ji, &ji, &omega, &res, true,
+                &mut m_mat, &mut m_vec, base_i, base_i, ji, ji, omega, res, true,
             );
         }
         // Accumulate H_jj, g_j.
         if lj >= 0 {
             let base_j = lj as usize * KF_DOF;
             accum_jt_omega_j(
-                &mut m_mat, &mut m_vec, base_j, base_j, &jj, &jj, &omega, &res, true,
+                &mut m_mat, &mut m_vec, base_j, base_j, jj, jj, omega, res, true,
             );
         }
         // Off-diagonal H_ij and H_ji (symmetric pair).
@@ -2210,24 +2298,24 @@ fn build_reduced_system(
             let base_i = li as usize * KF_DOF;
             let base_j = lj as usize * KF_DOF;
             accum_jt_omega_j(
-                &mut m_mat, &mut m_vec, base_i, base_j, &ji, &jj, &omega, &res, false,
+                &mut m_mat, &mut m_vec, base_i, base_j, ji, jj, omega, res, false,
             );
             accum_jt_omega_j(
-                &mut m_mat, &mut m_vec, base_j, base_i, &jj, &ji, &omega, &res, false,
+                &mut m_mat, &mut m_vec, base_j, base_i, jj, ji, omega, res, false,
             );
         }
-        if let (Some(c), Some(border)) = (calibration, border.as_ref()) {
-            let columns = c.imu_columns(e, edge, kfs, calib, params);
+        if let (Some(columns), Some(border)) = (term.columns.as_ref(), border.as_ref()) {
             border.add_imu(
                 &mut m_mat,
                 &mut m_vec,
-                &columns,
-                &res,
-                &omega,
-                [(li, &ji), (lj, &jj)],
+                columns,
+                res,
+                omega,
+                [(li, ji), (lj, jj)],
             );
         }
     }
+    let (cost_vis, cost_imu) = (lin.cost_vis, lin.cost_imu);
 
     // ── 3b. Accel-bias magnitude prior (unary, per free keyframe) ────────
     // See ViBaParams::accel_bias_prior_weight doc. Deliberately not scaled
@@ -2289,12 +2377,13 @@ fn build_reduced_system(
     ReducedSystem {
         m_mat,
         m_vec,
-        vis,
         c_inv,
-        border,
         cost,
         split: [cost_vis, cost_imu, cost_bias_prior, cost_prior],
-        time: [schur_time, started.elapsed() - schur_time],
+        time: [
+            lin.time[0] + schur_time,
+            lin.time[1] + started.elapsed() - schur_time,
+        ],
     }
 }
 
@@ -2304,8 +2393,8 @@ fn build_reduced_system(
 /// its inverse would be round-off.
 fn undamped_information(inputs: &SystemInputs<'_>, state: &SystemState<'_>) -> Mat<f64> {
     let mut inliers = vec![false; inputs.observations.len()];
-    let system = build_reduced_system(inputs, state, 0.0, &mut inliers, false, &[]);
-    let rank_deficient: Vec<bool> = system
+    let lin = linearize(inputs, state, &mut inliers, false, &[]);
+    let rank_deficient: Vec<bool> = lin
         .vis
         .c
         .iter()
@@ -2315,9 +2404,10 @@ fn undamped_information(inputs: &SystemInputs<'_>, state: &SystemState<'_>) -> M
         })
         .collect();
     if !rank_deficient.contains(&true) {
-        return system.m_mat;
+        return assemble(inputs, state, &lin, 0.0).m_mat;
     }
-    build_reduced_system(inputs, state, 0.0, &mut inliers, false, &rank_deficient).m_mat
+    let lin = linearize(inputs, state, &mut inliers, false, &rank_deficient);
+    assemble(inputs, state, &lin, 0.0).m_mat
 }
 
 /// Visual-inertial bundle adjustment via dense Schur-complement reduction.
@@ -2495,6 +2585,8 @@ fn solve_vi_ba(
     // current linearization point (refreshed by every system build).
     let mut vis_inlier = vec![false; observations.len()];
     let mut time = SolveTime::default();
+    // The linearization at the current state; a rejected step keeps it.
+    let mut linearized: Option<Linearization> = None;
 
     for _iter in 0..params.max_iterations {
         iters_done += 1;
@@ -2507,16 +2599,17 @@ fn solve_vi_ba(
             calib: &calib,
             imu_edges: cal_edges.as_deref().unwrap_or(imu_edges),
         };
+        let lin = linearized
+            .get_or_insert_with(|| linearize(&inputs, &state, &mut vis_inlier, is_first_iter, &[]));
         let ReducedSystem {
             mut m_mat,
             m_vec,
-            vis,
             c_inv,
-            border,
             cost: cost_f64,
             split,
             time: [schur_time, imu_time],
-        } = build_reduced_system(&inputs, &state, lambda, &mut vis_inlier, is_first_iter, &[]);
+        } = assemble(&inputs, &state, lin, lambda);
+        let (vis, border) = (&lin.vis, &lin.border);
         time.schur += schur_time;
         time.imu += imu_time;
         let chol_started = Instant::now();
@@ -2779,6 +2872,7 @@ fn solve_vi_ba(
             } else {
                 0.0
             };
+            linearized = None;
             kfs = kfs_trial;
             se3s = se3s_trial;
             xyz = xyz_trial;
