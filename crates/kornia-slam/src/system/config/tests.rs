@@ -851,7 +851,8 @@ fn orin_preset(threads: usize, per_camera: usize) -> SystemConfig {
         gyro_guess: GyroGuess::RotatedRay,
         flow_pose: FlowPose::AnalyticGn { max_iter: 3 },
         flow_bookkeeping: FlowBookkeeping::KeyframesOnly,
-        keyframe_orb: KeyframeOrb::Mapping,
+        // Card E's `Mapping` has no tracking path yet, so validation refuses it.
+        keyframe_orb: KeyframeOrb::Tracking,
         ..OrbFrontendConfig::default()
     });
     config
@@ -1553,7 +1554,7 @@ mod ron_files {
         );
 
         let config = parse(
-            "(version: 1, pipeline: OrbSlam((tracking: (frame_velocity: PropagatedFromKeyframe))))",
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking: (frame_velocity: PropagatedFromKeyframe))))",
         )
         .unwrap();
         assert_eq!(
@@ -2037,7 +2038,7 @@ mod ron_files {
                     gyro_guess: RotatedRay,
                     flow_pose: AnalyticGn(max_iter: 3),
                     flow_bookkeeping: KeyframesOnly,
-                    keyframe_orb: Mapping,
+                    keyframe_orb: Tracking,
                 )),
                 mapping: ( execution: Asynchronous ),
             )),
@@ -2154,4 +2155,125 @@ fn knobs_that_read_the_imu_are_refused_without_it() {
         );
     }
     assert_eq!(with(false, &|_| {}), Ok(()), "the defaults need no IMU");
+}
+
+/// R-C6: `keyframe_orb: Mapping` parses, but no tracking path reads it, so it
+/// is a config error rather than a panic in `SlamSystem::build`.
+#[test]
+fn keyframe_orb_mapping_is_a_config_error() {
+    let mapping = OrbFrontendConfig {
+        keyframe_orb: KeyframeOrb::Mapping,
+        ..OrbFrontendConfig::default()
+    };
+    let unbuilt = Err(ConfigError::FrontendKnobNeeds {
+        knob: "keyframe_orb",
+        needs: crate::system::validation::UNBUILT,
+    });
+    assert_eq!(
+        with_frontend(mapping, CameraSelection::Rig).validate(),
+        unbuilt
+    );
+    let mut built = orin_preset(2, 48);
+    assert_eq!(built.validate(), Ok(()));
+    let FrontendConfig::Orb(frontend) = &mut orb_mut(&mut built).frontend;
+    frontend.keyframe_orb = KeyframeOrb::Mapping;
+    assert_eq!(built.validate(), unbuilt);
+}
+
+/// R-C8: the frame velocity knob reads the IMU and is inert under the
+/// pose-inertial solve.
+#[test]
+fn the_frame_velocity_needs_the_imu_and_no_pose_inertial_solve() {
+    let with = |imu: bool, pose_inertial: PoseInertial| {
+        let mut config = SystemConfig {
+            sensors: sensors(CameraSelection::Stereo, imu),
+            ..SystemConfig::default()
+        };
+        let tracking = &mut orb_mut(&mut config).tracking;
+        tracking.frame_velocity = FrameVelocity::PropagatedFromKeyframe;
+        tracking.pose_inertial = pose_inertial;
+        config.validate()
+    };
+    assert_eq!(with(true, PoseInertial::Off), Ok(()));
+    assert_eq!(
+        with(false, PoseInertial::Off),
+        Err(ConfigError::InertialKnobWithoutImu(
+            "tracking.frame_velocity"
+        ))
+    );
+    for mode in [PoseInertial::LastKeyframe, PoseInertial::OrbSlam3] {
+        assert_eq!(
+            with(true, mode),
+            Err(ConfigError::FrameVelocityWithPoseInertial),
+            "{mode:?}"
+        );
+    }
+}
+
+/// R-C8: the IMU-propagated keyframe seed reads the IMU.
+#[test]
+fn the_imu_propagated_keyframe_seed_needs_the_imu() {
+    use crate::mapping::KeyframeSeed;
+    let with = |imu: bool| {
+        let mut config = SystemConfig {
+            sensors: sensors(CameraSelection::Stereo, imu),
+            ..SystemConfig::default()
+        };
+        orb_mut(&mut config).mapping.keyframe_seed = KeyframeSeed::ImuPropagated;
+        config.validate()
+    };
+    assert_eq!(with(true), Ok(()));
+    assert_eq!(
+        with(false),
+        Err(ConfigError::InertialKnobWithoutImu("mapping.keyframe_seed"))
+    );
+}
+
+/// R-C8: a bridge edge longer than the IMU buffer would be integrated from
+/// a truncated buffer.
+#[test]
+fn the_bridge_is_bounded_by_the_imu_buffer() {
+    use crate::inertial::MAX_BUFFERED_SEC;
+    let with = |max_bridge_sec: f64| {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).tracking_loss.reseed.max_bridge_sec = max_bridge_sec;
+        invalid_setting(&config)
+    };
+    assert_eq!(MAX_BUFFERED_SEC, 30.0, "the error message names 30 s");
+    assert_eq!(with(MAX_BUFFERED_SEC), None);
+    let refused = Some("tracking_loss.reseed.max_bridge_sec".to_string());
+    for value in [0.0, MAX_BUFFERED_SEC + 0.1, f64::INFINITY] {
+        assert_eq!(with(value), refused, "{value}");
+    }
+}
+
+/// R-D3: a lock-free flow frame has no descriptors, and a late pose-inertial
+/// reject would send it to relocalization and lost keyframes.
+#[test]
+fn pose_inertial_with_windowed_flow_is_refused() {
+    let with = |flow_pose: FlowPose, klt_first: KltFirst, pose_inertial: PoseInertial| {
+        let mut config = orin_preset(2, 48);
+        let orb = orb_mut(&mut config);
+        let FrontendConfig::Orb(frontend) = &mut orb.frontend;
+        frontend.flow_pose = flow_pose;
+        frontend.klt_first = klt_first;
+        orb.tracking.pose_inertial = pose_inertial;
+        config.validate()
+    };
+    let analytic = FlowPose::AnalyticGn { max_iter: 3 };
+    let klt_first = KltFirst::default();
+    assert_ne!(klt_first, KltFirst::Disabled);
+    assert_eq!(
+        with(analytic, klt_first, PoseInertial::LastKeyframe),
+        Err(ConfigError::PoseInertialWithLockFreeFlow)
+    );
+    assert_eq!(with(analytic, klt_first, PoseInertial::Off), Ok(()));
+    assert_eq!(
+        with(FlowPose::RansacPnp, klt_first, PoseInertial::LastKeyframe),
+        Ok(())
+    );
+    assert_eq!(
+        with(analytic, KltFirst::Disabled, PoseInertial::LastKeyframe),
+        Ok(())
+    );
 }

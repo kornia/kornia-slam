@@ -274,7 +274,11 @@ impl SlamSystem {
         config.validate_raw_fisheye(&rig)?;
         let settings = config.settings(&rig);
         if let Some(knob) = settings.frontend_flow.unbuilt_knob() {
-            todo!("lane T: frontend.{knob}");
+            return Err(ConfigError::FrontendKnobNeeds {
+                knob,
+                needs: validation::UNBUILT,
+            }
+            .into());
         }
         let frontend = OrbFrontend::new(config.orb_detector(), &rig)
             .with_secondary_keypoints(config.secondary_n_keypoints())

@@ -2,24 +2,25 @@ use kornia_imgproc::features::OrbMatchConfig;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    AnchorGuard, CameraSelection, FlowPose, ForwardBackward, FrontendConfig, KeyframeOrb, KltFirst,
-    KltRetry, KltRig, LocalBaConfig, LoopClosingMode, MAX_FLOW_THREADS, OnlineCalibrationConfig,
-    OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition, PoseInertial,
-    SYSTEM_CONFIG_VERSION, SensorSelection, SnapbackFix, StereoCloseDepth, StereoDepthSigma,
-    SystemConfig, TrackRefill, TrackingConfig, TrackingLossConfig,
+    AnchorGuard, CameraSelection, FlowPose, ForwardBackward, FrameVelocity, FrontendConfig,
+    KeyframeOrb, KltFirst, KltRetry, KltRig, LocalBaConfig, LoopClosingMode, MAX_FLOW_THREADS,
+    OnlineCalibrationConfig, OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition,
+    PoseInertial, SYSTEM_CONFIG_VERSION, SensorSelection, SnapbackFix, StereoCloseDepth,
+    StereoDepthSigma, SystemConfig, TrackRefill, TrackingConfig, TrackingLossConfig,
 };
 use super::recovery::RecoveryConfig;
+use crate::inertial::MAX_BUFFERED_SEC;
 use crate::inertial::trust::ImuTrustMode;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{
     LoopClosingConfig, LoopGraphInformation, LoopOdometryGate, LoopTemporalConsistency,
     OdometryRandomWalk,
 };
-use crate::mapping::GrowthNeighbours;
 use crate::mapping::bundle_adjustment::{LargeWindow, LostKeyframes};
 use crate::mapping::global_vi_ba::OfflineBaConfig;
 use crate::mapping::map::StateEnvelope;
 use crate::mapping::marginalization::BoundaryPrior;
+use crate::mapping::{GrowthNeighbours, KeyframeSeed};
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
 use crate::tracking::pose_gate::PoseGate;
@@ -81,6 +82,17 @@ pub enum ConfigError {
         "tracking.snapback_fix AnchorNextFrame is part of tracking.pose_inertial: set one of them"
     )]
     SnapbackFixWithPoseInertial,
+    #[error(
+        "tracking.frame_velocity PropagatedFromKeyframe has no effect with tracking.pose_inertial: \
+         the pose-inertial solve carries its own velocity; set one of them"
+    )]
+    FrameVelocityWithPoseInertial,
+    #[error(
+        "tracking.pose_inertial needs descriptors on every frame it can reject, but with \
+         frontend.klt_first, klt_kernel WindowedU8 and flow_pose AnalyticGn a flow frame has \
+         none: set flow_pose RansacPnp or pose_inertial Off"
+    )]
+    PoseInertialWithLockFreeFlow,
     #[error("`{0}` needs loop closing's vocabulary: enable `pipeline.loop_closing`")]
     RelocalizationWithoutVocabulary(&'static str),
     #[error("frontend.{knob} needs {needs}")]
@@ -138,6 +150,12 @@ impl OrbSlamPipeline {
         validate_pose_gate(&self.tracking_loss.pose_gate, sensors.imu)?;
         validate_lost_relocalization(&self.tracking_loss, &self.loop_closing)?;
         validate_estimator(&self.tracking, sensors.imu)?;
+        match &self.frontend {
+            FrontendConfig::Orb(orb) => validate_lock_free_flow(orb, &self.tracking)?,
+        }
+        if self.mapping.keyframe_seed != KeyframeSeed::default() && !sensors.imu {
+            return Err(ConfigError::InertialKnobWithoutImu("mapping.keyframe_seed"));
+        }
         check(
             "inertial.viba_velocity_gate",
             self.inertial.viba_velocity_gate,
@@ -187,7 +205,11 @@ fn validate_recovery(recovery: &RecoveryConfig, imu: bool) -> Result<(), ConfigE
         recovery.bridge_covariance_scale,
         AT_LEAST_ONE,
     )?;
-    check(at("max_bridge_sec"), recovery.max_bridge_sec, POSITIVE)?;
+    check(
+        at("max_bridge_sec"),
+        recovery.max_bridge_sec,
+        WITHIN_IMU_BUFFER,
+    )?;
     check(
         at("min_seed_points"),
         recovery.min_seed_points as f64,
@@ -252,9 +274,35 @@ fn validate_estimator(tracking: &TrackingConfig, imu: bool) -> Result<(), Config
         if tracking.snapback_fix != SnapbackFix::Off {
             return Err(ConfigError::InertialKnobWithoutImu("tracking.snapback_fix"));
         }
+        if tracking.frame_velocity != FrameVelocity::KeyframeVelocity {
+            return Err(ConfigError::InertialKnobWithoutImu(
+                "tracking.frame_velocity",
+            ));
+        }
     }
     if tracking.snapback_fix != SnapbackFix::Off && tracking.pose_inertial != PoseInertial::Off {
         return Err(ConfigError::SnapbackFixWithPoseInertial);
+    }
+    // The pose-inertial solve carries its own velocity (R-C8).
+    if tracking.frame_velocity != FrameVelocity::KeyframeVelocity
+        && tracking.pose_inertial != PoseInertial::Off
+    {
+        return Err(ConfigError::FrameVelocityWithPoseInertial);
+    }
+    Ok(())
+}
+
+/// A flow frame built without the map has no descriptors, so it must not
+/// reach the lost path, which a late pose-inertial reject sends it to (R-D3).
+fn validate_lock_free_flow(
+    frontend: &OrbFrontendConfig,
+    tracking: &TrackingConfig,
+) -> Result<(), ConfigError> {
+    let lock_free = frontend.klt_first != KltFirst::Disabled
+        && frontend.klt_kernel == LkKernel::WindowedU8
+        && matches!(frontend.flow_pose, FlowPose::AnalyticGn { .. });
+    if lock_free && tracking.pose_inertial != PoseInertial::Off {
+        return Err(ConfigError::PoseInertialWithLockFreeFlow);
     }
     Ok(())
 }
@@ -486,8 +534,15 @@ fn validate_flow(
     if frontend.keyframe_orb == KeyframeOrb::Mapping && frontend.klt_first == KltFirst::Disabled {
         return needs("keyframe_orb", "klt_first Enabled");
     }
+    // `SlamSystem::build` has no tracking path for it yet (R-C6).
+    if frontend.keyframe_orb == KeyframeOrb::Mapping {
+        return needs("keyframe_orb", UNBUILT);
+    }
     Ok(())
 }
+
+/// What a knob that parses but no tracking path reads yet needs.
+pub(super) const UNBUILT: &str = "a tracking path, which is not built yet (keep the default)";
 
 /// Every online calibration sigma, as the offline ones.
 fn validate_online_calibration(config: &OnlineCalibrationConfig) -> Result<(), ConfigError> {
@@ -965,6 +1020,12 @@ const AT_LEAST_ONE: Requirement = Requirement("finite and >= 1", |v| v >= 1.0);
 const UNIT_INTERVAL: Requirement = Requirement("in [0, 1]", |v| (0.0..=1.0).contains(&v));
 const OPEN_UNIT: Requirement = Requirement("in (0, 1)", |v| v > 0.0 && v < 1.0);
 const OPEN_UNIT_UPPER: Requirement = Requirement("in (0, 1]", |v| v > 0.0 && v <= 1.0);
+/// A span the IMU buffer still holds whole: a bridge edge integrated over a
+/// longer one would come from a truncated buffer (R-C8).
+const WITHIN_IMU_BUFFER: Requirement =
+    Requirement("in (0, 30] s, the span of the IMU buffer", |v| {
+        v > 0.0 && v <= MAX_BUFFERED_SEC
+    });
 
 fn check(
     setting: impl Into<String>,

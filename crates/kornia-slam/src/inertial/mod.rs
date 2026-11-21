@@ -26,7 +26,7 @@ use kornia_sensors::imu::{
 /// Longest span of IMU samples kept while no keyframe prunes them, well beyond
 /// the gap between keyframes. Also how far ahead of the latest image a sample
 /// may be before it is taken for a clock glitch.
-const MAX_BUFFERED_SEC: f64 = 30.0;
+pub(crate) const MAX_BUFFERED_SEC: f64 = 30.0;
 
 pub(crate) struct InertialState {
     pub(crate) bias: ImuBias,
