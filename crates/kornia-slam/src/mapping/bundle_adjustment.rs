@@ -23,7 +23,7 @@ use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::ransac::RobustKernelKind;
-use kornia_algebra::Vec3F64;
+use kornia_algebra::{SO3F64, Vec3F64};
 use kornia_factors::inertial::preintegration;
 use kornia_factors::inertial::stationary::StationaryFactor;
 use kornia_factors::wheel_odometry::WheelOdomFactor;
@@ -948,6 +948,7 @@ fn run_local_inertial_ba_inner(
             (&vi_keyframes, &window.positions),
             &vi_result,
             points_rejected,
+            gravity_world,
         );
     }
     window.write_back_where(&vi_result.points, &keep, &mut update.map_points);
@@ -1006,6 +1007,7 @@ fn debug_window_line(
     (kfs_before, points_before): (&[ViBaKeyframe], &[Vec3F64]),
     result: &ViBaResult,
     guard: usize,
+    gravity_world: Vec3F64,
 ) {
     let active: Vec<usize> = (active_start..keyframes.len())
         .filter(|&slot| !keyframes[slot].anchor)
@@ -1035,7 +1037,7 @@ fn debug_window_line(
     debug_eprintln!(
         "[vi_ba] WINDOW kf={} active={} lost={lost} fixed={} pts={} pinned={} obs={} \
             obs_fixed={obs_fixed} shift={:.4e} shift_rot={:.4e} pts_shift_pinned={:.4e} \
-            pts_shift_free={:.4e} guard={guard} iters={} conv={}",
+            pts_shift_free={:.4e} guard={guard} iters={} conv={} shift_tilt={:.4e} shift_yaw={:.4e}",
         keyframes[newest].frame.idx,
         active.len(),
         keyframes.len() - active.len(),
@@ -1048,7 +1050,27 @@ fn debug_window_line(
         median_shift(false),
         result.iterations,
         result.converged,
+        shift_tilt_deg(before, after, gravity_world),
+        shift_yaw_deg(before, after, gravity_world),
     );
+}
+
+/// Angle between gravity seen from the camera before and after a solve, degrees.
+fn shift_tilt_deg(before: &Pose3d, after: &Pose3d, gravity_world: Vec3F64) -> f64 {
+    let (b, a) = (
+        (before.rotation * gravity_world).normalize(),
+        (after.rotation * gravity_world).normalize(),
+    );
+    b.dot(a).clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+/// World-frame rotation of the camera over a solve, projected on gravity, degrees.
+fn shift_yaw_deg(before: &Pose3d, after: &Pose3d, gravity_world: Vec3F64) -> f64 {
+    let delta_world = after.rotation.transpose() * before.rotation;
+    SO3F64::from_matrix(&delta_world)
+        .log()
+        .dot(gravity_world.normalize())
+        .to_degrees()
 }
 
 /// Why a window has no carried boundary prior; either way the solve falls

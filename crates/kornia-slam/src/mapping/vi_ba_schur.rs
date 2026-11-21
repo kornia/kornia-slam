@@ -1934,6 +1934,8 @@ struct ReducedSystem {
     c_inv: Vec<Option<SMatF64<3, 3>>>,
     border: Option<Border>,
     cost: f64,
+    /// Visual, IMU, accel-bias prior and boundary prior terms of `cost`.
+    split: [f64; 4],
 }
 
 /// Builds the reduced system at `state`, the point blocks damped by
@@ -2273,6 +2275,7 @@ fn build_reduced_system(
         c_inv,
         border,
         cost,
+        split: [cost_vis, cost_imu, cost_bias_prior, cost_prior],
     }
 }
 
@@ -2465,6 +2468,8 @@ fn solve_vi_ba(
     let mut converged = false;
     let mut final_cost = f64::MAX;
     let mut initial_cost = f64::MAX;
+    let mut first_split = [0.0f64; 4];
+    let mut final_split = [0.0f64; 4];
     let mut cheirality_rejections = 0usize;
     let mut cheirality_points_held = 0usize;
     // Whether each observation's reprojection is a Huber inlier at the
@@ -2489,10 +2494,13 @@ fn solve_vi_ba(
             c_inv,
             border,
             cost: cost_f64,
+            split,
         } = build_reduced_system(&inputs, &state, lambda, &mut vis_inlier, is_first_iter, &[]);
         let dim = m_vec.len();
         if initial_cost == f64::MAX {
             initial_cost = cost_f64;
+            first_split = split;
+            final_split = split;
         }
         let cost = cost_f64 as f32;
 
@@ -2746,6 +2754,12 @@ fn solve_vi_ba(
             calib = calib_trial;
             cal_edges = cal_edges_trial;
             final_cost = new_cost as f64;
+            final_split = [
+                new_cost_vis,
+                new_cost_imu,
+                new_cost_bias_prior,
+                new_cost_prior,
+            ];
             lambda = (lambda / 3.0).max(1e-8);
             if rel < params.cost_tolerance {
                 converged = true;
@@ -2760,6 +2774,12 @@ fn solve_vi_ba(
     }
 
     // ── Post-convergence residual diagnostic ──────────────────────────────
+    let [v0, i0, b0, p0] = first_split;
+    let [v1, i1, b1, p1] = final_split;
+    debug_eprintln!(
+        "[vi_ba] COST first vis={v0:.4e} imu={i0:.4e} bias_prior={b0:.4e} prior={p0:.4e} \
+            final vis={v1:.4e} imu={i1:.4e} bias_prior={b1:.4e} prior={p1:.4e}"
+    );
     let imu_t_bc = calibration.map_or(params.imu_t_bc, |c| c.imu_t_bc(&calib, params));
     for edge in cal_edges.as_deref().unwrap_or(imu_edges) {
         let i = edge.from_idx;
