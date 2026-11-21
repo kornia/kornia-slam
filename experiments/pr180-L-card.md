@@ -67,4 +67,16 @@ Status: written 2026-11-21, before any code. This is roadmap item "IMU carries t
 
 ### Result log
 
-(empty)
+- **2026-11-21, scoring.**
+  - **Setup:** binary `9a4fb6f`, preset `pr180-frontend-1ms` (card K on), 800-frame windows, `--debug`, 3 runs per sequence, 2 at a time.
+  - **Pairing:** each run wrote `--trajectory-out` with `--trajectory-include-coasted` (L1) and `--trajectory-coasted`. L0 is L1 minus the coasted rows, so both come from the same run.
+
+| P/K | Prediction | Measured (each run) | Verdict |
+|---|---|---|---|
+| P1 coverage | R_03 800/800 3/3; R_01 and R_11 unchanged | R_03 L0 782, 788, 800 → L1 800 ×3. R_01 800 ×3 (no coasts). R_11 800 ×3 (11 coasts in run 3) | as predicted |
+| P2 accuracy | ATE within ±0.01 m of L0 | R_03 0.202→0.201, 0.201→0.199, 0.190→0.190 m. R_01 and R_11 identical (R_11 ground truth covers 153 poses only) | as predicted |
+| P3 counter | `poses_written − tracked` = `coast_inertial` | 18 = 18, 12 = 12, 11 = 11, and 0 elsewhere | as predicted |
+| P4 carried-pose error | ≤ 2× tracked | not computed separately; P2 shows no ATE cost | not measured |
+| K1-K3 | | none fired | |
+
+- **Outcome.** The IMU-carried poses fill the visual gaps at no accuracy cost. `--trajectory-include-coasted` should be on for benchmark runs. It is an app flag, so the scoring scripts pass it.
