@@ -679,15 +679,25 @@ impl Map {
             .map_or(0, |kf| kf.frame.camera_of(key.feature_idx) as u8)
     }
 
-    /// Smallest `(keyframe_idx, feature_idx)` becomes the reference.
+    /// The reference keyframe's remaining record with the smallest feature
+    /// stays the reference (another rig camera of that keyframe still sees
+    /// the landmark); without one, the smallest `(keyframe_idx, feature_idx)`
+    /// becomes the reference.
     pub(super) fn adopt_reference(&mut self, landmark_idx: usize) {
         let Some(mp) = self.map_points.get(landmark_idx) else {
             return;
         };
+        let current = mp.keyframe_idx;
         let Some(next) = mp
             .observations()
             .iter()
-            .min_by_key(|o| (o.key.keyframe_idx, o.key.feature_idx))
+            .min_by_key(|o| {
+                (
+                    o.key.keyframe_idx != current,
+                    o.key.keyframe_idx,
+                    o.key.feature_idx,
+                )
+            })
             .map(|o| o.key)
         else {
             return;
