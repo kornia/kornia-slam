@@ -208,6 +208,36 @@ pub fn information(pim: &PreintegratedImu, weight: f64) -> ImuInformation {
     }
 }
 
+/// Covariance of state `j` given state `i`'s, through the edge's linearisation:
+/// `J_j⁻¹ (J_i Σ_i J_iᵀ + Ω⁻¹) J_j⁻ᵀ`, layout `[ρ ω v b_g b_a]`. `None` if `J_j`
+/// is singular.
+///
+/// The residual `r(x_i, x_j)` is zero up to its noise `n ~ N(0, Ω⁻¹)`, so to
+/// first order `J_i δx_i + J_j δx_j = n`. `Ω⁻¹` is the preintegration's own
+/// navigation and bias-walk covariance, block diagonal as in [`information`].
+pub fn propagate_state_covariance(
+    state_i: NavState<'_>,
+    covariance_i: &Mat15F64,
+    state_j: NavState<'_>,
+    preintegrated: &PreintegratedImu,
+    gravity: &Vec3F64,
+    t_bc: Option<&Pose3d>,
+) -> Option<Mat15F64> {
+    let (_, j_i, j_j) = residual_and_jacobians(state_i, state_j, preintegrated, gravity, t_bc);
+    let j_j_inverse = j_j.try_inverse()?;
+    let mut noise = Mat15F64::zeros();
+    noise
+        .fixed_view_mut::<9, 9>(0, 0)
+        .copy_from(&preintegrated.covariance);
+    noise
+        .fixed_view_mut::<6, 6>(9, 9)
+        .copy_from(&preintegrated.bias_covariance);
+    let propagated =
+        j_j_inverse * (j_i * covariance_i * j_i.transpose() + noise) * j_j_inverse.transpose();
+    let symmetric = (propagated + propagated.transpose()) * 0.5;
+    symmetric.iter().all(|v| v.is_finite()).then_some(symmetric)
+}
+
 /// `1 / var`, or 1e6 for a (near-)zero variance.
 fn inverse_variance(var: f64) -> f64 {
     if var > 1e-20 { 1.0 / var } else { 1e6 }
@@ -217,6 +247,7 @@ fn inverse_variance(var: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::testing::{Lcg, perturbed};
+    use kornia_algebra::{SMatF64, Vec6F64};
     use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement};
 
     fn preintegrated(rng: &mut Lcg) -> PreintegratedImu {
@@ -305,6 +336,241 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Card A T1: a 5 s constant-velocity coast with EuRoC noise. The
+    /// propagated body-position spread matches a Monte Carlo of the start
+    /// state and the sensor noise within 10 %.
+    #[test]
+    fn propagated_position_spread_matches_monte_carlo() {
+        let calib = ImuCalib {
+            gyro_noise: 1.7e-4,
+            accel_noise: 2.0e-3,
+            gyro_bias_noise: 1.9e-5,
+            accel_bias_noise: 3.0e-3,
+        };
+        let (dt, steps) = (0.005, 1000);
+        let gravity = Vec3F64::new(0.0, 0.0, -9.81);
+        let velocity = Vec3F64::new(1.0, 0.0, 0.0);
+        let level = ImuMeasurement {
+            timestamp: 0.0,
+            gyro: Vec3F64::ZERO,
+            accel: Vec3F64::new(0.0, 0.0, 9.81),
+        };
+        let mut nominal = PreintegratedImu::new(ImuBias::default(), calib);
+        for _ in 0..steps {
+            nominal.integrate(&level, dt);
+        }
+        let span = nominal.dt;
+        let pose_i = Pose3d::IDENTITY;
+        let position_j = velocity * span;
+        let pose_j = Pose3d::new(Mat3F64::IDENTITY, position_j * -1.0);
+        let sigma_sq = [1e-6, 1e-6, 1e-4, 1e-8, 1e-4];
+        let mut covariance_i = Mat15F64::zeros();
+        for k in 0..15 {
+            covariance_i[(k, k)] = sigma_sq[k / 3];
+        }
+        let state = |pose_cw| NavState {
+            pose_cw,
+            velocity,
+            bias: ImuBias::default(),
+        };
+        let covariance_j = propagate_state_covariance(
+            state(&pose_i),
+            &covariance_i,
+            state(&pose_j),
+            &nominal,
+            &gravity,
+            None,
+        )
+        .expect("an invertible edge");
+        // t_wb ← t_wb − ρ + [t_wb]× ω under the right perturbation.
+        let mut to_position = SMatF64::<3, 6>::zeros();
+        to_position.fixed_view_mut::<3, 3>(0, 0).fill_diagonal(-1.0);
+        to_position
+            .fixed_view_mut::<3, 3>(0, 3)
+            .copy_from(&SO3F64::hat(position_j).into());
+        let pose_block: SMatF64<6, 6> = covariance_j.fixed_view::<6, 6>(0, 0).into_owned();
+        let predicted = (to_position * pose_block * to_position.transpose()).trace();
+
+        let mut rng = Lcg(11);
+        let mut gaussian = || {
+            let u1 = 0.5 * (rng.next() + 1.0);
+            let u2 = 0.5 * (rng.next() + 1.0);
+            (-2.0 * (1.0 - u1).ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+        };
+        let samples = 2000;
+        let mut spread = 0.0;
+        for _ in 0..samples {
+            let mut draw = |k: usize| sigma_sq[k].sqrt() * gaussian();
+            let rho = Vec3F64::new(draw(0), draw(0), draw(0));
+            let omega = Vec3F64::new(draw(1), draw(1), draw(1));
+            let start_velocity = velocity + Vec3F64::new(draw(2), draw(2), draw(2));
+            let bias = ImuBias {
+                gyro: Vec3F64::new(draw(3), draw(3), draw(3)),
+                accel: Vec3F64::new(draw(4), draw(4), draw(4)),
+            };
+            let start = pose_i.compose(&crate::testing::exp(&Vec6F64::new(
+                rho.x, rho.y, rho.z, omega.x, omega.y, omega.z,
+            )));
+            let (sigma_g, sigma_a) = (calib.gyro_noise / dt.sqrt(), calib.accel_noise / dt.sqrt());
+            let mut pim = PreintegratedImu::new(bias, calib);
+            for _ in 0..steps {
+                let noisy = ImuMeasurement {
+                    timestamp: 0.0,
+                    gyro: Vec3F64::new(gaussian(), gaussian(), gaussian()) * sigma_g,
+                    accel: level.accel + Vec3F64::new(gaussian(), gaussian(), gaussian()) * sigma_a,
+                };
+                pim.integrate(&noisy, dt);
+            }
+            let r_wb = start.rotation.transpose();
+            let p_i = start.inverse().translation;
+            let (_, _, p_j) = pim.predict(&r_wb, &start_velocity, &p_i, &gravity);
+            let error = p_j - position_j;
+            spread += error.dot(error);
+        }
+        let measured = spread / samples as f64;
+        assert!(
+            (predicted.sqrt() / measured.sqrt() - 1.0).abs() < 0.1,
+            "predicted {:.4} m, Monte Carlo {:.4} m",
+            predicted.sqrt(),
+            measured.sqrt()
+        );
+    }
+
+    /// E11: card A T1 on a rotated, turning rig with a camera-to-body
+    /// extrinsic and an anisotropic start covariance. The propagated camera
+    /// pose block, rotation included, matches a Monte Carlo of the start state
+    /// and the sensor noise; T1's identity frames and position trace could not
+    /// see a frame or sign error.
+    #[test]
+    fn propagated_camera_pose_spread_matches_monte_carlo_on_a_rotated_rig() {
+        let calib = ImuCalib {
+            gyro_noise: 1.7e-4,
+            accel_noise: 2.0e-3,
+            gyro_bias_noise: 1.9e-5,
+            accel_bias_noise: 3.0e-3,
+        };
+        let (dt, steps) = (0.005, 200);
+        let gravity = Vec3F64::new(0.0, 0.0, -9.81);
+        let reading = ImuMeasurement {
+            timestamp: 0.0,
+            gyro: Vec3F64::new(0.1, -0.2, 0.3),
+            accel: Vec3F64::new(0.4, 0.3, 9.7),
+        };
+        let mut nominal = PreintegratedImu::new(ImuBias::default(), calib);
+        for _ in 0..steps {
+            nominal.integrate(&reading, dt);
+        }
+        let t_bc = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.1, -0.2, 0.3)).matrix(),
+            Vec3F64::new(0.05, -0.02, 0.1),
+        );
+        let camera_of = |r_wb: &Mat3F64, p_wb: &Vec3F64| {
+            let body_from_world = Pose3d::new(r_wb.transpose(), r_wb.transpose() * *p_wb * -1.0);
+            t_bc.inverse().compose(&body_from_world)
+        };
+        let body_of = |pose_cw: &Pose3d| {
+            let world_from_body = t_bc.compose(pose_cw).inverse();
+            (world_from_body.rotation, world_from_body.translation)
+        };
+        let pose_i = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.4, 0.2, -1.1)).matrix(),
+            Vec3F64::new(1.0, -2.0, 0.5),
+        );
+        let velocity = Vec3F64::new(0.8, -0.3, 0.1);
+        let (r_wb_i, p_i) = body_of(&pose_i);
+        let (r_wb_j, velocity_j, p_j) = nominal.predict(&r_wb_i, &velocity, &p_i, &gravity);
+        let pose_j = camera_of(&r_wb_j, &p_j);
+        // Milliradian attitude doubt dominates: through the specific force it
+        // moves velocity and position along world directions a frame error
+        // would turn.
+        let sigma_sq = [
+            1e-7, 4e-7, 0.5e-7, 4e-6, 1e-5, 2e-6, 1e-4, 0.3e-4, 2e-4, 1e-8, 0.3e-8, 2e-8, 1e-4,
+            3e-4, 0.5e-4,
+        ];
+        let mut covariance_i = Mat15F64::zeros();
+        for (k, variance) in sigma_sq.iter().enumerate() {
+            covariance_i[(k, k)] = *variance;
+        }
+        let state = |pose_cw, velocity| NavState {
+            pose_cw,
+            velocity,
+            bias: ImuBias::default(),
+        };
+        let covariance_j = propagate_state_covariance(
+            state(&pose_i, velocity),
+            &covariance_i,
+            state(&pose_j, velocity_j),
+            &nominal,
+            &gravity,
+            Some(&t_bc),
+        )
+        .expect("an invertible edge");
+
+        let mut rng = Lcg(17);
+        let mut gaussian = || {
+            let u1 = 0.5 * (rng.next() + 1.0);
+            let u2 = 0.5 * (rng.next() + 1.0);
+            (-2.0 * (1.0 - u1).ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+        };
+        let samples = 1500;
+        let mut measured = SMatF64::<9, 9>::zeros();
+        for _ in 0..samples {
+            let draw: Vec<f64> = sigma_sq.iter().map(|v| v.sqrt() * gaussian()).collect();
+            let start = pose_i.compose(&crate::testing::exp(&Vec6F64::from_column_slice(
+                &draw[..6],
+            )));
+            let start_velocity = velocity + Vec3F64::new(draw[6], draw[7], draw[8]);
+            let bias = ImuBias {
+                gyro: Vec3F64::new(draw[9], draw[10], draw[11]),
+                accel: Vec3F64::new(draw[12], draw[13], draw[14]),
+            };
+            let (sigma_g, sigma_a) = (calib.gyro_noise / dt.sqrt(), calib.accel_noise / dt.sqrt());
+            let mut pim = PreintegratedImu::new(bias, calib);
+            for _ in 0..steps {
+                let noisy = ImuMeasurement {
+                    timestamp: 0.0,
+                    gyro: reading.gyro + Vec3F64::new(gaussian(), gaussian(), gaussian()) * sigma_g,
+                    accel: reading.accel
+                        + Vec3F64::new(gaussian(), gaussian(), gaussian()) * sigma_a,
+                };
+                pim.integrate(&noisy, dt);
+            }
+            let (r_wb, p_wb) = body_of(&start);
+            let (r, v, p) = pim.predict(&r_wb, &start_velocity, &p_wb, &gravity);
+            let error = pose_j.inverse().compose(&camera_of(&r, &p));
+            let omega = SO3F64::from_matrix(&error.rotation).log();
+            let (rho, dv) = (error.translation, v - velocity_j);
+            let delta = SMatF64::<9, 1>::from_column_slice(&[
+                rho.x, rho.y, rho.z, omega.x, omega.y, omega.z, dv.x, dv.y, dv.z,
+            ]);
+            measured += delta * delta.transpose() / samples as f64;
+        }
+        let predicted: SMatF64<9, 9> = covariance_j.fixed_view::<9, 9>(0, 0).into_owned();
+        for (name, base) in [("translation", 0), ("rotation", 3), ("velocity", 6)] {
+            let block = |m: &SMatF64<9, 9>| m.fixed_view::<3, 3>(base, base).into_owned();
+            let difference =
+                (block(&measured) - block(&predicted)).norm() / block(&predicted).norm();
+            assert!(
+                difference < 0.15,
+                "{name} block off by {difference:.3}: predicted {}, Monte Carlo {}",
+                block(&predicted),
+                block(&measured)
+            );
+        }
+        // The cross terms carry the signs: whitened by the prediction, the
+        // Monte Carlo covariance is the identity up to sampling noise (about
+        // 0.03 an entry).
+        let l_inverse = predicted
+            .cholesky()
+            .expect("a positive definite prediction")
+            .l()
+            .try_inverse()
+            .expect("an invertible factor");
+        let whitened = l_inverse * measured * l_inverse.transpose();
+        let worst = (whitened - SMatF64::<9, 9>::identity()).abs().max();
+        assert!(worst < 0.15, "whitened Monte Carlo off by {worst:.3}");
     }
 
     /// The information matrix inverts the navigation covariance:

@@ -3,9 +3,12 @@
 //! Capture has no window or solver policy: mapping chooses a [`BaWindow`], the
 //! map copies exactly those entities, and correction applies the numeric result.
 
+use super::correction::{LocalBaMerge, StateEnvelope};
 use crate::mapping::map::{ImuFactor, Keyframe, Map, MapPoint};
+use crate::mapping::marginalization::MarginalPrior;
+use crate::mapping::online_calibration::OnlineCalibrationState;
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::Vec3F64;
+use kornia_algebra::{Mat15F64, Vec3F64};
 use kornia_sensors::imu::{ImuBias, PreintegratedImu};
 use std::collections::HashSet;
 
@@ -30,6 +33,7 @@ pub struct BaSnapshot {
     pub(super) map_points: Vec<MapPoint>,
     pub(super) imu_factors: Vec<ImuFactor>,
     pub(super) world_epoch: u64,
+    pub(super) marginal_prior: Option<MarginalPrior>,
 }
 
 /// Estimated quantities for a captured keyframe; identity stays in the snapshot.
@@ -52,6 +56,43 @@ pub struct BaUpdate {
     pub(crate) imu_preintegrations: Vec<PreintegratedImu>,
     pub(crate) snapshot: BaSnapshot,
     pub(crate) solve_stats: Option<LocalBaStats>,
+    /// The boundary prior for the next window; stored only if this update
+    /// is applied.
+    pub(crate) next_prior: Option<MarginalPrior>,
+    /// Checked by [`Map::apply_ba_update`] before any write.
+    pub(crate) state_envelope: StateEnvelope,
+    /// Whether [`Map::apply_ba_update`] carries the result to keyframes
+    /// inserted after the snapshot.
+    pub(crate) merge: LocalBaMerge,
+    /// Gravity and `T_bc` of a VI-BA solve, with which that merge re-predicts
+    /// their velocities.
+    pub(crate) merge_inertial: Option<(Vec3F64, Option<Pose3d>)>,
+    pub(crate) outcome: BaOutcome,
+    /// The newest keyframe's id and marginal covariance, when the solve was
+    /// asked for it.
+    pub(crate) newest_marginal: Option<(usize, Mat15F64)>,
+    /// The calibration state the next solve starts from, set by a calibrated
+    /// solve; stored only if this update is applied.
+    pub(crate) online_calibration: Option<OnlineCalibrationState>,
+}
+
+/// Whether the solver ran on an update, for the run counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BaOutcome {
+    pub solve: BaSolve,
+    /// The marginal boundary prior could not be carried; the solve used the
+    /// scaled boundary edge instead.
+    pub prior_fallback: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum BaSolve {
+    /// An early exit (too few keyframes or observations) left the window as captured.
+    #[default]
+    NotRun,
+    Solved,
+    /// The solver returned an error; the window is unchanged.
+    Failed,
 }
 
 /// What a local solve did, for the caller to log; set by
@@ -81,6 +122,10 @@ pub struct LocalBaStats {
     /// Landmarks whose optimized position was not written back: behind an
     /// observing keyframe, or flung far from every observer.
     pub points_rejected: usize,
+    /// The online calibration gate held the states: no calibration column.
+    pub calibration_gated: bool,
+    /// Calibration columns the solve added.
+    pub calibration_columns: usize,
 }
 
 impl BaUpdate {
@@ -126,6 +171,15 @@ impl BaSnapshot {
         &self.imu_factors
     }
 
+    /// The map's boundary prior, if it belongs to this snapshot's world epoch.
+    pub fn marginal_prior(&self) -> Option<&MarginalPrior> {
+        self.marginal_prior.as_ref()
+    }
+
+    pub(crate) fn world_epoch(&self) -> u64 {
+        self.world_epoch
+    }
+
     /// Starts an unchanged numeric result, including the original IMU edges.
     /// Solvers replace estimates in this result without changing their inputs.
     pub(crate) fn into_update(self) -> BaUpdate {
@@ -147,6 +201,13 @@ impl BaSnapshot {
                 .collect(),
             snapshot: self,
             solve_stats: None,
+            next_prior: None,
+            state_envelope: StateEnvelope::Off,
+            merge: LocalBaMerge::SnapshotOnly,
+            merge_inertial: None,
+            outcome: BaOutcome::default(),
+            newest_marginal: None,
+            online_calibration: None,
         }
     }
 }
@@ -186,6 +247,10 @@ impl Map {
             map_points,
             imu_factors,
             world_epoch: self.world_epoch,
+            marginal_prior: self
+                .marginal_prior
+                .clone()
+                .filter(|prior| prior.world_epoch == self.world_epoch),
         }
     }
 

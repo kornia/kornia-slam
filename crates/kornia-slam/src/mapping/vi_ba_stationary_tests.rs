@@ -78,6 +78,7 @@ fn random_keyframe(rng: &mut Lcg, near: Option<&Pose3d>) -> ViBaKeyframe {
             accel: rng.vec3(1e-2),
         },
         fixed: false,
+        inertial_fixed: false,
     }
 }
 
@@ -322,6 +323,7 @@ fn a_stationary_edge_pulls_a_parked_keyframe_onto_its_neighbour() {
             velocity: Vec3F64::ZERO,
             bias: parked_bias(),
             fixed: true,
+            inertial_fixed: false,
         },
         ViBaKeyframe {
             pose: off,
@@ -331,6 +333,7 @@ fn a_stationary_edge_pulls_a_parked_keyframe_onto_its_neighbour() {
                 accel: Vec3F64::ZERO,
             },
             fixed: false,
+            inertial_fixed: false,
         },
     ];
     // The landmarks as keyframe 0 sees them; keyframe 1 sees them only
@@ -390,6 +393,7 @@ fn stationary_and_imu_edges_solve_together_around_fixed_keyframes() {
             velocity: if k >= 3 { v } else { Vec3F64::ZERO },
             bias,
             fixed: k == 0,
+            inertial_fixed: false,
         })
         .collect();
     kfs[1].pose = parked.compose(&se3_exp(&[0.004, -0.002, 0.0, 0.003, 0.0, 0.0]));
@@ -461,12 +465,14 @@ fn stationary_edge_errors_are_reported() {
             velocity: Vec3F64::ZERO,
             bias: ImuBias::default(),
             fixed: true,
+            inertial_fixed: false,
         },
         ViBaKeyframe {
             pose: Pose3d::IDENTITY,
             velocity: Vec3F64::ZERO,
             bias: ImuBias::default(),
             fixed: false,
+            inertial_fixed: false,
         },
     ];
     let run = |edge: StationaryFactor| {

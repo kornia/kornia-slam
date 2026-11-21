@@ -11,7 +11,9 @@ use kornia_algebra::Mat3F64;
 use kornia_algebra::Vec3F64;
 use kornia_factors::inertial::stationary::StationaryFactor;
 use kornia_factors::wheel_odometry::{WheelOdomFactor, WheelOdomMeasurement};
-use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
+use kornia_sensors::imu::{
+    ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu, SampleInterpolation,
+};
 use kornia_sensors::wheel::PlanarMotion;
 
 /// Frame ids of the keyframe fixture: non-contiguous so ids and slots differ.
@@ -307,6 +309,7 @@ fn imu_edge(slot: usize) -> ImuFactor {
         t0,
         t1,
         bias_walk_extra_s: 0.0,
+        interpolation: SampleInterpolation::Hold,
     }
 }
 
@@ -603,6 +606,7 @@ fn imu_edge_between(from: usize, to: usize, t0: f64, span_s: f64) -> ImuFactor {
         t0,
         t1,
         bias_walk_extra_s: 0.0,
+        interpolation: SampleInterpolation::Hold,
     }
 }
 
@@ -880,5 +884,47 @@ fn eviction_slides_the_window_and_every_chain_starts_at_the_new_oldest() {
     assert_eq!(ids(&map), IDS[2..].to_vec());
     assert_eq!(imu_chain(&map)[0].0, IDS[2]);
     assert_eq!(factors[0].from_idx, IDS[2]);
+    assert_map_consistent(&map);
+}
+
+#[test]
+fn the_bound_leaves_a_map_at_or_under_it_alone() {
+    let mut map = culling_fixture();
+    let report = bound_keyframes(&mut map, IDS.len(), &enabled(), None);
+    assert!(report.culled.is_empty() && report.evicted.is_empty());
+    assert_eq!(ids(&map), IDS.to_vec());
+}
+
+#[test]
+fn the_bound_culls_redundant_keyframes_before_evicting_any() {
+    let mut map = culling_fixture();
+    let culled_alone = {
+        let mut m = culling_fixture();
+        cull_redundant_keyframes(&mut m, &enabled(), None, None).removed
+    };
+    assert!(
+        !culled_alone.is_empty(),
+        "the fixture has redundant keyframes"
+    );
+    let bound = IDS.len() - culled_alone.len();
+    let report = bound_keyframes(&mut map, bound, &enabled(), None);
+    assert_eq!(report.culled, culled_alone);
+    assert!(report.evicted.is_empty(), "culling alone reached the bound");
+    assert_eq!(map.keyframes().len(), bound);
+    assert_map_consistent(&map);
+}
+
+#[test]
+fn past_what_culling_frees_the_oldest_are_evicted_down_to_the_bound() {
+    let mut map = culling_fixture();
+    let report = bound_keyframes(&mut map, 2, &enabled(), None);
+    assert_eq!(map.keyframes().len(), 2);
+    assert!(!report.evicted.is_empty());
+    let newest = *IDS.last().unwrap();
+    assert!(ids(&map).contains(&newest), "the newest keyframe stays");
+    assert!(
+        report.removed().all(|k| !ids(&map).contains(&k)),
+        "every reported keyframe is gone"
+    );
     assert_map_consistent(&map);
 }

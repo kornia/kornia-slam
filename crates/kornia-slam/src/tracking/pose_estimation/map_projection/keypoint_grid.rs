@@ -48,10 +48,10 @@ impl KeypointGrid {
     ) -> Vec<usize> {
         let r_sq = radius * radius;
 
-        let col_min = ((x - radius).max(0.0) / self.cell_w) as usize;
+        let col_min = (((x - radius).max(0.0) / self.cell_w) as usize).min(self.n_cols - 1);
         let col_max =
             (((x + radius).min(self.img_w - 1.0) / self.cell_w) as usize).min(self.n_cols - 1);
-        let row_min = ((y - radius).max(0.0) / self.cell_h) as usize;
+        let row_min = (((y - radius).max(0.0) / self.cell_h) as usize).min(self.n_rows - 1);
         let row_max =
             (((y + radius).min(self.img_h - 1.0) / self.cell_h) as usize).min(self.n_rows - 1);
 
@@ -75,6 +75,15 @@ impl KeypointGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_fisheye_query_centred_outside_the_image_reaches_border_cells() {
+        let kps = [[630.0, 470.0], [900.0, 700.0], [10.0, 10.0]];
+        let grid = KeypointGrid::new(&kps, 640.0, 480.0, 64.0);
+        assert_eq!(grid.query_radius(905.0, 702.0, 10.0, &kps), vec![1]);
+        assert!(grid.query_radius(2000.0, 2000.0, 10.0, &kps).is_empty());
+        assert_eq!(grid.query_radius(632.0, 472.0, 5.0, &kps), vec![0]);
+    }
 
     #[test]
     fn test_empty_grid() {

@@ -221,6 +221,7 @@ impl FrameSource for OakdSource {
             timestamp_sec,
             image,
             right_image,
+            rig_images: Vec::new(),
             imu_samples: Vec::new(),
         }))
     }

@@ -7,6 +7,7 @@ use kornia_image::ImageSize;
 use super::*;
 use crate::frontend::OrbFrontend;
 use crate::frontend::tests::synthetic_pair;
+use crate::initialization::bootstrap::MIN_STEREO_POINTS;
 use crate::loop_closure::place_recognition::{Vocabulary, VocabularyLoadError};
 use crate::mapping::LocalMappingMode;
 
@@ -135,6 +136,37 @@ fn build_restricts_the_rig_to_selected_sensors() {
 }
 
 #[test]
+fn build_plumbs_the_viba_knobs_to_the_initializer() {
+    let stereo_imu = || config(CameraSelection::Stereo, true, LoopClosingMode::Disabled);
+    let mut knobs = stereo_imu();
+    let PipelineDefinition::OrbSlam(orb) = &mut knobs.pipeline;
+    orb.inertial.viba_window = crate::inertial::VibaWindow::VisualOnly;
+    orb.inertial.viba_velocity_gate = 10.0;
+
+    let system = SlamSystem::build(knobs, stereo_imu_rig()).unwrap();
+    let init = &system.inertial.initializer.config;
+    assert_eq!(init.viba_window, crate::inertial::VibaWindow::VisualOnly);
+    assert_eq!(init.viba_velocity_gate, 10.0);
+
+    let system = SlamSystem::build(stereo_imu(), stereo_imu_rig()).unwrap();
+    let init = &system.inertial.initializer.config;
+    assert_eq!(init.viba_window, crate::inertial::VibaWindow::All);
+    assert_eq!(init.viba_velocity_gate, 0.0);
+}
+
+#[test]
+fn build_plumbs_the_growth_baseline_ratio() {
+    let mut knobs = mono();
+    let PipelineDefinition::OrbSlam(orb) = &mut knobs.pipeline;
+    orb.mapping.growth_min_baseline_ratio = 0.0175;
+    let system = SlamSystem::build(knobs, SensorRig::new(camera())).unwrap();
+    assert_eq!(system.growth_min_baseline_ratio, 0.0175);
+
+    let system = SlamSystem::build(mono(), SensorRig::new(camera())).unwrap();
+    assert_eq!(system.growth_min_baseline_ratio, 0.0);
+}
+
+#[test]
 fn build_reports_a_missing_vocabulary() {
     let missing = PathBuf::from("/nonexistent/ORBvoc.bin");
     let enabled = config(
@@ -142,6 +174,8 @@ fn build_reports_a_missing_vocabulary() {
         false,
         LoopClosingMode::Enabled {
             vocabulary: missing.clone(),
+            execution: LoopClosingExecution::default(),
+            graph: Default::default(),
         },
     );
     match SlamSystem::build(enabled, stereo_imu_rig()) {
@@ -164,6 +198,8 @@ fn loop_closing_constructs_only_when_enabled() {
             imu,
             LoopClosingMode::Enabled {
                 vocabulary: vocabulary.0.clone(),
+                execution: LoopClosingExecution::default(),
+                graph: Default::default(),
             },
         );
         SlamSystem::build(config, stereo_imu_rig()).unwrap()
@@ -304,6 +340,42 @@ fn frames_are_numbered_in_call_order_and_failures_keep_the_number() {
     }
 }
 
+#[test]
+fn a_fresh_systems_first_frame_is_a_bootstrap_skip() {
+    let mut system = SlamSystem::build(mono(), stereo_imu_rig()).unwrap();
+    assert_eq!(system.last_skip(), None);
+    let result = system.process_image(stamp(0), &textured(0)).unwrap();
+    assert_eq!(result.status, TrackingStatus::Skipped);
+    assert_eq!(system.last_skip(), Some(SkipKind::Bootstrap));
+    let counters = system.run_counters();
+    assert_eq!(counters.frames, 1);
+    assert_eq!(counters.skipped_bootstrap, 1);
+}
+
+#[test]
+fn every_frame_is_counted_as_exactly_one_kind() {
+    let mut system = SlamSystem::build(mono(), stereo_imu_rig()).unwrap();
+    assert!(system.process_image(f64::NAN, &textured(0)).is_err());
+    let frames = 30;
+    for idx in 0..frames {
+        let result = system
+            .process_image(stamp(idx), &textured(idx * 2))
+            .unwrap();
+        assert_eq!(
+            result.status == TrackingStatus::Skipped,
+            system.last_skip().is_some(),
+            "frame {idx}"
+        );
+    }
+    let c = system.run_counters();
+    assert_eq!(c.frames, frames as u64, "a refused input is not a frame");
+    assert_eq!(
+        c.tracked + c.skipped_bootstrap + c.coast_inertial + c.coast_visual,
+        c.frames
+    );
+    assert!(c.keyframes <= c.tracked);
+}
+
 mod keyframe_evidence {
     use super::*;
     use crate::tracking::parallax::tests::{
@@ -349,7 +421,7 @@ mod keyframe_evidence {
         frame.pose_world_to_cam = Pose3d::IDENTITY;
 
         let system = system_tracked_at(Some(10.0), yaw);
-        let evidence = system.keyframe_evidence(&frame, 9, &all_matches());
+        let evidence = system.keyframe_evidence(&frame, 9, &all_matches(), 0.0);
         assert_eq!(evidence.curr_idx, 7);
         assert_eq!(evidence.last_keyframe_idx, Some(0));
         assert_eq!(evidence.tracked_inliers, 9);
@@ -361,12 +433,87 @@ mod keyframe_evidence {
 
         let off = system_tracked_at(None, yaw);
         assert_eq!(
-            off.keyframe_evidence(&frame, 9, &all_matches())
+            off.keyframe_evidence(&frame, 9, &all_matches(), 0.0)
                 .median_parallax_px,
             None,
             "not measured unless the policy reads it"
         );
     }
+    /// E9: ORB-SLAM3 counts a stereo observation twice (`MapPoint.cc:162-165`),
+    /// so a landmark seen by two stereo keyframes passes the 3-observation
+    /// floor of a map with more than two keyframes.
+    #[test]
+    fn a_stereo_observation_counts_twice_toward_the_reference_points() {
+        use crate::mapping::map::{LandmarkSeed, ObservationKey};
+        use crate::tracking::KeyframeRules;
+        let points: Vec<Vec3F64> = (0..9)
+            .map(|i| Vec3F64::new((i % 3) as f64 * 0.5 - 0.5, (i / 3) as f64 * 0.4 - 0.4, 4.0))
+            .collect();
+        let stereo = |idx: usize| {
+            let mut frame = frame_seeing_points(idx, Pose3d::IDENTITY, &points);
+            frame.depth = vec![4.0; points.len()];
+            frame
+        };
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(stereo(0)))
+            .unwrap();
+        for (i, &position) in points.iter().enumerate() {
+            map.insert_landmark(LandmarkSeed {
+                position,
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx: i,
+                },
+            })
+            .unwrap();
+        }
+        map.insert_keyframe(Keyframe::from_frame(stereo(1)))
+            .unwrap();
+        for i in 0..points.len() {
+            map.link_observation(1, i, i).unwrap();
+        }
+        map.insert_keyframe(Keyframe::from_frame(frame_seeing_points(
+            2,
+            Pose3d::IDENTITY,
+            &[],
+        )))
+        .unwrap();
+
+        let mut system = SlamSystem::build(mono(), SensorRig::new(camera())).unwrap();
+        system.keyframe_policy.rules = KeyframeRules::OrbSlam3 { max_frames: 20 };
+        *system.map.lock().unwrap() = map;
+        system.state.current_keyframe_idx = Some(0);
+        let (evidence, _) = system.with_orb_slam3_evidence(
+            KeyframeEvidence::default(),
+            &frame_seeing_points(3, Pose3d::IDENTITY, &[]),
+            &[],
+            0.0,
+        );
+        assert_eq!(evidence.ref_points_min_obs, 9);
+    }
+
+    /// T7: a flow frame's keyframe evidence locks the map, once more under
+    /// the OrbSlam3 keyframe rules; `flow_map_wait` (P17) must see those
+    /// waits, so a held lock shows up in it.
+    #[test]
+    fn the_keyframe_evidence_reports_its_map_lock_wait() {
+        let mut system = system_tracked_at(None, Pose3d::IDENTITY);
+        system.keyframe_policy.rules = crate::tracking::KeyframeRules::OrbSlam3 { max_frames: 20 };
+        let frame = frame_seeing_points(7, Pose3d::IDENTITY, &[]);
+        let map = Arc::clone(&system.map);
+        let (locked, held) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = map.lock().unwrap();
+            locked.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(60));
+        });
+        held.recv().unwrap();
+        let (_, waited) = system.timed_keyframe_evidence(&frame, 0, &[], 0.0);
+        holder.join().unwrap();
+        assert!(waited >= Duration::from_millis(40), "{waited:?}");
+    }
+
     /// A parked camera earns no keyframe from the motion policy; the time
     /// bound still forces one, measured from the last keyframe's timestamp.
     #[test]
@@ -385,11 +532,1109 @@ mod keyframe_evidence {
             tracked_inliers: 80,
             n_ref_map_points: 100,
             median_parallax_px: Some(0.3),
+            ..KeyframeEvidence::default()
         };
         assert!(!system.keyframe_policy.should_insert_with(&parked));
         assert!(!system.keyframe_due(&parked, 10.49));
         assert!(system.keyframe_due(&parked, 10.5));
         system.keyframe_policy.max_interval_sec = None;
         assert!(!system.keyframe_due(&parked, 1e6), "no bound unless set");
+    }
+}
+
+mod wheels {
+    use super::*;
+    use crate::system::wheel::{WheelError, WheelOdomConfig, WheelSample};
+    use kornia_algebra::Mat3F64;
+
+    fn system() -> SlamSystem {
+        SlamSystem::build(
+            config(CameraSelection::Stereo, false, LoopClosingMode::Disabled),
+            stereo_imu_rig(),
+        )
+        .expect("builds")
+    }
+
+    fn straight(seconds: u64) -> Vec<WheelSample> {
+        (0..=seconds * 50)
+            .map(|i| WheelSample {
+                stamp_ns: i * 20_000_000,
+                x: i as f64 * 0.002,
+                y: 0.0,
+                theta: 0.0,
+            })
+            .collect()
+    }
+
+    fn enabled() -> SlamSystem {
+        let mut s = system();
+        s.enable_wheel_odometry(
+            WheelOdomConfig::new(Pose3d::IDENTITY, 0.05, 0.01).expect("valid config"),
+        );
+        s
+    }
+
+    #[test]
+    fn without_wheels_nothing_is_kept_and_jobs_carry_no_factors() {
+        let mut s = system();
+        assert_eq!(s.process_wheel_odometry(straight(1)), 0);
+        assert!(s.push_camera_mount(0, Pose3d::IDENTITY).is_ok());
+        s.note_wheel_keyframe(Some((0, 0.0)), 5, 1.0);
+        assert!(s.wheel_factors().is_empty());
+    }
+
+    #[test]
+    fn a_covered_keyframe_interval_becomes_one_edge_between_those_keyframes() {
+        let mut s = enabled();
+        assert!(s.process_wheel_odometry(straight(2)) > 0);
+        s.note_wheel_keyframe(None, 0, 0.0);
+        s.note_wheel_keyframe(Some((0, 0.0)), 5, 1.0);
+        let factors = s.wheel_factors();
+        assert_eq!(factors.len(), 1);
+        assert_eq!((factors[0].from_idx, factors[0].to_idx), (0, 5));
+    }
+
+    #[test]
+    fn an_interval_past_the_newest_reading_waits_for_the_readings() {
+        let mut s = enabled();
+        s.process_wheel_odometry(straight(1));
+        s.note_wheel_keyframe(Some((0, 0.5)), 9, 3.0);
+        assert!(s.wheel_factors().is_empty(), "not covered yet");
+        s.process_wheel_odometry((51..=200).map(|i| WheelSample {
+            stamp_ns: i * 20_000_000,
+            x: i as f64 * 0.002,
+            y: 0.0,
+            theta: 0.0,
+        }));
+        s.note_wheel_keyframe(Some((9, 3.0)), 12, 3.5);
+        let ends: Vec<_> = s
+            .wheel_factors()
+            .iter()
+            .map(|f| (f.from_idx, f.to_idx))
+            .collect();
+        assert!(ends.contains(&(0, 9)), "the waiting edge landed: {ends:?}");
+    }
+
+    #[test]
+    fn a_non_rigid_mount_is_refused() {
+        let mut s = enabled();
+        let skew = Pose3d::new(Mat3F64::IDENTITY * 2.0, Vec3F64::ZERO);
+        assert!(matches!(
+            s.push_camera_mount(0, skew),
+            Err(WheelError::MountNotRigid { .. })
+        ));
+    }
+}
+
+mod anchors {
+    use super::*;
+    use crate::tracking::parallax::tests::{frame_seeing_points, map_with_keyframe_at};
+    use kornia_sensors::imu::ImuBias;
+
+    const ACCEL_X: f64 = 0.3;
+
+    /// A monocular-inertial system tracking against keyframe 0 (inserted at
+    /// t = 0), with an initialized IMU and 2 s of constant-acceleration
+    /// samples buffered.
+    fn system() -> SlamSystem {
+        let mut config = config(CameraSelection::Mono, true, LoopClosingMode::Disabled);
+        let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+        orb.tracking_loss.keyframes_while_lost = KeyframesWhileLost::Anchor;
+        let rig = SensorRig::new(camera()).with_imu(Pose3d::IDENTITY);
+        let mut system = SlamSystem::build(config, rig).unwrap();
+        *system.map.lock().unwrap() = map_with_keyframe_at(Pose3d::IDENTITY);
+        system.state.current_keyframe_idx = Some(0);
+        system.state.last_keyframe_idx = Some(0);
+        system.state.imu_initialized = true;
+        system.inertial.last_keyframe_timestamp_sec = Some(0.0);
+        system.inertial.gravity_world = Vec3F64::ZERO;
+        let samples: Vec<ImuMeasurement> = (0..=400)
+            .map(|i| ImuMeasurement {
+                timestamp: i as f64 * 0.005,
+                gyro: Vec3F64::ZERO,
+                accel: Vec3F64::new(ACCEL_X, 0.0, 0.0),
+            })
+            .collect();
+        system.process_imu(&samples);
+        system
+    }
+
+    fn frame(idx: usize) -> Frame {
+        frame_seeing_points(idx, Pose3d::IDENTITY, &[])
+    }
+
+    #[test]
+    fn the_config_selects_anchors_and_defaults_to_lost_keyframes() {
+        assert_eq!(
+            TrackingLossConfig::default().keyframes_while_lost,
+            KeyframesWhileLost::Enabled
+        );
+        assert_eq!(system().keyframes_while_lost, KeyframesWhileLost::Anchor);
+    }
+
+    #[test]
+    fn an_anchor_stays_out_of_the_imu_chain_and_the_next_keyframe_bridges_it() {
+        let mut system = system();
+        assert!(system.insert_keyframe(&frame(4), 0.2, &[], 0, KeyframeRole::Anchor));
+        {
+            let map = system.map.lock().unwrap();
+            let anchor = map.get_keyframe(4).unwrap();
+            assert!(anchor.anchor && anchor.inserted_while_lost);
+            assert!(map.imu_factors().is_empty());
+        }
+        assert_eq!(system.state.current_keyframe_idx, Some(4));
+        assert_eq!(system.state.last_keyframe_idx, Some(0));
+        assert_eq!(system.inertial.last_keyframe_timestamp_sec, Some(0.0));
+        assert_eq!(system.state.last_anchor_timestamp_sec, Some(0.2));
+
+        assert!(system.insert_keyframe(&frame(8), 0.4, &[], 0, KeyframeRole::Tracked));
+        let map = system.map.lock().unwrap();
+        let [edge] = map.imu_factors() else {
+            panic!("one edge, got {}", map.imu_factors().len());
+        };
+        assert_eq!((edge.prev_kf_idx, edge.curr_kf_idx), (0, 8));
+        assert_eq!((edge.t0, edge.t1), (0.0, 0.4));
+        assert!(!map.get_keyframe(8).unwrap().anchor);
+        assert_eq!(system.state.last_keyframe_idx, Some(8));
+    }
+
+    #[test]
+    fn anchors_are_spaced_from_the_newest_anchor_and_tracking_clears_it() {
+        let mut system = system();
+        assert!(system.keyframe_due_while_lost(0.2));
+        assert!(system.insert_keyframe(&frame(4), 0.2, &[], 0, KeyframeRole::Anchor));
+        assert!(!system.keyframe_due_while_lost(0.3));
+        assert!(system.keyframe_due_while_lost(0.4));
+        system.state.mark_tracked();
+        assert_eq!(system.state.last_anchor_timestamp_sec, None);
+        system.state.last_anchor_timestamp_sec = Some(1.0);
+        system.state.reset();
+        assert_eq!(system.state.last_anchor_timestamp_sec, None);
+    }
+
+    /// Against an anchor the velocity keeps propagating through the loss
+    /// (`v + a k dt`) and the bias is the last tracked keyframe's, whatever
+    /// the anchor carries.
+    #[test]
+    fn an_anchor_reference_keeps_the_propagated_velocity_and_the_tracked_bias() {
+        let mut system = system();
+        let tracked_bias = ImuBias::default();
+        system
+            .map
+            .lock()
+            .unwrap()
+            .edit_keyframes_for_test(|_, kf| kf.imu_bias = tracked_bias);
+        system.state.velocity_world = Vec3F64::new(1.0, 0.0, 0.0);
+        assert!(system.insert_keyframe(&frame(4), 0.2, &[], 0, KeyframeRole::Anchor));
+        system.map.lock().unwrap().edit_keyframes_for_test(|_, kf| {
+            if kf.anchor {
+                kf.velocity_world = Vec3F64::new(-5.0, 0.0, 0.0);
+                kf.imu_bias.accel = Vec3F64::new(1.0, 0.0, 0.0);
+            }
+        });
+        system.inertial.bias.accel = Vec3F64::new(2.0, 0.0, 0.0);
+
+        let dt = 0.05;
+        let k = 10;
+        let mut pose = Pose3d::IDENTITY;
+        for i in 0..k {
+            system.refresh_reference_inertial_state();
+            let (t0, t1) = (0.2 + i as f64 * dt, 0.2 + (i + 1) as f64 * dt);
+            let (preintegrated, _) =
+                system
+                    .inertial
+                    .preintegrate_window(system.rig.imu_noise(), t0, t1);
+            let (next, velocity) = predict_pose(
+                pose,
+                None,
+                system.state.velocity_world,
+                Some(InertialPrediction {
+                    preintegrated: &preintegrated,
+                    camera_to_body: system.rig.camera_to_body(),
+                    gravity_world: system.inertial.gravity_world,
+                }),
+            );
+            pose = next;
+            system.state.velocity_world = velocity.unwrap();
+        }
+        assert_eq!(system.inertial.bias.accel, tracked_bias.accel);
+        let expected = 1.0 + ACCEL_X * k as f64 * dt;
+        let v = system.state.velocity_world;
+        assert!((v.x - expected).abs() < 1e-9, "{v:?} vs {expected}");
+        assert!(v.y.abs() < 1e-12 && v.z.abs() < 1e-12);
+    }
+
+    /// E7: against an anchor, a keyframe-origin prediction re-integrates
+    /// `[t_kf, t]` every coast frame. It must start from the keyframe's
+    /// velocity, `v_kf + a (t - t_kf)`, not from the propagated one, which
+    /// adds the whole window again each frame.
+    #[test]
+    fn a_keyframe_origin_prediction_starts_from_the_keyframe_velocity() {
+        let mut system = system();
+        system.tracking_config.pose_inertial = PoseInertial::OrbSlam3;
+        let t_kf = 0.1;
+        system.inertial.last_keyframe_timestamp_sec = Some(t_kf);
+        system
+            .map
+            .lock()
+            .unwrap()
+            .edit_keyframes_for_test(|_, kf| kf.velocity_world = Vec3F64::new(1.0, 0.0, 0.0));
+        assert!(system.insert_keyframe(&frame(4), 0.2, &[], 0, KeyframeRole::Anchor));
+        system.state.velocity_world = Vec3F64::new(1.0 + ACCEL_X * (0.2 - t_kf), 0.0, 0.0);
+
+        let dt = 0.05;
+        let mut pose = Pose3d::IDENTITY;
+        let mut prev = 0.2;
+        let mut t = prev;
+        for i in 0..10 {
+            let idx = 5 + i;
+            if !system.frame_state_carried(idx) {
+                system.refresh_reference_inertial_state();
+            }
+            t = 0.2 + (i + 1) as f64 * dt;
+            let (from, from_sec) = system.prediction_origin(idx, pose, prev);
+            assert_eq!(from_sec, t_kf, "keyframe-anchored without a frame prior");
+            (pose, _) = system.predict_frame_pose(from, from_sec, t);
+            prev = t;
+        }
+        let expected = 1.0 + ACCEL_X * (t - t_kf);
+        let v = system.state.velocity_world;
+        assert!((v.x - expected).abs() < 1e-9, "{v:?} vs {expected}");
+    }
+}
+
+mod pose_inertial_guards {
+    use super::*;
+    use crate::tracking::KeyframeRules;
+    use crate::tracking::parallax::tests::{
+        all_matches, frame_seeing_points, map_with_keyframe_at,
+    };
+    use crate::tracking::pose_estimation::Estimate;
+
+    /// A monocular-inertial system solving every tracked frame from its last
+    /// keyframe 0 (t = 0), with 2 s of IMU at rest and the debug log on.
+    fn system() -> SlamSystem {
+        let config = config(CameraSelection::Mono, true, LoopClosingMode::Disabled);
+        let rig = SensorRig::new(camera()).with_imu(Pose3d::IDENTITY);
+        let mut system = SlamSystem::build(config, rig).unwrap();
+        system.tracking_config.pose_inertial = PoseInertial::LastKeyframe;
+        *system.map.lock().unwrap() = map_with_keyframe_at(Pose3d::IDENTITY);
+        system.state.current_keyframe_idx = Some(0);
+        system.state.last_keyframe_idx = Some(0);
+        system.state.imu_initialized = true;
+        system.inertial.last_keyframe_timestamp_sec = Some(0.0);
+        let samples: Vec<ImuMeasurement> = (0..=400)
+            .map(|i| ImuMeasurement {
+                timestamp: i as f64 * 0.005,
+                gyro: Vec3F64::ZERO,
+                accel: Vec3F64::ZERO,
+            })
+            .collect();
+        system.process_imu(&samples);
+        system.set_debug(true);
+        system
+    }
+
+    /// Whether frame `idx` at `t` ran the pose-inertial solve.
+    fn solved(system: &mut SlamSystem, idx: usize, t: f64) -> bool {
+        refine(system, idx, t).0
+    }
+
+    /// Whether frame `idx` at `t` ran the solve, and whether it was kept.
+    fn refine(system: &mut SlamSystem, idx: usize, t: f64) -> (bool, bool) {
+        let points: Vec<Vec3F64> =
+            system.with_map_points(|mps| mps.iter().map(|mp| mp.position).collect());
+        let frame = frame_seeing_points(idx, Pose3d::IDENTITY, &points);
+        let mut estimate = Estimate {
+            pose: Pose3d::IDENTITY,
+            matches: all_matches(),
+            inliers: points.len(),
+            most_voted_keyframe: None,
+        };
+        system.drain_debug_messages();
+        let kept = system.refine_pose_inertial(&frame, &mut estimate, t - 0.05, t);
+        let ran = system
+            .drain_debug_messages()
+            .iter()
+            .any(|m| m.starts_with("[pose_inertial]"));
+        (ran, kept)
+    }
+
+    /// E5: a solve that keeps fewer than `min_inliers` (9 of 50 here) fails
+    /// the frame, as ORB-SLAM3 does, and is counted; it no longer keeps the
+    /// visual pose silently.
+    #[test]
+    fn a_solve_with_too_few_inliers_rejects_the_frame() {
+        let mut system = system();
+        assert_eq!(refine(&mut system, 10, 0.5), (true, false));
+        assert_eq!(system.counters.pose_inertial_rejects, 1);
+        assert_eq!(system.counters.pose_inertial_solves, 0);
+        system.tracking_config.pose_inertial = PoseInertial::Off;
+        assert_eq!(
+            refine(&mut system, 11, 0.55),
+            (false, true),
+            "no solve, kept"
+        );
+    }
+
+    /// E4: ORB-SLAM3 stays visual for `mMaxFrames` frames after a
+    /// relocalization (`Tracking.cc:2973`), and a keyframe held exact over a
+    /// window past a second is overconfident (27x at 5 s).
+    #[test]
+    fn the_solve_waits_after_a_relocalization_and_skips_a_long_fixed_window() {
+        let mut system = system();
+        assert!(solved(&mut system, 10, 0.5), "a short window solves");
+        assert!(!solved(&mut system, 30, 1.5), "1.5 s held exact");
+
+        system.keyframe_policy.rules = KeyframeRules::OrbSlam3 { max_frames: 10 };
+        system.estimator.last_relocalization_frame = Some(5);
+        assert!(
+            !solved(&mut system, 10, 0.5),
+            "5 frames after a relocalization"
+        );
+        assert!(solved(&mut system, 16, 0.5), "past max_frames");
+
+        system.keyframe_policy.rules = KeyframeRules::Kornia;
+        system.estimator.last_relocalization_sec = Some(0.2);
+        assert!(
+            !solved(&mut system, 40, 0.5),
+            "0.3 s after a relocalization"
+        );
+        system.estimator.last_relocalization_sec = Some(-0.6);
+        assert!(solved(&mut system, 41, 0.5), "past a second");
+    }
+}
+
+mod own_window {
+    use super::*;
+    use crate::tracking::parallax::tests::frame_seeing_points;
+
+    /// G2: a give-up re-seeds segment 1 at keyframe 100 under a 3-keyframe
+    /// own window; a lost relocalization into segment 0 must open the window
+    /// and tag the next keyframes with segment 0.
+    #[test]
+    fn a_lost_relocalization_into_an_older_segment_lifts_the_own_window() {
+        let mut config = config(CameraSelection::Stereo, true, LoopClosingMode::Disabled);
+        let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+        orb.tracking_loss.reseed.own_window_keyframes = 3;
+        let mut system = SlamSystem::build(config, stereo_imu_rig()).unwrap();
+        let mut map = Map::new();
+        for idx in [0, 2, 100] {
+            map.insert_keyframe(Keyframe::from_frame(frame_seeing_points(
+                idx,
+                Pose3d::IDENTITY,
+                &[],
+            )))
+            .unwrap();
+        }
+        *system.map.lock().unwrap() = map;
+        system.finish_bootstrap(0, 0.0);
+        system.update_seeded_window();
+        assert_eq!(system.seeded_window_start(), None, "the first segment");
+        system.finish_bootstrap(100, 10.0);
+        system.update_seeded_window();
+        assert_eq!(system.seeded_window_start(), Some(100));
+
+        system.adopt_relocalization(105, 10.5, 2, Pose3d::IDENTITY, true);
+        system.update_seeded_window();
+        assert_eq!(system.seeded_window_start(), None);
+        assert_eq!(system.segment_of(106), 0);
+        assert_eq!(system.segment_of(100), 1);
+    }
+}
+
+mod windowed_tracks {
+    use super::*;
+    use crate::tracking::parallax::tests::{frame_seeing_points, map_with_keyframe_at};
+
+    /// A stereo system on the `WindowedU8` kernels whose tracks follow the
+    /// 9 landmarks of keyframe 0.
+    fn system() -> SlamSystem {
+        let mut config = config(CameraSelection::Stereo, true, LoopClosingMode::Disabled);
+        let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+        orb.frontend = FrontendConfig::Orb(OrbFrontendConfig {
+            klt_kernel: LkKernel::WindowedU8,
+            klt_window: 11,
+            ..OrbFrontendConfig::default()
+        });
+        let mut system = SlamSystem::build(config, stereo_imu_rig()).unwrap();
+        *system.map.lock().unwrap() = map_with_keyframe_at(Pose3d::IDENTITY);
+        system.state.current_keyframe_idx = Some(0);
+        system.state.last_keyframe_idx = Some(0);
+        let landmarks: Vec<Vec3F64> =
+            system.with_map_points(|mps| mps.iter().map(|mp| mp.position).collect());
+        for (i, position) in landmarks.into_iter().enumerate() {
+            system
+                .tracker
+                .adopt([10.0 * i as f32, 20.0], 0, i, position);
+        }
+        system
+    }
+
+    fn positions(system: &SlamSystem) -> Vec<Option<Vec3F64>> {
+        system
+            .tracker
+            .tracks()
+            .iter()
+            .map(|t| t.position())
+            .collect()
+    }
+
+    /// T3: a keyframe insertion that moved the map (here the whole map
+    /// shifted, as an inertial alignment rescales and rotates it) must leave
+    /// the tracks' stored positions on the new landmarks, not the old ones.
+    #[test]
+    fn a_keyframe_insertion_refreshes_the_track_positions() {
+        let mut system = system();
+        let shifted = Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            Vec3F64::new(0.3, 0.0, 0.0),
+        );
+        *system.map.lock().unwrap() = map_with_keyframe_at(shifted);
+        let moved: Vec<Option<Vec3F64>> =
+            system.with_map_points(|mps| mps.iter().map(|mp| Some(mp.position)).collect());
+        assert_ne!(positions(&system), moved);
+        let frame = frame_seeing_points(4, Pose3d::IDENTITY, &[]);
+        assert!(system.insert_keyframe(&frame, 0.2, &[], 0, KeyframeRole::Anchor));
+        assert_eq!(positions(&system), moved);
+    }
+
+    /// T9: an anchor does not become the last keyframe, whose landmarks are
+    /// adopted, so it must not replace that keyframe's kept frames.
+    #[test]
+    fn an_anchor_keeps_the_last_keyframes_frames_for_adoption() {
+        let mut system = system();
+        system.flow.adopt_landmarks = true;
+        let image = textured(0);
+        let mut timings = TrackingTimings::default();
+        let mut prepare = |system: &mut SlamSystem, frame_idx: u64| {
+            system
+                .rig_flow
+                .as_mut()
+                .unwrap()
+                .prepare(&[&image], frame_idx, &mut timings)
+                .unwrap();
+        };
+        prepare(&mut system, 3);
+        let tracked = frame_seeing_points(3, Pose3d::IDENTITY, &[]);
+        assert!(system.insert_keyframe(&tracked, 0.15, &[], 0, KeyframeRole::Tracked));
+        prepare(&mut system, 4);
+        let anchor = frame_seeing_points(4, Pose3d::IDENTITY, &[]);
+        assert!(system.insert_keyframe(&anchor, 0.2, &[], 0, KeyframeRole::Anchor));
+        assert_eq!(system.state.last_keyframe_idx, Some(3));
+        let pixel = [188.0, 120.0];
+        assert!(
+            system
+                .rig_flow
+                .as_mut()
+                .unwrap()
+                .adopt(3, 0, pixel, pixel)
+                .is_some(),
+            "keyframe 3's frames are still kept"
+        );
+    }
+}
+
+mod gyro_guess {
+    use super::*;
+    use crate::tracking::parallax::tests::map_with_keyframe_at;
+
+    const RATE: f64 = std::f64::consts::FRAC_PI_6; // 30°/s
+    const DT: f64 = 1.0 / 15.0;
+    const T_KF: f64 = 0.1;
+
+    /// Angle of a rotation matrix, rad.
+    fn angle(r: Mat3F64) -> f64 {
+        let c = r.to_cols_array();
+        ((c[0] + c[4] + c[8] - 1.0) / 2.0).clamp(-1.0, 1.0).acos()
+    }
+
+    /// T5: with a keyframe-anchored prediction (OrbSlam3, no frame prior),
+    /// the gyro guess turns previous-frame pixels by one frame of rotation,
+    /// not by the whole window since the keyframe 5 frames back (10° for 2°).
+    #[test]
+    fn the_gyro_guess_spans_one_frame_on_a_keyframe_anchored_prediction() {
+        let config = config(CameraSelection::Mono, true, LoopClosingMode::Disabled);
+        let rig = SensorRig::new(camera()).with_imu(Pose3d::IDENTITY);
+        let mut system = SlamSystem::build(config, rig).unwrap();
+        system.tracking_config.pose_inertial = PoseInertial::OrbSlam3;
+        system.flow.gyro_guess = GyroGuess::RotatedRay;
+        *system.map.lock().unwrap() = map_with_keyframe_at(Pose3d::IDENTITY);
+        system.state.current_keyframe_idx = Some(0);
+        system.state.last_keyframe_idx = Some(0);
+        system.state.imu_initialized = true;
+        system.inertial.last_keyframe_timestamp_sec = Some(T_KF);
+        system.inertial.gravity_world = Vec3F64::ZERO;
+        let samples: Vec<ImuMeasurement> = (0..=400)
+            .map(|i| ImuMeasurement {
+                timestamp: i as f64 * 0.005,
+                gyro: Vec3F64::new(0.0, RATE, 0.0),
+                accel: Vec3F64::ZERO,
+            })
+            .collect();
+        system.process_imu(&samples);
+
+        let t = T_KF + 5.0 * DT;
+        let (pose_before, _) = system.predict_frame(4, Pose3d::IDENTITY, t - 2.0 * DT, t - DT);
+        system.predict_frame(5, pose_before, t - DT, t);
+        let turned = angle(system.gyro_rotation.expect("a rotated-ray guess"));
+        assert!((turned - RATE * DT).abs() < 1e-3, "{turned} rad");
+    }
+}
+
+mod inertial_origin {
+    use super::*;
+    use crate::tracking::local_map::LocalMapRules;
+    use crate::tracking::parallax::tests::{frame_seeing_points, map_with_keyframe_at};
+
+    fn stale() -> Vec3F64 {
+        Vec3F64::new(-5.0, 0.0, 0.0)
+    }
+
+    fn propagated() -> Vec3F64 {
+        Vec3F64::new(1.0, 0.0, 0.0)
+    }
+
+    /// A monocular-inertial system whose last keyframe is 1 and whose
+    /// tracking reference is the older keyframe 0, with a stale velocity and
+    /// bias on keyframe 0.
+    /// The knob is set after the build: relocalization needs a vocabulary.
+    fn system(configure: impl FnOnce(&mut SlamSystem)) -> SlamSystem {
+        let config = config(CameraSelection::Mono, true, LoopClosingMode::Disabled);
+        let rig = SensorRig::new(camera()).with_imu(Pose3d::IDENTITY);
+        let mut system = SlamSystem::build(config, rig).unwrap();
+        configure(&mut system);
+        let mut map = map_with_keyframe_at(Pose3d::IDENTITY);
+        map.insert_keyframe(Keyframe::from_frame(frame_seeing_points(
+            1,
+            Pose3d::IDENTITY,
+            &[],
+        )))
+        .unwrap();
+        map.edit_keyframes_for_test(|_, kf| {
+            if kf.frame.idx == 0 {
+                kf.velocity_world = stale();
+                kf.imu_bias.accel = Vec3F64::new(1.0, 0.0, 0.0);
+            } else {
+                kf.velocity_world = Vec3F64::new(2.0, 0.0, 0.0);
+                kf.imu_bias.accel = Vec3F64::new(0.5, 0.0, 0.0);
+            }
+        });
+        *system.map.lock().unwrap() = map;
+        system.state.imu_initialized = true;
+        system.state.current_keyframe_idx = Some(0);
+        system.state.last_keyframe_idx = Some(1);
+        system.state.velocity_world = propagated();
+        system
+    }
+
+    fn assert_kept_with_the_last_bias(system: &SlamSystem) {
+        assert_eq!(system.state.velocity_world, propagated());
+        assert_eq!(system.inertial.bias.accel, Vec3F64::new(0.5, 0.0, 0.0));
+    }
+
+    /// E1: A8's most-voted reference is older than the last keyframe; its
+    /// velocity is `v(t_ref)`, so the propagated velocity stays, with the
+    /// last keyframe's bias.
+    #[test]
+    fn a_most_voted_reference_leaves_the_inertial_state_to_the_last_keyframe() {
+        let mut system =
+            system(|system| system.tracking_config.local_map = LocalMapRules::OrbSlam3);
+        system.refresh_reference_inertial_state();
+        assert_kept_with_the_last_bias(&system);
+    }
+
+    /// G3: a relocalization while lost makes an old keyframe the reference;
+    /// its velocity and bias can be minutes old.
+    #[test]
+    fn a_relocalized_reference_leaves_the_inertial_state_to_the_last_keyframe() {
+        let mut system = system(|system| system.relocalization.while_lost = true);
+        system.refresh_reference_inertial_state();
+        assert_kept_with_the_last_bias(&system);
+    }
+
+    /// Without those knobs the reference's state is copied, as before.
+    #[test]
+    fn without_the_knobs_the_reference_state_is_copied() {
+        let mut system = system(|_| {});
+        system.refresh_reference_inertial_state();
+        assert_eq!(system.state.velocity_world, stale());
+        assert_eq!(system.inertial.bias.accel, Vec3F64::new(1.0, 0.0, 0.0));
+    }
+}
+
+mod recovery_after_loss {
+    use super::*;
+    use crate::tracking::parallax::tests::frame_seeing_points;
+
+    /// World-to-camera pose of a camera centred at `(x, 0, 0)`.
+    fn centred_at(x: f64) -> Pose3d {
+        Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            Vec3F64::new(-x, 0.0, 0.0),
+        )
+    }
+
+    /// A stereo-inertial system with anchors and the inertial state kept
+    /// across a give-up, tracked to keyframe 40 at t = 10 s, lost
+    /// from t = 10 s at `centred_at(1.0)` and coasted to `centred_at(coast_x)`.
+    fn lost_metric_system(coast_x: f64) -> SlamSystem {
+        let mut config = config(CameraSelection::Stereo, true, LoopClosingMode::Disabled);
+        let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+        orb.tracking_loss.keyframes_while_lost = KeyframesWhileLost::Anchor;
+        orb.tracking_loss.reseed.keep_inertial = true;
+        orb.tracking_loss.reseed.min_seed_points = 10;
+        let mut system = SlamSystem::build(config, stereo_imu_rig()).unwrap();
+        system.state.mode = SystemMode::Tracking;
+        system.state.imu_initialized = true;
+        system.state.imu_init_timestamp_sec = Some(2.0);
+        system.state.last_keyframe_idx = Some(40);
+        system.state.current_keyframe_idx = Some(40);
+        system.inertial.last_keyframe_timestamp_sec = Some(10.0);
+        system.state.mark_lost(10.0, centred_at(1.0), 9.95);
+        system.state.pose_world_to_cam = centred_at(coast_x);
+        system.state.velocity_world = Vec3F64::new(1.2, 0.0, 0.0);
+        system
+    }
+
+    #[test]
+    fn the_gate_reference_needs_an_inertial_prediction_and_bounds_a_loss_from_the_last_tracked_pose()
+     {
+        let mut system = lost_metric_system(7.0);
+        let prediction = centred_at(7.05);
+        assert_eq!(
+            system.pose_gate_reference(prediction, Some(Vec3F64::ZERO), 0.05, 1.0),
+            None,
+            "neither the gate nor the debug log asks for it"
+        );
+        system.set_debug(true);
+        assert_eq!(
+            system.pose_gate_reference(prediction, None, 0.05, 1.0),
+            None,
+            "a constant-velocity guess is no reference"
+        );
+        let reference = system
+            .pose_gate_reference(prediction, Some(Vec3F64::ZERO), 0.05, 1.0)
+            .unwrap();
+        assert_eq!(reference.prediction, prediction);
+        assert_eq!(reference.lost, Some((centred_at(1.0), 1.05)));
+        system.state.mark_tracked();
+        let reference = system
+            .pose_gate_reference(prediction, Some(Vec3F64::ZERO), 0.05, 0.0)
+            .unwrap();
+        assert_eq!(reference.lost, None);
+    }
+
+    fn stereo_frame(idx: usize) -> Frame {
+        let mut frame = frame_seeing_points(idx, Pose3d::IDENTITY, &[]);
+        frame.depth = vec![2.0; frame.features.keypoints_xy.len().max(1)];
+        frame
+    }
+
+    #[test]
+    fn a_plausible_coast_seeds_the_next_segment_there_and_keeps_the_inertial_state() {
+        let mut system = lost_metric_system(7.0);
+
+        system.give_up(&stereo_frame(140), 5.0);
+
+        let state = &system.state;
+        assert!(state.reseeding(), "the IMU stays initialized");
+        assert_eq!(state.imu_init_timestamp_sec, Some(2.0));
+        assert_eq!(state.pose_world_to_cam, centred_at(7.0));
+        assert_eq!(state.velocity_world, Vec3F64::new(1.2, 0.0, 0.0));
+        assert_eq!(
+            state.bridge_anchor,
+            Some(BridgeAnchor {
+                kf_idx: 40,
+                timestamp_sec: 10.0
+            })
+        );
+    }
+
+    /// G7: the last tracked pose is one frame (50 ms) before the loss, so a
+    /// 2.1 m coast given up 0.5 s into the loss spans 0.55 s: 3.8 m/s, under
+    /// the 4 m/s limit, not the 4.2 m/s of the loss time alone.
+    #[test]
+    fn the_coast_speed_spans_the_gap_from_the_last_tracked_frame() {
+        let mut system = lost_metric_system(3.1);
+        system.give_up(&stereo_frame(140), 0.5);
+        assert_eq!(system.state.pose_world_to_cam, centred_at(3.1), "plausible");
+        assert!(system.state.bridge_anchor.is_some());
+    }
+
+    #[test]
+    fn a_runaway_coast_seeds_at_the_last_tracked_pose_at_rest_without_a_bridge() {
+        let mut system = lost_metric_system(-8.1e57);
+
+        system.give_up(&stereo_frame(140), 5.0);
+
+        let state = &system.state;
+        assert!(state.reseeding());
+        assert_eq!(state.pose_world_to_cam, centred_at(1.0));
+        assert_eq!(state.velocity_world, Vec3F64::ZERO);
+        assert_eq!(state.bridge_anchor, None);
+    }
+
+    /// A coast whose average over the gap looks like walking but whose last
+    /// 10 s ran away is no seed either.
+    #[test]
+    fn a_runaway_over_the_window_overrides_a_plausible_gap_average() {
+        let mut system = lost_metric_system(7.0);
+        system.runaway.record(3.0, Vec3F64::ZERO);
+        system.runaway.record(13.0, Vec3F64::new(60.0, 0.0, 0.0));
+
+        system.give_up(&stereo_frame(140), 5.0);
+
+        assert_eq!(system.state.pose_world_to_cam, centred_at(1.0));
+        assert_eq!(system.state.bridge_anchor, None);
+        assert!(!system.runaway.runaway(), "the runaway history is dropped");
+    }
+
+    #[test]
+    fn a_monocular_frame_or_the_knob_off_starts_over_as_before() {
+        let mut mono_frame = lost_metric_system(7.0);
+        mono_frame.give_up(&frame_seeing_points(140, Pose3d::IDENTITY, &[]), 5.0);
+        assert!(!mono_frame.state.imu_initialized);
+        assert_eq!(mono_frame.state.pose_world_to_cam, centred_at(1.0));
+
+        let mut off = lost_metric_system(7.0);
+        off.recovery.keep_inertial = false;
+        off.give_up(&stereo_frame(140), 5.0);
+        assert!(!off.state.imu_initialized);
+    }
+
+    /// The bridge is the IMU edge from the anchor to the new keyframe with
+    /// its covariance scaled by `bridge_covariance_scale`.
+    #[test]
+    fn the_bridge_edge_spans_the_gap_with_an_inflated_covariance() {
+        let mut system = lost_metric_system(7.0);
+        let samples: Vec<ImuMeasurement> = (0..=1000)
+            .map(|i| ImuMeasurement {
+                timestamp: 10.0 + i as f64 * 0.005,
+                gyro: Vec3F64::new(0.0, 0.01, 0.0),
+                accel: Vec3F64::new(0.0, 0.0, 9.81),
+            })
+            .collect();
+        system.inertial.latest_image_timestamp_sec = Some(15.0);
+        system.process_imu(&samples);
+        {
+            let mut map = system.map.lock().unwrap();
+            for (idx, x) in [(40, 1.0), (141, 7.0)] {
+                map.insert_keyframe(Keyframe::from_frame(frame_seeing_points(
+                    idx,
+                    centred_at(x),
+                    &[],
+                )))
+                .unwrap();
+            }
+        }
+        let anchor = BridgeAnchor {
+            kf_idx: 40,
+            timestamp_sec: 10.0,
+        };
+
+        let gap = system.publish_bridge(anchor, 141, 15.0);
+
+        let plain = system
+            .inertial
+            .keyframe_edge(system.rig.imu_noise(), 40, 141, 10.0, 15.0)
+            .unwrap();
+        let map = system.map.lock().unwrap();
+        let [bridge] = map.imu_factors() else {
+            panic!("one bridge edge, got {}", map.imu_factors().len());
+        };
+        assert_eq!((bridge.prev_kf_idx, bridge.curr_kf_idx), (40, 141));
+        let scale = system.recovery.bridge_covariance_scale;
+        crate::system::recovery::tests::assert_scaled(
+            plain.preintegrated.covariance.as_slice(),
+            bridge.preintegrated.covariance.as_slice(),
+            scale,
+        );
+        let replayed = bridge.repreintegrate(bridge.preintegrated.bias);
+        assert_eq!(replayed.covariance, bridge.preintegrated.covariance);
+        // G1: the graph gap is the largest one-sigma axis of the position and
+        // rotation blocks, between the largest variance and the trace.
+        let covariance = &bridge.preintegrated.covariance;
+        let bounds = |base: usize| {
+            let diagonal = (base..base + 3).map(|i| covariance[(i, i)]);
+            (
+                diagonal.clone().fold(0.0, f64::max).sqrt(),
+                diagonal.sum::<f64>().sqrt(),
+            )
+        };
+        let Some(crate::loop_closure::KeyframeGap::Reseeded { sigma_m, sigma_rad }) = gap else {
+            panic!("a published bridge gives a re-seed gap, got {gap:?}");
+        };
+        for (sigma, (low, high)) in [(sigma_m, bounds(6)), (sigma_rad, bounds(0))] {
+            assert!(
+                low - 1e-12 <= sigma && sigma <= high + 1e-12,
+                "{sigma} outside [{low}, {high}]"
+            );
+        }
+    }
+
+    /// A system re-seeding after a plausible give-up at t = 15 s, with level
+    /// static IMU samples buffered to t = 16 s.
+    fn reseeding_system() -> SlamSystem {
+        let mut system = lost_metric_system(7.0);
+        system.give_up(&stereo_frame(140), 5.0);
+        system.state.last_frame_timestamp_sec = 15.0;
+        system.inertial.latest_image_timestamp_sec = Some(15.0);
+        let samples: Vec<ImuMeasurement> = (0..=200)
+            .map(|i| ImuMeasurement {
+                timestamp: 15.0 + i as f64 * 0.005,
+                gyro: Vec3F64::ZERO,
+                accel: Vec3F64::new(0.0, 0.0, 9.81),
+            })
+            .collect();
+        system.process_imu(&samples);
+        system
+    }
+
+    #[test]
+    fn a_stalled_reseed_coasts_on_the_kept_inertial_state() {
+        let mut system = reseeding_system();
+
+        system.coast_while_reseeding(141, 15.05);
+
+        let centre = recovery::camera_centre(&system.state.pose_world_to_cam);
+        assert!((centre.x - (7.0 + 1.2 * 0.05)).abs() < 1e-6, "{centre:?}");
+        assert_eq!(system.state.last_frame_timestamp_sec, 15.05);
+        assert!(system.state.bridge_anchor.is_some());
+    }
+
+    #[test]
+    fn a_runaway_while_reseeding_holds_the_pose_at_rest_and_drops_the_bridge() {
+        let mut system = reseeding_system();
+        system.runaway.record(14.0, Vec3F64::new(-100.0, 0.0, 0.0));
+
+        system.coast_while_reseeding(141, 15.05);
+
+        assert_eq!(system.state.pose_world_to_cam, centred_at(7.0));
+        assert_eq!(system.state.velocity_world, Vec3F64::ZERO);
+        assert_eq!(system.state.bridge_anchor, None);
+    }
+
+    #[test]
+    fn a_bridge_older_than_max_bridge_sec_is_dropped() {
+        let mut system = lost_metric_system(7.0);
+        system.give_up(&stereo_frame(140), 5.0);
+        assert!(system.live_bridge_anchor(19.9).is_some());
+        assert!(system.live_bridge_anchor(20.1).is_none());
+        assert!(system.state.bridge_anchor.is_none());
+    }
+
+    #[test]
+    fn the_inertial_state_is_kept_only_when_asked() {
+        assert!(!RecoveryConfig::default().keep_inertial);
+        assert_eq!(RecoveryConfig::default().min_seed_points, MIN_STEREO_POINTS);
+    }
+
+    #[test]
+    fn card_i_defaults_keep_the_cold_start_and_the_young_map_reset() {
+        let recovery = RecoveryConfig::default();
+        assert_eq!(recovery.min_cold_start_points, MIN_STEREO_POINTS);
+        assert_eq!(recovery.young_map_grace_sec, 0.0);
+    }
+
+    #[test]
+    fn a_young_map_is_reset_at_once_unless_given_grace() {
+        for lost_for in [0.0, 0.1, 0.6] {
+            assert!(
+                gives_up(false, lost_for, 0.5, 0.0),
+                "grace 0.0, lost {lost_for}"
+            );
+            assert_eq!(gives_up(true, lost_for, 0.5, 0.0), lost_for >= 0.5);
+        }
+        assert!(!gives_up(false, 0.2, 5.0, 0.5));
+        assert!(gives_up(false, 0.5, 5.0, 0.5));
+    }
+
+    /// The first loss of a re-seeded segment gets its first anchor within
+    /// `keyframe_interval_while_lost_sec` of the seed keyframe: the old
+    /// segment's anchor spacing does not carry over.
+    #[test]
+    fn the_first_anchor_after_a_kept_give_up_comes_within_the_lost_interval() {
+        let mut system = lost_metric_system(7.0);
+        system.state.last_anchor_timestamp_sec = Some(14.9);
+        assert!(system.give_up(&stereo_frame(140), 5.0));
+        assert_eq!(system.state.last_anchor_timestamp_sec, None);
+        system.finish_bootstrap(141, 15.0);
+        assert!(system.state.imu_initialized);
+        let interval = system
+            .tracking_loss_recovery
+            .keyframe_interval_while_lost_sec;
+        assert!(!system.keyframe_due_while_lost(15.0 + interval / 2.0));
+        assert!(system.keyframe_due_while_lost(15.0 + interval * 1.01));
+    }
+    /// World-to-camera pose with camera-to-world rotation `exp(axis_angle)`
+    /// and centre `centre`.
+    fn turned_at(axis_angle: Vec3F64, centre: Vec3F64) -> Pose3d {
+        let cam_to_world = kornia_algebra::SO3F64::exp(axis_angle).matrix();
+        Pose3d::new(
+            cam_to_world.transpose(),
+            -(cam_to_world.transpose() * centre),
+        )
+    }
+
+    #[test]
+    fn an_implausible_coast_seeds_the_last_tracked_position_with_the_propagated_attitude() {
+        let mut system = lost_metric_system(1.0);
+        let coasted = turned_at(Vec3F64::new(0.0, 0.7, 0.1), Vec3F64::new(300.0, 0.0, 0.0));
+        system.state.pose_world_to_cam = coasted;
+
+        assert!(system.give_up(&stereo_frame(140), 5.0));
+
+        let seed = system.state.pose_world_to_cam;
+        assert!((recovery::camera_centre(&seed) - Vec3F64::new(1.0, 0.0, 0.0)).length() < 1e-9);
+        assert!(seed.rotation_defect() < 1e-9);
+        let turn = (seed.rotation - coasted.rotation).to_cols_array();
+        assert!(turn.iter().all(|d| d.abs() < 1e-12), "{turn:?}");
+        assert_eq!(system.state.velocity_world, Vec3F64::ZERO);
+        assert_eq!(system.state.bridge_anchor, None);
+        assert_eq!(
+            (system.counters.reseeds, system.counters.reseeds_held),
+            (1, 1)
+        );
+    }
+
+    /// A re-seeding system whose buffered samples turn at `gyro` rad/s, held
+    /// by a runaway at its first stalled frame.
+    fn held_reseeding_system(gyro: Vec3F64) -> SlamSystem {
+        let mut system = lost_metric_system(7.0);
+        system.give_up(&stereo_frame(140), 5.0);
+        system.state.last_frame_timestamp_sec = 15.0;
+        system.inertial.latest_image_timestamp_sec = Some(15.0);
+        let samples: Vec<ImuMeasurement> = (0..=400)
+            .map(|i| ImuMeasurement {
+                timestamp: 15.0 + i as f64 * 0.005,
+                gyro,
+                accel: Vec3F64::new(0.0, 0.0, 9.81),
+            })
+            .collect();
+        system.process_imu(&samples);
+        system.runaway.record(14.0, Vec3F64::new(-100.0, 0.0, 0.0));
+        system
+    }
+
+    #[test]
+    fn a_held_reseed_keeps_integrating_the_attitude() {
+        let mut system = held_reseeding_system(Vec3F64::new(0.0, 0.5, 0.0));
+
+        system.coast_while_reseeding(141, 15.1);
+        system.coast_while_reseeding(142, 15.5);
+
+        let pose = system.state.pose_world_to_cam;
+        let centre = recovery::camera_centre(&pose);
+        assert!(
+            (centre - Vec3F64::new(7.0, 0.0, 0.0)).length() < 1e-9,
+            "{centre:?}"
+        );
+        assert_eq!(system.state.velocity_world, Vec3F64::ZERO);
+        // 0.5 rad/s over 0.5 s about the body (and camera) y axis.
+        let turned = kornia_algebra::SO3F64::from_matrix(&pose.rotation.transpose())
+            .log()
+            .length();
+        assert!((turned - 0.25).abs() < 1e-3, "{turned}");
+        assert_eq!(system.counters.reseeds_held, 1, "counted once per re-seed");
+    }
+
+    #[test]
+    fn a_reseed_starved_past_the_bridge_holds_its_translation() {
+        let mut system = reseeding_system();
+        system.coast_while_reseeding(141, 15.05);
+        assert!(!system.reseed_held);
+        system.state.last_frame_timestamp_sec = 20.05;
+        system.inertial.latest_image_timestamp_sec = Some(20.1);
+        system.coast_while_reseeding(242, 20.1);
+        assert!(system.reseed_held, "the bridge from t = 10 s outgrew 10 s");
+        assert_eq!(system.state.bridge_anchor, None);
+        assert_eq!(system.state.velocity_world, Vec3F64::ZERO);
+    }
+
+    #[test]
+    fn a_tilted_seed_is_levelled_about_its_centre_at_rest_without_a_bridge() {
+        let mut system = lost_metric_system(7.0);
+        let gravity = system.inertial.gravity_world;
+        let samples: Vec<ImuMeasurement> = (0..=200)
+            .map(|i| ImuMeasurement {
+                timestamp: 13.0 + i as f64 * 0.01,
+                gyro: Vec3F64::ZERO,
+                accel: -gravity,
+            })
+            .collect();
+        let stats = crate::inertial::ImuWindowStats::from_samples(&samples).unwrap();
+        // The body reads level, but the kept attitude is 20 deg off.
+        let tilted = kornia_algebra::SO3F64::exp(Vec3F64::new(20f64.to_radians(), 0.0, 0.0));
+        system
+            .tilt
+            .record(15.0, &stats, Vec3F64::ZERO, &tilted.matrix());
+
+        assert!(system.give_up(&stereo_frame(140), 5.0));
+
+        let seed = system.state.pose_world_to_cam;
+        assert!((recovery::camera_centre(&seed) - Vec3F64::new(7.0, 0.0, 0.0)).length() < 1e-9);
+        let turned = kornia_algebra::SO3F64::from_matrix(&seed.rotation)
+            .log()
+            .length();
+        assert!((turned - 20f64.to_radians()).abs() < 1e-6, "{turned}");
+        assert_eq!(system.state.velocity_world, Vec3F64::ZERO);
+        assert_eq!(system.state.bridge_anchor, None);
+        assert_eq!(system.counters.tilt_relevels, 1);
+    }
+
+    #[test]
+    fn a_bias_outside_the_envelope_is_zeroed_at_a_reseed() {
+        let mut system = lost_metric_system(7.0);
+        system.inertial.bias.accel = Vec3F64::new(0.8, 0.0, 0.0);
+        system.inertial.bias.gyro = Vec3F64::new(0.01, 0.0, 0.0);
+
+        system.give_up(&stereo_frame(140), 5.0);
+
+        assert_eq!(system.inertial.bias.accel, Vec3F64::ZERO);
+        assert_eq!(system.inertial.bias.gyro, Vec3F64::new(0.01, 0.0, 0.0));
+        assert_eq!(system.counters.bias_resets, 1);
+    }
+
+    #[test]
+    fn a_kept_reseed_spends_the_refinements_of_the_first_map() {
+        let mut system = lost_metric_system(7.0);
+        system.inertial.schedule.start(0, 9.0);
+        assert!(system.inertial.schedule.due_refinement(14.5).is_some());
+
+        system.give_up(&stereo_frame(140), 5.0);
+
+        for t in [15.0, 25.0, 40.0] {
+            assert!(
+                system.inertial.schedule.due_refinement(t).is_none(),
+                "t={t}"
+            );
+        }
+        assert_eq!(system.counters.reseeds, 1);
+    }
+}
+
+mod adoption {
+    use super::*;
+    use crate::tracking::parallax::tests::map_with_keyframe_at;
+
+    /// T9: with asynchronous mapping no result is back on the frame after a
+    /// keyframe; its landmarks are adopted then anyway, from its keypoints.
+    #[test]
+    fn landmarks_are_adopted_without_waiting_for_a_mapping_result() {
+        let mut system = SlamSystem::build(mono(), SensorRig::new(camera())).unwrap();
+        system.flow.adopt_landmarks = true;
+        *system.map.lock().unwrap() = map_with_keyframe_at(Pose3d::IDENTITY);
+        system.state.last_keyframe_idx = Some(0);
+        // Frame 1 is being processed, so tracks refer to keyframe 0's frame.
+        system.next_frame_idx = 2;
+
+        system.adopt_landmarks();
+
+        let landmarks = system.map.lock().unwrap().num_active_map_points();
+        let tracks = system.tracker.tracks();
+        assert!(landmarks > 0);
+        assert_eq!(tracks.len(), landmarks);
+        assert!(tracks.iter().all(|track| track.map_point_idx().is_some()));
     }
 }

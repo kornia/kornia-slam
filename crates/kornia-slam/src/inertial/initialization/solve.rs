@@ -9,9 +9,10 @@ use kornia_algebra::optim::{LevenbergMarquardt, Problem, Variable, VariableType}
 use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias};
 
-use super::factor::{InertialInitFactor, KfConst, WeightedZeroPrior};
+use super::factor::{InertialInitFactor, KfConst, WeightedZeroPrior, velocity_residual};
+use super::gate;
 use super::{ImuInitResult, ImuInitializer, rotation_from_to, window_is_mono};
-use crate::mapping::map::{Keyframe, Map};
+use crate::mapping::map::{ImuFactor, Keyframe, KeyframeVelocity, Map};
 
 /// Pack a `Vec3F64` into the `Vec<f32>` value layout `kornia_algebra::optim`
 /// variables use.
@@ -24,10 +25,207 @@ fn vec3_from_var(values: &[f32]) -> Vec3F64 {
     Vec3F64::new(values[0] as f64, values[1] as f64, values[2] as f64)
 }
 
+/// An IMU edge between window keyframes `i` and `j` (local indices).
+#[derive(Clone, Copy)]
+struct WindowEdge<'a> {
+    i: usize,
+    j: usize,
+    factor: &'a ImuFactor,
+}
+
+/// Everything a solve starts from, shared by the gated re-solve.
+struct SolveInputs<'a> {
+    kf_const: &'a [KfConst],
+    rwg: Mat3F64,
+    seed_velocities: &'a [Vec3F64],
+    scale_init: f64,
+    bg: Vec3F64,
+    ba: Vec3F64,
+    is_mono: bool,
+    prior_g: f64,
+    prior_a: f64,
+}
+
+struct InertialSolution {
+    rwg: Mat3F64,
+    scale: f64,
+    bg: Vec3F64,
+    ba: Vec3F64,
+    velocities: Vec<Vec3F64>,
+}
+
+impl InertialSolution {
+    /// The edge's velocity cost at this solution (see `gate::velocity_cost`).
+    fn velocity_cost(&self, kf_const: &[KfConst], edge: &WindowEdge<'_>) -> Option<f64> {
+        let pim = &edge.factor.preintegrated;
+        let bias = ImuBias {
+            gyro: self.bg,
+            accel: self.ba,
+        };
+        let ev = velocity_residual(
+            kf_const[edge.i].r_bw,
+            self.velocities[edge.i],
+            self.velocities[edge.j],
+            self.scale,
+            self.rwg * Vec3F64::new(0.0, 0.0, -GRAVITY_MAGNITUDE),
+            pim.dt,
+            pim.delta_velocity_with_bias(&bias),
+        );
+        gate::velocity_cost(ev, pim)
+    }
+}
+
+/// The map's IMU edges inside the window, in map order.
+fn window_edges<'a>(map: &'a Map, frame_to_local: &HashMap<usize, usize>) -> Vec<WindowEdge<'a>> {
+    let mut edges = Vec::new();
+    for factor in map.imu_factors() {
+        // Factors crossing the window boundary (e.g. the mono bootstrap's
+        // reference-keyframe -> first-in-window-keyframe factor, whose
+        // prev_kf_idx sits before start_idx) are skipped, not fatal —
+        // using `?` here previously made every call silently return None
+        // as soon as any such factor existed, which mono always has and
+        // stereo never does.
+        let Some(&i) = frame_to_local.get(&factor.prev_kf_idx) else {
+            continue;
+        };
+        let Some(&j) = frame_to_local.get(&factor.curr_kf_idx) else {
+            continue;
+        };
+
+        if factor.preintegrated.dt <= 0.0 {
+            continue;
+        }
+        edges.push(WindowEdge { i, j, factor });
+    }
+    edges
+}
+
+/// One joint LM solve over `edges`, from the seed in `inputs`.
+fn solve_edges(inputs: &SolveInputs<'_>, edges: &[WindowEdge<'_>]) -> Option<InertialSolution> {
+    let n = inputs.kf_const.len();
+    let mut problem = Problem::new();
+
+    for (local_idx, vel) in inputs.seed_velocities.iter().enumerate().take(n) {
+        let name = format!("v{}", local_idx);
+        problem
+            .add_variable(Variable::euclidean(&name, 3), vec3_to_f32(*vel))
+            .ok()?;
+    }
+    problem
+        .add_variable(Variable::euclidean("bg", 3), vec3_to_f32(inputs.bg))
+        .ok()?;
+    problem
+        .add_variable(Variable::euclidean("ba", 3), vec3_to_f32(inputs.ba))
+        .ok()?;
+    let q = SO3F64::from_matrix(&inputs.rwg).to_array();
+    let g_f32: Vec<f32> = q.iter().map(|&v| v as f32).collect();
+    problem
+        .add_variable(
+            Variable::new("gdir", VariableType::SO3, g_f32.clone()),
+            g_f32,
+        )
+        .ok()?;
+    problem
+        .add_variable(
+            Variable::euclidean("scale", 1),
+            vec![inputs.scale_init as f32],
+        )
+        .ok()?;
+
+    for &WindowEdge { i, j, factor } in edges {
+        let f = InertialInitFactor::new(
+            inputs.kf_const[i],
+            inputs.kf_const[j],
+            factor.preintegrated.clone(),
+            inputs.is_mono,
+        );
+        problem
+            .add_factor(
+                Box::new(f),
+                vec![
+                    format!("v{i}"),
+                    format!("v{j}"),
+                    "bg".to_string(),
+                    "ba".to_string(),
+                    "gdir".to_string(),
+                    "scale".to_string(),
+                ],
+            )
+            .ok()?;
+    }
+
+    if edges.is_empty() {
+        return None;
+    }
+
+    problem
+        .add_factor(
+            Box::new(WeightedZeroPrior {
+                sqrt_weight: inputs.prior_g.sqrt(),
+            }),
+            vec!["bg".to_string()],
+        )
+        .ok()?;
+    problem
+        .add_factor(
+            Box::new(WeightedZeroPrior {
+                sqrt_weight: inputs.prior_a.sqrt(),
+            }),
+            vec!["ba".to_string()],
+        )
+        .ok()?;
+
+    let lm = LevenbergMarquardt {
+        max_iterations: 200,
+        lambda_init: if inputs.prior_g != 0.0 { 1e3 } else { 1e-3 },
+        ..Default::default()
+    };
+
+    let result = lm.optimize(&mut problem).ok()?;
+    debug_eprintln!(
+        "[inertial_optimizer] {:?} after {} iters, final_cost={:.6}",
+        result.termination_reason,
+        result.iterations,
+        result.final_cost
+    );
+    let vars = problem.get_variables(); // &HashMap<String, Variable>
+
+    let bg_out = vec3_from_var(&vars["bg"].values);
+    let ba_out = vec3_from_var(&vars["ba"].values);
+    let gdir_v = &vars["gdir"].values;
+    let rwg_out = SO3F64::from_array([
+        gdir_v[0] as f64,
+        gdir_v[1] as f64,
+        gdir_v[2] as f64,
+        gdir_v[3] as f64,
+    ])
+    .matrix();
+    let scale_out = if inputs.is_mono {
+        vars["scale"].values[0] as f64
+    } else {
+        1.0
+    };
+
+    let velocities_out: Vec<Vec3F64> = (0..n)
+        .map(|i| vec3_from_var(&vars[&format!("v{i}")].values))
+        .collect();
+
+    Some(InertialSolution {
+        rwg: rwg_out,
+        scale: scale_out,
+        bg: bg_out,
+        ba: ba_out,
+        velocities: velocities_out,
+    })
+}
+
 impl ImuInitializer {
     // ── main entry point ──────────────────────────────────────────────────────
+    /// One solve over the window, and with the velocity gate on, a second one
+    /// from the same seed without the edges it drops; also returns those
+    /// edges' `(prev, curr)` keyframe indices, worst first.
     #[allow(clippy::too_many_arguments)]
-    pub fn inertial_optimizer(
+    fn inertial_optimizer(
         &self,
         map: &Map,
         frame_to_local: &HashMap<usize, usize>,
@@ -41,136 +239,59 @@ impl ImuInitializer {
         prior_g: f64,
         prior_a: f64,
         imu_t_bc: Pose3d,
-    ) -> Option<(Mat3F64, f64, Vec3F64, Vec3F64, Vec<Vec3F64>)> {
-        let n = keyframes.len();
-        let mut problem = Problem::new();
-
-        for (local_idx, vel) in seed_velocities.iter().enumerate().take(n) {
-            let name = format!("v{}", local_idx);
-            problem
-                .add_variable(Variable::euclidean(&name, 3), vec3_to_f32(*vel))
-                .ok()?;
-        }
-        problem
-            .add_variable(Variable::euclidean("bg", 3), vec3_to_f32(bg))
-            .ok()?;
-        problem
-            .add_variable(Variable::euclidean("ba", 3), vec3_to_f32(ba))
-            .ok()?;
-        let q = SO3F64::from_matrix(&rwg).to_array();
-        let g_f32: Vec<f32> = q.iter().map(|&v| v as f32).collect();
-        problem
-            .add_variable(
-                Variable::new("gdir", VariableType::SO3, g_f32.clone()),
-                g_f32,
-            )
-            .ok()?;
-        problem
-            .add_variable(Variable::euclidean("scale", 1), vec![scale_init as f32])
-            .ok()?;
+    ) -> Option<(InertialSolution, Vec<(usize, usize)>)> {
         let kf_const: Vec<KfConst> = keyframes
             .iter()
             .map(|kf| KfConst::new(&kf.frame.pose_world_to_cam, &imu_t_bc))
             .collect();
-
-        let mut edge_count = 0;
-        for factor in map.imu_factors() {
-            // Factors crossing the window boundary (e.g. the mono bootstrap's
-            // reference-keyframe -> first-in-window-keyframe factor, whose
-            // prev_kf_idx sits before start_idx) are skipped, not fatal —
-            // using `?` here previously made every call silently return None
-            // as soon as any such factor existed, which mono always has and
-            // stereo never does.
-            let Some(&i) = frame_to_local.get(&factor.prev_kf_idx) else {
-                continue;
-            };
-            let Some(&j) = frame_to_local.get(&factor.curr_kf_idx) else {
-                continue;
-            };
-
-            if factor.preintegrated.dt <= 0.0 {
-                continue;
-            }
-
-            let f = InertialInitFactor::new(
-                kf_const[i],
-                kf_const[j],
-                factor.preintegrated.clone(),
-                is_mono,
-            );
-            problem
-                .add_factor(
-                    Box::new(f),
-                    vec![
-                        format!("v{i}"),
-                        format!("v{j}"),
-                        "bg".to_string(),
-                        "ba".to_string(),
-                        "gdir".to_string(),
-                        "scale".to_string(),
-                    ],
-                )
-                .ok()?;
-            edge_count += 1;
-        }
-
-        if edge_count == 0 {
-            return None;
-        }
-
-        problem
-            .add_factor(
-                Box::new(WeightedZeroPrior {
-                    sqrt_weight: prior_g.sqrt(),
-                }),
-                vec!["bg".to_string()],
-            )
-            .ok()?;
-        problem
-            .add_factor(
-                Box::new(WeightedZeroPrior {
-                    sqrt_weight: prior_a.sqrt(),
-                }),
-                vec!["ba".to_string()],
-            )
-            .ok()?;
-
-        let lm = LevenbergMarquardt {
-            max_iterations: 200,
-            lambda_init: if prior_g != 0.0 { 1e3 } else { 1e-3 },
-            ..Default::default()
+        let edges = window_edges(map, frame_to_local);
+        let inputs = SolveInputs {
+            kf_const: &kf_const,
+            rwg,
+            seed_velocities,
+            scale_init,
+            bg,
+            ba,
+            is_mono,
+            prior_g,
+            prior_a,
         };
+        let first = solve_edges(&inputs, &edges)?;
 
-        let result = lm.optimize(&mut problem).ok()?;
-        debug_eprintln!(
-            "[inertial_optimizer] {:?} after {} iters, final_cost={:.6}",
-            result.termination_reason,
-            result.iterations,
-            result.final_cost
-        );
-        let vars = problem.get_variables(); // &HashMap<String, Variable>
-
-        let bg_out = vec3_from_var(&vars["bg"].values);
-        let ba_out = vec3_from_var(&vars["ba"].values);
-        let gdir_v = &vars["gdir"].values;
-        let rwg_out = SO3F64::from_array([
-            gdir_v[0] as f64,
-            gdir_v[1] as f64,
-            gdir_v[2] as f64,
-            gdir_v[3] as f64,
-        ])
-        .matrix();
-        let scale_out = if is_mono {
-            vars["scale"].values[0] as f64
-        } else {
-            1.0
-        };
-
-        let velocities_out: Vec<Vec3F64> = (0..n)
-            .map(|i| vec3_from_var(&vars[&format!("v{i}")].values))
+        let k = self.config.viba_velocity_gate;
+        if k.is_nan() || k <= 0.0 {
+            return Some((first, Vec::new()));
+        }
+        let costs: Vec<Option<f64>> = edges
+            .iter()
+            .map(|edge| first.velocity_cost(&kf_const, edge))
             .collect();
-
-        Some((rwg_out, scale_out, bg_out, ba_out, velocities_out))
+        let dropped = gate::outlier_edges(&costs, k);
+        if dropped.is_empty() {
+            return Some((first, Vec::new()));
+        }
+        let dropped_pairs: Vec<(usize, usize)> = dropped
+            .iter()
+            .map(|&e| (edges[e].factor.prev_kf_idx, edges[e].factor.curr_kf_idx))
+            .collect();
+        debug_eprintln!(
+            "[imu_init] gate dropped {} of {} edges: {}",
+            dropped_pairs.len(),
+            edges.len(),
+            dropped_pairs
+                .iter()
+                .map(|(a, b)| format!("{a}->{b}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let kept: Vec<WindowEdge<'_>> = edges
+            .iter()
+            .enumerate()
+            .filter(|(e, _)| !dropped.contains(e))
+            .map(|(_, edge)| *edge)
+            .collect();
+        let second = solve_edges(&inputs, &kept)?;
+        Some((second, dropped_pairs))
     }
 
     /// Mirrors ORB-SLAM3's `LocalMapping::InitializeIMU(priorG, priorA, bFIBA)`:
@@ -202,7 +323,7 @@ impl ImuInitializer {
         let mut keyframes: Vec<&Keyframe> = map
             .keyframes()
             .iter()
-            .filter(|kf| kf.frame.idx >= start_idx)
+            .filter(|kf| self.in_solve_window(kf, start_idx))
             .collect();
         keyframes.sort_by_key(|kf| kf.frame.idx);
         let n = keyframes.len();
@@ -273,7 +394,8 @@ impl ImuInitializer {
             (velocities, rwg)
         };
 
-        let (rwg_out, scale_out, bg_out, ba_out, velocities_out) = self.inertial_optimizer(
+        let keyframe_indices: Vec<usize> = keyframes.iter().map(|kf| kf.frame.idx).collect();
+        let (solution, gated_edges) = self.inertial_optimizer(
             map,
             &frame_to_local,
             keyframes,
@@ -287,6 +409,13 @@ impl ImuInitializer {
             prior_a,
             imu_t_bc,
         )?;
+        let InertialSolution {
+            rwg: rwg_out,
+            scale: scale_out,
+            bg: bg_out,
+            ba: ba_out,
+            velocities: velocities_out,
+        } = solution;
 
         // ── Sanity check — mirrors ORB-SLAM3's *only* gate on this result,
         // `if (mScale<1e-1) { bInitializing=false; return; }` (LocalMapping.cc
@@ -347,11 +476,19 @@ impl ImuInitializer {
         Some(ImuInitResult {
             scale: scale_out,
             gravity_world,
-            velocities_world: velocities_out,
+            keyframe_velocities: keyframe_indices
+                .into_iter()
+                .zip(velocities_out)
+                .map(|(keyframe_idx, velocity_world)| KeyframeVelocity {
+                    keyframe_idx,
+                    velocity_world,
+                })
+                .collect(),
             bias: ImuBias {
                 gyro: bg_out,
                 accel: ba_out,
             },
+            gated_edges,
         })
     }
 }

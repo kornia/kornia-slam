@@ -59,6 +59,12 @@ impl InertialInitSchedule {
         self.start_kf_idx
     }
 
+    /// A window is open and VIBA2 has not run (ORB-SLAM3's `bRecInit`,
+    /// `LocalMapping.cc:149`).
+    pub(crate) fn recently_initialized(&self) -> bool {
+        self.start_kf_idx.is_some() && !self.viba2_done
+    }
+
     pub(crate) fn retry_due(&self, timestamp_sec: f64) -> bool {
         due_for_retry(self.last_attempt_sec, timestamp_sec)
     }
@@ -84,6 +90,13 @@ impl InertialInitSchedule {
         } else {
             None
         }
+    }
+
+    /// Spends both refinements: after a give-up that kept the inertial state,
+    /// a refinement would re-align the whole world about the origin again.
+    pub(crate) fn close(&mut self) {
+        self.viba1_done = true;
+        self.viba2_done = true;
     }
 
     /// Marks a refinement as spent, whether or not its solve was accepted.
@@ -145,6 +158,33 @@ mod tests {
 
         assert_eq!(mono, 1e10);
         assert_eq!(stereo, 1e5);
+    }
+
+    #[test]
+    fn recently_initialized_lasts_until_viba2() {
+        let mut schedule = InertialInitSchedule::default();
+        assert!(!schedule.recently_initialized(), "no window yet");
+        schedule.start(7, 100.0);
+        assert!(schedule.recently_initialized());
+        schedule.complete(Refinement::Viba1);
+        assert!(schedule.recently_initialized());
+        schedule.complete(Refinement::Viba2);
+        assert!(!schedule.recently_initialized());
+        schedule.start(40, 200.0);
+        assert!(schedule.recently_initialized(), "a new window re-arms it");
+        schedule.close();
+        assert!(!schedule.recently_initialized());
+    }
+
+    #[test]
+    fn a_closed_schedule_runs_no_refinement() {
+        let mut schedule = InertialInitSchedule::default();
+        schedule.start(7, 100.0);
+        assert_eq!(schedule.due_refinement(105.1), Some(Refinement::Viba1));
+        schedule.close();
+        for t in [105.1, 115.1, 120.0, 149.0] {
+            assert_eq!(schedule.due_refinement(t), None, "t={t}");
+        }
     }
 
     /// VIBA1 waits for 5 s of window and VIBA2 for 15 s after VIBA1; each

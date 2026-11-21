@@ -5,6 +5,7 @@
 //! (a ~1e8-sigma residual) was lowered by turning a keyframe by ~90°.
 
 use super::*;
+use crate::mapping::synthetic_walk::Gauss;
 use kornia_algebra::{Mat3F64, SO3F64};
 
 fn camera() -> PinholeCamera {
@@ -73,6 +74,7 @@ fn flung_window() -> (Vec<ViBaKeyframe>, Vec<Vec3F64>, Vec<BaObservation>) {
             velocity: Vec3F64::ZERO,
             bias: ImuBias::default(),
             fixed: k < N_FIXED,
+            inertial_fixed: false,
         })
         .collect();
 
@@ -292,14 +294,25 @@ fn the_depth_gate_drops_only_rows_far_from_their_measurement() {
 fn cheirality_flips_are_counted_per_observation() {
     let (keyframes, points, observations) = flung_window();
     assert_eq!(
-        cheirality_flips(&observations, (&keyframes, &points), (&keyframes, &points)).len(),
+        cheirality_flips(
+            &observations,
+            ObservationViews::PRIMARY,
+            (&keyframes, &points),
+            (&keyframes, &points)
+        )
+        .len(),
         0
     );
     let mut behind = points.clone();
     behind[3] = point_at(&parked_pose(), 300.0, 200.0, -1.0);
     // Landmark 3 is seen by all six keyframes.
     assert_eq!(
-        cheirality_flips(&observations, (&keyframes, &points), (&keyframes, &behind)),
+        cheirality_flips(
+            &observations,
+            ObservationViews::PRIMARY,
+            (&keyframes, &points),
+            (&keyframes, &behind)
+        ),
         observations
             .iter()
             .enumerate()
@@ -309,7 +322,13 @@ fn cheirality_flips_are_counted_per_observation() {
     );
     // Already behind before the step: not a flip.
     assert_eq!(
-        cheirality_flips(&observations, (&keyframes, &behind), (&keyframes, &behind)).len(),
+        cheirality_flips(
+            &observations,
+            ObservationViews::PRIMARY,
+            (&keyframes, &behind),
+            (&keyframes, &behind)
+        )
+        .len(),
         0
     );
 }
@@ -446,6 +465,7 @@ fn cheirality_holds_the_landmark_and_refuses_only_for_inliers() {
     after[4] = points[4] + Vec3F64::new(0.0, 0.0, 0.01);
     let out = enforce_cheirality(
         &observations,
+        ObservationViews::PRIMARY,
         &inliers,
         &all_free,
         (&keyframes, &points),
@@ -470,6 +490,7 @@ fn cheirality_holds_the_landmark_and_refuses_only_for_inliers() {
     after[3] = point_at(&pose, 300.0, 200.0, -1.0);
     let out = enforce_cheirality(
         &observations,
+        ObservationViews::PRIMARY,
         &inliers,
         &fixed,
         (&keyframes, &points),
@@ -488,6 +509,7 @@ fn cheirality_holds_the_landmark_and_refuses_only_for_inliers() {
     let outliers: Vec<bool> = observations.iter().map(|o| o.point_idx != 3).collect();
     let out = enforce_cheirality(
         &observations,
+        ObservationViews::PRIMARY,
         &outliers,
         &fixed,
         (&keyframes, &points),
@@ -544,6 +566,7 @@ fn moving_window(outlier: bool) -> (ViBaResult, Vec<Pose3d>, usize) {
             velocity: Vec3F64::ZERO,
             bias: ImuBias::default(),
             fixed: k < 2,
+            inertial_fixed: false,
         })
         .collect();
     let mut observations = Vec::new();
@@ -631,28 +654,6 @@ fn a_moving_window_converges_past_a_near_plane_outlier() {
     assert_eq!(result.cheirality_rejections, 0);
 }
 
-/// Deterministic standard-normal draws (xorshift64* and Box-Muller), so the
-/// parked chain below is reproducible without a `rand` dependency.
-struct Gauss(u64);
-
-impl Gauss {
-    fn uniform(&mut self) -> f64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        ((self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as f64 + 0.5) / (1u64 << 53) as f64
-    }
-
-    fn normal(&mut self) -> f64 {
-        let (a, b) = (self.uniform(), self.uniform());
-        (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
-    }
-
-    fn vec3(&mut self, sigma: f64) -> Vec3F64 {
-        Vec3F64::new(self.normal(), self.normal(), self.normal()) * sigma
-    }
-}
-
 /// A camera parked for many windows. Every window has six keyframes (the
 /// first three fixed) whose pose estimates are the true parked pose plus
 /// tracking noise (1 mm, 0.02°), and pixels that are the true projections
@@ -716,6 +717,7 @@ impl ParkedChain {
                     velocity: Vec3F64::ZERO,
                     bias: ImuBias::default(),
                     fixed: k < N_FIXED,
+                    inertial_fixed: false,
                 }
             })
             .collect();
@@ -758,6 +760,7 @@ impl ParkedChain {
         let keep = if guard {
             crate::mapping::bundle_adjustment::landmarks_to_write_back(
                 &observations,
+                |_| None,
                 (&keyframes, &self.points),
                 (&result.keyframes, &result.points),
             )

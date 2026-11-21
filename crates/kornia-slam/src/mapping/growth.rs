@@ -9,7 +9,7 @@
 
 use crate::frame::{Frame, undistorted_camera};
 use crate::mapping::map::{
-    LandmarkSeed, LandmarkTarget, Map, MapInsertion, ORB_SCALE_FACTOR, ObservationKey,
+    Keyframe, LandmarkSeed, LandmarkTarget, Map, MapInsertion, ORB_SCALE_FACTOR, ObservationKey,
     ObservationLink,
 };
 use crate::stereo::unproject_stereo;
@@ -67,12 +67,67 @@ pub fn stereo_seeds(
     seeds
 }
 
+/// Seeds and second observations for a rig frame's overlap-triangulated
+/// points nearer than `max_depth` (metres, primary camera), whose primary and
+/// camera-1 features are both unclaimed: each landmark is referenced to its
+/// primary feature and also observed by the camera-1 match (ORB-SLAM3's
+/// `StereoInitialization` and `CreateNewKeyFrame` for non-rectified stereo).
+/// Link targets index the returned seeds.
+pub fn rig_seeds(
+    frame: &Frame,
+    max_depth: f64,
+    claimed: &[Option<usize>],
+) -> (Vec<LandmarkSeed>, Vec<ObservationLink>) {
+    let pose_inv = frame.pose_world_to_cam.inverse();
+    let is_claimed = |i: usize| claimed.get(i).copied().flatten().is_some();
+    let mut seeds = Vec::new();
+    let mut links = Vec::new();
+    for (i, (point, right)) in frame
+        .rig
+        .stereo_points
+        .iter()
+        .zip(&frame.rig.left_to_right)
+        .enumerate()
+    {
+        let (Some(point), Some(right)) = (point, right) else {
+            continue;
+        };
+        if point.z > max_depth || is_claimed(i) || is_claimed(*right) {
+            continue;
+        }
+        links.push(ObservationLink {
+            observation: ObservationKey {
+                keyframe_idx: frame.idx,
+                feature_idx: *right,
+            },
+            landmark: LandmarkTarget::New(seeds.len()),
+        });
+        seeds.push(LandmarkSeed {
+            position: pose_inv.transform_point(point),
+            color: frame.keypoint_colors.get(i).copied().unwrap_or([128; 3]),
+            reference: ObservationKey {
+                keyframe_idx: frame.idx,
+                feature_idx: i,
+            },
+        });
+    }
+    (seeds, links)
+}
+
 /// Triangulates unassociated features shared by two stored keyframes.
 ///
 /// Both keyframes must already be in the map. Each new landmark is referenced
 /// to its `curr_kf_idx` feature and carries an explicit second observation on
 /// `prev_kf_idx` — without that second observer the point would bias its own
 /// scale and normal geometry and the cull would be over-aggressive.
+///
+/// A rig keyframe pair grows in each camera separately: camera `c`'s features
+/// of both keyframes, triangulated from camera `c`'s poses, so a landmark
+/// may be seen by a secondary camera only.
+///
+/// A camera's pair grows nothing when its baseline is under
+/// `min_baseline_ratio` times the current keyframe's scene median depth;
+/// `0.0` turns the gate off.
 pub fn pair_growth_request(
     map: &Map,
     prev_kf_idx: usize,
@@ -80,18 +135,123 @@ pub fn pair_growth_request(
     match_config: OrbMatchConfig,
     triangulation_config: &TriangulationConfig,
     camera: &PinholeCamera,
+    min_baseline_ratio: f64,
 ) -> Option<MapInsertion> {
     let prev_kf = map.get_keyframe(prev_kf_idx)?;
     let curr_kf = map.get_keyframe(curr_kf_idx)?;
+    let scene_depth_m = (min_baseline_ratio > 0.0)
+        .then(|| map.scene_median_depth(curr_kf_idx))
+        .flatten();
+    let geometry = curr_kf
+        .frame
+        .rig
+        .geometry
+        .as_ref()
+        .filter(|_| curr_kf.frame.is_rig() && prev_kf.frame.is_rig());
+    let Some(geometry) = geometry else {
+        let baseline_m = Pose3d::between(
+            &prev_kf.frame.pose_world_to_cam,
+            &curr_kf.frame.pose_world_to_cam,
+        )
+        .translation
+        .length();
+        if !baseline_admitted(baseline_m, min_baseline_ratio, scene_depth_m) {
+            return None;
+        }
+        return pair_growth_in_camera(
+            prev_kf,
+            curr_kf,
+            0,
+            camera,
+            (
+                &prev_kf.frame.pose_world_to_cam,
+                &curr_kf.frame.pose_world_to_cam,
+            ),
+            match_config,
+            triangulation_config,
+        );
+    };
+    let mut merged = MapInsertion::default();
+    for (c, view) in geometry.views().iter().enumerate() {
+        let (view_camera, prev_pose, curr_pose) = if c == 0 {
+            (
+                camera,
+                prev_kf.frame.pose_world_to_cam,
+                curr_kf.frame.pose_world_to_cam,
+            )
+        } else {
+            (
+                &view.camera,
+                view.pose(&prev_kf.frame.pose_world_to_cam),
+                view.pose(&curr_kf.frame.pose_world_to_cam),
+            )
+        };
+        let baseline_m = Pose3d::between(&prev_pose, &curr_pose).translation.length();
+        if !baseline_admitted(baseline_m, min_baseline_ratio, scene_depth_m) {
+            continue;
+        }
+        let Some(request) = pair_growth_in_camera(
+            prev_kf,
+            curr_kf,
+            c,
+            view_camera,
+            (&prev_pose, &curr_pose),
+            match_config,
+            triangulation_config,
+        ) else {
+            continue;
+        };
+        let base = merged.landmarks.len();
+        merged.landmarks.extend(request.landmarks);
+        merged.observations.extend(
+            request
+                .observations
+                .into_iter()
+                .map(|link| ObservationLink {
+                    landmark: match link.landmark {
+                        LandmarkTarget::New(i) => LandmarkTarget::New(base + i),
+                        existing => existing,
+                    },
+                    ..link
+                }),
+        );
+    }
+    (!merged.landmarks.is_empty()).then_some(merged)
+}
+
+/// Whether a pair `baseline_m` apart may grow: its baseline over the current
+/// keyframe's scene median depth must reach `min_ratio` (ORB-SLAM3
+/// `LocalMapping::CreateNewMapPoints`, the monocular baseline/depth test).
+/// A zero ratio or an unknown depth admits every pair.
+fn baseline_admitted(baseline_m: f64, min_ratio: f64, scene_depth_m: Option<f64>) -> bool {
+    match scene_depth_m {
+        Some(depth) if min_ratio > 0.0 => baseline_m >= min_ratio * depth,
+        _ => true,
+    }
+}
+
+/// [`pair_growth_request`] over the features of rig camera `camera_idx`,
+/// with that camera's model and world-to-camera poses of both keyframes.
+fn pair_growth_in_camera(
+    prev_kf: &Keyframe,
+    curr_kf: &Keyframe,
+    camera_idx: usize,
+    camera: &PinholeCamera,
+    (prev_pose, curr_pose): (&Pose3d, &Pose3d),
+    match_config: OrbMatchConfig,
+    triangulation_config: &TriangulationConfig,
+) -> Option<MapInsertion> {
+    let prev_kf_idx = prev_kf.frame.idx;
+    let curr_kf_idx = curr_kf.frame.idx;
 
     // Only features without a landmark in either keyframe. Matching the full
     // arrays and filtering afterwards discards almost everything once the
     // keyframes are mature.
     let prev_unassoc: Vec<usize> = (0..prev_kf.frame.features.descriptors.len())
-        .filter(|&i| prev_kf.map_point(i).is_none())
+        .filter(|&i| prev_kf.frame.camera_of(i) == camera_idx && prev_kf.map_point(i).is_none())
         .collect();
     let curr_unassoc: Vec<usize> = (0..curr_kf.frame.features.descriptors.len())
-        .filter(|&i| curr_kf.map_point(i).is_none())
+        .filter(|&i| curr_kf.frame.camera_of(i) == camera_idx && curr_kf.map_point(i).is_none())
         .collect();
     if prev_unassoc.is_empty() || curr_unassoc.is_empty() {
         return None;
@@ -101,10 +261,7 @@ pub fn pair_growth_request(
     // F = K^-T [t]x R K^-1 with (R, t) the prev->curr relative pose. Filtering
     // against it replaces the two-view estimator's F-matrix RANSAC (mirrors
     // ORB-SLAM3's SearchForTriangulation).
-    let rel = Pose3d::between(
-        &prev_kf.frame.pose_world_to_cam,
-        &curr_kf.frame.pose_world_to_cam,
-    );
+    let rel = Pose3d::between(prev_pose, curr_pose);
     if rel.translation.length() <= 1e-8 {
         // No baseline: epipolar geometry degenerates and triangulation would
         // reject everything anyway.
@@ -123,11 +280,8 @@ pub fn pair_growth_request(
     // there: wrong matches survive and triangulate to depth-garbage points that
     // still reproject well in both views. Mirrors ORB-SLAM3's epipole-proximity
     // rejection; RANSAC consensus used to absorb these.
-    let prev_center_world = prev_kf.frame.pose_world_to_cam.inverse().translation;
-    let epipole_cam = curr_kf
-        .frame
-        .pose_world_to_cam
-        .transform_point(&prev_center_world);
+    let prev_center_world = prev_pose.inverse().translation;
+    let epipole_cam = curr_pose.transform_point(&prev_center_world);
     let epipole_px = (epipole_cam.z.abs() > 1e-9).then(|| {
         Vec2F64::new(
             camera.fx * epipole_cam.x / epipole_cam.z + camera.cx,
@@ -215,8 +369,8 @@ pub fn pair_growth_request(
     let triangulated = triangulate_matched_points(
         &matched_prev,
         &matched_curr,
-        &prev_kf.frame.pose_world_to_cam,
-        &curr_kf.frame.pose_world_to_cam,
+        prev_pose,
+        curr_pose,
         &undistorted_camera(camera),
         triangulation_config,
     )
@@ -310,55 +464,57 @@ pub fn neighbor_fusion_links(
             continue;
         };
 
-        // (keypoint in neighbour, landmark, hamming)
-        let mut proposals: Vec<(usize, usize, u32)> = Vec::new();
-        for &mp_idx in &curr_mp_indices {
-            let mp = match map.map_points().get(mp_idx) {
-                Some(mp) if !mp.culled => mp,
-                _ => continue,
-            };
-            if mp.is_observed_by(nb_kf_idx) {
-                continue;
-            }
-            let p_cam = nb_kf.frame.pose_world_to_cam.transform_point(&mp.position);
-            let Ok(pixel) = camera.project_to_image(&p_cam, 0.0, nb_kf.frame.image_size) else {
-                continue;
-            };
-            let (u, v) = (pixel.x as f32, pixel.y as f32);
-
-            let mut best_dist = u32::MAX;
-            let mut best_kp = usize::MAX;
-            for kp_idx in 0..nb_kf.frame.features.keypoints_xy.len() {
-                if nb_kf.map_point(kp_idx).is_some() {
+        // (keypoint in neighbour, landmark, camera, hamming)
+        let mut proposals: Vec<(usize, usize, usize, u32)> = Vec::new();
+        for (view, view_camera, pose, size) in neighbour_views(nb_kf, camera) {
+            for &mp_idx in &curr_mp_indices {
+                let mp = match map.map_points().get(mp_idx) {
+                    Some(mp) if !mp.culled => mp,
+                    _ => continue,
+                };
+                if mp.is_observed_in(nb_kf_idx, view as u8) {
                     continue;
                 }
-                let Some(kp) = nb_kf.frame.undistorted_xy(kp_idx, camera) else {
+                let p_cam = pose.transform_point(&mp.position);
+                let Ok(pixel) = view_camera.project_to_image(&p_cam, 0.0, size) else {
                     continue;
                 };
-                let (dx, dy) = (kp[0] - u, kp[1] - v);
-                if dx * dx + dy * dy > r2 {
-                    continue;
+                let (u, v) = (pixel.x as f32, pixel.y as f32);
+
+                let mut best_dist = u32::MAX;
+                let mut best_kp = usize::MAX;
+                for kp_idx in nb_kf.frame.camera_range(view) {
+                    if nb_kf.map_point(kp_idx).is_some() {
+                        continue;
+                    }
+                    let Some(kp) = nb_kf.frame.undistorted_xy(kp_idx, camera) else {
+                        continue;
+                    };
+                    let (dx, dy) = (kp[0] - u, kp[1] - v);
+                    if dx * dx + dy * dy > r2 {
+                        continue;
+                    }
+                    let dist =
+                        hamming_distance(&mp.descriptor, &nb_kf.frame.features.descriptors[kp_idx]);
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_kp = kp_idx;
+                    }
                 }
-                let dist =
-                    hamming_distance(&mp.descriptor, &nb_kf.frame.features.descriptors[kp_idx]);
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_kp = kp_idx;
+                if best_dist <= FUSE_MAX_HAMMING && best_kp != usize::MAX {
+                    proposals.push((best_kp, mp_idx, view, best_dist));
                 }
-            }
-            if best_dist <= FUSE_MAX_HAMMING && best_kp != usize::MAX {
-                proposals.push((best_kp, mp_idx, best_dist));
             }
         }
 
         // Closest descriptor wins a contested keypoint; one claim per keypoint
         // and one per landmark, since a landmark may hold only one feature in
         // any keyframe.
-        proposals.sort_by_key(|&(_, _, dist)| dist);
+        proposals.sort_by_key(|&(_, _, _, dist)| dist);
         let mut taken_kp: HashSet<usize> = HashSet::new();
-        let mut taken_mp: HashSet<usize> = HashSet::new();
-        for (kp_idx, mp_idx, _) in proposals {
-            if !taken_kp.insert(kp_idx) || !taken_mp.insert(mp_idx) {
+        let mut taken_mp: HashSet<(usize, usize)> = HashSet::new();
+        for (kp_idx, mp_idx, view, _) in proposals {
+            if !taken_kp.insert(kp_idx) || !taken_mp.insert((mp_idx, view)) {
                 continue;
             }
             links.push(ObservationLink {
@@ -371,6 +527,29 @@ pub fn neighbor_fusion_links(
         }
     }
     links
+}
+
+/// `(camera index, model, world-to-camera pose, image size)` of each camera
+/// of a keyframe: every rig camera, or the one camera outside a rig.
+fn neighbour_views<'a>(
+    keyframe: &'a Keyframe,
+    camera: &'a PinholeCamera,
+) -> Vec<(usize, &'a PinholeCamera, Pose3d, kornia_image::ImageSize)> {
+    let frame = &keyframe.frame;
+    let primary = (0, camera, frame.pose_world_to_cam, frame.image_size);
+    let Some(rig) = frame.rig.geometry.as_ref().filter(|_| frame.is_rig()) else {
+        return vec![primary];
+    };
+    std::iter::once(primary)
+        .chain(rig.views().iter().enumerate().skip(1).map(|(c, view)| {
+            (
+                c,
+                &view.camera,
+                view.pose(&frame.pose_world_to_cam),
+                view.size,
+            )
+        }))
+        .collect()
 }
 
 /// Which of `candidates`, given as `(reference feature, current feature)`, can
@@ -439,6 +618,7 @@ mod tests {
             u_right: Vec::new(),
             depth: Vec::new(),
             keypoints_undist: Vec::new(),
+            rig: Default::default(),
         }
     }
 
@@ -460,6 +640,31 @@ mod tests {
     }
 
     #[test]
+    fn rig_seeds_link_both_cameras_of_close_unclaimed_overlap_points() {
+        // Features 0..3 are the primary camera's, 3..6 camera 1's.
+        let mut frame = test_frame(4, vec![[0; 32]; 6]);
+        frame.rig.camera_ranges = vec![0..3, 3..6];
+        frame.rig.left_to_right = vec![Some(3), Some(4), Some(5)];
+        frame.rig.stereo_points = vec![
+            Some(Vec3F64::new(0.0, 0.0, 2.0)),
+            Some(Vec3F64::new(0.0, 0.0, 40.0)),
+            Some(Vec3F64::new(0.0, 0.0, 3.0)),
+        ];
+        frame.pose_world_to_cam.translation = Vec3F64::new(-1.0, 0.0, 0.0);
+        // Camera 1's match of feature 2 is already tracked.
+        let claimed = vec![None, None, None, None, None, Some(9)];
+
+        let (seeds, links) = rig_seeds(&frame, 10.0, &claimed);
+
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].reference.feature_idx, 0);
+        assert_eq!(seeds[0].position, Vec3F64::new(1.0, 0.0, 2.0));
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].observation.feature_idx, 3);
+        assert_eq!(links[0].landmark, LandmarkTarget::New(0));
+    }
+
+    #[test]
     fn proposal_generation_leaves_the_map_untouched() {
         let mut map = Map::new();
         map.insert_keyframe(Keyframe::from_frame(test_frame(10, vec![[0; 32]; 4])))
@@ -474,6 +679,7 @@ mod tests {
             OrbMatchConfig::default(),
             &TriangulationConfig::default(),
             &camera(),
+            0.0,
         );
         let _ = neighbor_fusion_links(&map, 10, &[10], &camera());
 
@@ -518,6 +724,7 @@ mod tests {
             OrbMatchConfig::default(),
             &TriangulationConfig::default(),
             &camera,
+            0.0,
         )
         .expect("a well-conditioned pair should propose landmarks");
         assert_eq!(request.landmarks.len(), points.len());
@@ -542,10 +749,110 @@ mod tests {
                 OrbMatchConfig::default(),
                 &TriangulationConfig::default(),
                 &camera,
+                0.0,
             )
             .is_none(),
             "every feature is claimed, so nothing is left to propose"
         );
+    }
+
+    #[test]
+    fn baseline_gate_off_admits_every_baseline_above_the_guard() {
+        for baseline in [1.0000001e-8, 1e-6, 1e-3, 1.0, 1e3] {
+            for depth in [None, Some(1e-3), Some(0.8), Some(1e6)] {
+                assert!(baseline_admitted(baseline, 0.0, depth));
+            }
+        }
+    }
+
+    #[test]
+    fn baseline_gate_skips_only_baselines_under_the_ratio() {
+        assert!(!baseline_admitted(0.999, 0.25, Some(4.0)));
+        assert!(baseline_admitted(1.0, 0.25, Some(4.0)));
+        assert!(baseline_admitted(1.5, 0.25, Some(4.0)));
+        assert!(baseline_admitted(0.001, 0.25, None));
+    }
+
+    /// The two-keyframe grid pair, 1 m apart over points 5 m deep, with `held`
+    /// extra keyframe-20 features that already hold landmarks at depth 5, so
+    /// the pair's baseline/depth is 0.2 once `held > 0`.
+    fn baseline_pair(held: usize) -> Map {
+        let camera = camera();
+        let descriptors: Vec<[u8; 32]> = (0..20).map(|i| [i as u8; 32]).collect();
+        let mut previous = test_frame(10, descriptors.clone());
+        let mut current = test_frame(
+            20,
+            descriptors
+                .into_iter()
+                .chain((0..held).map(|j| [100 + j as u8; 32]))
+                .collect(),
+        );
+        current.pose_world_to_cam.translation = Vec3F64::new(-1.0, 0.0, 0.0);
+        let points: Vec<Vec3F64> = (0..20)
+            .map(|i| Vec3F64::new((i % 5) as f64 * 0.3 - 0.6, (i / 5) as f64 * 0.3 - 0.45, 5.0))
+            .collect();
+        for frame in [&mut previous, &mut current] {
+            frame.features.keypoints_xy = points
+                .iter()
+                .map(|p| {
+                    let p = frame.pose_world_to_cam.transform_point(p);
+                    [
+                        (camera.fx * p.x / p.z + camera.cx) as f32,
+                        (camera.fy * p.y / p.z + camera.cy) as f32,
+                    ]
+                })
+                .collect();
+        }
+        current
+            .features
+            .keypoints_xy
+            .extend((0..held).map(|_| [camera.cx as f32, camera.cy as f32]));
+
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(previous)).unwrap();
+        map.insert_keyframe(Keyframe::from_frame(current)).unwrap();
+        for j in 0..held {
+            map.insert_landmark(LandmarkSeed {
+                position: Vec3F64::new(1.0, 0.0, 5.0),
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 20,
+                    feature_idx: 20 + j,
+                },
+            })
+            .unwrap();
+        }
+        map
+    }
+
+    fn baseline_request(map: &Map, ratio: f64) -> Option<MapInsertion> {
+        pair_growth_request(
+            map,
+            10,
+            20,
+            OrbMatchConfig::default(),
+            &TriangulationConfig::default(),
+            &camera(),
+            ratio,
+        )
+    }
+
+    #[test]
+    fn pair_growth_skips_a_pair_under_the_baseline_ratio() {
+        let map = baseline_pair(3);
+        assert!(baseline_request(&map, 0.25).is_none());
+        let gated = baseline_request(&map, 0.15).expect("0.2 clears a 0.15 ratio");
+        let ungated = baseline_request(&map, 0.0).expect("the gate is off");
+        assert_eq!(gated.landmarks.len(), 20);
+        assert_eq!(gated.landmarks, ungated.landmarks);
+        assert_eq!(gated.observations, ungated.observations);
+    }
+
+    #[test]
+    fn pair_growth_is_not_gated_without_map_points() {
+        let map = baseline_pair(0);
+        let request = baseline_request(&map, 100.0).expect("no depth, no gate");
+        assert_eq!(request.landmarks.len(), 20);
     }
 
     /// Keypoints are raw pixels of a distorted camera; triangulation must
@@ -590,6 +897,7 @@ mod tests {
             OrbMatchConfig::default(),
             &TriangulationConfig::default(),
             &camera,
+            0.0,
         )
         .expect("a well-conditioned pair should propose landmarks");
         assert_eq!(request.landmarks.len(), points.len());

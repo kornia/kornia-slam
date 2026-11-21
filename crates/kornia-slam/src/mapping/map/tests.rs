@@ -29,6 +29,12 @@ impl Map {
         }
     }
 
+    /// Moves the map to a new world epoch without touching its geometry, as a
+    /// concurrent inertial refinement or compaction would.
+    pub(crate) fn advance_world_epoch_for_test(&mut self) {
+        self.world_epoch = self.world_epoch.wrapping_add(1);
+    }
+
     /// A comparable rendering of the complete stored state.
     ///
     /// For unchanged-on-error assertions: comparing two of these catches a
@@ -126,6 +132,7 @@ pub(crate) fn test_frame_with_pose(idx: usize, descriptors: Vec<[u8; 32]>, pose:
         u_right: Vec::new(),
         depth: Vec::new(),
         keypoints_undist: Vec::new(),
+        rig: Default::default(),
     }
 }
 
@@ -241,6 +248,35 @@ pub(crate) fn assert_map_consistent(map: &Map) {
             "duplicate imu edge {} -> {}",
             factor.prev_kf_idx,
             factor.curr_kf_idx
+        );
+    }
+}
+
+#[test]
+fn keyframes_are_found_by_id_in_and_out_of_frame_order() {
+    let ids_of = |map: &Map, ids: &[usize]| {
+        ids.iter()
+            .map(|&id| map.get_keyframe(id).map(|kf| kf.frame.idx))
+            .collect::<Vec<_>>()
+    };
+    for order in [[10, 20, 30, 40], [30, 10, 40, 20]] {
+        let mut map = Map::new();
+        for id in order {
+            map.insert_keyframe(Keyframe::from_frame(test_frame(id, vec![[id as u8; 32]])))
+                .unwrap();
+        }
+        assert!(
+            map.insert_keyframe(Keyframe::from_frame(test_frame(20, vec![[0; 32]])))
+                .is_err()
+        );
+        assert_eq!(
+            ids_of(&map, &[10, 20, 30, 40, 5, 25, 99]),
+            vec![Some(10), Some(20), Some(30), Some(40), None, None, None]
+        );
+        map.remove_keyframe(30).unwrap();
+        assert_eq!(
+            ids_of(&map, &[10, 20, 30, 40]),
+            vec![Some(10), Some(20), None, Some(40)]
         );
     }
 }

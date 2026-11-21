@@ -10,6 +10,135 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**New settings for a 1 ms frontend frame and for online calibration, all off by
+default.** Every default is today's behaviour, so existing run files load and
+run unchanged. Built, not validated: no benchmark has run on them. Not built:
+`frontend.keyframe_orb: Mapping` stops with `todo!`.
+- `frontend.flow_threads` (`1`): threads the flow step runs on, the tracking
+  thread included; 1, the rig's camera count or one more, at most 4.
+- `frontend.flow_first_core` (`None`): pins the flow workers from this core on;
+  read only in builds with the new `pin_threads` feature.
+- `frontend.klt_rig` (`PrimaryOnly`): `AllCameras` tracks every rig camera, so
+  a rig frame can be tracked from flow alone.
+- `frontend.klt_kernel: WindowedU8`: window-only fixed-point LK from the
+  predicted start; the default stays `FixedPointU8`.
+- `frontend.klt_window` (`21`): the LK window, odd; the `F32` kernel supports 21
+  only.
+- `frontend.klt_retry` (`Off`): `CoarseLevel(max_level)` re-runs the tracks
+  that failed at the predicted level over coarser levels.
+- `frontend.forward_backward` (`Off`): `Enabled(max_round_trip_px, max_iter,
+  every_n_frames)` drops a track whose round trip back to the previous frame is
+  too long.
+- `frontend.track_refill` (`Off`): `Enabled(per_camera, min_spacing_px,
+  refill_below, border_px)` refills each camera with spaced Shi-Tomasi corners.
+- `frontend.adopt_landmarks` (`false`): tracks start from the landmarks each new
+  keyframe creates.
+- `frontend.gyro_guess` (`Off`): `RotatedRay` starts a track without a trusted
+  map-point prediction at its previous ray rotated by the gyro.
+- `frontend.anchor_guard` (`Off`): `Enabled(every_n_frames, max_drift_px)` drops
+  a track that drifts from its first-sighting template.
+- `frontend.flow_pose` (`RansacPnp`): `AnalyticGn(max_iter)` solves a flow
+  frame's pose by Gauss-Newton from the IMU prediction, RANSAC PnP as fallback.
+- `frontend.flow_bookkeeping` (`EveryFrame`): `KeyframesOnly` counts landmark
+  visibility only on frames that run ORB, as ORB-SLAM3.
+- `frontend.keyframe_orb` (`Tracking`): `Mapping` runs a flow keyframe's ORB,
+  overlap match and insert on the mapping thread; needs `klt_first`.
+- `frontend.stereo_pyramid` (`Resized`): `Shared` matches stereo and rig overlap
+  on the ORB detector's own pyramid; changes output.
+- `frontend.fisheye_weight` (`Uniform`): `Magnification` scales the local VI-BA
+  pixel sigma, the rig-overlap gates and the projection search radius of raw
+  fisheye rig views by the raw-to-pinhole magnification; `Uniform` on a rig
+  without raw images.
+- LaMAria `images` (`Pinhole`): `RawFisheye(calib, root)` reads the raw 640x480
+  Aria fisheye images of a `.vrs` ASL extraction with their
+  `aria_calibrations/<seq>.json` (Fisheye624, new `kornia_sensors::Fisheye624Camera`
+  and `RigCamera::raw_model`), keypoints mapped into a virtual pinhole up to 80°.
+  Needs the `Rig` cameras, and is refused with `frontend.klt_first` enabled.
+- `mapping.local_ba.online_calibration` (all `None`): the local VI-BA estimates
+  the clock offset, a rotation and a focal scale per camera, and the gyro
+  intrinsics online; camera 0's rotation is the IMU-camera extrinsic inside the
+  IMU residual. Needs the IMU.
+- Cargo features `bench_internals`, `opencv_bench` and `pin_threads`, for the
+  kernel benches and the flow-worker pinning.
+- Two untested run files for the robot test, `configs/pr180-frontend-1ms.ron`
+  (the Orin 2-core frontend preset) and `configs/pr180-full.ron` (the same plus
+  the estimator and recovery settings below).
+
+**New settings for the estimator, recovery and offline-BA work, all off by
+default.** Every default is the behaviour before the setting existed, so
+existing run files load and run unchanged. Built, not validated: none of them
+has been scored on a benchmark sequence yet.
+- `mapping.local_ba.large_window` (`Off`): ORB-SLAM3's longer window when the
+  keyframe was tracked strongly, `Enabled(min_tracked_inliers, active_keyframes,
+  max_iterations, initial_lambda)`.
+- `mapping.local_ba.imu_huber: BoundaryOrRecentInit`: Huber on the boundary edge,
+  and on every IMU edge until VIBA2 has run.
+- `mapping.local_ba.dense_parallelism` (`Global`): `Sequential` factors and
+  solves the local VI-BA's reduced system on the calling thread instead of
+  faer's global thread pool (card T). **Breaking (library):** `ViBaParams`,
+  `LocalBaParams` and `LocalBaConfig` gain a field.
+- `mapping.growth_neighbours` (`RecentTen`): `OrbSlam3(covisible)` grows and fuses
+  against ORB-SLAM3's covisibility lists instead of the 10 most recent keyframes.
+- `inertial.sample_interpolation` (`Hold`): `Midpoint` integrates the mean of
+  consecutive IMU samples, the end samples interpolated to the frame stamps.
+- `tracking.pose_inertial` (`Off`): a pose-inertial solve per frame,
+  `LastKeyframe` or `OrbSlam3`; needs the IMU.
+- `tracking.imu_trust` (`TimeSinceInit`): `Covariance(search_sigmas)` trusts the
+  inertial prediction by its propagated covariance instead of time since
+  initialization; needs the IMU.
+- `tracking.local_map` (`Kornia`): `OrbSlam3` picks tracking's local keyframes
+  as ORB-SLAM3's `UpdateLocalKeyFrames`.
+- `tracking.snapback_fix` (`Off`): `AnchorNextFrame` anchors the frame after a
+  local-BA write-back at the corrected keyframe; needs the IMU, and is refused
+  together with `pose_inertial`.
+- `tracking.refine_monotone` (`false`): the analytic PnP refine keeps its last
+  LM step only when the step does not raise the cost; `false` keeps an uphill
+  step inside the cost tolerance, as kornia-3d's generic solver does.
+- `tracking_loss.reseed.young_map_grace_sec` (`0.0`): seconds a map with too
+  few keyframes for the grace period may stay lost before it is reset; `0.0`
+  resets it at its first lost frame (card I).
+- `tracking_loss.reseed.min_cold_start_points` (`50`): fewest stereo points
+  that seed a map from a cold start (card I).
+- `inertial.viba_window` (`All`): `VisualOnly` keeps keyframes inserted while
+  lost out of every VIBA solve and of the VIBA0 readiness count (card J).
+- `inertial.viba_velocity_gate` (`0.0`, off): drops the VIBA edges whose
+  velocity cost exceeds this multiple of the median, at most a quarter of the
+  edges, then one re-solve (card J).
+  **Breaking (library):** `ImuInitResult::velocities_world` is now
+  `keyframe_velocities` plus `gated_edges`; `ImuInitConfig` gains two fields;
+  `InertialConfig` loses `Eq`; `ImuInitializer::inertial_optimizer` is private.
+- `mapping.growth_min_baseline_ratio` (`0.0`, off): a keyframe pair grows no map
+  points when its baseline is under this fraction of the new keyframe's median
+  scene depth, as ORB-SLAM3's `CreateNewMapPoints` (card K).
+  **Breaking (library):** `growth::pair_growth_request` takes the ratio;
+  `MappingConfig` gains a field.
+- App: `--trajectory-include-coasted` (off) also writes the frames coasted on
+  the IMU prediction to `--trajectory-out`, so it has one pose per frame through
+  visual gaps; a `[summary] poses_written=` line counts the rows (card L).
+- `keyframes.rules` (`Kornia`): `OrbSlam3(max_frames)` inserts keyframes by
+  ORB-SLAM3's `NeedNewKeyFrame`.
+- `tracking_loss.relocalization.while_lost` (`false`): relocalize on every lost
+  frame, also while the IMU is confident; needs loop closing's vocabulary.
+- `tracking_loss.relocalization.solver` (`PrimaryEpnp`): `PrimaryAp3p`, or
+  `RigAp3p` on every rig camera's rays; needs loop closing's vocabulary.
+- `tracking_loss.relocalization.max_jump_m` (`0.5`): how far a relocalized pose
+  may lie from the coasted one within the segment being tracked.
+- `tracking_loss.reseed.relocalize_when_lost` (`false`): relocalize while
+  re-seeding after a give-up, into any older segment of the map whatever the
+  jump; needs loop closing's vocabulary.
+- `tracking_loss.reseed.own_window_keyframes` (`0`, off): a re-seeded segment
+  tracks and grows only against its own keyframes until it holds that many.
+- Run file `rig_calibration` (omitted): a rig calibration file that replaces the
+  source's camera geometry; `--write-rig-calibration <path>` writes one from the
+  source.
+- Run file `offline_ba` (defaults): settings of the new `offline-ba` subcommand,
+  an offline global VI-BA over a session recorded with `--session-out <file>`;
+  its calibration states (`calibration.camera_rotation`, `camera_focal`,
+  `gyro_intrinsics`, `clock_offset`) and `bridge_segments` are off. The online
+  run never reads it.
+- A fourth `[summary] estimator_recovery` line prints the counters these settings
+  move, plus relocalization attempts and time in every mode.
+
 **IMU, wheel-odometry and stationary factors move to a new `kornia-factors` crate.**
 Their residuals, Jacobians, information matrices and the Huber cost the VI-BA
 factors share no longer live inside `kornia-slam`'s mapping module, so another
@@ -25,6 +154,83 @@ the SE(3) relative-pose residual the wheel and stationary factors share is
 now holds the `kornia_sensors::wheel::PlanarMotion` that `WheelPreintegration`
 produces: `WheelOdomMeasurement::new(motion)` replaces `new(delta, covariance)`,
 and `delta` / `covariance` are read through `motion`.
+
+**Run counters.** `SlamSystem::run_counters()` returns a `RunCounters` tally
+since build: frames, tracked frames and keyframes, bootstrap skips, inertial
+and visual coasting, give-ups, dropped optical-flow errors, failed visual and
+visual-inertial local BA solves, boundary-prior fallbacks, refused BA merges,
+and BA solve count and time. `SlamSystem::last_skip()` says why the latest
+frame was skipped (`SkipKind::Bootstrap` or `SkipKind::Coasting { inertial }`);
+`TrackingStatus` is unchanged. The CLI prints them as `[summary]` lines after
+the final map line, with p50/p90/p99 of the per-frame tracking and frontend
+times. Local-mapping figures are exact in synchronous mode; in asynchronous
+mode a job still on the worker is not counted yet.
+
+**A `[proj]` debug line for rejected projection tracking.** With
+`KORNIA_SLAM_DEBUG` set, a frame whose projection search fails logs
+`[proj] frame=N local=L matched=M stage=S` before the reference-keyframe
+fallback overwrites its reject reason; `S` is `LowProjectionMatches`,
+`PnpFailed` or `LowPnpInliers(k)` with the early PnP inlier count. A pose
+refused by the inertial-prediction inlier gate logs
+`[proj] frame=N trusted_gate inliers=k`. Tracking is unchanged.
+
+**`--trajectory-coasted <path>`.** The CLI writes the frames skipped while
+coasting on the IMU prediction to a second file in the `--trajectory-out`
+layout, so coasted poses can be measured without changing the scored file.
+Bootstrap skips, which hold the pose from before the loss, and visual coasts
+are not written.
+
+**`--no-pace`.** The CLI normally sleeps so frames arrive at most 30 per
+second; `--no-pace` processes them as fast as they come, for timing runs.
+With synchronous local mapping the output is unchanged.
+
+**Loop closing can solve off the tracking thread.** `LoopClosingMode::Enabled`
+gains an optional `execution` (source-breaking for code that builds the variant
+by hand): `Synchronous`, the default, keeps today's inline solve whatever the
+mapping execution; `Asynchronous` solves on a `slam-loop-closing` thread,
+`FollowMapping` picks one of the two from the local-mapping execution, and
+`Deferred { frames }` solves inline but writes back `frames` frames later
+through the background path, so runs replay. The background path is opt-in
+because it accepts fewer loops than the inline one on the same input (18-22
+against 47 on the sim recording), which is not explained yet. A background result is written back at a frame boundary; keyframes
+created or refined by bundle adjustment during the solve keep their relative
+pose, and a result from another world frame is solved again. The map then jumps
+once per correction: `SlamSystem::correction_epoch()` advances with each one,
+so consumers publishing odometry as `T_map * map_correction()` can re-anchor,
+and `loop_solve_in_flight()` reports a pending solve. The landmark geometry
+refresh after a correction no longer scans the keyframe list per observer.
+In the background modes the loop's landmark fusion is searched on the worker,
+on a copy of both loop neighbourhoods moved by the solve, and the writeback
+only re-checks and applies the links and merges it found
+(`Map::merge_map_points_by_records` merges without sweeping every keyframe).
+The tracking pose and the map correction then follow the correction most of
+the camera's local landmarks take rather than the reference keyframe's alone,
+so odometry stays continuous when a later solve moves the reference keyframe
+away from landmarks fused onto an earlier visit. An unusable solve now reports
+why (`PgoResult::unusable_reason`, a `PgoFailed` event) instead of a silent
+`applied: false`.
+
+**Loop closing gains an odometry gate and an opt-in global pose graph.** A
+verified loop whose correction is more than 3 sigma of the odometry drift
+model (1.9 %/m + 0.10 m, 0.026 deg/m + 1 deg) is now rejected before it reaches
+the pose graph. That refuses a false loop from repeated structure when it
+implies more correction than odometry can have drifted; one inside the bound
+still passes (on a sim recording in EuRoC format, ATE 1.55 m ungated → 0.12 m
+gated; 0.32 m without loop closing). Loops close through `PoseGraph`. By
+default it is the same computation as before, `w*I` on a fresh snapshot of the
+map at each solve. `LoopClosingMode::Enabled { graph }` opts into the rest from
+a configuration file, e.g. `graph: (information: Drift(), persistent: true)`:
+- `persistent` keeps every keyframe the map has held across solves. A culled
+  or evicted keyframe stays a node, so loops that touch it keep constraining
+  the map instead of failing with `MissingLoopKeyframe`.
+- `Drift` makes odometry edges a random walk in path, `sigma = sqrt(q * d)`,
+  so the weighting does not depend on keyframe density. Loop edges get
+  0.10 m / 1 deg under a Cauchy kernel. The kernel bounds what a false loop
+  the gate lets through can do, but does not remove it.
+
+`SlamSystem::map_correction()` reports the composed map-from-odometry
+correction. `PoseGraph<P>`, its `LoopVerifier` and the `LoopGate` trait are
+public for other front ends.
 
 **Stereo-inertial tracking rides through fast motion instead of resetting.**
 Once the IMU has settled, a tracking failure now coasts on the inertial

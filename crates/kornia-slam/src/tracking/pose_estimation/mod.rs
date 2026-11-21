@@ -2,6 +2,8 @@
 
 pub mod map_projection;
 pub mod pnp;
+pub(crate) mod pose_inertial;
+pub mod rig_pnp;
 
 use kornia_3d::pose::Pose3d;
 
@@ -16,4 +18,7 @@ pub struct Estimate {
     pub matches: Vec<(usize, usize)>,
     /// Number of inlier correspondences supporting the estimate.
     pub inliers: usize,
+    /// The local map's most-voted keyframe; `None` without votes, or under
+    /// [`LocalMapRules::Kornia`](crate::tracking::local_map::LocalMapRules).
+    pub most_voted_keyframe: Option<usize>,
 }

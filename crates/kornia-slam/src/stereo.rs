@@ -481,6 +481,7 @@ mod tests {
             u_right: vec![95.0, -1.0, 45.0],
             depth: vec![5.0, -1.0, 2.0],
             keypoints_undist: Vec::new(),
+            rig: Default::default(),
         };
 
         let pts = unproject_stereo(&frame, &camera);

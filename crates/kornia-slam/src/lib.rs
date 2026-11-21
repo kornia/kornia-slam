@@ -48,9 +48,15 @@ pub mod initialization;
 pub mod loop_closure;
 pub mod mapping;
 mod pose_conversion;
+pub mod rig;
 pub mod stereo;
 pub mod system;
 pub mod tracking;
+#[cfg(feature = "bench_internals")]
+#[doc(hidden)]
+pub mod upstream;
+#[cfg(not(feature = "bench_internals"))]
+pub(crate) mod upstream;
 
 pub use frame::Frame;
 pub use frontend::FrontendObservation;
@@ -60,7 +66,8 @@ pub use loop_closure::{LoopClosingConfig, LoopClosureEvent};
 #[cfg(feature = "serde")]
 pub use system::LoadError;
 pub use system::{
-    BuildError, CameraSelection, ConfigError, LoopClosingMode, ProcessError, SensorSelection,
-    SlamSystem, SystemConfig, TrackingResult, TrackingStatus,
+    BuildError, CameraSelection, ConfigError, FrameTrace, LoopClosingExecution, LoopClosingMode,
+    ProcessError, RunCounters, SensorSelection, SkipKind, SlamSystem, SystemConfig, TrackingResult,
+    TrackingStatus,
 };
-pub use tracking::{KeyframePolicy, MapProjectionEstimator};
+pub use tracking::{KeyframePolicy, MapProjectionEstimator, TrackingTimings};
