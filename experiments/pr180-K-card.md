@@ -103,4 +103,39 @@ All runs are 3 per config. The tracking counts are 800-frame windows. The counte
 
 ### Result log
 
-(empty)
+- **2026-11-21, scoring.**
+  - **Setup:** binary `92acd29` plus the diagnosis print (md5 7d09a8c68f297830aac35ad1dc844ba7), preset `pr180-frontend-1ms`, 800-frame windows, `--no-pace --debug`, 3 runs per config, 2 at a time (an extraction job ran alongside).
+  - **Measurements:**
+    - tracking counts from `[summary]`;
+    - ATE SE3 from `quick-eval/ate.py`;
+    - the step ratio from the new `quick-eval/steps.py`, over poses 50-250;
+    - the near-point counter from the diagnosis print, keyframes 0-60, points in pairs with p50 < 0.4 m.
+
+| P/K | Prediction | Baseline (this binary) | Measured (each run) | Verdict |
+|---|---|---|---|---|
+| P1 (KA, R_03) | near ≤ 150; total 800-2600 | Ib: near 2394, total 2394 | near 11, 13, 13; total 3039, 3036, 3037 | near as predicted; total missed, above the range (growth not starved) |
+| P2 (KA, R_03) | step ratio 0.95-1.05 | Ib 1.300, 0.718, 0.235; I0 1.051, 1.048 | 1.012, 1.012, 1.010 | as predicted |
+| P3 (KA, R_03) | tracked ≥ 777, coast ≤ 10, VIBA2 accepted 3/3 | Ib tracked 705, 715, 542, coast 85-128, VIBA2 rejected 3/3; I0 787, 786, 776 | tracked 790, 798, 784; coast 10, 2, 16; VIBA2 accepted 3/3; ATE 0.202, 0.194, 0.196 m | as predicted except coast in run 3 (16) |
+| P4 (KA, R_03) | VIBA0 gravity error ≤ 1.0°, by VIBA1's correction | Ib VIBA0 gravity z 0.350 | VIBA1's gravity is not printed by this binary (card J's print was temporary); VIBA0 gravity z 0.062-0.073, and VIBA2 is accepted 3/3 | not measured; proxy consistent |
+| P5 (KA, R_11) | 800/800 3/3, ATE ≤ 0.35 m | Ib (card I) 800 ×3, 0.214-0.333 m | 800, 799, 798; ATE 0.136, 0.156, 0.170 m; scale 0.947-0.970 | tracked missed by 1-2 frames; ATE better than predicted |
+| P6 (KA, R_01) | 800/800, ATE ≤ 0.13 m | base 0.097-0.112 m | 800 ×3; ATE 0.120, 0.108, 0.119 m | as predicted |
+| P7 (KC, R_03) | tracked 777-788, ATE ≤ 0.25 m | I0 787, 786, 776; 0.208-0.216 m | 797, 788, 789; ATE 0.214, 0.209, 0.218 m; ratio 1.045; near 16 ×3 | as predicted (tracked at or above the band) |
+| P8 (KB, R_03) | passes P1-P3 if KA does | as above | near 10, 26, 10; ratio 1.017, 1.012, 1.017; tracked 775, 790, 776; coast 25, 10, 24; VIBA2 accepted 3/3 | P1-P2 as predicted; P3 missed in 2 runs (775, 776) |
+| K1 | near falls but tracking does not | n/a | tracking rose with the counter | not fired |
+| K2 | tracking rises but near does not fall | n/a | near fell 2394 to 11-13 | not fired |
+| K3 | R_01 or R_11 regresses | n/a | R_11 ATE improved, R_01 inside 0.13 m | not fired |
+| K4 | P2 holds but P4 fails | n/a | P4 not measured | open |
+
+- **The theory was right.**
+  - Under `min_cold_start_points: 20`, R_03's early keyframes grew points only from pairs too short for the 1° parallax gate. Those points sat at 2-25 cm instead of 0.8 m and shrank the trajectory to about 1/5 scale.
+  - The baseline-to-depth gate removes them (2394 to 11-13). It does not starve growth: total growth in keyframes 0-60 rose to about 3040.
+  - With the gate, the scale comes out right (ratio 1.01), and VIBA2 is accepted in 3/3 runs, which card J's two fixes could not achieve.
+  - R_03 tracks 784-798/800 with ATE 0.194-0.202 m, better than the base (0.208-0.216 m).
+- **G31 unblocked.** With the gate, `min_cold_start_points: 20` no longer breaks R_03.
+  - R_11 tracks 798-800/800 with ATE 0.136-0.170 m (Ib alone: 0.214-0.333 m).
+  - R_01 stays 800/800 at 0.108-0.120 m, slightly above the base band of 0.097-0.112 m; the 0.13 m bound held.
+- **The gate on the base (KC) is neutral to slightly better.** The near-point counter was only 82 there to begin with.
+- **The ORB-SLAM3 mono ratio 0.01 (KB) also fixes the scale,** but it tracks less on R_03 (775-790). tan 1° = 0.0175 is the better setting, as the theory predicts: it is the ratio below which a correct match cannot pass the parallax gate.
+- **Next:**
+  - ship `growth_min_baseline_ratio: 0.0175` together with `min_cold_start_points: 20` in `pr180-frontend-1ms`. This needs the owner's go, and the validation workflow should confirm it on the other sequences.
+  - P4 is open until a VIBA1 gravity print exists. Roadmap item "still-device handling" is next.
