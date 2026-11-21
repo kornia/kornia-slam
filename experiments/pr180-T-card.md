@@ -182,3 +182,25 @@ All four trajectories are `cmp`-identical, to each other and to `cardR/out/r01fu
     threshold in this sample. Card L's K1 and card I's young-map item point at it. K4 stands as written,
     but the tracking loss is not a 10-active mechanism. The next card should measure the post-gap
     velocity against ground truth.
+
+- **2026-11-21, the `dense_parallelism` knob timed.** Commit c3d19d0, binary `kornia-slam-t-seq`
+  (md5 32b6d5506ebeaa18fba296abac1e8a4d), full R_01, 1 job each, `RAYON_NUM_THREADS` unset. Tseq uses
+  `cardT/cfg/r01full-S10-7-seq.ron` (`cardR/cfg/r01full-S10-7.ron` plus `dense_parallelism: Sequential`);
+  Tglobal uses `cardR/cfg/r01full-S10-7.ron` unchanged. Run dirs `cardT/out/{Tseq,Tglobal}`. Load
+  average (1 min): Tseq 2.65 at start, 2.45 at end; Tglobal 2.07 at start, 3.20 at end. Timing from
+  `cardR/vitime.py`; chol ms per iteration is the share times the mean iteration.
+
+| Run | Solves | Solve p50 / p90 / mean | Per iteration p50 / mean | chol share (ms per iteration) |
+|---|---|---|---|---|
+| Tseq, `Sequential` | 534 | 39.8 / 63.3 / 42.4 ms | 5.69 / 5.99 ms | 3.2 % (0.19) |
+| Tglobal, default `Global` | 534 | 57.7 / 148.2 / 77.8 ms | 8.26 / 11.00 ms | 40.5 % (4.46) |
+| T1 (phase 1, env var) | 534 | 38.0 / 60.5 / 41.3 ms | 5.43 / 5.84 ms | 2.1 % (0.12) |
+| T0 (phase 1, default) | 534 | 52.2 / 129.8 / 67.6 ms | 7.46 / 9.55 ms | 35.5 % (3.39) |
+
+- **Bit identity.** `cmp` Tseq against T1: identical. `cmp` Tglobal against T0: identical. `cmp` Tseq
+  against Tglobal: identical. Trajectory md5 d4f77b567b912b5a4caa2af6085a35b1, 2898 poses, so ATE stays
+  0.384 m, scale 0.971.
+- **Reading.** The knob gives the env var's result without the env var: chol 0.19 ms per iteration
+  against 0.12 ms for T1, solve p50 39.8 ms against 38.0 ms. The default still uses faer's pool (40.5 %
+  chol), so the knob is wired and the default is unchanged. Tglobal is slower than T0 (57.7 against
+  52.2 ms p50); load reached 3.2 during that run, so the gap is not attributed to the code.
