@@ -778,10 +778,9 @@ impl Map {
         if update.merge == LocalBaMerge::PropagateToNewer
             && let Some(newest) = newest_correction
         {
-            let in_snapshot: HashSet<usize> = snapshot.landmark_ids.iter().copied().collect();
             let (carried, stopped_at_bridge) =
                 self.propagate_to_newer(&newest, update.merge_inertial);
-            carried_points = self.carry_landmarks(&newest, &carried, &in_snapshot);
+            carried_points = self.carry_landmarks(&newest, &carried, &snapshot.landmark_ids);
             result.propagated_keyframes = carried.len();
             result.stopped_at_bridge = stopped_at_bridge;
             moved_keyframes.extend(
@@ -922,25 +921,40 @@ impl Map {
         (carried, false)
     }
 
-    /// Moves the live landmarks outside the snapshot whose reference keyframe
-    /// is in `carried` rigidly with `newest`, and returns their indices.
+    /// Moves the live landmarks outside the snapshot (`in_snapshot`, sorted)
+    /// whose reference keyframe is in `carried` rigidly with `newest`, and
+    /// returns their indices in ascending order.
+    ///
+    /// An active landmark is observed by its reference keyframe, so the
+    /// carried keyframes' feature slots hold every candidate: the walk
+    /// follows the carried keyframes, not the whole map.
     fn carry_landmarks(
         &mut self,
         newest: &KeyframeBaCorrection,
         carried: &[KeyframeBaCorrection],
-        in_snapshot: &HashSet<usize>,
+        in_snapshot: &[usize],
     ) -> Vec<usize> {
         let carried: HashSet<usize> = carried.iter().map(|c| c.kf_idx).collect();
-        let mut moved = Vec::new();
-        for (idx, point) in self.map_points.iter_mut().enumerate() {
-            if point.culled || in_snapshot.contains(&idx) || !carried.contains(&point.keyframe_idx)
-            {
-                continue;
-            }
+        let mut moved: Vec<usize> = self
+            .keyframes
+            .iter()
+            .filter(|kf| carried.contains(&kf.frame.idx))
+            .flat_map(|kf| kf.map_point_by_desc_idx.iter().flatten().copied())
+            .filter(|&idx| {
+                self.map_points.get(idx).is_some_and(|point| {
+                    !point.culled
+                        && carried.contains(&point.keyframe_idx)
+                        && in_snapshot.binary_search(&idx).is_err()
+                })
+            })
+            .collect();
+        moved.sort_unstable();
+        moved.dedup();
+        for &idx in &moved {
+            let point = &mut self.map_points[idx];
             point.position = newest
                 .pose_after
                 .untransform_point(&newest.pose_before.transform_point(&point.position));
-            moved.push(idx);
         }
         moved
     }
@@ -2163,5 +2177,105 @@ mod validation_tests {
             before,
             "an overflowing pose graph correction was partly applied"
         );
+    }
+}
+
+#[cfg(test)]
+mod carry_tests {
+    use super::*;
+    use crate::mapping::map::{
+        Keyframe, LandmarkSeed, ObservationKey,
+        tests::{assert_map_consistent, test_frame},
+    };
+
+    fn seed(kf: usize, feature: usize, z: f64) -> LandmarkSeed {
+        LandmarkSeed {
+            position: Vec3F64::new(0.1 * kf as f64, 0.2, z),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: kf,
+                feature_idx: feature,
+            },
+        }
+    }
+
+    /// R-B3: walking the carried keyframes' slots moves exactly the set the
+    /// whole-map scan moved, by the same transform: landmarks seen by a
+    /// carried keyframe but referenced elsewhere, culled ones and snapshot
+    /// ones stay put.
+    #[test]
+    fn carry_landmarks_moves_the_same_set() {
+        let mut map = Map::new();
+        for kf in 0..5 {
+            map.insert_keyframe(Keyframe::from_frame(test_frame(
+                kf,
+                vec![[kf as u8; 32]; 6],
+            )))
+            .unwrap();
+        }
+        let mut ids = Vec::new();
+        for kf in 0..5 {
+            for feature in 0..3 {
+                ids.push(
+                    map.insert_landmark(seed(kf, feature, 2.0 + feature as f64))
+                        .unwrap(),
+                );
+            }
+        }
+        // Landmarks referenced at keyframes 1 and 2, also seen by 3 and 4.
+        map.link_observation(3, 4, ids[3]).unwrap();
+        map.link_observation(4, 5, ids[6]).unwrap();
+        // A landmark referenced at carried keyframe 3, also seen by 1.
+        map.link_observation(1, 4, ids[9]).unwrap();
+        map.remove_landmark(ids[10]).unwrap();
+        assert_map_consistent(&map);
+
+        let newest = KeyframeBaCorrection {
+            kf_idx: 2,
+            pose_before: Pose3d::IDENTITY,
+            pose_after: Pose3d::new(
+                SO3F64::exp(Vec3F64::new(0.01, -0.02, 0.03)).matrix(),
+                Vec3F64::new(0.1, 0.0, -0.05),
+            ),
+            velocity_world: Vec3F64::ZERO,
+            imu_bias: ImuBias::default(),
+            propagated: false,
+        };
+        let carried: Vec<KeyframeBaCorrection> = [3usize, 4]
+            .iter()
+            .map(|&kf_idx| KeyframeBaCorrection {
+                kf_idx,
+                propagated: true,
+                ..newest
+            })
+            .collect();
+        let in_snapshot = vec![ids[0], ids[12]];
+
+        let carried_ids: HashSet<usize> = carried.iter().map(|c| c.kf_idx).collect();
+        let expected: Vec<usize> = map
+            .map_points
+            .iter()
+            .enumerate()
+            .filter(|(idx, p)| {
+                !p.culled && !in_snapshot.contains(idx) && carried_ids.contains(&p.keyframe_idx)
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+        let before: Vec<Vec3F64> = map.map_points.iter().map(|p| p.position).collect();
+
+        let moved = map.carry_landmarks(&newest, &carried, &in_snapshot);
+
+        assert_eq!(moved, expected);
+        assert_eq!(moved, vec![ids[9], ids[11], ids[13], ids[14]]);
+        for (idx, (point, before)) in map.map_points.iter().zip(&before).enumerate() {
+            let want = if moved.contains(&idx) {
+                newest
+                    .pose_after
+                    .untransform_point(&newest.pose_before.transform_point(before))
+            } else {
+                *before
+            };
+            assert_eq!(point.position, want, "landmark {idx}");
+        }
     }
 }
