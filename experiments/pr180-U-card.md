@@ -114,4 +114,29 @@ Runs: R_03 and R_11 800-frame windows, and full R_01, 3 each, 2 jobs.
   frame velocity equals v_kf + a·Δt to 1e-9, and `KeyframeVelocity` keeps today's value.
 - Noise: async runs differ run to run. All verdicts are on 3 runs, and the per-age medians are per run.
 
+### Stage 0: staleness or a BA-written velocity (config only, before code)
+
+- Competing cause (frontend review, T-2): VI-BA writes a wrong velocity into the lost keyframes (free states),
+  and the tracker copies it every frame.
+- Offline, cardT/out2/r03-T-r1 (synchronous): no keyframe is inserted in 388-394, the reference is lost keyframe
+  387, and no solve lands in those frames, so the copied velocity is constant. A constant error gives a flat
+  predgap. Measured 1.6 -> 9.5 cm. The logged step (1.7-1.9 m/s) and step_rot (1.6-2.2 rad/s) give a centripetal
+  3.2-3.9 m/s^2, so staleness alone predicts 0.9, 1.8, 2.7, 3.6, 4.5, 5.4 cm. About 40 % of the slope is unexplained.
+- S0a: r03-T (synchronous S10-7) and r03-W, each plus local_ba: ( lost_keyframes: FixedInertial ).
+- S0b: r03-T plus tracking_loss: ( keyframes_while_lost: Anchor ). An upper bound only: against an anchor the
+  velocity is never reset (system/mod.rs:1702-1716), so this removes staleness and the BA edge together.
+- P0a (if the BA edge is the cause): under S0a, predgap/dt stays under 0.3 m/s over the 6 frames after the
+  recovery, and the second gap (395-401) is tracked.
+- P0b (if staleness is the cause): under S0a, predgap still grows at least 3x from the first to the sixth frame
+  after the recovery, with a slope of 2.5-7 m/s^2 against the time since the reference keyframe, and it resets at
+  each keyframe.
+- K5: P0a holds. The fix for 395-401 is the lost-keyframe state, not this card. Drop P3; keep P1 and P2 for the
+  age growth elsewhere; write a card for lost_keyframes: FixedInertial.
+- K6: U1 flattens the per-age medians (P2) but the error at age 1 after a recovery stays above 0.3 m/s. Both
+  causes act; the remainder is the BA edge.
+
+Mechanism note: the copy at system/mod.rs:1704-1706 also runs for a non-anchor reference that is not the last
+keyframe (a relocalization, :2857). The IMU samples before the last keyframe are pruned (:2087-2089), so the knob
+falls back to KeyframeVelocity there.
+
 ## Result log
