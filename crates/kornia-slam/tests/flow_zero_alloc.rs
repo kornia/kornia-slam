@@ -226,11 +226,16 @@ fn a_warm_flow_step_does_not_allocate() {
         ALLOCATIONS.store(0, Ordering::SeqCst);
         // F-7: the count means nothing if every track died in the warm-up.
         let mut fewest_survivors = usize::MAX;
-        replay(settings(threads), shift, WARM_UP + COUNTED, |frame, output| {
-            if frame >= WARM_UP {
-                fewest_survivors = fewest_survivors.min(output.survivors.len());
-            }
-        });
+        replay(
+            settings(threads),
+            shift,
+            WARM_UP + COUNTED,
+            |frame, output| {
+                if frame >= WARM_UP {
+                    fewest_survivors = fewest_survivors.min(output.survivors.len());
+                }
+            },
+        );
         assert_eq!(
             ALLOCATIONS.load(Ordering::SeqCst),
             0,

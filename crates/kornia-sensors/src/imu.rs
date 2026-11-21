@@ -478,8 +478,7 @@ fn reading_at(sorted: &[ImuMeasurement], t: f64) -> (Vec3F64, Vec3F64) {
         (None, Some(b)) => (b.gyro, b.accel),
         (Some(b), None) => match after.checked_sub(2).map(|i| &sorted[i]) {
             Some(a)
-                if b.timestamp > a.timestamp
-                    && t - b.timestamp <= b.timestamp - a.timestamp =>
+                if b.timestamp > a.timestamp && t - b.timestamp <= b.timestamp - a.timestamp =>
             {
                 line(a, b)
             }
