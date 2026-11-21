@@ -1127,6 +1127,48 @@ mod windowed_tracks {
         assert_eq!(positions(&system), moved);
     }
 
+    /// The 9 tracks of `system()`, adopted again.
+    fn adopt_all(system: &mut SlamSystem) {
+        let landmarks: Vec<Vec3F64> =
+            system.with_map_points(|mps| mps.iter().map(|mp| mp.position).collect());
+        for (i, position) in landmarks.into_iter().enumerate() {
+            system
+                .tracker
+                .adopt([10.0 * i as f32, 20.0], 0, i, position);
+        }
+    }
+
+    /// R-D4: a failed prepare clears the tracks, and so does the next prepare,
+    /// whose previous frame is then a copy of its own capture; consecutive
+    /// prepares keep them.
+    #[test]
+    fn a_failed_prepare_clears_the_tracks() {
+        let image = textured(0);
+        let size = ImageSize {
+            width: 4,
+            height: 4,
+        };
+        let too_small = Image::<u8, 1>::new(size, vec![0; 16]).unwrap();
+        let mut system = system();
+        system.prepare_flow(&[&image], 3);
+        adopt_all(&mut system);
+        system.prepare_flow(&[&image], 4);
+        assert_eq!(system.tracker.tracks().len(), 9, "consecutive captures");
+
+        system.prepare_flow(&[&too_small], 5);
+        assert!(system.tracker.tracks().is_empty(), "the prepare failed");
+
+        adopt_all(&mut system);
+        system.prepare_flow(&[&image], 6);
+        assert!(
+            system.tracker.tracks().is_empty(),
+            "capture 5 was never prepared"
+        );
+        adopt_all(&mut system);
+        system.prepare_flow(&[&image], 7);
+        assert_eq!(system.tracker.tracks().len(), 9, "back to consecutive");
+    }
+
     /// T9: an anchor does not become the last keyframe, whose landmarks are
     /// adopted, so it must not replace that keyframe's kept frames.
     #[test]

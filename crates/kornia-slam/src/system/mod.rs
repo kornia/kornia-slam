@@ -775,18 +775,7 @@ impl SlamSystem {
         self.deferred_extraction = Duration::ZERO;
         let tracking_start = Instant::now();
         self.last_skip = None;
-        if let Some(rig_flow) = self.rig_flow.as_mut()
-            && let Err(error) = rig_flow.prepare(
-                images,
-                self.next_frame_idx as u64 - 1,
-                &mut self.tracking_timings,
-            )
-        {
-            self.dbg(format!(
-                "[flow] frame={} frames not prepared: {error}",
-                self.next_frame_idx - 1
-            ));
-        }
+        self.prepare_flow(images, self.next_frame_idx as u64 - 1);
         let result = self.process_prepared(source, previous_image.as_ref(), images, timestamp_sec);
         self.tracking_duration = tracking_start
             .elapsed()
@@ -809,6 +798,33 @@ impl SlamSystem {
             self.retain_secondary_images(&images[1..]);
         }
         result
+    }
+
+    /// Prepares the `WindowedU8` flow frames of capture `frame_idx`. The
+    /// tracks' pixels refer to the previous capture: when prepare fails, or
+    /// the previous frame is not capture `frame_idx - 1` (a failed prepare
+    /// left a fresh pair of this capture), they are cleared, so no template is
+    /// recut at stale pixels in another image (R-D4).
+    fn prepare_flow(&mut self, images: &[&Image<u8, 1>], frame_idx: u64) {
+        let Some(rig_flow) = self.rig_flow.as_mut() else {
+            return;
+        };
+        match rig_flow.prepare(images, frame_idx, &mut self.tracking_timings) {
+            Ok(()) => {
+                let follows = rig_flow
+                    .previous_frame(0)
+                    .is_some_and(|previous| previous.frame_id() + 1 == frame_idx);
+                if !follows {
+                    self.tracker.reset_tracks();
+                }
+            }
+            Err(error) => {
+                self.tracker.reset_tracks();
+                self.dbg(format!(
+                    "[flow] frame={frame_idx} frames not prepared: {error}"
+                ));
+            }
+        }
     }
 
     /// Time the latest successfully processed frame spent in tracking and
