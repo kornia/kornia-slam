@@ -376,6 +376,29 @@ fn every_frame_is_counted_as_exactly_one_kind() {
     assert!(c.keyframes <= c.tracked);
 }
 
+/// Card Z: each flow-only outcome but a tracked one has its counter;
+/// `flow_frames` is counted where a tracked one is accepted.
+#[test]
+fn flow_decisions_are_counted_by_kind() {
+    let mut system = SlamSystem::build(mono(), stereo_imu_rig()).unwrap();
+    system.count_flow_decision(&FlowOnly::Unavailable);
+    system.count_flow_decision(&FlowOnly::Refused);
+    system.count_flow_decision(&FlowOnly::Refused);
+    for _ in 0..3 {
+        system.count_flow_decision(&FlowOnly::KeyframeDue(Pose3d::IDENTITY));
+    }
+    let c = system.run_counters();
+    assert_eq!(
+        (
+            c.flow_unavailable,
+            c.flow_refused,
+            c.flow_keyframe_due,
+            c.flow_frames
+        ),
+        (1, 2, 3, 0)
+    );
+}
+
 mod keyframe_evidence {
     use super::*;
     use crate::tracking::parallax::tests::{

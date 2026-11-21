@@ -124,6 +124,17 @@ pub struct RunCounters {
     pub seeded_window_dropped_points: u64,
     /// Frames tracked from optical flow alone.
     pub flow_frames: u64,
+    /// Deferred frames whose flow-only pose was accepted but fell due as a
+    /// keyframe, so ORB ran (card Z).
+    pub flow_keyframe_due: u64,
+    /// Deferred frames whose flow-only pose was refused (card Z).
+    pub flow_refused: u64,
+    /// Deferred frames with too few flow survivors on a map point, or no
+    /// flow (card Z).
+    pub flow_unavailable: u64,
+    /// Of the keyframe-due frames, those whose ORB estimate was then
+    /// rejected: the accepted flow pose was lost (S0-C11).
+    pub flow_due_orb_rejected: u64,
     /// Coasted frames the runaway check flagged, so not trusted (S0-C1b).
     pub coast_runaway_frames: u64,
     /// Lost keyframes inserted while the runaway check flagged the coast;

@@ -1978,7 +1978,11 @@ impl SlamSystem {
             ),
             FrameSource::Ready(_) => FlowOnly::Unavailable,
         };
+        if matches!(source, FrameSource::Deferred(_)) {
+            self.count_flow_decision(&flow_only);
+        }
         let flow_tracked = matches!(flow_only, FlowOnly::Tracked(..));
+        let flow_due = matches!(flow_only, FlowOnly::KeyframeDue(_));
         let (frame, result) = match flow_only {
             FlowOnly::Tracked(frame, estimate) => (*frame, Ok(estimate)),
             outcome => {
@@ -2017,6 +2021,8 @@ impl SlamSystem {
                 .ok_or(MapProjectionRejectReason::LowPnpInliers),
             Err(reason) => Err(reason),
         };
+        // S0-C11: an accepted flow pose thrown away for a due keyframe.
+        self.counters.flow_due_orb_rejected += u64::from(flow_due && result.is_err());
         let (mut status, matches, tracked_inliers, reject_reason) = match result {
             Ok(estimate) => {
                 self.note_tracked_step(&candidate_pose, &estimate.pose);
@@ -2500,6 +2506,18 @@ impl SlamSystem {
             ));
         }
         FlowOnly::Tracked(Box::new(frame), estimate)
+    }
+
+    /// Counts what a deferred frame's flow-only attempt gave (card Z);
+    /// `flow_frames` counts the tracked ones where they are accepted.
+    fn count_flow_decision(&mut self, flow_only: &FlowOnly) {
+        let counter = match flow_only {
+            FlowOnly::Unavailable => &mut self.counters.flow_unavailable,
+            FlowOnly::Refused => &mut self.counters.flow_refused,
+            FlowOnly::KeyframeDue(_) => &mut self.counters.flow_keyframe_due,
+            FlowOnly::Tracked(..) => return,
+        };
+        *counter += 1;
     }
 
     /// Whether a frame tracked from flow alone was built without the map,

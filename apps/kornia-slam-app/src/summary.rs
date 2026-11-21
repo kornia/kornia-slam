@@ -29,6 +29,7 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
          ba_propagations_stopped_at_bridge={}\n\
          [summary] frame_ms {}\n\
          [summary] frontend_ms {}\n\
+         {}\n\
          {}",
         c.frames,
         c.tracked,
@@ -60,6 +61,24 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
         format_percentiles(&times.frame_ms),
         format_percentiles(&times.frontend_ms),
         format_estimator_recovery(c),
+        format_flow_coast(c),
+    )
+}
+
+/// The flow-frame decisions (card Z, S0-C11) and the runaway coast counters
+/// (S0-C1b), in a fixed order.
+fn format_flow_coast(c: &RunCounters) -> String {
+    format!(
+        "[summary] flow_coast flow_frames={} flow_keyframe_due={} flow_refused={} \
+         flow_unavailable={} flow_due_orb_rejected={} coast_runaway_frames={} \
+         lost_keyframes_at_runaway={}",
+        c.flow_frames,
+        c.flow_keyframe_due,
+        c.flow_refused,
+        c.flow_unavailable,
+        c.flow_due_orb_rejected,
+        c.coast_runaway_frames,
+        c.lost_keyframes_at_runaway,
     )
 }
 
@@ -159,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn the_last_line_holds_the_estimator_and_recovery_counters_in_order() {
+    fn the_fourth_line_holds_the_estimator_and_recovery_counters_in_order() {
         let mut counters = RunCounters::default();
         counters.ba_keyframe_shifts = 1;
         counters.ba_snapbacks = 2;
@@ -183,7 +202,7 @@ mod tests {
         counters.vi_ba_iterations_max = 20;
         let text = format(&counters, &FrameTimes::default());
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 5);
         assert_eq!(
             lines[3],
             "[summary] estimator_recovery ba_keyframe_shifts=1 ba_snapbacks=2 \
@@ -194,6 +213,25 @@ mod tests {
              relocalization_without_vocabulary=14 relocalization_ms=15.0 \
              seeded_window_frames=16 seeded_window_dropped_points=17 vi_ba_base_solves=18 \
              vi_ba_base_iterations=19 vi_ba_iterations_max=20"
+        );
+    }
+
+    #[test]
+    fn the_last_line_holds_the_flow_and_coast_counters_in_order() {
+        let mut counters = RunCounters::default();
+        counters.flow_frames = 1;
+        counters.flow_keyframe_due = 2;
+        counters.flow_refused = 3;
+        counters.flow_unavailable = 4;
+        counters.flow_due_orb_rejected = 5;
+        counters.coast_runaway_frames = 6;
+        counters.lost_keyframes_at_runaway = 7;
+        let text = format(&counters, &FrameTimes::default());
+        assert_eq!(
+            text.lines().last().unwrap(),
+            "[summary] flow_coast flow_frames=1 flow_keyframe_due=2 flow_refused=3 \
+             flow_unavailable=4 flow_due_orb_rejected=5 coast_runaway_frames=6 \
+             lost_keyframes_at_runaway=7"
         );
     }
 }
