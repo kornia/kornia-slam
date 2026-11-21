@@ -26,7 +26,7 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
   - **Cause:** while the device is still, keyframe pairs a few millimetres apart grew map points. Only wrong matches can pass the 1° parallax gate from such a short baseline, so the points landed at 2-25 cm instead of 0.8 m and shrank the trajectory to about 1/5 scale.
   - **Fix:** `mapping.growth_min_baseline_ratio` skips a pair whose baseline is below that fraction of the keyframe's median depth (ORB-SLAM3 `CreateNewMapPoints`, mono rule). At 0.0175 (tan 1°): near points 2394 to 11-13, step ratio 1.01, VIBA2 accepted 3/3.
   - **Result with `min_cold_start_points: 20`, 3 runs each:** R_03 784-798/800 at ATE 0.194-0.202 m; R_11 798-800/800 at 0.136-0.170 m; R_01 800/800 at 0.108-0.120 m.
-  - **Not yet in a preset.** Shipping both knobs in `pr180-frontend-1ms` awaits the owner.
+  - **Shipped in `pr180-frontend-1ms`** (owner, 2026-11-21), with both knob defaults in code still off.
 - **#180, card F resumed.** The owner decided D1-D6. The raw `.vrs` files for R_01, R_03 and R_11 are downloaded and are being extracted to the ASL layout.
 
 ### 2026-11-19
@@ -203,7 +203,7 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 We are working toward top results on the [LaMAria](https://github.com/cvg/lamaria) egocentric benchmark ([#78](https://github.com/kornia/kornia-slam/issues/78)), using the Aria rig and IMU and no GPS. The work is sequenced by where the benchmark score is lost: each change states its theory and predictions first, ships behind a config knob that defaults to the old behaviour, and is compared window by window against ORB-SLAM3 in the same harness.
 
 Next, start-up and scale (2026-11-19, from cards I and J; in this order):
-- [x] **Baseline and parallax gate on new map points** (card K, 2026-11-21: built, knob `mapping.growth_min_baseline_ratio`; at 0.0175 (tan 1°) with `min_cold_start_points: 20`, R_03 784-798/800, R_11 798-800/800, R_01 800/800; not yet in a preset).
+- [x] **Baseline and parallax gate on new map points** (card K, 2026-11-21: built, knob `mapping.growth_min_baseline_ratio`; at 0.0175 (tan 1°) with `min_cold_start_points: 20`, R_03 784-798/800, R_11 798-800/800, R_01 800/800; shipped in `pr180-frontend-1ms`).
 - [ ] **Raw fisheye images instead of the pinhole crop (card F).** Basalt, OKVIS2, ORB-SLAM3 (`KannalaBrandt8`) and Aria's own SLAM run on the full fisheye view; the wider stereo overlap removes the R_11 start-up starvation (G31) at its source.
 - [ ] **Still-device handling.** Detect no motion; skip keyframes or apply a zero-velocity update, and initialise gravity and bias from the still period, as OpenVINS and Basalt do.
 - [ ] **IMU carries tracking through visual gaps.** Keep the young map and propagate with the IMU when a frame has too few matches, instead of resetting it at its first lost frame (Basalt, OKVIS2, VINS); ORB-SLAM3 keeps old maps in its Atlas and merges them later.

@@ -139,3 +139,4 @@ All runs are 3 per config. The tracking counts are 800-frame windows. The counte
 - **Next:**
   - ship `growth_min_baseline_ratio: 0.0175` together with `min_cold_start_points: 20` in `pr180-frontend-1ms`. This needs the owner's go, and the validation workflow should confirm it on the other sequences.
   - P4 is open until a VIBA1 gravity print exists. Roadmap item "still-device handling" is next.
+- **2026-11-21, shipped.** By the owner's decision, `configs/pr180-frontend-1ms.ron` now sets `mapping.growth_min_baseline_ratio: 0.0175` and `tracking_loss.reseed.min_cold_start_points: 20`. The knob defaults in code stay off.
