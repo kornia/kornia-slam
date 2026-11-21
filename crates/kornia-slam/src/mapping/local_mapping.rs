@@ -126,6 +126,7 @@ pub(crate) struct LocalMappingCounts {
     pub vi_ba_iterations_max: u64,
     pub ba_stale_keyframes: u64,
     pub ba_propagated_keyframes: u64,
+    pub ba_propagations_stopped_at_bridge: u64,
 }
 
 // Atomics because the asynchronous worker writes them while tracking reads.
@@ -143,6 +144,7 @@ struct LocalMappingCounters {
     vi_ba_iterations_max: AtomicU64,
     ba_stale_keyframes: AtomicU64,
     ba_propagated_keyframes: AtomicU64,
+    ba_propagations_stopped_at_bridge: AtomicU64,
 }
 
 impl LocalMappingCounters {
@@ -198,6 +200,10 @@ impl LocalMappingCounters {
             Ok(result) => {
                 add(&self.ba_stale_keyframes, result.newer_keyframes);
                 add(&self.ba_propagated_keyframes, result.propagated_keyframes);
+                add(
+                    &self.ba_propagations_stopped_at_bridge,
+                    usize::from(result.stopped_at_bridge),
+                );
             }
             Err(_) => {
                 add(&self.ba_updates_rejected, 1);
@@ -220,6 +226,7 @@ impl LocalMappingCounters {
             vi_ba_iterations_max: read(&self.vi_ba_iterations_max),
             ba_stale_keyframes: read(&self.ba_stale_keyframes),
             ba_propagated_keyframes: read(&self.ba_propagated_keyframes),
+            ba_propagations_stopped_at_bridge: read(&self.ba_propagations_stopped_at_bridge),
         }
     }
 }

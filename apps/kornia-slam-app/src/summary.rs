@@ -25,7 +25,8 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
          prior_fallbacks={} ba_updates_rejected={} ba_solves={} ba_solve_ms={:.1} \
          nonrigid_poses={} nonrigid_keyframes={} reseeds={} reseeds_held={} tilt_relevels={} \
          bias_resets={} reseed_stall_frames={} gate_rejects_rotation={} \
-         gate_rejects_translation={} ba_stale_keyframes={} ba_propagated_keyframes={}\n\
+         gate_rejects_translation={} ba_stale_keyframes={} ba_propagated_keyframes={} \
+         ba_propagations_stopped_at_bridge={}\n\
          [summary] frame_ms {}\n\
          [summary] frontend_ms {}\n\
          {}",
@@ -55,6 +56,7 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
         c.gate_rejects_translation,
         c.ba_stale_keyframes,
         c.ba_propagated_keyframes,
+        c.ba_propagations_stopped_at_bridge,
         format_percentiles(&times.frame_ms),
         format_percentiles(&times.frontend_ms),
         format_estimator_recovery(c),
@@ -142,6 +144,7 @@ mod tests {
         counters.gate_rejects_translation = 9;
         counters.ba_stale_keyframes = 21;
         counters.ba_propagated_keyframes = 5;
+        counters.ba_propagations_stopped_at_bridge = 6;
         let text = format(&counters, &FrameTimes::default());
         let first = text.lines().next().unwrap();
         assert!(
@@ -149,7 +152,7 @@ mod tests {
                 "ba_solve_ms=2.5 nonrigid_poses=3 nonrigid_keyframes=1 reseeds=12 \
                  reseeds_held=2 tilt_relevels=1 bias_resets=0 reseed_stall_frames=140 \
                  gate_rejects_rotation=4 gate_rejects_translation=9 ba_stale_keyframes=21 \
-                 ba_propagated_keyframes=5"
+                 ba_propagated_keyframes=5 ba_propagations_stopped_at_bridge=6"
             ),
             "{first}"
         );

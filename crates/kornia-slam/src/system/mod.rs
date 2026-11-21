@@ -555,6 +555,7 @@ impl SlamSystem {
             vi_ba_iterations_max: mapping.vi_ba_iterations_max,
             ba_stale_keyframes: mapping.ba_stale_keyframes,
             ba_propagated_keyframes: mapping.ba_propagated_keyframes,
+            ba_propagations_stopped_at_bridge: mapping.ba_propagations_stopped_at_bridge,
             flow_reconcile_clears: self.tracker.reconcile_clears(),
             flow_tracks_tried: flow.tracks_tried,
             flow_fb_rejects: flow.fb_rejects,
@@ -1302,6 +1303,7 @@ impl SlamSystem {
         if self.state.reseeding() {
             keyframe.velocity_world = self.state.velocity_world;
             keyframe.imu_bias = self.inertial.bias;
+            keyframe.segment_start = true;
         }
 
         // A kept inertial state only needs a few points to start the segment;

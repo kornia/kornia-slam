@@ -654,6 +654,9 @@ pub struct LocalBaMergeResult {
     pub newer_keyframes: usize,
     /// Of those, keyframes the merge carried the correction to.
     pub propagated_keyframes: usize,
+    /// The propagation stopped at a re-seeded segment's first keyframe that
+    /// a bridge edge reaches (card V, E-2).
+    pub stopped_at_bridge: bool,
 }
 
 impl Map {
@@ -776,9 +779,11 @@ impl Map {
             && let Some(newest) = newest_correction
         {
             let in_snapshot: HashSet<usize> = snapshot.landmark_ids.iter().copied().collect();
-            let carried = self.propagate_to_newer(&newest, update.merge_inertial);
+            let (carried, stopped_at_bridge) =
+                self.propagate_to_newer(&newest, update.merge_inertial);
             carried_points = self.carry_landmarks(&newest, &carried, &in_snapshot);
             result.propagated_keyframes = carried.len();
+            result.stopped_at_bridge = stopped_at_bridge;
             moved_keyframes.extend(
                 carried
                     .iter()
@@ -841,12 +846,16 @@ impl Map {
     /// velocity is re-predicted from the corrected keyframe before it over
     /// their IMU edge when `inertial` (gravity, `T_bc`) is given, else
     /// rotated with the correction; the bias is `newest`'s. Stops at an
-    /// anchor or at a keyframe no IMU edge reaches, the start of a segment.
+    /// anchor or at the start of a segment: a keyframe no IMU edge reaches,
+    /// or a re-seeded segment's first keyframe, whose bridge edge from the
+    /// old segment is inflated. The old window's correction then stays a
+    /// residual on that edge, as ORB-SLAM3 carries nothing inertial into a
+    /// new map. The flag reports a stop at such a bridge.
     fn propagate_to_newer(
         &mut self,
         newest: &KeyframeBaCorrection,
         inertial: Option<(Vec3F64, Option<Pose3d>)>,
-    ) -> Vec<KeyframeBaCorrection> {
+    ) -> (Vec<KeyframeBaCorrection>, bool) {
         let mut newer: Vec<usize> = self
             .keyframes
             .iter()
@@ -867,6 +876,9 @@ impl Map {
             };
             if live.anchor || incoming.is_empty() {
                 break;
+            }
+            if live.segment_start {
+                return (carried, true);
             }
             let pose_before = live.frame.pose_world_to_cam;
             let edge = incoming
@@ -907,7 +919,7 @@ impl Map {
             carried.push(correction);
             previous = correction;
         }
-        carried
+        (carried, false)
     }
 
     /// Moves the live landmarks outside the snapshot whose reference keyframe

@@ -1244,6 +1244,16 @@ fn raw_fisheye_magnification_scales_the_local_ba_sigma() {
 /// (referenced by 5).
 /// Returns the live map, the solve, and that landmark.
 fn stale_cruise(merge: LocalBaMerge, anchor_five: bool) -> (Map, BaUpdate, usize) {
+    stale_cruise_with(merge, anchor_five, false)
+}
+
+/// `stale_cruise`, with keyframe 5 a re-seeded segment's first keyframe
+/// when `segment_start_five`; the 4 -> 5 edge is then its bridge.
+fn stale_cruise_with(
+    merge: LocalBaMerge,
+    anchor_five: bool,
+    segment_start_five: bool,
+) -> (Map, BaUpdate, usize) {
     let gravity = Vec3F64::new(0.0, 9.81, 0.0);
     let mut map = cruise_map(gravity, Vec3F64::ZERO, 5);
     map.edit_keyframes_for_test(|_, kf| {
@@ -1271,6 +1281,7 @@ fn stale_cruise(merge: LocalBaMerge, anchor_five: bool) -> (Map, BaUpdate, usize
         kf.frame.pose_world_to_cam.translation.y += 0.02;
         kf.velocity_world = Vec3F64::new(CRUISE_SPEED + 0.3, 0.0, 0.0);
         kf.anchor = anchor_five && id == 5;
+        kf.segment_start = segment_start_five && id == 5;
         map.insert_keyframe(kf).unwrap();
         for landmark in 0..landmarks {
             map.link_observation(id, landmark, landmark).unwrap();
@@ -1405,6 +1416,28 @@ fn a_propagating_merge_does_not_cross_an_anchor() {
     let result = map.apply_ba_update(update).unwrap();
     assert_eq!(result.propagated_keyframes, 0);
     assert_eq!([live_state(&map, 5), live_state(&map, 6)], before);
+}
+
+/// Card V (E-2): a bridged re-seed's first keyframe stops the propagation,
+/// so neither it nor anything after it takes the old window's correction.
+#[test]
+fn a_propagating_merge_stops_at_a_bridged_segment_start() {
+    let (mut map, update, _) = stale_cruise_with(LocalBaMerge::PropagateToNewer, false, true);
+    assert!(
+        map.imu_factors()
+            .iter()
+            .any(|f| f.prev_kf_idx == 4 && f.curr_kf_idx == 5),
+        "the bridge edge reaches 5"
+    );
+    let before = [live_state(&map, 5), live_state(&map, 6)];
+    let result = map.apply_ba_update(update).unwrap();
+    assert_eq!(result.newer_keyframes, 2);
+    assert_eq!(result.propagated_keyframes, 0);
+    assert!(result.stopped_at_bridge);
+    assert_eq!([live_state(&map, 5), live_state(&map, 6)], before);
+
+    let (mut plain, update, _) = stale_cruise(LocalBaMerge::PropagateToNewer, false);
+    assert!(!plain.apply_ba_update(update).unwrap().stopped_at_bridge);
 }
 
 /// A snapshot from another world frame is still refused wholesale.

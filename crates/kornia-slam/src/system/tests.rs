@@ -1543,6 +1543,59 @@ mod recovery_after_loss {
         assert_eq!(system.state.bridge_anchor, None);
     }
 
+    /// Card V (E-2): a bridged re-seed's first keyframe is marked as a
+    /// segment start, and the bridge edge reaches it.
+    #[test]
+    fn a_bridged_reseed_marks_its_first_keyframe_as_a_segment_start() {
+        let mut system = lost_metric_system(7.0);
+        let samples: Vec<ImuMeasurement> = (0..=1000)
+            .map(|i| ImuMeasurement {
+                timestamp: 10.0 + i as f64 * 0.005,
+                gyro: Vec3F64::ZERO,
+                accel: Vec3F64::new(0.0, 0.0, 9.81),
+            })
+            .collect();
+        system.inertial.latest_image_timestamp_sec = Some(15.0);
+        system.process_imu(&samples);
+        system
+            .map
+            .lock()
+            .unwrap()
+            .insert_keyframe(Keyframe::from_frame(frame_seeing_points(
+                40,
+                centred_at(1.0),
+                &[],
+            )))
+            .unwrap();
+        system.give_up(&stereo_frame(140), 5.0);
+        assert!(system.state.bridge_anchor.is_some());
+
+        let pose = system.state.pose_world_to_cam;
+        let points: Vec<Vec3F64> = (0..12)
+            .map(|i| {
+                pose.untransform_point(&Vec3F64::new(
+                    (i % 4) as f64 * 0.3 - 0.45,
+                    (i / 4) as f64 * 0.3 - 0.3,
+                    2.0,
+                ))
+            })
+            .collect();
+        let mut seed = frame_seeing_points(141, pose, &points);
+        seed.depth = vec![2.0; points.len()];
+        let result = system.bootstrap_stereo(seed, 15.0);
+
+        assert_eq!(result.status, TrackingStatus::KeyframeAccepted);
+        let map = system.map.lock().unwrap();
+        assert!(map.get_keyframe(141).unwrap().segment_start);
+        assert!(!map.get_keyframe(40).unwrap().segment_start);
+        assert!(
+            map.imu_factors()
+                .iter()
+                .any(|f| (f.prev_kf_idx, f.curr_kf_idx) == (40, 141)),
+            "the bridge edge"
+        );
+    }
+
     /// T-4: a coast is trusted only with a confident IMU and no runaway.
     #[test]
     fn a_coast_is_trusted_only_when_confident_and_not_a_runaway() {

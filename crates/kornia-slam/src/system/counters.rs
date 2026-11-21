@@ -87,6 +87,9 @@ pub struct RunCounters {
     pub ba_stale_keyframes: u64,
     /// Of those, keyframes the merge carried the correction to.
     pub ba_propagated_keyframes: u64,
+    /// Merges whose propagation stopped at a re-seeded segment's first
+    /// keyframe that a bridge edge reaches (card V).
+    pub ba_propagations_stopped_at_bridge: u64,
     /// Frames tracked by the pose-inertial solve.
     pub pose_inertial_solves: u64,
     /// Of those, solves anchored at a keyframe rather than the previous frame.
