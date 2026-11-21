@@ -14,7 +14,7 @@ use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabular
 use crate::loop_closure::{LoopCloser, LoopClosingConfig, LoopSolver};
 use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
 use crate::mapping::visual_information::FisheyeWeight;
-use crate::mapping::{GrowthNeighbours, LocalMappingMode};
+use crate::mapping::{GrowthNeighbours, KeyframeSeed, LocalMappingMode};
 use crate::tracking::flow_pool::FlowPoolError;
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
@@ -64,6 +64,7 @@ pub(crate) struct SystemSettings {
     pub relocalization: LostRelocalization,
     pub growth_neighbours: GrowthNeighbours,
     pub growth_min_baseline_ratio: f64,
+    pub keyframe_seed: KeyframeSeed,
 }
 
 /// The 1 ms frontend knobs the tracking path reads.
@@ -228,6 +229,7 @@ impl SystemConfig {
             relocalization: orb.tracking_loss.relocalization,
             growth_neighbours: orb.mapping.growth_neighbours,
             growth_min_baseline_ratio: orb.mapping.growth_min_baseline_ratio,
+            keyframe_seed: orb.mapping.keyframe_seed,
         }
     }
 

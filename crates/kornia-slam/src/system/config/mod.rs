@@ -16,7 +16,7 @@ use crate::mapping::map::StateEnvelope;
 use crate::mapping::marginalization::BoundaryPrior;
 use crate::mapping::vi_ba_schur::ImuHuber;
 use crate::mapping::visual_information::{FisheyeWeight, VisualInformation};
-use crate::mapping::{GrowthNeighbours, LocalMappingMode};
+use crate::mapping::{GrowthNeighbours, KeyframeSeed, LocalMappingMode};
 use crate::tracking::local_map::LocalMapRules;
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::{KeyframeObservations, MapProjectionConfig};
@@ -529,6 +529,8 @@ pub struct MappingConfig {
     pub growth_neighbours: GrowthNeighbours,
     /// Smallest baseline, as a fraction of the new keyframe's median scene depth, from which a keyframe pair grows map points (card K); `0.0` is off.
     pub growth_min_baseline_ratio: f64,
+    /// The velocity a new keyframe is seeded with.
+    pub keyframe_seed: KeyframeSeed,
 }
 
 /// The local BA / VI-BA window and its error model. The defaults are the
@@ -814,6 +816,9 @@ impl fmt::Display for SystemConfig {
                 "  growth: pairs under baseline/depth {} skipped",
                 orb.mapping.growth_min_baseline_ratio
             )?;
+        }
+        if orb.mapping.keyframe_seed != KeyframeSeed::default() {
+            writeln!(f, "  keyframe seed: {:?}", orb.mapping.keyframe_seed)?;
         }
         let ba = &orb.mapping.local_ba;
         if *ba != LocalBaConfig::default() {

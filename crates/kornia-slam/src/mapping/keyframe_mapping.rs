@@ -163,6 +163,18 @@ pub enum GrowthNeighbours {
     OrbSlam3 { covisible: usize },
 }
 
+/// The velocity a new keyframe enters its first VI-BA with (card R).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum KeyframeSeed {
+    /// The tracker's velocity: the reference keyframe's plus one frame of IMU.
+    #[default]
+    ReferenceVelocity,
+    /// The last keyframe's state propagated over the new keyframe edge
+    /// (ORB-SLAM3 `Tracking.cc:1746-1762`).
+    ImuPropagated,
+}
+
 /// A pair whose growth batch was refused, with the neighbour it was against.
 pub(crate) struct PairGrowthFailure {
     pub neighbor_keyframe_idx: usize,
