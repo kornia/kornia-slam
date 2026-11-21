@@ -88,3 +88,9 @@ Our `boundary_imu_info_scale: 1e-2` is the departure.
 | O3 | 8, 10, 3 | 1.9-2.1 cm | 2.64, 2.75, 1.51 m | 0.98, 0.96, 1.09 |
 
 - **Verdict:** P1-P4 missed, all worse. A full-weight boundary edge makes the drift worse, not better, so a weak anchor is not the cause.
+
+### Correction (2026-11-21)
+
+- The reference claim above is wrong. ORB-SLAM3 scales the boundary edge by 1e-2 and puts Huber on it (`Optimizer.cc:2632-2643`: `if(i==N-1) setInformation(information()*1e-2)`, Huber delta `sqrt(16.92)`).
+- O1 and O2 (`boundary_imu_info_scale: 1.0`) were therefore not the ORB-SLAM3 literal. The literal is run as Q0b in card Q.
+- The predictions above are left as written.
