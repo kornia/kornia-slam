@@ -92,7 +92,8 @@ pub fn rig_seeds(
         let (Some(point), Some(right)) = (point, right) else {
             continue;
         };
-        if point.z > max_depth || is_claimed(i) || is_claimed(*right) {
+        let finite = point.x.is_finite() && point.y.is_finite() && point.z.is_finite();
+        if !finite || point.z > max_depth || is_claimed(i) || is_claimed(*right) {
             continue;
         }
         links.push(ObservationLink {
@@ -662,6 +663,28 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].observation.feature_idx, 3);
         assert_eq!(links[0].landmark, LandmarkTarget::New(0));
+    }
+
+    /// R-B10: a NaN overlap point fails `z > max_depth`; it must still not
+    /// become a seed, which would make the whole insertion batch refused.
+    #[test]
+    fn a_non_finite_stereo_point_is_not_a_seed() {
+        let mut frame = test_frame(4, vec![[0; 32]; 8]);
+        frame.rig.camera_ranges = vec![0..4, 4..8];
+        frame.rig.left_to_right = vec![Some(4), Some(5), Some(6), Some(7)];
+        frame.rig.stereo_points = vec![
+            Some(Vec3F64::new(0.0, 0.0, f64::NAN)),
+            Some(Vec3F64::new(f64::NAN, 0.0, 2.0)),
+            Some(Vec3F64::new(0.0, f64::INFINITY, 2.0)),
+            Some(Vec3F64::new(0.0, 0.0, 2.0)),
+        ];
+
+        let (seeds, links) = rig_seeds(&frame, f64::INFINITY, &[]);
+
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].reference.feature_idx, 3);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].observation.feature_idx, 7);
     }
 
     #[test]
