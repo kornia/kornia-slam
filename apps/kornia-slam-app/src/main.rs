@@ -95,6 +95,12 @@ struct Args {
     #[argh(switch)]
     no_pace: bool,
 
+    /// process each frame no earlier than its source timestamp after the
+    /// first frame's, so a run is paced at the sensor rate instead of at most
+    /// 30 per second; excludes --no-pace
+    #[argh(switch)]
+    pace_timestamps: bool,
+
     /// disable the terminal UI (status lines stream to stderr instead)
     #[argh(switch)]
     no_tui: bool,
@@ -224,6 +230,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "viz"))]
     let tui_active = !args.no_tui;
 
+    if args.pace_timestamps && args.no_pace {
+        return Err("--pace-timestamps and --no-pace exclude each other".into());
+    }
     let mut run = RunConfig::from_ron_file(&args.config)?;
     if let Some(Command::OfflineBa(offline)) = &args.command {
         return run_offline_ba(&run, offline);
@@ -257,6 +266,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let target_dt = Duration::from_secs_f64(1.0 / 30.0);
     let mut last_frame_walltime = Instant::now();
+    let mut timestamp_pacer = TimestampPacer::default();
 
     let n_frames_hint = source.n_frames_hint();
     let PipelineDefinition::OrbSlam(orb) = &run.system.pipeline;
@@ -353,7 +363,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let now = Instant::now();
         let elapsed = now.duration_since(last_frame_walltime);
 
-        if !args.no_pace && elapsed < target_dt {
+        if args.pace_timestamps {
+            std::thread::sleep(timestamp_pacer.delay(item.timestamp_sec, now));
+        } else if !args.no_pace && elapsed < target_dt {
             std::thread::sleep(target_dt - elapsed);
         }
 
@@ -656,6 +668,23 @@ fn run_offline_ba(run: &RunConfig, args: &OfflineBaArgs) -> Result<(), Box<dyn s
     Ok(())
 }
 
+/// `--pace-timestamps`: holds each frame until as much wall time has passed
+/// since the first frame as source time.
+#[derive(Default)]
+struct TimestampPacer {
+    /// The first frame's timestamp (s) and wall time.
+    start: Option<(f64, Instant)>,
+}
+
+impl TimestampPacer {
+    /// How long to wait at `now` before processing the frame at `timestamp_sec`.
+    fn delay(&mut self, timestamp_sec: f64, now: Instant) -> Duration {
+        let (first_sec, first_wall) = *self.start.get_or_insert((timestamp_sec, now));
+        let due = Duration::try_from_secs_f64(timestamp_sec - first_sec).unwrap_or(Duration::ZERO);
+        due.saturating_sub(now.duration_since(first_wall))
+    }
+}
+
 /// Bootstrap skips hold the pose from before the loss and a visual coast has
 /// no metric motion, so only an inertial coast is a usable estimate.
 fn is_inertial_coast(skip: Option<SkipKind>) -> bool {
@@ -726,6 +755,32 @@ mod cli_tests {
         assert_eq!(offline.session, "s.cbor");
         assert_eq!(offline.trajectory_out, "t.txt");
         assert!(offline.report.is_none());
+    }
+
+    /// R-F5: a frame waits for its timestamp's offset from the first frame,
+    /// minus the wall time already spent; a late frame or a timestamp that
+    /// steps back does not wait.
+    #[test]
+    fn pace_delay_follows_the_timestamps() {
+        let wall = Instant::now();
+        let mut pacer = TimestampPacer::default();
+        assert_eq!(pacer.delay(1.0, wall), Duration::ZERO);
+        assert_eq!(
+            pacer.delay(1.5, wall + Duration::from_millis(30)),
+            Duration::from_millis(470)
+        );
+        assert_eq!(
+            pacer.delay(1.75, wall + Duration::from_millis(800)),
+            Duration::ZERO
+        );
+        assert_eq!(pacer.delay(0.5, wall), Duration::ZERO);
+
+        assert!(!parse(&["--config", "r.ron"]).unwrap().pace_timestamps);
+        assert!(
+            parse(&["--config", "r.ron", "--pace-timestamps"])
+                .unwrap()
+                .pace_timestamps
+        );
     }
 
     #[test]
