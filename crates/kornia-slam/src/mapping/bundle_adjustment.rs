@@ -3,6 +3,7 @@
 //! Solvers consume immutable map snapshots and return numerical updates. The
 //! map owns capture and writeback; the local-mapping worker owns scheduling.
 
+use crate::mapping::dense_llt::DenseParallelism;
 use crate::mapping::map::{
     BaSnapshot, BaSolve, BaUpdate, BaUpdateError, BaWindow, ImuFactor as MapImuFactor, Keyframe,
     LocalBaMerge, LocalBaStats, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR, StateEnvelope,
@@ -70,6 +71,8 @@ pub struct LocalBaParams {
     pub recently_initialized: bool,
     /// Ask VI-BA for the newest keyframe's marginal covariance.
     pub newest_marginal: bool,
+    /// Threads of VI-BA's dense factor and solves; the visual-only BA ignores it.
+    pub dense_parallelism: DenseParallelism,
 }
 
 /// ORB-SLAM3's larger window when tracking is strong (`LocalMapping.cc:148`,
@@ -137,6 +140,7 @@ impl Default for LocalBaParams {
             initial_lambda: 1.0,
             recently_initialized: false,
             newest_marginal: false,
+            dense_parallelism: DenseParallelism::Global,
         }
     }
 }
@@ -838,6 +842,7 @@ fn run_local_inertial_ba_inner(
         imu_huber: params.imu_huber,
         imu_recently_initialized: params.recently_initialized,
         newest_marginal: params.newest_marginal,
+        dense_parallelism: params.dense_parallelism,
         rig_views: rig_views.clone(),
         observation_views: observation_views.clone(),
         observation_sigma_px,

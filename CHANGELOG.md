@@ -73,6 +73,10 @@ has been scored on a benchmark sequence yet.
   max_iterations, initial_lambda)`.
 - `mapping.local_ba.imu_huber: BoundaryOrRecentInit`: Huber on the boundary edge,
   and on every IMU edge until VIBA2 has run.
+- `mapping.local_ba.dense_parallelism` (`Global`): `Sequential` factors and
+  solves the local VI-BA's reduced system on the calling thread instead of
+  faer's global thread pool (card T). **Breaking (library):** `ViBaParams`,
+  `LocalBaParams` and `LocalBaConfig` gain a field.
 - `mapping.growth_neighbours` (`RecentTen`): `OrbSlam3(covisible)` grows and fuses
   against ORB-SLAM3's covisibility lists instead of the 10 most recent keyframes.
 - `inertial.sample_interpolation` (`Hold`): `Midpoint` integrates the mean of

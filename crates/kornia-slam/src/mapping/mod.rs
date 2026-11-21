@@ -16,6 +16,7 @@
 pub mod bundle_adjustment;
 mod calibration_states;
 pub mod culling;
+pub mod dense_llt;
 pub mod global_vi_ba;
 pub mod growth;
 pub(crate) mod keyframe_mapping;

@@ -176,6 +176,7 @@ impl LocalBaConfig {
             initial_lambda: LocalBaParams::default().initial_lambda,
             recently_initialized: false,
             newest_marginal: false,
+            dense_parallelism: self.dense_parallelism,
         }
     }
 }

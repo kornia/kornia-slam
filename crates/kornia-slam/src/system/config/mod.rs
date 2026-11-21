@@ -9,6 +9,7 @@ use crate::inertial::trust::ImuTrustMode;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{LoopClosingConfig, LoopGraphInformation, LoopGraphSettings};
 use crate::mapping::bundle_adjustment::{LargeWindow, LostKeyframes, VisualKernel};
+use crate::mapping::dense_llt::DenseParallelism;
 use crate::mapping::global_vi_ba::{
     ClockOffsetPrior, FocalSlicePrior, GyroIntrinsicsPrior, RotationSlicePrior,
 };
@@ -568,6 +569,8 @@ pub struct LocalBaConfig {
     pub large_window: LargeWindow,
     /// Calibration states VI-BA estimates online; needs the IMU.
     pub online_calibration: OnlineCalibrationConfig,
+    /// Threads of VI-BA's dense factor and solves.
+    pub dense_parallelism: DenseParallelism,
 }
 
 /// Calibration states the local VI-BA estimates online; each is off when `None`.
@@ -611,6 +614,7 @@ impl Default for LocalBaConfig {
             visual_kernel: VisualKernel::L2,
             large_window: LargeWindow::Off,
             online_calibration: OnlineCalibrationConfig::default(),
+            dense_parallelism: DenseParallelism::Global,
         }
     }
 }
@@ -848,6 +852,13 @@ impl fmt::Display for SystemConfig {
         }
         if ba.merge != LocalBaMerge::default() {
             writeln!(f, "  local BA merge: {:?}", ba.merge)?;
+        }
+        if ba.dense_parallelism != DenseParallelism::default() {
+            writeln!(
+                f,
+                "  local BA dense parallelism: {:?}",
+                ba.dense_parallelism
+            )?;
         }
         if ba.online_calibration.is_enabled() {
             writeln!(f, "  online calibration: {:?}", ba.online_calibration)?;

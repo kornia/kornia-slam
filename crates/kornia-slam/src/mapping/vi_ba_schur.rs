@@ -68,8 +68,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use faer::Mat;
-use faer::prelude::Solve;
+use faer::{Mat, Par};
 use kornia_algebra::{
     Mat6F64, Mat15F64, SE3F32, SMatF64, SO3F64, SVecF64, Vec3F64, Vec6F64, Vec15F64,
 };
@@ -79,6 +78,7 @@ use crate::mapping::calibration_states::{
     Calibration, Layout, PriorRow, ROTATION_STEP_RAD, corrected_samples, imu_calibration_columns,
     imu_t_bc_with_offset, online_prior_rows,
 };
+use crate::mapping::dense_llt::{DenseLlt, DenseParallelism};
 use crate::mapping::map::ImuFactor as MapImuFactor;
 use crate::mapping::marginalization::{BoundaryPrior, MarginalPrior, accumulate_prior};
 use crate::mapping::online_calibration::{
@@ -287,6 +287,8 @@ pub struct ViBaParams {
     /// The inertial initialization is recent: VIBA2 has not run
     /// ([`ImuHuber::BoundaryOrRecentInit`]).
     pub imu_recently_initialized: bool,
+    /// Threads the reduced system's Cholesky factor and solves run on.
+    pub dense_parallelism: DenseParallelism,
 }
 
 /// IMU edges whose nav residual gets the Huber kernel.
@@ -398,6 +400,7 @@ impl Default for ViBaParams {
             observation_sigma_px: Vec::new(),
             newest_marginal: false,
             imu_recently_initialized: false,
+            dense_parallelism: DenseParallelism::Global,
         }
     }
 }
@@ -1881,16 +1884,17 @@ fn prior_cost(solve: &CalibratedSolve<'_>, values: &Calibration) -> f64 {
 
 /// Marginal sigma of each column from `base` on, from the undamped reduced
 /// system; `None` when it is not positive definite.
-fn border_marginal_sigma(information: &Mat<f64>, base: usize) -> Option<Vec<f64>> {
+fn border_marginal_sigma(information: &Mat<f64>, base: usize, par: Par) -> Option<Vec<f64>> {
     let dim = information.nrows();
     let n = dim.checked_sub(base)?;
-    let chol = information.llt(faer::Side::Lower).ok()?;
+    let mut chol = DenseLlt::new(dim, par);
+    chol.factor(information).ok()?;
     let mut unit = Mat::<f64>::zeros(dim, n);
     for c in 0..n {
         unit[(base + c, c)] = 1.0;
     }
-    let columns = chol.solve(&unit);
-    let sigma: Vec<f64> = (0..n).map(|c| columns[(base + c, c)].sqrt()).collect();
+    chol.solve_in_place(&mut unit);
+    let sigma: Vec<f64> = (0..n).map(|c| unit[(base + c, c)].sqrt()).collect();
     sigma.iter().all(|s| s.is_finite()).then_some(sigma)
 }
 
@@ -2585,6 +2589,7 @@ fn solve_vi_ba(
     // current linearization point (refreshed by every system build).
     let mut vis_inlier = vec![false; observations.len()];
     let mut time = SolveTime::default();
+    let mut dense = DenseLlt::new(cal_base + n_cal, params.dense_parallelism.par());
     // The linearization at the current state; a rejected step keeps it.
     let mut linearized: Option<Linearization> = None;
 
@@ -2652,22 +2657,17 @@ fn solve_vi_ba(
             }
         }
 
-        let chol = match m_mat.llt(faer::Side::Lower) {
-            Ok(c) => c,
-            Err(e) => {
-                time.chol += chol_started.elapsed();
-                time.rejects += 1;
-                lambda *= 10.0;
-                if lambda > 1e10 {
-                    return Err(ViBaError::CholeskyFailed(format!("{e:?}")));
-                }
-                continue;
+        if let Err(e) = dense.factor(&m_mat) {
+            time.chol += chol_started.elapsed();
+            time.rejects += 1;
+            lambda *= 10.0;
+            if lambda > 1e10 {
+                return Err(ViBaError::CholeskyFailed(format!("{e:?}")));
             }
-        };
+            continue;
+        }
 
-        let m_col = Mat::<f64>::from_fn(dim, 1, |i, _| m_vec[i]);
-        let d_full_col = chol.solve(&m_col);
-        let d_full: Vec<f64> = (0..dim).map(|i| d_full_col[(i, 0)]).collect();
+        let d_full = dense.solve_column(&m_vec);
         time.chol += chol_started.elapsed();
         let trial_started = Instant::now();
 
@@ -3020,7 +3020,7 @@ fn solve_vi_ba(
         .filter(|_| params.newest_marginal)
         .and_then(|information| {
             let newest = usize::try_from(*kf_local.last()?).ok()?;
-            newest_marginal_covariance(information, newest * KF_DOF)
+            newest_marginal_covariance(information, newest * KF_DOF, params.dense_parallelism.par())
         });
     if let Some((i, p)) = prior {
         let fmt = |x: Option<f64>| x.map_or("-".to_string(), |x| format!("{x:.4e}"));
@@ -3099,7 +3099,9 @@ fn solve_vi_ba(
         marginal_sigma: information
             .as_ref()
             .filter(|_| border_sigma)
-            .and_then(|information| border_marginal_sigma(information, cal_base)),
+            .and_then(|information| {
+                border_marginal_sigma(information, cal_base, params.dense_parallelism.par())
+            }),
     };
 
     Ok((
@@ -3128,21 +3130,21 @@ fn solve_vi_ba(
 /// The 15×15 block of `information⁻¹` at `base`: the marginal covariance of
 /// one keyframe, the points already eliminated by the Schur complement.
 /// `None` when the system is not positive definite.
-fn newest_marginal_covariance(information: &Mat<f64>, base: usize) -> Option<Mat15F64> {
+fn newest_marginal_covariance(information: &Mat<f64>, base: usize, par: Par) -> Option<Mat15F64> {
     const KF_DOF: usize = 15;
     let dim = information.nrows();
     if base + KF_DOF > dim {
         return None;
     }
-    let chol = information.llt(faer::Side::Lower).ok()?;
+    let mut chol = DenseLlt::new(dim, par);
+    chol.factor(information).ok()?;
     let mut unit = Mat::<f64>::zeros(dim, KF_DOF);
     for col in 0..KF_DOF {
         unit[(base + col, col)] = 1.0;
     }
-    let columns = chol.solve(&unit);
-    let covariance = Mat15F64::from_fn(|row, col| {
-        0.5 * (columns[(base + row, col)] + columns[(base + col, row)])
-    });
+    chol.solve_in_place(&mut unit);
+    let covariance =
+        Mat15F64::from_fn(|row, col| 0.5 * (unit[(base + row, col)] + unit[(base + col, row)]));
     covariance
         .iter()
         .all(|v| v.is_finite())
@@ -3207,8 +3209,8 @@ mod incidence_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaObservation, ImuFactor, ImuHuber, ObservationViews, PinholeCamera, Pose3d,
-        PreintegratedImu, RigObservationCamera, ViBaKeyframe, ViBaParams,
+        BaObservation, DenseParallelism, ImuFactor, ImuHuber, ObservationViews, PinholeCamera,
+        Pose3d, PreintegratedImu, RigObservationCamera, ViBaKeyframe, ViBaParams,
         depth_residual_and_jacobian, imu_edge_information, imu_huber_chi2, imu_information_matrix,
         residual_and_jacobians, visual_huber, visual_inertial_bundle_adjust,
     };
@@ -3654,10 +3656,22 @@ mod tests {
         assert_eq!(visual_huber(100.0, 25.0), (0.5, 37.5));
     }
 
-    /// Level keyframes cruising along x at 1 m/s, `EDGE_S` apart, the first
-    /// fixed. Free landmarks every keyframe sees start a few cm off; three
-    /// more only the newest keyframe sees (rank-2 C, depth-free).
     fn cruise_window() -> (
+        Vec<ViBaKeyframe>,
+        Vec<Vec3F64>,
+        Vec<BaObservation>,
+        Vec<ImuFactor>,
+        PinholeCamera,
+    ) {
+        cruise_window_of(5)
+    }
+
+    /// `n_keyframes` level keyframes cruising along x at 1 m/s, `EDGE_S`
+    /// apart, the first fixed. Free landmarks every keyframe sees start a few
+    /// cm off; three more only the newest keyframe sees (rank-2 C, depth-free).
+    fn cruise_window_of(
+        n_keyframes: usize,
+    ) -> (
         Vec<ViBaKeyframe>,
         Vec<Vec3F64>,
         Vec<BaObservation>,
@@ -3675,7 +3689,7 @@ mod tests {
             p2: 0.0,
         };
         let gravity = ViBaParams::default().gravity;
-        let keyframes: Vec<ViBaKeyframe> = (0..5)
+        let keyframes: Vec<ViBaKeyframe> = (0..n_keyframes)
             .map(|k| ViBaKeyframe {
                 pose: Pose3d::new(
                     kornia_algebra::Mat3F64::IDENTITY,
@@ -3687,7 +3701,7 @@ mod tests {
                 inertial_fixed: false,
             })
             .collect();
-        let imu_edges: Vec<ImuFactor> = (0..4)
+        let imu_edges: Vec<ImuFactor> = (0..n_keyframes - 1)
             .map(|k| {
                 let mut preintegrated = PreintegratedImu::new(ImuBias::default(), spin_calib());
                 let n = (EDGE_S * IMU_HZ).round() as usize;
@@ -3776,6 +3790,36 @@ mod tests {
             (low / high - 1.0).abs() < 0.01,
             "sigma {low:.4e} m from λ 1e-2, {high:.4e} m from λ 1"
         );
+    }
+
+    /// 10 free keyframes give the production 150 columns; 5 would stay
+    /// inside faer's unblocked leaf (64) and never reach a threaded path.
+    #[test]
+    fn the_sequential_dense_solve_matches_the_global_one_bit_for_bit() {
+        let (keyframes, points, observations, imu_edges, camera) = cruise_window_of(11);
+        let solve = |dense_parallelism| {
+            let params = ViBaParams {
+                newest_marginal: true,
+                dense_parallelism,
+                ..ViBaParams::default()
+            };
+            visual_inertial_bundle_adjust(
+                &keyframes,
+                &points,
+                &observations,
+                &imu_edges,
+                &[],
+                &[],
+                &camera,
+                &params,
+            )
+            .unwrap()
+        };
+        let global = solve(DenseParallelism::Global);
+        let sequential = solve(DenseParallelism::Sequential);
+        assert!(global.iterations >= 2, "{} iterations", global.iterations);
+        assert!(global.newest_marginal.is_some());
+        assert_eq!(format!("{global:?}"), format!("{sequential:?}"));
     }
 }
 

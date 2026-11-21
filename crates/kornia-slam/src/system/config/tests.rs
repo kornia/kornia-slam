@@ -1354,6 +1354,7 @@ mod runtime_settings {
             max_iterations: 10,
             stereo_depth_sigma: StereoDepthSigma::Disparity { px: 1.0 },
             visual_information: VisualInformation::OctaveScaled,
+            dense_parallelism: DenseParallelism::Sequential,
             ..LocalBaConfig::default()
         };
         let settings = config.settings(&selected);
@@ -1365,6 +1366,7 @@ mod runtime_settings {
         assert_eq!(local_ba.visual_information, VisualInformation::OctaveScaled);
         assert_eq!(local_ba.active_keyframes, 10);
         assert_eq!(local_ba.max_iterations, 10);
+        assert_eq!(local_ba.dense_parallelism, DenseParallelism::Sequential);
         let fb = selected.camera.fx * 0.11;
         assert_eq!(
             local_ba.depth_sigma,
@@ -1491,6 +1493,30 @@ mod ron_files {
 
         let default = parse("(version: 1)").unwrap();
         assert_eq!(orb(&default).mapping.growth_min_baseline_ratio, 0.0);
+    }
+
+    #[test]
+    fn the_dense_parallelism_parses_and_round_trips() {
+        let default = parse("(version: 1)").unwrap();
+        assert_eq!(
+            orb(&default).mapping.local_ba.dense_parallelism,
+            DenseParallelism::Global
+        );
+
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((mapping: (local_ba: (dense_parallelism: Sequential)))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).mapping.local_ba.dense_parallelism,
+            DenseParallelism::Sequential
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+        assert_eq!(config.validate(), Ok(()));
+        assert!(matches!(
+            parse_error("(version: 1, pipeline: OrbSlam((mapping: (local_ba: (dense_parallelism: Bogus)))))"),
+            ron::Error::NoSuchEnumVariant { found, .. } if found == "Bogus"
+        ));
     }
 
     #[test]
