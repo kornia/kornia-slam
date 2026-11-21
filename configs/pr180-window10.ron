@@ -1,5 +1,6 @@
 // PR #180: pr180-frontend-1ms plus a 10-keyframe local VI-BA window (cards R and T).
-// Asynchronous mapping; 7 iterations from lambda 1e-4; the dense solve on the
+// Asynchronous mapping; 7 iterations from lambda 1e-4 in every window (the
+// base budget, card V1, as well as the large window); the dense solve on the
 // calling thread; each solve's correction carried to the keyframes inserted
 // while it ran. Full R_01 (card T, Tam): ATE SE3 0.40-0.46 m, against
 // 1.11-1.23 m for pr180-frontend-1ms. Not yet run on the challenge sequences.
@@ -40,7 +41,7 @@
             // under tan(1 deg) of the median depth (they only pass the
             // parallax gate as wrong matches); this lets the cold start
             // seed from 20 stereo points (card I, R_11 start-up).
-            mapping: ( execution: Asynchronous, growth_min_baseline_ratio: 0.0175, local_ba: ( active_keyframes: 10, dense_parallelism: Sequential, large_window: Enabled(min_tracked_inliers: 0, active_keyframes: 10, max_iterations: 7, initial_lambda: 1e-4), merge: PropagateToNewer ) ),
+            mapping: ( execution: Asynchronous, growth_min_baseline_ratio: 0.0175, local_ba: ( active_keyframes: 10, max_iterations: 7, initial_lambda: 1e-4, dense_parallelism: Sequential, large_window: Enabled(min_tracked_inliers: 0, active_keyframes: 10, max_iterations: 7, initial_lambda: 1e-4), merge: PropagateToNewer ) ),
             tracking_loss: ( reseed: ( min_cold_start_points: 20 ) ),
             // G11: the analytic refine never adopts an uphill LM step.
             tracking: ( refine_monotone: true ),
