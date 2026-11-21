@@ -167,7 +167,11 @@ impl Frame {
             .get(i)
             .map(|kp| match self.raw_view(i) {
                 Some(view) => raw_keypoint(view, kp),
-                None => undistort_keypoint(camera, kp),
+                // D-10: the feature's own camera, as `ensure_undistorted` uses.
+                None => undistort_keypoint(
+                    self.secondary_view(i).map_or(camera, |view| &view.camera),
+                    kp,
+                ),
             })
             .filter(is_finite_xy)
     }
@@ -285,6 +289,58 @@ mod tests {
             let error = (got[0] as f64 - expected.x).hypot(got[1] as f64 - expected.y);
             assert!(error < 5e-4 + 1e-4 * radial, "θ {theta}: {error} px");
         }
+    }
+
+    /// D-10: without the cache, a secondary-camera feature is undistorted
+    /// with its own camera's model, the same pixel the cache gives.
+    #[test]
+    fn the_uncached_fallback_uses_the_feature_view() {
+        let pinhole = |fx: f64, k1: f64| PinholeCamera {
+            fx,
+            fy: fx,
+            cx: 320.0,
+            cy: 240.0,
+            k1,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let size = ImageSize {
+            width: 640,
+            height: 480,
+        };
+        let rig_camera = |camera: PinholeCamera, x: f64| kornia_sensors::RigCamera {
+            camera,
+            size,
+            primary_from_camera: Pose3d::new(
+                kornia_algebra::Mat3F64::IDENTITY,
+                Vec3F64::new(x, 0.0, 0.0),
+            ),
+            raw_model: None,
+        };
+        let primary = pinhole(400.0, 0.0);
+        let secondary = pinhole(300.0, -0.2);
+        let rig = kornia_sensors::SensorRig::new(primary.clone()).with_rig_cameras(vec![
+            rig_camera(primary.clone(), 0.0),
+            rig_camera(secondary.clone(), 0.1),
+        ]);
+        let mut frame = empty_frame(Vec::new(), Vec::new());
+        frame.features.keypoints_xy = vec![[500.0, 400.0], [500.0, 400.0]];
+        frame.rig = RigFeatures {
+            geometry: Some(Arc::new(RigGeometry::from_rig(&rig).unwrap())),
+            camera_ranges: vec![0..1, 1..2],
+            ..RigFeatures::default()
+        };
+
+        let on_the_fly: Vec<_> = (0..2).map(|i| frame.undistorted_xy(i, &primary)).collect();
+        assert_eq!(
+            on_the_fly[1],
+            Some(undistort_keypoint(&secondary, &[500.0, 400.0]))
+        );
+        assert_ne!(on_the_fly[0], on_the_fly[1]);
+        frame.ensure_undistorted(&primary);
+        let cached: Vec<_> = (0..2).map(|i| frame.undistorted_xy(i, &primary)).collect();
+        assert_eq!(cached, on_the_fly);
     }
 
     #[test]
