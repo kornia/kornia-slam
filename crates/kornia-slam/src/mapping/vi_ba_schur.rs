@@ -3888,3 +3888,7 @@ mod calibration_tests;
 #[cfg(test)]
 #[path = "vi_ba_window_tests.rs"]
 mod window_tests;
+
+#[cfg(test)]
+#[path = "vi_ba_preset_tests.rs"]
+mod preset_tests;
