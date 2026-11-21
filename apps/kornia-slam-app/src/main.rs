@@ -297,6 +297,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .transpose()?;
     let mut poses_written: u64 = 0;
+    let mut poses_non_finite: u64 = 0;
     let mut trajectory_coasted = args
         .trajectory_coasted
         .as_deref()
@@ -482,14 +483,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("{status_line}");
         }
 
+        let scored = writes_scored_pose(
+            result.status,
+            system.last_skip(),
+            args.trajectory_include_coasted,
+        );
+        let finite = trajectory::is_finite_pose(&result.pose_world_to_cam);
+        if scored && !finite {
+            poses_non_finite += 1;
+        }
         if let Some(writer) = trajectory_out.as_mut()
-            && writes_scored_pose(
-                result.status,
-                system.last_skip(),
-                args.trajectory_include_coasted,
-            )
+            && scored
+            && writer.write(timestamp_sec, &result.pose_world_to_cam)?
         {
-            writer.write(timestamp_sec, &result.pose_world_to_cam)?;
             poses_written += 1;
         }
         if let Some(writer) = trajectory_coasted.as_mut()
@@ -500,20 +506,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Gated as --trajectory-out, so the session dump and offline-ba see
         // the same frames that are scored.
         if let Some(smoothed) = smoothed.as_mut()
-            && writes_scored_pose(
-                result.status,
-                system.last_skip(),
-                args.trajectory_include_coasted,
-            )
-            && let Some(reference_kf) = system.current_keyframe_idx()
-            && let Some(reference_pose) = system.keyframe_pose(reference_kf)
+            && scored
+            && finite
         {
-            smoothed.record(
-                timestamp_sec,
-                &result.pose_world_to_cam,
-                reference_kf,
-                &reference_pose,
-            );
+            let reference = system
+                .current_keyframe_idx()
+                .and_then(|kf| system.keyframe_pose(kf).map(|pose| (kf, pose)));
+            smoothed.record_scored(timestamp_sec, &result.pose_world_to_cam, reference);
         }
         let traj_pt = trajectory_point_from_pose(&result.pose_world_to_cam);
         trajectory.push(traj_pt);
@@ -597,6 +596,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("{}", summary::format(&system.run_counters(), &frame_times));
     if trajectory_out.is_some() {
         eprintln!("[summary] poses_written={poses_written}");
+        eprintln!("[summary] poses_non_finite={poses_non_finite}");
     }
     if let Some(writer) = trajectory_out {
         writer.finish()?;
@@ -619,6 +619,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ) {
         let unanchored = recorder.write(std::path::Path::new(path), &system, smoothed)?;
         eprintln!("Session: {path}, {unanchored} frame(s) without a dumped keyframe");
+        // R-F1: session frames plus unrecorded ones equal the scored poses.
+        eprintln!(
+            "[summary] session_frames={} session_unrecorded={}",
+            smoothed.frame_count() - unanchored,
+            smoothed.unrecorded() + unanchored,
+        );
     }
     if let Some(path) = args.dump_map.as_deref() {
         system.with_map_points(|map_points| {
@@ -657,10 +663,24 @@ fn run_offline_ba(run: &RunConfig, args: &OfflineBaArgs) -> Result<(), Box<dyn s
     // The solved states are `T_bw`: written as given, they are `world_from_body`.
     let mut writer =
         trajectory::TrajectoryWriter::create(std::path::Path::new(&args.trajectory_out), None)?;
+    let mut rows = 0usize;
     for (timestamp_sec, pose_bw) in reanchor_frames(&dump, &result.body_poses) {
-        writer.write(timestamp_sec, &pose_bw)?;
+        rows += usize::from(writer.write(timestamp_sec, &pose_bw)?);
     }
     writer.finish()?;
+    // R-F1: a frame without a solved keyframe or with a non-finite pose is
+    // missing from the output; the count makes the hole visible.
+    eprintln!(
+        "[offline_ba] rows={rows} session_frames={}",
+        dump.frames.len()
+    );
+    if rows < dump.frames.len() {
+        eprintln!(
+            "[offline_ba] warning: {} session frame(s) missing from {}",
+            dump.frames.len() - rows,
+            args.trajectory_out
+        );
+    }
     if let Some(path) = args.report.as_deref() {
         let out = std::io::BufWriter::new(std::fs::File::create(path)?);
         serde_json::to_writer_pretty(out, &result.report)?;
@@ -736,27 +756,6 @@ mod cli_tests {
         assert_eq!(args.eval_out, "out");
     }
 
-    #[test]
-    fn offline_ba_is_an_optional_subcommand() {
-        assert!(parse(&["--config", "r.ron"]).unwrap().command.is_none());
-        let args = parse(&[
-            "--config",
-            "r.ron",
-            "offline-ba",
-            "--session",
-            "s.cbor",
-            "--trajectory-out",
-            "t.txt",
-        ])
-        .unwrap();
-        let Some(Command::OfflineBa(offline)) = args.command else {
-            panic!("offline-ba did not parse");
-        };
-        assert_eq!(offline.session, "s.cbor");
-        assert_eq!(offline.trajectory_out, "t.txt");
-        assert!(offline.report.is_none());
-    }
-
     /// R-F5: a frame waits for its timestamp's offset from the first frame,
     /// minus the wall time already spent; a late frame or a timestamp that
     /// steps back does not wait.
@@ -781,6 +780,27 @@ mod cli_tests {
                 .unwrap()
                 .pace_timestamps
         );
+    }
+
+    #[test]
+    fn offline_ba_is_an_optional_subcommand() {
+        assert!(parse(&["--config", "r.ron"]).unwrap().command.is_none());
+        let args = parse(&[
+            "--config",
+            "r.ron",
+            "offline-ba",
+            "--session",
+            "s.cbor",
+            "--trajectory-out",
+            "t.txt",
+        ])
+        .unwrap();
+        let Some(Command::OfflineBa(offline)) = args.command else {
+            panic!("offline-ba did not parse");
+        };
+        assert_eq!(offline.session, "s.cbor");
+        assert_eq!(offline.trajectory_out, "t.txt");
+        assert!(offline.report.is_none());
     }
 
     #[test]

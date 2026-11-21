@@ -27,18 +27,33 @@ impl TrajectoryWriter {
         })
     }
 
-    pub fn write(&mut self, timestamp_sec: f64, pose_world_to_cam: &Pose3d) -> std::io::Result<()> {
+    /// Writes one line unless the pose is non-finite; returns whether it did.
+    pub fn write(
+        &mut self,
+        timestamp_sec: f64,
+        pose_world_to_cam: &Pose3d,
+    ) -> std::io::Result<bool> {
+        if !is_finite_pose(pose_world_to_cam) {
+            return Ok(false);
+        }
         let world_from_cam = pose_world_to_cam.inverse();
         let pose = match &self.body_to_camera {
             Some(t_cb) => world_from_cam.compose(t_cb),
             None => world_from_cam,
         };
-        writeln!(self.out, "{}", format_line(timestamp_sec, &pose))
+        writeln!(self.out, "{}", format_line(timestamp_sec, &pose))?;
+        Ok(true)
     }
 
     pub fn finish(mut self) -> std::io::Result<()> {
         self.out.flush()
     }
+}
+
+/// Whether every entry of `pose` is finite; a diverged estimate is never written.
+pub fn is_finite_pose(pose: &Pose3d) -> bool {
+    let t = pose.translation;
+    pose.rotation.is_finite() && t.x.is_finite() && t.y.is_finite() && t.z.is_finite()
 }
 
 /// `--trajectory-smoothed`: each frame of `--trajectory-out` (tracked, plus
@@ -52,6 +67,8 @@ pub struct SmoothedTrajectory {
     /// Keyframe -> (parent keyframe, `T_kf_from_parent`), at first reference.
     parents: HashMap<usize, (usize, Pose3d)>,
     last_reference: Option<(usize, Pose3d)>,
+    /// Scored frames with no reference keyframe to record against.
+    unrecorded: usize,
 }
 
 struct SmoothedFrame {
@@ -87,6 +104,25 @@ impl SmoothedTrajectory {
             frame_from_kf: Pose3d::between(reference_pose, pose_world_to_cam),
             pose_world_to_cam: *pose_world_to_cam,
         });
+    }
+
+    /// Records a scored frame, or counts it as unrecorded when the system has
+    /// no reference keyframe (`T_cw`) for it.
+    pub fn record_scored(
+        &mut self,
+        timestamp_sec: f64,
+        pose_world_to_cam: &Pose3d,
+        reference: Option<(usize, Pose3d)>,
+    ) {
+        match reference {
+            Some((kf, kf_pose)) => self.record(timestamp_sec, pose_world_to_cam, kf, &kf_pose),
+            None => self.unrecorded += 1,
+        }
+    }
+
+    /// Scored frames [`Self::record_scored`] could not record.
+    pub fn unrecorded(&self) -> usize {
+        self.unrecorded
     }
 
     /// Writes every recorded frame; `final_pose(kf)` is the keyframe's `T_cw`
@@ -144,7 +180,7 @@ impl SmoothedTrajectory {
     }
 
     /// The first `found(ancestor)` up the parent chain from `kf`, with
-    /// `T_kf_from_ancestor`.
+    /// `T_kf_from_ancestor`; `None` when the chain ends or loops first.
     fn walk_parents<T>(
         &self,
         kf: usize,
@@ -152,8 +188,10 @@ impl SmoothedTrajectory {
     ) -> Option<(T, Pose3d)> {
         let mut kf_from_ancestor = Pose3d::IDENTITY;
         let mut current = kf;
-        // Parents always precede their children, so the chain ends.
-        loop {
+        // A return to an older reference keyframe (A, B, A) records A's
+        // parent as B after B's as A, so a chain can loop: a walk longer
+        // than the parent map has revisited a keyframe.
+        for _ in 0..=self.parents.len() {
             if let Some(value) = found(current) {
                 return Some((value, kf_from_ancestor));
             }
@@ -161,6 +199,7 @@ impl SmoothedTrajectory {
             kf_from_ancestor = kf_from_ancestor.compose(child_from_parent);
             current = *parent;
         }
+        None
     }
 }
 
@@ -176,8 +215,9 @@ fn format_line(timestamp_sec: f64, world_from_frame: &Pose3d) -> String {
     )
 }
 
-/// Sources read integer ns into f64 seconds; for recordings shorter than
-/// days the round trip back to ns is exact.
+/// Sources read integer ns into f64 seconds. The round trip back to ns is
+/// exact while timestamps stay under about 1e15 ns (11 days) from the
+/// clock's origin, not the recording's start; epoch-based ns are not exact.
 fn timestamp_ns(timestamp_sec: f64) -> i64 {
     (timestamp_sec * 1e9).round() as i64
 }
@@ -257,6 +297,57 @@ mod tests {
             .map(|(t, kf, _)| (t, kf))
             .collect();
         assert_eq!(anchored, vec![(0.0, 10), (0.1, 10)]);
+    }
+
+    /// R-C1: a diverged pose is skipped, and the caller is told.
+    #[test]
+    fn a_non_finite_pose_is_never_written() {
+        let dir = std::env::temp_dir().join(format!("nonfinite-{}", std::process::id()));
+        let path = dir.join("t.tum");
+        let mut writer = TrajectoryWriter::create(&path, None).unwrap();
+        assert!(writer.write(0.0, &translation(1.0)).unwrap());
+        assert!(!writer.write(0.1, &translation(f64::NAN)).unwrap());
+        assert!(!writer.write(0.2, &translation(f64::INFINITY)).unwrap());
+        let rotation =
+            Mat3F64::from_cols_array(&[f64::NAN, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+        let bad_rotation = Pose3d::new(rotation, Vec3F64::new(0.0, 0.0, 0.0));
+        assert!(!is_finite_pose(&bad_rotation));
+        assert!(!writer.write(0.3, &bad_rotation).unwrap());
+        writer.finish().unwrap();
+        assert_eq!(written(&path), vec![-1.0]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// R-F6: a reference sequence 10, 20, 10 gives 20 the parent 10 and 10
+    /// the parent 20; a walk that finds neither ends instead of spinning.
+    #[test]
+    fn walk_parents_ends_on_a_cycle() {
+        let mut smoothed = SmoothedTrajectory::default();
+        smoothed.record(0.0, &translation(1.5), 10, &translation(1.0));
+        smoothed.record(0.1, &translation(2.5), 20, &translation(2.0));
+        smoothed.record(0.2, &translation(1.5), 10, &translation(1.0));
+        assert_eq!(smoothed.parents.get(&20).map(|p| p.0), Some(10));
+        assert_eq!(smoothed.parents.get(&10).map(|p| p.0), Some(20));
+        assert!(smoothed.walk_parents(10, |_| None::<()>).is_none());
+        assert_eq!(smoothed.anchored_frames(|_| false).count(), 0);
+        assert_eq!(
+            smoothed
+                .walk_parents(20, |kf| (kf == 10).then_some(kf))
+                .map(|f| f.0),
+            Some(10)
+        );
+    }
+
+    /// R-F1: a scored frame without a reference keyframe is counted, so the
+    /// session's frames plus the unrecorded ones equal the poses written.
+    #[test]
+    fn unrecorded_scored_frames_are_counted() {
+        let mut smoothed = SmoothedTrajectory::default();
+        smoothed.record_scored(0.0, &translation(1.5), Some((10, translation(1.0))));
+        smoothed.record_scored(0.1, &translation(1.6), None);
+        smoothed.record_scored(0.2, &translation(1.7), Some((10, translation(1.0))));
+        assert_eq!(smoothed.frame_count(), 2);
+        assert_eq!(smoothed.unrecorded(), 1);
     }
 
     #[test]
