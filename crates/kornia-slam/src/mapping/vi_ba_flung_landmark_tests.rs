@@ -5,6 +5,7 @@
 //! (a ~1e8-sigma residual) was lowered by turning a keyframe by ~90°.
 
 use super::*;
+use crate::mapping::synthetic_walk::Gauss;
 use kornia_algebra::{Mat3F64, SO3F64};
 
 fn camera() -> PinholeCamera {
@@ -651,28 +652,6 @@ fn a_moving_window_converges_past_a_near_plane_outlier() {
         .z;
     assert!(z < 0.0, "the keyframe never passed the outlier (z = {z})");
     assert_eq!(result.cheirality_rejections, 0);
-}
-
-/// Deterministic standard-normal draws (xorshift64* and Box-Muller), so the
-/// parked chain below is reproducible without a `rand` dependency.
-struct Gauss(u64);
-
-impl Gauss {
-    fn uniform(&mut self) -> f64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        ((self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as f64 + 0.5) / (1u64 << 53) as f64
-    }
-
-    fn normal(&mut self) -> f64 {
-        let (a, b) = (self.uniform(), self.uniform());
-        (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
-    }
-
-    fn vec3(&mut self, sigma: f64) -> Vec3F64 {
-        Vec3F64::new(self.normal(), self.normal(), self.normal()) * sigma
-    }
 }
 
 /// A camera parked for many windows. Every window has six keyframes (the

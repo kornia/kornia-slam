@@ -26,6 +26,8 @@ pub mod marginalization;
 #[allow(dead_code)]
 pub(crate) mod online_calibration;
 pub mod session;
+#[cfg(test)]
+pub(crate) mod synthetic_walk;
 pub mod vi_ba_schur;
 pub mod visual_information;
 

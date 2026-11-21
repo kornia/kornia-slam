@@ -1,5 +1,5 @@
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
+use kornia_algebra::{Mat3F64, Vec3F64};
 use kornia_sensors::imu::SampleInterpolation;
 
 use super::*;
@@ -7,72 +7,20 @@ use crate::mapping::session::{
     ImuSample, SESSION_DUMP_VERSION, SessionCamera, SessionDump, SessionFrame, SessionKeyframe,
     SessionLandmark, SessionObservation, SessionPose, SessionRig,
 };
+use crate::mapping::synthetic_walk::{
+    Sampling, body_position, body_rotation, body_velocity, exact_reading,
+};
 
 const FX: f64 = 400.0;
 const CX: f64 = 320.0;
 const CY: f64 = 240.0;
 const GRAVITY: [f64; 3] = [0.0, 9.81, 0.0];
-/// Start velocity (m/s) of the synthetic walk and its acceleration
-/// `A + W sin(ω t)` (m/s², rad/s). A constant acceleration alone would leave
-/// scale to the free accel bias: `b_a = (1 - s) A` fits a world scaled by `s`
-/// exactly. The varying part makes scale observable; roll, pitch and gravity
-/// need the body to turn too ([`Sampling::Rotating`]).
-const VELOCITY: [f64; 3] = [0.5, 0.0, 0.0];
-const ACCELERATION: [f64; 3] = [0.4, 0.0, 0.2];
-const WOBBLE: [f64; 3] = [0.3, 0.2, -0.3];
-const WOBBLE_RAD_S: f64 = 3.0;
-
-fn body_position(t: f64) -> Vec3F64 {
-    let w = WOBBLE_RAD_S;
-    Vec3F64::from_array(VELOCITY) * t
-        + Vec3F64::from_array(ACCELERATION) * (0.5 * t * t)
-        + Vec3F64::from_array(WOBBLE) * (t / w - (w * t).sin() / (w * w))
-}
-
-fn body_velocity(t: f64) -> [f64; 3] {
-    let w = WOBBLE_RAD_S;
-    (Vec3F64::from_array(VELOCITY)
-        + Vec3F64::from_array(ACCELERATION) * t
-        + Vec3F64::from_array(WOBBLE) * ((1.0 - (w * t).cos()) / w))
-        .to_array()
-}
-
-/// How the synthetic IMU samples the specific force.
-#[derive(Clone, Copy)]
-enum Sampling {
-    /// Each sample the mean over the interval before it: exact for `Hold`.
-    IntervalMean,
-    /// Each sample the signal at its stamp, as a real IMU reads it.
-    Instantaneous,
-    /// Interval means, and the body turns about two axes: without rotation
-    /// a world tilted by `R_δ` and the bias `b_a = R_δᵀg − g` fit as well as
-    /// the truth, so neither roll, pitch nor gravity's sign is observed (D2).
-    Rotating,
-}
-
-/// `R_wb(t)` of the rotating walk: `Exp(α e_x) · Exp(0.7 α e_y)`,
-/// `α = 0.25 (1 − cos 2t)` rad; the identity otherwise.
-fn body_rotation(t: f64, sampling: Sampling) -> Mat3F64 {
-    match sampling {
-        Sampling::Rotating => {
-            let a = 0.25 * (1.0 - (2.0 * t).cos());
-            SO3F64::exp(Vec3F64::new(a, 0.0, 0.0)).matrix()
-                * SO3F64::exp(Vec3F64::new(0.0, 0.7 * a, 0.0)).matrix()
-        }
-        _ => Mat3F64::IDENTITY,
-    }
-}
-
 /// A camera at the IMU accelerating past a wall of landmarks, with exact
 /// pixels and an exact IMU stream (specific force `a - g`, no rotation).
 /// `offset` moves the dumped landmarks and every keyframe but the first off
 /// the truth.
 fn synthetic_session(offset: f64) -> SessionDump {
     sampled_session(offset, Sampling::IntervalMean)
-}
-
-fn body_acceleration(t: f64) -> Vec3F64 {
-    Vec3F64::from_array(ACCELERATION) + Vec3F64::from_array(WOBBLE) * (WOBBLE_RAD_S * t).sin()
 }
 
 fn sampled_session(offset: f64, sampling: Sampling) -> SessionDump {
@@ -126,35 +74,8 @@ fn sampled_session(offset: f64, sampling: Sampling) -> SessionDump {
     let imu = (0..=400)
         .map(|i| {
             let t = i as f64 * DT;
-            if let Sampling::Rotating = sampling {
-                // Held over `(t − dt, t]` and turned by the rotation at its
-                // start, as the `Hold` integrator applies it.
-                let (r_wb0, r_wb1) = (body_rotation(t - DT, sampling), body_rotation(t, sampling));
-                let dv = Vec3F64::from_array(body_velocity(t))
-                    - Vec3F64::from_array(body_velocity(t - DT))
-                    - Vec3F64::from_array(GRAVITY) * DT;
-                return ImuSample {
-                    t,
-                    gyro: (SO3F64::from_matrix(&(r_wb0.transpose() * r_wb1)).log() * (1.0 / DT))
-                        .to_array(),
-                    accel: ((r_wb0.transpose() * dv) * (1.0 / DT)).to_array(),
-                };
-            }
-            let mean = match sampling {
-                Sampling::Instantaneous => body_acceleration(t),
-                Sampling::Rotating => unreachable!(),
-                Sampling::IntervalMean if i == 0 => Vec3F64::from_array(ACCELERATION),
-                Sampling::IntervalMean => {
-                    (Vec3F64::from_array(body_velocity(t))
-                        - Vec3F64::from_array(body_velocity(t - DT)))
-                        * (1.0 / DT)
-                }
-            };
-            ImuSample {
-                t,
-                gyro: [0.0; 3],
-                accel: (mean - Vec3F64::from_array(GRAVITY)).to_array(),
-            }
+            let (gyro, accel) = exact_reading(t, DT, sampling, Vec3F64::from_array(GRAVITY));
+            ImuSample { t, gyro, accel }
         })
         .collect();
     let identity = SessionPose::from_pose(&Pose3d::IDENTITY);
