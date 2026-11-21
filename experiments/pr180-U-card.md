@@ -209,3 +209,87 @@ falls back to KeyframeVelocity there.
     turn). U alone hurts full R_01 (K4: 0.399-0.498 m against 0.296-0.399 m), as card R's
     `keyframe_seed: ImuPropagated` did alone; with card V1 (ALL) full R_01 is 0.322-0.384 m. Per K4, check
     the keyframe velocity against card R's crossing r_v before U ships. Do not ship U alone.
+
+## Stage 2: card U2
+
+Status: written 2026-11-21, before any run. From the PR #180 full review, plan `pr180-full-review-fixes.md`
+(finding 2, bucket 3). Awaiting owner approval (STOP 1). The text above is unchanged.
+
+Paths: `S` = `/tmp/claude-1000/-home-edgar/978f5be7-3122-4eb6-bf8e-8ea40ff0cac6/scratchpad`,
+`P` = `/home/edgar/dev/split/.pr180-fix`, `K` = `crates/kornia-slam/src`.
+
+### Experiment: U2, `frame_velocity: PropagatedFromKeyframe` in the preset
+
+- **Gap tested:** card T K4 (R_03 tracking), G13, G29.
+- **Base:** kornia-slam `feat/global-pose-graph` at the gated fix tip, tag `pr180c/F1` (made in phase 5 of
+  the plan; not yet cut). Binary tag `x`: `P/bin/kornia-slam-x`, built from `pr180c/F2`, md5 recorded at build.
+- **Baselines:** BASE = V1, `P/baseline/{r03,r11,r01full}-V1.ron` (copies of `S/cardV/cfg`), 3 runs R_03 and
+  R_11, 5 runs full R_01. Old runs: `S/cardV/out`, `S/cardT/out3`. New runs:
+  `P/out/{r03,r11,r01full}-{BASE,U2}-r<n>`.
+
+### Mechanism (file:line at ad443b7; code equals f57c13a)
+
+- The frame velocity is reset to the keyframe's every frame (`K/system/mod.rs:1760`); fix at `:1780-1800`
+  (`propagated_frame_velocity`).
+- Confirmed by card U P1 and P2 (predgap 5+ bin 5.5-5.9 cm to 0.40-0.44 cm).
+
+### Theory and reference
+
+- ORB-SLAM3 `PredictStateIMU` (`Tracking.cc:1746-1758`), as card U. Not re-argued.
+- New fact: on full R_01 the base budget never acts (`vi_ba_base_solves=0` in all 6 runs), so card U's
+  "U alone" and card V's "ALL" are one configuration there. K4 fired on 1 of 6 samples.
+
+### Knob
+
+- `tracking.frame_velocity` (exists; default `KeyframeVelocity` = today). Class: bug fix. No parameter.
+
+### Configs
+
+| Name | Config |
+|---|---|
+| BASE | `P/baseline/{r03,r11,r01full}-V1.ron`, new binary |
+| U2 | `P/baseline/{r03,r11,r01full}-ALL.ron` (V1 plus `tracking: ( frame_velocity: PropagatedFromKeyframe )`) |
+
+Runs: 3 per config on R_03 and R_11, 5 per config on full R_01. `--no-pace --debug`, `JOBS=2`, `RUN_FLAGS`
+empty, as cards T, U, V. R_01 and R_03 need `ALLOW_RAW_IMU=1` (no factory file). Load sampled every 30 s
+into `<out>/load.log`.
+
+### Precondition
+
+- The R-C9 unit test (gravity, rotated keyframe, T_bc) passes:
+  `the_frame_velocity_follows_gravity_and_the_lever_arm` (lane sys).
+
+### Predictions
+
+- **P1 (mechanism)** R_03 predgap 5+ bin: 5.5-5.9 cm -> at most 2.0 cm in 3/3. Measured by: `S/cardV/stats.py`.
+- **P2** R_03: tracked at least 779 in 3/3 (U-on so far 779-786, n=6); ATE at most 0.115 m.
+- **P3** R_11: ATE at most 0.170 m in at least 2/3 and scale at least 0.945 (U-on so far: 4 of 6 above 0.170).
+- **P4** full R_01, n=5: median ATE at most BASE median + 0.03 m; no run above 0.45 m.
+- **Mechanism counter:** `[vel]` error at 5+ frames at most 1.5x the 1-frame error (`velgt.py`, after R-F4).
+
+### Kill rules
+
+- **K1 (mechanism moved, score fell):** P1 holds, and R_11 ATE above 0.170 m in 2/3, or R_01 median worse
+  than BASE by more than 0.05 m, or any run above 0.50 m. U stays out of the preset. Next: card R's crossing
+  r_v check on the keyframe velocity (card U K4 follow-up).
+- **K2 (score moved, mechanism did not):** R_03 tracked 790+ in 3/3 with the predgap bins unchanged. Do not
+  credit U.
+
+### Decision
+
+- U enters `pr180-window10` only if P2, P3 and P4 hold.
+- Owner answer 10 (2026-11-21): the validation run does not wait for this verdict.
+
+### Bit-identity and noise
+
+- Knob off: `P/baseline/r01full-S10-7.ron` (copy of `S/cardR/cfg/r01full-S10-7.ron`), synchronous,
+  `RAYON_NUM_THREADS=1`, must be `cmp`-identical to `P/baseline/traj.txt` (copy of
+  `S/cardT/out/T1/r01full-S10-7-r1/traj.txt`, md5 d4f77b567b912b5a4caa2af6085a35b1).
+- Noise: asynchronous runs differ run to run; 3 runs per config, 5 on full R_01. Known bands: R_03 tracked
+  776-788, ATE 0.103-0.114 m (V1, n=3); R_11 ATE 0.149-0.190 m (n=6, U-on); R_01 full 0.30-0.50 m
+  (n=9, all configs). Pooled U-on full R_01 so far: 0.322, 0.332, 0.384, 0.399, 0.411, 0.498 m (n=6) against
+  U-off 0.296, 0.311, 0.399 m (n=3, old binary).
+- Load: recorded; no timing verdict above load p50 5.
+
+### Result log (U2)
+
