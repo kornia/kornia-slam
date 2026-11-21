@@ -451,6 +451,76 @@ fn the_report_adds_the_applied_clock_offset() {
     );
 }
 
+/// A-7: the report says why the LM loop ended and counts the accepted steps
+/// apart from the iteration index; A-1: it prints the observation total, so
+/// the share `dropped_10px` removed is visible. Red on the old code
+/// (2026-11-21): neither field existed.
+#[test]
+fn the_report_names_why_the_solve_stopped() {
+    let session = synthetic_session(0.03);
+    let observations: usize = session
+        .keyframes
+        .iter()
+        .map(|kf| kf.observations.len())
+        .sum();
+    let not_run = solve(
+        &session,
+        &OfflineBaConfig {
+            max_iterations: 0,
+            ..OfflineBaConfig::default()
+        },
+    )
+    .report;
+    assert_eq!(not_run.stop, OfflineStop::NotRun);
+    assert_eq!(not_run.accepted_steps, 0);
+    assert_eq!(not_run.observations, observations);
+
+    let capped = solve(
+        &session,
+        &OfflineBaConfig {
+            max_iterations: 1,
+            ..OfflineBaConfig::default()
+        },
+    )
+    .report;
+    assert_eq!(capped.stop, OfflineStop::IterationCap);
+    assert_eq!(capped.accepted_steps, 1);
+
+    // Exact data: the cost reaches its floor and no damping lowers it.
+    let floor = solve(
+        &session,
+        &OfflineBaConfig {
+            tighten_from_iteration: 100,
+            ..OfflineBaConfig::default()
+        },
+    )
+    .report;
+    assert_eq!(floor.stop, OfflineStop::NoDescent);
+    assert!(floor.accepted_steps > 0);
+
+    // A tolerance of 1 ends each stage at its first accepted step.
+    let converged = solve(
+        &session,
+        &OfflineBaConfig {
+            relative_cost_tolerance: 1.0,
+            tighten_from_iteration: 100,
+            ..OfflineBaConfig::default()
+        },
+    )
+    .report;
+    assert_eq!(converged.stop, OfflineStop::Converged);
+    assert!(converged.accepted_steps > 0);
+    assert!(converged.accepted_steps <= converged.iterations);
+    let line = converged.to_string();
+    assert!(
+        line.contains(&format!(
+            "observations={observations} accepted={} stop=converged",
+            converged.accepted_steps
+        )),
+        "{line}"
+    );
+}
+
 /// A-8: the solve runs sequential and leaves faer's global parallelism as
 /// it found it, on success and on an error. Red on the old code
 /// (2026-11-21): it stayed `Par::Seq`.

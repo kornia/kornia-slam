@@ -151,8 +151,14 @@ pub struct CalibrationEstimate {
 pub struct OfflineBaReport {
     /// Tracked frames the output re-anchors.
     pub frames: usize,
-    /// Accepted LM steps.
+    /// Visual observations in the problem, before any outlier drop.
+    pub observations: usize,
+    /// Index of the last LM iteration that accepted a step; earlier
+    /// iterations that found no descent are in it too.
     pub iterations: usize,
+    /// Accepted LM steps.
+    pub accepted_steps: usize,
+    pub stop: OfflineStop,
     pub initial_cost: f64,
     pub final_cost: f64,
     /// Observations dropped at `outlier_px`, and at `tight_outlier_px`.
@@ -185,6 +191,24 @@ pub struct OfflineBaReport {
     /// The offset to apply next: the dump's `imu_time_offset_ns` plus `td_ms`,
     /// both with the sign of an offset added to the IMU stamps.
     pub td_total_ms: Option<f64>,
+}
+
+/// Why the offline LM loop ended.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum OfflineStop {
+    /// No solve: `max_iterations` is 0 or the session has no keyframe.
+    #[default]
+    NotRun,
+    /// An accepted step after the tight stage lowered the cost by less than
+    /// `relative_cost_tolerance`.
+    Converged,
+    /// After the tight stage, no damping gave a step that lowered the cost.
+    NoDescent,
+    /// `max_iterations` ran out.
+    IterationCap,
+    /// The reduced system failed to factorise after the first iteration.
+    FactorisationFailed,
 }
 
 pub struct OfflineBaResult {
@@ -233,6 +257,7 @@ pub fn offline_visual_inertial_ba(
             .iter()
             .filter(|f| slots.contains_key(&f.reference_kf))
             .count(),
+        observations: problem.observations.len(),
         bridged: edges.iter().filter(|e| e.bridged).count(),
         gap_max_s,
         ..OfflineBaReport::default()
@@ -388,6 +413,7 @@ impl Solve<'_, '_> {
                 *cost = self.cost(state, pims);
             }
         };
+        let mut stop = OfflineStop::IterationCap;
         for iteration in 1..=config.max_iterations {
             let started = Instant::now();
             if iteration >= config.tighten_from_iteration {
@@ -415,23 +441,31 @@ impl Solve<'_, '_> {
             report
                 .iteration_ms
                 .push(started.elapsed().as_secs_f64() * 1e3);
-            let converged = match step {
+            let (converged, reason) = match step {
                 Ok(Some((candidate, candidate_pims, candidate_cost))) => {
                     report.iterations = iteration;
+                    report.accepted_steps += 1;
                     let decrease = (cost - candidate_cost) / cost.max(f64::MIN_POSITIVE);
                     state = candidate;
                     if let Some(candidate_pims) = candidate_pims {
                         pims = candidate_pims;
                     }
                     cost = candidate_cost;
-                    decrease < config.relative_cost_tolerance
+                    (
+                        decrease < config.relative_cost_tolerance,
+                        OfflineStop::Converged,
+                    )
                 }
-                Ok(None) => true,
+                Ok(None) => (true, OfflineStop::NoDescent),
                 Err(error) if iteration == 1 => return Err(error),
-                Err(_) => break,
+                Err(_) => {
+                    stop = OfflineStop::FactorisationFailed;
+                    break;
+                }
             };
             if converged {
                 if tightened {
+                    stop = reason;
                     break;
                 }
                 tighten(&state, &pims, &mut cost);
@@ -440,6 +474,7 @@ impl Solve<'_, '_> {
             }
         }
         report.final_cost = cost;
+        report.stop = stop;
         Ok((state, pims))
     }
 

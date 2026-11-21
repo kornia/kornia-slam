@@ -2,7 +2,20 @@
 
 use std::fmt;
 
-use super::{CalibrationEstimate, OfflineBaReport};
+use super::{CalibrationEstimate, OfflineBaReport, OfflineStop};
+
+impl OfflineStop {
+    /// The `stop=` token of the `[offline_ba]` line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRun => "not_run",
+            Self::Converged => "converged",
+            Self::NoDescent => "no_descent",
+            Self::IterationCap => "iteration_cap",
+            Self::FactorisationFailed => "factorisation_failed",
+        }
+    }
+}
 
 impl OfflineBaReport {
     /// Fills the calibration fields in the units the card predicts them in.
@@ -43,13 +56,16 @@ impl fmt::Display for OfflineBaReport {
         // dropped_10px / dropped_3px name the two outlier stages as the card does.
         writeln!(
             f,
-            "[offline_ba] frames={} iterations={} cost0={:.6e} cost={:.6e} dropped_10px={} dropped_3px={}",
+            "[offline_ba] frames={} iterations={} cost0={:.6e} cost={:.6e} dropped_10px={} dropped_3px={} observations={} accepted={} stop={}",
             self.frames,
             self.iterations,
             self.initial_cost,
             self.final_cost,
             self.dropped_outlier,
-            self.dropped_tight_outlier
+            self.dropped_tight_outlier,
+            self.observations,
+            self.accepted_steps,
+            self.stop.as_str()
         )?;
         writeln!(
             f,
