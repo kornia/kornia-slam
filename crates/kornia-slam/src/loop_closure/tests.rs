@@ -782,7 +782,7 @@ fn pgo_result_fingerprint(result: &PgoResult) -> u64 {
 }
 
 #[test]
-fn optimize_pose_graph_output_is_bit_identical_to_b1be250() {
+fn optimize_pose_graph_output_matches_its_golden_fingerprint() {
     let gravity = Vec3F64::new(0.1, -9.7, 0.4);
     let (map, loops) = drifting_lap_map(gravity.normalize());
     let se3 = optimize_pose_graph(&map, &loops, &PgoConfig::default(), None).unwrap();
@@ -1891,6 +1891,59 @@ fn planned_fusion_matches_the_synchronous_fusion() {
     assert!(outcome.pgo_applied);
     assert_eq!(outcome.timing.fusion_ops, 36);
     assert_eq!(outcome.timing.fusion_stale, 0);
+    crate::mapping::map::tests::assert_map_consistent(&map);
+    assert_eq!(
+        map.state_fingerprint_for_test(),
+        expected.state_fingerprint_for_test()
+    );
+}
+
+/// E-7: on a rig whose earlier visit sees features 18.. through a second camera, the planned
+/// search skips those sources as the synchronous `fuse_verified_loop` does, so planning on the
+/// snapshot and fusing synchronously leave the same map.
+#[test]
+fn the_planned_search_skips_secondary_camera_sources() {
+    let config = background_config();
+    let rig_map = || {
+        let (_, mut map) = duplicated_fixture(config.clone());
+        let edge = verify_loop_candidate(&map, &camera(), 10, 0, &config.verification).unwrap();
+        let solved = optimize_through_graph(
+            &map,
+            std::slice::from_ref(&edge),
+            &config.optimizer,
+            config.graph.information,
+            None,
+        )
+        .unwrap();
+        map.edit_keyframes_for_test(|_, keyframe| {
+            if keyframe.frame.idx != 10 {
+                let n = keyframe.frame.features.descriptors.len();
+                keyframe.frame.rig.camera_ranges = vec![0..18.min(n), 18.min(n)..n];
+            }
+        });
+        (map, edge, solved)
+    };
+    let correct = |map: &mut Map, solved: &PgoResult| {
+        map.apply_graph_correction(
+            map.world_epoch(),
+            &solved.keyframe_indices,
+            &solved.original_poses,
+            &solved.optimized_poses,
+        )
+        .unwrap();
+    };
+
+    let (mut expected, edge, solved) = rig_map();
+    correct(&mut expected, &solved);
+    fuse_verified_loop(&mut expected, &camera(), &edge, &config.fusion);
+
+    let (mut map, edge, solved) = rig_map();
+    let ops = FusionSnapshot::capture(&map, &camera(), &[edge], &config.fusion).plan(&solved);
+    correct(&mut map, &solved);
+    apply_fusion(&mut map, &camera(), &ops, &config.fusion);
+
+    assert!(!ops.is_empty());
+    assert!(ops.len() < 36, "{} ops", ops.len());
     crate::mapping::map::tests::assert_map_consistent(&map);
     assert_eq!(
         map.state_fingerprint_for_test(),
