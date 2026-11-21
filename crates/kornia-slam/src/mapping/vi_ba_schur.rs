@@ -442,7 +442,8 @@ pub struct ViBaResult {
     pub prior_residual_final: Option<f64>,
     /// The newest keyframe's marginal covariance, layout `[ρ ω v b_g b_a]`,
     /// when [`ViBaParams::newest_marginal`] asked for it and that keyframe is
-    /// free; taken from the last linearization.
+    /// free, velocity and bias included (not `inertial_fixed`); taken from
+    /// the last linearization.
     pub newest_marginal: Option<Mat15F64>,
     /// The online calibration gate held the states (card G): no column.
     pub calibration_gated: bool,
@@ -3019,6 +3020,10 @@ fn solve_vi_ba(
         .as_ref()
         .filter(|_| params.newest_marginal)
         .and_then(|information| {
+            // A held velocity and bias have identity rows: no estimate to report.
+            if keyframes.last()?.inertial_fixed {
+                return None;
+            }
             let newest = usize::try_from(*kf_local.last()?).ok()?;
             newest_marginal_covariance(information, newest * KF_DOF, params.dense_parallelism.par())
         });
@@ -3820,6 +3825,39 @@ mod tests {
         assert!(global.iterations >= 2, "{} iterations", global.iterations);
         assert!(global.newest_marginal.is_some());
         assert_eq!(format!("{global:?}"), format!("{sequential:?}"));
+    }
+
+    /// R-A6: a newest keyframe held with `inertial_fixed` has identity rows
+    /// for velocity and bias, so it reports no marginal rather than unit
+    /// placeholders.
+    #[test]
+    fn a_held_newest_keyframe_reports_no_marginal() {
+        let (mut keyframes, points, observations, imu_edges, camera) = cruise_window();
+        let params = ViBaParams {
+            newest_marginal: true,
+            ..ViBaParams::default()
+        };
+        let solve = |keyframes: &[ViBaKeyframe]| {
+            visual_inertial_bundle_adjust(
+                keyframes,
+                &points,
+                &observations,
+                &imu_edges,
+                &[],
+                &[],
+                &camera,
+                &params,
+            )
+            .unwrap()
+        };
+        assert!(solve(&keyframes).newest_marginal.is_some());
+        keyframes
+            .last_mut()
+            .expect("a window keyframe")
+            .inertial_fixed = true;
+        let held = solve(&keyframes);
+        assert!(held.newest_marginal.is_none());
+        assert!(held.iterations > 0);
     }
 }
 
