@@ -557,6 +557,8 @@ impl SlamSystem {
             vi_ba_base_solves: mapping.vi_ba_base_solves,
             vi_ba_base_iterations: mapping.vi_ba_base_iterations,
             vi_ba_iterations_max: mapping.vi_ba_iterations_max,
+            vi_ba_rejected_steps: mapping.vi_ba_rejected_steps,
+            vi_ba_solves_3plus_rejects: mapping.vi_ba_solves_3plus_rejects,
             ba_stale_keyframes: mapping.ba_stale_keyframes,
             ba_propagated_keyframes: mapping.ba_propagated_keyframes,
             ba_propagations_stopped_at_bridge: mapping.ba_propagations_stopped_at_bridge,

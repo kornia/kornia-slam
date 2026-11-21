@@ -82,6 +82,10 @@ pub struct RunCounters {
     pub vi_ba_base_iterations: u64,
     /// Most iterations of any VI-BA solve.
     pub vi_ba_iterations_max: u64,
+    /// Rejected VI-BA steps summed over all solves, and the solves with 3 or
+    /// more of them (card S0-A4).
+    pub vi_ba_rejected_steps: u64,
+    pub vi_ba_solves_3plus_rejects: u64,
     /// Keyframes inserted while a local BA solved, summed over its merges:
     /// the merge found them newer than its snapshot (card R).
     pub ba_stale_keyframes: u64,
