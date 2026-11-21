@@ -1155,3 +1155,70 @@ fn a_boundary_older_than_the_prior_keeps_the_prior() {
     assert!(update.outcome.prior_fallback);
     assert!(update.next_prior.is_none());
 }
+
+/// One keyframe whose camera 0 is raw fisheye, seeing landmark 0 at 70° on
+/// its feature 0 (octave 2) and landmark 1 on axis on feature 1.
+fn raw_fisheye_window() -> (Keyframe, WindowPoints) {
+    let rig = crate::rig::tests::raw_two_camera_rig(40.0);
+    let view = rig.view(0).unwrap().clone();
+    let (s, c) = 70f64.to_radians().sin_cos();
+    let mut frame = test_frame(0, vec![[0; 32]; 2]);
+    frame.features.keypoints_xy = [Vec3F64::new(s, 0.0, c), Vec3F64::new(0.0, 0.0, 1.0)]
+        .map(|p| view.project_raw(p).unwrap())
+        .to_vec();
+    frame.features.octaves = vec![2, 0];
+    frame.rig = crate::frame::RigFeatures {
+        geometry: Some(std::sync::Arc::new(rig)),
+        camera_ranges: vec![0..2, 2..2],
+        ..Default::default()
+    };
+    let mut keyframe = Keyframe::from_frame(frame);
+    keyframe.associate_map_point(0, 0);
+    keyframe.associate_map_point(1, 1);
+    let window = WindowPoints {
+        global: vec![0, 1],
+        slots: vec![0, 1],
+        local_of: HashMap::from([(0, 0), (1, 1)]),
+        positions: vec![Vec3F64::new(s, 0.0, c) * 4.0, Vec3F64::new(0.0, 0.0, 4.0)],
+    };
+    (keyframe, window)
+}
+
+#[test]
+fn raw_fisheye_magnification_scales_the_local_ba_sigma() {
+    let (keyframe, window) = raw_fisheye_window();
+    let sigmas = |information, weight| {
+        window
+            .observations_with_views(
+                [(0, &keyframe, false)],
+                &camera(),
+                true,
+                DepthSigma::Relative(STEREO_DEPTH_REL_SIGMA),
+                information,
+                weight,
+            )
+            .sigma_px
+    };
+    assert!(sigmas(VisualInformation::Unit, FisheyeWeight::Uniform).is_empty());
+
+    let view = keyframe.frame.raw_view(0).unwrap();
+    let pixel = keyframe.frame.undistorted_xy(0, &camera()).unwrap();
+    let scale = FisheyeWeight::Magnification.sigma_scale(Some(view), pixel);
+    assert!((scale - 4.479).abs() < 0.01, "{scale}");
+    let unit = sigmas(VisualInformation::Unit, FisheyeWeight::Magnification);
+    assert_eq!(unit.len(), 2);
+    assert_eq!(unit[0], scale);
+    assert!((unit[1] - 1.0).abs() < 1e-6, "{}", unit[1]);
+    let octave = sigmas(
+        VisualInformation::OctaveScaled,
+        FisheyeWeight::Magnification,
+    );
+    assert_eq!(
+        octave[0],
+        VisualInformation::OctaveScaled.sigma_px(2) * scale
+    );
+    assert_eq!(
+        sigmas(VisualInformation::OctaveScaled, FisheyeWeight::Uniform),
+        vec![VisualInformation::OctaveScaled.sigma_px(2), 1.0]
+    );
+}

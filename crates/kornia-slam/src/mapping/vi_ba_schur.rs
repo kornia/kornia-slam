@@ -100,6 +100,11 @@ use kornia_sensors::imu::{ImuBias, ImuMeasurement, PreintegratedImu, SampleInter
 
 const MIN_Z: f32 = 1e-3;
 
+/// Width (degrees) and count of the incidence bins of the FP5 debug line;
+/// the last bin takes everything past 80°.
+const INCIDENCE_BIN_DEG: f64 = 10.0;
+const INCIDENCE_BINS: usize = 9;
+
 /// Floor under a diagonal entry before Marquardt damping scales it, so a DOF
 /// with no curvature at all is still damped.
 const MIN_DAMPING_FLOOR: f64 = 1e-6;
@@ -2789,6 +2794,40 @@ fn solve_vi_ba(
             is_boundary_edge(edge, &kf_local),
         );
     }
+    // FP5 (card F): whitened reprojection chi² of the accepted state by the
+    // incidence of each observation's undistorted pixel, to see whether the
+    // raw fisheye weights flatten it across the lens.
+    if crate::debug_enabled() {
+        let mut bins = [(0usize, 0.0f64); INCIDENCE_BINS];
+        for (o, obs) in observations.iter().enumerate() {
+            if obs.pose_idx >= n_kf || obs.point_idx >= n_pts {
+                continue;
+            }
+            let (obs_camera, obs_pose) = views.camera_pose(o, camera, &se3s[obs.pose_idx]);
+            let view = calibration.map(|c| {
+                CalibratedView::new(
+                    &c.layout,
+                    &calib,
+                    views.camera_index(o),
+                    obs_camera,
+                    obs_pose,
+                )
+            });
+            let (obs_camera, obs_pose) = view
+                .as_ref()
+                .map_or((obs_camera, obs_pose), |v| (&v.camera, v.pose));
+            let (r, _, _) =
+                residual_and_jacobians(&obs_pose, &xyz[obs.point_idx], obs.pixel, obs_camera);
+            let mut chi2 = (r[0] * r[0] + r[1] * r[1]) as f64;
+            if let Some(&sigma) = params.observation_sigma_px.get(o) {
+                chi2 /= (sigma as f64).powi(2);
+            }
+            let bin = &mut bins[incidence_bin(obs_camera, obs.pixel)];
+            bin.0 += 1;
+            bin.1 += chi2;
+        }
+        eprintln!("[vi_ba] INCIDENCE{}", incidence_chi2_line(&bins));
+    }
     if let Some(i) = (0..n_kf).rev().find(|&i| kf_local[i] >= 0) {
         let (v, b) = (kfs[i].velocity, kfs[i].bias);
         debug_eprintln!(
@@ -2953,6 +2992,61 @@ fn newest_marginal_covariance(information: &Mat<f64>, base: usize) -> Option<Mat
         .iter()
         .all(|v| v.is_finite())
         .then_some(covariance)
+}
+
+/// FP5 bin of an undistorted `pixel` of `camera` by its incidence angle.
+fn incidence_bin(camera: &PinholeCamera, pixel: [f32; 2]) -> usize {
+    let x = (pixel[0] as f64 - camera.cx) / camera.fx;
+    let y = (pixel[1] as f64 - camera.cy) / camera.fy;
+    let degrees = x.hypot(y).atan().to_degrees();
+    ((degrees / INCIDENCE_BIN_DEG) as usize).min(INCIDENCE_BINS - 1)
+}
+
+/// `  <lo>-<hi>deg n=<count> chi2=<mean>` per non-empty FP5 bin.
+fn incidence_chi2_line(bins: &[(usize, f64)]) -> String {
+    bins.iter()
+        .enumerate()
+        .filter(|(_, (count, _))| *count > 0)
+        .map(|(b, (count, sum))| {
+            let lo = b as f64 * INCIDENCE_BIN_DEG;
+            format!(
+                "  {lo:.0}-{:.0}deg n={count} chi2={:.3}",
+                lo + INCIDENCE_BIN_DEG,
+                sum / *count as f64
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod incidence_tests {
+    use super::{PinholeCamera, incidence_bin, incidence_chi2_line};
+
+    #[test]
+    fn raw_fisheye_chi2_bins_by_incidence() {
+        let camera = PinholeCamera {
+            fx: 240.0,
+            fy: 240.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let at = |degrees: f64| [(320.0 + 240.0 * degrees.to_radians().tan()) as f32, 240.0];
+        assert_eq!(incidence_bin(&camera, [320.0, 240.0]), 0);
+        assert_eq!(incidence_bin(&camera, at(45.5)), 4);
+        assert_eq!(incidence_bin(&camera, at(79.0)), 7);
+        assert_eq!(incidence_bin(&camera, at(89.0)), 8);
+        let mut bins = [(0, 0.0); super::INCIDENCE_BINS];
+        bins[0] = (2, 3.0);
+        bins[7] = (1, 0.25);
+        assert_eq!(
+            incidence_chi2_line(&bins),
+            "  0-10deg n=2 chi2=1.500  70-80deg n=1 chi2=0.250"
+        );
+    }
 }
 
 #[cfg(test)]

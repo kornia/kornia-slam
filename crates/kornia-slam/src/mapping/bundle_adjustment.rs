@@ -14,7 +14,7 @@ use crate::mapping::online_calibration::{OnlineCalibrationInput, OnlineCalibrati
 use crate::mapping::vi_ba_schur::{
     ImuHuber, RigObservationCamera, ViBaKeyframe, ViBaParams, ViBaResult,
 };
-use crate::mapping::visual_information::VisualInformation;
+use crate::mapping::visual_information::{FisheyeWeight, VisualInformation};
 use crate::pose_conversion::{angle_deg, rigid};
 use crate::system::OnlineCalibrationConfig;
 use crate::upstream::kornia_3d::pose_ext::camera_centre;
@@ -54,6 +54,8 @@ pub struct LocalBaParams {
     /// Reprojection weighting by keypoint octave. Only VI-BA honours it:
     /// kornia-3d's visual-only solver has no per-observation weight.
     pub visual_information: VisualInformation,
+    /// Pixel-sigma scaling of raw fisheye views, VI-BA only as above.
+    pub fisheye_weight: FisheyeWeight,
     /// Bounds a VI-BA result must stay inside to be written back.
     pub state_envelope: StateEnvelope,
     pub lost_keyframes: LostKeyframes,
@@ -124,6 +126,7 @@ impl Default for LocalBaParams {
             imu_huber: ImuHuber::AllEdges,
             depth_sigma: DepthSigma::Relative(STEREO_DEPTH_REL_SIGMA),
             visual_information: VisualInformation::Unit,
+            fisheye_weight: FisheyeWeight::Uniform,
             state_envelope: StateEnvelope::Off,
             lost_keyframes: LostKeyframes::Free,
             visual_kernel: VisualKernel::L2,
@@ -698,6 +701,7 @@ fn run_local_inertial_ba_inner(
         true,
         params.depth_sigma,
         params.visual_information,
+        params.fisheye_weight,
     );
     let rig_views = rig_observation_cameras(snapshot.keyframes());
 
@@ -1308,13 +1312,20 @@ impl WindowPoints {
         camera: &PinholeCamera,
         depth_sigma: DepthSigma,
     ) -> Vec<BaObservation> {
-        self.observations_with_views(poses, camera, false, depth_sigma, VisualInformation::Unit)
-            .observations
+        self.observations_with_views(
+            poses,
+            camera,
+            false,
+            depth_sigma,
+            VisualInformation::Unit,
+            FisheyeWeight::Uniform,
+        )
+        .observations
     }
 
     /// Like [`Self::observations`], with every rig camera's observations
     /// when `all_cameras` is set, each one's rig camera index and, unless
-    /// `information` is unit, its pixel sigma.
+    /// `information` is unit and `fisheye_weight` uniform, its pixel sigma.
     fn observations_with_views<'a>(
         &self,
         poses: impl IntoIterator<Item = (usize, &'a Keyframe, bool)>,
@@ -1322,6 +1333,7 @@ impl WindowPoints {
         all_cameras: bool,
         depth_sigma: DepthSigma,
         information: VisualInformation,
+        fisheye_weight: FisheyeWeight,
     ) -> WindowObservations {
         let mut observations = Vec::new();
         let mut views = Vec::new();
@@ -1338,8 +1350,9 @@ impl WindowPoints {
                 if let Some(pixel) = kf.frame.undistorted_xy(desc_idx, camera) {
                     let octave = kf.frame.features.octaves.get(desc_idx).copied();
                     let pixel_sigma = information.sigma_px(octave.unwrap_or(0));
-                    if !information.is_unit() {
-                        sigma_px.push(pixel_sigma);
+                    if !information.is_unit() || fisheye_weight == FisheyeWeight::Magnification {
+                        let view = kf.frame.raw_view(desc_idx);
+                        sigma_px.push(pixel_sigma * fisheye_weight.sigma_scale(view, pixel));
                     }
                     let observation = BaObservation {
                         pose_idx,

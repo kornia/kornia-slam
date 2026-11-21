@@ -15,7 +15,7 @@ use crate::mapping::global_vi_ba::{
 use crate::mapping::map::StateEnvelope;
 use crate::mapping::marginalization::BoundaryPrior;
 use crate::mapping::vi_ba_schur::ImuHuber;
-use crate::mapping::visual_information::VisualInformation;
+use crate::mapping::visual_information::{FisheyeWeight, VisualInformation};
 use crate::mapping::{GrowthNeighbours, LocalMappingMode};
 use crate::tracking::local_map::LocalMapRules;
 use crate::tracking::optical_flow::LkKernel;
@@ -165,6 +165,9 @@ pub struct OrbFrontendConfig {
     pub flow_bookkeeping: FlowBookkeeping,
     pub keyframe_orb: KeyframeOrb,
     pub stereo_pyramid: StereoPyramid,
+    /// Weights and search radius of raw fisheye rig views; `Uniform` on a
+    /// rig without raw images whatever is set.
+    pub fisheye_weight: FisheyeWeight,
 }
 
 /// Most flow threads a frontend runs, the tracking thread included.
@@ -381,6 +384,7 @@ impl Default for OrbFrontendConfig {
             flow_bookkeeping: FlowBookkeeping::default(),
             keyframe_orb: KeyframeOrb::default(),
             stereo_pyramid: StereoPyramid::default(),
+            fisheye_weight: FisheyeWeight::default(),
         }
     }
 }
@@ -917,6 +921,9 @@ fn write_flow_knobs(f: &mut fmt::Formatter<'_>, frontend: &OrbFrontendConfig) ->
     }
     if frontend.stereo_pyramid != default.stereo_pyramid {
         writeln!(f, "  stereo pyramid: {:?}", frontend.stereo_pyramid)?;
+    }
+    if frontend.fisheye_weight != default.fisheye_weight {
+        writeln!(f, "  fisheye weight: {:?}", frontend.fisheye_weight)?;
     }
     Ok(())
 }

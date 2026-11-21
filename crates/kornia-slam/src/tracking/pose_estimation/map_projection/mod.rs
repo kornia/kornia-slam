@@ -36,7 +36,7 @@ use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
 use crate::frame::{Frame, is_finite_xy, undistort_keypoint};
 use crate::mapping::map::{Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
-use crate::mapping::visual_information::VisualInformation;
+use crate::mapping::visual_information::{FisheyeWeight, VisualInformation};
 use crate::rig::project_in_view;
 use crate::tracking::local_map::{LocalMapRules, LocalMapSelectionConfig, select_local_map_points};
 use crate::tracking::timings::{TrackingTimings, timed};
@@ -123,6 +123,8 @@ pub struct MapProjectionConfig {
     pub geometric_filter_threshold_px: f64,
     /// Which tracked matches the estimate hands on to the keyframe.
     pub keyframe_observations: KeyframeObservations,
+    /// Search-radius scaling of raw fisheye views.
+    pub fisheye_weight: FisheyeWeight,
 }
 
 /// Which matches of an accepted pose become keyframe observations (and
@@ -160,6 +162,7 @@ impl Default for MapProjectionConfig {
             min_inliers_with_prediction: 15,
             geometric_filter_threshold_px: 1.0,
             keyframe_observations: KeyframeObservations::AllMatches,
+            fisheye_weight: FisheyeWeight::Uniform,
         }
     }
 }
@@ -943,9 +946,12 @@ impl MapProjectionEstimator {
                 };
 
                 let view_keypoints = &keypoints_xy[view.offset..view.offset + view.len];
-                let nearby = view
-                    .grid
-                    .query_radius(u, v, config.search_radius, view_keypoints);
+                let radius = config.search_radius
+                    * self
+                        .config
+                        .fisheye_weight
+                        .radius_scale(view.raw.as_ref(), p_cam.x.hypot(p_cam.y).atan2(p_cam.z));
+                let nearby = view.grid.query_radius(u, v, radius, view_keypoints);
                 for kp_idx in nearby.into_iter().map(|i| i + view.offset) {
                     if matched_kp[kp_idx] {
                         continue;

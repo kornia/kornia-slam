@@ -13,6 +13,7 @@ use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabulary};
 use crate::loop_closure::{LoopCloser, LoopClosingConfig, LoopSolver};
 use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
+use crate::mapping::visual_information::FisheyeWeight;
 use crate::mapping::{GrowthNeighbours, LocalMappingMode};
 use crate::tracking::flow_pool::FlowPoolError;
 use crate::tracking::optical_flow::LkKernel;
@@ -163,6 +164,8 @@ impl LocalBaConfig {
             imu_huber: self.imu_huber,
             depth_sigma,
             visual_information: self.visual_information,
+            // Resolved against the rig in `SystemConfig::settings`.
+            fisheye_weight: FisheyeWeight::Uniform,
             state_envelope: self.state_envelope,
             lost_keyframes: self.lost_keyframes,
             visual_kernel: self.visual_kernel,
@@ -187,6 +190,7 @@ impl SystemConfig {
             two_view_init: tuning.initialization.clone(),
             map_projection: MapProjectionConfig {
                 keyframe_observations: orb.mapping.keyframe_observations,
+                fisheye_weight: self.fisheye_weight(rig),
                 ..tuning
                     .map_projection
                     .with_visual_information(orb.mapping.local_ba.visual_information)
@@ -198,10 +202,13 @@ impl SystemConfig {
             recovery: orb.tracking_loss.reseed,
             pose_gate: orb.tracking_loss.pose_gate,
             local_mapping: orb.mapping.execution,
-            local_ba: orb
-                .mapping
-                .local_ba
-                .params(stereo_baseline_m(rig).map(|baseline| rig.camera.fx * baseline)),
+            local_ba: LocalBaParams {
+                fisheye_weight: self.fisheye_weight(rig),
+                ..orb
+                    .mapping
+                    .local_ba
+                    .params(stereo_baseline_m(rig).map(|baseline| rig.camera.fx * baseline))
+            },
             stereo_close_depth_m: stereo_baseline_m(rig)
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
             // A primary-only flow frame drops the other cameras, whose
@@ -222,6 +229,12 @@ impl SystemConfig {
             growth_neighbours: orb.mapping.growth_neighbours,
             growth_min_baseline_ratio: orb.mapping.growth_min_baseline_ratio,
         }
+    }
+
+    /// `frontend.fisheye_weight` resolved against `rig`.
+    pub(crate) fn fisheye_weight(&self, rig: &SensorRig) -> FisheyeWeight {
+        let FrontendConfig::Orb(frontend) = self.orb().frontend;
+        frontend.fisheye_weight.for_rig(rig)
     }
 
     /// Keypoints for every image but the primary.

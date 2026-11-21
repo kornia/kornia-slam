@@ -9,7 +9,7 @@ use crate::mapping::LocalMappingMode;
 use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
 use crate::mapping::map::{StateEnvelope, StateEnvelopeLimits};
 use crate::mapping::marginalization::{BoundaryPrior, FrozenPoseSigma};
-use crate::mapping::visual_information::VisualInformation;
+use crate::mapping::visual_information::{FisheyeWeight, VisualInformation};
 use crate::system::ConfigError;
 #[cfg(feature = "serde")]
 use crate::system::LoadError;
@@ -183,6 +183,21 @@ fn display_names_the_growth_baseline_ratio_only_when_set() {
         config
             .to_string()
             .contains("  growth: pairs under baseline/depth 0.0175 skipped\n")
+    );
+}
+
+#[test]
+fn display_names_the_fisheye_weight_only_when_set() {
+    let mut config = SystemConfig::default();
+    assert!(!config.to_string().contains("fisheye weight"));
+    orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
+        fisheye_weight: FisheyeWeight::Magnification,
+        ..OrbFrontendConfig::default()
+    });
+    assert!(
+        config
+            .to_string()
+            .contains("  fisheye weight: Magnification\n")
     );
 }
 
@@ -741,6 +756,31 @@ fn raw_fisheye_rig_cameras_need_the_rig_selection() {
 }
 
 #[test]
+fn raw_fisheye_weight_reaches_local_ba_and_projection_on_raw_rigs_only() {
+    let mut config = SystemConfig::default();
+    orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
+        fisheye_weight: FisheyeWeight::Magnification,
+        ..OrbFrontendConfig::default()
+    });
+    let rig_selection = sensors(CameraSelection::Rig, false);
+    let raw = config.settings(&rig_selection.select_rig(raw_fisheye_rig()).unwrap());
+    assert_eq!(raw.local_ba.fisheye_weight, FisheyeWeight::Magnification);
+    assert_eq!(
+        raw.map_projection.fisheye_weight,
+        FisheyeWeight::Magnification
+    );
+    let pinhole = config.settings(&rig());
+    assert_eq!(pinhole.local_ba.fisheye_weight, FisheyeWeight::Uniform);
+    assert_eq!(
+        pinhole.map_projection.fisheye_weight,
+        FisheyeWeight::Uniform
+    );
+    let default =
+        SystemConfig::default().settings(&rig_selection.select_rig(raw_fisheye_rig()).unwrap());
+    assert_eq!(default.local_ba.fisheye_weight, FisheyeWeight::Uniform);
+}
+
+#[test]
 fn raw_fisheye_rig_rejects_klt_first() {
     let selected = sensors(CameraSelection::Rig, false)
         .select_rig(raw_fisheye_rig())
@@ -839,6 +879,7 @@ fn the_flow_knobs_default_to_todays_frontend() {
     assert_eq!(frontend.flow_bookkeeping, FlowBookkeeping::EveryFrame);
     assert_eq!(frontend.keyframe_orb, KeyframeOrb::Tracking);
     assert_eq!(frontend.stereo_pyramid, StereoPyramid::Resized);
+    assert_eq!(frontend.fisheye_weight, FisheyeWeight::Uniform);
     for threads in [2, 3] {
         let preset = orin_preset(threads, 48);
         assert_eq!(preset.validate(), Ok(()), "{threads} threads");
@@ -1450,6 +1491,21 @@ mod ron_files {
 
         let default = parse("(version: 1)").unwrap();
         assert_eq!(orb(&default).mapping.growth_min_baseline_ratio, 0.0);
+    }
+
+    #[test]
+    fn the_fisheye_weight_parses_and_round_trips() {
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((frontend: Orb((fisheye_weight: Magnification)))))",
+        )
+        .unwrap();
+        let FrontendConfig::Orb(frontend) = orb(&config).frontend;
+        assert_eq!(frontend.fisheye_weight, FisheyeWeight::Magnification);
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+
+        let default = parse("(version: 1)").unwrap();
+        let FrontendConfig::Orb(frontend) = orb(&default).frontend;
+        assert_eq!(frontend.fisheye_weight, FisheyeWeight::Uniform);
     }
 
     #[test]

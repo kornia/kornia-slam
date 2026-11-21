@@ -13,8 +13,7 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 **New settings for a 1 ms frontend frame and for online calibration, all off by
 default.** Every default is today's behaviour, so existing run files load and
 run unchanged. Built, not validated: no benchmark has run on them. Not built:
-`frontend.keyframe_orb: Mapping` stops with `todo!`; the raw Aria fisheye input
-and its knobs are deferred to their own round.
+`frontend.keyframe_orb: Mapping` stops with `todo!`.
 - `frontend.flow_threads` (`1`): threads the flow step runs on, the tracking
   thread included; 1, the rig's camera count or one more, at most 4.
 - `frontend.flow_first_core` (`None`): pins the flow workers from this core on;
@@ -46,6 +45,15 @@ and its knobs are deferred to their own round.
   overlap match and insert on the mapping thread; needs `klt_first`.
 - `frontend.stereo_pyramid` (`Resized`): `Shared` matches stereo and rig overlap
   on the ORB detector's own pyramid; changes output.
+- `frontend.fisheye_weight` (`Uniform`): `Magnification` scales the local VI-BA
+  pixel sigma, the rig-overlap gates and the projection search radius of raw
+  fisheye rig views by the raw-to-pinhole magnification; `Uniform` on a rig
+  without raw images.
+- LaMAria `images` (`Pinhole`): `RawFisheye(calib, root)` reads the raw 640x480
+  Aria fisheye images of a `.vrs` ASL extraction with their
+  `aria_calibrations/<seq>.json` (Fisheye624, new `kornia_sensors::Fisheye624Camera`
+  and `RigCamera::raw_model`), keypoints mapped into a virtual pinhole up to 80°.
+  Needs the `Rig` cameras, and is refused with `frontend.klt_first` enabled.
 - `mapping.local_ba.online_calibration` (all `None`): the local VI-BA estimates
   the clock offset, a rotation and a focal scale per camera, and the gyro
   intrinsics online; camera 0's rotation is the IMU-camera extrinsic inside the

@@ -15,6 +15,7 @@ use kornia_imgproc::resize::resize_fast_mono;
 use kornia_sensors::SensorRig;
 
 use crate::frame::{Frame, RigFeatures};
+use crate::mapping::visual_information::FisheyeWeight;
 use crate::rig::RigGeometry;
 use crate::stereo::{StereoMatchConfig, StereoMatches, compute_stereo_matches};
 use crate::system::StereoPyramid;
@@ -50,6 +51,8 @@ pub(crate) struct OrbFrontend {
     rig: Option<Arc<RigGeometry>>,
     /// The pyramid stereo matching reads.
     stereo_pyramid: StereoPyramid,
+    /// Gate scaling of the rig overlap on raw fisheye views.
+    fisheye_weight: FisheyeWeight,
     observation: FrontendObservation,
 }
 
@@ -77,6 +80,7 @@ impl OrbFrontend {
             fisheye,
             rig: RigGeometry::from_rig(rig).map(Arc::new),
             stereo_pyramid: StereoPyramid::Resized,
+            fisheye_weight: FisheyeWeight::Uniform,
             observation: FrontendObservation::default(),
         }
     }
@@ -90,6 +94,11 @@ impl OrbFrontend {
     /// Matches stereo on `pyramid`; rig overlap matching reads no pyramid.
     pub(crate) fn with_stereo_pyramid(mut self, pyramid: StereoPyramid) -> Self {
         self.stereo_pyramid = pyramid;
+        self
+    }
+
+    pub(crate) fn with_fisheye_weight(mut self, fisheye_weight: FisheyeWeight) -> Self {
+        self.fisheye_weight = fisheye_weight;
         self
     }
 
@@ -289,8 +298,13 @@ impl OrbFrontend {
             &frame.keypoints_undist
         };
         let overlap_start = Instant::now();
-        let matches =
-            overlap::match_overlap(&frame.features, pixels, &frame.rig.camera_ranges, &rig);
+        let matches = overlap::match_overlap(
+            &frame.features,
+            pixels,
+            &frame.rig.camera_ranges,
+            &rig,
+            self.fisheye_weight,
+        );
         self.observation.overlap = overlap_start.elapsed();
         self.observation.stereo_matched = Some(matches.num_matched());
         frame.rig.left_to_right = matches.left_to_right;

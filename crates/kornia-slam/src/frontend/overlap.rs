@@ -12,7 +12,8 @@ use kornia_algebra::{Vec2F64, Vec3F64};
 use kornia_imgproc::features::{OrbFeatures, hamming_distance};
 
 use crate::frame::is_finite_xy;
-use crate::rig::RigGeometry;
+use crate::mapping::visual_information::FisheyeWeight;
+use crate::rig::{RigGeometry, RigView};
 
 /// Search band around the epipolar line at octave 0, in pixels (ORB-SLAM3:
 /// chi² 3.84 at one-pixel sigma, so about two pixels).
@@ -52,11 +53,14 @@ impl OverlapMatches {
 /// those of the concatenated `features`. The overlap boxes test raw
 /// `keypoints_xy`; the epipolar search and triangulation read `pixels`, the
 /// pinhole coordinates parallel to them (non-finite entries are skipped).
+/// The epipolar band and reprojection gate widen by `fisheye_weight`'s
+/// sigma scale on raw fisheye views, as the BA sigma does.
 pub fn match_overlap(
     features: &OrbFeatures,
     pixels: &[[f32; 2]],
     ranges: &[Range<usize>],
     rig: &RigGeometry,
+    fisheye_weight: FisheyeWeight,
 ) -> OverlapMatches {
     let n_primary = ranges.first().map_or(0, |r| r.len());
     let mut out = OverlapMatches {
@@ -76,9 +80,10 @@ pub fn match_overlap(
         return out;
     };
     let kps = &features.keypoints_xy;
-    let right_candidates: Vec<usize> = right
+    let right_candidates: Vec<(usize, f64)> = right
         .clone()
         .filter(|&j| box1.contains(kps[j]) && is_finite_xy(&pixels[j]))
+        .map(|j| (j, gate_scale(fisheye_weight, view1, pixels[j])))
         .collect();
     if right_candidates.is_empty() {
         return out;
@@ -114,14 +119,14 @@ pub fn match_overlap(
         let octave_i = features.octaves[i] as i32;
         let mut best = (u32::MAX, usize::MAX);
         let mut second = u32::MAX;
-        for &j in &right_candidates {
+        for &(j, band_scale) in &right_candidates {
             let octave_j = features.octaves[j] as i32;
             if (octave_i - octave_j).abs() > 1 {
                 continue;
             }
             let distance_px =
                 (line.x * pixels[j][0] as f64 + line.y * pixels[j][1] as f64 + line.z).abs() / norm;
-            if distance_px > EPIPOLAR_BAND_PX * ORB_SCALE_FACTOR.powi(octave_j) {
+            if distance_px > EPIPOLAR_BAND_PX * ORB_SCALE_FACTOR.powi(octave_j) * band_scale {
                 continue;
             }
             let dist = hamming_distance(&features.descriptors[i], &features.descriptors[j]);
@@ -148,13 +153,13 @@ pub fn match_overlap(
             continue;
         }
         let Some(point) = triangulate(
-            pixels[i],
-            pixels[j],
+            [pixels[i], pixels[j]],
             &projection0,
             &projection1,
             &right_from_left,
             [features.octaves[i], features.octaves[j]],
             rig,
+            fisheye_weight,
         ) else {
             continue;
         };
@@ -163,6 +168,11 @@ pub fn match_overlap(
         out.points[slot] = Some(point);
     }
     out
+}
+
+/// [`FisheyeWeight::sigma_scale`] of an undistorted `pixel` of `view`.
+fn gate_scale(fisheye_weight: FisheyeWeight, view: &RigView, pixel: [f32; 2]) -> f64 {
+    f64::from(fisheye_weight.sigma_scale(Some(view), pixel))
 }
 
 fn projection_matrix(k: &kornia_algebra::Mat3F64, pose: &kornia_3d::pose::Pose3d) -> [f64; 12] {
@@ -188,14 +198,15 @@ fn projection_matrix(k: &kornia_algebra::Mat3F64, pose: &kornia_3d::pose::Pose3d
 /// DLT point in the primary camera frame, kept only when in front of both
 /// cameras, with enough parallax and a small reprojection error in both.
 fn triangulate(
-    left: [f32; 2],
-    right: [f32; 2],
+    observed: [[f32; 2]; 2],
     projection0: &[f64; 12],
     projection1: &[f64; 12],
     right_from_left: &kornia_3d::pose::Pose3d,
     octaves: [u8; 2],
     rig: &RigGeometry,
+    fisheye_weight: FisheyeWeight,
 ) -> Option<Vec3F64> {
+    let [left, right] = observed;
     let pixels = [
         Vec2F64::new(left[0] as f64, left[1] as f64),
         Vec2F64::new(right[0] as f64, right[1] as f64),
@@ -212,11 +223,14 @@ fn triangulate(
         return None;
     }
     let views = rig.views();
-    for ((p_cam, pixel), (view, octave)) in [(p0, pixels[0]), (p1, pixels[1])]
+    for (((p_cam, pixel), raw_pixel), (view, octave)) in [(p0, pixels[0]), (p1, pixels[1])]
         .into_iter()
+        .zip(observed)
         .zip(views.iter().zip(octaves))
     {
-        let max_px = MAX_REPROJECTION_PX * ORB_SCALE_FACTOR.powi(octave as i32);
+        let max_px = MAX_REPROJECTION_PX
+            * ORB_SCALE_FACTOR.powi(octave as i32)
+            * gate_scale(fisheye_weight, view, raw_pixel);
         let error_sq = view
             .camera
             .reprojection_error_sq_cam(&p_cam, pixel.x, pixel.y)?;
@@ -316,7 +330,13 @@ mod tests {
             descriptors,
             octaves: vec![0; 2 * n],
         };
-        let matches = match_overlap(&features, &features.keypoints_xy, &[0..n, n..2 * n], &rig);
+        let matches = match_overlap(
+            &features,
+            &features.keypoints_xy,
+            &[0..n, n..2 * n],
+            &rig,
+            FisheyeWeight::Uniform,
+        );
         assert_eq!(matches.num_matched(), n);
         for (i, p) in scene.iter().enumerate() {
             assert_eq!(matches.left_to_right[i], Some(n + i));
@@ -367,7 +387,7 @@ mod tests {
         };
         let ranges = [0..n, n..2 * n];
         let recovered = |pixels: &[[f32; 2]]| {
-            let matches = match_overlap(&features, pixels, &ranges, &rig);
+            let matches = match_overlap(&features, pixels, &ranges, &rig, FisheyeWeight::Uniform);
             scene
                 .iter()
                 .zip(&matches.points)
@@ -376,6 +396,66 @@ mod tests {
         };
         assert_eq!(recovered(&virtual_xy), n);
         assert_eq!(recovered(&features.keypoints_xy), 0);
+    }
+
+    /// Owner answer 3 (2026-11-21): a match 3 virtual px off its epipolar
+    /// line at about 48° in both raw views is outside the 2 px band, and
+    /// inside it once `Magnification` widens the band by the ~1.7 sigma scale.
+    #[test]
+    fn raw_fisheye_magnification_widens_the_overlap_gates() {
+        let rig = crate::rig::tests::raw_two_camera_rig(40.0);
+        let (view0, view1) = (rig.view(0).unwrap(), rig.view(1).unwrap());
+        let right_from_left = rig.b_from_a(0, 1).unwrap();
+        let (azimuth, elevation) = (20f64.to_radians(), 45f64.to_radians());
+        let direction = Vec3F64::new(
+            azimuth.sin() * elevation.cos(),
+            elevation.sin(),
+            azimuth.cos() * elevation.cos(),
+        );
+        let p = direction * 3.0;
+        let left_raw = view0.project_raw(p).unwrap();
+        let right_raw = view1
+            .project_raw(right_from_left.transform_point(&p))
+            .unwrap();
+        let left = view0.raw_to_virtual(left_raw).unwrap();
+        let right = view1.raw_to_virtual(right_raw).unwrap();
+        // The epipolar line of `left` in camera 1, from two depths on its ray.
+        let on_ray = |depth: f64| {
+            let q = view1
+                .camera
+                .project_to_pixel(&right_from_left.transform_point(&(direction * depth)), 0.0)
+                .unwrap();
+            [q.x, q.y]
+        };
+        let (a, b) = (on_ray(1.5), on_ray(6.0));
+        let along = [b[0] - a[0], b[1] - a[1]];
+        let length = along[0].hypot(along[1]);
+        let normal = [-along[1] / length, along[0] / length];
+        let off = [
+            (right[0] as f64 + 3.0 * normal[0]) as f32,
+            (right[1] as f64 + 3.0 * normal[1]) as f32,
+        ];
+        let scale = FisheyeWeight::Magnification.sigma_scale(Some(view1), off);
+        assert!((1.6..2.0).contains(&scale), "{scale}");
+        let features = OrbFeatures {
+            keypoints_xy: vec![left_raw, right_raw],
+            orientations: vec![0.0; 2],
+            descriptors: vec![descriptor(1); 2],
+            octaves: vec![0; 2],
+        };
+        let matched = |weight| {
+            match_overlap(&features, &[left, off], &[0..1, 1..2], &rig, weight).num_matched()
+        };
+        assert_eq!(matched(FisheyeWeight::Uniform), 0);
+        assert_eq!(matched(FisheyeWeight::Magnification), 1);
+        let exact = match_overlap(
+            &features,
+            &[left, right],
+            &[0..1, 1..2],
+            &rig,
+            FisheyeWeight::Uniform,
+        );
+        assert_eq!(exact.num_matched(), 1);
     }
 
     #[test]
@@ -393,7 +473,13 @@ mod tests {
             descriptors: vec![[0u8; 32], [0xFFu8; 32]],
             octaves: vec![0; 2],
         };
-        let matches = match_overlap(&features, &features.keypoints_xy, &[0..1, 1..2], &rig);
+        let matches = match_overlap(
+            &features,
+            &features.keypoints_xy,
+            &[0..1, 1..2],
+            &rig,
+            FisheyeWeight::Uniform,
+        );
         assert_eq!(matches.num_matched(), 0);
     }
 }
