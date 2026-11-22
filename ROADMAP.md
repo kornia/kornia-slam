@@ -222,7 +222,7 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 We are working toward top results on the [LaMAria](https://github.com/cvg/lamaria) egocentric benchmark ([#78](https://github.com/kornia/kornia-slam/issues/78)), using the Aria rig and IMU and no GPS. The work is sequenced by where the benchmark score is lost: each change states its theory and predictions first, ships behind a config knob that defaults to the old behaviour, and is compared window by window against ORB-SLAM3 in the same harness.
 
 General purpose, not tuned per deployment (owner, 2026-11-21). A new rig or dataset should need its sensor model only: calibration, IMU noise and frame rate. Knobs are how a change lands and is measured; after each validation round a cleanup card makes the winners the code default and deletes the refuted or redundant knobs.
-- [ ] **Cleanup after the first validation run.**
+- [ ] **Cleanup after the first validation run** (owner, 2026-11-22: next after card AA's verdict, then card F).
   - **Make the fixes the only path:** `dense_parallelism: Sequential`, `merge: PropagateToNewer` (with the stop at a re-seed), `frame_velocity: PropagatedFromKeyframe` (card U), and the coasted-pose output.
   - **Make the reference constants the code defaults:** 10 active keyframes, 7 iterations from λ 1e-4 (Basalt), `growth_min_baseline_ratio` tan 1° (ORB-SLAM3).
   - **Delete the refuted or redundant knobs:** `keyframe_seed` (card R), the full-weight boundary edge (card O), `SnapshotOnly`.
