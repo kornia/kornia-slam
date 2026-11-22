@@ -426,17 +426,12 @@ impl Problem<'_> {
 
     /// Observation `o`'s camera and world-to-camera pose at `current`.
     fn view(&self, o: usize, current: &FrameNavState) -> Option<(&PinholeCamera, Pose3d)> {
-        match usize::from(self.observations[o].view).checked_sub(1) {
-            None => Some((self.primary, current.pose_cw)),
-            // A right perturbation of T_pw is the same one of T_c'w = T_c'p T_pw.
-            Some(k) => {
-                let view = self.cameras.get(k)?;
-                Some((
-                    &view.camera,
-                    view.camera_from_primary.compose(&current.pose_cw),
-                ))
-            }
-        }
+        observation_view(
+            &self.observations[o],
+            self.primary,
+            self.cameras,
+            &current.pose_cw,
+        )
     }
 
     /// Observation `o`'s pixel residual and its Jacobian with respect to the
@@ -484,6 +479,49 @@ impl Problem<'_> {
         let symmetric = (marginal + marginal.transpose()) * 0.5;
         symmetric.cholesky().map(|_| symmetric)
     }
+}
+
+/// `observation`'s camera and world-to-camera pose for the primary pose
+/// `pose_cw`; `None` for a rig view the cameras do not hold.
+fn observation_view<'a>(
+    observation: &PoseInertialObservation,
+    primary: &'a PinholeCamera,
+    cameras: &'a [RigObservationCamera],
+    pose_cw: &Pose3d,
+) -> Option<(&'a PinholeCamera, Pose3d)> {
+    match usize::from(observation.view).checked_sub(1) {
+        None => Some((primary, *pose_cw)),
+        // A right perturbation of T_pw is the same one of T_c'w = T_c'p T_pw.
+        Some(k) => {
+            let view = cameras.get(k)?;
+            Some((&view.camera, view.camera_from_primary.compose(pose_cw)))
+        }
+    }
+}
+
+/// `observation`'s pixel residual and its Jacobian with respect to the right
+/// perturbation `T_cw · Exp(υ, ω)` of the primary pose `pose_cw`; `None`
+/// behind the camera.
+pub(crate) fn reprojection_row(
+    observation: &PoseInertialObservation,
+    primary: &PinholeCamera,
+    cameras: &[RigObservationCamera],
+    pose_cw: &Pose3d,
+) -> Option<ReprojectionRow> {
+    let (camera, pose) = observation_view(observation, primary, cameras, pose_cw)?;
+    let (residual, jacobian) = residual_and_pose_jacobian(
+        &pose,
+        &observation.point_w,
+        [observation.pixel.x, observation.pixel.y],
+        camera,
+        MIN_DEPTH_M,
+    )?;
+    Some(ReprojectionRow { residual, jacobian })
+}
+
+pub(crate) struct ReprojectionRow {
+    pub(crate) residual: SVecF64<2>,
+    pub(crate) jacobian: SMatF64<2, 6>,
 }
 
 #[cfg(test)]

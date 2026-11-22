@@ -369,16 +369,17 @@ fn validate_lost_keyframes(
     }
 }
 
-/// The gate checks against an inertial prediction (G12).
+/// The gate checks against an inertial prediction (G12); the innovation
+/// gate against its propagated covariance (card AC-2b).
 fn validate_pose_gate(gate: &PoseGate, imu: bool) -> Result<(), ConfigError> {
-    let PoseGate::Enabled(limits) = gate else {
-        return Ok(());
-    };
-    if !imu {
+    if *gate != PoseGate::Disabled && !imu {
         return Err(ConfigError::InertialKnobWithoutImu(
             "tracking_loss.pose_gate",
         ));
     }
+    let PoseGate::Enabled(limits) = gate else {
+        return Ok(());
+    };
     let at = |field| format!("tracking_loss.pose_gate.{field}");
     check(
         at("max_rotation_gap_deg"),

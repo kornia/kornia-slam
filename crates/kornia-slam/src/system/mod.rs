@@ -11,6 +11,7 @@ mod estimator;
 pub(crate) mod fan_out;
 #[cfg(feature = "serde")]
 mod file;
+mod innovation;
 mod input;
 mod recovery;
 mod state;
@@ -1141,6 +1142,16 @@ impl SlamSystem {
                 );
             }
             if let Some(correction) = inertial_idx.and_then(correction_of) {
+                if self.debug {
+                    self.dbg(format!(
+                        "[ba_vel] kf={} dv={:.4} dp={:.4}",
+                        correction.kf_idx,
+                        (correction.velocity_world - correction.velocity_before).length(),
+                        (recovery::camera_centre(&correction.pose_after)
+                            - recovery::camera_centre(&correction.pose_before))
+                        .length(),
+                    ));
+                }
                 self.state.velocity_world = correction.velocity_world;
                 self.inertial.bias = correction.imu_bias;
             }
@@ -2131,7 +2142,11 @@ impl SlamSystem {
                 .then_some(estimate)
                 .ok_or(MapProjectionRejectReason::LowPnpInliers),
             Err(reason) => Err(reason),
-        };
+        }
+        .and_then(|estimate| {
+            self.judge_pose_innovation(&frame, &estimate, gate.as_ref(), timestamp_sec)
+                .map(|()| estimate)
+        });
         // S0-C11: an accepted flow pose thrown away for a due keyframe.
         self.counters.flow_due_orb_rejected += u64::from(flow_due && result.is_err());
         let (mut status, matches, tracked_inliers, reject_reason) = match result {
@@ -2435,16 +2450,16 @@ impl SlamSystem {
         dt_sec: f64,
         lost_for_sec: f64,
     ) -> Option<GateReference> {
-        (velocity.is_some() && (self.debug || self.tracker.pose_gate().is_enabled())).then(|| {
-            GateReference {
-                prediction,
-                dt_sec,
-                lost: self
-                    .state
-                    .pose_before_loss
-                    .filter(|_| self.state.lost_since_sec.is_some())
-                    .map(|before_loss| (before_loss, lost_for_sec + dt_sec)),
-            }
+        let gate = self.tracker.pose_gate();
+        let reads_prediction = gate.is_enabled() || gate.innovation().is_some();
+        (velocity.is_some() && (self.debug || reads_prediction)).then(|| GateReference {
+            prediction,
+            dt_sec,
+            lost: self
+                .state
+                .pose_before_loss
+                .filter(|_| self.state.lost_since_sec.is_some())
+                .map(|before_loss| (before_loss, lost_for_sec + dt_sec)),
         })
     }
 
@@ -2709,7 +2724,7 @@ impl SlamSystem {
             newest_marginal: matches!(
                 self.tracking_config.imu_trust,
                 ImuTrustMode::Covariance { .. }
-            ),
+            ) || self.tracker.pose_gate().innovation().is_some(),
             ..self.local_ba
         }
     }

@@ -23,6 +23,7 @@ use crate::tracking::pose_estimation::Estimate;
 use crate::tracking::pose_estimation::pose_inertial::{
     Anchor, FrameNavState, NavPrior, PoseInertialObservation, solve_pose_inertial,
 };
+use crate::tracking::pose_gate::ConsistencyScale;
 use crate::tracking::{KeyframeEvidence, KeyframeRules};
 use crate::upstream::kornia_3d::pose_ext::camera_centre;
 
@@ -53,6 +54,8 @@ pub(super) struct EstimatorState {
     pub(super) newest_marginal: Option<(usize, Mat15F64)>,
     /// The covariance trust of the frame at the timestamp it was taken for.
     pub(super) trust: Option<(f64, ImuTrust)>,
+    /// The NIS consistency of accepted frames (card AC-2b).
+    pub(super) innovation_scale: ConsistencyScale,
     pub(super) trusted_before: bool,
     /// The last frame the pose-inertial solve tracked: its index, the map's
     /// world epoch then, and its prior for the next frame.
@@ -265,7 +268,7 @@ impl SlamSystem {
 
     /// The newest marginal propagated along the keyframe IMU chain to the last
     /// keyframe, then through this frame's window to `predicted_pose`.
-    fn predicted_covariance(
+    pub(super) fn predicted_covariance(
         &self,
         timestamp_sec: f64,
         predicted_pose: &Pose3d,
@@ -537,7 +540,7 @@ impl SlamSystem {
     /// The tracked matches as reprojection rows: undistorted pixels weighted
     /// by their octave, `1/σ²` with `σ = 1.2^octave` (ORB-SLAM3's
     /// `invSigma2`).
-    fn pose_inertial_observations(
+    pub(super) fn pose_inertial_observations(
         &self,
         frame: &Frame,
         matches: &[(usize, usize)],
@@ -642,13 +645,7 @@ fn orb_slam3_observations(map: &Map, mp: &MapPoint) -> usize {
 /// with the distance from the world origin (E2).
 fn pixel_sigma_px(covariance: &Mat15F64, centre: Vec3F64, fx: f64, depth: f64) -> Option<f64> {
     let largest = |block: SMatF64<3, 3>| block.symmetric_eigenvalues().max().max(0.0);
-    let mut a = SMatF64::<3, 6>::zeros();
-    a.fixed_view_mut::<3, 3>(0, 0)
-        .copy_from(&-SMatF64::<3, 3>::identity());
-    a.fixed_view_mut::<3, 3>(0, 3)
-        .copy_from(&SMatF64::<3, 3>::new(
-            0.0, -centre.z, centre.y, centre.z, 0.0, -centre.x, -centre.y, centre.x, 0.0,
-        ));
+    let a = centre_jacobian(centre);
     let pose: SMatF64<6, 6> = covariance.fixed_view::<6, 6>(0, 0).into_owned();
     let centre_covariance = a * pose * a.transpose();
     let rotation = covariance.fixed_view::<3, 3>(3, 3).into_owned();
@@ -656,9 +653,22 @@ fn pixel_sigma_px(covariance: &Mat15F64, centre: Vec3F64, fx: f64, depth: f64) -
     spread.is_finite().then_some(spread)
 }
 
+/// `A = [−I | [c]×]`: the centre `c`'s change `δc = A (ρ, ω)` under
+/// `T_cw·Exp(ρ, ω)`.
+pub(super) fn centre_jacobian(centre: Vec3F64) -> SMatF64<3, 6> {
+    let mut a = SMatF64::<3, 6>::zeros();
+    a.fixed_view_mut::<3, 3>(0, 0)
+        .copy_from(&-SMatF64::<3, 3>::identity());
+    a.fixed_view_mut::<3, 3>(0, 3)
+        .copy_from(&SMatF64::<3, 3>::new(
+            0.0, -centre.z, centre.y, centre.z, 0.0, -centre.x, -centre.y, centre.x, 0.0,
+        ));
+    a
+}
+
 /// The secondary cameras of `frame`'s rig, in rig order after the primary;
 /// empty outside a rig.
-fn rig_observation_cameras(frame: &Frame) -> Vec<RigObservationCamera> {
+pub(super) fn rig_observation_cameras(frame: &Frame) -> Vec<RigObservationCamera> {
     frame
         .rig
         .geometry

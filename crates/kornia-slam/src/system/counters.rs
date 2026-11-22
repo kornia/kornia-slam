@@ -214,6 +214,18 @@ pub struct RunCounters {
     /// Longest coast at a give-up, from the last tracked camera centre to the
     /// coasted one, in millimetres.
     pub coast_mm_at_give_up_max: u64,
+    /// Card AC-2b, `pose_gate: Innovation`: tracked frames with a trusted
+    /// prediction whose NIS was tested against the bound.
+    pub pose_innovation_judged: u64,
+    /// Of those, past the 99.9 % bound times the consistency scale.
+    pub pose_innovation_over: u64,
+    /// Poses refused under `Reject`; they coast.
+    pub pose_innovation_rejects: u64,
+    /// Frames not judged: no propagated covariance, a matrix not positive
+    /// definite, or fewer than 50 frames behind the scale.
+    pub pose_innovation_unavailable: u64,
+    /// Largest consistency scale `c`, in thousandths.
+    pub pose_innovation_scale_milli_max: u64,
 }
 
 /// Age, seconds, under which a segment's give-up counts as a young death:

@@ -2215,6 +2215,39 @@ mod ron_files {
         );
     }
 
+    #[test]
+    fn the_innovation_gate_parses_observe_by_default_and_round_trips() {
+        use crate::tracking::pose_gate::{InnovationGate, InnovationMode, PoseGate};
+        let config = parse(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (pose_gate: Innovation(())))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).tracking_loss.pose_gate,
+            PoseGate::Innovation(InnovationGate {
+                mode: InnovationMode::Observe
+            })
+        );
+        assert!(config_display_mentions_gate(&config));
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+
+        let config = parse(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (pose_gate: Innovation((mode: Reject))))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).tracking_loss.pose_gate,
+            PoseGate::Innovation(InnovationGate {
+                mode: InnovationMode::Reject
+            })
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+        assert!(parse(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (pose_gate: Innovation((confidence: 0.99))))))",
+        )
+        .is_err());
+    }
+
     fn config_display_mentions_gate(config: &SystemConfig) -> bool {
         config.to_string().contains("pose gate")
     }
@@ -2387,12 +2420,15 @@ fn knobs_that_read_the_imu_are_refused_without_it() {
         config.validate()
     };
     type SetKnob<'a> = &'a dyn Fn(&mut OrbSlamPipeline);
-    let knobs: [(&str, SetKnob); 4] = [
+    let knobs: [(&str, SetKnob); 5] = [
         ("mapping.local_ba.lost_keyframes", &|orb| {
             orb.mapping.local_ba.lost_keyframes = LostKeyframes::FixedInertial
         }),
         ("tracking_loss.pose_gate", &|orb| {
             orb.tracking_loss.pose_gate = PoseGate::Enabled(PoseGateLimits::default())
+        }),
+        ("tracking_loss.pose_gate", &|orb| {
+            orb.tracking_loss.pose_gate = PoseGate::Innovation(Default::default())
         }),
         ("tracking_loss.reseed.keep_inertial", &|orb| {
             orb.tracking_loss.reseed.keep_inertial = true

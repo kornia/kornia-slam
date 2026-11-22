@@ -636,6 +636,8 @@ pub struct KeyframeBaCorrection {
     pub pose_before: Pose3d,
     pub pose_after: Pose3d,
     pub velocity_world: Vec3F64,
+    /// The live keyframe's velocity before the write-back.
+    pub velocity_before: Vec3F64,
     pub imu_bias: ImuBias,
     /// Carried from the snapshot's newest keyframe, not solved
     /// ([`LocalBaMerge::PropagateToNewer`]).
@@ -755,6 +757,7 @@ impl Map {
             };
 
             let pose_before = live.frame.pose_world_to_cam;
+            let velocity_before = live.velocity_world;
             live.frame.pose_world_to_cam = optimized.pose_world_to_cam;
             live.velocity_world = optimized.velocity_world;
             live.imu_bias = optimized.imu_bias;
@@ -766,6 +769,7 @@ impl Map {
                 pose_before,
                 pose_after: optimized.pose_world_to_cam,
                 velocity_world: optimized.velocity_world,
+                velocity_before,
                 imu_bias: optimized.imu_bias,
                 propagated: false,
             });
@@ -909,6 +913,7 @@ impl Map {
                     newest.pose_after,
                 ),
                 velocity_world,
+                velocity_before: live.velocity_world,
                 imu_bias: newest.imu_bias,
                 propagated: true,
             };
@@ -2241,6 +2246,7 @@ mod carry_tests {
                 Vec3F64::new(0.1, 0.0, -0.05),
             ),
             velocity_world: Vec3F64::ZERO,
+            velocity_before: Vec3F64::ZERO,
             imu_bias: ImuBias::default(),
             propagated: false,
         };
