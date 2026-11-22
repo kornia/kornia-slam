@@ -27,7 +27,7 @@ use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
 use crate::tracking::pose_gate::PoseGate;
 use crate::tracking::relocalization::RelocalizationSolver;
-use crate::tracking::{KeyframePolicy, KeyframeRules, KeyframesWhileLost};
+use crate::tracking::{KeyframePolicy, KeyframeRules, KeyframesWhileLost, Stillness};
 
 /// A system configuration that cannot be built or does not fit its source.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -57,6 +57,10 @@ pub enum ConfigError {
          so set keyframes.max_interval_sec (ORB-SLAM3 forces one every 0.5 s)"
     )]
     UnboundedInertialKeyframes,
+    #[error("keyframes.stillness StationaryEdges links still keyframes by the IMU: enable the IMU")]
+    StationaryEdgesWithoutImu,
+    #[error("keyframes.stillness StationaryEdges is not built yet (card AB stage 2): use Gate")]
+    StationaryEdgesNotBuilt,
     #[error("loop closing vocabulary path is empty")]
     EmptyVocabularyPath,
     #[error("loop closing needs metric input: enable stereo cameras or the IMU")]
@@ -637,7 +641,15 @@ fn validate_keyframes(policy: &KeyframePolicy, imu: bool) -> Result<(), ConfigEr
     if imu && max == usize::MAX && policy.max_interval_sec.is_none() {
         return Err(ConfigError::UnboundedInertialKeyframes);
     }
-    Ok(())
+    validate_stillness(policy.stillness, imu)
+}
+
+fn validate_stillness(stillness: Stillness, imu: bool) -> Result<(), ConfigError> {
+    match (stillness, imu) {
+        (Stillness::StationaryEdges, false) => Err(ConfigError::StationaryEdgesWithoutImu),
+        (Stillness::StationaryEdges, true) => Err(ConfigError::StationaryEdgesNotBuilt),
+        _ => Ok(()),
+    }
 }
 
 fn validate_local_ba(config: &LocalBaConfig) -> Result<(), ConfigError> {

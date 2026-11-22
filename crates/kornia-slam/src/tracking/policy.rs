@@ -38,6 +38,8 @@ pub struct KeyframePolicy {
     pub rules: KeyframeRules,
     /// Whether a busy local mapping holds keyframes back.
     pub mapping_acceptance: MappingAcceptance,
+    /// What a still device does to the bound asks (card AB).
+    pub stillness: Stillness,
 }
 
 /// How local mapping's load enters the keyframe decision.
@@ -52,6 +54,36 @@ pub enum MappingAcceptance {
     /// weak-tracking rules insert, and `SlamSystem` refuses every keyframe
     /// while `local_ba.active_keyframes` of them wait for the mapping thread.
     OrbSlam3,
+}
+
+/// How keyframes are handled while the device is still: no voter says
+/// moving and the image, the wheels or a quiet IMU vouches for rest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Stillness {
+    /// No detector.
+    #[default]
+    Off,
+    /// The detector runs and counts; no decision changes.
+    Observe,
+    /// Bound asks (frame, time and lost-interval keyframes) are withheld
+    /// while still, up to a heartbeat; quality asks still insert.
+    Gate,
+    /// [`Self::Gate`] with still intervals linked by stationary factors
+    /// (stage 2, not built: refused by validation).
+    StationaryEdges,
+}
+
+impl Stillness {
+    /// Whether the detector runs.
+    pub fn observes(self) -> bool {
+        self != Self::Off
+    }
+
+    /// Whether still frames change keyframe decisions.
+    pub fn gates(self) -> bool {
+        matches!(self, Self::Gate | Self::StationaryEdges)
+    }
 }
 
 /// Which keyframe insertion rules apply.
@@ -77,6 +109,7 @@ impl Default for KeyframePolicy {
             max_interval_sec: None,
             rules: KeyframeRules::Kornia,
             mapping_acceptance: MappingAcceptance::Ignore,
+            stillness: Stillness::Off,
         }
     }
 }
@@ -145,6 +178,20 @@ impl KeyframeEvidence {
     }
 }
 
+/// Why the policy asks for a keyframe: a `bound` ask comes from elapsed
+/// frames or time alone, a `quality` ask from what the tracker measured.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyframeAsks {
+    pub bound: bool,
+    pub quality: bool,
+}
+
+impl KeyframeAsks {
+    pub fn any(self) -> bool {
+        self.bound || self.quality
+    }
+}
+
 /// Fewest tracked inliers for which a low reference ratio still earns a
 /// keyframe (ORB-SLAM3's `mnMatchesInliers > 15`): below it the keyframe
 /// would hold too little to be worth adding.
@@ -178,21 +225,35 @@ impl KeyframePolicy {
     /// `min_parallax_px` is set, when the measured parallax reaches it. The
     /// last two need an idle mapping under [`MappingAcceptance::OrbSlam3`].
     pub fn should_insert_with(&self, evidence: &KeyframeEvidence) -> bool {
+        self.asks(evidence).any()
+    }
+
+    /// [`Self::should_insert_with`] split into its bound and quality asks.
+    /// The first keyframe is a quality ask.
+    pub fn asks(&self, evidence: &KeyframeEvidence) -> KeyframeAsks {
         if let KeyframeRules::OrbSlam3 { max_frames } = self.rules {
-            return orb_slam3_needs_keyframe(max_frames, self.mapping_idle(evidence), evidence);
+            return orb_slam3_asks(max_frames, self.mapping_idle(evidence), evidence);
         }
         let Some(last_kf_idx) = evidence.last_keyframe_idx else {
-            return true;
+            return KeyframeAsks {
+                bound: false,
+                quality: true,
+            };
         };
-
         let frames_since_last_kf = evidence.curr_idx.saturating_sub(last_kf_idx);
         if frames_since_last_kf < self.min_frames_between {
-            return false;
+            return KeyframeAsks::default();
         }
-        if frames_since_last_kf >= self.max_frames_between {
-            return true;
+        KeyframeAsks {
+            bound: frames_since_last_kf >= self.max_frames_between,
+            quality: self.quality_due(evidence),
         }
+    }
 
+    /// Whether what the tracker measured earns a keyframe on its own, past
+    /// `min_frames_between`: an empty reference, the reference ratio, or
+    /// parallax.
+    fn quality_due(&self, evidence: &KeyframeEvidence) -> bool {
         if evidence.n_ref_map_points == 0 {
             return true;
         }
@@ -240,20 +301,29 @@ impl KeyframePolicy {
 /// with mapping taken as idle `c1a` adds nothing. The rules that read the
 /// map's keyframe count (`nKFs <= 2`, `< 2`) are left out: they act only on
 /// the first two keyframes.
-fn orb_slam3_needs_keyframe(
+///
+/// Bound asks: the 0.25 s rule before IMU initialization and `c3` (0.5 s);
+/// quality asks: `c2` (behind `c1a || mapping_idle`) and `c4`.
+fn orb_slam3_asks(
     max_frames: usize,
     mapping_idle: bool,
     evidence: &KeyframeEvidence,
-) -> bool {
+) -> KeyframeAsks {
     let Some(last_kf_idx) = evidence.last_keyframe_idx else {
-        return true;
+        return KeyframeAsks {
+            bound: false,
+            quality: true,
+        };
     };
     let secs_since_last_kf = evidence.secs_since_last_kf;
     if !evidence.imu_initialized {
-        return secs_since_last_kf.is_some_and(|secs| secs >= 0.25);
+        return KeyframeAsks {
+            bound: secs_since_last_kf.is_some_and(|secs| secs >= 0.25),
+            quality: false,
+        };
     }
     if evidence.frames_since_reloc.is_some_and(|n| n < max_frames) {
-        return false;
+        return KeyframeAsks::default();
     }
     let inliers = evidence.tracked_inliers;
     let need_close = evidence.tracked_close < 100 && evidence.untracked_close > 70;
@@ -268,7 +338,10 @@ fn orb_slam3_needs_keyframe(
     let c3 = secs_since_last_kf.is_some_and(|secs| secs >= 0.5);
     let c4 = evidence.mono_inertial
         && ((inliers < 75 && inliers > MIN_INLIERS_FOR_RATIO_INSERT) || evidence.recently_lost);
-    ((c1a || mapping_idle) && c2) || c3 || c4
+    KeyframeAsks {
+        bound: c3,
+        quality: ((c1a || mapping_idle) && c2) || c4,
+    }
 }
 
 /// Recently-lost grace period policy (mirrors ORB-SLAM3's RECENTLY_LOST vs
@@ -548,6 +621,7 @@ mod tests {
                 let expected = frames >= inserts_from;
                 let case = format!("frames={frames} inliers={inliers} n_ref={n_ref}");
                 assert_eq!(policy.should_insert_with(&e), expected, "{case}");
+                assert_eq!(policy.asks(&e).any(), expected, "{case}");
                 assert_eq!(
                     policy.should_insert(e.curr_idx, e.last_keyframe_idx, inliers, n_ref),
                     expected,
@@ -560,6 +634,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The frame bound and ORB-SLAM3's 0.25 s / `c3` rules are bound asks;
+    /// the ratio, an empty reference, `c2` and the first keyframe are quality.
+    #[test]
+    fn asks_split_into_bound_and_quality() {
+        let policy = KeyframePolicy::default();
+        let ask = |bound, quality| KeyframeAsks { bound, quality };
+        assert_eq!(policy.asks(&evidence(8, 80, 100)), ask(true, false));
+        assert_eq!(policy.asks(&evidence(8, 50, 100)), ask(true, true));
+        assert_eq!(policy.asks(&evidence(4, 50, 100)), ask(false, true));
+        assert_eq!(policy.asks(&evidence(4, 50, 0)), ask(false, true));
+        assert_eq!(policy.asks(&evidence(2, 50, 0)), ask(false, false));
+        let first = KeyframeEvidence {
+            last_keyframe_idx: None,
+            ..evidence(0, 0, 0)
+        };
+        assert_eq!(policy.asks(&first), ask(false, true));
+
+        let orb = KeyframePolicy {
+            rules: KeyframeRules::OrbSlam3 { max_frames: 20 },
+            ..KeyframePolicy::default()
+        };
+        let base = KeyframeEvidence {
+            imu_initialized: true,
+            secs_since_last_kf: Some(0.6),
+            ref_points_min_obs: 200,
+            ..evidence(1, 180, 200)
+        };
+        assert_eq!(orb.asks(&base), ask(true, false));
+        assert_eq!(
+            orb.asks(&KeyframeEvidence {
+                tracked_inliers: 140,
+                ..base
+            }),
+            ask(true, true)
+        );
+        assert_eq!(
+            orb.asks(&KeyframeEvidence {
+                imu_initialized: false,
+                secs_since_last_kf: Some(0.3),
+                ..base
+            }),
+            ask(true, false)
+        );
+        assert_eq!(orb.asks(&first), ask(false, true));
     }
 
     #[test]

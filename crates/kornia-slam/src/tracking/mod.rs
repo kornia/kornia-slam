@@ -24,8 +24,8 @@ pub use local_map::{
 };
 pub use parallax::{median_compensated_parallax_px, median_parallax_px};
 pub use policy::{
-    KeyframeEvidence, KeyframePolicy, KeyframeRules, KeyframesWhileLost, MappingAcceptance,
-    TrackingLossRecoveryPolicy,
+    KeyframeAsks, KeyframeEvidence, KeyframePolicy, KeyframeRules, KeyframesWhileLost,
+    MappingAcceptance, Stillness, TrackingLossRecoveryPolicy,
 };
 pub use pose_estimation::MapProjectionEstimator;
 pub use timings::TrackingTimings;
