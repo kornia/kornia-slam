@@ -1,4 +1,6 @@
-"""lossev.py RUN_DIR SEQ_DIR [SESSION]: what each tracking loss of one run cost (card AC, G39 G40 G46 G47).
+"""lossev.py RUN_DIR SEQ_DIR [SESSION] [--body C.txt]: what each tracking loss of one run cost (card AC, G39 G40
+G46 G47).
+lossev.py body REF_RUN_DIR SEQ_DIR > C.txt: fit the GT-to-trajectory body rotation C once per sequence.
 
 RUN_DIR holds stderr.txt and traj.txt (a run with --trajectory-include-coasted); SESSION (default
 RUN_DIR/session.cbor) gives the segment starts. SEQ_DIR is the LaMAria sequence directory (`asl/<seq>/aria/cam0`,
@@ -13,7 +15,9 @@ Prints:
   episodes:  frames per class, give-ups per class, young deaths and their share of give-ups.
   link:      per give-up, the gap (s), the gyro rotation over it, GT and SLAM rotation from the last tracked frame to
              the first tracked frame after it, the rotation error between them (GT taken into the trajectory's body
-             frame by the hand-eye rotation C fitted on tracked 1 s pairs; printed as "body"), and the position error of that
+             frame by the hand-eye rotation C of --body, fitted once per sequence on a long reference run's tracked
+             1 s pairs (`lossev.py body`, a sliding window over every tracked frame); without --body the run itself
+             is the reference, and too few pairs is an error, not an identity fallback), and the position error of that
              restart against GT after a local rotation fit on the 10 s before the loss (needs GT; medians per class).
   coast:     coasted frames of IMU-confident episodes (segment >= 3.5 s old), error against GT by age since the
              last tracked frame, the hold-still error (GT displacement), and the SLAM / GT coast speed.
@@ -80,7 +84,8 @@ class Gt:
 
     def rot(self, t):
         if not self.ok: return None
-        k = int(np.argmin(np.abs(self.t - t)))
+        k = int(np.clip(np.searchsorted(self.t, t), 1, len(self.t) - 1))
+        k = k - 1 if abs(self.t[k - 1] - t) < abs(self.t[k] - t) else k
         return q2R(self.q[k]) if abs(self.t[k] - t) <= 0.15 else None
 
 
@@ -112,24 +117,31 @@ class Run:
         for kf in self.kfs:
             starts.setdefault(segment_id(kf), kf["timestamp_sec"])
         self.seg_t = np.array(sorted(starts.values()))
-        self.C = self.body_alignment()
+        self.C = None
 
-    def body_alignment(self):
-        """Rotation C with GT relative rotations = C (SLAM relative rotations) C^T, fitted on the rotation vectors of
-        tracked 1 s pairs (hand-eye): the GT body frame is not the trajectory's on every sequence (2_11: tracked 1 s
-        pairs read 34-47 deg apart with equal magnitudes; R_01: 0.2 deg)."""
-        T = [f for f in sorted(self.cls) if self.cls[f] == "T" and self.ts[f] in self.traj]
+    def body_alignment(self, min_pairs=50):
+        """Rotation C with GT relative rotations = C (SLAM relative rotations) C^T (hand-eye), fitted on the rotation
+        vectors of every pair of tracked frames 20 apart (1 s) with a GT rotation over 10 deg. The GT body frame is a
+        fixed convention of the sequence, not the trajectory's on every sequence (2_11: tracked 1 s pairs agree with
+        the gyro in magnitude but read 34-47 deg apart; R_01: 0.2 deg), so fit it once on a long run."""
         X, Y = [], []
-        for a, b in zip(T[::20], T[20::20]):
+        for a in sorted(self.cls):
+            b = a + 20
+            if self.cls[a] != "T" or self.cls.get(b) != "T" or self.ts[a] not in self.traj or self.ts[b] not in self.traj:
+                continue
             ga, gb = self.gt.rot(self.tsec[a]), self.gt.rot(self.tsec[b])
-            if self.tsec[b] - self.tsec[a] > 1.2 or ga is None or gb is None: continue
+            if ga is None or gb is None: continue
             ws, wg = log(self.traj[self.ts[a]][1].T @ self.traj[self.ts[b]][1]), log(ga.T @ gb)
             if np.linalg.norm(wg) > np.radians(10): X.append(ws); Y.append(wg)
-        if len(X) < 5: return np.eye(3)
+        if len(X) < min_pairs:
+            raise SystemExit(f"lossev: {len(X)} tracked 1 s pairs with GT rotation over 10 deg, need {min_pairs} to fit "
+                             "the body rotation; pass --body from a longer run")
         X, Y = np.array(X), np.array(Y)
         U, _, Vt = np.linalg.svd(Y.T @ X); S = np.eye(3)
         if np.linalg.det(U @ Vt) < 0: S[2, 2] = -1
-        return U @ S @ Vt
+        C = U @ S @ Vt
+        res = np.degrees(np.linalg.norm(X @ C.T - Y, axis=1))
+        return C, len(X), float(np.median(res))
 
     def frame_at(self, t):
         return int(np.argmin(np.abs(self.tsec - t)))
@@ -227,7 +239,7 @@ def med(x):
 def report(r):
     c = "".join(r.cls[f] for f in sorted(r.cls))
     gu = r.give_ups()
-    print(f"body: GT-to-trajectory body rotation C {angle(r.C):.1f} deg (hand-eye on tracked 1 s pairs)")
+    print(f"body: GT-to-trajectory body rotation C {angle(r.C):.1f} deg")
     n = {k: sum(g["cls"] == k for g in gu) for k in ("startup", "young", "primary")}
     print(f"episodes: frames {len(c)} T {c.count('T')} C {c.count('C')} B {c.count('B')}; give_ups {len(gu)} {n}; "
           f"young deaths {n['young']} ({100 * n['young'] / max(len(gu), 1):.0f} %)")
@@ -260,7 +272,17 @@ def report(r):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
+    args = sys.argv[1:]
+    if len(args) == 3 and args[0] == "body":
+        C, n, res = Run(args[1], args[2], "/nonexistent").body_alignment()
+        print(f"# C ({angle(C):.1f} deg) from {n} tracked 1 s pairs, residual median {res:.2f} deg: {args[1]}")
+        np.savetxt(sys.stdout, C); sys.exit(0)
+    body = None
+    if "--body" in args:
+        i = args.index("--body"); body = np.loadtxt(args[i + 1]); del args[i:i + 2]
+    if len(args) < 2:
         print(__doc__, file=sys.stderr); sys.exit(2)
-    RUN = sys.argv[1]
-    report(Run(RUN, sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else f"{RUN}/session.cbor"))
+    RUN = args[0]
+    run = Run(RUN, args[1], args[2] if len(args) > 2 else f"{RUN}/session.cbor")
+    run.C = body if body is not None else run.body_alignment()[0]
+    report(run)
