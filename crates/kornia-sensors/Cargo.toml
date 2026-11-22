@@ -15,7 +15,6 @@ keywords = ["imu", "preintegration", "sensors", "robotics", "kornia"]
 kornia-3d.workspace = true
 kornia-algebra.workspace = true
 kornia-image.workspace = true
-glam = "0.33"
 serde = { version = "1", features = ["derive"], optional = true }
 thiserror = "1"
 

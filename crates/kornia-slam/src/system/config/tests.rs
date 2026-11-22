@@ -172,7 +172,7 @@ fn frontend_and_keyframe_settings_are_range_checked() {
     for px in [0.0, -1.0, f64::NAN, f64::INFINITY] {
         assert_eq!(
             parallax(Some(px)).as_deref(),
-            Some("keyframes.insertion.min_parallax_px"),
+            Some("keyframes.insertion.Parallax.min_parallax_px"),
             "parallax {px}"
         );
     }

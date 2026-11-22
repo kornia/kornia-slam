@@ -66,7 +66,7 @@ jobs:
         if: env.RUST_CHANGED == 'true'
       - name: cargo doc
         if: env.RUST_CHANGED == 'true'
-        run: cargo doc --locked --no-deps -p kornia-slam -p kornia-sensors
+        run: cargo doc --locked --no-deps -p kornia-slam -p kornia-sensors -p kornia-factors
 
   pins:
     name: Version pins
@@ -106,7 +106,7 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.version }}
       - name: cargo check on ${{ steps.msrv.outputs.version }}
         if: env.RUST_CHANGED == 'true'
-        run: cargo check -p kornia-sensors -p kornia-slam --all-targets --locked
+        run: cargo check -p kornia-sensors -p kornia-factors -p kornia-slam --all-targets --locked
 
   clippy:
     name: Clippy (${{ matrix.name }})

@@ -7,7 +7,7 @@
 //! The map does not need to know whether a position came from stereo depth or
 //! from pair triangulation — both paths build the same request.
 
-use crate::frame::Frame;
+use crate::frame::{Frame, undistorted_camera};
 use crate::mapping::map::{
     LandmarkSeed, LandmarkTarget, Map, MapInsertion, ORB_SCALE_FACTOR, ObservationKey,
     ObservationLink,
@@ -15,7 +15,7 @@ use crate::mapping::map::{
 use crate::stereo::unproject_stereo;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::{Pose3d, TriangulationConfig, triangulate_matched_points};
-use kornia_algebra::{Mat3F64, Vec2F64, Vec3F64};
+use kornia_algebra::{Mat3F64, SO3F64, Vec2F64, Vec3F64};
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use std::collections::HashSet;
 
@@ -110,12 +110,7 @@ pub fn pair_growth_request(
         // reject everything anyway.
         return None;
     }
-    let t = rel.translation;
-    let t_skew = Mat3F64::from_cols(
-        Vec3F64::new(0.0, t.z, -t.y),
-        Vec3F64::new(-t.z, 0.0, t.x),
-        Vec3F64::new(t.y, -t.x, 0.0),
-    );
+    let t_skew = SO3F64::hat(rel.translation);
     let k_inv = Mat3F64::from_cols(
         Vec3F64::new(1.0 / camera.fx, 0.0, 0.0),
         Vec3F64::new(0.0, 1.0 / camera.fy, 0.0),
@@ -222,7 +217,7 @@ pub fn pair_growth_request(
         &matched_curr,
         &prev_kf.frame.pose_world_to_cam,
         &curr_kf.frame.pose_world_to_cam,
-        camera,
+        &undistorted_camera(camera),
         triangulation_config,
     )
     .ok()?;
@@ -326,9 +321,6 @@ pub fn neighbor_fusion_links(
                 continue;
             }
             let p_cam = nb_kf.frame.pose_world_to_cam.transform_point(&mp.position);
-            if p_cam.z <= 0.0 {
-                continue;
-            }
             let Ok(pixel) = camera.project_to_image(&p_cam, 0.0, nb_kf.frame.image_size) else {
                 continue;
             };
@@ -411,6 +403,7 @@ pub fn accepted_pair_claims(candidates: &[(usize, usize)]) -> Vec<usize> {
 mod tests {
     use super::*;
     use crate::mapping::map::Keyframe;
+    use kornia_3d::camera::CameraModel;
     use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbFeatures;
 
@@ -553,6 +546,57 @@ mod tests {
             .is_none(),
             "every feature is claimed, so nothing is left to propose"
         );
+    }
+
+    /// Keypoints are raw pixels of a distorted camera; triangulation must
+    /// undistort them exactly once to recover the landmarks.
+    #[test]
+    fn pair_growth_triangulates_through_a_distorted_camera() {
+        let camera = PinholeCamera {
+            k1: -0.3,
+            k2: 0.1,
+            p1: 0.001,
+            p2: -0.0005,
+            ..camera()
+        };
+        let descriptors: Vec<[u8; 32]> = (0..20).map(|i| [i as u8; 32]).collect();
+        let mut previous = test_frame(10, descriptors.clone());
+        let mut current = test_frame(20, descriptors);
+        current.pose_world_to_cam.translation = Vec3F64::new(-1.0, 0.0, 0.0);
+        let points: Vec<Vec3F64> = (0..20)
+            .map(|i| Vec3F64::new((i % 5) as f64 * 0.8 - 1.6, (i / 5) as f64 * 0.5 - 0.75, 5.0))
+            .collect();
+        for frame in [&mut previous, &mut current] {
+            frame.features.keypoints_xy = points
+                .iter()
+                .map(|p| {
+                    let pixel = camera
+                        .project(&frame.pose_world_to_cam.transform_point(p))
+                        .unwrap();
+                    [pixel.x as f32, pixel.y as f32]
+                })
+                .collect();
+            frame.ensure_undistorted(&camera);
+        }
+
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(previous)).unwrap();
+        map.insert_keyframe(Keyframe::from_frame(current)).unwrap();
+
+        let request = pair_growth_request(
+            &map,
+            10,
+            20,
+            OrbMatchConfig::default(),
+            &TriangulationConfig::default(),
+            &camera,
+        )
+        .expect("a well-conditioned pair should propose landmarks");
+        assert_eq!(request.landmarks.len(), points.len());
+        for seed in &request.landmarks {
+            let expected = points[seed.reference.feature_idx];
+            assert!((seed.position - expected).length() < 1e-3);
+        }
     }
 
     /// Two landmarks projecting onto one neighbour keypoint: the closer

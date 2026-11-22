@@ -1,5 +1,7 @@
 use super::*;
-use crate::mapping::stationary::{StationaryFactor, StationaryGyro};
+use kornia_3d::ransac::{HuberKernel, RobustKernel};
+use kornia_algebra::{Mat3F64, SE3F64, SO3F64};
+use kornia_factors::inertial::stationary::{StationaryFactor, StationaryGyro};
 use kornia_sensors::imu::{ImuCalib, ImuMeasurement};
 
 fn camera() -> PinholeCamera {
@@ -43,12 +45,11 @@ impl Lcg {
 }
 
 fn se3_exp(xi: &[f64]) -> Pose3d {
-    let rho = Vec3F64::new(xi[0], xi[1], xi[2]);
-    let omega = Vec3F64::new(xi[3], xi[4], xi[5]);
-    Pose3d::new(
-        SO3F64::exp(omega).matrix(),
-        SO3F64::left_jacobian(omega) * rho,
-    )
+    let e = SE3F64::exp(
+        Vec3F64::new(xi[0], xi[1], xi[2]),
+        Vec3F64::new(xi[3], xi[4], xi[5]),
+    );
+    Pose3d::new(e.r.matrix(), e.t)
 }
 
 /// Applies a 15-DOF tangent step the way the solver does (pose
@@ -84,10 +85,10 @@ fn factor(gyro: bool, huber: Option<f64>) -> StationaryFactor {
     let mut f = StationaryFactor::new(0, 1, 30.0, calib());
     f.huber_chi2 = huber;
     if gyro {
-        f.gyro = Some(StationaryGyro {
-            mean: Vec3F64::new(0.003, -0.001, 0.0005),
-            covered_s: 25.0,
-        });
+        f.gyro = Some(StationaryGyro::new(
+            Vec3F64::new(0.003, -0.001, 0.0005),
+            25.0,
+        ));
     }
     f
 }
@@ -97,8 +98,8 @@ fn factor(gyro: bool, huber: Option<f64>) -> StationaryFactor {
 fn stacked(edge: &StationaryFactor, kfs: &[ViBaKeyframe]) -> (Vec<f64>, Vec<f64>) {
     let info = edge.information();
     let e = stationary_eval(edge, &info, &kfs[0], &kfs[1]);
-    let mut r: Vec<f64> = e.pose.to_vec();
-    let mut w: Vec<f64> = (0..6).map(|k| e.weight * info.pose[k][k]).collect();
+    let mut r: Vec<f64> = e.pose.iter().copied().collect();
+    let mut w: Vec<f64> = (0..6).map(|k| e.weight * info.pose[(k, k)]).collect();
     for v in [e.velocity_i, e.velocity_j] {
         r.extend([v.x, v.y, v.z]);
         w.extend([e.weight * info.velocity; 3]);
@@ -151,9 +152,12 @@ fn normal_equation_error(edge: &StationaryFactor, kfs: &[ViBaKeyframe]) -> f64 {
     let weight = stationary_eval(edge, &infos[0], &kfs[0], &kfs[1]).weight;
     let weighted =
         |range: std::ops::Range<usize>| -> f64 { range.map(|k| w[k] * r0[k] * r0[k]).sum() };
-    let expected_cost =
-        crate::mapping::robust::huber_weight_and_cost(weighted(0..12) / weight, edge.huber_chi2).1
-            + 0.5 * weighted(12..rows);
+    let nav_chi2 = weighted(0..12) / weight;
+    let nav_cost = match edge.huber_chi2 {
+        Some(k) if k > 0.0 => 0.5 * HuberKernel.rho(nav_chi2, k),
+        _ => 0.5 * nav_chi2,
+    };
+    let expected_cost = nav_cost + 0.5 * weighted(12..rows);
     let mut worst = (cost - expected_cost).abs() / (1e-6 * chi2.max(1e-12));
     let mut jac = vec![[0.0f64; 30]; rows];
     for col in 0..30 {
@@ -228,7 +232,7 @@ fn huber_weights_only_pose_and_velocity_rows() {
     assert_eq!(q.weight, 1.0);
     // The bias part of the cost is the same with and without Huber.
     let info = f.information();
-    let bias = |e: &crate::mapping::stationary::StationaryResidual| {
+    let bias = |e: &kornia_factors::inertial::stationary::StationaryResidual| {
         let g = e.gyro_mean.unwrap();
         0.5 * (info.gyro_bias * e.gyro_bias.dot(e.gyro_bias)
             + info.accel_bias * e.accel_bias.dot(e.accel_bias)
@@ -236,7 +240,8 @@ fn huber_weights_only_pose_and_velocity_rows() {
     };
     // The nav part is the Huber objective ½ρ of the quadratic one's chi².
     let chi2_nav = 2.0 * (q.cost - bias(&q));
-    let (w, huber_nav) = crate::mapping::robust::huber_weight_and_cost(chi2_nav, Some(1.0));
+    let w = HuberKernel.weight(chi2_nav, 1.0);
+    let huber_nav = 0.5 * HuberKernel.rho(chi2_nav, 1.0);
     assert_eq!(w, e.weight);
     assert!(((e.cost - bias(&e)) - huber_nav).abs() < 1e-9 * huber_nav);
     assert_eq!(bias(&e), bias(&q));
@@ -333,10 +338,7 @@ fn a_stationary_edge_pulls_a_parked_keyframe_onto_its_neighbour() {
     // alone has to bring it back.
     let obs = observations(&[(0, truth, true)], &points);
     let mut edge = factor(true, Some(StationaryFactor::DEFAULT_HUBER_CHI2));
-    edge.gyro = Some(StationaryGyro {
-        mean: parked_bias().gyro,
-        covered_s: 25.0,
-    });
+    edge.gyro = Some(StationaryGyro::new(parked_bias().gyro, 25.0));
     let out =
         visual_inertial_bundle_adjust(&kfs, &points, &obs, &[], &[], &[edge], &camera(), &params())
             .unwrap();
@@ -407,11 +409,7 @@ fn stationary_and_imu_edges_solve_together_around_fixed_keyframes() {
         StationaryFactor::new(0, 1, 30.0, calib()),
         StationaryFactor::new(1, 2, 30.0, calib()),
     ];
-    let imu = [ImuFactor {
-        from_idx: 3,
-        to_idx: 4,
-        preintegrated: pim,
-    }];
+    let imu = [ImuFactor::new(3, 4, pim)];
     let p = ViBaParams {
         gravity,
         ..params()
@@ -476,24 +474,24 @@ fn stationary_edge_errors_are_reported() {
     };
     let edge = StationaryFactor::new(0, 1, 10.0, calib());
     assert!(run(edge).is_ok());
+    let linking = |from_idx, to_idx| {
+        let mut e = edge;
+        (e.from_idx, e.to_idx) = (from_idx, to_idx);
+        e
+    };
+    let mut no_span = edge;
+    no_span.span_s = 0.0;
     assert!(matches!(
-        run(StationaryFactor { to_idx: 2, ..edge }),
+        run(linking(0, 2)),
         Err(ViBaError::StationaryFactorOutOfRange(0, 2))
     ));
     assert!(matches!(
-        run(StationaryFactor {
-            span_s: 0.0,
-            ..edge
-        }),
+        run(no_span),
         Err(ViBaError::InvalidStationaryFactor(0))
     ));
     // A self-loop is refused, not accumulated.
     assert!(matches!(
-        run(StationaryFactor {
-            to_idx: 1,
-            from_idx: 1,
-            ..edge
-        }),
+        run(linking(1, 1)),
         Err(ViBaError::InvalidStationaryFactor(0))
     ));
     // A stationary edge alone makes its free keyframe solvable.

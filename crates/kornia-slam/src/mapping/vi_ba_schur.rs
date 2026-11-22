@@ -67,19 +67,21 @@
 
 use faer::Mat;
 use faer::prelude::Solve;
-use kornia_algebra::{Mat3F64, SE3F32, SO3F64, Vec3F64};
+use kornia_algebra::{Mat6F64, Mat15F64, SE3F32, SMatF64, SVecF64, Vec3F64, Vec6F64, Vec15F64};
 use thiserror::Error;
 
-use crate::mapping::robust::huber_weight_and_cost;
-use crate::mapping::stationary::{
-    self, StationaryFactor, StationaryInfo, StationaryResidual, StationaryState,
-};
-use crate::mapping::wheel_odom::{self, Mat6, WheelOdomFactor};
 use crate::pose_conversion::{pose_to_se3, se3_to_pose, vec3_to_f32};
+use kornia_factors::inertial::NavState;
+use kornia_factors::inertial::preintegration::{self, ImuFactor};
+use kornia_factors::inertial::stationary::{
+    self, StationaryFactor, StationaryInfo, StationaryResidual,
+};
+use kornia_factors::wheel_odometry::{self, WheelOdomFactor};
 
 use kornia_3d::ba::{BaError, BaObservation};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
+use kornia_3d::ransac::{HuberKernel, RobustKernel};
 use kornia_sensors::imu::{ImuBias, PreintegratedImu};
 
 const MIN_Z: f32 = 1e-3;
@@ -149,17 +151,14 @@ pub struct ViBaKeyframe {
     pub fixed: bool,
 }
 
-/// An IMU factor connecting two consecutive keyframes.
-///
-/// `from_idx` and `to_idx` must be consecutive keyframe indices (to_idx =
-/// from_idx + 1 in a window), though non-consecutive indices work as long as
-/// `preintegrated` covers the interval.
-#[derive(Debug, Clone)]
-pub struct ImuFactor {
-    pub from_idx: usize,
-    pub to_idx: usize,
-    /// Preintegrated measurements between the two keyframes.
-    pub preintegrated: PreintegratedImu,
+impl ViBaKeyframe {
+    fn nav_state(&self) -> NavState<'_> {
+        NavState {
+            pose_cw: &self.pose,
+            velocity: self.velocity,
+            bias: self.bias,
+        }
+    }
 }
 
 /// Parameters for VI-BA.
@@ -362,8 +361,7 @@ fn reseed_walked_landmarks(
             let pose = &keyframes[observations[o].pose_idx].pose;
             let p_cam = pose.transform_point(&points[j]);
             (
-                pose.inverse()
-                    .transform_point(&(p_cam * (d as f64 / p_cam.z))),
+                pose.untransform_point(&(p_cam * (d as f64 / p_cam.z))),
                 p_cam.z,
             )
         };
@@ -503,10 +501,10 @@ fn enforce_cheirality(
 /// out along the ray by whatever round-off left there. Damping bounds the
 /// step, not the depth: λ falls to its floor on accepted steps, so a
 /// depth-free landmark still drifts along its ray across windows.
-fn damp_point_blocks(c_blocks: &mut [[f64; 9]], lambda: f64) {
+fn damp_point_blocks(c_blocks: &mut [SMatF64<3, 3>], lambda: f64) {
     for cb in c_blocks {
         for d in 0..3 {
-            cb[d * 4] += lambda * cb[d * 4].max(MIN_DAMPING_FLOOR);
+            cb[(d, d)] += lambda * cb[(d, d)].max(MIN_DAMPING_FLOOR);
         }
     }
 }
@@ -656,172 +654,6 @@ fn depth_residual_and_jacobian(
     (r_z, j_pose, j_point)
 }
 
-/// Converts a camera-frame world-to-cam pose to body-frame world-to-body rotation and
-/// world-frame body position, applying the camera-to-body extrinsic T_BC when provided.
-///
-/// Returns `(R_bw, twb)` where `R_bw` maps world vectors into the body frame and
-/// `twb` is the body origin in world coordinates.
-fn body_frame(cam_pose: &Pose3d, t_bc: Option<&Pose3d>) -> (Mat3F64, Vec3F64) {
-    let r_cw = &cam_pose.rotation;
-    let t_cw = &cam_pose.translation;
-    match t_bc {
-        None => {
-            let twb = -(Mat3F64(*r_cw.transpose()) * *t_cw);
-            (*r_cw, twb)
-        }
-        Some(t_bc) => {
-            let r_bc = &t_bc.rotation;
-            // T_bw = T_bc · T_cw:  R_bw = R_bc · R_cw
-            let r_bw = mat3_mul(r_bc, r_cw);
-            // t_bw = R_bc · t_cw + t_bc
-            let t_bw = *r_bc * *t_cw + t_bc.translation;
-            // twb = -R_bw^T · t_bw
-            let twb = -(Mat3F64(*r_bw.transpose()) * t_bw);
-            (r_bw, twb)
-        }
-    }
-}
-
-/// Computes the 15-DOF IMU residual and its Jacobians wrt the two keyframe states.
-///
-/// Returns:
-///   residual: [f64; 15]  — [r_R(3), r_v(3), r_p(3), r_bg(3), r_ba(3)]
-///   J_i: [f64; 15*15]   — Jacobian wrt state_i (row-major, 15 rows × 15 cols)
-///   J_j: [f64; 15*15]   — Jacobian wrt state_j
-///
-/// State layout (per keyframe): [ρ(6) | v(3) | bg(3) | ba(3)]
-///   ρ = [upsilon(3), omega(3)] — SE3 tangent, matching ReprojFactor convention
-fn imu_residual_and_jacobians(
-    kf_i: &ViBaKeyframe,
-    kf_j: &ViBaKeyframe,
-    pim: &PreintegratedImu,
-    gravity: &Vec3F64,
-    imu_t_bc: Option<&Pose3d>,
-) -> ([f64; 15], [f64; 225], [f64; 225]) {
-    let dt = pim.dt;
-
-    // kf.pose = T_cw (world→cam). IMU dynamics live in the body frame.
-    // If T_BC is provided (X_body = T_BC · X_cam):
-    //   T_bw = T_bc · T_cw  →  R_bw = R_bc · R_cw,  t_bw = R_bc · t_cw + t_bc
-    // Otherwise camera == body and R_bw = R_cw.
-    // World-frame body position: twb = -R_bw^T · t_bw.
-    // Key property: right-SE3 perturbation of T_cw = same right-SE3 perturbation
-    // of T_bw (since T_bc is fixed), so Jacobian column layout is unchanged.
-    let (r_bw_i, twb_i) = body_frame(&kf_i.pose, imu_t_bc);
-    let (r_bw_j, twb_j) = body_frame(&kf_j.pose, imu_t_bc);
-    let r_wb_j = Mat3F64(*r_bw_j.transpose()); // R_wb_j = R_bw_j^T (body→world rotation at j)
-
-    let v_i = &kf_i.velocity;
-    let v_j = &kf_j.velocity;
-
-    // Bias-corrected preintegrated measurements.
-    let dr_corrected = pim.delta_rotation_with_bias(&kf_i.bias);
-    let dv_corrected = pim.delta_velocity_with_bias(&kf_i.bias);
-    let dp_corrected = pim.delta_position_with_bias(&kf_i.bias);
-
-    // r_R = Log(ΔR^T · R_bw_i · R_bw_j^T)
-    let dr_t = Mat3F64(*dr_corrected.transpose());
-    let lhs_r = Mat3F64(dr_t.mul_mat3(&mat3_mul(&r_bw_i, &r_wb_j)));
-    let r_rot = SO3F64::from_matrix(&lhs_r).log();
-
-    // r_v = R_bw_i · (v_j - v_i - g·dt) - Δv
-    let dv_world = *v_j - *v_i - *gravity * dt;
-    let r_vel = r_bw_i * dv_world - dv_corrected;
-
-    // r_p = R_bw_i · (twb_j - twb_i - v_i·dt - ½g·dt²) - Δp
-    let dp_world = twb_j - twb_i - *v_i * dt - *gravity * (0.5 * dt * dt);
-    let r_pos = r_bw_i * dp_world - dp_corrected;
-
-    // Bias random-walk residuals.
-    let r_bg = kf_j.bias.gyro - kf_i.bias.gyro;
-    let r_ba = kf_j.bias.accel - kf_i.bias.accel;
-
-    let mut residual = [0.0f64; 15];
-    residual[0..3].copy_from_slice(&[r_rot.x, r_rot.y, r_rot.z]);
-    residual[3..6].copy_from_slice(&[r_vel.x, r_vel.y, r_vel.z]);
-    residual[6..9].copy_from_slice(&[r_pos.x, r_pos.y, r_pos.z]);
-    residual[9..12].copy_from_slice(&[r_bg.x, r_bg.y, r_bg.z]);
-    residual[12..15].copy_from_slice(&[r_ba.x, r_ba.y, r_ba.z]);
-
-    // Jacobians
-    // State layout: [upsilon(0-2) | ω(3-5) | v(6-8) | bg(9-11) | ba(12-14)]
-    // Right-SE3 perturbation: T_cw_new = T_cw · Exp([upsilon, ω])
-    //   R_cw_new ≈ R_cw · (I + [ω]×)
-    //   twb_new  ≈ twb - upsilon + [twb]× · ω
-    // Velocity / bias DOFs: additive.
-
-    let mut j_i = [0.0f64; 225];
-    let mut j_j = [0.0f64; 225];
-
-    let jr_inv = SO3F64::right_jacobian(r_rot).inverse();
-
-    // ── rotation residual ────────────────────────────────────────────────
-    // ∂r_R/∂ω_i = +J_r^{-1} · R_bw_j
-    let jr_inv_rbwj = mat3_mul(&jr_inv, &r_bw_j);
-    set_block_15x15(&mut j_i, 0, 3, &jr_inv_rbwj);
-
-    // ∂r_R/∂bg_i = -J_r^{-1} · eR^T · JRg  (eR = ΔR^T · R_bw_i · R_wb_j = lhs_r)
-    let er_t = Mat3F64(*lhs_r.transpose());
-    set_block_15x15(
-        &mut j_i,
-        0,
-        9,
-        &mat3_neg(mat3_mul(
-            &mat3_mul(&jr_inv, &er_t),
-            &pim.d_rotation_d_bias_gyro,
-        )),
-    );
-
-    // ∂r_R/∂ω_j = -J_r^{-1} · R_bw_j
-    set_block_15x15(&mut j_j, 0, 3, &mat3_neg(jr_inv_rbwj));
-
-    // ── velocity residual ────────────────────────────────────────────────
-    // ∂r_v/∂ω_i = -R_bw_i · [dv_world]×
-    set_block_15x15(
-        &mut j_i,
-        3,
-        3,
-        &mat3_neg(mat3_mul(&r_bw_i, &SO3F64::hat(dv_world))),
-    );
-
-    let neg_r_bw_i = mat3_neg(r_bw_i);
-    set_block_15x15(&mut j_i, 3, 6, &neg_r_bw_i); // ∂r_v/∂v_i = -R_bw_i
-    set_block_15x15(&mut j_i, 3, 9, &mat3_neg(pim.d_velocity_d_bias_gyro)); // ∂r_v/∂bg_i
-    set_block_15x15(&mut j_i, 3, 12, &mat3_neg(pim.d_velocity_d_bias_accel)); // ∂r_v/∂ba_i
-    set_block_15x15(&mut j_j, 3, 6, &r_bw_i); // ∂r_v/∂v_j = +R_bw_i
-
-    // ── position residual ────────────────────────────────────────────────
-    // Under upsilon_i: twb_i shifts by -upsilon → r_p gains R_bw_i · upsilon
-    set_block_15x15(&mut j_i, 6, 0, &r_bw_i); // ∂r_p/∂ρ_i = +R_bw_i
-
-    // Under ω_i: R_bw_i rotates and twb_i shifts. Combined: -R_bw_i · [twb_j - v_i·dt - ½g·dt²]×
-    let dp_omega_world = twb_j - *v_i * dt - *gravity * (0.5 * dt * dt);
-    set_block_15x15(
-        &mut j_i,
-        6,
-        3,
-        &mat3_neg(mat3_mul(&r_bw_i, &SO3F64::hat(dp_omega_world))),
-    );
-
-    set_block_15x15(&mut j_i, 6, 6, &mat3_scalar_f64(&r_bw_i, -dt)); // ∂r_p/∂v_i = -R_bw_i·dt
-    set_block_15x15(&mut j_i, 6, 9, &mat3_neg(pim.d_position_d_bias_gyro)); // ∂r_p/∂bg_i
-    set_block_15x15(&mut j_i, 6, 12, &mat3_neg(pim.d_position_d_bias_accel)); // ∂r_p/∂ba_i
-
-    // Under upsilon_j: twb_j shifts by -upsilon → r_p loses R_bw_i · upsilon
-    set_block_15x15(&mut j_j, 6, 0, &neg_r_bw_i); // ∂r_p/∂ρ_j = -R_bw_i
-
-    // Under ω_j: twb_j_new = twb_j + [twb_j]× · ω → r_p gains R_bw_i · [twb_j]× · ω
-    set_block_15x15(&mut j_j, 6, 3, &mat3_mul(&r_bw_i, &SO3F64::hat(twb_j))); // ∂r_p/∂ω_j
-
-    // ── bias random-walk residuals ───────────────────────────────────────
-    set_block_15x15(&mut j_i, 9, 9, &mat3_neg(Mat3F64::IDENTITY));
-    set_block_15x15(&mut j_j, 9, 9, &Mat3F64::IDENTITY);
-    set_block_15x15(&mut j_i, 12, 12, &mat3_neg(Mat3F64::IDENTITY));
-    set_block_15x15(&mut j_j, 12, 12, &Mat3F64::IDENTITY);
-
-    (residual, j_i, j_j)
-}
-
 /// Accumulate J_a^T · Ω · J_b into m_mat[row_base:, col_base:] (15×15 block).
 /// If `update_rhs`, also subtract J_a^T · Ω · r from m_vec[row_base:].
 #[allow(clippy::too_many_arguments)]
@@ -830,104 +662,38 @@ fn accum_jt_omega_j(
     m_vec: &mut [f64],
     row_base: usize,
     col_base: usize,
-    j_a: &[f64; 225],   // 15×15 row-major
-    j_b: &[f64; 225],   // 15×15 row-major
-    omega: &[f64; 225], // 15×15 row-major information matrix
-    res: &[f64; 15],
+    j_a: &Mat15F64,
+    j_b: &Mat15F64,
+    omega: &Mat15F64,
+    res: &Vec15F64,
     update_rhs: bool,
 ) {
-    // omega_jb[r,c] = Σ_k omega[r,k] · j_b[k,c]
-    let mut omega_jb = [0.0f64; 225];
-    for r in 0..15 {
-        for c in 0..15 {
-            let mut s = 0.0f64;
-            for k in 0..15 {
-                s += omega[idx15(r, k)] * j_b[idx15(k, c)];
-            }
-            omega_jb[idx15(r, c)] = s;
-        }
-    }
-
-    // H[row_base+i, col_base+j] += Σ_k j_a[k,i] · omega_jb[k,j]
-    for i in 0..15 {
-        for j in 0..15 {
-            let mut s = 0.0f64;
-            for k in 0..15 {
-                s += j_a[idx15(k, i)] * omega_jb[idx15(k, j)];
-            }
-            m_mat[(row_base + i, col_base + j)] += s;
-        }
-    }
-
-    // g[row_base+i] -= Σ_k j_a[k,i] · (Σ_m omega[k,m] · res[m])
+    let j_a_t = j_a.transpose();
+    add_block(m_mat, row_base, col_base, &(j_a_t * (omega * j_b)));
     if update_rhs {
-        let mut omega_r = [0.0f64; 15];
-        for k in 0..15 {
-            for m in 0..15 {
-                omega_r[k] += omega[idx15(k, m)] * res[m];
-            }
-        }
-        for i in 0..15 {
-            let mut s = 0.0f64;
-            for k in 0..15 {
-                s += j_a[idx15(k, i)] * omega_r[k];
-            }
-            m_vec[row_base + i] -= s;
-        }
+        sub_from(m_vec, row_base, &(j_a_t * (omega * res)));
     }
-}
-
-/// Row-major index of `(row, col)` in a 15×15 matrix stored as `[f64; 225]`
-/// (the IMU edge's information, Jacobians and products).
-#[inline]
-const fn idx15(row: usize, col: usize) -> usize {
-    row * 15 + col
-}
-
-/// Huber weight and cost of one IMU edge. The 9-dim nav block
-/// (rows/cols 0–8) is robustified on its Mahalanobis chi²; the bias random
-/// walk (9–14) stays quadratic. `omega_raw` is block-diagonal between the two
-/// (see [`imu_information_matrix`]) and symmetric. The caller scales only the
-/// nav block of omega by the returned weight.
-fn imu_weight_and_cost(res: &[f64; 15], omega_raw: &[f64; 225], chi2_threshold: f64) -> (f64, f64) {
-    let block_chi2 = |range: std::ops::Range<usize>| {
-        let mut chi2 = 0.0f64;
-        for i in range.clone() {
-            for j in range.clone() {
-                chi2 += res[i] * omega_raw[idx15(i, j)] * res[j];
-            }
-        }
-        chi2
-    };
-    let (hw, nav_cost) = huber_weight_and_cost(block_chi2(0..9), Some(chi2_threshold));
-    (hw, nav_cost + 0.5 * block_chi2(9..15))
 }
 
 /// Huber weight and cost `½ρ(chi2)` of a reprojection or depth residual.
 fn visual_huber(chi2: f64, chi2_threshold: f64) -> (f64, f64) {
-    huber_weight_and_cost(chi2, Some(chi2_threshold))
+    if chi2_threshold > 0.0 {
+        (
+            HuberKernel.weight(chi2, chi2_threshold),
+            0.5 * HuberKernel.rho(chi2, chi2_threshold),
+        )
+    } else {
+        (1.0, 0.5 * chi2)
+    }
 }
 
-/// IMU edge information matrix: the full inverse of the 9×9 navigation
-/// covariance (diagonal if it is singular) plus the diagonal bias random walk.
-fn imu_information_matrix(pim: &PreintegratedImu, weight: f64) -> [f64; 225] {
-    let mut omega = [0.0f64; 225];
-
-    // Full 9×9 nav block inverse (pim.covariance is column-major).
-    // Diagonal-only inversion is incorrect because preintegration correlates
-    // rotation, velocity, and position errors (gyro drives all three; accel
-    // drives velocity and position).
-    if let Some(nav_inv) = invert_9x9_f64(&pim.covariance) {
-        for r in 0..9 {
-            for c in 0..9 {
-                // `nav_inv` is column-major, like the covariance it inverts.
-                omega[idx15(r, c)] = weight * nav_inv[c * 9 + r];
-            }
-        }
-    } else {
-        // Degenerate covariance — fall back to diagonal with a log warning:
-        // the first one always (it is a fault in the IMU input, not chatter),
-        // the rest only under KORNIA_SLAM_DEBUG, as it can recur every solve.
+/// [`preintegration::information`], warning when the navigation covariance
+/// is singular: the first time always (it is a fault in the IMU input, not
+/// chatter), the rest only under KORNIA_SLAM_DEBUG, as it can recur every
+/// solve.
+fn imu_information_matrix(pim: &PreintegratedImu, weight: f64) -> Mat15F64 {
+    let info = preintegration::information(pim, weight);
+    if info.diagonal_fallback {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             eprintln!(
@@ -939,141 +705,96 @@ fn imu_information_matrix(pim: &PreintegratedImu, weight: f64) -> [f64; 225] {
                 "[vi_ba] WARNING: 9×9 IMU covariance singular, using diagonal fallback"
             );
         }
-        for i in 0..9 {
-            let var = pim.covariance[i * 10]; // diagonal: col-major index i*9+i
-            omega[idx15(i, i)] = weight * if var > 1e-20 { 1.0 / var } else { 1e6 };
-        }
     }
-
-    // Bias random-walk block (6×6): uncorrelated, diagonal is exact.
-    for i in 0..6 {
-        let var = pim.bias_covariance[i * 7]; // diagonal: col-major index i*6+i
-        omega[idx15(9 + i, 9 + i)] = weight * if var > 1e-20 { 1.0 / var } else { 1e6 };
-    }
-    omega
+    info.omega
 }
 
-/// Invert a column-major 9×9 matrix via Gauss-Jordan elimination with partial pivoting.
-fn invert_9x9_f64(cm: &[f64; 81]) -> Option<[f64; 81]> {
-    // Work in row-major internally.
-    let mut a = [0.0f64; 81];
-    let mut inv = [0.0f64; 81];
-    for r in 0..9 {
-        for c in 0..9 {
-            a[r * 9 + c] = cm[c * 9 + r]; // column-major → row-major
-        }
-        inv[r * 9 + r] = 1.0;
-    }
-    for col in 0..9 {
-        let mut max_val = a[col * 9 + col].abs();
-        let mut max_row = col;
-        for row in col + 1..9 {
-            let v = a[row * 9 + col].abs();
-            if v > max_val {
-                max_val = v;
-                max_row = row;
-            }
-        }
-        if max_val < 1e-20 {
-            return None;
-        }
-        if max_row != col {
-            for c in 0..9 {
-                a.swap(col * 9 + c, max_row * 9 + c);
-                inv.swap(col * 9 + c, max_row * 9 + c);
-            }
-        }
-        let pivot = a[col * 9 + col];
-        for c in 0..9 {
-            a[col * 9 + c] /= pivot;
-            inv[col * 9 + c] /= pivot;
-        }
-        for row in 0..9 {
-            if row == col {
-                continue;
-            }
-            let factor = a[row * 9 + col];
-            for c in 0..9 {
-                let da = a[col * 9 + c];
-                let di = inv[col * 9 + c];
-                a[row * 9 + c] -= factor * da;
-                inv[row * 9 + c] -= factor * di;
-            }
-        }
-    }
-    // Row-major result → column-major output.
-    let mut result = [0.0f64; 81];
-    for r in 0..9 {
-        for c in 0..9 {
-            result[c * 9 + r] = inv[r * 9 + c];
-        }
-    }
-    Some(result)
-}
-
-/// f64 version of invert_3x3 (the existing one uses f32).
-fn invert_3x3_f64(m: &[f64; 9]) -> Option<[f64; 9]> {
-    let det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6])
-        + m[2] * (m[3] * m[7] - m[4] * m[6]);
-    if det.abs() < 1e-20 {
+/// Inverse of a point block, refused as singular below `|det| < 1e-20`
+/// rather than only at an exact zero.
+fn invert_point_block(c: &SMatF64<3, 3>) -> Option<SMatF64<3, 3>> {
+    if c.determinant().abs() < 1e-20 {
         return None;
     }
-    let inv = 1.0 / det;
-    Some([
-        (m[4] * m[8] - m[5] * m[7]) * inv,
-        (m[2] * m[7] - m[1] * m[8]) * inv,
-        (m[1] * m[5] - m[2] * m[4]) * inv,
-        (m[5] * m[6] - m[3] * m[8]) * inv,
-        (m[0] * m[8] - m[2] * m[6]) * inv,
-        (m[2] * m[3] - m[0] * m[5]) * inv,
-        (m[3] * m[7] - m[4] * m[6]) * inv,
-        (m[1] * m[6] - m[0] * m[7]) * inv,
-        (m[0] * m[4] - m[1] * m[3]) * inv,
-    ])
+    c.try_inverse()
 }
 
-/// f64 version of matmul_6x3_3x3.
-fn matmul_6x3_3x3_f64(a: &[f64; 18], b: &[f64; 9]) -> [f64; 18] {
-    let mut out = [0.0f64; 18];
-    for i in 0..6 {
-        for k in 0..3 {
-            let mut s = 0.0f64;
-            for r in 0..3 {
-                s += a[i * 3 + r] * b[r * 3 + k];
-            }
-            out[i * 3 + k] = s;
-        }
-    }
-    out
-}
-
-#[inline]
-fn set_block_15x15(m: &mut [f64; 225], row: usize, col: usize, block: &Mat3F64) {
-    let cols = block.to_cols_array(); // column-major from glam
-    for c in 0..3 {
-        for r in 0..3 {
-            m[idx15(row + r, col + c)] = cols[c * 3 + r];
+/// Adds `block` into `m_mat` with its top-left entry at (`row0`, `col0`).
+fn add_block<const R: usize, const C: usize>(
+    m_mat: &mut Mat<f64>,
+    row0: usize,
+    col0: usize,
+    block: &SMatF64<R, C>,
+) {
+    for c in 0..C {
+        for r in 0..R {
+            m_mat[(row0 + r, col0 + c)] += block[(r, c)];
         }
     }
 }
 
-#[inline]
-fn mat3_mul(a: &Mat3F64, b: &Mat3F64) -> Mat3F64 {
-    Mat3F64(a.mul_mat3(b))
+/// Subtracts `v` from `m_vec[base..]`.
+fn sub_from<const N: usize>(m_vec: &mut [f64], base: usize, v: &SVecF64<N>) {
+    for (m, x) in m_vec[base..base + N].iter_mut().zip(v.iter()) {
+        *m -= x;
+    }
 }
 
-#[inline]
-fn mat3_neg(a: Mat3F64) -> Mat3F64 {
-    mat3_scalar_f64(&a, -1.0)
+/// Norms of the rotation, velocity, position, gyro-bias and accel-bias
+/// parts of an IMU residual.
+fn imu_residual_norms(res: &Vec15F64) -> [f64; 5] {
+    std::array::from_fn(|k| res.fixed_rows::<3>(3 * k).norm())
 }
 
-#[inline]
-fn mat3_scalar_f64(m: &Mat3F64, s: f64) -> Mat3F64 {
-    Mat3F64(m.mul_scalar(s))
+/// The visual (reprojection and depth) part of the Schur system: 6×6 pose
+/// blocks A and gradients per free keyframe, 3×3 point blocks C and gradients
+/// per free point, and the 6×3 couplings B grouped by free point.
+struct VisualBlocks {
+    a: Vec<Mat6F64>,
+    g_pose: Vec<Vec6F64>,
+    c: Vec<SMatF64<3, 3>>,
+    g_point: Vec<SVecF64<3>>,
+    b_by_point: Vec<Vec<(usize, SMatF64<6, 3>)>>,
+}
+
+impl VisualBlocks {
+    fn new(n_free_kf: usize, n_free_pts: usize) -> Self {
+        Self {
+            a: vec![Mat6F64::zeros(); n_free_kf],
+            g_pose: vec![Vec6F64::zeros(); n_free_kf],
+            c: vec![SMatF64::zeros(); n_free_pts],
+            g_point: vec![SVecF64::zeros(); n_free_pts],
+            b_by_point: vec![Vec::new(); n_free_pts],
+        }
+    }
+
+    /// Adds `M` whitened residual rows of one observation, for the free
+    /// keyframe slot `pose` and free point slot `point`.
+    fn add_rows<const M: usize>(
+        &mut self,
+        pose: Option<usize>,
+        point: Option<usize>,
+        j_pose: &SMatF64<M, 6>,
+        j_point: &SMatF64<M, 3>,
+        r: &SVecF64<M>,
+    ) {
+        let j_pose_t = j_pose.transpose();
+        let j_point_t = j_point.transpose();
+        if let Some(p) = pose {
+            self.a[p] += j_pose_t * j_pose;
+            self.g_pose[p] -= j_pose_t * r;
+        }
+        if let Some(x) = point {
+            self.c[x] += j_point_t * j_point;
+            self.g_point[x] -= j_point_t * r;
+        }
+        if let (Some(p), Some(x)) = (pose, point) {
+            self.b_by_point[x].push((p, j_pose_t * j_point));
+        }
+    }
 }
 
 /// Validates the wheel edges and returns each one's information matrix.
-fn wheel_information(edges: &[WheelOdomFactor], n_kf: usize) -> Result<Vec<Mat6>, ViBaError> {
+fn wheel_information(edges: &[WheelOdomFactor], n_kf: usize) -> Result<Vec<Mat6F64>, ViBaError> {
     edges
         .iter()
         .enumerate()
@@ -1088,7 +809,9 @@ fn wheel_information(edges: &[WheelOdomFactor], n_kf: usize) -> Result<Vec<Mat6>
             }
             // A NaN delta or extrinsic makes every cost NaN, so LM could
             // never accept a step; refuse it by name instead.
-            if !(edge.extrinsics_finite() && edge.measurement.delta.iter().all(|v| v.is_finite())) {
+            if !(edge.extrinsics_finite()
+                && edge.measurement.motion.delta.iter().all(|v| v.is_finite()))
+            {
                 return Err(ViBaError::NonFiniteWheelFactor(k));
             }
             if !edge.huber_valid() {
@@ -1110,7 +833,7 @@ fn accumulate_wheel_edges(
     kfs: &[ViBaKeyframe],
     kf_local: &[i64],
     edges: &[WheelOdomFactor],
-    infos: &[Mat6],
+    infos: &[Mat6F64],
 ) -> f64 {
     let mut cost = 0.0;
     for (edge, info) in edges.iter().zip(infos) {
@@ -1118,12 +841,12 @@ fn accumulate_wheel_edges(
         if li < 0 && lj < 0 {
             continue;
         }
-        let (r, j) = wheel_odom::residual_and_jacobian(
+        let (r, j) = wheel_odometry::residual_and_jacobian(
             &kfs[edge.from_idx].pose,
             &kfs[edge.to_idx].pose,
             edge,
         );
-        let (w, c) = wheel_odom::robust_weight_and_cost(&r, info, edge.huber_chi2);
+        let (w, c) = wheel_odometry::robust_weight_and_cost(&r, info, edge.huber_chi2);
         cost += c;
         accumulate_pose_pair(m_mat, m_vec, li, lj, &r, &j, info, w);
     }
@@ -1139,23 +862,16 @@ fn accumulate_pose_pair(
     m_vec: &mut [f64],
     li: i64,
     lj: i64,
-    r: &[f64; 6],
-    j: &Mat6,
-    info: &Mat6,
+    r: &Vec6F64,
+    j: &Mat6F64,
+    info: &Mat6F64,
     w: f64,
 ) {
     const KF_DOF: usize = 15;
     // JᵀΩ, with the robust weight folded in.
-    let mut jt_omega = [[0.0f64; 6]; 6];
-    for (a, row) in jt_omega.iter_mut().enumerate() {
-        for (b, x) in row.iter_mut().enumerate() {
-            *x = w * (0..6).map(|k| j[k][a] * info[k][b]).sum::<f64>();
-        }
-    }
-    let h: Mat6 = std::array::from_fn(|a| {
-        std::array::from_fn(|b| (0..6).map(|k| jt_omega[a][k] * j[k][b]).sum())
-    });
-    let g: [f64; 6] = std::array::from_fn(|a| (0..6).map(|k| jt_omega[a][k] * r[k]).sum());
+    let jt_omega = (j.transpose() * info) * w;
+    let h = jt_omega * j;
+    let g = jt_omega * r;
 
     let slots = [(li, 1.0), (lj, -1.0)];
     for &(l_row, s_row) in &slots {
@@ -1173,7 +889,7 @@ fn accumulate_pose_pair(
             let col0 = l_col as usize * KF_DOF;
             for a in 0..6 {
                 for b in 0..6 {
-                    m_mat[(row0 + a, col0 + b)] += s_row * s_col * h[a][b];
+                    m_mat[(row0 + a, col0 + b)] += s_row * s_col * h[(a, b)];
                 }
             }
         }
@@ -1185,19 +901,19 @@ fn wheel_cost(
     kfs: &[ViBaKeyframe],
     kf_local: &[i64],
     edges: &[WheelOdomFactor],
-    infos: &[Mat6],
+    infos: &[Mat6F64],
 ) -> f64 {
     edges
         .iter()
         .zip(infos)
         .filter(|(edge, _)| kf_local[edge.from_idx] >= 0 || kf_local[edge.to_idx] >= 0)
         .map(|(edge, info)| {
-            let (r, _) = wheel_odom::residual_and_jacobian(
+            let (r, _) = wheel_odometry::residual_and_jacobian(
                 &kfs[edge.from_idx].pose,
                 &kfs[edge.to_idx].pose,
                 edge,
             );
-            wheel_odom::robust_weight_and_cost(&r, info, edge.huber_chi2).1
+            wheel_odometry::robust_weight_and_cost(&r, info, edge.huber_chi2).1
         })
         .sum()
 }
@@ -1232,18 +948,11 @@ fn stationary_eval(
     i: &ViBaKeyframe,
     j: &ViBaKeyframe,
 ) -> StationaryResidual {
-    fn state(kf: &ViBaKeyframe) -> StationaryState<'_> {
-        StationaryState {
-            pose_cw: &kf.pose,
-            velocity: kf.velocity,
-            bias: kf.bias,
-        }
-    }
-    stationary::residual(edge, info, state(i), state(j))
+    stationary::residual(edge, info, i.nav_state(), j.nav_state())
 }
 
-/// Stationary edges ([`crate::mapping::stationary`]). The pose rows go
-/// through [`accumulate_pose_pair`]; the rest are linear with constant
+/// Stationary edges ([`kornia_factors::inertial::stationary`]). The pose rows
+/// go through [`accumulate_pose_pair`]; the rest are linear with constant
 /// Jacobians and are written directly (`m_vec −= JᵀΩr`, `m_mat += JᵀΩJ`):
 ///
 /// * `v_i`, `v_j` (`J = I`, weight `w`): `H_vv += wΩ_v`, `m_v −= wΩ_v v`.
@@ -1485,22 +1194,10 @@ pub fn visual_inertial_bundle_adjust(
         let is_first_iter = iters_done == 1;
 
         // ── 1. Schur blocks for visual residuals ─────────────────────────
-        // These are exactly the a_blocks / c_blocks / b_by_point / g_pose /
-        // g_point from bundle_adjust_schur_with_priors, but a_blocks are
-        // 6×6 (pose only) and we scatter them into the 15×15 keyframe slot
-        // when building m_mat.
-
-        // a_blocks[k]: 6×6 visual Hessian for free keyframe k (pose DOF only).
-        let mut a_blocks = vec![[0.0f64; 36]; n_free_kf];
-        // c_blocks[j]: 3×3 point Hessian block.
-        let mut c_blocks = vec![[0.0f64; 9]; n_free_pts];
-        // g_pose[k]: 6-vector RHS for free keyframe k (pose DOF).
-        let mut g_pose = vec![[0.0f64; 6]; n_free_kf];
-        // g_point[j]: 3-vector RHS for free point j.
-        let mut g_point = vec![[0.0f64; 3]; n_free_pts];
-        // B cross-terms grouped by free point index.
-        let mut b_by_point: Vec<Vec<(usize, [f64; 18])>> = vec![Vec::new(); n_free_pts];
-
+        // The blocks of bundle_adjust_schur_with_priors, but A is 6×6 (pose
+        // only) and is scattered into the 15×15 keyframe slot when building
+        // m_mat.
+        let mut vis = VisualBlocks::new(n_free_kf, n_free_pts);
         let mut cost_vis = 0.0f64;
 
         for ((obs, &depth_row), inlier) in observations
@@ -1518,62 +1215,18 @@ pub fn visual_inertial_bundle_adjust(
             // residual_and_jacobians is f32 internally; cast results to f64.
             let (r_f32, jp_f32, jx_f32) = residual_and_jacobians(pose, point, obs.pixel, camera);
 
-            let r_raw = [r_f32[0] as f64, r_f32[1] as f64];
-            let jp_raw: [f64; 12] = std::array::from_fn(|i| jp_f32[i] as f64);
-            let jx_raw: [f64; 6] = std::array::from_fn(|i| jx_f32[i] as f64);
-
-            let chi2_vis = r_raw[0] * r_raw[0] + r_raw[1] * r_raw[1];
+            let r_raw = SVecF64::<2>::from_fn(|i, _| f64::from(r_f32[i]));
+            let chi2_vis = r_raw.norm_squared();
             *inlier = chi2_vis <= params.huber_reproj_px_sq;
             let (hw_vis, c_vis) = visual_huber(chi2_vis, params.huber_reproj_px_sq);
             cost_vis += c_vis;
             let sqrt_hw_vis = hw_vis.sqrt();
-            let r = [r_raw[0] * sqrt_hw_vis, r_raw[1] * sqrt_hw_vis];
-            let jp: [f64; 12] = std::array::from_fn(|i| jp_raw[i] * sqrt_hw_vis);
-            let jx: [f64; 6] = std::array::from_fn(|i| jx_raw[i] * sqrt_hw_vis);
+            let jp = SMatF64::<2, 6>::from_fn(|i, k| f64::from(jp_f32[i * 6 + k]) * sqrt_hw_vis);
+            let jx = SMatF64::<2, 3>::from_fn(|i, k| f64::from(jx_f32[i * 3 + k]) * sqrt_hw_vis);
 
-            let pli = kf_local[obs.pose_idx];
-            let xli = point_local[obs.point_idx];
-
-            // Accumulate A block (6×6).
-            if pli >= 0 {
-                let p = pli as usize;
-                let ab = &mut a_blocks[p];
-                for i in 0..6 {
-                    for k in 0..6 {
-                        ab[i * 6 + k] += jp[i] * jp[k] + jp[6 + i] * jp[6 + k];
-                    }
-                }
-                let gp = &mut g_pose[p];
-                for i in 0..6 {
-                    gp[i] -= jp[i] * r[0] + jp[6 + i] * r[1];
-                }
-            }
-
-            // Accumulate C block (3×3).
-            if xli >= 0 {
-                let x = xli as usize;
-                let cb = &mut c_blocks[x];
-                for i in 0..3 {
-                    for k in 0..3 {
-                        cb[i * 3 + k] += jx[i] * jx[k] + jx[3 + i] * jx[3 + k];
-                    }
-                }
-                let gx = &mut g_point[x];
-                for i in 0..3 {
-                    gx[i] -= jx[i] * r[0] + jx[3 + i] * r[1];
-                }
-            }
-
-            // Accumulate B block (6×3) for Schur.
-            if pli >= 0 && xli >= 0 {
-                let mut b = [0.0f64; 18];
-                for i in 0..6 {
-                    for k in 0..3 {
-                        b[i * 3 + k] += jp[i] * jx[k] + jp[6 + i] * jx[3 + k];
-                    }
-                }
-                b_by_point[xli as usize].push((pli as usize, b));
-            }
+            let pli = usize::try_from(kf_local[obs.pose_idx]).ok();
+            let xli = usize::try_from(point_local[obs.point_idx]).ok();
+            vis.add_rows(pli, xli, &jp, &jx, &(r_raw * sqrt_hw_vis));
 
             // Depth residual (stereo metric anchor) — see
             // depth_residual_and_jacobian for why this matters here.
@@ -1585,45 +1238,10 @@ pub fn visual_inertial_bundle_adjust(
                 let (hw_depth, c_depth) = visual_huber(chi2_depth, params.huber_depth_sigma_sq);
                 cost_vis += c_depth;
                 let sqrt_hw_depth = hw_depth.sqrt();
-                let r_z = r_z_raw * sqrt_hw_depth;
-                let jpd: [f64; 6] = std::array::from_fn(|i| jpd_raw[i] * sqrt_hw_depth);
-                let jxd: [f64; 3] = std::array::from_fn(|i| jxd_raw[i] * sqrt_hw_depth);
-
-                if pli >= 0 {
-                    let p = pli as usize;
-                    let ab = &mut a_blocks[p];
-                    for i in 0..6 {
-                        for k in 0..6 {
-                            ab[i * 6 + k] += jpd[i] * jpd[k];
-                        }
-                    }
-                    let gp = &mut g_pose[p];
-                    for i in 0..6 {
-                        gp[i] -= jpd[i] * r_z;
-                    }
-                }
-                if xli >= 0 {
-                    let x = xli as usize;
-                    let cb = &mut c_blocks[x];
-                    for i in 0..3 {
-                        for k in 0..3 {
-                            cb[i * 3 + k] += jxd[i] * jxd[k];
-                        }
-                    }
-                    let gx = &mut g_point[x];
-                    for i in 0..3 {
-                        gx[i] -= jxd[i] * r_z;
-                    }
-                }
-                if pli >= 0 && xli >= 0 {
-                    let mut b = [0.0f64; 18];
-                    for i in 0..6 {
-                        for k in 0..3 {
-                            b[i * 3 + k] += jpd[i] * jxd[k];
-                        }
-                    }
-                    b_by_point[xli as usize].push((pli as usize, b));
-                }
+                let jpd = SMatF64::<1, 6>::from_row_slice(&jpd_raw) * sqrt_hw_depth;
+                let jxd = SMatF64::<1, 3>::from_row_slice(&jxd_raw) * sqrt_hw_depth;
+                let r_z = SVecF64::<1>::new(r_z_raw * sqrt_hw_depth);
+                vis.add_rows(pli, xli, &jpd, &jxd, &r_z);
             }
         }
 
@@ -1635,59 +1253,33 @@ pub fn visual_inertial_bundle_adjust(
         let mut m_vec = vec![0.0f64; dim];
 
         // Scatter A blocks into the upper-left 6×6 of each 15×15 slot.
-        for (k, ab) in a_blocks.iter().enumerate() {
+        for (k, (ab, gp)) in vis.a.iter().zip(&vis.g_pose).enumerate() {
             let base = k * KF_DOF;
-            for i in 0..6 {
-                for j in 0..6 {
-                    m_mat[(base + i, base + j)] = ab[i * 6 + j];
-                }
-            }
-            m_vec[base..(6 + base)].copy_from_slice(&g_pose[k]);
+            add_block(&mut m_mat, base, base, ab);
+            m_vec[base..(6 + base)].copy_from_slice(gp.as_slice());
         }
 
         // Schur point elimination: M -= B C⁻¹ Bᵀ,  m -= B C⁻¹ g_point.
         // Point back-substitution only needs the first 6 elements of each
         // keyframe's delta (pose DOF), so the B blocks are 6×3 as before.
 
-        damp_point_blocks(&mut c_blocks, lambda);
-        let c_inv: Vec<Option<[f64; 9]>> = c_blocks.iter().map(invert_3x3_f64).collect();
+        damp_point_blocks(&mut vis.c, lambda);
+        let c_inv: Vec<Option<SMatF64<3, 3>>> = vis.c.iter().map(invert_point_block).collect();
 
-        for (j, b_for_j) in b_by_point.iter().enumerate() {
-            let Some(ci) = c_inv[j] else {
+        for ((b_for_j, ci), g_point) in vis.b_by_point.iter().zip(&c_inv).zip(&vis.g_point) {
+            let Some(ci) = ci else {
                 continue;
             };
+            let bc: Vec<(usize, SMatF64<6, 3>)> =
+                b_for_j.iter().map(|(i_loc, b)| (*i_loc, b * ci)).collect();
 
-            // Pre-multiply: BC_inv[i] = B[i,j] · C⁻¹  (6×3).
-            let bc: Vec<(usize, [f64; 18])> = b_for_j
-                .iter()
-                .map(|(i_loc, b)| (*i_loc, matmul_6x3_3x3_f64(b, &ci)))
-                .collect();
-
-            // RHS correction: m[i] -= BC_inv[i] · g_point[j].
             for (i_loc, bc_block) in &bc {
-                let base = i_loc * KF_DOF;
-                for r in 0..6 {
-                    let mut s = 0.0f64;
-                    for k in 0..3 {
-                        s += bc_block[r * 3 + k] * g_point[j][k];
-                    }
-                    m_vec[base + r] -= s;
-                }
+                sub_from(&mut m_vec, i_loc * KF_DOF, &(bc_block * g_point));
             }
-            // LHS correction: M[i1,i2] -= BC_inv[i1] · B[i2,j]ᵀ.
             for (i1_loc, bc1) in &bc {
-                for (i2_loc, b2) in b_for_j.iter() {
-                    let row0 = i1_loc * KF_DOF;
-                    let col0 = i2_loc * KF_DOF;
-                    for r in 0..6 {
-                        for c in 0..6 {
-                            let mut s = 0.0f64;
-                            for k in 0..3 {
-                                s += bc1[r * 3 + k] * b2[c * 3 + k];
-                            }
-                            m_mat[(row0 + r, col0 + c)] -= s;
-                        }
-                    }
+                for (i2_loc, b2) in b_for_j {
+                    let s = bc1 * b2.transpose();
+                    add_block(&mut m_mat, i1_loc * KF_DOF, i2_loc * KF_DOF, &-s);
                 }
             }
         }
@@ -1706,9 +1298,9 @@ pub fn visual_inertial_bundle_adjust(
                 continue;
             }
 
-            let (res, ji, jj) = imu_residual_and_jacobians(
-                &kfs[i],
-                &kfs[j],
+            let (res, ji, jj) = preintegration::residual_and_jacobians(
+                kfs[i].nav_state(),
+                kfs[j].nav_state(),
                 &edge.preintegrated,
                 &params.gravity,
                 params.imu_t_bc.as_ref(),
@@ -1733,24 +1325,18 @@ pub fn visual_inertial_bundle_adjust(
             // distinct g2o edges). Scaling it by the *nav* residual's outlier-ness
             // was silencing the one thing meant to resist a bad nav window explaining
             // itself away through bias, in exactly the windows where that matters.
-            let (hw, c_imu) = imu_weight_and_cost(&res, &omega_raw, params.huber_imu_chi2);
+            let (hw, c_imu) =
+                preintegration::weight_and_cost(&res, &omega_raw, params.huber_imu_chi2);
             cost_imu += c_imu;
-            let omega: [f64; 225] = {
+            let omega: Mat15F64 = {
                 let mut o = omega_raw;
-                for r in 0..9 {
-                    for c in 0..9 {
-                        o[idx15(r, c)] *= hw;
-                    }
-                }
+                let mut nav = o.fixed_view_mut::<9, 9>(0, 0);
+                nav *= hw;
                 o
             };
 
             if is_first_iter {
-                let nr = (res[0] * res[0] + res[1] * res[1] + res[2] * res[2]).sqrt();
-                let nv = (res[3] * res[3] + res[4] * res[4] + res[5] * res[5]).sqrt();
-                let np = (res[6] * res[6] + res[7] * res[7] + res[8] * res[8]).sqrt();
-                let nbg = (res[9] * res[9] + res[10] * res[10] + res[11] * res[11]).sqrt();
-                let nba = (res[12] * res[12] + res[13] * res[13] + res[14] * res[14]).sqrt();
+                let [nr, nv, np, nbg, nba] = imu_residual_norms(&res);
                 let om_min = omega_raw
                     .iter()
                     .cloned()
@@ -1885,30 +1471,24 @@ pub fn visual_inertial_bundle_adjust(
         let d_full: Vec<f64> = (0..dim).map(|i| d_full_col[(i, 0)]).collect();
 
         // ── 5. Point back-substitution (uses pose-DOF slice only) ────────
-        let mut d_point = vec![[0.0f64; 3]; n_free_pts];
-        for (j, b_for_j) in b_by_point.iter().enumerate() {
-            let Some(ci) = c_inv[j] else {
+        let mut d_point = vec![SVecF64::<3>::zeros(); n_free_pts];
+        for (((b_for_j, ci), g_point), dx) in vis
+            .b_by_point
+            .iter()
+            .zip(&c_inv)
+            .zip(&vis.g_point)
+            .zip(&mut d_point)
+        {
+            let Some(ci) = ci else {
                 continue;
             };
-            let mut rhs = g_point[j];
+            let mut rhs = *g_point;
             for (i_loc, b_block) in b_for_j {
-                // Only the first 6 elements of d_full for this keyframe (pose).
                 let base = i_loc * KF_DOF;
-                let dp6: [f64; 6] = std::array::from_fn(|k| d_full[base + k]);
-                // rhs -= B[i,j]ᵀ · δ_pose[i]  (B is 6×3, so Bᵀ is 3×6).
-                for c in 0..3 {
-                    let mut s = 0.0f64;
-                    for r in 0..6 {
-                        s += b_block[r * 3 + c] * dp6[r];
-                    }
-                    rhs[c] -= s;
-                }
+                let d_pose = Vec6F64::from_column_slice(&d_full[base..base + 6]);
+                rhs -= b_block.transpose() * d_pose;
             }
-            // δ_x = C⁻¹ · rhs.
-            for r in 0..3 {
-                d_point[j][r] =
-                    ci[r * 3] * rhs[0] + ci[r * 3 + 1] * rhs[1] + ci[r * 3 + 2] * rhs[2];
-            }
+            *dx = ci * rhs;
         }
 
         // ── 6. Trial retraction ───────────────────────────────────────────
@@ -2010,9 +1590,9 @@ pub fn visual_inertial_bundle_adjust(
             if kf_local[i] < 0 && kf_local[j] < 0 {
                 continue;
             }
-            let (res, _, _) = imu_residual_and_jacobians(
-                &kfs_trial[i],
-                &kfs_trial[j],
+            let (res, _, _) = preintegration::residual_and_jacobians(
+                kfs_trial[i].nav_state(),
+                kfs_trial[j].nav_state(),
                 &edge.preintegrated,
                 &params.gravity,
                 params.imu_t_bc.as_ref(),
@@ -2023,7 +1603,8 @@ pub fn visual_inertial_bundle_adjust(
                     *x *= params.boundary_imu_info_scale;
                 }
             }
-            new_cost_imu += imu_weight_and_cost(&res, &omega_raw, params.huber_imu_chi2).1;
+            new_cost_imu +=
+                preintegration::weight_and_cost(&res, &omega_raw, params.huber_imu_chi2).1;
         }
         let mut new_cost_bias_prior = 0.0f64;
         if params.accel_bias_prior_weight > 0.0 {
@@ -2076,18 +1657,14 @@ pub fn visual_inertial_bundle_adjust(
         if kf_local[i] < 0 && kf_local[j] < 0 {
             continue;
         }
-        let (res, _, _) = imu_residual_and_jacobians(
-            &kfs[i],
-            &kfs[j],
+        let (res, _, _) = preintegration::residual_and_jacobians(
+            kfs[i].nav_state(),
+            kfs[j].nav_state(),
             &edge.preintegrated,
             &params.gravity,
             params.imu_t_bc.as_ref(),
         );
-        let nr = (res[0] * res[0] + res[1] * res[1] + res[2] * res[2]).sqrt();
-        let nv = (res[3] * res[3] + res[4] * res[4] + res[5] * res[5]).sqrt();
-        let np = (res[6] * res[6] + res[7] * res[7] + res[8] * res[8]).sqrt();
-        let nbg = (res[9] * res[9] + res[10] * res[10] + res[11] * res[11]).sqrt();
-        let nba = (res[12] * res[12] + res[13] * res[13] + res[14] * res[14]).sqrt();
+        let [nr, nv, np, nbg, nba] = imu_residual_norms(&res);
         debug_eprintln!(
             "[vi_ba] FINAL edge {i}→{j}  dt={:.3}s  |r_R|={nr:.4e}  |r_v|={nv:.4e}  \
                 |r_p|={np:.4e}  |r_bg|={nbg:.4e}  |r_ba|={nba:.4e}  \
@@ -2134,7 +1711,7 @@ pub fn visual_inertial_bundle_adjust(
 
 #[cfg(test)]
 mod tests {
-    use super::{ViBaParams, depth_residual_and_jacobian, imu_weight_and_cost, visual_huber};
+    use super::{ViBaParams, depth_residual_and_jacobian, visual_huber};
     use kornia_algebra::{SE3F32, SO3F32, SO3F64, Vec3AF32, Vec3F64};
 
     /// The stereo depth row's analytic Jacobian matches central differences
@@ -2215,57 +1792,6 @@ mod tests {
                 (moved - predicted).abs() < 2e-3 * (1.0 / sigma),
                 "retract column {k}: {moved} vs {predicted}"
             );
-        }
-    }
-
-    /// The IMU edge's cost (used by both the system build and the trial
-    /// step) has the gradient the normal equations use: `w Ω r` on the
-    /// Huber-robustified nav rows 0-8, `Ω r` on the quadratic bias rows
-    /// 9-14, inside and past `huber_imu_chi2`.
-    ///
-    /// Red (2026-10-13, mutated in place) with the old `½ w chi²` nav cost,
-    /// and with the bias block taken over rows 8-14.
-    #[test]
-    fn imu_cost_gradient_is_the_weighted_gradient() {
-        // Block-diagonal SPD omega: a coupled nav block, a diagonal bias block.
-        let mut omega = [0.0f64; 225];
-        for i in 0..9 {
-            for j in 0..9 {
-                omega[i * 15 + j] = if i == j {
-                    4.0 + i as f64
-                } else {
-                    0.3 / (1.0 + (i as f64 - j as f64).abs())
-                };
-            }
-        }
-        for i in 9..15 {
-            omega[i * 15 + i] = 50.0 + 10.0 * i as f64;
-        }
-        let k = ViBaParams::default().huber_imu_chi2;
-        for scale in [0.05, 3.0] {
-            let res: [f64; 15] = std::array::from_fn(|i| {
-                scale * (0.4 + 0.1 * i as f64) * if i % 2 == 0 { 1.0 } else { -1.0 }
-            });
-            let (w, _) = imu_weight_and_cost(&res, &omega, k);
-            assert!(
-                if scale > 1.0 { w < 1.0 } else { w == 1.0 },
-                "{scale}: w = {w}"
-            );
-            for d in 0..15 {
-                let h = 1e-6;
-                let (mut up, mut down) = (res, res);
-                up[d] += h;
-                down[d] -= h;
-                let numeric = (imu_weight_and_cost(&up, &omega, k).1
-                    - imu_weight_and_cost(&down, &omega, k).1)
-                    / (2.0 * h);
-                let omega_r: f64 = (0..15).map(|m| omega[d * 15 + m] * res[m]).sum();
-                let analytic = if d < 9 { w * omega_r } else { omega_r };
-                assert!(
-                    (numeric - analytic).abs() <= 1e-5 * analytic.abs().max(1.0),
-                    "scale {scale}, row {d}: {numeric} vs {analytic}"
-                );
-            }
         }
     }
 

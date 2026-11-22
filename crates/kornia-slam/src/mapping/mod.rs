@@ -10,8 +10,7 @@
 //! keeps admission, core publication and the tracker/IMU lifecycle.
 //!
 //! [`vi_ba_schur`] is the visual-inertial solver behind [`bundle_adjustment`];
-//! [`wheel_odom`] is its wheel-odometry factor and [`stationary`] its
-//! parked-robot factor.
+//! its IMU, wheel-odometry and parked-robot factors come from `kornia_factors`.
 
 pub mod bundle_adjustment;
 pub mod culling;
@@ -20,10 +19,7 @@ pub(crate) mod keyframe_mapping;
 pub mod keyframes;
 pub mod local_mapping;
 pub mod map;
-pub(crate) mod robust;
-pub mod stationary;
 pub mod vi_ba_schur;
-pub mod wheel_odom;
 
 pub use keyframes::{
     KeyframeCullingConfig, KeyframeCullingStrategy, KeyframeEvidence, KeyframeInsertionStrategy,

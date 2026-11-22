@@ -15,10 +15,11 @@
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 pub use kornia_3d::pose::TwoViewError;
-use kornia_3d::pose::{TriangulationConfig, TwoViewEstimator, TwoViewModel};
-use kornia_algebra::Vec3F64;
+use kornia_3d::pose::{TriangulationConfig, TwoViewEstimator, TwoViewModel, TwoViewResult};
+use kornia_algebra::{Vec2F64, Vec3F64};
 use kornia_imgproc::features::{OrbFeatures, OrbMatchConfig, match_orb_descriptors};
 
+use crate::frame::undistorted_camera;
 use crate::tracking::pose_estimation::Estimate;
 
 /// Acceptance thresholds of two-view initialization.
@@ -118,7 +119,7 @@ pub fn try_initialize_two_view(
 ) -> Result<TwoViewEstimate, TwoViewRejectReason> {
     let acceptance = &config.acceptance_config;
 
-    let matches = match_orb_descriptors(
+    let mut matches = match_orb_descriptors(
         &ref_features.orientations,
         &ref_features.descriptors,
         &curr_features.orientations,
@@ -129,10 +130,11 @@ pub fn try_initialize_two_view(
         return Err(TwoViewRejectReason::LowMatches);
     }
 
-    let (reference_pts, current_pts) = camera.undistort_matched_pairs(
+    let (reference_pts, current_pts) = undistort_matches(
+        camera,
         &ref_features.keypoints_xy,
         &curr_features.keypoints_xy,
-        &matches,
+        &mut matches,
     );
 
     let k = camera.intrinsic_matrix();
@@ -156,7 +158,7 @@ pub fn try_initialize_two_view(
         return Err(TwoViewRejectReason::LowInliers);
     }
 
-    let median_parallax_deg = result.median_parallax_deg(&reference_pts, &current_pts, camera);
+    let median_parallax_deg = median_parallax_deg(&result, &reference_pts, &current_pts, camera);
     if median_parallax_deg < config.triangulation_config.min_parallax_deg {
         return Err(TwoViewRejectReason::LowParallax);
     }
@@ -192,6 +194,45 @@ pub fn try_initialize_two_view(
     })
 }
 
+/// Undistorts both keypoints of each match, dropping from `matches` the pairs
+/// `camera` cannot undistort so that `matches` and the returned points stay
+/// index-aligned.
+fn undistort_matches(
+    camera: &PinholeCamera,
+    reference: &[[f32; 2]],
+    current: &[[f32; 2]],
+    matches: &mut Vec<(usize, usize)>,
+) -> (Vec<Vec2F64>, Vec<Vec2F64>) {
+    let undistort = |keypoints: &[[f32; 2]], i: usize| {
+        let kp = keypoints.get(i)?;
+        camera.undistort(kp[0] as f64, kp[1] as f64)
+    };
+    let mut reference_pts = Vec::with_capacity(matches.len());
+    let mut current_pts = Vec::with_capacity(matches.len());
+    matches.retain(
+        |&(r, c)| match (undistort(reference, r), undistort(current, c)) {
+            (Some(p), Some(q)) => {
+                reference_pts.push(p);
+                current_pts.push(q);
+                true
+            }
+            _ => false,
+        },
+    );
+    (reference_pts, current_pts)
+}
+
+/// Median inlier parallax, in degrees, of correspondences already undistorted
+/// through `camera`.
+fn median_parallax_deg(
+    result: &TwoViewResult,
+    reference: &[Vec2F64],
+    current: &[Vec2F64],
+    camera: &PinholeCamera,
+) -> f64 {
+    result.median_parallax_deg(reference, current, &undistorted_camera(camera))
+}
+
 /// Computes the median of a mutable slice in-place.
 fn median_in_place(values: &mut [f64]) -> Option<f64> {
     if values.is_empty() {
@@ -200,4 +241,93 @@ fn median_in_place(values: &mut [f64]) -> Option<f64> {
     let mid = values.len() / 2;
     values.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
     Some(values[mid])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kornia_3d::camera::CameraModel;
+    use kornia_algebra::Mat3F64;
+
+    fn euroc_camera() -> PinholeCamera {
+        PinholeCamera {
+            fx: 458.654,
+            fy: 457.296,
+            cx: 367.215,
+            cy: 248.375,
+            k1: -0.283_408_11,
+            k2: 0.073_959_07,
+            p1: 0.000_193_59,
+            p2: 1.761_871_14e-5,
+        }
+    }
+
+    #[test]
+    fn parallax_of_undistorted_points_is_the_angle_between_the_true_bearings() {
+        let camera = euroc_camera();
+        let reference = Vec3F64::new(1.0, 0.6, 2.0);
+        let current = reference + Vec3F64::new(-0.3, 0.0, 0.0);
+        let undistort = |p_cam: &Vec3F64| {
+            let pixel = camera.project(p_cam).unwrap();
+            camera.undistort(pixel.x, pixel.y).unwrap()
+        };
+        let result = TwoViewResult {
+            model: TwoViewModel::Fundamental(Mat3F64::IDENTITY),
+            rotation: Mat3F64::IDENTITY,
+            translation: Vec3F64::new(1.0, 0.0, 0.0),
+            points3d: vec![reference],
+            inlier_indices: vec![0],
+            inliers: vec![true],
+        };
+
+        let parallax = median_parallax_deg(
+            &result,
+            &[undistort(&reference)],
+            &[undistort(&current)],
+            &camera,
+        );
+
+        let expected = reference
+            .normalize()
+            .dot(current.normalize())
+            .acos()
+            .to_degrees();
+        assert!(
+            (parallax - expected).abs() < 1e-6,
+            "{parallax} vs {expected}"
+        );
+    }
+
+    #[test]
+    fn undistorting_matches_drops_unusable_pairs_and_keeps_the_rest_aligned() {
+        // k1 = -0.5 folds the radial map at r = 0.82, so no point images
+        // beyond a distorted radius of 0.54: (600, 240) has no preimage.
+        let camera = PinholeCamera {
+            fx: 400.0,
+            fy: 400.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: -0.5,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let reference = [[300.0, 200.0], [600.0, 240.0], [340.0, 260.0]];
+        let current = [[310.0, 210.0], [330.0, 250.0], [350.0, 270.0]];
+        let mut matches = vec![(0, 0), (1, 1), (2, 2)];
+
+        let (reference_pts, current_pts) =
+            undistort_matches(&camera, &reference, &current, &mut matches);
+
+        assert_eq!(matches, vec![(0, 0), (2, 2)]);
+        for (k, &(r, c)) in matches.iter().enumerate() {
+            let [ru, rv] = reference[r];
+            let [cu, cv] = current[c];
+            assert_eq!(
+                Some(reference_pts[k]),
+                camera.undistort(ru as f64, rv as f64)
+            );
+            assert_eq!(Some(current_pts[k]), camera.undistort(cu as f64, cv as f64));
+        }
+    }
 }

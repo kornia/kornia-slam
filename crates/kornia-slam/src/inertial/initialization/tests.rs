@@ -450,16 +450,14 @@ fn recovers_scale_bias_gravity_from_synthetic_trajectory() {
     // correction is only reflected in `result.scale`, applied to the map
     // by a subsequent apply_initialization — not folded back into
     // `result.velocities_world` here).
-    for k in 0..n_keyframes {
+    for (k, &velocity) in result.velocities_world[..n_keyframes].iter().enumerate() {
         let t = k as f64 * kf_dt;
         let (_, v_true, _, _) = circular_trajectory(t, OMEGA);
         let expected_v = rwg_viba0 * ((r_arb * v_true) * s_true * viba0_scale);
-        let err = (result.velocities_world[k] - expected_v).length();
+        let err = (velocity - expected_v).length();
         assert!(
             err < 0.15,
-            "velocity[{k}]: got {:?}, want {:?}",
-            result.velocities_world[k],
-            expected_v
+            "velocity[{k}]: got {velocity:?}, want {expected_v:?}",
         );
     }
 }

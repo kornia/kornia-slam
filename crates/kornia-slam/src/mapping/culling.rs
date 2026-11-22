@@ -3,8 +3,8 @@
 //! Redundant-keyframe culling is owned by [`crate::mapping::keyframes`].
 
 use crate::mapping::map::Map;
-use crate::mapping::stationary::StationaryFactor;
-use crate::mapping::wheel_odom::WheelOdomFactor;
+use kornia_factors::inertial::stationary::StationaryFactor;
+use kornia_factors::wheel_odometry::WheelOdomFactor;
 use std::collections::HashSet;
 
 // Compatibility for the established public path. New callers should use

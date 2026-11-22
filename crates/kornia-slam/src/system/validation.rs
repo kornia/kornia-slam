@@ -125,7 +125,7 @@ fn validate_keyframes(policy: &KeyframePolicy, imu: bool) -> Result<(), ConfigEr
         min_parallax_px: px,
     } = policy.insertion
     {
-        check("keyframes.insertion.min_parallax_px", px, POSITIVE)?;
+        check("keyframes.insertion.Parallax.min_parallax_px", px, POSITIVE)?;
     }
     if let Some(secs) = policy.max_interval_sec {
         check("keyframes.max_interval_sec", secs, POSITIVE)?;

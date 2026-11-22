@@ -331,7 +331,10 @@ fn inertial_ba_repropagates_active_edges_and_preserves_new_live_edges() {
 #[test]
 fn failed_inertial_solve_still_returns_repropagated_measurements() {
     let mut map = fixture();
-    map.edit_keyframes_for_test(|_, kf| kf.imu_bias.accel.x = 0.05);
+    map.edit_keyframes_for_test(|_, kf| {
+        kf.imu_bias.accel.x = 0.05;
+        kf.frame.ensure_undistorted(&camera());
+    });
     map.apply_insertion(MapInsertion {
         imu_factors: vec![imu_edge(KF_IDS[1], KF_IDS[2])],
         ..Default::default()
@@ -364,7 +367,11 @@ fn failed_inertial_solve_still_returns_repropagated_measurements() {
     assert_eq!(map.imu_factors()[0].preintegrated.bias.accel.x, 0.05);
 }
 #[test]
-fn stereo_depth_obs_uses_proportional_sigma_with_floor() {
+fn stereo_depth_uses_proportional_sigma_with_floor() {
+    let stereo_depth_obs = |kf: &Keyframe, desc_idx: usize| {
+        let observation = with_stereo_depth(BaObservation::default(), kf, desc_idx);
+        (observation.depth_meas, observation.depth_sigma)
+    };
     let mut frame = test_frame(0, vec![[0u8; 32], [1u8; 32]]);
     frame.depth = vec![10.0, -1.0];
     frame.u_right = vec![5.0, -1.0];
@@ -390,7 +397,8 @@ fn stereo_depth_obs_uses_proportional_sigma_with_floor() {
 
 #[test]
 fn inertial_ba_maps_wheel_factors_by_frame_id_and_drops_inactive_ones() {
-    use crate::mapping::wheel_odom::{self, WheelOdomFactor, WheelOdomMeasurement};
+    use kornia_factors::wheel_odometry::{self, WheelOdomFactor, WheelOdomMeasurement};
+    use kornia_sensors::wheel::PlanarMotion;
     let map = fixture();
     let solve = |wheel: &[WheelOdomFactor]| {
         let update = run_local_inertial_ba(
@@ -408,16 +416,19 @@ fn inertial_ba_maps_wheel_factors_by_frame_id_and_drops_inactive_ones() {
     let pose = |map: &Map, id| map.get_keyframe(id).unwrap().frame.pose_world_to_cam;
     // Identity extrinsic: the camera is the base. The fixture moves 0.2 m
     // per keyframe along camera -x; the wheels claim 0.1 m more.
-    let factor = |from_idx, to_idx| WheelOdomFactor {
-        from_idx,
-        to_idx,
-        measurement: WheelOdomMeasurement::new(
-            [-0.3, 0.0, 0.0],
-            [[1e-4, 0.0, 0.0], [0.0, 1e-4, 0.0], [0.0, 0.0, 1e-4]],
-        ),
-        t_cb_from: Pose3d::IDENTITY,
-        t_cb_to: Pose3d::IDENTITY,
-        huber_chi2: None,
+    let measurement = WheelOdomMeasurement::new(PlanarMotion {
+        delta: [-0.3, 0.0, 0.0],
+        covariance: Mat3F64::from_diagonal(Vec3F64::new(1e-4, 1e-4, 1e-4)),
+    });
+    let factor = |from_idx, to_idx| {
+        WheelOdomFactor::new(
+            from_idx,
+            to_idx,
+            measurement,
+            Pose3d::IDENTITY,
+            Pose3d::IDENTITY,
+            None,
+        )
     };
     let baseline = solve(&[]).state_fingerprint_for_test();
     assert_eq!(
@@ -427,8 +438,11 @@ fn inertial_ba_maps_wheel_factors_by_frame_id_and_drops_inactive_ones() {
 
     let edge = factor(KF_IDS[3], KF_IDS[4]);
     let residual = |map: &Map| {
-        let (r, _) =
-            wheel_odom::residual_and_jacobian(&pose(map, KF_IDS[3]), &pose(map, KF_IDS[4]), &edge);
+        let (r, _) = wheel_odometry::residual_and_jacobian(
+            &pose(map, KF_IDS[3]),
+            &pose(map, KF_IDS[4]),
+            &edge,
+        );
         r.iter().map(|x| x * x).sum::<f64>().sqrt()
     };
     let fused = solve(&[edge]);
@@ -505,8 +519,8 @@ fn inertial_ba_repropagation_keeps_the_elided_bias_walk() {
     let walk = |density: f64| density * density * (3600.0 + 0.1);
     let calib = repropagated.calib;
     for i in 0..3 {
-        let g = repropagated.bias_covariance[i * 7];
-        let a = repropagated.bias_covariance[(i + 3) * 7];
+        let g = repropagated.bias_covariance[(i, i)];
+        let a = repropagated.bias_covariance[(i + 3, i + 3)];
         assert!((g - walk(calib.gyro_bias_noise)).abs() < 1e-3 * g, "{g}");
         assert!((a - walk(calib.accel_bias_noise)).abs() < 1e-3 * a, "{a}");
     }

@@ -10,12 +10,13 @@
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pnp::{PnPMethod, RansacParams, solve_pnp_ransac};
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat3AF32, Vec2F32, Vec3AF32};
+use kornia_algebra::{Vec2F32, Vec3AF32};
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
 use crate::Frame;
+use crate::frame::is_finite_xy;
 use crate::mapping::{Keyframe, Map};
-use crate::pose_conversion::{mat3_to_f64, vec3_to_f32, vec3_to_f64};
+use crate::pose_conversion::{mat3_to_f32, mat3_to_f64, vec3_to_f32, vec3_to_f64};
 use crate::tracking::pose_estimation::{Estimate, MapProjectionEstimator};
 
 /// Thresholds for relocalization (ORB-SLAM3's values).
@@ -122,7 +123,11 @@ fn keyframe_correspondences(
     .filter_map(|(keyframe_desc, keypoint)| {
         let map_point = keyframe.map_point(keyframe_desc)?;
         let point = map.map_points().get(map_point)?;
-        (!point.culled).then_some((map_point, keypoint))
+        let undistorted = frame
+            .keypoints_undist
+            .get(keypoint)
+            .is_some_and(is_finite_xy);
+        (undistorted && !point.culled).then_some((map_point, keypoint))
     })
     .collect()
 }
@@ -164,11 +169,7 @@ fn ransac_pose(
             Vec2F32::new(u, v)
         })
         .collect();
-    let k = Mat3AF32::from_cols(
-        Vec3AF32::new(camera.fx as f32, 0.0, 0.0),
-        Vec3AF32::new(0.0, camera.fy as f32, 0.0),
-        Vec3AF32::new(camera.cx as f32, camera.cy as f32, 1.0),
-    );
+    let k = mat3_to_f32(camera.intrinsic_matrix());
     let result = solve_pnp_ransac(
         &world,
         &image,
@@ -326,6 +327,21 @@ mod tests {
         .length();
         assert!(rotation_error < 1e-3, "rotation error {rotation_error}");
         assert!((found.estimate.pose.translation - truth.translation).length() < 1e-2);
+    }
+
+    #[test]
+    fn keypoints_without_an_undistorted_pixel_are_not_matched() {
+        let map = mapped_keyframe();
+        let mut query = frame(50, query_pose(), (0..LANDMARKS).map(descriptor).collect());
+        let unusable = 10;
+        for xy in &mut query.keypoints_undist[..unusable] {
+            *xy = [f32::NAN; 2];
+        }
+
+        let found =
+            relocalize_query(&query, &map, &[0], |_| true).expect("the keyframe sees the query");
+
+        assert!(found.estimate.matches.iter().all(|&(_, kp)| kp >= unusable));
     }
 
     #[test]

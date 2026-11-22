@@ -1,8 +1,8 @@
-keypoints 1991
-keypoints_xy 2cb34df93a1b8171
-descriptors 0dd35a886975eec1
-octaves 89cb8df6c48eac94
-stereo_matched 1243
-u_right f0dcfdf6e5a874a4
-depth 67a85c1f9e623003
-colors a0c9af4ae3c380e9
+keypoints 995
+keypoints_xy cd81fe0438771620
+descriptors a273da0b3cf7ce24
+octaves eb6ae65209217770
+stereo_matched 524
+u_right eab9a8b63d3e13a5
+depth 0a49af16ca7b9880
+colors 88bf41c28a8234cf

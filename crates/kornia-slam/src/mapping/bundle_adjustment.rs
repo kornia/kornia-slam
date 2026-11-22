@@ -7,15 +7,16 @@ use crate::mapping::map::{
     BaSnapshot, BaUpdate, BaUpdateError, BaWindow, Keyframe, LocalBaStats, Map, ORB_N_LEVELS,
     ORB_SCALE_FACTOR,
 };
-use crate::mapping::stationary::StationaryFactor;
 use crate::mapping::vi_ba_schur::ViBaKeyframe;
-use crate::mapping::wheel_odom::WheelOdomFactor;
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::ransac::RobustKernelKind;
 use kornia_algebra::Vec3F64;
+use kornia_factors::inertial::preintegration;
+use kornia_factors::inertial::stationary::StationaryFactor;
+use kornia_factors::wheel_odometry::WheelOdomFactor;
 use std::collections::{HashMap, HashSet};
 
 /// Relative standard deviation of a stereo depth measurement, as a fraction of
@@ -329,9 +330,7 @@ pub fn run_local_inertial_ba(
 ) -> BaUpdate {
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
-    use crate::mapping::vi_ba_schur::{
-        ImuFactor as ViBaImuFactor, ViBaParams, visual_inertial_bundle_adjust,
-    };
+    use crate::mapping::vi_ba_schur::{ViBaParams, visual_inertial_bundle_adjust};
 
     const MIN_OBSERVATIONS: usize = 8;
 
@@ -414,7 +413,7 @@ pub fn run_local_inertial_ba(
     }
 
     // Build IMU edges; include only edges where at least one endpoint is active.
-    let imu_edges: Vec<ViBaImuFactor> = snapshot
+    let imu_edges: Vec<preintegration::ImuFactor> = snapshot
         .imu_factors()
         .iter()
         .zip(&update.imu_preintegrations)
@@ -424,11 +423,11 @@ pub fn run_local_inertial_ba(
             if from < active_start && to < active_start {
                 return None;
             }
-            Some(ViBaImuFactor {
-                from_idx: from,
-                to_idx: to,
-                preintegrated: preintegrated.clone(),
-            })
+            Some(preintegration::ImuFactor::new(
+                from,
+                to,
+                preintegrated.clone(),
+            ))
         })
         .collect();
 
@@ -450,11 +449,9 @@ pub fn run_local_inertial_ba(
                 );
                 return None;
             }
-            Some(WheelOdomFactor {
-                from_idx: from,
-                to_idx: to,
-                ..*f
-            })
+            let mut f = *f;
+            (f.from_idx, f.to_idx) = (from, to);
+            Some(f)
         })
         .collect();
 
@@ -474,11 +471,9 @@ pub fn run_local_inertial_ba(
                 );
                 return None;
             }
-            Some(StationaryFactor {
-                from_idx: from,
-                to_idx: to,
-                ..*f
-            })
+            let mut f = *f;
+            (f.from_idx, f.to_idx) = (from, to);
+            Some(f)
         })
         .collect();
 
@@ -656,16 +651,14 @@ impl WindowPoints {
                     continue;
                 };
                 if let Some(pixel) = kf.frame.undistorted_xy(desc_idx, camera) {
-                    let (depth_meas, depth_sigma) = stereo_depth_obs(kf, desc_idx);
-                    observations.push(BaObservation {
+                    let observation = BaObservation {
                         pose_idx,
                         point_idx,
                         pixel,
                         fixed_pose,
-                        fixed_point: false,
-                        depth_meas,
-                        depth_sigma,
-                    });
+                        ..Default::default()
+                    };
+                    observations.push(with_stereo_depth(observation, kf, desc_idx));
                 }
             }
         }
@@ -696,18 +689,15 @@ impl WindowPoints {
     }
 }
 
-/// Depth measurement + sigma for a BA observation at `desc_idx` of `kf`.
-///
-/// Returns `(Some(z), sigma)` when the keyframe's keypoint has a valid stereo
-/// depth (anchoring the BA's metric scale), else `(None, 1.0)` for a pure
-/// reprojection observation.
-fn stereo_depth_obs(kf: &Keyframe, desc_idx: usize) -> (Option<f32>, f32) {
+/// `observation` with the stereo depth of `kf`'s keypoint `desc_idx` attached when
+/// it has one, anchoring the BA's metric scale; otherwise a pure reprojection
+/// observation.
+fn with_stereo_depth(observation: BaObservation, kf: &Keyframe, desc_idx: usize) -> BaObservation {
     match kf.frame.stereo_depth(desc_idx) {
-        Some(z) => (
-            Some(z),
-            (STEREO_DEPTH_REL_SIGMA * z).max(STEREO_DEPTH_MIN_SIGMA),
-        ),
-        None => (None, 1.0),
+        Some(z) => {
+            observation.with_depth(z, (STEREO_DEPTH_REL_SIGMA * z).max(STEREO_DEPTH_MIN_SIGMA))
+        }
+        None => observation,
     }
 }
 

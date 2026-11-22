@@ -103,7 +103,7 @@ pub(crate) mod tests {
             .map(|i| {
                 let in_cam =
                     Vec3F64::new((i % 3) as f64 * 0.5 - 0.5, (i / 3) as f64 * 0.4 - 0.4, 4.0);
-                kf_pose.inverse().transform_point(&in_cam)
+                kf_pose.untransform_point(&in_cam)
             })
             .collect()
     }

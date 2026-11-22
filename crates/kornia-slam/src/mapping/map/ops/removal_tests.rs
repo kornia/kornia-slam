@@ -3,7 +3,7 @@ use crate::mapping::map::tests::{assert_map_consistent, test_frame};
 use crate::mapping::map::{
     ImuFactor, Keyframe, LandmarkSeed, Map, MapInsertion, ObservationKey, ops::BaWindow,
 };
-use kornia_algebra::{Mat3F64, Vec3F64};
+use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 
 fn calib() -> ImuCalib {
@@ -176,7 +176,7 @@ fn the_imu_chain_is_merged_into_the_edge_that_skipping_the_keyframe_would_give()
         0.4,
     );
     let (a, b) = (&first.preintegrated, &second.preintegrated);
-    let rotation = Mat3F64(a.delta_rotation.mul_mat3(&b.delta_rotation));
+    let rotation = a.delta_rotation * b.delta_rotation;
     let velocity = a.delta_velocity + a.delta_rotation * b.delta_velocity;
     let position = a.delta_position + a.delta_velocity * b.dt + a.delta_rotation * b.delta_position;
     let close = |x: &[f64], y: &[f64]| x.iter().zip(y).all(|(p, q)| (p - q).abs() < 1e-9);
@@ -290,7 +290,7 @@ fn a_snapshot_captured_before_the_removal_still_merges_without_resurrecting_it()
 }
 
 fn gyro_walk(preintegrated: &PreintegratedImu) -> f64 {
-    preintegrated.bias_covariance[0]
+    preintegrated.bias_covariance[(0, 0)]
 }
 
 /// A merge re-preintegrates from the samples, which alone give back only the
@@ -380,7 +380,9 @@ fn a_still_boundary_keyframe_moves_its_imu_edge_onto_the_still_neighbour() {
         let widened = calib().gyro_bias_noise.powi(2) * 50.0;
         assert!((gyro_walk(a) - gyro_walk(b) - widened).abs() < 1e-6 * widened);
         let accel = calib().accel_bias_noise.powi(2) * 50.0;
-        assert!((a.bias_covariance[35] - b.bias_covariance[35] - accel).abs() < 1e-6 * accel);
+        assert!(
+            (a.bias_covariance[(5, 5)] - b.bias_covariance[(5, 5)] - accel).abs() < 1e-6 * accel
+        );
     }
 }
 

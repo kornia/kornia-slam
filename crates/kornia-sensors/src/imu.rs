@@ -1,4 +1,4 @@
-use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
+use kornia_algebra::{Mat3F64, Mat6F64, Mat9F64, SMatF64, SO3F64, Vec3F64};
 
 /// Standard gravity magnitude in m/s².
 pub const GRAVITY_MAGNITUDE: f64 = 9.81;
@@ -69,11 +69,11 @@ pub struct PreintegratedImu {
     pub bias: ImuBias,
     /// Sensor noise parameters.
     pub calib: ImuCalib,
-    /// 9×9 covariance in tangent space [rot, vel, pos], stored column-major.
-    pub covariance: [f64; 81],
-    /// 6×6 bias covariance [bias_gyro, bias_accel], stored column-major.
+    /// 9×9 covariance in tangent space [rot, vel, pos].
+    pub covariance: Mat9F64,
+    /// 6×6 bias covariance [bias_gyro, bias_accel].
     /// Grows by σ²·dt each step (random walk).
-    pub bias_covariance: [f64; 36],
+    pub bias_covariance: Mat6F64,
     /// ∂ΔR/∂bias_gyro (so(3) tangent perturbation per unit gyro-bias change).
     pub d_rotation_d_bias_gyro: Mat3F64,
     /// ∂Δv/∂bias_gyro.
@@ -95,8 +95,8 @@ impl PreintegratedImu {
             dt: 0.0,
             bias,
             calib,
-            covariance: [0.0; 81],
-            bias_covariance: [0.0; 36],
+            covariance: Mat9F64::zeros(),
+            bias_covariance: Mat6F64::zeros(),
             d_rotation_d_bias_gyro: Mat3F64::ZERO,
             d_velocity_d_bias_gyro: Mat3F64::ZERO,
             d_velocity_d_bias_accel: Mat3F64::ZERO,
@@ -110,14 +110,21 @@ impl PreintegratedImu {
     /// still stretch elided before it), so `bias_covariance` is the walk over
     /// `dt + seconds`. Non-positive or non-finite `seconds` change nothing.
     pub fn widen_bias_walk(&mut self, seconds: f64) {
-        if !(seconds.is_finite() && seconds > 0.0) {
-            return;
+        if seconds.is_finite() && seconds > 0.0 {
+            self.add_bias_walk(seconds);
         }
+    }
+
+    /// Bias random walk: gyro_bias_noise/accel_bias_noise are continuous-time
+    /// densities [units/s/√Hz], so the walk over `seconds` has variance
+    /// density²·seconds (inverse discretization of the per-sample /dt, since
+    /// here the time scales up a rate rather than scaling down a reading).
+    fn add_bias_walk(&mut self, seconds: f64) {
         let bg_var = self.calib.gyro_bias_noise * self.calib.gyro_bias_noise * seconds;
         let ba_var = self.calib.accel_bias_noise * self.calib.accel_bias_noise * seconds;
         for i in 0..3 {
-            self.bias_covariance[i + i * 6] += bg_var;
-            self.bias_covariance[(i + 3) * 7] += ba_var;
+            self.bias_covariance[(i, i)] += bg_var;
+            self.bias_covariance[(i + 3, i + 3)] += ba_var;
         }
     }
 
@@ -174,7 +181,7 @@ impl PreintegratedImu {
     pub fn delta_rotation_with_bias(&self, bias: &ImuBias) -> Mat3F64 {
         let dbg = bias.gyro - self.bias.gyro;
         let correction = SO3F64::exp(self.d_rotation_d_bias_gyro * dbg).matrix();
-        Mat3F64(self.delta_rotation.mul_mat3(&correction))
+        self.delta_rotation * correction
     }
 
     /// Δv re-expressed at a new bias estimate (first order).
@@ -233,63 +240,42 @@ impl PreintegratedImu {
         // back to so(3) (tangent space at identity) relative to the new ΔR.
         // For Lie groups, pullback is multiplication by the inverse, which for
         // rotation matrices is the transpose.
-        let d_rot_t = Mat3F64(*d_rot.transpose());
-        let dr_accel_hat = Mat3F64(self.delta_rotation.mul_mat3(&accel_hat));
-        let neg_dr_ah_dt = mat3_scalar(&dr_accel_hat, -dt);
-        let neg_dr_ah_half_dt2 = mat3_scalar(&dr_accel_hat, -0.5 * dt * dt);
-        let i_dt = mat3_scalar(&Mat3F64::IDENTITY, dt);
+        let d_rot_t = d_rot.transpose();
+        let dr_accel_hat = self.delta_rotation * accel_hat;
+        let neg_dr_ah_dt = dr_accel_hat * -dt;
+        let neg_dr_ah_half_dt2 = dr_accel_hat * (-0.5 * dt * dt);
 
-        let a = block3x3_to_9x9([
-            [d_rot_t, Mat3F64::ZERO, Mat3F64::ZERO],
-            [neg_dr_ah_dt, Mat3F64::IDENTITY, Mat3F64::ZERO],
-            [neg_dr_ah_half_dt2, i_dt, Mat3F64::IDENTITY],
-        ]);
+        let mut a = Mat9F64::identity();
+        a.fixed_view_mut::<3, 3>(0, 0).copy_from(&d_rot_t.into());
+        a.fixed_view_mut::<3, 3>(3, 0)
+            .copy_from(&neg_dr_ah_dt.into());
+        a.fixed_view_mut::<3, 3>(6, 0)
+            .copy_from(&neg_dr_ah_half_dt2.into());
+        a.fixed_view_mut::<3, 3>(6, 3).fill_diagonal(dt);
 
         // B is the 9×6 noise input matrix (how sensor noise enters the state):
         //
         //     [ J_r·dt   0     ]     gyro noise enters rotation via right Jacobian
         // B = [ 0        ΔR·dt ]     accel noise enters velocity
         //     [ 0        ½·ΔR·dt² ]  accel noise enters position
-        let jr_dt = mat3_scalar(&jr, dt);
-        let dr_dt = mat3_scalar(&self.delta_rotation, dt);
-        let dr_half_dt2 = mat3_scalar(&self.delta_rotation, 0.5 * dt * dt);
-
-        let b = block3x2_to_9x6([
-            [jr_dt, Mat3F64::ZERO],
-            [Mat3F64::ZERO, dr_dt],
-            [Mat3F64::ZERO, dr_half_dt2],
-        ]);
+        let mut b = SMatF64::<9, 6>::zeros();
+        b.fixed_view_mut::<3, 3>(0, 0).copy_from(&(jr * dt).into());
+        b.fixed_view_mut::<3, 3>(3, 3)
+            .copy_from(&(self.delta_rotation * dt).into());
+        b.fixed_view_mut::<3, 3>(6, 3)
+            .copy_from(&(self.delta_rotation * (0.5 * dt * dt)).into());
 
         // gyro_noise/accel_noise are continuous-time spectral densities [units/√Hz]
         // (datasheet convention), so the discrete per-sample variance is density²/dt
         // — same discretization ORB-SLAM3 uses when loading IMU calibration.
         let ng = self.calib.gyro_noise * self.calib.gyro_noise / dt;
         let na = self.calib.accel_noise * self.calib.accel_noise / dt;
-        let n = diag_6x6(ng, na);
+        let mut n = Mat6F64::zeros();
+        n.fixed_view_mut::<3, 3>(0, 0).fill_diagonal(ng);
+        n.fixed_view_mut::<3, 3>(3, 3).fill_diagonal(na);
 
-        // C' = A·C·Aᵀ + B·N·Bᵀ
-        let ac = mat9_mul(&a, &self.covariance);
-        let a_t = mat9_transpose(&a);
-        let acat = mat9_mul(&ac, &a_t);
-
-        let bn = mat9x6_mul_6x6(&b, &n);
-        let b_t = mat6x9_transpose(&b);
-        let bnbt = mat9x6_mul_6x9(&bn, &b_t);
-
-        self.covariance = mat9_add(&acat, &bnbt);
-
-        // Bias random walk: gyro_bias_noise/accel_bias_noise are continuous-time
-        // densities [units/s/√Hz], so each step's bias increment has variance
-        // density²·dt (inverse discretization of the /dt above, since here dt
-        // scales up a rate rather than scaling down a per-sample reading).
-        let bg_var = self.calib.gyro_bias_noise * self.calib.gyro_bias_noise * dt;
-        let ba_var = self.calib.accel_bias_noise * self.calib.accel_bias_noise * dt;
-        for i in 0..3 {
-            self.bias_covariance[i + i * 6] += bg_var;
-        }
-        for i in 3..6 {
-            self.bias_covariance[i + i * 6] += ba_var;
-        }
+        self.covariance = (a * self.covariance) * a.transpose() + (b * n) * b.transpose();
+        self.add_bias_walk(dt);
 
         // --- Bias Jacobian propagation (Forster et al. TRO 2017, eq. 70-71) ---
         // Measurements enter bias-corrected (ω - bg, a - ba), so each step's
@@ -316,7 +302,7 @@ impl PreintegratedImu {
 
         // 3. Rotation: compose on the manifold SO(3), then normalize to
         // prevent floating-point drift away from SO(3) over long windows.
-        self.delta_rotation = normalize_rotation(&Mat3F64(self.delta_rotation.mul_mat3(&d_rot)));
+        self.delta_rotation = normalize_rotation(&(self.delta_rotation * d_rot));
 
         self.dt += dt;
     }
@@ -340,7 +326,7 @@ impl PreintegratedImu {
         let dt = self.dt;
 
         // Predicted rotation: R_{k+1} = R_k · ΔR
-        let r_k1 = Mat3F64(r_k.mul_mat3(&self.delta_rotation));
+        let r_k1 = *r_k * self.delta_rotation;
 
         // Predicted velocity: v_{k+1} = v_k + g·dt + R_k · Δv
         let r_k_dv = *r_k * self.delta_velocity;
@@ -366,156 +352,20 @@ impl PreintegratedImu {
 /// Prevents floating-point drift from accumulating over many rotation compositions.
 fn normalize_rotation(r: &Mat3F64) -> Mat3F64 {
     let cols = r.to_cols_array();
-    // Extract columns (column-major: col0 = [0,1,2], col1 = [3,4,5], col2 = [6,7,8])
-    let c0 = glam::DVec3::new(cols[0], cols[1], cols[2]);
-    let c1 = glam::DVec3::new(cols[3], cols[4], cols[5]);
+    let c0 = Vec3F64::new(cols[0], cols[1], cols[2]);
+    let c1 = Vec3F64::new(cols[3], cols[4], cols[5]);
 
-    // Gram-Schmidt: orthonormalize col0, col1, then cross for col2
     let e0 = c0.normalize();
     let e1 = (c1 - e0 * c1.dot(e0)).normalize();
     let e2 = e0.cross(e1); // right-handed cross product ensures det = +1
 
-    Mat3F64::from_cols_array(&[e0.x, e0.y, e0.z, e1.x, e1.y, e1.z, e2.x, e2.y, e2.z])
-}
-
-// --- Matrix helpers ---
-// These operate on flat column-major arrays to avoid pulling in a full linear algebra crate.
-
-/// Scalar multiply a Mat3F64.
-fn mat3_scalar(m: &Mat3F64, s: f64) -> Mat3F64 {
-    Mat3F64(m.mul_scalar(s))
-}
-
-/// Column-major index for any matrix with 9 rows (9×9 and 9×6 alike).
-#[inline]
-fn idx9(row: usize, col: usize) -> usize {
-    row + col * 9
-}
-
-/// Build a 9×9 matrix from a 3×3 grid of Mat3F64 blocks.
-fn block3x3_to_9x9(blocks: [[Mat3F64; 3]; 3]) -> [f64; 81] {
-    let mut out = [0.0f64; 81];
-    for br in 0..3 {
-        for bc in 0..3 {
-            let cols = blocks[br][bc].to_cols_array();
-            for c in 0..3 {
-                for r in 0..3 {
-                    out[idx9(br * 3 + r, bc * 3 + c)] = cols[c * 3 + r];
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Build a 9×6 matrix from a 3×2 grid of Mat3F64 blocks.
-fn block3x2_to_9x6(blocks: [[Mat3F64; 2]; 3]) -> [f64; 54] {
-    let mut out = [0.0f64; 54];
-    for br in 0..3 {
-        for bc in 0..2 {
-            let cols = blocks[br][bc].to_cols_array();
-            for c in 0..3 {
-                for r in 0..3 {
-                    out[idx9(br * 3 + r, bc * 3 + c)] = cols[c * 3 + r];
-                }
-            }
-        }
-    }
-    out
-}
-
-/// 6×6 diagonal noise matrix.
-fn diag_6x6(gyro_var: f64, accel_var: f64) -> [f64; 36] {
-    let mut out = [0.0f64; 36];
-    for i in 0..3 {
-        out[i + i * 6] = gyro_var;
-    }
-    for i in 3..6 {
-        out[i + i * 6] = accel_var;
-    }
-    out
-}
-
-/// 9×9 multiply (column-major).
-fn mat9_mul(a: &[f64; 81], b: &[f64; 81]) -> [f64; 81] {
-    let mut out = [0.0f64; 81];
-    for c in 0..9 {
-        for r in 0..9 {
-            let mut sum = 0.0;
-            for k in 0..9 {
-                sum += a[idx9(r, k)] * b[idx9(k, c)];
-            }
-            out[idx9(r, c)] = sum;
-        }
-    }
-    out
-}
-
-/// 9×9 transpose (column-major).
-fn mat9_transpose(a: &[f64; 81]) -> [f64; 81] {
-    let mut out = [0.0f64; 81];
-    for c in 0..9 {
-        for r in 0..9 {
-            out[idx9(r, c)] = a[idx9(c, r)];
-        }
-    }
-    out
-}
-
-/// 9×9 add.
-fn mat9_add(a: &[f64; 81], b: &[f64; 81]) -> [f64; 81] {
-    let mut out = [0.0f64; 81];
-    for i in 0..81 {
-        out[i] = a[i] + b[i];
-    }
-    out
-}
-
-/// 9×6 × 6×6 -> 9×6 (column-major).
-fn mat9x6_mul_6x6(a: &[f64; 54], b: &[f64; 36]) -> [f64; 54] {
-    let mut out = [0.0f64; 54];
-    for c in 0..6 {
-        for r in 0..9 {
-            let mut sum = 0.0;
-            for k in 0..6 {
-                sum += a[r + k * 9] * b[k + c * 6];
-            }
-            out[r + c * 9] = sum;
-        }
-    }
-    out
-}
-
-/// Transpose 9×6 -> 6×9 (column-major).
-fn mat6x9_transpose(a: &[f64; 54]) -> [f64; 54] {
-    let mut out = [0.0f64; 54];
-    for c in 0..6 {
-        for r in 0..9 {
-            // a[r,c] in 9×6 -> out[c,r] in 6×9
-            out[c + r * 6] = a[r + c * 9];
-        }
-    }
-    out
-}
-
-/// 9×6 × 6×9 -> 9×9 (column-major).
-fn mat9x6_mul_6x9(a: &[f64; 54], b: &[f64; 54]) -> [f64; 81] {
-    let mut out = [0.0f64; 81];
-    for c in 0..9 {
-        for r in 0..9 {
-            let mut sum = 0.0;
-            for k in 0..6 {
-                sum += a[r + k * 9] * b[k + c * 6];
-            }
-            out[idx9(r, c)] = sum;
-        }
-    }
-    out
+    Mat3F64::from_cols(e0, e1, e2)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kornia_algebra::Vec9F64;
 
     const EPS: f64 = 1e-8;
 
@@ -537,15 +387,11 @@ mod tests {
         for i in 0..3 {
             let g = calib.gyro_bias_noise * calib.gyro_bias_noise * 10.0;
             let a = calib.accel_bias_noise * calib.accel_bias_noise * 10.0;
-            assert!((pre.bias_covariance[i * 7] - g).abs() <= g * 1e-12);
-            assert!((pre.bias_covariance[(i + 3) * 7] - a).abs() <= a * 1e-12);
+            assert!((pre.bias_covariance[(i, i)] - g).abs() <= g * 1e-12);
+            assert!((pre.bias_covariance[(i + 3, i + 3)] - a).abs() <= a * 1e-12);
         }
-        let off_diagonal = (0..36).filter(|k| k % 7 != 0);
-        assert!(
-            off_diagonal
-                .into_iter()
-                .all(|k| pre.bias_covariance[k] == 0.0)
-        );
+        let diagonal = Mat6F64::from_diagonal(&pre.bias_covariance.diagonal());
+        assert_eq!(pre.bias_covariance, diagonal);
         let before = pre.bias_covariance;
         for s in [0.0, -1.0, f64::NAN] {
             pre.widen_bias_walk(s);
@@ -694,7 +540,7 @@ mod tests {
 
         // Diagonal should be zero initially
         for i in 0..9 {
-            assert_eq!(pre.covariance[i + i * 9], 0.0);
+            assert_eq!(pre.covariance[(i, i)], 0.0);
         }
 
         // After some integration, diagonal should be positive
@@ -703,7 +549,7 @@ mod tests {
         }
         for i in 0..9 {
             assert!(
-                pre.covariance[i + i * 9] > 0.0,
+                pre.covariance[(i, i)] > 0.0,
                 "diagonal {i} should be positive"
             );
         }
@@ -715,9 +561,85 @@ mod tests {
         }
         for i in 0..9 {
             assert!(
-                pre.covariance[i + i * 9] >= cov_after_100[i + i * 9],
+                pre.covariance[(i, i)] >= cov_after_100[(i, i)],
                 "diagonal {i} should not decrease"
             );
+        }
+    }
+
+    /// The covariance is `Σ_k J_k · N · J_kᵀ`, with `J_k` the central-difference
+    /// derivative of the final `[Log(ΔR̂ᵀ·ΔR), Δv − Δv̂, Δp − Δp̂]` by step `k`'s
+    /// reading, so a transposed block of the transition matrix shows up.
+    #[test]
+    fn covariance_matches_linearized_noise_propagation() {
+        let dt = 0.01;
+        let calib = ImuCalib {
+            gyro_noise: 0.05,
+            accel_noise: 0.02,
+            ..default_calib()
+        };
+        let readings: Vec<ImuMeasurement> = (0..20)
+            .map(|k| {
+                let t = k as f64 * dt;
+                ImuMeasurement {
+                    timestamp: t,
+                    gyro: Vec3F64::new(0.8 + 2.0 * t, -0.5, 0.3 * (10.0 * t).sin()),
+                    accel: Vec3F64::new(1.0, -2.0 + 5.0 * t, 9.81),
+                }
+            })
+            .collect();
+        let integrate = |readings: &[ImuMeasurement]| {
+            let mut pre = PreintegratedImu::new(ImuBias::default(), calib);
+            for m in readings {
+                pre.integrate(m, dt);
+            }
+            pre
+        };
+        let nominal = integrate(&readings);
+        let error = |pre: &PreintegratedImu| {
+            let rot_err = nominal.delta_rotation.transpose() * pre.delta_rotation;
+            let r = SO3F64::from_matrix(&rot_err).log();
+            let v = pre.delta_velocity - nominal.delta_velocity;
+            let p = pre.delta_position - nominal.delta_position;
+            Vec9F64::from_column_slice(&[r.x, r.y, r.z, v.x, v.y, v.z, p.x, p.y, p.z])
+        };
+
+        let h = 1e-6;
+        let variances = [
+            calib.gyro_noise * calib.gyro_noise / dt,
+            calib.accel_noise * calib.accel_noise / dt,
+        ];
+        let mut expected = Mat9F64::zeros();
+        for k in 0..readings.len() {
+            for axis in 0..6 {
+                let shifted = |eps: f64| {
+                    let mut perturbed = readings.clone();
+                    let mut e = [0.0; 3];
+                    e[axis % 3] = eps;
+                    let e = Vec3F64::from_array(e);
+                    if axis < 3 {
+                        perturbed[k].gyro += e;
+                    } else {
+                        perturbed[k].accel += e;
+                    }
+                    error(&integrate(&perturbed))
+                };
+                let column = (shifted(h) - shifted(-h)) / (2.0 * h);
+                expected += column * column.transpose() * variances[axis / 3];
+            }
+        }
+
+        let got = nominal.covariance;
+        for r in 0..9 {
+            for c in 0..9 {
+                let scale = (got[(r, r)] * got[(c, c)]).sqrt();
+                assert!(
+                    (got[(r, c)] - expected[(r, c)]).abs() < 1e-6 * scale,
+                    "({r}, {c}): {} vs {}",
+                    got[(r, c)],
+                    expected[(r, c)]
+                );
+            }
         }
     }
 }

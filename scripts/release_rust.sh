@@ -26,8 +26,8 @@ for arg in "$@"; do
   esac
 done
 
-# kornia-slam depends on kornia-sensors.
-PUBLISH_ORDER=(kornia-sensors kornia-slam)
+# kornia-factors depends on kornia-sensors; kornia-slam on both.
+PUBLISH_ORDER=(kornia-sensors kornia-factors kornia-slam)
 
 cd "$(dirname "$0")/.."
 python3 scripts/check_version_pins.py
