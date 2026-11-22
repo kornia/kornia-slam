@@ -4,7 +4,10 @@
       Single-frame jumps (dt <= 0.06 s) over MIN_JUMP_M (default 1 m) in a `t x y z qx qy qz qw` file, t in ns.
       A jump that keeps the distance from the origin to 0.1 m is an origin rotation: the later segment's inertial
       alignment (`Map::apply_inertial_alignment`) moved the tracking pose with the whole map. Prints time (s from
-      the first pose), jump, distance from the origin before and after, the angle about the origin, and the axis.
+      the first pose), jump, distance from the origin before and after, the angle between the two positions about
+      the origin, the orientation change across the jump, and the axis. The position angle is only a lower bound
+      of the world rotation (equal when the axis is normal to the position); the orientation change is the
+      rotation itself, the one to compare with an `[imu_init]` gravity angle.
   worldrot.py segrot TRAJ SESSION.cbor
       Per session segment: the rotation about the origin that takes the online trajectory's positions to the
       session dump's keyframe centres (-R^T t of `pose_cw`), its angle, the tilt of world Y under it, and the fit
@@ -18,9 +21,15 @@ import struct, sys, re
 import numpy as np
 
 
-def load_traj(path):
+def load_traj(path, rotations=False):
     a = np.loadtxt(path, comments="#", ndmin=2)
+    if rotations:
+        return a[:, 0].astype(np.int64), a[:, 1:4], a[:, 4:8]
     return a[:, 0].astype(np.int64), a[:, 1:4]
+
+
+def rotation_deg(R):
+    return float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
 
 
 def angle_deg(a, b):
@@ -177,13 +186,14 @@ def gravity_angles(stderr):
 
 def main(argv):
     if len(argv) >= 2 and argv[0] == "jumps":
-        t, p = load_traj(argv[1]); mj = float(argv[2]) if len(argv) > 2 else 1.0
+        t, p, q = load_traj(argv[1], rotations=True); mj = float(argv[2]) if len(argv) > 2 else 1.0
         rows = jumps(t, p, mj)
         print(f"jumps over {mj} m: {len(rows)}, origin-preserving: {sum(r[6] for r in rows)}")
-        print("  t_s     jump_m  r_before  r_after  angle_deg  origin  axis")
+        print("  t_s     jump_m  r_before  r_after  angle_deg  orient_deg  origin  axis")
         for i, d, r0, r1, ang, ax, keep in rows:
-            print(f"  {(t[i] - t[0]) / 1e9:8.1f} {d:7.1f} {r0:8.1f} {r1:8.1f} {ang:8.1f}   {'yes' if keep else 'no ':3s}   "
-                  f"({ax[0]:.2f}, {ax[1]:.2f}, {ax[2]:.2f})")
+            orient = rotation_deg(q2R(q[i]) @ q2R(q[i - 1]).T)
+            print(f"  {(t[i] - t[0]) / 1e9:8.1f} {d:7.1f} {r0:8.1f} {r1:8.1f} {ang:8.1f} {orient:9.1f}     "
+                  f"{'yes' if keep else 'no ':3s}   ({ax[0]:.2f}, {ax[1]:.2f}, {ax[2]:.2f})")
         return 0
     if len(argv) == 3 and argv[0] == "segrot":
         t, p = load_traj(argv[1]); kfs, meta = load_session(argv[2])
