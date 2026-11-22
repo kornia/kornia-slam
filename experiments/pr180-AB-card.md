@@ -231,3 +231,8 @@ neighbours' baseline), and K3 (R_01 SE3 guard missed in 2/3, R_03 tracked below 
 the evidence above: nothing was withheld on LaMAria, and an Observe arm running the same code sits inside BASE's
 async spread. The knob stays Off
 (default) until the owner rules on K4/M2 and the IMU-voter finding; stage 2 waits for the cleanup card.
+
+## Owner rulings (2026-11-22)
+
+- **K4 / M2:** the overrule is accepted. Stage 1 (`Gate`) stands. The knob stays `Off` in code until the cleanup card decides whether to promote it.
+- **IMU-voter finding:** fix it by carrying the IMU reference chunk across a keyframe inserted while still. This is its own follow-up card (AB-1b), before stage 2, and it covers the lost case.
