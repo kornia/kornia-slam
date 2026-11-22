@@ -81,6 +81,15 @@ impl AskOutcome {
     }
 }
 
+/// What [`StillnessState::sync`] did with the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunStart {
+    Unchanged,
+    Started,
+    /// The keyframe was inserted on a frame judged still: the run goes on.
+    Carried,
+}
+
 /// The run since the last keyframe and the detector's tallies.
 #[derive(Debug, Default)]
 pub(crate) struct StillnessState {
@@ -91,23 +100,48 @@ pub(crate) struct StillnessState {
     run_counted: bool,
     /// The verdict of the frame judged last, so every caller on a frame gets the same one.
     judged: Option<(usize, Verdict)>,
+    /// The stamp of the frame judged last, when it was still.
+    last_still_sec: Option<f64>,
     ask_counted: Option<usize>,
     pub(crate) counters: StillnessCounters,
 }
 
 impl StillnessState {
-    /// Restarts the run when the last keyframe changed; no run without one.
-    /// Returns whether a run started.
-    fn sync(&mut self, last_keyframe: Option<(usize, f64)>) -> bool {
+    /// Follows the last keyframe: carries the open run when the keyframe was
+    /// inserted on a frame judged still, restarts it otherwise; no run
+    /// without a keyframe.
+    fn sync(&mut self, last_keyframe: Option<(usize, f64)>) -> RunStart {
         let current = self.run.as_ref().map(|r| (r.kf_idx, self.run_start_sec));
         if current == last_keyframe {
-            return false;
+            return RunStart::Unchanged;
+        }
+        self.run_start_sec = last_keyframe.map_or(0.0, |(_, t)| t);
+        self.run_counted = false;
+        if let Some((idx, t)) = last_keyframe
+            && self.last_still_sec == Some(t)
+            && self.closed_by.is_none()
+            && let Some(run) = self.run.as_mut().filter(|r| r.is_open())
+        {
+            run.carry_to(idx);
+            self.counters.runs_carried += 1;
+            return RunStart::Carried;
         }
         self.run = last_keyframe.map(|(idx, t)| StillRun::new(idx, t));
-        self.run_start_sec = last_keyframe.map_or(0.0, |(_, t)| t);
         self.closed_by = None;
-        self.run_counted = false;
-        self.run.is_some()
+        if self.run.is_some() {
+            RunStart::Started
+        } else {
+            RunStart::Unchanged
+        }
+    }
+
+    /// The judged end of a run still open: the samples after it must stay
+    /// buffered, or a carried run would close on a hole.
+    pub(super) fn unjudged_from(&self) -> Option<f64> {
+        self.run
+            .as_ref()
+            .filter(|r| r.is_open() && self.closed_by.is_none())
+            .map(StillRun::end_sec)
     }
 
     /// Where the next IMU chunk starts, once one is due at `newest_sec`.
@@ -134,8 +168,10 @@ impl StillnessState {
         }
         self.counters.runs_closed_imu += 1;
         let (stat, threshold) = run.closing().unwrap_or((f64::NAN, f64::NAN));
+        let ref_age = run.end_sec() - run.reference_sec().unwrap_or(f64::NAN);
         Some(format!(
-            "[still] run kf={} closed by={} at={:.3} stat={stat:.4} threshold={threshold:.4}",
+            "[still] run kf={} closed by={} at={:.3} stat={stat:.4} threshold={threshold:.4} \
+             ref_age={ref_age:.1}",
             run.kf_idx,
             closer.name(),
             run.end_sec()
@@ -158,6 +194,7 @@ impl StillnessState {
         };
         self.count(verdict);
         self.judged = Some((frame_idx, verdict));
+        self.last_still_sec = verdict.still().then_some(t);
         (verdict, true)
     }
 
@@ -251,10 +288,23 @@ impl SlamSystem {
             .state
             .last_keyframe_idx
             .zip(self.inertial.last_keyframe_timestamp_sec);
-        if self.stillness.sync(last)
-            && let Some((idx, t)) = last
-        {
-            self.dbg(format!("[still] run kf={idx} t={t:.3} started"));
+        let start = self.stillness.sync(last);
+        if let Some((idx, t)) = last {
+            match start {
+                RunStart::Started => self.dbg(format!("[still] run kf={idx} t={t:.3} started")),
+                RunStart::Carried => {
+                    let ref_t = self
+                        .stillness
+                        .run
+                        .as_ref()
+                        .and_then(StillRun::reference_sec)
+                        .unwrap_or(f64::NAN);
+                    self.dbg(format!(
+                        "[still] run kf={idx} t={t:.3} carried ref_t={ref_t:.3}"
+                    ));
+                }
+                RunStart::Unchanged => {}
+            }
         }
         let Some(imu) = self.rig.imu.as_ref().map(|imu| imu.noise) else {
             return;
@@ -433,9 +483,55 @@ mod tests {
 
     fn state_on_keyframe() -> StillnessState {
         let mut state = StillnessState::default();
-        assert!(state.sync(Some((4, 1.0))));
-        assert!(!state.sync(Some((4, 1.0))));
+        assert_eq!(state.sync(Some((4, 1.0))), RunStart::Started);
+        assert_eq!(state.sync(Some((4, 1.0))), RunStart::Unchanged);
         state
+    }
+
+    fn image(image: Option<NoiseDisplacement>) -> FrameVotes {
+        FrameVotes {
+            image,
+            wheels: None,
+        }
+    }
+
+    #[test]
+    fn a_keyframe_on_a_still_frame_carries_the_run() {
+        let mut state = state_on_keyframe();
+        assert!(state.judge(5, 1.05, image(still_image())).0.still());
+        assert_eq!(state.sync(Some((5, 1.05))), RunStart::Carried);
+        assert_eq!(state.run.as_ref().map(|r| r.kf_idx), Some(5));
+        assert_eq!(state.counters.runs_carried, 1);
+        assert_eq!(state.unjudged_from(), Some(1.0), "the judged end stays");
+        assert!(state.judge(6, 1.1, image(still_image())).0.still());
+        assert_eq!(state.counters.still_runs, 2, "a carried run counts again");
+    }
+
+    #[test]
+    fn a_keyframe_on_a_frame_not_still_restarts_the_run() {
+        let mut state = state_on_keyframe();
+        assert!(!state.judge(5, 1.05, FrameVotes::default()).0.still());
+        assert_eq!(state.sync(Some((5, 1.05))), RunStart::Started);
+        assert_eq!(state.unjudged_from(), Some(1.05));
+        assert_eq!(state.counters.runs_carried, 0);
+    }
+
+    #[test]
+    fn a_keyframe_stamped_off_the_still_frame_restarts_the_run() {
+        let mut state = state_on_keyframe();
+        assert!(state.judge(5, 1.05, image(still_image())).0.still());
+        assert_eq!(state.sync(Some((6, 1.1))), RunStart::Started);
+        assert_eq!(state.counters.runs_carried, 0);
+    }
+
+    #[test]
+    fn a_closed_run_restarts_at_the_next_keyframe() {
+        let mut state = state_on_keyframe();
+        assert!(state.judge(5, 1.05, image(still_image())).0.still());
+        state.close(Voter::Wheels);
+        assert_eq!(state.unjudged_from(), None);
+        assert_eq!(state.sync(Some((5, 1.05))), RunStart::Started);
+        assert_eq!(state.counters.runs_carried, 0);
     }
 
     #[test]

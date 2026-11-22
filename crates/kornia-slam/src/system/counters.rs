@@ -267,6 +267,8 @@ pub struct StillnessCounters {
     pub vouched_image: u64,
     pub vouched_imu: u64,
     pub vouched_wheels: u64,
+    /// Runs carried across a keyframe inserted on a still frame (card AB-1b).
+    pub runs_carried: u64,
 }
 
 impl RunCounters {

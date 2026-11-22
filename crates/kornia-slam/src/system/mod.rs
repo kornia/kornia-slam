@@ -1710,6 +1710,20 @@ impl SlamSystem {
         self.inertial.prune_before(t);
     }
 
+    /// Samples older than the last keyframe can't enter any future window
+    /// (the next edge and all per-frame predictions start at or after it),
+    /// except those an open still run has yet to judge.
+    fn prune_imu_after_frame(&mut self, timestamp_sec: f64) {
+        if let Some(kf_ts) = self.inertial.last_keyframe_timestamp_sec {
+            let floor = kf_ts.min(timestamp_sec);
+            let floor = self
+                .stillness
+                .unjudged_from()
+                .map_or(floor, |from| floor.min(from));
+            self.prune_imu_before(floor);
+        }
+    }
+
     /// Tracks the frame, then attempts VIBA0 on accepted keyframes once the
     /// window is ready and a retry is due.
     fn inertial_init_step(
@@ -2375,11 +2389,7 @@ impl SlamSystem {
             self.state.mark_tracked();
         }
         self.state.last_frame_timestamp_sec = timestamp_sec;
-        // Samples older than the last keyframe can't enter any future window
-        // (the next edge and all per-frame predictions start at or after it).
-        if let Some(kf_ts) = self.inertial.last_keyframe_timestamp_sec {
-            self.prune_imu_before(kf_ts.min(timestamp_sec));
-        }
+        self.prune_imu_after_frame(timestamp_sec);
         Ok(self.frame_result(status))
     }
 

@@ -674,6 +674,34 @@ mod stillness {
         assert_eq!(gate, vec![60]);
     }
 
+    /// A still rig that lost tracking at frame 21: each frame takes the lost
+    /// path's keyframe decision, with insertion emulated as in [`keyframes`],
+    /// and the buffer pruned as after every frame.
+    #[test]
+    fn a_lost_still_rig_keeps_one_lost_keyframe_per_heartbeat() {
+        let mut system = system(Stillness::Gate);
+        assert!(keyframes(&mut system, 1..21, &mut 0).is_empty());
+        let mut lost = Vec::new();
+        for idx in 21..141 {
+            let t = stamp(idx);
+            system.inertial.latest_image_timestamp_sec = Some(t);
+            system.process_imu(&rest_samples(idx));
+            system.advance_stillness();
+            let due = system.keyframe_due_while_lost(t);
+            if due && !system.withhold_lost_keyframe(idx, t, due) {
+                lost.push(idx);
+                system.inertial.last_keyframe_timestamp_sec = Some(t);
+            }
+            system.prune_imu_after_frame(t);
+        }
+        assert_eq!(lost, vec![60, 120]);
+        let c = system.run_counters().stillness;
+        assert!(c.vouched_imu >= 110, "{c:?}");
+        assert!(c.lost_keyframes_withheld >= 100, "{c:?}");
+        assert_eq!(c.runs_closed_imu, 0, "{c:?}");
+        assert_eq!(c.runs_carried, 2, "{c:?}");
+    }
+
     #[test]
     fn off_and_observe_change_no_decision() {
         let mut off = system(Stillness::Off);
