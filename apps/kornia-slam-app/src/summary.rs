@@ -205,7 +205,7 @@ fn format_stillness(c: &RunCounters) -> String {
         "[summary] stillness still_frames={} still_runs={} keyframe_asks_withheld={} \
          heartbeat_keyframes={} still_quality_keyframes={} lost_keyframes_withheld={} \
          runs_closed_imu={} runs_closed_image={} runs_closed_wheels={} vouched_image={} \
-         vouched_imu={} vouched_wheels={}",
+         vouched_imu={} vouched_wheels={} runs_carried={}",
         s.still_frames,
         s.still_runs,
         s.keyframe_asks_withheld,
@@ -218,6 +218,7 @@ fn format_stillness(c: &RunCounters) -> String {
         s.vouched_image,
         s.vouched_imu,
         s.vouched_wheels,
+        s.runs_carried,
     )
 }
 
@@ -445,6 +446,7 @@ mod tests {
             &mut s.vouched_image,
             &mut s.vouched_imu,
             &mut s.vouched_wheels,
+            &mut s.runs_carried,
         ]
         .into_iter()
         .enumerate()
@@ -457,7 +459,7 @@ mod tests {
             "[summary] stillness still_frames=1 still_runs=2 keyframe_asks_withheld=3 \
              heartbeat_keyframes=4 still_quality_keyframes=5 lost_keyframes_withheld=6 \
              runs_closed_imu=7 runs_closed_image=8 runs_closed_wheels=9 vouched_image=10 \
-             vouched_imu=11 vouched_wheels=12"
+             vouched_imu=11 vouched_wheels=12 runs_carried=13"
         );
     }
 
