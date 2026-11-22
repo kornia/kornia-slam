@@ -89,7 +89,7 @@ use crate::mapping::session::{SessionKeyframe, SessionLandmark, snapshot_map};
 use crate::mapping::{
     GrowthNeighbours, KeyframeGrowth, KeyframeJob, KeyframeSeed, LocalMapping, SegmentId,
 };
-use crate::pose_conversion::{RIGID_TOLERANCE, apply_reference_pose_correction};
+use crate::pose_conversion::{RIGID_TOLERANCE, angle_deg, apply_reference_pose_correction};
 use build::SystemSettings;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, Mat9F64, Vec3F64};
@@ -202,6 +202,8 @@ pub struct SlamSystem {
     runaway: RunawayDetector,
     tilt: TiltMonitor,
     segments: Segments,
+    /// When the current segment's bootstrap finished, for the young-death count.
+    segment_begun_sec: Option<f64>,
     relocalization: LostRelocalization,
     tracking_config: TrackingConfig,
     growth_neighbours: GrowthNeighbours,
@@ -369,6 +371,7 @@ impl SlamSystem {
             ),
             tilt: TiltMonitor::default(),
             segments: Segments::default(),
+            segment_begun_sec: None,
             relocalization: settings.relocalization,
             tracking_config: settings.tracking,
             growth_neighbours: settings.growth_neighbours,
@@ -1649,6 +1652,7 @@ impl SlamSystem {
     /// A segment re-seeded with the inertial state kept tracks inertially at once.
     fn finish_bootstrap(&mut self, kf_idx: usize, timestamp_sec: f64) {
         self.segments.begin(kf_idx);
+        self.segment_begun_sec = Some(timestamp_sec);
         self.window_segment_start = (self.segments.latest() > 0).then_some(kf_idx);
         if self.segments_reported() {
             self.dbg(format!(
@@ -1790,12 +1794,36 @@ impl SlamSystem {
             init,
             start_kf_idx,
         )?;
+        let pose_before = self.state.pose_world_to_cam;
         self.state.adopt_inertial_initialization(applied.aligned);
         let pose = self.state.pose_world_to_cam;
+        self.count_later_alignment(&pose_before, &pose);
         self.note_pose("imu_init", self.next_frame_idx.saturating_sub(1), &pose);
         // The alignment rescaled and rotated the landmarks under the tracks (T3).
         self.refresh_track_positions();
         Ok(applied)
+    }
+
+    /// Card AC (G46): an alignment while a later segment is tracked moves
+    /// every older segment with it, so its size is counted.
+    fn count_later_alignment(&mut self, before: &Pose3d, after: &Pose3d) {
+        if self.segments.latest() == 0 {
+            return;
+        }
+        let jump_m = (recovery::camera_centre(after) - recovery::camera_centre(before)).length();
+        self.counters.later_alignments += 1;
+        counters::raise_milli_max(
+            &mut self.counters.later_alignment_mdeg_max,
+            angle_deg(before, after),
+        );
+        counters::raise_milli_max(&mut self.counters.later_alignment_jump_mm_max, jump_m);
+    }
+
+    fn count_young_death(&mut self, lost_since_sec: f64) {
+        let young = self
+            .segment_begun_sec
+            .is_some_and(|begun| lost_since_sec - begun < counters::YOUNG_SEGMENT_SEC);
+        self.counters.young_segment_deaths += u64::from(young);
     }
 
     fn resume_tracking_after_viba0(&mut self, timestamp_sec: f64, applied: AppliedInitialization) {
@@ -2270,6 +2298,7 @@ impl SlamSystem {
                     frame.idx, recently_lost_for, map_established,
                 ));
                 self.counters.give_ups += 1;
+                self.count_young_death(lost_since);
                 self.tracker.reset_tracks();
                 if self.give_up(&frame, recently_lost_for) {
                     // This frame's coast is already in the seed.
@@ -2853,6 +2882,12 @@ impl SlamSystem {
     /// is tilted past `max_tilt_deg`. Returns whether the inertial state was
     /// kept.
     fn give_up(&mut self, frame: &Frame, lost_for_sec: f64) -> bool {
+        let coasted = self.state.pose_world_to_cam;
+        let before = self.state.pose_before_loss.unwrap_or(coasted);
+        counters::raise_milli_max(
+            &mut self.counters.coast_mm_at_give_up_max,
+            (recovery::camera_centre(&coasted) - recovery::camera_centre(&before)).length(),
+        );
         let keep = self.recovery.keep_inertial && self.state.imu_initialized && frame.is_metric();
         if !keep {
             self.runaway.clear();
@@ -2860,8 +2895,6 @@ impl SlamSystem {
             return false;
         }
         let give_up_sec = self.state.lost_since_sec.unwrap_or(0.0) + lost_for_sec;
-        let coasted = self.state.pose_world_to_cam;
-        let before = self.state.pose_before_loss.unwrap_or(coasted);
         // The last tracked pose is a frame older than the loss (G7).
         let coast_sec = self
             .state
@@ -2930,6 +2963,10 @@ impl SlamSystem {
             },
         ));
         self.counters.reseeds += 1;
+        counters::raise_milli_max(
+            &mut self.counters.seed_rotation_mdeg_max,
+            angle_deg(&before, &seed),
+        );
         self.reseed_held = !plausible;
         if self.reseed_held {
             self.counters.reseeds_held += 1;

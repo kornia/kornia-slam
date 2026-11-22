@@ -188,6 +188,39 @@ pub struct RunCounters {
     pub growth_queue_max: u64,
     /// Most frames between a keyframe and the frame that saw its growth done.
     pub growth_lag_frames_max: u64,
+    /// Inertial alignments applied while a segment after the first was
+    /// tracked: each rotates every older segment about the origin (card AC, G46).
+    pub later_alignments: u64,
+    /// Largest rotation of those alignments, in thousandths of a degree.
+    pub later_alignment_mdeg_max: u64,
+    /// Largest jump of the tracking camera centre they caused, in millimetres.
+    pub later_alignment_jump_mm_max: u64,
+    /// Re-seeds placed at the last tracked position with the gyro's attitude
+    /// by `reseed.seed: Held`.
+    pub seeds_gyro_held: u64,
+    /// Largest rotation of a re-seed from the last tracked pose, in
+    /// thousandths of a degree: the gyro's turn over the loss.
+    pub seed_rotation_mdeg_max: u64,
+    /// Give-ups of a segment lost less than 3 s after it began.
+    pub young_segment_deaths: u64,
+    /// Give-ups `reseed.seed: Held` sent down the cold path because VIBA2
+    /// had not run yet.
+    pub keeps_refused_before_viba2: u64,
+    /// Longest coast at a give-up, from the last tracked camera centre to the
+    /// coasted one, in millimetres.
+    pub coast_mm_at_give_up_max: u64,
+}
+
+/// Age, seconds, under which a segment's give-up counts as a young death:
+/// the 2 s IMU confidence plus the 0.5 s grace leave it no trusted coast.
+pub(crate) const YOUNG_SEGMENT_SEC: f64 = 3.0;
+
+/// Raises `slot`, held in thousandths of the unit, to `value` if larger;
+/// a non-finite value is not counted.
+pub(crate) fn raise_milli_max(slot: &mut u64, value: f64) {
+    if value.is_finite() {
+        *slot = (*slot).max((value.abs() * 1e3).round() as u64);
+    }
 }
 
 impl RunCounters {
