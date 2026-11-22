@@ -1,8 +1,11 @@
 //! Rotation-compensated parallax between a keyframe and the current frame,
-//! the motion measure behind [`super::KeyframePolicy::min_parallax_px`].
+//! the motion measure behind [`super::KeyframePolicy::min_parallax_px`], and the
+//! pixel-noise displacement an image stillness vote reads.
 
 use crate::frame::Frame;
+use crate::inertial::still::Z_999;
 use crate::mapping::map::Map;
+use crate::mapping::visual_information::VisualInformation;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, Vec3F64};
@@ -28,7 +31,26 @@ pub fn median_parallax_px(
         .compose(&keyframe.frame.pose_world_to_cam.inverse())
         .rotation;
     // Rotation compensation holds between primary-camera views only.
-    let pairs = matches.iter().filter_map(|&(mp_idx, feature)| {
+    let pairs =
+        primary_feature_pairs(map, keyframe_idx, current, matches).filter_map(|(kf, cur)| {
+            Some((
+                keyframe.frame.undistorted_xy(kf, camera)?,
+                current.undistorted_xy(cur, camera)?,
+            ))
+        });
+    median_compensated_parallax_px(camera, &rotation_cur_from_kf, pairs)
+}
+
+/// `(keyframe feature, current feature)` of each match that both views see
+/// in the primary camera; a match whose landmark is retired or not observed
+/// by the keyframe is skipped.
+fn primary_feature_pairs<'a>(
+    map: &'a Map,
+    keyframe_idx: usize,
+    current: &'a Frame,
+    matches: &'a [(usize, usize)],
+) -> impl Iterator<Item = (usize, usize)> + 'a {
+    matches.iter().filter_map(move |&(mp_idx, feature)| {
         if current.camera_of(feature) != 0 {
             return None;
         }
@@ -39,12 +61,69 @@ pub fn median_parallax_px(
             .find(|o| o.key.keyframe_idx == keyframe_idx && o.camera == 0)?
             .key
             .feature_idx;
-        Some((
-            keyframe.frame.undistorted_xy(kf_feature, camera)?,
-            current.undistorted_xy(feature, camera)?,
-        ))
-    });
-    median_compensated_parallax_px(camera, &rotation_cur_from_kf, pairs)
+        Some((kf_feature, feature))
+    })
+}
+
+/// Fewest matched features an image stillness vote needs (OpenVINS
+/// `UpdaterZeroVelocity.cpp:228-231`).
+pub(crate) const MIN_STILL_PAIRS: usize = 20;
+
+/// The median of `d² / (σ_cur² + σ_kf²)` over the matched primary-camera
+/// features, `d` the pixel displacement against the keyframe (not rotation
+/// compensated, so a turn moves it too) and `σ` each keypoint's pixel noise.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct NoiseDisplacement {
+    pub(crate) median: f64,
+    pub(crate) pairs: usize,
+}
+
+impl NoiseDisplacement {
+    /// At rest each term is χ²₂, whose median is `ln 4` and whose sample
+    /// median has a spread of about `2 / √n`; the bound is that median plus
+    /// the 99.9 % quantile of the spread.
+    pub(crate) fn bound(pairs: usize) -> f64 {
+        4f64.ln() + Z_999 * 2.0 / (pairs as f64).sqrt()
+    }
+
+    pub(crate) fn is_still(&self) -> bool {
+        self.median <= Self::bound(self.pairs)
+    }
+}
+
+/// The image stillness statistic of `current` against keyframe
+/// `keyframe_idx`; `None` under [`MIN_STILL_PAIRS`] usable matches.
+pub(crate) fn median_normalized_displacement(
+    map: &Map,
+    keyframe_idx: usize,
+    current: &Frame,
+    matches: &[(usize, usize)],
+    camera: &PinholeCamera,
+    information: VisualInformation,
+) -> Option<NoiseDisplacement> {
+    let keyframe = map.get_keyframe(keyframe_idx)?;
+    let sigma_sq = |frame: &Frame, i: usize| {
+        let sigma = information.sigma_px(frame.features.octaves.get(i).copied().unwrap_or(0));
+        f64::from(sigma * sigma)
+    };
+    let mut terms: Vec<f64> = primary_feature_pairs(map, keyframe_idx, current, matches)
+        .filter_map(|(kf, cur)| {
+            let a = keyframe.frame.undistorted_xy(kf, camera)?;
+            let b = current.undistorted_xy(cur, camera)?;
+            let d_sq = f64::from(b[0] - a[0]).powi(2) + f64::from(b[1] - a[1]).powi(2);
+            let q = d_sq / (sigma_sq(current, cur) + sigma_sq(&keyframe.frame, kf));
+            q.is_finite().then_some(q)
+        })
+        .collect();
+    if terms.len() < MIN_STILL_PAIRS {
+        return None;
+    }
+    let mid = terms.len() / 2;
+    terms.select_nth_unstable_by(mid, f64::total_cmp);
+    Some(NoiseDisplacement {
+        median: terms[mid],
+        pairs: terms.len(),
+    })
 }
 
 /// Median pixel distance between each current-frame pixel and its keyframe
@@ -143,8 +222,8 @@ pub(crate) mod tests {
         map_with_keyframe_seeing(kf_pose, points_before(&kf_pose))
     }
 
-    /// A map whose keyframe 0 sits at `kf_pose` and observes `pts` as
-    /// landmarks, feature `i` = landmark `i`.
+    /// A map whose keyframe 0 at `kf_pose` observes `pts` as landmarks, feature
+    /// `i` = landmark `i`.
     pub(crate) fn map_with_keyframe_seeing(kf_pose: Pose3d, pts: Vec<Vec3F64>) -> Map {
         let mut map = Map::new();
         map.insert_keyframe(Keyframe::from_frame(frame_seeing_points(0, kf_pose, &pts)))
@@ -257,5 +336,47 @@ pub(crate) mod tests {
             median_compensated_parallax_px(&camera(), &Mat3F64::IDENTITY, []),
             None
         );
+    }
+
+    /// 30 landmarks 4 m in front of the identity camera.
+    pub(crate) fn grid() -> Vec<Vec3F64> {
+        (0..30)
+            .map(|i| Vec3F64::new((i % 6) as f64 * 0.3 - 0.75, (i / 6) as f64 * 0.3 - 0.6, 4.0))
+            .collect()
+    }
+
+    fn displacement(shift_px: f32, matches: &[(usize, usize)]) -> Option<NoiseDisplacement> {
+        let pts = grid();
+        let map = map_with_keyframe_seeing(Pose3d::IDENTITY, pts.clone());
+        let mut current = frame_seeing_points(5, Pose3d::IDENTITY, &pts);
+        for kp in &mut current.features.keypoints_xy {
+            kp[0] += shift_px;
+        }
+        median_normalized_displacement(
+            &map,
+            0,
+            &current,
+            matches,
+            &camera(),
+            VisualInformation::Unit,
+        )
+    }
+
+    #[test]
+    fn static_pairs_are_still_and_a_three_pixel_shift_is_not() {
+        let all: Vec<(usize, usize)> = (0..30).map(|i| (i, i)).collect();
+        let still = displacement(0.5, &all).expect("30 pairs");
+        assert_eq!(still.pairs, 30);
+        assert!(still.is_still(), "{still:?}");
+        let moved = displacement(3.0, &all).expect("30 pairs");
+        assert!(!moved.is_still(), "{moved:?}");
+        // 2 px of motion at n = 100 is the bound (σ = 1 px per keypoint).
+        assert!((NoiseDisplacement::bound(100) * 2.0 - 4.0).abs() < 0.02);
+    }
+
+    #[test]
+    fn under_twenty_pairs_gives_no_vote() {
+        let few: Vec<(usize, usize)> = (0..19).map(|i| (i, i)).collect();
+        assert_eq!(displacement(0.0, &few), None);
     }
 }
