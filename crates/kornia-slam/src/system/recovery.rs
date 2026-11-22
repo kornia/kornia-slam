@@ -57,6 +57,23 @@ pub struct RecoveryConfig {
     pub young_map_grace_sec: f64,
     /// Fewest stereo points that seed a map from a cold start (card I).
     pub min_cold_start_points: usize,
+    /// Where a re-seed that keeps the inertial state starts (card AC).
+    pub seed: SeedPlacement,
+}
+
+/// Where a re-seed with the inertial state kept places the next segment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SeedPlacement {
+    /// At the coasted pose with its velocity and an IMU bridge when the coast
+    /// is plausible, else held at the last tracked position.
+    #[default]
+    CoastedIfPlausible,
+    /// Always held: the gyro's attitude at the last tracked position, at
+    /// rest, with no bridge. The inertial state is kept only once VIBA2 has
+    /// run (ORB-SLAM3 `Tracking.cc:2149` resets before it); earlier give-ups
+    /// start cold.
+    Held,
 }
 
 impl Default for RecoveryConfig {
@@ -73,6 +90,7 @@ impl Default for RecoveryConfig {
             own_window_keyframes: 0,
             young_map_grace_sec: 0.0,
             min_cold_start_points: crate::initialization::bootstrap::MIN_STEREO_POINTS,
+            seed: SeedPlacement::CoastedIfPlausible,
         }
     }
 }

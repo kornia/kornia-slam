@@ -2229,6 +2229,10 @@ mod ron_files {
         assert_eq!(defaults.runaway_window_sec, 10.0);
         assert_eq!(defaults.max_bridge_sec, 10.0);
         assert_eq!(defaults.bridge_covariance_scale, 100.0);
+        assert_eq!(
+            defaults.seed,
+            crate::system::SeedPlacement::CoastedIfPlausible
+        );
 
         let config = parse(
             "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (reseed: (keep_inertial: true, min_seed_points: 10, max_tilt_deg: 7.5)))))",
@@ -2240,6 +2244,31 @@ mod ron_files {
             orb(&parse(&ron(&config)).unwrap()).tracking_loss.reseed,
             reseed
         );
+
+        let held = parse(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (reseed: (keep_inertial: true, seed: Held)))))",
+        )
+        .unwrap();
+        let reseed = orb(&held).tracking_loss.reseed;
+        assert_eq!(reseed.seed, crate::system::SeedPlacement::Held);
+        assert_eq!(
+            orb(&parse(&ron(&held)).unwrap()).tracking_loss.reseed,
+            reseed
+        );
+        assert_eq!(held.validate(), Ok(()));
+    }
+
+    /// Card AC: a held seed only places a re-seed that keeps the inertial state.
+    #[test]
+    fn a_held_seed_needs_the_kept_inertial_state() {
+        assert!(matches!(
+            parse(
+                "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (reseed: (seed: Held)))))"
+            ),
+            Err(LoadError::Invalid(
+                ConfigError::HeldSeedWithoutKeptInertialState
+            ))
+        ));
     }
 
     /// Card E's Orin 2-core preset, as `configs/lamaria-rig-imu-orin2.ron` sets it.
@@ -2358,7 +2387,7 @@ fn knobs_that_read_the_imu_are_refused_without_it() {
         config.validate()
     };
     type SetKnob<'a> = &'a dyn Fn(&mut OrbSlamPipeline);
-    let knobs: [(&str, SetKnob); 3] = [
+    let knobs: [(&str, SetKnob); 4] = [
         ("mapping.local_ba.lost_keyframes", &|orb| {
             orb.mapping.local_ba.lost_keyframes = LostKeyframes::FixedInertial
         }),
@@ -2367,6 +2396,10 @@ fn knobs_that_read_the_imu_are_refused_without_it() {
         }),
         ("tracking_loss.reseed.keep_inertial", &|orb| {
             orb.tracking_loss.reseed.keep_inertial = true
+        }),
+        ("tracking_loss.reseed.seed", &|orb| {
+            orb.tracking_loss.reseed.keep_inertial = true;
+            orb.tracking_loss.reseed.seed = crate::system::SeedPlacement::Held;
         }),
     ];
     for (knob, set) in knobs {

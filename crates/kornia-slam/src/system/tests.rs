@@ -2067,6 +2067,116 @@ mod recovery_after_loss {
         }
         assert_eq!(system.counters.reseeds, 1);
     }
+
+    fn held_system(coast_x: f64) -> SlamSystem {
+        let mut system = lost_metric_system(coast_x);
+        system.recovery.seed = recovery::SeedPlacement::Held;
+        system
+    }
+
+    /// Card AC: under `Held` a plausible coast is no seed; the attitude is
+    /// the coasted (gyro) one at the last tracked centre, at rest, unbridged.
+    #[test]
+    fn a_held_reseed_takes_the_gyro_attitude_at_the_last_tracked_centre() {
+        let mut system = held_system(3.1);
+        let turned = kornia_algebra::Mat3F64::from_cols(
+            Vec3F64::new(0.0, 0.0, -1.0),
+            Vec3F64::new(0.0, 1.0, 0.0),
+            Vec3F64::new(1.0, 0.0, 0.0),
+        );
+        let coasted = centred_at(3.1);
+        system.state.pose_world_to_cam =
+            Pose3d::new(turned, -(turned * recovery::camera_centre(&coasted)));
+
+        assert!(system.give_up(&stereo_frame(140), 0.5));
+
+        let state = &system.state;
+        assert!(state.reseeding());
+        let centre = recovery::camera_centre(&state.pose_world_to_cam);
+        assert!(
+            (centre - Vec3F64::new(1.0, 0.0, 0.0)).length() < 1e-9,
+            "{centre:?}"
+        );
+        assert!(
+            crate::pose_conversion::angle_deg(
+                &state.pose_world_to_cam,
+                &Pose3d::new(turned, Vec3F64::ZERO)
+            ) < 1e-6
+        );
+        assert_eq!(state.velocity_world, Vec3F64::ZERO);
+        assert_eq!(state.bridge_anchor, None);
+        let counters = &system.counters;
+        assert_eq!(
+            (
+                counters.reseeds,
+                counters.reseeds_held,
+                counters.seeds_gyro_held
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(counters.seed_rotation_mdeg_max, 90_000);
+        assert_eq!(counters.coast_mm_at_give_up_max, 2_100);
+    }
+
+    #[test]
+    fn a_held_give_up_before_viba2_starts_cold_and_is_counted() {
+        let mut system = held_system(3.1);
+        system.inertial.schedule.start(40, 2.0);
+
+        assert!(!system.give_up(&stereo_frame(140), 0.5));
+
+        assert!(!system.state.imu_initialized);
+        assert_eq!(system.counters.keeps_refused_before_viba2, 1);
+        assert_eq!(system.counters.reseeds, 0);
+    }
+
+    /// A held re-seed keeps gravity: the next segment tracks at once and no
+    /// refinement re-aligns the world under its first keyframes (G46).
+    #[test]
+    fn a_held_reseed_leaves_the_world_epoch_alone_through_the_new_segment() {
+        let mut system = held_system(3.1);
+        system.give_up(&stereo_frame(140), 0.5);
+        let epoch = system.map.lock().unwrap().world_epoch();
+
+        system.finish_bootstrap(141, 15.0);
+        for t in [20.5, 30.5, 45.0] {
+            system.refine_inertial_init(t);
+        }
+
+        assert_eq!(system.state.mode, SystemMode::Tracking);
+        assert_eq!(system.map.lock().unwrap().world_epoch(), epoch);
+        assert_eq!(system.counters.later_alignments, 0);
+    }
+
+    #[test]
+    fn the_seed_placement_defaults_to_todays_coasted_seed() {
+        assert_eq!(
+            RecoveryConfig::default().seed,
+            recovery::SeedPlacement::CoastedIfPlausible
+        );
+        let mut system = lost_metric_system(3.1);
+        system.give_up(&stereo_frame(140), 0.5);
+        assert_eq!(system.state.pose_world_to_cam, centred_at(3.1));
+        assert_eq!(system.counters.seeds_gyro_held, 0);
+    }
+
+    /// A reset before any inertial alignment (R_01's start-up reset, G31)
+    /// leaves no aligned world, so the next segment's VIBA0-2 are no later
+    /// alignment; a segment after an aligned one is (G46).
+    #[test]
+    fn only_an_alignment_after_an_aligned_segment_counts_as_later() {
+        let mut system = lost_metric_system(1.0);
+        system.segments.begin(0);
+        system.segments.begin(5);
+        system.count_later_alignment(&centred_at(0.0), &centred_at(0.0));
+        system.count_later_alignment(&centred_at(0.0), &centred_at(0.2));
+        assert_eq!(system.counters.later_alignments, 0);
+
+        system.segments.begin(9);
+        system.count_later_alignment(&centred_at(1.0), &centred_at(4.0));
+        assert_eq!(system.counters.later_alignments, 1);
+        assert_eq!(system.counters.later_alignment_jump_mm_max, 3_000);
+    }
 }
 
 mod adoption {

@@ -188,8 +188,9 @@ pub struct RunCounters {
     pub growth_queue_max: u64,
     /// Most frames between a keyframe and the frame that saw its growth done.
     pub growth_lag_frames_max: u64,
-    /// Inertial alignments applied while a segment after the first was
-    /// tracked: each rotates every older segment about the origin (card AC, G46).
+    /// Inertial alignments applied in a later segment than the first aligned
+    /// one: each rotates every older, already aligned segment about the
+    /// origin (card AC, G46).
     pub later_alignments: u64,
     /// Largest rotation of those alignments, in thousandths of a degree.
     pub later_alignment_mdeg_max: u64,

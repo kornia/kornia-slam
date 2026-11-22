@@ -9,7 +9,7 @@ use super::config::{
     StereoCloseDepth, StereoDepthSigma, SystemConfig, TrackRefill, TrackingConfig,
     TrackingLossConfig,
 };
-use super::recovery::RecoveryConfig;
+use super::recovery::{RecoveryConfig, SeedPlacement};
 use crate::inertial::MAX_BUFFERED_SEC;
 use crate::inertial::trust::ImuTrustMode;
 use crate::initialization::two_view::TwoViewInitConfig;
@@ -80,6 +80,11 @@ pub enum ConfigError {
     LargeWindowNotLarger { active: usize, large: usize },
     #[error("{0} needs the IMU: select sensors.imu")]
     InertialKnobWithoutImu(&'static str),
+    #[error(
+        "tracking_loss.reseed.seed Held places a re-seed that keeps the inertial state: \
+         set tracking_loss.reseed.keep_inertial"
+    )]
+    HeldSeedWithoutKeptInertialState,
     #[error(
         "tracking.snapback_fix AnchorNextFrame is part of tracking.pose_inertial: set one of them"
     )]
@@ -203,6 +208,15 @@ impl OrbSlamPipeline {
 
 /// A kept inertial state needs the IMU (G12).
 fn validate_recovery(recovery: &RecoveryConfig, imu: bool) -> Result<(), ConfigError> {
+    let held = recovery.seed == SeedPlacement::Held;
+    if held && !imu {
+        return Err(ConfigError::InertialKnobWithoutImu(
+            "tracking_loss.reseed.seed",
+        ));
+    }
+    if held && !recovery.keep_inertial {
+        return Err(ConfigError::HeldSeedWithoutKeptInertialState);
+    }
     if recovery.keep_inertial && !imu {
         return Err(ConfigError::InertialKnobWithoutImu(
             "tracking_loss.reseed.keep_inertial",

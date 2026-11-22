@@ -32,7 +32,7 @@ pub use counters::{RunCounters, SkipKind};
 #[cfg(feature = "serde")]
 pub use file::LoadError;
 pub use input::ProcessError;
-pub use recovery::RecoveryConfig;
+pub use recovery::{RecoveryConfig, SeedPlacement};
 pub use state::{TrackingResult, TrackingStatus};
 pub use trace::{FrameTrace, TraceMapPoint, TraceTrack};
 pub use validation::ConfigError;
@@ -204,6 +204,9 @@ pub struct SlamSystem {
     segments: Segments,
     /// When the current segment's bootstrap finished, for the young-death count.
     segment_begun_sec: Option<f64>,
+    /// The segment the first inertial alignment was applied in: a later
+    /// segment's alignment rotates that already gravity-aligned world.
+    first_aligned_segment: Option<SegmentId>,
     relocalization: LostRelocalization,
     tracking_config: TrackingConfig,
     growth_neighbours: GrowthNeighbours,
@@ -372,6 +375,7 @@ impl SlamSystem {
             tilt: TiltMonitor::default(),
             segments: Segments::default(),
             segment_begun_sec: None,
+            first_aligned_segment: None,
             relocalization: settings.relocalization,
             tracking_config: settings.tracking,
             growth_neighbours: settings.growth_neighbours,
@@ -1804,10 +1808,13 @@ impl SlamSystem {
         Ok(applied)
     }
 
-    /// Card AC (G46): an alignment while a later segment is tracked moves
-    /// every older segment with it, so its size is counted.
+    /// Card AC (G46): an alignment in a later segment than the first aligned
+    /// one moves the already gravity-aligned older segments with it, so its
+    /// size is counted. Segments reset before any alignment (a start-up
+    /// reset) hold no aligned world, so their successor's alignment is not.
     fn count_later_alignment(&mut self, before: &Pose3d, after: &Pose3d) {
-        if self.segments.latest() == 0 {
+        let segment = self.segments.latest();
+        if *self.first_aligned_segment.get_or_insert(segment) == segment {
             return;
         }
         let jump_m = (recovery::camera_centre(after) - recovery::camera_centre(before)).length();
@@ -2879,8 +2886,9 @@ impl SlamSystem {
     /// over the runaway window), with an IMU bridge from the last keyframe;
     /// otherwise at the last tracked position, at rest. Either way the seed
     /// takes the gyro's attitude, levelled when the measured specific force
-    /// is tilted past `max_tilt_deg`. Returns whether the inertial state was
-    /// kept.
+    /// is tilted past `max_tilt_deg`. Under [`SeedPlacement::Held`] the seed
+    /// is always held, and only after VIBA2. Returns whether the inertial
+    /// state was kept.
     fn give_up(&mut self, frame: &Frame, lost_for_sec: f64) -> bool {
         let coasted = self.state.pose_world_to_cam;
         let before = self.state.pose_before_loss.unwrap_or(coasted);
@@ -2888,8 +2896,12 @@ impl SlamSystem {
             &mut self.counters.coast_mm_at_give_up_max,
             (recovery::camera_centre(&coasted) - recovery::camera_centre(&before)).length(),
         );
+        let held = self.recovery.seed == SeedPlacement::Held;
         let keep = self.recovery.keep_inertial && self.state.imu_initialized && frame.is_metric();
-        if !keep {
+        // Under `Held`, gravity is kept only once VIBA2 has refined it.
+        let refused = keep && held && self.inertial.schedule.recently_initialized();
+        self.counters.keeps_refused_before_viba2 += u64::from(refused);
+        if !keep || refused {
             self.runaway.clear();
             self.state.reset_after_loss();
             return false;
@@ -2900,7 +2912,8 @@ impl SlamSystem {
             .state
             .pose_before_loss_sec
             .map_or(lost_for_sec, |before_sec| give_up_sec - before_sec);
-        let plausible = !self.runaway.runaway()
+        let plausible = !held
+            && !self.runaway.runaway()
             && recovery::coast_is_plausible(
                 &before,
                 &coasted,
@@ -2971,6 +2984,7 @@ impl SlamSystem {
         if self.reseed_held {
             self.counters.reseeds_held += 1;
         }
+        self.counters.seeds_gyro_held += u64::from(held);
         self.reseed_coast_from_sec = anchor.map_or(give_up_sec, |anchor| anchor.timestamp_sec);
         // No refinement re-aligns the world after a re-seed.
         self.inertial.schedule.close();
