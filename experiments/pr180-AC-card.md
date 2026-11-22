@@ -358,3 +358,9 @@ offline BA starting at the R_11 level. Score: 5_11 5.4 -> 25.9, 2_11 now Sim3-sc
 30.0), 1_19 unchanged within noise. The U component (`frame_velocity: PropagatedFromKeyframe`) inflates the accel
 bias on R_11 and fails the R_11 guard; it is not ready to ship with Held. Next decision for the owner: Held without U
 (H0) on the challenge sequences and the guard set, and AC-2b for the loss-onset velocity.
+
+**Correction note (2026-11-22, card AC-2b, owner answer 7; K4 itself is not re-worded).** The "4.4-7.6 m/s at loss
+onset" in the K4 line above is not the onset. In `W211aP-U-r1/score.txt` those are the 2-3 s and 3-5 s coast bins
+(4.40 and 7.63 m/s against GT 1.28 and 1.11). The 0-0.5 s bins are 1.43 against 1.02 m/s (W211aP-U) and 1.28 against
+0.68 m/s (W211c-KIU). Each runaway coast follows single-frame pose jumps (5.98 and 6.36 m on W211c-KIU, 11.39 m with
+a 47 deg turn on W211aP-U), then its speed ramps at +1.1 to +2.4 m/s^2; card AC-2b (`pr180-AC2b-card.md`) tests it.
