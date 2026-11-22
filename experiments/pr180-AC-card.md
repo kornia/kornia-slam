@@ -38,8 +38,16 @@ Baselines (F1 validation, one sample, $V=/home/edgar/dev/split/.pr180-fix/bench-
   Young deaths 36 (59 %) on 2_11, 115 (86 %) on 4_11. Rotation error across give-ups, median: 131 / 119 deg.
   Coast error at 3-5 s 6.9-7.1 m, hold 0.6 m. Keyframes over 4 m/s: 155 / 393 / 513 / 37 (1_19/2_11/4_11/5_11).
   CP oracle, restarts linked: 1_19 38.8, 3_18 32.1, R_11 56.3.
+Owner change (2026-11-22, after AC-0 round 1, K6): R0 below is retired as a gate. AC-0 and AC-1 are scored on each
+  run's own loss events (give-ups after the first VIBA2, coasts, restarts), with BASE and the variant run as a pair
+  from the same window or prefix on a quiet machine (load <= 4 before each pair, no other kornia-slam process). F1
+  event times are no longer the gate. `later_alignments` counts only alignments in a segment later than the first
+  aligned one (start-up resets before any alignment do not count). No distance threshold is needed: a world
+  never aligned holds nothing gravity-aligned to rotate, so the first alignment is the world's own levelling
+  whatever its size (R_01: 90.4 deg, 0.32 m); any later one rotates aligned keyframes (G46).
 Predictions, AC-0 (windows of section 4; paired BASE; DEBUG=1 on one BASE per window):
-  R0  each BASE window has >= 1 give-up after the first VIBA2, within 10 s of the F1 event time.
+  R0  (retired 2026-11-22, see the owner change above) each BASE window has >= 1 give-up after the first VIBA2,
+      within 10 s of the F1 event time.
   M0e angle between a later segment's printed VIBA0 gravity and (0, 9.81, 0) equals the single-frame
       origin-jump angle within 2 deg.                                  measured by: worldrot.py + [imu_init] lines
   M0a (unscored) at keyframes with |v| > 3 m/s: inliers, [predgap] trans, [vi_ba] edge |r_v|, [vel] src.
