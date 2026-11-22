@@ -163,6 +163,8 @@ pub(crate) struct StillRun {
     /// Whether the newest judged chunk was within the model's spread.
     newest_quiet: Option<bool>,
     vote: ImuVote,
+    /// Sample period of the newest judged chunk, seconds.
+    sample_period_sec: f64,
     /// `∫(ω - b̂_g) dt` over the judged chunks, rad; only with a known bias.
     rotation: Vec3F64,
     /// The statistic and threshold of the test that closed the run.
@@ -178,6 +180,7 @@ impl StillRun {
             reference_sec: None,
             newest_quiet: None,
             vote: ImuVote::Pending,
+            sample_period_sec: 0.0,
             rotation: Vec3F64::ZERO,
             closing: None,
         }
@@ -222,9 +225,11 @@ impl StillRun {
     }
 
     /// Whether the IMU vouches for rest at `t`: every chunk quiet and `t`
-    /// within one chunk of the judged end.
+    /// within one chunk of the judged end, plus the sample lag a hole
+    /// allows, since a frame can be stamped ahead of the newest sample.
     pub(crate) fn quiet_at(&self, t: f64) -> bool {
-        self.vote == ImuVote::Quiet && t <= self.end_sec + RUN_CHUNK_SEC
+        let lag = HOLE_PERIODS * self.sample_period_sec;
+        self.vote == ImuVote::Quiet && t <= self.end_sec + RUN_CHUNK_SEC + lag
     }
 
     /// Judges the samples after the judged end once a chunk's worth has
@@ -249,7 +254,8 @@ impl StillRun {
         let start = samples.partition_point(|m| m.timestamp < from);
         let chunk = &samples[start..];
         match judge_chunk(chunk, from, calib) {
-            Some(mean) => {
+            Some((mean, rate)) => {
+                self.sample_period_sec = 1.0 / rate;
                 self.reference_sec.get_or_insert(newest);
                 self.accept(mean, newest - from, view);
             }
@@ -283,9 +289,9 @@ impl StillRun {
     }
 }
 
-/// A chunk's means, or `None` when it has too few samples or a hole (a gap
-/// over [`HOLE_PERIODS`] sample periods, the start gap included).
-fn judge_chunk(chunk: &[ImuMeasurement], from: f64, calib: &ImuCalib) -> Option<ChunkMean> {
+/// A chunk's means and sample rate, or `None` when it has too few samples or
+/// a hole (a gap over [`HOLE_PERIODS`] sample periods, the start gap included).
+fn judge_chunk(chunk: &[ImuMeasurement], from: f64, calib: &ImuCalib) -> Option<(ChunkMean, f64)> {
     if chunk.len() < MIN_CHUNK_SAMPLES {
         return None;
     }
@@ -296,7 +302,7 @@ fn judge_chunk(chunk: &[ImuMeasurement], from: f64, calib: &ImuCalib) -> Option<
         return None;
     }
     let stats = ImuWindowStats::from_samples(chunk)?;
-    Some(ChunkMean::new(&stats, calib, rate))
+    Some((ChunkMean::new(&stats, calib, rate), rate))
 }
 
 #[cfg(test)]
@@ -567,6 +573,15 @@ mod tests {
         assert_eq!(run.vote(), ImuVote::Unknown, "Unknown holds within a run");
         run.carry_to(4);
         assert_eq!(run.vote(), ImuVote::Quiet, "the newest chunk is quiet");
+    }
+
+    #[test]
+    fn a_frame_ahead_of_the_samples_by_less_than_a_hole_is_vouched() {
+        let run = run_over(&imu(10.0, Vec3F64::ZERO, rest), None);
+        let edge = run.end_sec() + RUN_CHUNK_SEC;
+        let hole = HOLE_PERIODS / RATE;
+        assert!(run.quiet_at(edge + 0.9 * hole));
+        assert!(!run.quiet_at(edge + 1.1 * hole));
     }
 
     #[test]
