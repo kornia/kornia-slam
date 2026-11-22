@@ -12,6 +12,7 @@ Per primary loss it prints:
   speed:  SLAM and GT speeds over 0.25 s (5 frames), SLAM displacement taken into GT by the local rotation of the
           10 s before the loss; the median speed error over the first 0.5 s, and the slope of the speed error over
           the coast (m/s^2, least squares), with the SLAM speed at the start and the end.
+  coast:  the median coast position error 3-5 s after the last tracked frame (lossev.py's coast error, per loss).
 """
 import os, sys
 import numpy as np
@@ -52,6 +53,17 @@ def speeds(r, i, j, Rm):
     return np.array(rows).reshape(-1, 3)
 
 
+def coast_error(r, i, j, Rm):
+    last = i - 1; g0 = r.gt.pos(r.tsec[last])
+    if r.ts[last] not in r.traj or g0 is None: return []
+    p0, out = r.traj[r.ts[last]][0], []
+    for f in range(i, j):
+        age, g = r.tsec[f] - r.tsec[last], r.gt.pos(r.tsec[f])
+        if not 3 <= age < 5.1 or g is None or r.ts[f] not in r.traj: continue
+        out.append(float(np.linalg.norm(Rm @ (r.traj[r.ts[f]][0] - p0) - (g - g0))))
+    return out
+
+
 def report(r):
     print(f"body: GT-to-trajectory body rotation C {angle(r.C):.1f} deg")
     n = 0
@@ -81,6 +93,8 @@ def report(r):
               f"(slam {np.median(s[s[:, 0] < 0.5, 1]) if len(first) else np.nan:.2f}, "
               f"gt {np.median(s[s[:, 0] < 0.5, 2]) if len(first) else np.nan:.2f}); "
               f"slope {slope:+.2f} m/s^2 over {s[-1, 0]:.2f} s; slam speed {s[0, 1]:.2f} -> {s[-1, 1]:.2f} m/s")
+        e = coast_error(r, i, j, Rm)
+        print(f"  coast: error 3-5 s med {np.median(e) if len(e) else np.nan:.2f} m (n={len(e)})")
     print(f"primary losses: {n}")
 
 
