@@ -28,7 +28,17 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
   - 2_11: Sim3 failed in F1, 4.06 under H. Give-ups 61 against 21.
   - R_11: 55.54 against 26.92, a regression.
   - Across these runs: no world rotations (`later_alignments=0`), and 3_18 and 4_11 are still running.
-  - **R_11 regression (diagnosis, read-only):** both runs lose vision at about 370 s. F1 coasts at 1.45-1.81 m/s (GT 1.50-1.63) and recovers with no give-up. H enters the loss with |ba| 0.55-0.83 m/s² (F1 0.13-0.37), so its coast decelerates to 0.19 m/s and then runs to 2.4 m/s. Projection then finds 0-49 observations, and H gives up at 375.4 s. The Held segment inherits the bad state and dies again. Whether the bias gap comes from a knob (`frame_velocity: PropagatedFromKeyframe`, `keep_inertial`) or from async divergence is being tested on a paired BASE/H run.
+  - **R_11 regression (diagnosis, read-only):** both runs lose vision at about 370 s. F1 coasts at 1.45-1.81 m/s (GT 1.50-1.63) and recovers with no give-up. H enters the loss with |ba| 0.55-0.83 m/s² (F1 0.13-0.37), so its coast decelerates to 0.19 m/s and then runs to 2.4 m/s. Projection then finds 0-49 observations, and H gives up at 375.4 s. The Held segment inherits the bad state and dies again. **Cause found (card AC final):** `frame_velocity: PropagatedFromKeyframe` (U), not the Held seed.
+    - Keyframe |ba| at 360-370 s is 0.30-0.86 m/s² in every U run, against 0.01-0.54 without U.
+    - Without U, the paired runs score BASE 37.0, KI 39.8 and H0 (Held, no U) 30.9, all with 0 re-seeds. With U, U, KIU and H all fail Sim3.
+    - R_11_5cp CP spreads 31-55 across runs that behave identically, so one sample per sequence cannot gate it.
+- **#180, card AC verdict (`feat/loss-one-world`, `experiments/pr180-AC-card.md` there; 15 commits, unpushed).** Held keeps one world wherever it acts:
+  - `later_alignments` is 0 on every Held, KI and KIU run, against 3 per W511 window for BASE (85-94° world rotations).
+  - On 2_11 give-ups fall 61 to 21 and young deaths 59 % to 14 %; primary link rotation error is 10.9° against 132.3°.
+  - On R_01 with a 6 s blackout, the rotation error across the give-up is 4.1° against 125.6° for BASE.
+  - Offline BA on the H sessions starts from cost 1.25e8 (F1 8.1e10) and converges in 34 iterations.
+  - K3 fired (R_11 under U) and K4 fired (loss-onset speed 4.4-7.6 m/s against 1.1-1.3 m/s on W211aP-U and W211c-KIU); 3_18 and 4_11 were not run. All knobs stay at their defaults.
+  - Metric fixes: `lossev.py` fits the GT body frame once per sequence (104.8-105.9°) and slerps GT; the 4_11 heading error across give-ups is 83°, not 119°.
 - **#180, 1_19 start-up resets (diagnosis):** before VIBA0 the frame prediction is the last pose with zero velocity, and the gyro is unused. A start-up turn of 3.0-4.4° per frame gives a 29-32 px PnP residual against the 25 px gate, and 19-56-point maps reset at once. This leads to card AD (planned, approved; it starts after AC).
 - **Process:** the full-sequence regression gate (6 sequences, 2 runs each, no sequence below its baseline range) is now required before any knob is promoted (see "Now").
 - **Coverage (research, lamaria.ethz.ch and arXiv 2509.26639):**
