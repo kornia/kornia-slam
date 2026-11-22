@@ -178,7 +178,8 @@ fn format_loss(c: &RunCounters) -> String {
         "[summary] loss later_alignments={} later_alignment_deg_max={:.3} \
          later_alignment_jump_m_max={:.3} seeds_gyro_held={} seed_rotation_deg_max={:.3} \
          young_segment_deaths={} startup_segment_deaths={} keeps_refused_before_viba2={} \
-         coast_m_at_give_up_max={:.3}",
+         coast_m_at_give_up_max={:.3} pose_innovation_judged={} pose_innovation_over={} \
+         pose_innovation_rejects={} pose_innovation_unavailable={} pose_innovation_scale_max={:.3}",
         c.later_alignments,
         milli(c.later_alignment_mdeg_max),
         milli(c.later_alignment_jump_mm_max),
@@ -188,6 +189,11 @@ fn format_loss(c: &RunCounters) -> String {
         c.startup_segment_deaths,
         c.keeps_refused_before_viba2,
         milli(c.coast_mm_at_give_up_max),
+        c.pose_innovation_judged,
+        c.pose_innovation_over,
+        c.pose_innovation_rejects,
+        c.pose_innovation_unavailable,
+        milli(c.pose_innovation_scale_milli_max),
     )
 }
 
@@ -531,13 +537,19 @@ mod tests {
         counters.startup_segment_deaths = 5;
         counters.keeps_refused_before_viba2 = 1;
         counters.coast_mm_at_give_up_max = 7_125;
+        counters.pose_innovation_judged = 900;
+        counters.pose_innovation_over = 8;
+        counters.pose_innovation_rejects = 6;
+        counters.pose_innovation_unavailable = 50;
+        counters.pose_innovation_scale_milli_max = 1_450;
         let text = format(&counters, &FrameTimes::default());
         assert_eq!(
             text.lines().last().unwrap(),
             "[summary] loss later_alignments=2 later_alignment_deg_max=61.100 \
              later_alignment_jump_m_max=423.500 seeds_gyro_held=3 seed_rotation_deg_max=150.250 \
              young_segment_deaths=4 startup_segment_deaths=5 keeps_refused_before_viba2=1 \
-             coast_m_at_give_up_max=7.125"
+             coast_m_at_give_up_max=7.125 pose_innovation_judged=900 pose_innovation_over=8 \
+             pose_innovation_rejects=6 pose_innovation_unavailable=50 pose_innovation_scale_max=1.450"
         );
     }
 }
