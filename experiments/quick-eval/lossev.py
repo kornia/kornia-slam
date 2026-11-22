@@ -17,7 +17,8 @@ Prints:
              the first tracked frame after it, the rotation error between them (GT taken into the trajectory's body
              frame by the hand-eye rotation C of --body, fitted once per sequence on a long reference run's tracked
              1 s pairs (`lossev.py body`, a sliding window over every tracked frame); without --body the run itself
-             is the reference, and too few pairs is an error, not an identity fallback), and the position error of that
+             is the reference, and too few pairs is an error, not an identity fallback; GT rotations are slerped and
+             both ends move to the nearest tracked frame within 0.03 s of a GT sample, inside their segment), and the position error of that
              restart against GT after a local rotation fit on the 10 s before the loss (needs GT; medians per class).
   coast:     coasted frames of IMU-confident episodes (segment >= 3.5 s old), error against GT by age since the
              last tracked frame, the hold-still error (GT displacement), and the SLAM / GT coast speed.
@@ -30,6 +31,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from worldrot import load_session, segment_id, q2R  # noqa: E402
 
+# Link and body pairs use frames this close to a GT sample (2_11 pseudo-dense spacing: median 0.2 s, p90 0.65 s).
+GT_STAMP_SEC = 0.03
 STATUS = re.compile(r"^\[ *(\d+)\] (\w+)\s+kf=(\d+)\s+pts=(\d+)")
 VEL = re.compile(r"\[vel\] frame=(\d+) .* src=(\w+)")
 
@@ -83,10 +86,22 @@ class Gt:
         return self.p[k - 1] * (1 - a) + self.p[k] * a
 
     def rot(self, t):
+        """Slerp between the bracketing samples, as pos() interpolates; None across a gap over 1 s."""
         if not self.ok: return None
+        k = np.searchsorted(self.t, t)
+        if k <= 0 or k >= len(self.t) or self.t[k] - self.t[k - 1] > 1.0: return None
+        a = (t - self.t[k - 1]) / (self.t[k] - self.t[k - 1])
+        q0, q1 = self.q[k - 1] / np.linalg.norm(self.q[k - 1]), self.q[k] / np.linalg.norm(self.q[k])
+        if np.dot(q0, q1) < 0: q1 = -q1
+        th = np.arccos(np.clip(np.dot(q0, q1), -1, 1))
+        q = q0 if th < 1e-9 else (np.sin((1 - a) * th) * q0 + np.sin(a * th) * q1) / np.sin(th)
+        return q2R(q)
+
+    def near(self, t):
+        """Seconds to the nearest GT sample."""
+        if not self.ok: return np.inf
         k = int(np.clip(np.searchsorted(self.t, t), 1, len(self.t) - 1))
-        k = k - 1 if abs(self.t[k - 1] - t) < abs(self.t[k] - t) else k
-        return q2R(self.q[k]) if abs(self.t[k] - t) <= 0.15 else None
+        return float(min(abs(self.t[k - 1] - t), abs(self.t[k] - t)))
 
 
 def kabsch(X, Y):
@@ -129,6 +144,7 @@ class Run:
             b = a + 20
             if self.cls[a] != "T" or self.cls.get(b) != "T" or self.ts[a] not in self.traj or self.ts[b] not in self.traj:
                 continue
+            if max(self.gt.near(self.tsec[a]), self.gt.near(self.tsec[b])) > GT_STAMP_SEC: continue
             ga, gb = self.gt.rot(self.tsec[a]), self.gt.rot(self.tsec[b])
             if ga is None or gb is None: continue
             ws, wg = log(self.traj[self.ts[a]][1].T @ self.traj[self.ts[b]][1]), log(ga.T @ gb)
@@ -188,13 +204,26 @@ class Run:
             rows.append(self.link(c, a, self.first_tracked_from(a + 1), age, n))
         return rows
 
+    def gt_anchor(self, f, step, t_lo, t_hi):
+        """The tracked frame nearest f (walking by step, at most 20 frames, inside [t_lo, t_hi)) that lies within
+        GT_STAMP_SEC of a GT sample: at a 160-200 deg/s restart turn, an interpolated GT pose between samples up to
+        0.35 s apart reads 10-25 deg of false error."""
+        for g in range(f, f + 21 * step, step):
+            if not (self.lo <= g < self.hi) or not (t_lo <= self.tsec[g] < t_hi): return None
+            if self.cls.get(g) == "T" and self.ts[g] in self.traj and self.gt.near(self.tsec[g]) <= GT_STAMP_SEC:
+                return g
+        return None
+
     def link(self, c, a, s, age, n):
         r = dict(cls=c, t=self.tsec[a] - self.tsec[0], age=age, gap=self.tsec[min(s, len(self.ts) - 1)] - self.tsec[a],
                  gyro=self.gyro_angle(self.tsec[a], self.tsec[min(s, len(self.ts) - 1)]), rot_err=np.nan, pos_err=np.nan,
                  gt_rot=np.nan, slam_rot=np.nan)
         if s >= self.hi or self.ts[a] not in self.traj or self.ts[s] not in self.traj: return r
+        r["slam_rot"] = angle(self.traj[self.ts[a]][1].T @ self.traj[self.ts[s]][1])
+        nxt = self.seg_t[n + 1] if n + 1 < len(self.seg_t) else np.inf
+        a, s = self.gt_anchor(a, -1, self.seg_t[n - 1], np.inf), self.gt_anchor(s, 1, -np.inf, nxt)
+        if a is None or s is None: return r
         (pa, Ra), (pb, Rb) = self.traj[self.ts[a]], self.traj[self.ts[s]]
-        r["slam_rot"] = angle(Ra.T @ Rb)
         ga, gb = self.gt.rot(self.tsec[a]), self.gt.rot(self.tsec[s])
         if ga is not None and gb is not None:
             g = self.C.T @ (ga.T @ gb) @ self.C
