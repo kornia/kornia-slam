@@ -22,12 +22,43 @@ Newest first, one entry per working day. "main" means a merged PR; "#180" means 
 sits behind config knobs that default to the old behaviour, and nothing in it has been benchmarked yet.
 
 ### 2026-11-22
+- **#180, metric check (no bug found).**
+  - The official evaluator scores pseudo-dense GT as the estimate at 1_19 69.9, 2_11 80.2 and 4_11 85.2. That is the ceiling a 5 Hz GT sets.
+  - `ate.py` recovers a known Sim3 exactly.
+  - Our trajectory frame is the evaluator's: rotating it by the 105° GT body rotation drops 1_19 from 14.6 to 3.9 or 8.5.
+  - The CP score is rotation-invariant (GT at 40° yaw: 80.17 both ways) but not scale-invariant (GT ×0.5 73.6, ×0.8 76.2, ×1.2 85.1, ×2.5 91.3). The likely cause is the metric camera-IMU lever arm. Scale error moves our score directly; this is not something to exploit.
+  - R_11 "Robust Sim3d estimation failed" is a real outcome: only 3 control points have height, and `estimate_sim3d_robust` uses `max_error` 5 m. The gate's BASE run has inter-CP scale ratios of 0.80-1.02. It scores CP 0, so R_11 is gated on tracked frames and ATE.
+- **#180, where the score goes.**
+  - Gate H0 run, 1_19: one segment over 5-917 s, with per-segment Sim3 RMS 37.1 m over a 1000 m GT path and scale 1.196.
+  - 1_20: 21.2 m over 1140 m.
+  - So on the long sequences the loss is drift while tracking, not tracking losses.
+  - Loop closing is disabled in every validation and gate config (`LoopClosingMode` defaults to `Disabled`).
+  - Ledger G35 still has our local VI-BA at 1.5-5× ORB-SLAM3's ATE on full R_01.
+- **Order (owner, 2026-11-22): drift first.** Card AG covers the drift budget per sequence, ORB-SLAM3 reference scores on 1_19 and 2_11, and loop closure on the challenge sequences (planner running). Card AE follows, then card AD.
+- **#180, H0 regression gate, round 1 (interim, 1 run per arm; 11 sequences × 2 rounds).** CP BASE/H0:
+
+  | sequence | BASE CP | H0 CP | tracked BASE/H0 |
+  |---|---|---|---|
+  | 1_19 | 14.56 | 8.80 | 17806/17823 |
+  | 1_20 | 11.59 | 7.06 | 18933/19162 |
+  | 5_11 | 2.33 | 11.22 | 20597/20377 |
+  | R_11 | 0 (Sim3 failed) | 0 (Sim3 failed) | 8998/8003 |
+
+  R_11 ATE Sim3: 5.8 m against 29.9 m.
+- **#180, R_11 under H0 (diagnosis; card AE planner, from session keyframes).**
+  - From 329 s, during a 94-126 °/s turn and still tracked with 138-248 observations, the VI-BA gyro bias leaves its median (about 2e-3 rad/s) and reaches 48e-3 rad/s.
+  - The loss at 331.4 s freezes it, and each Held re-seed keeps it (45-57e-3 rad/s).
+  - Attitude then tilts at about 3 °/s, so seeds start 5-41° off level. g·sin(7-8°) gives the 1.3-1.4 m/s² speed ramp in every young segment, and 4 young deaths follow (give-ups 8 against 2).
+  - It generalises: on 4_11, 35 of 49 seeds sit over 15e-3 rad/s, with segment life 4.9 s against 24.2 s.
+  - This corrects the card AC entry below: H0 has no `frame_velocity`, so U is not the only R_11 cause.
+- **#180, card AE planned and approved** (`tracking_loss.reseed.inertial_seed: AtGiveUp | Trusted`): the Held seed takes the median bias over a sensor-model window (33.5 s gyro, 58 s accel on R_11) of vision-anchored keyframes, and its attitude from a gyro chain from the last vision-anchored pose. It runs after card AG.
+- **#180, card AC-2b (pose innovation gate) being implemented;** its SLAM runs wait for the H0 gate.
 - **#180, card AB-1b (`feat/still-device`, 7 commits, unpushed): the IMU still run is carried across a keyframe inserted while still.**
   - The system test now gives lost keyframes at `[60, 120]` against 17 at base, with `vouched_imu` 114.
   - MH_01 frames reading `imu=Pending` in the still window fall from 341 to 18.
   - Every identity check is `cmp`-identical (R_01 md5 d4f77b56, EuRoC Off and Observe), and LaMAria decision counters stay 0.
   - P3 missed as worded (K1): the V1_03 blackout lands before IMU init, where a loss resets the map, so it is a test-design miss. The real-data proof waits for the robot's parked capture.
-- **Next (owner, 2026-11-22):** the H0 regression gate (Held seed without `frame_velocity`, 11 sequences × 2 paired rounds), and card AC-2b (loss-onset velocity, K4) being planned. Then card AD, then the cleanup card.
+- **Next (owner, 2026-11-22, superseded later that day by "drift first" above):** the H0 regression gate (Held seed without `frame_velocity`, 11 sequences × 2 paired rounds), and card AC-2b (loss-onset velocity, K4) being planned. Then card AD, then the cleanup card.
 - **#180, card AC, H arm (Held seed, `feat/loss-one-world`) on the full validation sequences, one paced run each (interim, not a verdict).** Official CP, F1 against H:
   - 1_19: 4.84 against 6.89. Give-ups 11 against 3, and the 3 are start-up resets.
   - 5_11: 5.39 against 25.86. Give-ups 9 against 3.
@@ -253,17 +284,20 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 ## Now — egocentric accuracy on LaMAria
 
 **Regression gate (owner, 2026-11-22).** No knob is promoted into a preset or a code default until it passes the full-sequence gate:
-- **Runs:** all 6 validation sequences (R_11_5cp, 1_19, 2_11, 3_18, 4_11, 5_11), full length, paced at sensor timestamps, on a quiet machine (load ≤ 4, no other SLAM job).
+- **Runs:** all 11 validation sequences (R_11_5cp, 1_19, 1_20, 2_11, 2_12, 3_17, 3_18, 4_10, 4_11, 5_11, 5_12), full length, paced at sensor timestamps, on a quiet machine (load ≤ 4, no other SLAM job).
 - **Samples:** 2 runs of the candidate against 2 runs of the current baseline.
 - **Pass rule:** no sequence's official CP score or tracked frames falls below the baseline's range. Any drop is diagnosed before the knob is promoted.
+- **R_11:** with 3 usable control points the CP Sim3 often fails (scored 0), so R_11 is gated on tracked frames and ATE (`ate.py`).
 - **Guards:** the 800-frame per-card guards stay as a cheap first check. They do not replace the gate: card AC's Held seed passed them, yet R_11 fell from 55.5 to 26.9 at 370 s.
 - **Cleanup card:** it applies the gate to the stacked winners together.
 
 We are working toward top results on the [LaMAria](https://github.com/cvg/lamaria) egocentric benchmark ([#78](https://github.com/kornia/kornia-slam/issues/78)), using the Aria rig and IMU and no GPS. The work is sequenced by where the benchmark score is lost: each change states its theory and predictions first, ships behind a config knob that defaults to the old behaviour, and is compared window by window against ORB-SLAM3 in the same harness.
 
 General purpose, not tuned per deployment (owner, 2026-11-21). A new rig or dataset should need its sensor model only: calibration, IMU noise and frame rate. Knobs are how a change lands and is measured; after each validation round a cleanup card makes the winners the code default and deletes the refuted or redundant knobs.
+- [ ] **Card AG: drift budget and loop closure on the challenge sequences** (owner, 2026-11-22: next, before cards AE and AD). On 1_19 the whole run is one segment with 37 m Sim3 RMS and 1.2× scale, and loop closing is off in every validation config. Stage 0 splits the score loss per sequence into drift, breaks, scale and untracked frames, and checks GT for revisits (ledger G10's "no revisits on R_11 and 1_19" is unverified). Then ORB-SLAM3 reference scores on 1_19 and 2_11, and the #180 loop closer on the challenge sequences (the drift gate may refuse true loops: `pr180-full-review.md`).
+- [ ] **Card AE: trusted inertial state for a Held re-seed** (planned and approved 2026-11-22, after AG): the median bias over vision-anchored keyframes plus a gyro attitude chain. It fixes the R_11 and 4_11 seed-bias deaths found by the H0 gate.
 - [ ] **Keep one world through a tracking loss** (owner, 2026-11-22: next, before the cleanup card): carry the gyro attitude across a give-up, give a new segment the kept inertial state, refuse visual velocities the IMU contradicts, link or merge the segments (ORB-SLAM3 RECENTLY_LOST and Atlas merge; Basalt and OpenVINS never reset). See `experiments/pr180-validation-diagnosis.md`.
-- [ ] **Card AD: gyro rotation prediction before IMU init** (owner, 2026-11-22: after card AC, before the cleanup card). Before VIBA0 the tracker predicts each frame with zero motion (`predict_frame_pose` needs `imu_initialized`; the RotatedRay guess needs a predicted velocity), so a start-up turn of 3-4.4° per frame leaves a 29-32 px PnP residual against the 25 px gate and resets 19-56-point maps at once (1_19 frames 0-13; G31 class). The previous-frame timestamp (`state.last_frame_timestamp_sec`) also stays stale across cold bootstraps. Plan approved 2026-11-22 (knob `tracking.prediction_before_init: Visual | Gyro | GyroHeld`, timestamp refresh unconditional); starts when card AC lands.
+- [ ] **Card AD: gyro rotation prediction before IMU init** (owner, 2026-11-22: after cards AG and AE, before the cleanup card). Before VIBA0 the tracker predicts each frame with zero motion (`predict_frame_pose` needs `imu_initialized`; the RotatedRay guess needs a predicted velocity), so a start-up turn of 3-4.4° per frame leaves a 29-32 px PnP residual against the 25 px gate and resets 19-56-point maps at once (1_19 frames 0-13; G31 class). The previous-frame timestamp (`state.last_frame_timestamp_sec`) also stays stale across cold bootstraps. Plan approved 2026-11-22 (knob `tracking.prediction_before_init: Visual | Gyro | GyroHeld`, timestamp refresh unconditional); starts when card AC lands.
 - [ ] **Diagnose the first-map resets on R_01, R_03, R_11** (owner, 2026-11-22, read-only): the first map is lost on the 2nd or 3rd frame after a cold bootstrap at under 0.8° per frame, with 2-9 projected matches; not rotation, so card AD does not cover it. Ledger row to add with the diagnosis.
 - [ ] **Cleanup after the first validation run** (owner, 2026-11-22: after the loss card, then card F).
   - **Make the fixes the only path:** `dense_parallelism: Sequential`, `merge: PropagateToNewer` (with the stop at a re-seed), `frame_velocity: PropagatedFromKeyframe` (card U), and the coasted-pose output.
