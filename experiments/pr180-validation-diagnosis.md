@@ -86,3 +86,20 @@ Scripts in `$S/diagV/track/`. DEBUG=0, so no per-frame reject reasons; built fro
 ## Combined picture
 
 Both diagnoses point to one chain: weak vision lets a wrong velocity in, the coast runs away, the give-up resets the attitude and starts an IMU-less segment that dies again, and nothing links the pieces. Card AA (2026-11-22) fixed the clock on the IMU edges but did not move R_01's along-track scale (K1), so the smooth-drift term is set by the visual side.
+
+## Offline-BA test on the F1 sessions (2026-11-22, no code)
+
+Arms on the existing sessions (`/home/edgar/dev/split/.pr180-fix/offbridge/`): B0 defaults, H `offline_ba: ( imu_kernel: Huber )`, BR `( bridge_segments: true )`, HB both. B0 reproduces the validation exactly on all three sequences.
+
+**Confounded:** card AC's planner found that the F1 session dumps hold earlier segments rotated 27-89° about the origin and off gravity (a later segment's inertial alignment re-aligns the whole world; `Map::apply_inertial_alignment`). Only R_11 (0.1°) is clean.
+
+| Seq | B0 CP | H CP | BR CP | HB CP | 3 px drop B0 / H | Components B0 / BR |
+|---|---|---|---|---|---|---|
+| R_11 (clean) | 56.10 | 55.45 | **59.62** (ATE 3.96 to 3.79 m) | 57.69 | 24 / 23 % | 1 / 1 (2 bridges, residual 0.25σ) |
+| 1_19 | 3.74 | FAIL | 24.21 | FAIL | 46 / 35 % | 9 / 1 (bridge residual 12σ) |
+| 5_11 | FAIL | 8.53 | 3.63 | 0.00 | 76 / 50 % | 7 / 1 (bridge residual 153σ) |
+
+- **H missed its prediction** (3 px drop 14-16 %): it stays at 35-50 % on the tilted sessions, and on R_11 there was little to fix (24 %). On 5_11 the IMU rotation residual rises to 130σ under H: the kernel down-weights the mis-levelled edges, which is what Huber should do there (inference from the report).
+- **BR joins every session into one component,** but on the tilted sessions the bridges are forced (residuals 12σ and 153σ). 1_19's CP rise (3.74 to 24.2) is likely partly the scorer: a single connected trajectory lets its robust Sim3 succeed. ATE on 1_19 is unchanged (62.3 to 62.4 m).
+- **Clean result:** on R_11, BR alone is best (+3.5 CP, ATE −4 %).
+- **Rerun on card AC-1 sessions** (no mis-levelled segments) before any offline-BA default changes.
