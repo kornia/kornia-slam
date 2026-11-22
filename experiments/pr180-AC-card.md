@@ -1,7 +1,9 @@
 # Card AC: one world through a tracking loss
 
-Status: 2026-11-22. Card written; AC-0 (existing knobs, F1 binary) and AC-1 (`tracking_loss.reseed.seed: Held`)
-to run. AC-2b, AC-2c and AC-3 wait for the owner's verdict on AC-0 and AC-1. Plan: planner (Fable), owner answers
+Status: 2026-11-22. AC-0 stopped at R0: K6 fired on W211a, W211b and W119 (BASE does not reproduce the F1 events),
+and the box ran at load 20-40 against the F1 validation's 2.5, which breaks the paired-run assumption (W318 BASE and
+BASEd differ: 2 and 0 give-ups). Counters (step 4) landed; AC-1 (`tracking_loss.reseed.seed: Held`) not built, per
+the stop rule. AC-2b, AC-2c and AC-3 wait for the owner's verdict on AC-0 and AC-1. Plan: planner (Fable), owner answers
 2026-11-22. Worktree `/home/edgar/dev/split/kornia-slam-loss`, branch
 `feat/loss-one-world`.
 
@@ -169,4 +171,54 @@ Scoring: the official CP score is not comparable below about 25 on a fragmented 
 
 ## Results
 
-(AC-0 and AC-1 results follow.)
+### AC-0, round 1 (2026-11-22, F1 binary md5 52e38c464d4369df0c9d3f61df17b5aa, BASE only)
+
+Runs: `$AC/out/<window>-BASE-r1` (DEBUG=0) and `-BASEd-r1` (DEBUG=1), `PACE=timestamps`, `--trajectory-include-coasted
+--session-out`, scored by `$AC/score.sh` (summary, `worldrot.py jumps`, `lossev.py`). Load every 30 s in
+`$AC/load/q0.txt`: 1-min load median 25.6, range 19-40 on 12 cores, swap full; the F1 validation ran at median 2.5
+(max 6.6). Frontend p50 here 31-108 ms against 10.5 ms in the F1 run (`sequence_1_19-r1`), so the paced runs fell
+behind real time.
+
+| Window | F1 event | BASE: give-ups (startup/young/primary), tracked | BASEd | frontend p50 ms | R0 |
+|---|---|---|---|---|---|
+| W211a | 171 s turn, 5.05 s loss, restart | 2 (2/0/0), 1204/1300; no loss at 171 s | 2 (2/0/0), 1193 | 108 / 105 | miss |
+| W211b | give-ups 375, 403 s | 0, 1335/1500; losses 356 s 1.3 s, 370 s 1.4 s only | 0, 1362 | 89 / 81 | miss |
+| W211c | frames 21400-21900 (1070-1095 s) | 13 (0/12/1), 541/1100; primary at 1079.9 s after a 5.1 s loss, after VIBA2 | 17 (0/16/1), 511 | 83 / 80 | holds |
+| W119 | 436 s coast, 565-600 s runaways, 605 s restart | 7 (7/0/0) at 401-414 s, 3931/4400; no runaway (0 keyframes over 4 m/s) | 7 (7/0/0), 3968 | 99 / 103 | miss |
+| W318 | 1212 s wall, restarts 1264, 1355 s | 2 (0/1/1), 4559/5000; primary give-up, segment at 1346.5 s | 0, 4723 | 43 / 39 | holds (BASE), not BASEd |
+| W511 | 11.4 s coast at 961 s, restart 975 s | 2 (0/1/1), 1040/1300; 8.8 s loss at 964 s, segment at 972.8 s | 2 (0/1/1), 1034 | 36 / 31 | holds |
+
+M0e (angle of a later segment's VIBA0 gravity to +Y against the origin jump): only W511-BASEd has a later VIBA0 in a
+DEBUG run. Gravity (-7.917, 0.426, 5.777), 87.5 deg to +Y; the single-frame origin jump at 45.8 s (5.3 m, distance
+from the origin 26.7 m kept) has an orientation change of 88.7 deg: 1.2 deg apart, so M0e holds on its one sample.
+The rotation about the origin maps the position before to the one after within 1.25 m. The prediction's "jump
+angle" (the angle between the two positions about the origin) reads 11.5 deg there: it only bounds the rotation from
+below (equal when the axis is normal to the position), so `worldrot.py jumps` now also prints the orientation change.
+On the F1 5_11 run the two origin jumps rotate 86.5 and 55.1 deg (section 1 lists the position angles 61.1 and 43.6).
+W318-BASE (DEBUG=0) shows the same mechanism: a 158.3 m origin-preserving jump at 1356.8 s, orientation change
+89.4 deg.
+
+Also seen: every window's first VIBA0 sits 72-106 deg off +Y (the bootstrap world is the camera frame), so the
+first alignment always rotates the young map a lot; that is the first segment and harmless. The R_01 identity run
+reports `later_alignments=3` (max 90.4 deg, jump 0.317 m): R_01's start-up reset (G31) makes the first real segment
+segment 1, so its VIBA0/1/2 count as later alignments. The counter follows the plan's definition
+(`segments.latest() > 0`); the jump column separates the cases (0.3 m against 158-424 m).
+
+Not run: the U, KI, KIU and HB arms, the BK blackout pairs and the noise samples (P0u, P0k, P0s, P0b, M0a, K5).
+Stop point: K6 fired, so step 5 (AC-1) was not built.
+
+### K6 diagnosis (owner rule: why it missed)
+
+1. **The load, first.** The windows ran at 8-16x the F1 validation's load. With `--pace-timestamps` a slow frame is
+   not dropped, it is late: frontend p50 31-108 ms against 10.5 ms means 1.5-5 frames of source time per frame of
+   work, so local mapping and VI-BA get several times more wall time per keyframe than in the F1 run, and keyframe
+   decisions shift. Evidence that the run depends on timing: W318 BASE and BASEd, same window and binary, give 2 and
+   0 give-ups (4559 against 4723 tracked); W211c gives 13 and 17. A deterministic-pairing card cannot be scored on
+   these runs, so the misses are not evidence against the windows yet.
+2. **Mid-sequence starts, second.** W211a, W119 and W211b start with a cascade of start-up give-ups (2-7 in the first
+   14 s, while VIBA0 is still unsolved); the 30 s lead is spent on that, and the map at the event is younger and
+   different from F1's. W211c, W318 and W511, whose events lie 40-200 s after the window start, reproduce.
+3. **Next (K6's own remedy, queued, not run).** `$AC/q0b.txt`: W211aL60 (start 2200, 1900 frames), W211bL60 (6300,
+   2100), W119L60 (7520, 4880), through `$AC/runq2.sh`, which starts a job only when the 1-min load is under 8 and
+   fewer than 2 kornia-slam processes run. If the 60 s lead still misses at low load, the full prefix (frame 0) is
+   the next step, per K6.
