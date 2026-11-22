@@ -35,7 +35,9 @@ chunk means against the noise model, wheels when enabled) and reports it on a ne
 and lost-interval keyframes while still, up to a 3 s heartbeat (0.5 s before the inertial
 schedule settles); keyframes earned by tracking quality still insert. `StationaryEdges` is
 refused until it is built. `KeyframePolicy::asks` splits a decision into its bound and quality
-asks.
+asks. A keyframe inserted on a still frame no longer restarts the IMU still run (card AB-1b), so
+the IMU can vouch for a lost still rig right after a heartbeat; `[summary] stillness` gains
+`runs_carried`.
 
 **New settings for a 1 ms frontend frame and for online calibration, all off by
 default.** Every default is today's behaviour, so existing run files load and

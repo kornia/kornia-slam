@@ -89,3 +89,64 @@ Noise: Synchronous runs repeat bit-for-bit, so the blackout start is perturbed b
   recorded per run; no run starts while card AC's queue runs.
 If it misses: (1) P1 / P2 low: list the frames after each carried line and their imu= state. (2) P3: K1's
   reading. (3) K6: first frame whose [still] line differs between the binaries.
+
+## Results (2026-11-22)
+
+Commits: 16975cf card, 8c7b511 quick-eval, cef3e28 inertial carry, acf80c7 system carry + prune floor + T1,
+a360d88 app summary, c677c20 `quiet_at` lag tolerance (owner Q3). Binary `$O1/bin/kornia-slam-ab1b` built at
+c677c20, md5 e14e2da4c68a69659e3ef9aa20e1f9cb; base arm `$O/bin/kornia-slam-ab` (md5 2f07e849). Runs started
+only after the step 0 gate (no card AC queue, no kornia-slam process, load <= 2.0); start loads 1.47-1.96.
+EuRoC and R_01 identity ran one at a time; LaMAria pairs at load p50 1.53 (R_03), 1.80 (R_11), 6.50 (R_01 full;
+max 7.24, the two arms together). Per-run load in `$O/<out>/load.log` and `$O/out/<seq>-1b/load-r1.log`.
+
+Verification: fmt clean; clippy `--release --all-targets -D warnings` clean; `test --release -p kornia-slam --lib
+-- still` 39 passed; `test --release --workspace` all passed (kornia-slam lib 803 passed, 4 ignored).
+
+T1 at the base decision code (the test and the prune helper with today's floor, before the carry) fails:
+lost keyframes `[60, 64, 68, 73, 78, 82, 87, 92, 96, 101, 106, 111, 116, 121, 126, 131, 136]` (17). After the
+carry: `[60, 120]`, vouched_imu 114, lost_keyframes_withheld 112, runs_closed_imu 0, runs_carried 2.
+
+Bit-identity (`cmp`, all silent): Off and Observe of MH_01, MH_05, V1_03 against `$O/eu/<seq>-BASE-r1`; R_01 S10-7
+Off, Observe and Gate against `$P/baseline/traj.txt` (md5 d4f77b567b912b5a4caa2af6085a35b1 three times; Gate
+decision counters 0); MH_01 blackout Off and Gate, new against old. Also identical, beyond the card: Gate on MH_01,
+MH_05, V1_03 against `$O/eu/<seq>-G-r1`, and the three V1_03 blackout phases new against old.
+
+| Pred | Predicted | Measured | Verdict |
+|---|---|---|---|
+| T1 | lost kf >= 16 at base -> exactly 60, 120; vouched_imu >= 110; runs_carried 2; runs_closed_imu 0 | base 17 (60, 64, 68, ...); new [60, 120], 114, 2, 0 | hit |
+| P1 | MH_01 Observe W: Pending <= 51; Unknown >= 273; runs_carried in W 36-43 | Pending 18 (old 341), Unknown 318, Moving 5, carried 41 | hit |
+| P2 | V1_03 Observe 0-59: Quiet 40-50, carried 5-7; MH_05: Unknown 40-50, Quiet <= 5 | V1_03 Quiet 50 (old 0), carried 7; MH_05 Unknown 50 (old 0), Quiet 0 | hit |
+| P3 | V1_03 Gate blackout 1.05 / 1.10 / 1.15: vouched_imu 0 -> 5-7 each; give_ups equal to old | vouched_imu 0, 0, 0; give_ups 1 = 1 in each | miss (vouch); give_ups hit |
+| P4 | MH_01 Gate blackout 24:3: withheld 0, vouched_imu 0, lost kf = old (13-15) | 0, 0, 14 = 14; trajectory identical | hit |
+| P5 | MH_01 Gate: kf in W 6-8, heartbeats W 4, tracked 900, SE3 0.00604 +/- 10 %, vi_ba_failed 0, closed_imu 0-3, carried 6-8, cmp-identical; MH_05, V1_03 kf 6 | 6, 4, 900, 0.00604 (trajectory cmp-identical to card AB's), 0, 0, carried 6 (4 in W), identical; MH_05 6, V1_03 6 | hit |
+| P6 | LaMAria Gate: decision counters and vouched_imu 0; R_03 <= 0.117 m, tracked >= 753; R_11 <= 0.180 m, >= 792; R_01 <= 0.61 m | all 0 (runs_carried 0); R_03 0.108 m / 773 (BASE 0.097 / 775); R_11 0.152 m / 800 (BASE 0.174 / 799); R_01 0.392 m (BASE 0.424) | hit |
+
+Kill rules: K1 fires as worded (runs_carried > 0, P2 holds, P3's vouched_imu 0); diagnosis below. K2 no (no score
+moved). K3 no (P5 holds; LaMAria decision counters 0, so one round, Q6). K4 no (withheld_above_5cm 0 on all 14
+EuRoC runs; LaMAria vouched_imu 0). K5 no (Observe MH_01 runs_closed_imu 0, so no closing line and no ref_age
+sample yet). K6 no. K7 no.
+
+**Diagnosis, P3 miss / K1.** Neither of K1's readings applies. Every phase gives up on its first black frame
+(22, 23, 24): `[lost] frame=22 giving up after 0.00s (map_established=false): resetting`, the same in the old
+binary. The map has 3 keyframes, at or under `min_keyframes_for_grace`, `young_map_grace_sec` is 0, and the
+IMU is not initialised (`[imu_init_gate] kfs=2/10`). So no black frame reaches `withhold_lost_keyframe`: there is
+no `[still]` line on any black frame in either binary, so there was neither an `imu_hole` close nor a frame past
+the judged end + 0.5 s. The IMU side did what the carry predicts. The frame before the blackout reads `imu=Quiet`
+in the new binary (old `Pending`), on a run carried at keyframes 10 and 20 (`carried ref_t=...887.084`). P3 used
+a start-of-sequence blackout because the card's own pricing found V1_03 0-3 s the only in-band span. That span is
+before IMU init and before the map is established, where the lost path resets and never asks for a lost keyframe.
+This is a test-design miss, not a mechanism miss. No EuRoC sequence on disk has an in-band still span after init.
+The positive lost-keyframe proof stays T1, and on the robot it is the parked capture (Q1). No fix in this card.
+
+Observation, not a rule: under Observe, MH_01 frames 636-640 read `imu=Moving(Hole)`. Frame 635's image vote
+(q 2.119 against bound 1.764) closed that run first. With `closed_by` set, `unjudged_from` is `None` and the prune
+returns to the keyframe stamp, so the dead run's next chunk finds a hole. It is not counted, as before, and the
+next keyframe (640) restarts the run. The prune floor works as designed; the log state is cosmetic.
+
+**Verdict.** The carry works where the IMU is quiet. In the system test a lost still rig keeps one lost keyframe
+per heartbeat (17 -> 2). On V1_03 the carried run reads Quiet on 50 of 60 frames, against 0 before. On MH_05 and
+MH_01 it reads Unknown, as priced (Q1). Off, Observe and the R_01 Gate identity are byte-identical, and every Gate
+trajectory on EuRoC is unchanged. LaMAria makes no decision. The real-data vouch (P3) could not be exercised,
+because the only quiet span on disk comes before init, where tracking loss resets. The knob stays Off. Next: price
+the robot's parked capture with `imuquiet.py` before stage 2 (Q1). Anchor heartbeat hole to the ledger (Q4).
+Bias-walk term at stage 2 (Q5).
