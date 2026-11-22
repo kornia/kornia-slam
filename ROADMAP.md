@@ -22,6 +22,12 @@ Newest first, one entry per working day. "main" means a merged PR; "#180" means 
 sits behind config knobs that default to the old behaviour, and nothing in it has been benchmarked yet.
 
 ### 2026-11-22
+- **#180, card AB-1b (`feat/still-device`, 7 commits, unpushed): the IMU still run is carried across a keyframe inserted while still.**
+  - The system test now gives lost keyframes at `[60, 120]` against 17 at base, with `vouched_imu` 114.
+  - MH_01 frames reading `imu=Pending` in the still window fall from 341 to 18.
+  - Every identity check is `cmp`-identical (R_01 md5 d4f77b56, EuRoC Off and Observe), and LaMAria decision counters stay 0.
+  - P3 missed as worded (K1): the V1_03 blackout lands before IMU init, where a loss resets the map, so it is a test-design miss. The real-data proof waits for the robot's parked capture.
+- **Next (owner, 2026-11-22):** the H0 regression gate (Held seed without `frame_velocity`, 11 sequences × 2 paired rounds), and card AC-2b (loss-onset velocity, K4) being planned. Then card AD, then the cleanup card.
 - **#180, card AC, H arm (Held seed, `feat/loss-one-world`) on the full validation sequences, one paced run each (interim, not a verdict).** Official CP, F1 against H:
   - 1_19: 4.84 against 6.89. Give-ups 11 against 3, and the 3 are start-up resets.
   - 5_11: 5.39 against 25.86. Give-ups 9 against 3.
