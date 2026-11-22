@@ -14,7 +14,9 @@ Prints key=value lines:
   withheld_in_window, heartbeat_in_window, quality_in_window, lost_withheld_in_window,
   landmarks_in_window (close_points + grown of the keyframes in the window),
   withheld_above_5cm (withheld or lost-withheld frames with GT speed over 5 cm/s),
-  runs_closed_<voter> counts in the window.
+  runs_closed_<voter> counts in the window,
+  imu_vote_in_window (the imu= state per judged frame), vouched_in_window (by= per still frame),
+  lost_keyframes_in_window, runs_carried_in_window, blackout_frames (card AB-1b).
 """
 import argparse
 import bisect
@@ -22,10 +24,13 @@ import re
 
 KF = re.compile(r"\[kf\] frame=(\d+) grown=(\d+)")
 CLOSE = re.compile(r"\[kf_stereo\] frame=(\d+) close_points=(\d+)")
-STILL = re.compile(r"\[still\] frame=(\d+) t=\S+ still=([01])")
+STILL = re.compile(r"\[still\] frame=(\d+) t=\S+ still=([01]) by=(\S+) .*imu=(\w+)")
 ASK = re.compile(r"\[still\] frame=(\d+) ask=(\w+)")
 CLOSED = re.compile(r"\[still\] run kf=(\d+) closed by=(\w+) at=([0-9.]+)")
-RUN_START = re.compile(r"\[still\] run kf=(\d+) t=")
+RUN_START = re.compile(r"\[still\] run kf=(\d+) t=\S+ started")
+RUN_CARRIED = re.compile(r"\[still\] run kf=(\d+) t=\S+ carried")
+LOST_KF = re.compile(r"\[lost\] frame=(\d+) keyframe inserted")
+BLACKOUT = re.compile(r"\[blackout\] frame=(\d+)")
 
 
 def span(text):
@@ -64,7 +69,19 @@ def speed_at(gt, t):
 
 
 def parse(stderr):
-    log = {"kf": {}, "close": {}, "still": {}, "ask": {}, "closed": [], "runs": []}
+    log = {
+        "kf": {},
+        "close": {},
+        "still": {},
+        "imu": {},
+        "by": {},
+        "ask": {},
+        "closed": [],
+        "runs": [],
+        "carried": [],
+        "lost_kf": [],
+        "blackout": [],
+    }
     with open(stderr, errors="replace") as f:
         for line in f:
             if m := KF.search(line):
@@ -72,13 +89,22 @@ def parse(stderr):
             elif m := CLOSE.search(line):
                 log["close"][int(m[1])] = int(m[2])
             elif m := STILL.search(line):
-                log["still"].setdefault(int(m[1]), m[2] == "1")
+                k = int(m[1])
+                log["still"].setdefault(k, m[2] == "1")
+                log["by"].setdefault(k, m[3])
+                log["imu"].setdefault(k, m[4])
             elif m := ASK.search(line):
                 log["ask"][int(m[1])] = m[2]
             elif m := CLOSED.search(line):
                 log["closed"].append((int(m[1]), m[2]))
             elif m := RUN_START.search(line):
                 log["runs"].append(int(m[1]))
+            elif m := RUN_CARRIED.search(line):
+                log["carried"].append(int(m[1]))
+            elif m := LOST_KF.search(line):
+                log["lost_kf"].append(int(m[1]))
+            elif m := BLACKOUT.search(line):
+                log["blackout"].append(int(m[1]))
     return log
 
 
@@ -143,6 +169,19 @@ def main():
         if in_w(kf):
             closers[voter] = closers.get(voter, 0) + 1
     print("runs_closed_in_window " + " ".join(f"{k}={v}" for k, v in sorted(closers.items())))
+    votes = {v: 0 for v in ("Pending", "Quiet", "Unknown", "Moving")}
+    for k, v in log["imu"].items():
+        if in_w(k):
+            votes[v] = votes.get(v, 0) + 1
+    print("imu_vote_in_window " + " ".join(f"{k}={v}" for k, v in votes.items()))
+    vouched = {v: 0 for v in ("image", "imu", "wheels")}
+    for k, v in log["by"].items():
+        if in_w(k) and still.get(k) and v != "-":
+            vouched[v] = vouched.get(v, 0) + 1
+    print("vouched_in_window " + " ".join(f"{k}={v}" for k, v in vouched.items()))
+    print(f"lost_keyframes_in_window={sum(1 for k in log['lost_kf'] if in_w(k))}")
+    print(f"runs_carried_in_window={sum(1 for k in log['carried'] if in_w(k))}")
+    print(f"blackout_frames={len(log['blackout'])}")
     per_min, secs = longest_still_run({k: s for k, s in still.items() if in_w(k)}, kfs, frames)
     print(f"longest_still_run_sec={secs:.2f} keyframes_per_min_in_it={per_min}")
     if a.gt:
