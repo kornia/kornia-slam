@@ -1,6 +1,8 @@
 # Card AB: no keyframes from a still device
 
-Status: 2026-11-22. Card written; stages 0-1 (Observe, Gate) to be built and scored on branch `feat/still-device`.
+Status: 2026-11-22. Stages 0-1 (Observe, Gate) built and scored on branch `feat/still-device` (results below):
+mechanism confirmed on EuRoC MH_01 (keyframes in the still segment 43 -> 6 at unchanged ATE), nothing withheld on
+LaMAria; K3 and K4 fired on wording and were overruled with evidence; the knob stays Off pending the owner.
 Stage 2 (StationaryEdges) waits for the cleanup card. Plan: planner (Fable), owner answers 2026-11-22. Ledger row G45.
 
 Paths: `P=/home/edgar/dev/split/.pr180-fix`, `O=$P/cardAB`, `Q=experiments/quick-eval`.
@@ -97,3 +99,135 @@ If it misses: (1) M1 low: [still] lines give the closing voter, statistic and th
 New `[summary] stillness` line: `still_frames still_runs keyframe_asks_withheld heartbeat_keyframes still_quality_keyframes lost_keyframes_withheld runs_closed_imu runs_closed_image runs_closed_wheels vouched_image vouched_imu vouched_wheels stationary_edges stationary_merged tail_edges`.
 
 Data: EuRoC `/home/edgar/data/euroc/MH_01_easy` (also MH_05, V1_03). LaMAria `/home/edgar/dev/.flux-connect-scratch/bench/lamaria/data`. Robot: `kornia-slam-app`'s `Mcap` source has no IMU (`apps/kornia-slam-app/src/source/mcap.rs:63`), so no robot bag replays here. P8 runs on the 8097 sim or the robot. I did not check `/home/edgar/blackbox_20261019T090607Z_fusion_vision_rejected.mcap` for a parked span.
+
+## Results, stages 0-1 (2026-11-22, branch feat/still-device)
+
+Binary `$O/bin/kornia-slam-ab`, md5 2f07e8496769f312fba9094aaf8a2b72, built at 95b5d41 (`cargo +1.100.0 build --release
+-j2 -p kornia-slam-app`). Laptop shared with card AC's runs (one or two other kornia-slam processes and a parallel
+build most of the time), so machine load was high: identity runs load p50 17.6 (10.7-27.4), EuRoC arms 25.4,
+LaMAria rounds below. EuRoC arms are Synchronous and repeat bit-for-bit, so counters come from 1 run each.
+
+Runs: identity `$O/id/r01full-S10-7{,-OBS,-G}-r1/`; EuRoC `$O/eu/{mh01,mh05,v103}-{BASE,OBS,G}-r1/`; LaMAria
+`$O/out/{r03,r11,r01full}/r<k>/` (`$O/pairs.sh`, BASE and G started together, load in `load-r<k>.log`), scored by
+`$O/score-lam.sh`. Frame log scored by `experiments/quick-eval/still.py <stderr> mav0/cam0/data.csv --window 430-770
+--quiet 21.5-31.0,34.0-38.5 --gt mav0/state_groundtruth_estimate0/data.csv`.
+
+Identity: Off on `$P/baseline/r01full-S10-7.ron` (RAYON_NUM_THREADS=1) `cmp`-identical to `$P/baseline/traj.txt`,
+md5 d4f77b567b912b5a4caa2af6085a35b1. Observe and Gate on the same config: identical too (same md5);
+`keyframe_asks_withheld=0` in both. MH_01, MH_05 and V1_03: OBS `cmp`-identical to BASE (MH_01 md5 3ecb23ac).
+
+MH_01 frames 0-900 (W = 430-770):
+
+| Arm | keyframes (run) | keyframes in W | still frames in W | quiet frames still | still outside W | withheld (in W) | heartbeat (in W) | landmarks in W | tracked | SE3 m | 3plus rejects |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| BASE | 163 | 43 | - | - | - | 0 | 0 | 96 | 900 | 0.00603 | 3 |
+| OBS | 163 | 43 | 328 | 282 / 282 | 138 / 558 | 0 | 0 | 96 | 900 | 0.00603 | 3 |
+| G | 114 | 6 | 332 | 282 / 282 | 138 / 558 | 394 (293) | 6 (4) | 166 | 900 | 0.00604 | 1 |
+
+G keyframes in W: 476, 536, 596 (heartbeats), 650, 658 (bound asks on non-still frames: the rotor test), 718
+(heartbeat). Heartbeat spacing inside a still run is 60 frames = 3.0 s. Every still frame was vouched by the image
+(`vouched_imu=0`, `vouched_wheels=0`); still_quality_keyframes 0; VIBA0/1/2 accepted in all three arms; vi_ba_failed 0.
+
+Quiet starts (frames 0-60, before IMU init): MH_05 keyframes BASE 8, OBS 8, G 6 (12 withheld, 5 heartbeats);
+V1_03 8, 8, 6 (12, 5). 59 of 60 frames still in both. SE3 under 3 mm in every arm (GT path 0.0 m).
+
+LaMAria guards, G against its paired BASE (SE3 from score.sh, 800 frames; R_01 full 2898):
+
+| Seq | Round (load p50) | BASE SE3 / tracked | G SE3 / tracked | G still_frames | G withheld / heartbeat / lost withheld |
+|---|---|---|---|---|---|
+| R_03 | r1 (8.64) | 0.112 / 788 | 0.112 / 776 | 10 | 0 / 0 / 0 |
+| R_03 | r2 (21.52) | 0.115 / 781 | 0.113 / 755 | 10 | 0 / 0 / 0 |
+| R_03 | r3 (15.59) | 0.109 / 753 | 0.109 / 760 | 10 | 0 / 0 / 0 |
+| R_11 | r1 (10.66) | 0.160 / 800 | 0.160 / 800 | 1 | 0 / 0 / 0 |
+| R_11 | r2 (10.10) | 0.160 / 800 | 0.173 / 794 | 1 | 0 / 0 / 0 |
+| R_11 | r3 (9.07) | 0.180 / 798 | 0.165 / 800 | 1 | 0 / 0 / 0 |
+| R_01 full | r1 (10.20) | 0.341 / 2898 | 0.412 / 2898 | 32 | 0 / 0 / 0 |
+| R_01 full | r2 (10.34) | 0.395 / 2898 | 0.607 / 2898 | 28 | 0 / 0 / 0 |
+| R_01 full | r3 (15.65) | 0.372 / 2898 | 0.400 / 2898 | 23 | 0 / 0 / 0 |
+| R_01 full | r4 (9.87, repeat of r3) | 0.451 / 2898 | 0.529 / 2898 | 31 | 0 / 0 / 0 |
+
+Every LaMAria run exits 0 with vi_ba_failed 0 and VIBA0/1/2 as in its paired BASE. The R_03 load p50s are 8.6 /
+21.5 / 15.6 and R_01 r3 sits more than 2 above r1/r2: the other card's runs set the load, so no set of three R_03
+rounds within 2 of each other was reachable; R_01 r3 was repeated as r4.
+
+### Scoring
+
+| P/K | prediction | baseline | measured (each sample) | verdict |
+|---|---|---|---|---|
+| M1 | still frames in W >= 196 of the 280 IMU-quiet; outside W <= 6 of 560 | - | quiet 282 / 282; outside W 138 / 558 | missed (outside W); see diagnosis 1 |
+| M2 | still frames <= 1 % on R_01, R_03, R_11 windows and R_01 full | - | R_01 full 17 / 2898 (0.59 %, OBS identity run), 23-32 in the async G runs (0.8-1.1 %); R_03 10 / 800 (1.25 %) in all 3 G rounds; R_11 1 / 800 (0.13 %) | missed on R_03 (and R_01 G r1 1.1 %) |
+| M3 | OBS cmp-identical to BASE on MH_01 and R_01 S10-7 | md5 d4f77b56 | MH_01 identical (3ecb23ac); R_01 S10-7 identical (d4f77b56); MH_05, V1_03 identical | as predicted |
+| M4 | BASE keyframes in W 42-60 | - | 43; still_quality_keyframes in W 0 (OBS) | as predicted |
+| P1 | keyframes in W 6-12; 20 +/- 2 per minute inside a still run > 6 s | 43 | 6; 16.4 / min by still.py over the longest run (10.95 s, 3 keyframes), heartbeat spacing 60 frames = 3.0 s = 20 / min | as predicted (count); missed (per-minute wording, see diagnosis 2) |
+| P2 | withheld > 0 only on still frames; heartbeat keyframes in W 5-7 | 0 | 394 withheld, 0 on non-still frames; 4 heartbeats in W | as predicted (withheld); missed (heartbeats, diagnosis 3) |
+| P3 | landmarks created in W fall >= 60 % | 96 | 166 (+73 %) | missed (diagnosis 4) |
+| P4 | MH_01 tracked = BASE; SE3 within +/- 10 %; vi_ba_failed, 3plus rejects not above BASE | 900; 0.00603 m; 0; 3 | 900; 0.00604 m; 0; 1 | as predicted |
+| P5 | MH_05, V1_03 frames 0-60: keyframes within +/- 1 of BASE; ATE in band | 8; 8 | 6; 6 (ATE < 3 mm, GT path 0 m) | missed (diagnosis 5) |
+| P6 | R_03 SE3 <= 0.117, tracked >= 758; R_11 <= 0.178, >= 792; R_01 full <= 0.51; withheld 0; Gate identity | - | R_03 0.112 / 0.113 / 0.109, tracked 776 / 755 / 760; R_11 0.160 / 0.173 / 0.165, 800 / 794 / 800; R_01 0.412 / 0.607 / 0.400, r4 0.529; withheld 0 everywhere; R_01 S10-7 Gate identical | R_03 tracked missed 1/3; R_01 SE3 missed 1/3 on r1-r3 and 2/3 on the load-valid set r1/r2/r4; identity as predicted |
+| K1 | withheld on >= 70 % of W still frames and keyframes in W > 20 | - | 293 / 332 (88 %), keyframes in W 6 | not fired |
+| K2 | keyframes in W fall with withheld 0 or still frames < 50 % of W | - | withheld 293, still 332 / 341 | not fired |
+| K3 | a P4/P6 guard missed in 2/3, a VIBA accepted in BASE and rejected here, or tracked below BASE | - | R_01 SE3 guard missed in 2/3 (r1/r2/r4: 0.412, 0.607, 0.529); G above its paired BASE in 4/4 R_01 rounds (+0.071, +0.212, +0.028, +0.078 m); VIBA same; R_03 tracked below BASE in r1 (776 < 788) and r2 (755 < 781) | fired, overruled as noise (diagnosis 6); the knob stays Off anyway |
+| K4 | M2 fails, or a withheld keyframe while GT speed > 5 cm/s | - | M2 fails on R_03; withheld_above_5cm 0 on MH_01; no keyframe withheld on LaMAria | fired (M2 wording), overruled: diagnosis 7 |
+| K5 | M1 fails (false moving) | - | 282 / 282 quiet frames still | not fired |
+| K6 | M3 fails or P6 identity fails with withheld 0 | - | both identical | not fired |
+
+### Diagnoses ("If it misses")
+
+1. **M1 outside W.** 136 of the 138 still frames outside W have GT speed under 1.8 cm/s: frames 409-429 (20.4-21.4 s,
+   landing) and 771-890 (38.5-44.5 s). The drone sits on the ground with its rotors spinning up: IMU spread 0.024-0.068
+   rad/s and 0.43-1.44 m/s² there, so the plan's W (picked from IMU-quiet spans) missed a span that is still by
+   position. The other two are single frames: 146 (5.8 cm/s GT) and 173 (2.4 cm/s). The detector was right; the
+   prediction's still set was too narrow.
+2. **P1 per minute.** still.py divides the keyframes inside the longest still run by its length: 3 heartbeats in
+   10.95 s. The spacing is exactly 60 frames (3.0 s); a finite window holds floor(T / 3) of them. The mechanism runs at
+   20 / min.
+3. **P2 heartbeats.** W is not one still run: the rotor test (31.5-33.5 s) closes it, and frames 650 and 658 become
+   keyframes on non-still frames (bound asks). The still spans are 430-650 (3 heartbeats: 476, 536, 596) and 658-770
+   (1: 718). The 5-7 assumed one 17 s run.
+4. **P3 landmarks.** BASE's keyframes in W grow 9, 2, 7, 2, 3, 1 points over the first 40 frames and 0 after frame
+   480: all 10 growth neighbours are still keyframes from the last 80 frames, with no baseline. G's heartbeat
+   keyframes grow 12-31 points each from 10 neighbours that reach back to keyframes taken before the stop (frames
+   <= 416, while landing), which have a baseline. The theory assumed creation scales with the keyframe count; it
+   scales with the neighbours' baseline. Unverified whether those points are good (they did not move ATE: P4).
+5. **P5.** Before IMU init the heartbeat is 0.5 s (10 frames) against the Kornia frame bound of 8 frames (0.4 s), so
+   60 frames hold 8 BASE keyframes and 6 G keyframes. The +/- 1 band was an arithmetic error in the prediction.
+6. **K3.** On every LaMAria G run `keyframe_asks_withheld`, `heartbeat_keyframes` and `lost_keyframes_withheld`
+   are 0 (`still_quality_keyframes` is 2 on R_03, and a quality ask inserts as under Off), so the gate changed no
+   keyframe decision, and on LaMAria G runs exactly the code
+   `Observe` runs. The runs are Asynchronous, and the detector adds one map lock per frame (the image vote), so they
+   diverge as any two async runs do. Diagnosis run: `Observe` paired with BASE on R_01 full, 3 rounds
+   (`$O/out/r01obs/`, load p50 9.96 / 9.05 / 7.69): BASE 0.361 / 0.577 / 0.324, OBS 0.327 / 0.301 / 0.378.
+   Over all seven BASE runs R_01 SE3 spans 0.324-0.577 (mean 0.403); over the seven G and OBS runs 0.301-0.607
+   (mean 0.422). BASE itself missed the 0.51 m guard once. R_03 tracked: BASE spans 753-788, G 755-776. The R_01
+   guard misses and the tracked deficits sit inside the async spread; overruled as noise. Gate's own effect on
+   LaMAria is nil (nothing withheld), as finding 3 predicted.
+7. **K4 / M2.** Every R_03 still frame is 1-3 frames after a keyframe (frame 90: kf 89; frames 6-41: start-up at GT
+   speed 0-5.6 cm/s). The image test asks whether the view changed since the keyframe, which one frame after it is
+   true at walking speed (1.5 cm at several metres is under 1 px at f ~ 240). The harmful case, a withheld keyframe
+   while moving, did not occur: no LaMAria run withheld anything and MH_01's withheld frames all sit under 5 cm/s.
+   M2 counts frames, not withheld asks. Overruled, but the owner should decide whether M2's wording or the detector
+   (for example, a minimum of frames since the keyframe before a vote counts) changes.
+
+### Findings for the owner
+
+- **The IMU voter never vouches after a keyframe within 0.5 s.** A run starts at each keyframe and the first IMU chunk
+  closes 0.5 s later, while the frame bound asks at 0.4 s (8 frames at 20 Hz) and the lost interval at 0.2 s. So
+  `vouched_imu` is 0 in every run, and under Gate a still rig that is lost gets a heartbeat lost keyframe, then its
+  run restarts and the next lost keyframe (0.2 s later) is not withheld: lost keyframes still come every 0.2 s after
+  the first heartbeat. Fix candidates (not built, plan step for the owner): carry the IMU reference chunk across a
+  keyframe inserted while still, or let the stage 2 stationary link own the lost case.
+- **The image voter is on its own on EuRoC and LaMAria.** EuRoC MH_01's measured spread is above the model in the
+  quiet spans too (the card's finding 4), so the IMU would abstain there even with time to judge.
+- **Gate on MH_01 cut the run's keyframes 163 -> 114** (wall time BASE 204 s, OBS 233 s, G 126 s, all at load
+  20-29, so not a timing sample), with ATE unchanged.
+
+### Verdict
+
+Stage 0: the detector finds the still segment (282 / 282 IMU-quiet frames, plus the rotor spin-up on the ground)
+and changes nothing in Observe (M3, identity). Stage 1: Gate removes 37 of 43 keyframes in W at unchanged MH_01
+accuracy and makes no decision on LaMAria. Theory confirmed for the bound asks; three predictions missed on
+arithmetic or a too-narrow still set (P1 wording, P2, P5), one on mechanism (P3: landmark creation follows the
+neighbours' baseline), and K3 (R_01 SE3 guard missed in 2/3, R_03 tracked below BASE) and K4 (M2 on R_03) fired and were overruled with
+the evidence above: nothing was withheld on LaMAria, and an Observe arm running the same code sits inside BASE's
+async spread. The knob stays Off
+(default) until the owner rules on K4/M2 and the IMU-voter finding; stage 2 waits for the cleanup card.

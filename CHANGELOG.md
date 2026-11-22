@@ -28,6 +28,15 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
   3 s), `startup_segment_deaths`, `keeps_refused_before_viba2` and
   `coast_m_at_give_up_max`.
 
+**`keyframes.stillness` (`Off`): no keyframes from a still device (card AB).** `Observe` runs a
+still-device detector (image displacement against the last keyframe in pixel-noise units, IMU
+chunk means against the noise model, wheels when enabled) and reports it on a new
+`[summary] stillness` line without changing any decision; `Gate` also withholds the frame, time
+and lost-interval keyframes while still, up to a 3 s heartbeat (0.5 s before the inertial
+schedule settles); keyframes earned by tracking quality still insert. `StationaryEdges` is
+refused until it is built. `KeyframePolicy::asks` splits a decision into its bound and quality
+asks.
+
 **New settings for a 1 ms frontend frame and for online calibration, all off by
 default.** Every default is today's behaviour, so existing run files load and
 run unchanged. Built, not validated: no benchmark has run on them. Not built:
