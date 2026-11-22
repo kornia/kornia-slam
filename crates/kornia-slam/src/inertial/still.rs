@@ -149,7 +149,8 @@ pub(crate) fn has_hole(samples: &[ImuMeasurement], max_gap_sec: f64) -> bool {
 }
 
 /// The still stretch since one keyframe, verified chunk by chunk as samples
-/// arrive. Once closed it stays closed; the next keyframe starts a new run.
+/// arrive. Once closed it stays closed; the next keyframe starts a new run,
+/// unless it was inserted on a still frame and the run is carried.
 #[derive(Debug, Clone)]
 pub(crate) struct StillRun {
     /// `Frame::idx` of the keyframe the run starts at.
@@ -157,6 +158,10 @@ pub(crate) struct StillRun {
     /// The samples are verified up to here.
     end_sec: f64,
     reference: Option<ChunkMean>,
+    /// End stamp of the reference chunk.
+    reference_sec: Option<f64>,
+    /// Whether the newest judged chunk was within the model's spread.
+    newest_quiet: Option<bool>,
     vote: ImuVote,
     /// `∫(ω - b̂_g) dt` over the judged chunks, rad; only with a known bias.
     rotation: Vec3F64,
@@ -170,10 +175,32 @@ impl StillRun {
             kf_idx,
             end_sec: start_sec,
             reference: None,
+            reference_sec: None,
+            newest_quiet: None,
             vote: ImuVote::Pending,
             rotation: Vec3F64::ZERO,
             closing: None,
         }
+    }
+
+    /// Moves the run onto keyframe `kf_idx`, inserted while still. Rest is a
+    /// property of the device, and constancy against one reference is
+    /// transitive, so the reference and the judged end stay (OpenVINS
+    /// `UpdaterZeroVelocity.cpp:93-97, :327-328`). The view rotation restarts
+    /// against the new keyframe, and the vote follows the newest chunk.
+    pub(crate) fn carry_to(&mut self, kf_idx: usize) {
+        self.kf_idx = kf_idx;
+        self.rotation = Vec3F64::ZERO;
+        self.vote = match self.newest_quiet {
+            None => ImuVote::Pending,
+            Some(true) => ImuVote::Quiet,
+            Some(false) => ImuVote::Unknown,
+        };
+    }
+
+    /// End stamp of the reference chunk, once one is judged.
+    pub(crate) fn reference_sec(&self) -> Option<f64> {
+        self.reference_sec
     }
 
     pub(crate) fn vote(&self) -> ImuVote {
@@ -222,13 +249,17 @@ impl StillRun {
         let start = samples.partition_point(|m| m.timestamp < from);
         let chunk = &samples[start..];
         match judge_chunk(chunk, from, calib) {
-            Some(mean) => self.accept(mean, newest - from, view),
+            Some(mean) => {
+                self.reference_sec.get_or_insert(newest);
+                self.accept(mean, newest - from, view);
+            }
             None => self.close(ImuCloser::Hole, None),
         }
         self.end_sec = newest;
     }
 
     fn accept(&mut self, mean: ChunkMean, span: f64, view: Option<GyroView>) {
+        self.newest_quiet = Some(mean.quiet);
         let reference = *self.reference.get_or_insert(mean);
         if let Some((closer, stat)) = mean.moved_from(&reference) {
             return self.close(closer, Some((stat, CHI2_3_999)));
@@ -427,6 +458,115 @@ mod tests {
         let (rad, max) = run.closing().expect("statistic recorded");
         assert!(rad > max);
         assert!(run_over(&imu(10.0, bias, rest), Some(view)).is_open());
+    }
+
+    /// Feeds `samples` in 0.05 s batches into `run`, from sample `from`.
+    fn feed(run: &mut StillRun, samples: &[ImuMeasurement], from: usize) {
+        for end in (from + 10..=samples.len()).step_by(10) {
+            run.advance(&samples[..end], &calib(), None);
+        }
+    }
+
+    /// Up to sample `split`, then a carry at a keyframe there, then the rest.
+    fn carried_over(samples: &[ImuMeasurement], split: usize) -> StillRun {
+        let mut run = StillRun::new(1, 0.0);
+        feed(&mut run, &samples[..split], 0);
+        run.carry_to(7);
+        feed(&mut run, samples, split);
+        run
+    }
+
+    #[test]
+    fn a_carry_in_mid_chunk_leaves_no_hole_and_stays_quiet() {
+        let samples = imu(6.0, Vec3F64::ZERO, rest);
+        let mut run = StillRun::new(1, 0.0);
+        feed(&mut run, &samples[..550], 0);
+        let end = run.end_sec();
+        run.carry_to(7);
+        assert_eq!(run.kf_idx, 7);
+        assert_eq!(run.end_sec(), end, "the judged end stays");
+        assert!(
+            run.quiet_at(samples[549].timestamp),
+            "right after the carry"
+        );
+        feed(&mut run, &samples, 550);
+        assert_eq!(run.vote(), ImuVote::Quiet);
+        assert!(run.end_sec() > 5.4, "{}", run.end_sec());
+        assert_eq!(run.reference_sec(), Some(samples[109].timestamp));
+    }
+
+    #[test]
+    fn an_accel_step_after_a_carry_closes_against_the_carried_reference() {
+        // Noise-free, so each statistic is exact: one 0.012 m/s² step is
+        // 9 against 16.27 (sigma of a mean difference 0.004), two are 36.
+        let samples: Vec<_> = (0..1600)
+            .map(|k| {
+                let t = k as f64 / RATE;
+                let steps = [2.0, 5.0].iter().filter(|&&s| t >= s).count();
+                ImuMeasurement {
+                    timestamp: t,
+                    gyro: Vec3F64::ZERO,
+                    accel: Vec3F64::new(0.012 * steps as f64, 0.0, GRAVITY),
+                }
+            })
+            .collect();
+        let carried = carried_over(&samples, 700);
+        assert_eq!(carried.vote(), ImuVote::Moving(ImuCloser::AccelMean));
+        let mut fresh = StillRun::new(7, samples[699].timestamp);
+        feed(&mut fresh, &samples, 700);
+        assert!(fresh.is_open(), "{:?}", fresh.vote());
+    }
+
+    #[test]
+    fn the_view_rotation_restarts_at_a_carry() {
+        let bias = Vec3F64::new(0.08, -0.01, 0.02);
+        let turn = |_: f64| (Vec3F64::ZERO, Vec3F64::new(0.0, 0.0, 0.004));
+        let samples = imu(10.0, bias, turn);
+        let view = GyroView {
+            bias,
+            max_rad: 2.35 / 400.0,
+        };
+        let advance = |run: &mut StillRun, range: std::ops::Range<usize>| {
+            for end in range.step_by(10) {
+                run.advance(&samples[..end], &calib(), Some(view));
+            }
+        };
+        // 4 mrad/s reaches 5.9 mrad at 1.5 s; a carry each second keeps it under.
+        let mut carried = StillRun::new(1, 0.0);
+        for second in 0..9 {
+            advance(&mut carried, second * 200 + 10..(second + 1) * 200 + 1);
+            carried.carry_to(second + 2);
+        }
+        assert!(carried.is_open(), "{:?}", carried.vote());
+        let mut kept = StillRun::new(1, 0.0);
+        advance(&mut kept, 10..1801);
+        assert_eq!(kept.vote(), ImuVote::Moving(ImuCloser::GyroView));
+    }
+
+    #[test]
+    fn the_vote_after_a_carry_follows_the_newest_chunk() {
+        let mut run = StillRun::new(1, 0.0);
+        run.carry_to(2);
+        assert_eq!(run.vote(), ImuVote::Pending, "nothing judged yet");
+        let w = std::f64::consts::TAU * 38.0;
+        // Vibration from 1 s to 2 s only.
+        let vibrate = |t: f64| {
+            let s = if (1.0..2.0).contains(&t) {
+                (w * t).sin()
+            } else {
+                0.0
+            };
+            (Vec3F64::new(0.179 * s, 0.0, 0.0), Vec3F64::ZERO)
+        };
+        let samples = imu(4.0, Vec3F64::ZERO, vibrate);
+        feed(&mut run, &samples[..400], 0);
+        assert_eq!(run.vote(), ImuVote::Unknown);
+        run.carry_to(3);
+        assert_eq!(run.vote(), ImuVote::Unknown, "the newest chunk vibrated");
+        feed(&mut run, &samples, 400);
+        assert_eq!(run.vote(), ImuVote::Unknown, "Unknown holds within a run");
+        run.carry_to(4);
+        assert_eq!(run.vote(), ImuVote::Quiet, "the newest chunk is quiet");
     }
 
     #[test]
