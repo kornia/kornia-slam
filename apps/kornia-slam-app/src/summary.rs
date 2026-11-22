@@ -177,13 +177,15 @@ fn format_loss(c: &RunCounters) -> String {
     format!(
         "[summary] loss later_alignments={} later_alignment_deg_max={:.3} \
          later_alignment_jump_m_max={:.3} seeds_gyro_held={} seed_rotation_deg_max={:.3} \
-         young_segment_deaths={} keeps_refused_before_viba2={} coast_m_at_give_up_max={:.3}",
+         young_segment_deaths={} startup_segment_deaths={} keeps_refused_before_viba2={} \
+         coast_m_at_give_up_max={:.3}",
         c.later_alignments,
         milli(c.later_alignment_mdeg_max),
         milli(c.later_alignment_jump_mm_max),
         c.seeds_gyro_held,
         milli(c.seed_rotation_mdeg_max),
         c.young_segment_deaths,
+        c.startup_segment_deaths,
         c.keeps_refused_before_viba2,
         milli(c.coast_mm_at_give_up_max),
     )
@@ -526,6 +528,7 @@ mod tests {
         counters.seeds_gyro_held = 3;
         counters.seed_rotation_mdeg_max = 150_250;
         counters.young_segment_deaths = 4;
+        counters.startup_segment_deaths = 5;
         counters.keeps_refused_before_viba2 = 1;
         counters.coast_mm_at_give_up_max = 7_125;
         let text = format(&counters, &FrameTimes::default());
@@ -533,7 +536,8 @@ mod tests {
             text.lines().last().unwrap(),
             "[summary] loss later_alignments=2 later_alignment_deg_max=61.100 \
              later_alignment_jump_m_max=423.500 seeds_gyro_held=3 seed_rotation_deg_max=150.250 \
-             young_segment_deaths=4 keeps_refused_before_viba2=1 coast_m_at_give_up_max=7.125"
+             young_segment_deaths=4 startup_segment_deaths=5 keeps_refused_before_viba2=1 \
+             coast_m_at_give_up_max=7.125"
         );
     }
 }

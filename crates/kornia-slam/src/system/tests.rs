@@ -2177,6 +2177,25 @@ mod recovery_after_loss {
         assert_eq!(system.counters.later_alignments, 1);
         assert_eq!(system.counters.later_alignment_jump_mm_max, 3_000);
     }
+
+    /// Resets before any segment lived 3 s are start-up, not deaths after a
+    /// loss (1_19 resets three times in its first 0.65 s).
+    #[test]
+    fn start_up_resets_are_no_young_deaths() {
+        let mut system = lost_metric_system(1.0);
+        for (begun, lost) in [(0.0, 0.3), (0.35, 0.6), (0.65, 400.0), (402.0, 403.5)] {
+            system.segment_begun_sec = Some(begun);
+            system.count_young_death(lost);
+        }
+        let counters = &system.counters;
+        assert_eq!(
+            (
+                counters.startup_segment_deaths,
+                counters.young_segment_deaths
+            ),
+            (2, 1)
+        );
+    }
 }
 
 mod adoption {

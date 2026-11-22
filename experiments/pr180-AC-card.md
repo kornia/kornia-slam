@@ -45,6 +45,9 @@ Owner change (2026-11-22, after AC-0 round 1, K6): R0 below is retired as a gate
   aligned one (start-up resets before any alignment do not count). No distance threshold is needed: a world
   never aligned holds nothing gravity-aligned to rotate, so the first alignment is the world's own levelling
   whatever its size (R_01: 90.4 deg, 0.32 m); any later one rotates aligned keyframes (G46).
+  Likewise `young_segment_deaths` counts only give-ups of segments under 3 s old once some segment has lived 3 s;
+  the earlier ones are start-up resets and go to `startup_segment_deaths` (1_19: three resets in the first 0.65 s,
+  frames 0-12, the same in F1). AC-1's M3 is scored on post-loss young deaths only (lossev class "young").
 Predictions, AC-0 (windows of section 4; paired BASE; DEBUG=1 on one BASE per window):
   R0  (retired 2026-11-22, see the owner change above) each BASE window has >= 1 give-up after the first VIBA2,
       within 10 s of the F1 event time.

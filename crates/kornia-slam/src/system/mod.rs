@@ -204,6 +204,9 @@ pub struct SlamSystem {
     segments: Segments,
     /// When the current segment's bootstrap finished, for the young-death count.
     segment_begun_sec: Option<f64>,
+    /// A segment has lived [`counters::YOUNG_SEGMENT_SEC`]: give-ups of young
+    /// segments before that are start-up resets, not deaths after a loss.
+    startup_over: bool,
     /// The segment the first inertial alignment was applied in: a later
     /// segment's alignment rotates that already gravity-aligned world.
     first_aligned_segment: Option<SegmentId>,
@@ -375,6 +378,7 @@ impl SlamSystem {
             tilt: TiltMonitor::default(),
             segments: Segments::default(),
             segment_begun_sec: None,
+            startup_over: false,
             first_aligned_segment: None,
             relocalization: settings.relocalization,
             tracking_config: settings.tracking,
@@ -1830,7 +1834,12 @@ impl SlamSystem {
         let young = self
             .segment_begun_sec
             .is_some_and(|begun| lost_since_sec - begun < counters::YOUNG_SEGMENT_SEC);
-        self.counters.young_segment_deaths += u64::from(young);
+        if young && self.startup_over {
+            self.counters.young_segment_deaths += 1;
+        } else if young {
+            self.counters.startup_segment_deaths += 1;
+        }
+        self.startup_over |= !young;
     }
 
     fn resume_tracking_after_viba0(&mut self, timestamp_sec: f64, applied: AppliedInitialization) {

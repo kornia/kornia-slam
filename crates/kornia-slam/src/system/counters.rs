@@ -202,8 +202,12 @@ pub struct RunCounters {
     /// Largest rotation of a re-seed from the last tracked pose, in
     /// thousandths of a degree: the gyro's turn over the loss.
     pub seed_rotation_mdeg_max: u64,
-    /// Give-ups of a segment lost less than 3 s after it began.
+    /// Give-ups of a segment lost less than 3 s after it began, once some
+    /// segment has lived 3 s: deaths of a segment re-seeded after a loss.
     pub young_segment_deaths: u64,
+    /// Give-ups of young segments before any segment lived 3 s: start-up
+    /// resets (R_01 and 1_19 reset 2-3 times in their first second).
+    pub startup_segment_deaths: u64,
     /// Give-ups `reseed.seed: Held` sent down the cold path because VIBA2
     /// had not run yet.
     pub keeps_refused_before_viba2: u64,
