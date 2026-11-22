@@ -218,7 +218,20 @@ Stop point: K6 fired, so step 5 (AC-1) was not built.
 2. **Mid-sequence starts, second.** W211a, W119 and W211b start with a cascade of start-up give-ups (2-7 in the first
    14 s, while VIBA0 is still unsolved); the 30 s lead is spent on that, and the map at the event is younger and
    different from F1's. W211c, W318 and W511, whose events lie 40-200 s after the window start, reproduce.
-3. **Next (K6's own remedy, queued, not run).** `$AC/q0b.txt`: W211aL60 (start 2200, 1900 frames), W211bL60 (6300,
-   2100), W119L60 (7520, 4880), through `$AC/runq2.sh`, which starts a job only when the 1-min load is under 8 and
-   fewer than 2 kornia-slam processes run. If the 60 s lead still misses at low load, the full prefix (frame 0) is
-   the next step, per K6.
+3. **K6's remedy, run (BASE, F1 binary).** 60 s lead: W211aL60 (start frame 2200, 1900 frames; load median 17,
+   frontend p50 25.5 ms): 3 start-up give-ups at 110-118 s, then losses at 137.6 s (1.5 s) and 143.3 s (4.5 s), no
+   loss at 171 s; miss. W119L60 (7520, 4880; frontend p50 56.7 ms): 0 give-ups, no runaway, losses at 444 s (2.2 s)
+   and 563 s (1.25 s) only; miss. W211bL60 did not start (config renamed under a queued runner; exit 1). Full
+   prefix: W211aP (frames 0-4100, load median 7.6, frontend p50 15.0 ms, the closest to F1's 10.5): 13 start-up
+   give-ups in the first 10 s, then a primary give-up after VIBA2, a 5.45 s loss at 120.6 s and a segment at 126.0 s,
+   with an origin-preserving jump at 127.3 s (31.1 m, distance from the origin 41.9 m kept, orientation change
+   49.0 deg); no loss at 171 s. Coasts at 3-5 s: 15.4 m median error at 4.46 m/s SLAM against 0.12 m/s GT.
+   R0 misses at full prefix too: the run reaches the same mechanism (a primary give-up after VIBA2, then the later
+   alignment rotating the world) but 45 s before F1's event.
+4. **Verdict.** K6 fired and its remedy is exhausted on W211a (30 s, 60 s, full prefix) and W119 (30 s, 60 s). Runs
+   of the same binary and window do not repeat (W318 2 against 0 give-ups, W211c 13 against 17), and a window's
+   trajectory diverges from F1's within seconds, so "within 10 s of the F1 event time" cannot be met by any window
+   while the system is this timing-sensitive. Four runs do produce a scoreable event, a primary give-up after VIBA2
+   (W211c 1079.9 s, W318 1346.5 s, W511 972.8 s, W211aP 126.0 s), each followed by the world rotation (W318 89.4 deg,
+   W511 83.8-88.7 deg, W211aP 49.0 deg). Whether to score AC-0 on those runs' own events instead of F1's times is
+   the owner's call (it changes R0). Per the stop rule AC-1 was not built.
