@@ -103,3 +103,19 @@ Measurement, no prediction (owner answer 2): R_11 frames 0-7600, BASE against U,
 
 ## Results
 
+### Stage 0a, jumps.py on card AC outputs (offline, 2026-11-22)
+
+`python3 -I experiments/quick-eval/jumps.py $P/cardAC/out/<run> .../sequence_2_11 --body $P/cardAC/body/sequence_2_11.txt`.
+A primary loss here is a coast episode of at least 0.5 s in a segment at least 3 s old; times from the window start.
+
+- W211c-KIU, loss 7 (onset frame 21389, 29.45 s, coast 5.05 s): steps 5.98 m / 6.4 deg at 29.30 s (T) and 6.36 m /
+  3.9 deg at 29.45 s (the first coasted frame), plus 1.79 m and 2.08 m at 26.25 and 26.50 s. SLAM speed 3.13 ->
+  6.87 m/s over the coast, GT 0.50 m/s in the first 0.5 s; speed error first 0.5 s 3.94 m/s. Reproduces finding 2.
+- W211aP-U, loss 6 (onset frame 3444, 172.20 s, coast 5.05 s): steps 3.93 m at 170.75 s and 3.41 m at 171.25 s
+  inside the 5 s window, plus 16 more steps of 0.5-2.1 m. The 11.39 m / 47.2 deg and 11.26 m / 41.9 deg steps sit at
+  166.90 and 167.10 s, 5.30 and 5.10 s before the onset, just outside the 5 s window (a 6 s window shows them). The
+  planner's times read 0.15 s earlier (166.75, 170.6, 171.1 s): a different time origin, same frames. SLAM speed
+  11.21 -> 12.13 m/s against GT 1.15 m/s; slope of the speed error +1.64 m/s^2 over 3.6 s.
+- Slope on W211c-KIU loss 7 reads +0.06 m/s^2, not +1.1: the 0.25 s speed window starts on the 6.36 m step, so the
+  first samples already read 3-4 m/s; the start-to-end SLAM speeds (3.1 -> 6.9 m/s) carry the ramp.
+
