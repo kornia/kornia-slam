@@ -226,6 +226,8 @@ pub struct RunCounters {
     pub pose_innovation_unavailable: u64,
     /// Largest consistency scale `c`, in thousandths.
     pub pose_innovation_scale_milli_max: u64,
+    /// The still-device detector (`keyframes.stillness`, card AB).
+    pub stillness: StillnessCounters,
 }
 
 /// Age, seconds, under which a segment's give-up counts as a young death:
@@ -238,6 +240,33 @@ pub(crate) fn raise_milli_max(slot: &mut u64, value: f64) {
     if value.is_finite() {
         *slot = (*slot).max((value.abs() * 1e3).round() as u64);
     }
+}
+
+/// What the still-device detector saw and did; all zero with
+/// `keyframes.stillness: Off`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StillnessCounters {
+    /// Frames judged still.
+    pub still_frames: u64,
+    /// Runs (one per keyframe) with at least one still frame.
+    pub still_runs: u64,
+    /// Bound asks withheld on still frames (`Gate` only).
+    pub keyframe_asks_withheld: u64,
+    /// Bound asks on still frames let through by the heartbeat (`Gate` only).
+    pub heartbeat_keyframes: u64,
+    /// Quality asks on still frames, which always insert.
+    pub still_quality_keyframes: u64,
+    /// Lost-interval keyframes withheld on still frames (`Gate` only).
+    pub lost_keyframes_withheld: u64,
+    /// Runs closed by each voter.
+    pub runs_closed_imu: u64,
+    pub runs_closed_image: u64,
+    pub runs_closed_wheels: u64,
+    /// Still frames by the voter that vouched for rest.
+    pub vouched_image: u64,
+    pub vouched_imu: u64,
+    pub vouched_wheels: u64,
 }
 
 impl RunCounters {

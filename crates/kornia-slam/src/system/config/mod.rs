@@ -5,6 +5,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::inertial::VibaWindow;
+use crate::inertial::still::RUN_CHUNK_SEC;
 use crate::inertial::trust::ImuTrustMode;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{LoopClosingConfig, LoopGraphInformation, LoopGraphSettings};
@@ -30,6 +31,7 @@ use crate::tracking::{
 use kornia_sensors::imu::SampleInterpolation;
 
 use super::recovery::RecoveryConfig;
+use super::stillness::{HEARTBEAT_SETTLED_SEC, HEARTBEAT_UNSETTLED_SEC};
 
 /// Schema version of [`SystemConfig`] this crate reads and writes.
 pub const SYSTEM_CONFIG_VERSION: u32 = 1;
@@ -894,6 +896,13 @@ impl fmt::Display for SystemConfig {
         match k.max_interval_sec {
             Some(secs) => writeln!(f, ", at most {secs} s apart")?,
             None => writeln!(f)?,
+        }
+        if k.stillness.observes() {
+            writeln!(
+                f,
+                "  stillness: {:?} (99.9 %, {} s IMU chunks, heartbeat {} s settled, {} s before)",
+                k.stillness, RUN_CHUNK_SEC, HEARTBEAT_SETTLED_SEC, HEARTBEAT_UNSETTLED_SEC
+            )?;
         }
         let execution = match orb.mapping.execution {
             LocalMappingMode::Synchronous => "synchronous",

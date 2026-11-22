@@ -15,6 +15,7 @@ mod innovation;
 mod input;
 mod recovery;
 mod state;
+mod stillness;
 mod trace;
 mod validation;
 pub mod wheel;
@@ -29,7 +30,7 @@ pub use config::{
     PoseInertialMinInliers, SYSTEM_CONFIG_VERSION, SensorSelection, SnapbackFix, StereoCloseDepth,
     StereoDepthSigma, StereoPyramid, SystemConfig, TrackRefill, TrackingConfig, TrackingLossConfig,
 };
-pub use counters::{RunCounters, SkipKind};
+pub use counters::{RunCounters, SkipKind, StillnessCounters};
 #[cfg(feature = "serde")]
 pub use file::LoadError;
 pub use input::ProcessError;
@@ -44,7 +45,7 @@ use fan_out::TrackingFanOut;
 use state::{SystemMode, SystemState};
 
 use crate::tracking::{
-    KeyframeEvidence, KeyframePolicy, KeyframesWhileLost, MappingAcceptance,
+    KeyframeAsks, KeyframeEvidence, KeyframePolicy, KeyframesWhileLost, MappingAcceptance,
     TrackingLossRecoveryPolicy, median_parallax_px,
 };
 
@@ -291,6 +292,8 @@ pub struct SlamSystem {
     // First keyframe of the re-seeded segment the own window holds; cleared
     // once it is full or a relocalization is adopted (G2).
     window_segment_start: Option<usize>,
+    // The still run since the last keyframe (`keyframes.stillness`, card AB).
+    stillness: stillness::StillnessState,
 }
 
 impl SlamSystem {
@@ -435,6 +438,7 @@ impl SlamSystem {
             flow,
             gyro_rotation: None,
             window_segment_start: None,
+            stillness: stillness::StillnessState::default(),
             adopted_keyframe: None,
         }
     }
@@ -619,6 +623,7 @@ impl SlamSystem {
             flow_anchor_drops: flow.anchor_drops,
             flow_template_rebuilds: flow.template_rebuilds,
             flow_refill_spawns: refill_spawns,
+            stillness: self.stillness.counters,
             ..self.counters
         }
     }
@@ -2049,6 +2054,7 @@ impl SlamSystem {
             self.report_frame_velocity(frame_idx, velocity_source);
         }
         self.update_seeded_window();
+        self.advance_stillness();
 
         let (candidate_pose, predicted_velocity) =
             self.predict_frame(frame_idx, pose_before, prev_timestamp, timestamp_sec);
@@ -2343,6 +2349,8 @@ impl SlamSystem {
                 KeyframesWhileLost::Disabled => None,
             };
             let due = imu_confident && self.keyframe_due_while_lost(timestamp_sec);
+            let withheld = self.withhold_lost_keyframe(frame.idx, timestamp_sec, due);
+            let due = due && !withheld;
             if due && role.is_some() && self.recovery.keep_inertial && self.runaway.runaway() {
                 self.dbg(format!(
                     "[lost] frame={} runaway at {:.1} m/s: no keyframe at the coasted pose",
@@ -2613,7 +2621,7 @@ impl SlamSystem {
             timestamp_sec,
         );
         self.tracking_timings.flow_map_wait += map_wait;
-        if self.keyframe_due(&evidence, timestamp_sec) {
+        if self.keyframe_due(&evidence, &frame, &estimate.matches, timestamp_sec) {
             self.tracking_timings.flow_bookkeeping += started.elapsed();
             self.dbg(format!(
                 "[klt-first] frame={idx} keyframe due seeded={n_seeded} inliers={}",
@@ -2808,8 +2816,15 @@ impl SlamSystem {
     }
 
     /// The policy's decision, or `max_interval_sec` elapsed since the last
-    /// keyframe's timestamp, unless the mapping refuses it.
-    fn keyframe_due(&mut self, evidence: &KeyframeEvidence, timestamp_sec: f64) -> bool {
+    /// keyframe's timestamp (a bound ask); then the still-device gate, unless the mapping
+    /// refuses it.
+    fn keyframe_due(
+        &mut self,
+        evidence: &KeyframeEvidence,
+        frame: &Frame,
+        matches: &[(usize, usize)],
+        timestamp_sec: f64,
+    ) -> bool {
         let interval_elapsed = evidence
             .last_keyframe_idx
             .zip(self.inertial.last_keyframe_timestamp_sec)
@@ -2819,7 +2834,16 @@ impl SlamSystem {
                     timestamp_sec - last_ts,
                 )
             });
-        let due = interval_elapsed || self.keyframe_policy.should_insert_with(evidence);
+        let asks = self.keyframe_policy.asks(evidence);
+        let asks = KeyframeAsks {
+            bound: asks.bound || interval_elapsed,
+            ..asks
+        };
+        let due = if self.keyframe_policy.stillness.observes() {
+            self.still_gated_decision(asks, frame, matches, timestamp_sec)
+        } else {
+            asks.any()
+        };
         if due && self.mapping_refuses(evidence) {
             self.counters.keyframes_refused_busy += 1;
             return false;
@@ -3226,7 +3250,7 @@ impl SlamSystem {
         matches: &[(usize, usize)],
     ) -> bool {
         let evidence = self.keyframe_evidence(frame, tracked_inliers, matches, timestamp_sec);
-        if !self.keyframe_due(&evidence, timestamp_sec) {
+        if !self.keyframe_due(&evidence, frame, matches, timestamp_sec) {
             return false;
         }
         self.insert_keyframe(

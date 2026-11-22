@@ -1307,6 +1307,7 @@ mod runtime_settings {
             max_interval_sec: Some(0.5),
             rules: KeyframeRules::Kornia,
             mapping_acceptance: crate::tracking::MappingAcceptance::Ignore,
+            stillness: crate::tracking::Stillness::Gate,
         };
         orb.mapping.execution = LocalMappingMode::Synchronous;
         orb.tuning.initialization.acceptance_config.min_inliers = 40;
@@ -1557,6 +1558,7 @@ mod ron_files {
 
     use super::*;
     use crate::loop_closure::OdometryRandomWalk;
+    use crate::tracking::Stillness;
 
     #[test]
     fn the_keyframe_growth_parses() {
@@ -1670,6 +1672,33 @@ mod ron_files {
     /// are compared through their serialized form.
     fn ron(config: &SystemConfig) -> String {
         config.to_ron_string().unwrap()
+    }
+
+    #[test]
+    fn the_stillness_knob_parses_round_trips_and_refuses_stationary_edges() {
+        let config = parse(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((keyframes: (stillness: Gate))))",
+        )
+        .unwrap();
+        assert_eq!(orb(&config).keyframes.stillness, Stillness::Gate);
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+        assert_eq!(config.validate(), Ok(()));
+        assert!(config.to_string().contains("stillness: Gate"));
+
+        let default = parse("(version: 1)").unwrap();
+        assert_eq!(orb(&default).keyframes.stillness, Stillness::Off);
+        assert!(!default.to_string().contains("stillness"));
+
+        let edges = |imu: bool| {
+            parse(&format!(
+                "(version: 1, sensors: (imu: {imu}), pipeline: OrbSlam((keyframes: \
+                 (stillness: StationaryEdges))))"
+            ))
+            .unwrap()
+            .validate()
+        };
+        assert_eq!(edges(false), Err(ConfigError::StationaryEdgesWithoutImu));
+        assert_eq!(edges(true), Err(ConfigError::StationaryEdgesNotBuilt));
     }
 
     #[test]

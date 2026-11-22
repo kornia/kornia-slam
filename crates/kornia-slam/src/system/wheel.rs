@@ -741,8 +741,15 @@ impl WheelState {
     /// stationary initialization's wheel floors, so a there-and-back is motion. `false` when the
     /// readings do not cover the interval: nothing then vouches for the base.
     pub fn parked_between(&self, t0_ns: u64, t1_ns: u64) -> bool {
+        self.parked_vote(t0_ns, t1_ns) == Some(true)
+    }
+
+    /// [`Self::parked_between`] as a stillness vote: `Some(false)` when the readings cover the
+    /// interval and the base moved, `None` when they do not cover it.
+    pub fn parked_vote(&self, t0_ns: u64, t1_ns: u64) -> Option<bool> {
         self.delta(t0_ns, t1_ns, self.cfg.max_gap_ns())
-            .is_ok_and(|d| d.path_m <= PARKED_PATH_M && d.path_rad <= PARKED_PATH_RAD)
+            .ok()
+            .map(|d| d.path_m <= PARKED_PATH_M && d.path_rad <= PARKED_PATH_RAD)
     }
 
     /// Checks a frame stamp against the readings' span. Returns `frame - newest reading` in ns

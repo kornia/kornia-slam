@@ -558,10 +558,134 @@ mod keyframe_evidence {
             ..KeyframeEvidence::default()
         };
         assert!(!system.keyframe_policy.should_insert_with(&parked));
-        assert!(!system.keyframe_due(&parked, 10.49));
-        assert!(system.keyframe_due(&parked, 10.5));
+        let frame = frame_seeing_points(1100, Pose3d::IDENTITY, &[]);
+        assert!(!system.keyframe_due(&parked, &frame, &[], 10.49));
+        assert!(system.keyframe_due(&parked, &frame, &[], 10.5));
         system.keyframe_policy.max_interval_sec = None;
-        assert!(!system.keyframe_due(&parked, 1e6), "no bound unless set");
+        assert!(
+            !system.keyframe_due(&parked, &frame, &[], 1e6),
+            "no bound unless set"
+        );
+    }
+}
+
+/// `keyframes.stillness` (card AB) on a stereo-inertial rig at rest: the
+/// keyframe decisions of a sequence of identical frames. Insertion is
+/// emulated by moving the last keyframe's stamp (which restarts the run)
+/// while the image vote keeps measuring against map keyframe 0.
+mod stillness {
+    use super::*;
+    use crate::tracking::Stillness;
+    use crate::tracking::parallax::tests::{frame_seeing_points, grid, map_with_keyframe_seeing};
+
+    fn system(stillness: Stillness) -> SlamSystem {
+        let mut config = config(CameraSelection::Stereo, true, LoopClosingMode::Disabled);
+        let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+        orb.keyframes.stillness = stillness;
+        let mut system = SlamSystem::build(config, stereo_imu_rig()).unwrap();
+        *system.map.lock().unwrap() = map_with_keyframe_seeing(Pose3d::IDENTITY, grid());
+        system.state.imu_initialized = true;
+        system.inertial.schedule.close();
+        system.state.last_keyframe_idx = Some(0);
+        system.inertial.last_keyframe_timestamp_sec = Some(stamp(0));
+        system
+    }
+
+    /// At-rest samples of frame `idx`'s 50 ms at 200 Hz.
+    fn rest_samples(idx: usize) -> Vec<ImuMeasurement> {
+        (0..10)
+            .map(|i| ImuMeasurement {
+                timestamp: stamp(idx) - 0.05 + (i + 1) as f64 * 0.005,
+                gyro: Vec3F64::ZERO,
+                accel: Vec3F64::new(0.0, 0.0, 9.81),
+            })
+            .collect()
+    }
+
+    /// Steady tracking: the reference ratio holds, so only the frame bound asks.
+    fn steady(idx: usize, last: usize) -> KeyframeEvidence {
+        KeyframeEvidence {
+            curr_idx: idx,
+            last_keyframe_idx: Some(last),
+            tracked_inliers: 80,
+            n_ref_map_points: 100,
+            ..KeyframeEvidence::default()
+        }
+    }
+
+    /// Runs `frames`, each seeing the grid where keyframe 0 saw it, and
+    /// returns the frames a keyframe was due on; `last` is the last one.
+    fn keyframes(
+        system: &mut SlamSystem,
+        frames: std::ops::Range<usize>,
+        last: &mut usize,
+    ) -> Vec<usize> {
+        let matches: Vec<(usize, usize)> = (0..grid().len()).map(|i| (i, i)).collect();
+        let mut due = Vec::new();
+        for idx in frames {
+            let t = stamp(idx);
+            system.inertial.latest_image_timestamp_sec = Some(t);
+            system.process_imu(&rest_samples(idx));
+            system.advance_stillness();
+            let frame = frame_seeing_points(idx, Pose3d::IDENTITY, &grid());
+            if system.keyframe_due(&steady(idx, *last), &frame, &matches, t) {
+                due.push(idx);
+                *last = idx;
+                system.inertial.last_keyframe_timestamp_sec = Some(t);
+            }
+        }
+        due
+    }
+
+    #[test]
+    fn a_still_rig_keeps_one_keyframe_per_heartbeat_under_gate() {
+        let mut gated = system(Stillness::Gate);
+        let gate = keyframes(&mut gated, 1..200, &mut 0);
+        assert!((1..=6).contains(&gate.len()), "{gate:?}");
+        let mut off = system(Stillness::Off);
+        assert_eq!(keyframes(&mut off, 1..200, &mut 0).len(), 24);
+        let c = gated.run_counters().stillness;
+        assert!(c.keyframe_asks_withheld > 0);
+        assert_eq!(c.heartbeat_keyframes, gate.len() as u64);
+        assert!(c.vouched_image > 0);
+        assert_eq!(off.run_counters().stillness, StillnessCounters::default());
+    }
+
+    #[test]
+    fn a_bound_ask_waits_for_the_heartbeat_and_a_quality_ask_does_not() {
+        let mut system = system(Stillness::Gate);
+        let mut last = 0;
+        assert!(
+            keyframes(&mut system, 1..40, &mut last).is_empty(),
+            "under 3 s"
+        );
+        // Frame 40's samples too: a missing 50 ms is a hole, which closes the run.
+        system.process_imu(&rest_samples(40));
+        system.advance_stillness();
+        let frame = frame_seeing_points(40, Pose3d::IDENTITY, &grid());
+        let matches: Vec<(usize, usize)> = (0..grid().len()).map(|i| (i, i)).collect();
+        let empty_reference = KeyframeEvidence {
+            n_ref_map_points: 0,
+            ..steady(40, 0)
+        };
+        assert!(system.keyframe_due(&empty_reference, &frame, &matches, stamp(40)));
+        assert_eq!(system.run_counters().stillness.still_quality_keyframes, 1);
+        let gate = keyframes(&mut system, 41..70, &mut last);
+        assert_eq!(gate, vec![60]);
+    }
+
+    #[test]
+    fn off_and_observe_change_no_decision() {
+        let mut off = system(Stillness::Off);
+        let mut observe = system(Stillness::Observe);
+        assert_eq!(
+            keyframes(&mut off, 1..200, &mut 0),
+            keyframes(&mut observe, 1..200, &mut 0)
+        );
+        let c = observe.run_counters().stillness;
+        assert!(c.still_frames > 0);
+        assert_eq!(c.keyframe_asks_withheld, 0);
+        assert_eq!(c.heartbeat_keyframes, 0);
     }
 }
 
@@ -741,18 +865,25 @@ mod anchors {
             mapping_pending: 2,
             ..KeyframeEvidence::default()
         };
-        assert!(system.keyframe_due(&waiting, 0.4), "max_frames_between");
+        let frame = frame_seeing_points(8, Pose3d::IDENTITY, &[]);
+        assert!(
+            system.keyframe_due(&waiting, &frame, &[], 0.4),
+            "max_frames_between"
+        );
         let full = KeyframeEvidence {
             mapping_pending: 3,
             ..waiting
         };
-        assert!(!system.keyframe_due(&full, 0.4));
+        assert!(!system.keyframe_due(&full, &frame, &[], 0.4));
         assert_eq!(system.counters.keyframes_refused_busy, 1);
         system.state.imu_initialized = false;
-        assert!(system.keyframe_due(&full, 0.4), "IsInitializing");
+        assert!(
+            system.keyframe_due(&full, &frame, &[], 0.4),
+            "IsInitializing"
+        );
         system.state.imu_initialized = true;
         system.keyframe_policy.mapping_acceptance = MappingAcceptance::Ignore;
-        assert!(system.keyframe_due(&full, 0.4));
+        assert!(system.keyframe_due(&full, &frame, &[], 0.4));
         assert_eq!(system.counters.keyframes_refused_busy, 1);
         assert!(system.keyframe_due_while_lost(0.2));
     }

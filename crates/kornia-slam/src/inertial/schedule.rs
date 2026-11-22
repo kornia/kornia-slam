@@ -99,6 +99,14 @@ impl InertialInitSchedule {
         self.viba2_done = true;
     }
 
+    /// Whether a refinement may still run on this window: the map may yet be
+    /// rotated or rescaled.
+    pub(crate) fn refinements_pending(&self, timestamp_sec: f64) -> bool {
+        self.window_start_sec.is_some_and(|start| {
+            timestamp_sec - start < 50.0 && !(self.viba1_done && self.viba2_done)
+        })
+    }
+
     /// Marks a refinement as spent, whether or not its solve was accepted.
     pub(crate) fn complete(&mut self, refinement: Refinement) {
         match refinement {
@@ -174,6 +182,22 @@ mod tests {
         assert!(schedule.recently_initialized(), "a new window re-arms it");
         schedule.close();
         assert!(!schedule.recently_initialized());
+    }
+
+    #[test]
+    fn refinements_are_pending_until_both_ran_or_the_window_aged() {
+        let mut schedule = InertialInitSchedule::default();
+        assert!(!schedule.refinements_pending(0.0), "no window");
+        schedule.start(3, 10.0);
+        assert!(schedule.refinements_pending(20.0));
+        assert!(!schedule.refinements_pending(60.0));
+        schedule.complete(Refinement::Viba1);
+        assert!(schedule.refinements_pending(20.0));
+        schedule.complete(Refinement::Viba2);
+        assert!(!schedule.refinements_pending(20.0));
+        schedule.start(9, 30.0);
+        schedule.close();
+        assert!(!schedule.refinements_pending(31.0));
     }
 
     #[test]
