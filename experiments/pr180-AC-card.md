@@ -1,6 +1,9 @@
 # Card AC: one world through a tracking loss
 
-Status: 2026-11-22. AC-0 stopped at R0: K6 fired on W211a, W211b and W119 (BASE does not reproduce the F1 events),
+Status: 2026-11-22 evening. AC-1 built and scored (owner change to R0: own events, quiet pairs). Mechanism holds
+wherever Held acts (M1, M2, M3 on 2_11, M4); 5_11 CP 5.4 -> 25.9, 2_11 Sim3-scoreable; K3 fired on the R_11_5cp guard,
+traced to U (`frame_velocity`), not Held; K4 fired. Knobs stay at their defaults; 3_18 and 4_11 not run.
+Earlier, round 1: AC-0 stopped at R0: K6 fired on W211a, W211b and W119 (BASE does not reproduce the F1 events),
 and the box ran at load 20-40 against the F1 validation's 2.5, which breaks the paired-run assumption (W318 BASE and
 BASEd differ: 2 and 0 give-ups). Counters (step 4) landed; AC-1 (`tracking_loss.reseed.seed: Held`) not built, per
 the stop rule. AC-2b, AC-2c and AC-3 wait for the owner's verdict on AC-0 and AC-1. Plan: planner (Fable), owner answers
@@ -246,3 +249,112 @@ Stop point: K6 fired, so step 5 (AC-1) was not built.
    (W211c 1079.9 s, W318 1346.5 s, W511 972.8 s, W211aP 126.0 s), each followed by the world rotation (W318 89.4 deg,
    W511 83.8-88.7 deg, W211aP 49.0 deg). Whether to score AC-0 on those runs' own events instead of F1's times is
    the owner's call (it changes R0). Per the stop rule AC-1 was not built.
+
+### AC-0 round 2 and AC-1 (2026-11-22 afternoon, owner change: own events, quiet pairs)
+
+Binary `kornia-slam-ac` (md5 fc1ff0c1bf42d83b02254f48364bb9c9, branch `feat/loss-one-world` at e9fe4ad; the final
+`kornia-slam-ac2`, md5 983a69bfe1def7f5b2722d91d64ab797, only splits the start-up counter). Knobs off, KI and H
+without U on r01full-S10-7 (`RAYON_NUM_THREADS=1`): all three `cmp`-identical, md5 d4f77b567b912b5a4caa2af6085a35b1,
+`later_alignments=0 reseeds=0`. All arms ran on this binary (knobs off = F1, by the cmp), so AC-0 also has the loss
+line. Pairs from the same window, `PACE=timestamps`, DEBUG=0, each pair started at 1-min load <= 4 with no other
+kornia-slam process (`$AC/runpairs.sh`, log `$AC/load/q1.txt`: start loads 2.0-4.0, median 5.0 while a pair ran).
+H = KIU + `seed: Held`. Scores: `lossev.py` with the per-sequence GT body rotation (105.0 deg on 2_11, 0.1 on R_01),
+slerped GT and link frames within 0.03 s of a GT sample (commits 15a0a02-1ec755d); `worldrot.py`.
+
+Metric note: before 15a0a02 the link rotation error compared GT and trajectory rotations in different body frames
+(2_11 GT body is 105 deg from the trajectory's; R_01's is the same frame) and took the nearest GT sample up to
+0.15 s away at 160-200 deg/s turns. A frozen seed has SLAM rotation 0, so the F1 numbers survive the frame fix; with
+both fixes the F1 primary give-up error is 132.3 deg on 2_11 (n=8; 131.3 before) and 83.0 deg on 4_11 (n=9; 118.9
+before, n=16), all give-ups 61.6 deg (n=18) and 47.2 deg (n=37).
+
+**Windows** (give-ups startup/young/primary by `lossev.py`; later_al = alignments after a first aligned segment,
+max deg and tracking jump m; link errors at the primary give-ups):
+
+| run | tracked | give-ups | reseeds (held) | later_al | origin jumps > 10 m | primary rot err deg | restart pos err m | coast err 3-5 s m |
+|---|---|---|---|---|---|---|---|---|
+| W211c BASE / BASE2 | 457 / 856 | 0/16/1 / 0 | 0 | 0 / 0 | 0 / 0 | nan | 0.81 | 9.78 / - |
+| W211c U | 779 | 0 | 0 | 0 | 0 | - | - | 0.87 |
+| W211c KI | 530 | 0/2/1 | 3 (2) | 0 | 0 | nan | nan | 3.74 |
+| W211c KIU | 728 | 0/0/1 | 1 (1) | 0 | 0 | 6.5 | 6.38 | 20.20 |
+| W211c H | 611 | 0/1/1 | 2 (2) | 0 | 0 | 6.5 | 0.90 | 3.83 |
+| W211c noise BASE p50 / m50 | 606 / 838 | 0/9/1 / 0 | 0 | 2 (100.8, 16.6) / 0 | 1 / 0 | 172.2 | 0.66 | 4.12 / - |
+| W211c noise H p50 / m50 | 659 / 709 | 0/1/1 / 0/0/1 | 2 (2) / 1 (1) | 0 / 0 | 0 / 0 | 7.8 / nan | 0.97 / nan | 2.40 / 20.64 |
+| W211c noise KIU p50 / m50 | 860 / 766 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | - | - | - / 2.26 |
+| W511 BASE / BASE2 / p50 / m50 | 1039 / 1034 / 1023 / 1040 | 0/1/1 each | 0 | 3 (93.6, 38.1) / 3 (85.5, 11.6) / 3 (88.2, 0.5) / 3 (91.6, 35.3) | 1 / 1 / 0 / 1 | no GT | no GT | - |
+| W511 U | 1038 | 0/1/1 | 0 | 3 (85.7, 10.3) | 1 | no GT | no GT | - |
+| W511 KI / KIU / KIU p50 / m50 | 1023 / 1013 / 1016 / 1036 | 0/0/1 each | 1 (0) each | 0 | 0 | no GT | no GT | - |
+| W511 H / p50 / m50 | 1035 / 1028 / 1023 | 0/0/1 each | 1 (1) each | 0 | 0 | no GT | no GT | - |
+| W211aP BASE / BASE2 | 3685 / 3544 | 13/0/0 / 13/1/1 | 0 | 0 / 2 (11.7, 22.1) | 0 / 1 | - / 27.1 | - / 9.95 | - |
+| W211aP U | 3630 | 13/0/1 | 0 | 3 (10.6, 7.6) | 0 | 114.1 | 7.12 | 21.32 |
+| W211aP KI / KIU / H | 3473 / 3611 / 3515 | 13/0/2 / 13/0/1 / 13/0/2 | 2 (1) / 1 (1) / 2 (2) | 0 | 0 | 5.7 / nan / 15.3 | 9.70 / nan / nan | 6.95 / - / - |
+| W318 BASE / BASE2 | 4578 / 4795 | 0/0/1 / 0 | 0 | 3 (92.7, 109.2) / 0 | 1 / 0 | 92.0 | nan | 4.86 / - |
+| W318 U / KIU / H / HB | 4771 / 4772 / 4821 / 4733 | 0 each | 0 | 0 | 0 | - | - | - / 3.32 / - / - |
+| W318 KI | 4414 | 0/0/2 | 2 (2) | 0 | 0 | 30.3 | 8.01 | 15.63 |
+
+**R_01 blackout** (1000 frames, `--blackout 25:6`; 25:2 coasts only, no give-up, all arms 960/1000 tracked):
+
+| arm | reseeds | later_al | rotation error across the give-up | position error at restart | coast err 3-5 s |
+|---|---|---|---|---|---|
+| BASE | 0 | 3 (6.5 deg, 0.30 m) | 125.6 deg | 1.51 m | 1.36 m |
+| U | 0 | 3 (6.9, 0.31) | 125.6 | 1.51 | 2.20 |
+| KI | 1 (0 held) | 0 | 3.5 | 3.69 | 1.60 |
+| KIU | 1 (0) | 0 | 4.1 | 3.75 | 1.86 |
+| H | 1 (1) | 0 | 4.1 | 1.59 | 1.71 |
+
+**Full sequences, H, one job at a time** (`$AC/valH.sh`, load median 4.9, max 7.4; F1 = `bench-F1/val`):
+
+| seq | official CP (R@1m) H / F1 | tracked H / F1 | give-ups s/y/p H / F1 | reseeds (held) | later_al | oracle H: own restarts / 60 s / F1 | per-segment Sim3 (share of path, scale) | link errors (primary) |
+|---|---|---|---|---|---|---|---|---|
+| 1_19 | 6.89 (0) / 4.84 (0) | 97.3 / 93.7 % | 3/0/0 / 3/7/1 | 0 | 0 | one piece 8.37, F1-event splits 44.5, 60 s 96.7 / 38.8, 76.4 | H one segment 2.69 %, 1.119; F1 2.79 % 0.985 and 1.43 % 0.898 | none after init (H) |
+| 5_11 | 25.86 (0) / 5.39 (0) | 93.7 / 91.8 % | 3 (1 reseed) / 9 | 1 (1) | 0 (F1 origin jumps 423.5, 291.9 m) | no GT | no GT; session tilt 0.0 / 0.0 deg (F1 43.9) | no GT |
+| 2_11 | 4.06 (0), Sim3 succeeds / Sim3 failed | 83.2 / 76.9 % | 13/3/5 / 13/36/12 | 8 (8) | 0 (F1: 19 origin-preserving jumps > 10 m) | 30.0 / 53.0 / 11.7 / 45.4 | 13: 0.89 % 1.134; 16: 3.61 % 1.191; 20: 2.34 % 1.010; short ones 6-12 % | rot 10.9 deg (n=3: 14.0, 10.9, 2.3) / 132.3 (n=8); pos 6.82 m (n=2) / 3.46 (n=4) |
+| R_11_5cp | 26.92 (20) / 55.54 (40) | 89.8 / 93.8 % | 2/3/1 / 2/0/0 | 4 (4) | 0 | - | - | - |
+
+1_19 offline BA on the H session: initial cost 1.25e8 (F1 8.1e10, R_11 F1 1.2e8), converged in 34 iterations
+(F1 hit the 60 cap), offline CP 6.98 (F1 3.74). 1_19 session tilt 0.0 deg (F1 26.7). 3_18 and 4_11 were not run
+(K3, below).
+
+**Guards.** KI and H without U on r01full-S10-7: cmp-identical. With U (`run.sh` defaults, RAYON 1, BASE / H):
+R_01 full 0.450 / 0.366 m (band 0.30-0.57), R_03 0.114 / 0.113 m and 799 / 777 tracked (0.10-0.12, 758-790), R_11
+window 0.221 / 0.171 m (0.15-0.20), reseeds 0 in all: hold. R_11_5cp full: CP 26.9 (reseeds 4) and a repeat with
+failed Sim3 (reseeds 0) against the band 50-60 with reseeds 0: misses 2 of 2.
+
+**R_11_5cp diagnosis** (paired runs on the quiet box, same binary): BASE 37.0 (2 give-ups, 0 reseeds); U Sim3 failed
+(4 give-ups, 0 reseeds, segments at 393, 402 s); KIU failed (6, 4 reseeds); H repeat failed (2, 0 reseeds); without U:
+H0 (Held, no U) 30.9 and KI 39.8, both 0 reseeds. So F1's 55.5 and these 31-40 are the run-to-run spread of
+behaviourally identical runs, and every run with U fails or drops. Keyframe |ba| in 360-370 s, before the 370 s
+loss: F1 0.01-0.38, BASE 0.17-0.54, H0 0.06-0.27, KI 0.07-0.44; U 0.49-0.76, KIU 0.34-0.86, H 0.30-0.83 (H repeat
+0.14-0.53). GT speed 1.5-1.6 m/s; the U runs enter the loss at |v| 1.0-1.1 and the coast decelerates to 0.2 m/s,
+then runs to 2.4 m/s. The accel bias is inflated by U (`frame_velocity: PropagatedFromKeyframe`) before any give-up,
+so Held is neither credited nor blamed on R_11.
+
+**Scores against the predictions** (one sample unless noted; CP below 25 read on the oracle):
+
+- M0e holds (1 sample, round 1). P0u mixed: U fixes W211c (3-5 s coast 9.78 -> 0.87 m, speed error 0.19 m/s) but
+  W211aP-U coasts 21.3 m at 7.6 m/s against 1.1 m/s GT and BK-U 2.20 against BASE 1.36 m; `[vel] src` not measured
+  (DEBUG=0). P0k: later alignments and origin jumps 0 on every KI run, reseeds = give-ups after init; rotation error
+  5.7 / 30.3 deg (W211aP, W318), young deaths 2 of 3 on W211c: partly. P0s misses (KIU restart error 6.38 m W211c,
+  3.75 m BK). P0b misses on position (BASE 1.51 m, the walk during the 6 s blackout was 1.6 m; KIU 3.75 m) and holds
+  on rotation in substance: 125.6 deg (BASE) against 4.1 (KIU, H), just over the 3 deg bound. K5 not measured.
+- M1 holds: `later_alignments=0` on every H run (14 windows, 6 blackouts, 4 full sequences); BASE and U do 2-3 per
+  W511 window at 85-94 deg. M2: `seeds_gyro_held = reseeds` on every H run; rotation error median 10.9 deg on 2_11
+  (n=3), 6.5-7.8 on W211c: holds on the windows, 0.9 deg over on 2_11. M3 on 2_11: young deaths 3 of 21 (14 %),
+  give-ups 61 -> 21: holds; 4_11 not run. M4 holds: session tilt 0.0-0.3 deg on every H segment (1_19, 2_11, 5_11),
+  1_19 offline start cost 8.1e10 -> 1.25e8.
+- P1 holds on the W211c turn (0.90, 0.97 m); 2_11 full 6.82 m (n=2). P2 2_11 76.9 -> 83.2 %: holds; 4_11 not run.
+  P3: 5_11 25.9 (holds), 1_19 6.9 (misses; the H run had no re-seed after init, so Held did not act there; the
+  oracle with F1's event splits is 44.5 against F1's 38.8), 2_11 Sim3 succeeds (holds), 3_18 and 4_11 not run.
+  P4: H's blackout restart 1.59 m against the predicted 5-7 m: the device walked 1.6 m in 6 s.
+- Kill rules: K1 not fired (P3 misses on 1_19 only). K2 not fired (5_11: later_alignments 0, reseeds 1 = give-ups
+  after init 1). **K3 fired** for H: the R_11_5cp guard misses 2 of 2, post-loss young deaths 3 against BASE 0 and
+  `reseed_stall_frames` 37 against BASE `skipped_bootstrap` 0 on R_11. Diagnosis above: the harm comes from U, not
+  Held. Knobs stay at their defaults; 3_18 and 4_11 were not run. K4 fired on W211aP-U (21.3 m) and W211c-KIU
+  (20.2 m): the velocity is wrong at loss onset (4.4-7.6 m/s against 1.1-1.3 m/s GT), so stale velocity is not the
+  only driver; AC-2b is the card for it.
+
+**Verdict.** The mechanism holds wherever Held acts: no later alignment, a level world (0.0-0.3 deg against 27-86),
+the gyro attitude across give-ups (2_11 10.9 deg against 132.3; blackout 4.1 against 125.6), young deaths 59 -> 14 %,
+offline BA starting at the R_11 level. Score: 5_11 5.4 -> 25.9, 2_11 now Sim3-scoreable (oracle own restarts 11.7 ->
+30.0), 1_19 unchanged within noise. The U component (`frame_velocity: PropagatedFromKeyframe`) inflates the accel
+bias on R_11 and fails the R_11 guard; it is not ready to ship with Held. Next decision for the owner: Held without U
+(H0) on the challenge sequences and the guard set, and AC-2b for the loss-onset velocity.

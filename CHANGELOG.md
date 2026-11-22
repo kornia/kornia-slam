@@ -15,6 +15,19 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
   (`configs/euroc-rig-imu-loop.ron`). A distorted pinhole rig now matches its
   camera overlap on undistorted keypoints.
 
+**Tracking-loss re-seed placement and loss counters (card AC), off by default.**
+- `tracking_loss.reseed.seed` (`CoastedIfPlausible`, today's keep path): `Held`
+  seeds every re-seed that keeps the inertial state at the gyro's attitude at the
+  last tracked position, at rest, with no bridge, and keeps the inertial state
+  only once VIBA2 has run (earlier give-ups start cold). Needs
+  `reseed.keep_inertial` and the IMU.
+- A sixth `[summary] loss` line: `later_alignments` (inertial alignments in a
+  segment after the first aligned one, each rotating the older segments about
+  the origin) with their largest rotation and tracking jump, `seeds_gyro_held`,
+  `seed_rotation_deg_max`, `young_segment_deaths` (re-seeded segments lost within
+  3 s), `startup_segment_deaths`, `keeps_refused_before_viba2` and
+  `coast_m_at_give_up_max`.
+
 **New settings for a 1 ms frontend frame and for online calibration, all off by
 default.** Every default is today's behaviour, so existing run files load and
 run unchanged. Built, not validated: no benchmark has run on them. Not built:
