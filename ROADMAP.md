@@ -222,6 +222,13 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 
 ## Now — egocentric accuracy on LaMAria
 
+**Regression gate (owner, 2026-11-22).** No knob is promoted into a preset or a code default until it passes the full-sequence gate:
+- **Runs:** all 6 validation sequences (R_11_5cp, 1_19, 2_11, 3_18, 4_11, 5_11), full length, paced at sensor timestamps, on a quiet machine (load ≤ 4, no other SLAM job).
+- **Samples:** 2 runs of the candidate against 2 runs of the current baseline.
+- **Pass rule:** no sequence's official CP score or tracked frames falls below the baseline's range. Any drop is diagnosed before the knob is promoted.
+- **Guards:** the 800-frame per-card guards stay as a cheap first check. They do not replace the gate: card AC's Held seed passed them, yet R_11 fell from 55.5 to 26.9 at 370 s.
+- **Cleanup card:** it applies the gate to the stacked winners together.
+
 We are working toward top results on the [LaMAria](https://github.com/cvg/lamaria) egocentric benchmark ([#78](https://github.com/kornia/kornia-slam/issues/78)), using the Aria rig and IMU and no GPS. The work is sequenced by where the benchmark score is lost: each change states its theory and predictions first, ships behind a config knob that defaults to the old behaviour, and is compared window by window against ORB-SLAM3 in the same harness.
 
 General purpose, not tuned per deployment (owner, 2026-11-21). A new rig or dataset should need its sensor model only: calibration, IMU noise and frame rate. Knobs are how a change lands and is measured; after each validation round a cleanup card makes the winners the code default and deletes the refuted or redundant knobs.
