@@ -6,6 +6,7 @@
 
 pub mod initialization;
 mod schedule;
+pub(crate) mod still;
 pub mod trust;
 
 pub use initialization::{
@@ -158,6 +159,17 @@ impl InertialState {
             self.sample_interpolation,
         );
         (pre, samples)
+    }
+
+    /// Stamp of the newest buffered sample.
+    pub(crate) fn newest_sample_sec(&self) -> Option<f64> {
+        self.pending_samples.back().map(|m| m.timestamp)
+    }
+
+    /// The buffered samples from `t0` on, in time order.
+    pub(crate) fn samples_from(&self, t0: f64) -> Vec<ImuMeasurement> {
+        let start = self.pending_samples.partition_point(|m| m.timestamp < t0);
+        self.pending_samples.range(start..).copied().collect()
     }
 
     /// Mean and spread of the buffered samples in the inclusive window
