@@ -1694,11 +1694,15 @@ mod ron_files {
                 "(version: 1, sensors: (imu: {imu}), pipeline: OrbSlam((keyframes: \
                  (stillness: StationaryEdges))))"
             ))
-            .unwrap()
-            .validate()
         };
-        assert_eq!(edges(false), Err(ConfigError::StationaryEdgesWithoutImu));
-        assert_eq!(edges(true), Err(ConfigError::StationaryEdgesNotBuilt));
+        assert!(matches!(
+            edges(false),
+            Err(LoadError::Invalid(ConfigError::StationaryEdgesWithoutImu))
+        ));
+        assert!(matches!(
+            edges(true),
+            Err(LoadError::Invalid(ConfigError::StationaryEdgesNotBuilt))
+        ));
     }
 
     #[test]
