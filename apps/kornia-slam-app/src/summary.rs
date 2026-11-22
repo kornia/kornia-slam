@@ -58,6 +58,7 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
          {}\n\
          {}\n\
          {}\n\
+         {}\n\
          {}",
         c.frames,
         c.tracked,
@@ -94,6 +95,7 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
         format_flow_tracks(c),
         format_mapping_load(c),
         format_loss(c),
+        format_stillness(c),
     )
 }
 
@@ -169,7 +171,6 @@ fn format_flow_tracks(c: &RunCounters) -> String {
     )
 }
 
-
 /// The tracking-loss counters of card AC: later-segment alignments, seeds,
 /// young deaths and coasts at a give-up, in a fixed order.
 fn format_loss(c: &RunCounters) -> String {
@@ -194,6 +195,29 @@ fn format_loss(c: &RunCounters) -> String {
         c.pose_innovation_rejects,
         c.pose_innovation_unavailable,
         milli(c.pose_innovation_scale_milli_max),
+    )
+}
+
+/// The still-device detector's counters (card AB), in a fixed order.
+fn format_stillness(c: &RunCounters) -> String {
+    let s = &c.stillness;
+    format!(
+        "[summary] stillness still_frames={} still_runs={} keyframe_asks_withheld={} \
+         heartbeat_keyframes={} still_quality_keyframes={} lost_keyframes_withheld={} \
+         runs_closed_imu={} runs_closed_image={} runs_closed_wheels={} vouched_image={} \
+         vouched_imu={} vouched_wheels={}",
+        s.still_frames,
+        s.still_runs,
+        s.keyframe_asks_withheld,
+        s.heartbeat_keyframes,
+        s.still_quality_keyframes,
+        s.lost_keyframes_withheld,
+        s.runs_closed_imu,
+        s.runs_closed_image,
+        s.runs_closed_wheels,
+        s.vouched_image,
+        s.vouched_imu,
+        s.vouched_wheels,
     )
 }
 
@@ -389,7 +413,7 @@ mod tests {
         counters.pose_inertial_rejects = 23;
         let text = format(&counters, &FrameTimes::default());
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 9);
+        assert_eq!(lines.len(), 10);
         assert_eq!(
             lines[3],
             "[summary] estimator_recovery ba_keyframe_shifts=1 ba_snapbacks=2 \
@@ -401,6 +425,39 @@ mod tests {
              seeded_window_frames=16 seeded_window_dropped_points=17 vi_ba_base_solves=18 \
              vi_ba_base_iterations=19 vi_ba_iterations_max=20 vi_ba_rejected_steps=21 \
              vi_ba_solves_3plus_rejects=22 pose_inertial_rejects=23"
+        );
+    }
+
+    #[test]
+    fn the_last_line_holds_the_stillness_counters_in_order() {
+        let mut counters = RunCounters::default();
+        let s = &mut counters.stillness;
+        for (k, field) in [
+            &mut s.still_frames,
+            &mut s.still_runs,
+            &mut s.keyframe_asks_withheld,
+            &mut s.heartbeat_keyframes,
+            &mut s.still_quality_keyframes,
+            &mut s.lost_keyframes_withheld,
+            &mut s.runs_closed_imu,
+            &mut s.runs_closed_image,
+            &mut s.runs_closed_wheels,
+            &mut s.vouched_image,
+            &mut s.vouched_imu,
+            &mut s.vouched_wheels,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            *field = k as u64 + 1;
+        }
+        let text = format(&counters, &FrameTimes::default());
+        assert_eq!(
+            text.lines().last().unwrap(),
+            "[summary] stillness still_frames=1 still_runs=2 keyframe_asks_withheld=3 \
+             heartbeat_keyframes=4 still_quality_keyframes=5 lost_keyframes_withheld=6 \
+             runs_closed_imu=7 runs_closed_image=8 runs_closed_wheels=9 vouched_image=10 \
+             vouched_imu=11 vouched_wheels=12"
         );
     }
 
@@ -526,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn the_last_line_holds_the_loss_counters_in_order() {
+    fn the_ninth_line_holds_the_loss_counters_in_order() {
         let mut counters = RunCounters::default();
         counters.later_alignments = 2;
         counters.later_alignment_mdeg_max = 61_100;
@@ -544,7 +601,7 @@ mod tests {
         counters.pose_innovation_scale_milli_max = 1_450;
         let text = format(&counters, &FrameTimes::default());
         assert_eq!(
-            text.lines().last().unwrap(),
+            text.lines().nth(8).unwrap(),
             "[summary] loss later_alignments=2 later_alignment_deg_max=61.100 \
              later_alignment_jump_m_max=423.500 seeds_gyro_held=3 seed_rotation_deg_max=150.250 \
              young_segment_deaths=4 startup_segment_deaths=5 keeps_refused_before_viba2=1 \
