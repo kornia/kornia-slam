@@ -57,6 +57,7 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
          {}\n\
          {}\n\
          {}\n\
+         {}\n\
          {}",
         c.frames,
         c.tracked,
@@ -92,6 +93,7 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
         format_outlier_erase(c),
         format_flow_tracks(c),
         format_mapping_load(c),
+        format_loss(c),
     )
 }
 
@@ -164,6 +166,26 @@ fn format_flow_tracks(c: &RunCounters) -> String {
         c.flow_secondary_inliers,
         c.flow_tracks_tried,
         c.flow_refill_spawns,
+    )
+}
+
+
+/// The tracking-loss counters of card AC: later-segment alignments, seeds,
+/// young deaths and coasts at a give-up, in a fixed order.
+fn format_loss(c: &RunCounters) -> String {
+    let milli = |value: u64| value as f64 / 1e3;
+    format!(
+        "[summary] loss later_alignments={} later_alignment_deg_max={:.3} \
+         later_alignment_jump_m_max={:.3} seeds_gyro_held={} seed_rotation_deg_max={:.3} \
+         young_segment_deaths={} keeps_refused_before_viba2={} coast_m_at_give_up_max={:.3}",
+        c.later_alignments,
+        milli(c.later_alignment_mdeg_max),
+        milli(c.later_alignment_jump_mm_max),
+        c.seeds_gyro_held,
+        milli(c.seed_rotation_mdeg_max),
+        c.young_segment_deaths,
+        c.keeps_refused_before_viba2,
+        milli(c.coast_mm_at_give_up_max),
     )
 }
 
@@ -359,7 +381,7 @@ mod tests {
         counters.pose_inertial_rejects = 23;
         let text = format(&counters, &FrameTimes::default());
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 8);
+        assert_eq!(lines.len(), 9);
         assert_eq!(
             lines[3],
             "[summary] estimator_recovery ba_keyframe_shifts=1 ba_snapbacks=2 \
@@ -422,12 +444,12 @@ mod tests {
     }
 
     #[test]
-    fn the_last_line_holds_the_mapping_load_counters() {
+    fn the_eighth_line_holds_the_mapping_load_counters() {
         let mut counters = RunCounters::default();
         counters.keyframes_refused_busy = 4;
         let text = format(&counters, &FrameTimes::default());
         assert_eq!(
-            text.lines().last().unwrap(),
+            text.lines().nth(7).unwrap(),
             "[summary] mapping_load keyframes_refused_busy=4 growth_queue_max=0 \
              growth_lag_frames_max=0"
         );
@@ -492,6 +514,26 @@ mod tests {
                 "[summary] late_frames=0 frame_period_ms=0.0 final_latency_ms=0.0 \
                  sum_total_s=0.000 sum_sleep_s=0.000 loop_wall_s=0.000"
             )
+        );
+    }
+
+    #[test]
+    fn the_last_line_holds_the_loss_counters_in_order() {
+        let mut counters = RunCounters::default();
+        counters.later_alignments = 2;
+        counters.later_alignment_mdeg_max = 61_100;
+        counters.later_alignment_jump_mm_max = 423_500;
+        counters.seeds_gyro_held = 3;
+        counters.seed_rotation_mdeg_max = 150_250;
+        counters.young_segment_deaths = 4;
+        counters.keeps_refused_before_viba2 = 1;
+        counters.coast_mm_at_give_up_max = 7_125;
+        let text = format(&counters, &FrameTimes::default());
+        assert_eq!(
+            text.lines().last().unwrap(),
+            "[summary] loss later_alignments=2 later_alignment_deg_max=61.100 \
+             later_alignment_jump_m_max=423.500 seeds_gyro_held=3 seed_rotation_deg_max=150.250 \
+             young_segment_deaths=4 keeps_refused_before_viba2=1 coast_m_at_give_up_max=7.125"
         );
     }
 }
