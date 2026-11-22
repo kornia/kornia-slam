@@ -21,8 +21,21 @@ Newest first, one entry per working day. "main" means a merged PR; "#180" means 
 `feat/global-pose-graph` branch (PR #180), which is not merged. Unless marked validated, branch work
 sits behind config knobs that default to the old behaviour, and nothing in it has been benchmarked yet.
 
+### 2026-11-22
+- **#180, first LaMAria validation run (tag `pr180c/F1`, preset `pr180-window10`): mean CP score 11.0 online, 10.8 after offline BA.** Six training challenge sequences, one sample each, paced at the sensor timestamps, factory-rectified IMU, no clock offset. Aria SLAM's test mean is 75.9; the top-3 line is 66.7.
+  - R_11 55.5 (ATE 4.75 m); 1_19 4.8 (60.6 m); 3_18 0.4 (209 m); 5_11 5.4; 2_11 Sim3 failed (380 m, 76.9 % tracked, 61 give-ups); 4_11 low light Sim3 failed (4392 m, 63.5 % tracked, 134 give-ups).
+  - Offline BA stopped at its 60-iteration cap on every sequence; sessions split into 7-110 unjoined components (`bridge_segments` off). It raised 2_11 and 3_18 and lowered 1_19 and 5_11.
+  - Speed: S10-7 solve p50 42-43 ms, frame p90 102-104 ms. The card T binary gives the same numbers on the same night and a byte-identical trajectory, so the change from card T's 38 / 87 ms is machine state. Frontend 2.0 ms per frame against a 0.8 ms budget, mostly feature refill (1.2 ms against 40 µs amortised). The OpenCV comparison did not run (OpenCV not installed).
+  - Diagnoses of the drift (1_19, 3_18, 5_11) and of the tracking losses and offline-BA convergence (2_11, 4_11) are running, read-only.
+- **#180, card AA (`experiments/pr180-AA-card.md`), running.** The camera-IMU clock is never corrected: IMU stamps run 4.2-5.3 ms late on every sequence. The Aria factory record carries about 4.1 ms of it (`TimeOffsetSec_Device_Gyro`), and `read_factory_rectification` does not read it. With Huber on every interior IMU edge, the clock error down-weights 34-41 % of them, mostly the fast-motion edges that carry scale. Stage 1 applies the offset (config); stage 2 applies ORB-SLAM3's kernel layout (Huber on the boundary edge only); control arm K0 runs the kernel change alone, as ORB-SLAM3 itself ran on this data.
+
+### 2026-11-21 (evening)
+- **#180, full-review fixes (tag `pr180c/F1`, 81bc775).** Six review lanes, 36 commits, gate green, knobs-off R_01 trajectory byte-identical (md5 d4f77b56). They include: no non-finite pose is written; `--pace-timestamps`; the offline-BA stop reason and the faer parallelism restore; the base local-BA budget (7 iterations from λ 1e-4) in `pr180-window10`. R_01 A/B against the card V binary: inside noise (0.33-0.47 against 0.30-0.51 m).
+- **#180, card S (`experiments/pr180-S-card.md`): refuted as a score fix.** Bias random-walk rows at full weight across the window boundary cut the boundary bias residual from 8.0 / 3.0 σ (gyro / accel) to 1.3 / 1.3 σ, but R_01 ATE stayed inside noise. Diagnosis: R_01's error is along-track scale, shared across runs (correlation 0.53-0.78), and the accel-bias wander is tilt compensation, not a free walk. That led to card AA.
+- **Correction to the entry below:** "the full-sequence drift (G35) is fixed" overstated it. R_01 went from 1.1-1.2 m to 0.30-0.50 m, still 1.5-5× ORB-SLAM3 (0.07-0.25 m), and the long sequences still drift tens to thousands of metres (2026-11-22 validation).
+
 ### 2026-11-21
-- **#180, cards Q, R and T: the full-sequence drift (G35) is fixed behind knobs.**
+- **#180, cards Q, R and T: the full-sequence drift (G35) is reduced behind knobs** (not fixed; see the evening entry above).
   - **Cause:** with 10 active keyframes, the slow asynchronous solve absorbed 4-5 new keyframes each, starting them from a stale state (crossing velocity error 1.4-1.6 m/s), so the window slid 8-14 cm per solve. A 3-keyframe window avoids the slide but cannot hold the scale.
   - **Fix:** 7 iterations from λ 1e-4 in the 10-keyframe window, `merge: PropagateToNewer` (each solve's correction carried to the keyframes inserted while it ran), and `dense_parallelism: Sequential`. faer's default thread pool made a 150×150 factorisation 3.4 ms idle and 39 ms loaded; on one thread it is 0.12 ms, bit-identical.
   - **Result, full R_01:** ATE 1.11-1.23 m to 0.30-0.40 m (async preset), 0.384 m (sync), mono 3.5-4.4 m to 0.760 m. R_03 800 frames 0.19-0.20 to 0.085-0.112 m, but 762-789 tracked (base 782-800, post-gap velocity drift). R_11 unchanged. Solve 38 ms p50 (sync, idle).
@@ -233,6 +246,8 @@ Scale and drift while tracking:
 - [ ] Longer visual-inertial BA window, and keyframes no longer dragged away from the map by BA (built, knobs `mapping.local_ba.large_window`, `mapping.local_ba.imu_huber`, `tracking.snapback_fix`, not yet validated; `mapping.local_ba.active_keyframes` already existed)
 - [ ] Per-frame velocity state and a pose-inertial solve per frame (built, knob `tracking.pose_inertial`, not yet validated)
 - [ ] ORB-SLAM3's keyframe insertion, local map and growth rules (built, knobs `keyframes.rules`, `tracking.local_map`, `mapping.growth_neighbours`, not yet validated)
+- [ ] Camera-IMU clock offset from the device record, then estimated online, and ORB-SLAM3's IMU kernel layout (card AA running; the online estimator, `online_calibration.clock_offset`, is built and not yet validated)
+- [ ] Window-local frame for the VI-BA solve, so its convergence does not depend on the distance from the world origin (card Y, W2; arithmetic only so far)
 - [ ] IMU bias and noise model, compared across ORB-SLAM3, Basalt and other references (built in part, knob `inertial.sample_interpolation`, not yet validated)
 - [ ] IMU covariance trust: trust the inertial prediction by its propagated covariance (built, knob `tracking.imu_trust`, not yet validated)
 - [ ] Offline global visual-inertial BA (built, run file `offline_ba` and the `offline-ba` subcommand over a `--session-out` dump, not yet validated)
