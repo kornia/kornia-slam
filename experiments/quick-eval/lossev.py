@@ -12,7 +12,8 @@ startup (no segment has lived 3 s yet), young (< 3 s), primary.
 Prints:
   episodes:  frames per class, give-ups per class, young deaths and their share of give-ups.
   link:      per give-up, the gap (s), the gyro rotation over it, GT and SLAM rotation from the last tracked frame to
-             the first tracked frame after it, the rotation error between them, and the position error of that
+             the first tracked frame after it, the rotation error between them (GT taken into the trajectory's body
+             frame by the hand-eye rotation C fitted on tracked 1 s pairs; printed as "body"), and the position error of that
              restart against GT after a local rotation fit on the 10 s before the loss (needs GT; medians per class).
   coast:     coasted frames of IMU-confident episodes (segment >= 3.5 s old), error against GT by age since the
              last tracked frame, the hold-still error (GT displacement), and the SLAM / GT coast speed.
@@ -31,6 +32,12 @@ VEL = re.compile(r"\[vel\] frame=(\d+) .* src=(\w+)")
 
 def angle(R):
     return float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
+
+
+def log(R):
+    th = np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))
+    v = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+    return v * (th / (2 * np.sin(th)) if th > 1e-9 else 0.5)
 
 
 def classes(stderr):
@@ -105,6 +112,24 @@ class Run:
         for kf in self.kfs:
             starts.setdefault(segment_id(kf), kf["timestamp_sec"])
         self.seg_t = np.array(sorted(starts.values()))
+        self.C = self.body_alignment()
+
+    def body_alignment(self):
+        """Rotation C with GT relative rotations = C (SLAM relative rotations) C^T, fitted on the rotation vectors of
+        tracked 1 s pairs (hand-eye): the GT body frame is not the trajectory's on every sequence (2_11: tracked 1 s
+        pairs read 34-47 deg apart with equal magnitudes; R_01: 0.2 deg)."""
+        T = [f for f in sorted(self.cls) if self.cls[f] == "T" and self.ts[f] in self.traj]
+        X, Y = [], []
+        for a, b in zip(T[::20], T[20::20]):
+            ga, gb = self.gt.rot(self.tsec[a]), self.gt.rot(self.tsec[b])
+            if self.tsec[b] - self.tsec[a] > 1.2 or ga is None or gb is None: continue
+            ws, wg = log(self.traj[self.ts[a]][1].T @ self.traj[self.ts[b]][1]), log(ga.T @ gb)
+            if np.linalg.norm(wg) > np.radians(10): X.append(ws); Y.append(wg)
+        if len(X) < 5: return np.eye(3)
+        X, Y = np.array(X), np.array(Y)
+        U, _, Vt = np.linalg.svd(Y.T @ X); S = np.eye(3)
+        if np.linalg.det(U @ Vt) < 0: S[2, 2] = -1
+        return U @ S @ Vt
 
     def frame_at(self, t):
         return int(np.argmin(np.abs(self.tsec - t)))
@@ -160,7 +185,8 @@ class Run:
         r["slam_rot"] = angle(Ra.T @ Rb)
         ga, gb = self.gt.rot(self.tsec[a]), self.gt.rot(self.tsec[s])
         if ga is not None and gb is not None:
-            r["gt_rot"] = angle(ga.T @ gb); r["rot_err"] = angle((ga.T @ gb).T @ (Ra.T @ Rb))
+            g = self.C.T @ (ga.T @ gb) @ self.C
+            r["gt_rot"] = angle(g); r["rot_err"] = angle(g.T @ (Ra.T @ Rb))
         Rm = self.local_rotation(a, self.seg_t[n - 1])
         p0, p1 = self.gt.pos(self.tsec[a]), self.gt.pos(self.tsec[s])
         if Rm is not None and p0 is not None and p1 is not None:
@@ -201,6 +227,7 @@ def med(x):
 def report(r):
     c = "".join(r.cls[f] for f in sorted(r.cls))
     gu = r.give_ups()
+    print(f"body: GT-to-trajectory body rotation C {angle(r.C):.1f} deg (hand-eye on tracked 1 s pairs)")
     n = {k: sum(g["cls"] == k for g in gu) for k in ("startup", "young", "primary")}
     print(f"episodes: frames {len(c)} T {c.count('T')} C {c.count('C')} B {c.count('B')}; give_ups {len(gu)} {n}; "
           f"young deaths {n['young']} ({100 * n['young'] / max(len(gu), 1):.0f} %)")
