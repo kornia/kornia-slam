@@ -313,5 +313,6 @@ if __name__ == "__main__":
         print(__doc__, file=sys.stderr); sys.exit(2)
     RUN = args[0]
     run = Run(RUN, args[1], args[2] if len(args) > 2 else f"{RUN}/session.cbor")
-    run.C = body if body is not None else run.body_alignment()[0]
+    # Without GT there is no link error to take into the body frame.
+    run.C = body if body is not None else (run.body_alignment()[0] if run.gt.ok else np.eye(3))
     report(run)
