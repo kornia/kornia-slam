@@ -640,4 +640,265 @@ mod tests {
             );
         }
     }
+
+    /// An active row that a trial step moves behind the camera makes the cost
+    /// infinite, so the step is refused rather than shedding the row's cost.
+    #[test]
+    fn a_row_behind_the_camera_makes_the_cost_infinite() {
+        let edge = still_edge();
+        let camera = camera();
+        let observations = [PoseInertialObservation {
+            point_w: Vec3F64::new(0.0, 0.0, -1.0),
+            pixel: Vec2F64::new(320.0, 240.0),
+            information: 1.0,
+            view: 0,
+        }];
+        let problem = Problem {
+            prior: None,
+            preintegrated: &edge,
+            information: information(&edge, 1.0).omega,
+            gravity: Vec3F64::ZERO,
+            t_bc: None,
+            cameras: &[],
+            primary: &camera,
+            observations: &observations,
+        };
+        let states = States {
+            previous: at_rest(),
+            current: at_rest(),
+        };
+        assert_eq!(problem.build(&states, &[true], false).cost, f64::INFINITY);
+    }
+
+    mod motion {
+        //! Recovery, outlier and prior-chain tests, ported from PR #195 (Astik).
+
+        use super::super::*;
+        use super::camera;
+        use kornia_algebra::Mat3F64;
+        use kornia_sensors::imu::{ImuCalib, ImuMeasurement};
+
+        const IMU_RATE_HZ: f64 = 1000.0;
+
+        fn gravity() -> Vec3F64 {
+            Vec3F64::new(0.0, 0.0, -9.81)
+        }
+
+        fn noise() -> ImuCalib {
+            ImuCalib {
+                gyro_noise: 1.6968e-4,
+                accel_noise: 2.0e-3,
+                gyro_bias_noise: 1.9393e-5,
+                accel_bias_noise: 3.0e-3,
+            }
+        }
+
+        /// Constant world acceleration, no rotation, camera-frame body: the
+        /// IMU model integrates it exactly.
+        struct Motion {
+            velocity: Vec3F64,
+            acceleration: Vec3F64,
+        }
+
+        impl Motion {
+            fn state(&self, t: f64) -> FrameNavState {
+                let position = self.velocity * t + self.acceleration * (0.5 * t * t);
+                FrameNavState {
+                    pose_cw: Pose3d::new(Mat3F64::IDENTITY, position * -1.0),
+                    velocity: self.velocity + self.acceleration * t,
+                    bias: ImuBias::default(),
+                }
+            }
+
+            fn preintegrated(&self, t0: f64, t1: f64) -> PreintegratedImu {
+                let n = ((t1 - t0) * IMU_RATE_HZ).round() as usize;
+                let samples: Vec<ImuMeasurement> = (0..=n)
+                    .map(|k| ImuMeasurement {
+                        timestamp: t0 + k as f64 / IMU_RATE_HZ,
+                        gyro: Vec3F64::ZERO,
+                        accel: self.acceleration - gravity(),
+                    })
+                    .collect();
+                PreintegratedImu::from_measurements(ImuBias::default(), noise(), &samples, t0, t1)
+            }
+        }
+
+        fn motion() -> Motion {
+            Motion {
+                velocity: Vec3F64::new(0.8, -0.1, 0.2),
+                acceleration: Vec3F64::new(0.5, 0.3, -0.2),
+            }
+        }
+
+        fn world_points() -> Vec<Vec3F64> {
+            (0..40)
+                .map(|k| {
+                    let (row, col) = ((k / 8) as f64, (k % 8) as f64);
+                    Vec3F64::new(
+                        -1.75 + 0.5 * col,
+                        -1.0 + 0.5 * row,
+                        5.0 + 0.3 * (k % 5) as f64,
+                    )
+                })
+                .collect()
+        }
+
+        fn observe(state: &FrameNavState, points: &[Vec3F64]) -> Vec<PoseInertialObservation> {
+            let camera = camera();
+            points
+                .iter()
+                .map(|p| {
+                    let p_c = state.pose_cw.transform_point(p);
+                    PoseInertialObservation {
+                        point_w: *p,
+                        pixel: Vec2F64::new(
+                            camera.fx * p_c.x / p_c.z + camera.cx,
+                            camera.fy * p_c.y / p_c.z + camera.cy,
+                        ),
+                        information: 1.0,
+                        view: 0,
+                    }
+                })
+                .collect()
+        }
+
+        fn perturbed(state: &FrameNavState) -> FrameNavState {
+            let mut delta = SVecF64::<15>::zeros();
+            for (k, value) in [0.08, -0.05, 0.06, 0.02, -0.015, 0.01, 0.3, -0.2, 0.1]
+                .into_iter()
+                .enumerate()
+            {
+                delta[k] = value;
+            }
+            state.plus(&delta)
+        }
+
+        fn position_error(a: &FrameNavState, b: &FrameNavState) -> f64 {
+            (a.pose_cw.inverse().translation - b.pose_cw.inverse().translation).length()
+        }
+
+        fn inlier_count(solution: &PoseInertialSolution) -> usize {
+            solution.inliers.iter().filter(|&&inlier| inlier).count()
+        }
+
+        fn solve(
+            anchor: Anchor<'_>,
+            preintegrated: &PreintegratedImu,
+            initial: FrameNavState,
+            observations: &[PoseInertialObservation],
+        ) -> PoseInertialSolution {
+            solve_pose_inertial(
+                anchor,
+                preintegrated,
+                gravity(),
+                None,
+                &[],
+                &camera(),
+                initial,
+                observations,
+            )
+        }
+
+        #[test]
+        fn recovers_pose_and_velocity_from_a_keyframe_anchor() {
+            let motion = motion();
+            let (keyframe, truth) = (motion.state(0.0), motion.state(0.25));
+            let solution = solve(
+                Anchor::Fixed(&keyframe),
+                &motion.preintegrated(0.0, 0.25),
+                perturbed(&truth),
+                &observe(&truth, &world_points()),
+            );
+            assert!(position_error(&solution.state, &truth) < 1e-4);
+            assert!((solution.state.velocity - truth.velocity).length() < 1e-3);
+            assert_eq!(inlier_count(&solution), world_points().len());
+            assert!(solution.prior.is_some());
+        }
+
+        #[test]
+        fn the_imu_holds_the_pose_when_vision_alone_is_underdetermined() {
+            let motion = motion();
+            let (keyframe, truth) = (motion.state(0.0), motion.state(0.25));
+            let points = world_points();
+            let solution = solve(
+                Anchor::Fixed(&keyframe),
+                &motion.preintegrated(0.0, 0.25),
+                perturbed(&truth),
+                &observe(&truth, &points[..2]),
+            );
+            assert!(position_error(&solution.state, &truth) < 1e-3);
+            assert!((solution.state.velocity - truth.velocity).length() < 1e-2);
+        }
+
+        #[test]
+        fn gross_outliers_are_classified_out() {
+            let motion = motion();
+            let (keyframe, truth) = (motion.state(0.0), motion.state(0.25));
+            let mut observations = observe(&truth, &world_points());
+            for observation in observations.iter_mut().step_by(4) {
+                observation.pixel.x += 40.0;
+            }
+            let solution = solve(
+                Anchor::Fixed(&keyframe),
+                &motion.preintegrated(0.0, 0.25),
+                perturbed(&truth),
+                &observations,
+            );
+            for (k, inlier) in solution.inliers.iter().enumerate() {
+                assert_eq!(*inlier, k % 4 != 0, "observation {k}");
+            }
+            assert!(position_error(&solution.state, &truth) < 1e-4);
+        }
+
+        #[test]
+        fn a_gross_outlier_cannot_escape_behind_the_camera() {
+            let motion = motion();
+            let (keyframe, truth) = (motion.state(0.0), motion.state(0.25));
+            let mut observations = observe(&truth, &world_points());
+            // Just in front of the camera and hundreds of pixels off: rotating it
+            // behind the camera would remove a huge cost if that were free.
+            let camera_centre = truth.pose_cw.inverse().translation;
+            observations.push(PoseInertialObservation {
+                point_w: camera_centre + Vec3F64::new(0.3, 0.0, 0.02),
+                pixel: Vec2F64::new(320.0, 240.0),
+                information: 1.0,
+                view: 0,
+            });
+            let solution = solve(
+                Anchor::Fixed(&keyframe),
+                &motion.preintegrated(0.0, 0.25),
+                perturbed(&truth),
+                &observations,
+            );
+            assert!(!solution.inliers[observations.len() - 1]);
+            assert!(position_error(&solution.state, &truth) < 1e-4);
+            assert!(solution.imu_chi2 < 1.0);
+        }
+
+        #[test]
+        fn chains_frames_through_the_marginal_prior() {
+            let motion = motion();
+            let points = world_points();
+            let (keyframe, first, second) =
+                (motion.state(0.0), motion.state(0.05), motion.state(0.1));
+            let first_solution = solve(
+                Anchor::Fixed(&keyframe),
+                &motion.preintegrated(0.0, 0.05),
+                perturbed(&first),
+                &observe(&first, &points),
+            );
+            let prior = first_solution.prior.expect("positive-definite marginal");
+            assert!((prior.information - prior.information.transpose()).norm() < 1e-6);
+
+            let second_solution = solve(
+                Anchor::Prior(&prior),
+                &motion.preintegrated(0.05, 0.1),
+                perturbed(&second),
+                &observe(&second, &points),
+            );
+            assert!(position_error(&second_solution.state, &second) < 1e-4);
+            assert!((second_solution.state.velocity - second.velocity).length() < 1e-3);
+            assert!(second_solution.prior.is_some());
+        }
+    }
 }
