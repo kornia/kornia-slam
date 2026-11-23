@@ -8,10 +8,11 @@ use kornia_3d::ransac::{HuberKernel, RobustKernel};
 use kornia_algebra::{Mat15F64, SMatF64, SO3F64, SVecF64, Vec2F64, Vec3F64};
 use kornia_factors::inertial::NavState;
 use kornia_factors::inertial::preintegration::{information, residual_and_jacobians};
+use kornia_factors::reprojection::residual_and_pose_jacobian;
 use kornia_sensors::imu::{ImuBias, PreintegratedImu};
 
 use crate::mapping::vi_ba_schur::RigObservationCamera;
-use crate::upstream::kornia_3d::refine_analytic::pose_jacobian_2x6;
+use crate::pose_conversion::rigid;
 
 /// Four rounds of ten iterations; outliers are re-classified after each
 /// (`Optimizer.cc:4698-4712`).
@@ -86,7 +87,8 @@ pub(crate) struct PoseInertialSolution {
 /// Solves the frame's pose, velocity and bias from `observations` and the IMU
 /// edge `preintegrated` from `anchor`. A `Fixed` anchor is held; a `Prior`
 /// anchor is free under its prior and marginalized out of the result's.
-/// A solve that leaves the finite numbers returns `initial` with no inliers.
+/// Rows behind the camera at `initial` start as outliers. A solve that leaves
+/// the finite numbers returns `initial` with no inliers.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_pose_inertial(
     anchor: Anchor<'_>,
@@ -98,9 +100,14 @@ pub(crate) fn solve_pose_inertial(
     initial: FrameNavState,
     observations: &[PoseInertialObservation],
 ) -> PoseInertialSolution {
-    let (previous, prior) = match anchor {
+    let (mut previous, prior) = match anchor {
         Anchor::Fixed(state) => (*state, None),
         Anchor::Prior(prior) => (prior.mean, Some(prior)),
+    };
+    previous.pose_cw = rigid(previous.pose_cw);
+    let initial = FrameNavState {
+        pose_cw: rigid(initial.pose_cw),
+        ..initial
     };
     let problem = Problem {
         prior,
@@ -121,7 +128,10 @@ pub(crate) fn solve_pose_inertial(
         previous,
         current: initial,
     };
-    let mut inliers = vec![true; observations.len()];
+    // A behind-camera row makes the cost infinite, so it cannot start active.
+    let mut inliers: Vec<bool> = (0..observations.len())
+        .map(|o| problem.chi2_and_depth(o, &initial).is_some())
+        .collect();
     for (round, gate) in gates.iter().enumerate() {
         problem.optimize(&mut states, &inliers, round + 1 < ROUNDS);
         for (o, inlier) in inliers.iter_mut().enumerate() {
@@ -343,7 +353,8 @@ impl Problem<'_> {
 
     /// The normal equations at `states`: the IMU edge, the prior when the
     /// previous frame is free, and the reprojection rows in `inliers`, under
-    /// the Huber kernel when `robust`.
+    /// the Huber kernel when `robust`. An active row behind the camera makes
+    /// the cost infinite, so a step cannot shed a row's cost by moving it there.
     fn build(&self, states: &States, inliers: &[bool], robust: bool) -> System {
         let mut hessian = SMatF64::<30, 30>::zeros();
         let mut gradient = SVecF64::<30>::zeros();
@@ -384,10 +395,11 @@ impl Problem<'_> {
             if !inliers[o] {
                 continue;
             }
-            let Some(row) = self.reprojection(o, &states.current) else {
+            let Some((residual, jacobian)) = self.reprojection(o, &states.current) else {
+                cost = f64::INFINITY;
                 continue;
             };
-            let chi2 = observation.information * row.residual.norm_squared();
+            let chi2 = observation.information * residual.norm_squared();
             let (weight, row_cost) = if robust {
                 (
                     HuberKernel.weight(chi2, HUBER_REPROJECTION_CHI2),
@@ -399,9 +411,9 @@ impl Problem<'_> {
             cost += 0.5 * row_cost;
             let scale = weight * observation.information;
             let mut block = hessian.fixed_view_mut::<6, 6>(15, 15);
-            block += row.jacobian.transpose() * row.jacobian * scale;
+            block += jacobian.transpose() * jacobian * scale;
             let mut rows = gradient.fixed_rows_mut::<6>(15);
-            rows += row.jacobian.transpose() * row.residual * scale;
+            rows += jacobian.transpose() * residual * scale;
         }
 
         System {
@@ -412,49 +424,48 @@ impl Problem<'_> {
         }
     }
 
-    /// Observation `o`'s pixel residual and its Jacobian with respect to the
-    /// current pose; `None` behind the camera.
-    fn reprojection(&self, o: usize, current: &FrameNavState) -> Option<ReprojectionRow> {
-        let observation = &self.observations[o];
-        let (camera, pose) = match usize::from(observation.view).checked_sub(1) {
-            None => (self.primary, current.pose_cw),
+    /// Observation `o`'s camera and world-to-camera pose at `current`.
+    fn view(&self, o: usize, current: &FrameNavState) -> Option<(&PinholeCamera, Pose3d)> {
+        match usize::from(self.observations[o].view).checked_sub(1) {
+            None => Some((self.primary, current.pose_cw)),
             // A right perturbation of T_pw is the same one of T_c'w = T_c'p T_pw.
             Some(k) => {
                 let view = self.cameras.get(k)?;
-                (
+                Some((
                     &view.camera,
                     view.camera_from_primary.compose(&current.pose_cw),
-                )
+                ))
             }
-        };
-        let point_cam = pose.transform_point(&observation.point_w);
-        if point_cam.z < MIN_DEPTH_M {
-            return None;
         }
-        let residual = SVecF64::<2>::new(
-            camera.fx * point_cam.x / point_cam.z + camera.cx - observation.pixel.x,
-            camera.fy * point_cam.y / point_cam.z + camera.cy - observation.pixel.y,
-        );
-        Some(ReprojectionRow {
-            residual,
-            jacobian: pose_jacobian_2x6(
-                &pose.rotation,
-                observation.point_w,
-                point_cam,
-                camera.fx,
-                camera.fy,
-            ),
-            depth: point_cam.z,
-        })
+    }
+
+    /// Observation `o`'s pixel residual and its Jacobian with respect to the
+    /// current pose; `None` behind the camera.
+    fn reprojection(
+        &self,
+        o: usize,
+        current: &FrameNavState,
+    ) -> Option<(SVecF64<2>, SMatF64<2, 6>)> {
+        let observation = &self.observations[o];
+        let (camera, pose) = self.view(o, current)?;
+        residual_and_pose_jacobian(
+            &pose,
+            &observation.point_w,
+            [observation.pixel.x, observation.pixel.y],
+            camera,
+            MIN_DEPTH_M,
+        )
     }
 
     /// Observation `o`'s weighted chi² and depth at `current`; `None` behind
     /// the camera.
     fn chi2_and_depth(&self, o: usize, current: &FrameNavState) -> Option<(f64, f64)> {
-        let row = self.reprojection(o, current)?;
+        let observation = &self.observations[o];
+        let (residual, _) = self.reprojection(o, current)?;
+        let (_, pose) = self.view(o, current)?;
         Some((
-            self.observations[o].information * row.residual.norm_squared(),
-            row.depth,
+            observation.information * residual.norm_squared(),
+            pose.transform_point(&observation.point_w).z,
         ))
     }
 
@@ -473,12 +484,6 @@ impl Problem<'_> {
         let symmetric = (marginal + marginal.transpose()) * 0.5;
         symmetric.cholesky().map(|_| symmetric)
     }
-}
-
-struct ReprojectionRow {
-    residual: SVecF64<2>,
-    jacobian: SMatF64<2, 6>,
-    depth: f64,
 }
 
 #[cfg(test)]
