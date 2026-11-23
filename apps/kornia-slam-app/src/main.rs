@@ -143,6 +143,7 @@ struct Args {
 #[argh(subcommand)]
 enum Command {
     OfflineBa(OfflineBaArgs),
+    SessionSlice(SessionSliceArgs),
 }
 
 /// Offline global visual-inertial BA over a recorded session, with the run
@@ -161,6 +162,28 @@ struct OfflineBaArgs {
     /// write the solve's counters to this JSON file
     #[argh(option)]
     report: Option<String>,
+}
+
+/// Cuts a time span out of a recorded session (break-case fixtures); the run
+/// file is not read.
+#[derive(argh::FromArgs)]
+#[argh(subcommand, name = "session-slice")]
+struct SessionSliceArgs {
+    /// session file written by --session-out
+    #[argh(option)]
+    session: String,
+
+    /// first keyframe stamp to keep, in the session's clock (s)
+    #[argh(option)]
+    from_sec: f64,
+
+    /// last keyframe stamp to keep, in the session's clock (s)
+    #[argh(option)]
+    to_sec: f64,
+
+    /// write the slice here (CBOR)
+    #[argh(option)]
+    out: String,
 }
 
 /// Evaluation switches for loop-closure tuning that configuration files do not
@@ -232,6 +255,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.pace_timestamps && args.no_pace {
         return Err("--pace-timestamps and --no-pace exclude each other".into());
+    }
+    if let Some(Command::SessionSlice(slice)) = &args.command {
+        return run_session_slice(slice);
     }
     let mut run = RunConfig::from_ron_file(&args.config)?;
     if let Some(Command::OfflineBa(offline)) = &args.command {
@@ -722,6 +748,32 @@ fn run_offline_ba(run: &RunConfig, args: &OfflineBaArgs) -> Result<(), Box<dyn s
         let out = std::io::BufWriter::new(std::fs::File::create(path)?);
         serde_json::to_writer_pretty(out, &result.report)?;
     }
+    Ok(())
+}
+
+/// `session-slice`: writes the part of a session in `[from_sec, to_sec]`.
+fn run_session_slice(args: &SessionSliceArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.from_sec.is_nan() || args.to_sec.is_nan() || args.from_sec > args.to_sec {
+        return Err("--from-sec must be a time at or before --to-sec".into());
+    }
+    let dump = session::read(std::path::Path::new(&args.session))?;
+    let sliced = session::slice(&dump, args.from_sec, args.to_sec);
+    if sliced.keyframes.is_empty() {
+        return Err(format!(
+            "no keyframe of {} lies in {}..={} s",
+            args.session, args.from_sec, args.to_sec
+        )
+        .into());
+    }
+    session::write_dump(std::path::Path::new(&args.out), &sliced)?;
+    eprintln!(
+        "[session_slice] keyframes={} landmarks={} frames={} imu={} -> {}",
+        sliced.keyframes.len(),
+        sliced.landmarks.len(),
+        sliced.frames.len(),
+        sliced.imu.len(),
+        args.out
+    );
     Ok(())
 }
 
