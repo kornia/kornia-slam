@@ -1527,3 +1527,242 @@ matches) that S0E keeps and BA then uses. V2_01 is inside noise (per-start 0.049
   lag is the cause, ORB-SLAM3's rule that tracking inserts a keyframe only when local mapping accepts one
   (`Tracking::NeedNewKeyFrame`, `LocalMapping::AcceptKeyFrames`) behind a knob. RT1PE (S0PE under real time) is run in
   the same rung as the stacked candidate.
+
+## Residual diagnoses (2026-11-23)
+
+Read-only analysis of the existing runs plus one pair of short debug runs. No code change, no build. Binary
+`E/bin-r11b/kornia-slam-euroc`, md5 `e67615adaf558b4aef7b7d1e35a2fb40`. Scripts are in `E/resid/`:
+- `bins.py`: whole-run SE(3) error per bin, with tilt, piece scale and piece yaw;
+- `anch.py`: error per bin under an SE(3) alignment fitted on one span only;
+- `cf.py`: ATE with one event's error increment removed;
+- `step.py`: per-frame vertical error, split into keyframe and tracking frames;
+- `dbg.py`: per-bin debug counters;
+- `climb.py`: vertical error rate against GT climb and stereo depth;
+- `rotdrift.py`: world-frame yaw and tilt drift, from `R_gt R_est^T` against a reference span;
+- `kfrate.py`: keyframes per second.
+
+SE(3) ATE RMSE, m, body centre; causal is `traj.txt`.
+
+### Q1: MH_04 (SYNC causal S0 0.302, S0E 0.311, S0P 0.254, S0PE 0.227; Basalt 0.114)
+
+**Verdict.** Most of the MH_04 causal error comes from one event, not from tilt held in the frozen past. During
+63.3-66.7 s (the dark span) the trajectory loses 0.42-0.55 m of height. The size is the same in every arm (S0, S0E,
+S0P, S0PE, S1, S1E, S0O) and on every start (S0PE starts 0/1/2/30/60). The offset then stays flat until the loop at
+81.5 s. With that one increment removed, S0PE scores 0.110-0.134 on its starts, at Basalt's level (0.114). Online
+information can fix it: Basalt keeps the vertical error within 0.07 m through the same span with VIO alone. The
+offline global BA (0.075) removes it, but too late for the causal output.
+
+**What the "40-50 s and 70-80 s" error is.** It is the whole-run SE(3) fit spreading one offset. The error per 10 s
+bin under the whole-run fit (`bins.py`) shows 0.35-0.49 m at 40-50 s and 0.38-0.55 m at 70-80 s. The absolute tilt
+in those two bins is 0.7-1.2° and 2.4-4.0°. A fit on 15-30 s only (`anch.py`, 2.5 s bins) shows when the error
+enters:
+
+| span (s) | what happens (S0PE; S0 in brackets) | vertical error change, m |
+|---|---|---|
+| 25-40 | almost nothing: vertical error +0.01 to −0.06 m (S0 ±0.02), horizontal 0.01-0.08 (S0 0.01-0.13) | −0.06 (S0 0) |
+| 40-56 | slow drift; includes the GT step at 46.5 s seen by every system (MH04-DIAGNOSIS) | −0.15 (S0 −0.19) |
+| 56-63.3 | dark onset; median stereo depth 10.4-16.7 m against 3.7-7.8 m elsewhere | −0.10 (S0 −0.34) |
+| **63.3-66.7** | **the step, while GT climbs at +0.3-0.54 m/s** | **−0.54 (S0 −0.35; −0.42 to −0.55 over all arms)** |
+| 66.7-81.5 | flat: −0.73 to −0.86 m held, although the tilt is 2.4-4° (no further vertical drift) | about −0.05 |
+| 81.5 | loop to the 38 s map, `map_from_odometry` t_y −0.81 (S0PE) to −1.14 m (S0E), 0.3-1.0°; the error returns to 0.0-0.1 m | +0.8 |
+
+Counterfactual (`cf.py`; the increment ramped out over the span until the 81.5 s loop, then whole-run SE(3)):
+
+| arm (start 0) | base | 40-56 removed | 56-63.3 removed | 63.3-66.7 removed |
+|---|---|---|---|---|
+| S0 | 0.302 | 0.274 | 0.219 | 0.214 |
+| S0E | 0.311 | 0.294 | 0.261 | 0.187 |
+| S0P | 0.254 | 0.222 | 0.213 | 0.139 |
+| S0PE | 0.227 | 0.202 | 0.202 | **0.118** (starts 1/30/60: 0.123, 0.110, 0.134) |
+
+Basalt (`B/results/basalt/MH_04_difficult/trajectory.txt`, same fit) stays at −0.07 to +0.05 m vertical over 25-100 s
+and 0.07-0.18 m per 10 s bin. ORB-SLAM3 without loops dips to −0.12 m at 68-72 s and recovers.
+
+**Mechanism of the step (debug runs `E/debug/R11b-S0-MH04`, `R11b-S0E-MH04`, full MH_04, bit-identical to their batch
+runs).**
+
+1. **The drift accumulates on tracking frames, not in the BA solves.** Over 62-67 s the vertical error changes by
+   −1.10 m (S0E) and −1.24 m (S0) on non-keyframe frames, and by +0.48 / +0.75 m on keyframe frames (`step.py`). The
+   frames form a saw-tooth. Each solve moves the newest keyframe up by 0.13-0.22 m, toward GT. Examples: S0E kf
+   1309, 1317, 1325 at 65.4-66.3 s, with `shift` 0.19 / 0.22 / 0.17 m. The next tracked frame then falls back by
+   0.14-0.16 m onto the map. `[predgap]` at frame 1310 shows `trans=0.18` m against the tracker's own prediction.
+2. **The map, not the solve, holds the offset.** In those windows 512 of 550 landmarks are `pinned` (seen by fixed
+   keyframes), and 70 % (S0E) to 90 % (S0) of the rows are fixed context. The 3 free keyframes can move, but the landmarks the
+   tracker uses cannot. New landmarks (`grown` 40-120 per keyframe) are triangulated at the low tracked poses, so
+   the offset propagates into the new map.
+3. **Distant points leave vertical translation and pitch on one ridge.** A camera that climbs by t and pitches by
+   θ ≈ t/z gives the same image motion, and the points here sit at z ≈ 11-12 m. Per 1 s bin, the vertical error rate
+   follows −0.73 × the GT climb rate where the median depth is above 9 m (n = 8). Below 9 m the slope is −0.01
+   (n = 36; `climb.py`): we track climbs where points are near.
+
+   The window rotates along the ridge. The S0E solves at 65.3-66.7 s turn the free keyframes by 0.7-1.5° of tilt
+   each (`shift_tilt`), and the absolute tilt goes 1.6 → 3°. At 12 m, 1.4° is about 0.3 m of vertical, the order of
+   the step.
+
+   The IMU that would break the ridge is weak there:
+   - The tracker is visual-only PnP (G13, `tracking.pose_inertial: Off`).
+   - In the local BA, the boundary IMU edge to the past is Huber-cut: hw 0.33-0.40, χ² 103-160 at kf 1317-1333.
+   - The accel bias takes the tilt: b_a error 0.12 (60 s) → 0.30 (65 s) → 0.48-0.54 m/s² (67.5-70 s), against
+     g·3° = 0.51 (G49).
+4. **The dark span degrades the rows the solve sees.** S0E erases 44 % of the newest keyframe's rows in 60-70 s
+   (whole run 15.5 %). With 6-7 keyframes per 2.5 s (S0 16-17), keyframes are 8 frames apart, and inliers fall to
+   97-117. S0 (no erase) carries 26-33 % of rows above 25 px² in these windows (`VISRES out`).
+
+**Q1 checks asked for.**
+- **Scale:** 10 s piece scale is 0.996-1.016 over 20-90 s in all four arms (`bins.py`).
+- **Yaw:** piece yaw is within −3.6 to +5.4° of the global fit over 20-90 s. The 60-70 s piece has +3.8 to +5.4°,
+  partly the tilt projected onto the fit.
+- **Coasts:** `coast_inertial=0 coast_visual=0 give_ups=0`, 2032 / 2032 tracked, in all four arms.
+- **Keyframe shifts:** 0 (S0, S0P, S0PE) and 1 (S0E).
+- **Visual χ²:** in S0E, the median final visual cost per solve is 9.3-16 k at 57.5-70 s against 1.0-7.2 k
+  elsewhere. In S0 it is 130-267 k at 60-70 s.
+- **IMU χ²:** median final IMU cost per solve 19-42 at 60-70 s against 3-15 before 57.5 s (S0E).
+- **Observations per keyframe:** in the dark the window holds 2.3-5.0 k rows (S0E) and 10-21 k (S0).
+- **Loop corrections:** listed in the table above.
+
+**Why PnpInliers helps (S0 → S0P −0.048, S0E → S0PE −0.084).** It does not touch the step: −0.49 / −0.54 against
+−0.35 / −0.52 m. It lowers everything else:
+- Under the 15-30 s fit, the horizontal error at 42-62 s is 0.09-0.18 m for S0P and 0.05-0.16 for S0PE, against
+  0.20-0.35 for S0.
+- Whole-run bins at 0-30 s are 0.06-0.07 against 0.09-0.13.
+- The 56-63.3 s drift is −0.17 / −0.10 against −0.34 / −0.20.
+
+Mechanism: with `AllMatches`, the tracker links its PnP outliers into the new keyframe. They feed the KLT tracks and
+the found counts too (`tracking/pose_estimation/map_projection/mod.rs:131-142, 391-399`). The keyframe's first local
+solve, which sets its pose, velocity, bias and new landmarks, sees them before any erase can act. Measured:
+- S0E erases 15.5 % of newest-keyframe rows after that first solve (`erase_unlinked_newest / erase_tested_newest`
+  = 19305 / 124588), and 44 % in the dark.
+- S0PE erases 4.2 % (4628 / 110802).
+
+The erase cleans later windows only. PnpInliers cleans the first solve. MH_04 gains from it and V1_03 / V2_02 lose
+(the R11c P5 diagnosis stands).
+
+**Frozen past or online?** Online.
+- The step is born in the newest keyframes' tracking, at 63-67 s. The keyframes before 60 s were right (error −0.25
+  m and below).
+- The loop correction is 4-DoF and comes at 81.5 s, after every causal frame of the offset was written.
+- The global solve (R6, `E/r6/S0E_MH_04_difficult`) brings the final map to 0.075. Tilt is ≤ 0.24° per 10 s and
+  −0.19 m remains at 65 s. That fixes the smoothed output only.
+- S1 (bias rows full) lowers the 65-79 s tilt 3.74 → 2.46° but not the causal error (0.302 → 0.327). The step in S1
+  is still −0.42 m.
+
+So the tilt is a by-product of the ridge, not the cause of the score. The fix has to put the IMU on the ridge in
+tracking, or free the map.
+
+### Q2: V2_01 real time (RT0E 0.078 / 0.087 → RT1E 0.122 / 0.128)
+
+**Verdict.** PropagateToNewer copies a wrong local-BA correction into keyframes the solve never saw, and that
+happens under mapping lag. In V2_01 at 54-55 s (slow, rotation-dominant motion: speed 0.14-0.26 m/s, gyro peak 1.24
+rad/s), the solves rotate the window by +5.5° of yaw within 3 solves. In those solves 48-56 % of the newest
+keyframe's rows fail χ², and the boundary IMU edge is Huber-cut (hw 0.03-0.2).
+
+RT1E carries that rotation rigidly into the 1-2 newer keyframes per merge and their landmarks
+(`mapping/map/ops/correction.rs:781-796`; `propagate_to_newer` and `carry_landmarks` from line 856). The trajectory then holds a +3.0 to +4.0° yaw error from 54 s (both
+RT1E runs; RT1 alike, +2.5 to +4.2°). RT0E leaves the newer keyframes on their tracked poses, and its yaw stays within
+±1°.
+
+After the 62.6 s loop (4-DoF, 5.5-7.5° in RT1E), RT1E keeps a tilt of 3-5.4° to the end. RT1 without the erase heals
+to 0.4-1.7° over 66-106 s. The extra error at "0-20 s and 100-130 s" is the whole-run fit spreading this later tilt and yaw: a fit
+on 25-50 s puts RT1E and RT0E within 0.02 m of each other before 50 s (`anch.py`).
+
+**Evidence.**
+- World-frame drift against 30-45 s (`rotdrift.py`, 4 s bins, yaw / tilt in degrees):
+
+  | arm | yaw 50 s | yaw 54 s | yaw 58 s | tilt 62 s (loop) | tilt 66-110 s |
+  |---|---|---|---|---|---|
+  | RT0 r1 / r2 | −3.9 / −6.4 | −3.7 / −7.6 | −1.0 / −8.3 | 4.6 / 17.7 | 0.4-3.6 / 16-21 |
+  | RT1 r1 / r2 | −0.4 / −0.1 | +2.5 / +4.2 | +2.2 / +3.7 | 1.5 / 0.8 | 0.4-2.7 |
+  | RT0E r1 / r2 | −1.1 / −0.8 | −0.1 / −0.3 | +0.2 / −0.3 | 1.9 / 2.2 | 0.4-2.0 |
+  | RT1E r1 / r2 | −0.3 / −0.2 | +3.0 / +3.2 | +3.6 / +3.7 | 4.0 / 5.4 | 3.0-5.3 |
+  | S0E SYNC | +0.3 | +1.0 | +0.6 | 0.4 | 0.3-1.2 |
+
+- **Debug pair (new, `E/debug/Q2-RT1E-V201-s850`, `Q2-RT0E-V201-s850`).** V2_01 from frame 850 (42.5 s), 450 frames,
+  RT1E / RT0E config, async, `--pace-timestamps`, `--debug`, `taskset -c 6,7`, one at a time, load 3.1 / 4.7, one
+  other `kornia-slam` process (the R11d driver on cores 0,1). Both runs rc 0, walls 47 / 41 s, and both hit the same
+  loop (local kf 401 ≈ frame 1251 to the 49.3 s map; correction 5.12° and 6.55° in RT1E, 1.73° in RT0E). Both
+  reproduce the event:
+  - at 54-55 s the tilt rises to 2.2-4.3° in both;
+  - RT1E then jumps +4.5° in yaw at 55 s and holds +3.7 to +4.7° to 61 s; RT0E stays at −1.2 to +0.4°;
+  - before the loop (57-60 s), RT1E holds a tilt of 2.0-2.8° and RT0E recovers to 0.6-1.3°;
+  - after the loop, both rise (5.3 / 3.8°). A start at 42.5 s re-initialises the IMU during the event, so the
+    post-loop part does not separate here. It does in the full runs.
+
+  The window solves rotate alike in both arms: shift_yaw sums of +5.5 / +4.3° in the 54 s bin. The output differs
+  because of the carry. The erase share per 1 s bin, RT1E against RT0E:
+
+  | bin | all rows | newest keyframe | older free keyframes (the ones earlier merges carried) | fixed context |
+  |---|---|---|---|---|
+  | 50-53 s | 11.9-14.6 % / 10.3-16.4 % | 26-39 % / 25-36 % | 18-31 % / 21-31 % | 6.4-9.4 % / 5.8-9.5 % |
+  | **54 s** | **24.9 % / 12.8 %** | 55.5 % / 48.0 % | **55.8 % / 27.4 %** | **12.2 % / 5.2 %** |
+  | 55 s | 25.7 % / 23.7 % | 55.8 % / 51.7 % | 35.8 % / 46.2 % | 18.2 % / 14.0 % |
+  | whole run | 12.6 % / 11.2 % | 28.4 % / 27.5 % | 17.5 % / 17.2 % | 8.9 % / 7.5 % |
+
+  In the first second of the event, RT1E unlinks twice the share of rows (older free keyframes and fixed context).
+  Those are the rows that disagree with the carried rotation. Unlinked rows are gone for good. Under Huber (RT1)
+  they stay and pull the map back after the loop. This "erase locks the carried error in" step is supported by one
+  non-deterministic pair: **unverified as the only cause.**
+- **The three checks asked for.**
+  - Erase counts per solve with propagated keyframes in the window: the table above. They are equal to RT0E outside
+    the event and 2x in its first second.
+  - Stale-propagated keyframes judged by the erase: never in the merge that carries them. `erase_stale_links=0` on
+    every run, and the erase only tests the solved window's links (`mapping/outlier_erase.rs:153-200`). They are
+    judged in their next window, as "older free" rows.
+  - Mapping lag: solves per keyframe are 0.86-0.87 (RT1E) against 0.82-0.84 (RT0E), and 0.69-0.71 in the debug pair.
+    Lag is the precondition: at 49-62 s, RT runs insert 6-7 keyframes per second against 2-5 in SYNC (`kfrate.py`).
+    It is not what separates RT1E from RT0E.
+- **Post-hoc check on finished R11d runs (looked at after the diagnosis above was formed; mechanism counters only, no
+  score read; not predictions).** V2_01 r1:
+  - RT2E (7 iterations, `RAYON_NUM_THREADS=1`): `ba_stale_keyframes=0`, 359 keyframes / 363 solves, yaw −1.3 to
+    +0.8°, tilt 0.3-1.0° over 46-114 s.
+  - RT2E-r (rayon only; 246 stale = propagated): +4.0 / +4.8° yaw at 54 / 58 s and 3.6-4.9° tilt after the loop,
+    the RT1E signature.
+  - RT1PE (PnpInliers; 86 stale): yaw −0.9 to +0.7°, tilt 0.3-1.3°.
+
+  Removing either precondition removes the signature: the lag (every keyframe solved as newest) or the contaminated
+  newest rows (PnpInliers).
+
+### Fix rungs
+
+**R13a (config-only, SYNC, decides Q1): per-frame pose-inertial tracking on S0PE.** Arm `S0PEI` = S0PE +
+`tracking: ( pose_inertial: OrbSlam3 )` (`K/system/config/mod.rs:482-493`; ORB-SLAM3 `Tracking.cc:2970-2992`,
+`Optimizer.cc` `PoseInertialOptimizationLast{Frame,KeyFrame}`). This moves R7 ahead of R3+R4 on MH_04 only.
+
+Why the anchor bias is good enough here: in the dark the b_a error is 0.12-0.30 m/s². Over the longest gap between
+keyframes (0.4 s) it costs ½·0.3·0.4² = 0.024 m, against the 0.14-0.16 m the tracker loses per keyframe interval.
+The gyro bias error is 0.5 mrad/s. So the IMU decides along the pitch/vertical ridge.
+
+Runs: MH_04 starts 0/1/2/30/60. Guards: V1_02, V2_01, MH_01 starts 0/1/2. The header does not print
+`tracking.pose_inertial` (`K/system/config/mod.rs:800-900`), so the header must `diff` clean against
+`E/expect/S0PE.header`, and a run counts only with `pose_inertial_solves` > 0.
+- P1 (mechanism): the MH_04 vertical increment over 63.3-66.7 s (`E/resid/cf.py`, fit on 15-30 s) is ≥ −0.25 m on
+  every start. S0PE: −0.50 to −0.54.
+- P2: MH_04 causal median 0.12-0.17, every start ≤ 0.19 (S0PE 0.225-0.235). The counterfactual floor is 0.110-0.134.
+- P3: MH_04 tilt median 65-79 s ≤ 1.5° (S0PE 2.01-2.76°, `r11b/tiltwin.py`).
+- P4 (health): tracked = frames, `coast_inertial=0`, `give_ups=0` and `pose_inertial_solves` > 0 on every run.
+- P5 (guards): causal median ≤ 1.15x S0PE: V1_02 ≤ 0.041, V2_01 ≤ 0.064, MH_01 ≤ 0.056.
+- K1 (card H defect on EuRoC): any run below 100 % tracked or with `coast_inertial` > 0. Stop; card H first.
+- K2 (mechanism, no score): P1 holds but the MH_04 causal median is > 0.19. The step is not the score; diagnose.
+- K3 (score, no mechanism): MH_04 causal median ≤ 0.17 while the step stays ≤ −0.40 m. Another cause; do not credit.
+- If K2 or P1 fails with P4 clean, the map rigidity is the remaining lever: R12 (non-frozen window). R4 window 10 is
+  not proposed: the window-10 preset was 0.471 on MH_04.
+
+**R13b (no new run; adds predictions to R11d's runs not yet made, V2_01 r2; written before those runs).**
+- RT2E V2_01 r2: `ba_propagated_keyframes` ≤ 5 % of keyframes; yaw drift over 50-62 s within ±1.5°; tilt over
+  62-110 s ≤ 1.5° (`E/resid/rotdrift.py V2_01_easy 30 45 4 46 114`).
+- RT2E-r V2_01 r2: yaw ≥ +2.5° in the 54-58 s bins, and tilt ≥ 3° after the 62.6 s loop.
+- Kill K4: RT2E-r r2 without that signature. The propagation mechanism does not reproduce; the r1 match was luck.
+- Kill K5: RT2E r2 with 0 stale keyframes and a yaw step ≥ 3°. Another cause than propagation.
+
+**R13c (code, behind a knob, only if R11d's K1 fires or RT2E misses the 2-core budget on any sequence):** ORB-SLAM3's
+keyframe acceptance (`Tracking::NeedNewKeyFrame` with `LocalMapping::AcceptKeyFrames` / `InterruptBA`). Tracking
+inserts a keyframe only when local mapping is idle, or interrupts the running solve. Then every keyframe is the newest
+of its own solve, and PropagateToNewer has nothing to carry.
+- Predictions: solves per keyframe ≥ 0.97 on every real-time run; V2_01 propagated ≤ 5 %; the yaw and tilt bounds of
+  R13b; RT causal within 1.2x of S0E SYNC on V2_01 (≤ 0.066).
+- Kill: solves per keyframe ≥ 0.97 with the V2_01 signature present means lag is not the precondition; diagnose.
+- Alternative if acceptance costs tracking: carry the correction only when the solve kept its boundary IMU edge at
+  full weight (hw ≥ 0.9) and erased ≤ 30 % of the newest rows. Otherwise fall back to SnapshotOnly for that merge.
+  Theory first, no numbers yet.
+
+Ledger: G58 (MH_04 dark-span step) and G59 (PropagateToNewer carries a wrong correction under lag) in
+`experiments/gap-ledger.md`.
