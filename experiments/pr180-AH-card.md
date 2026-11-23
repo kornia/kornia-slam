@@ -281,3 +281,26 @@ step = yaw step of the 60 s pieces (driftbudget.py; nan when the event has no cl
 | sequence_5_12-r1 | 13 | 0 | no output (no GT, no session) | - |
 
 H0 keeps far fewer later alignments: 0 on 14 of 17 sessions, at most 3 (1_19 r1, 2_12, 4_10). BASE has 0-59, and 18-59 on 2_11, 2_12, 3_17, 4_10 and 4_11. H0 has somewhat fewer segments (4_10: 67 against 108; 2_12: 46 against 60), but 4_10 and 4_11 still have 38-67.
+
+## Stage 1, EuRoC arm (owner, 2026-11-23: EuRoC first, then LaMAria 60 s windows)
+
+Written before any run.
+
+- **Arms:**
+  - **E0:** the EuRoC baseline `default` config (stereo+IMU, knobs off), from `/home/edgar/dev/split/.pr180-fix/euroc/`.
+  - **E1:** E0 plus `mapping.local_ba.boundary_scales_bias_rows: false`.
+- **Runs:** all 11 sequences, full length, 1 run each. A sequence that decides a verdict gets 3 runs.
+- **Prior evidence that bounds the expectation:**
+  - Card S, on R_01: the same knob cut the boundary bias residual from 8.0/3.0 σ to 1.3/1.3 σ, but ATE stayed inside noise.
+  - Card O: a full-weight boundary edge (with Huber) made drift worse.
+  - Card W: at window 10, MH_03's gyro bias error was 5-6x larger.
+  - E0 runs at window 3.
+- **Predictions:**
+  - **EM1 (mechanism):** consecutive-keyframe gyro walk z p50 falls from E0's value (expected 8-12) to at most 2.0 on every sequence. Accel walk z falls to at most 2.0.
+  - **EP1:** mean ATE over 11 changes by -15 % to +5 %. No sequence is worse by more than 15 %.
+  - **EP2:** MH_03, MH_04, MH_05 and V1_03 improve by 0 % to 30 %. These are the sequences with fast motion and long bias excursions.
+  - **EP3:** tracked frames stay within 0.5 points of E0 on every sequence.
+- **Kill rules:**
+  - **EK1:** EM1 holds and EP1 shows less than 3 % gain. Bias memory is not where EuRoC error enters, as in card S. Go on to the LaMAria windows only for the heading-event test, and promote nothing on EuRoC grounds.
+  - **EK2:** any sequence is worse by more than 15 %, or EP3 fails. The knob harms EuRoC and stays Off, whatever LaMAria shows.
+  - **EK3:** ATE improves by 10 % or more while EM1 fails. No credit; check the `local BA:` header line.
