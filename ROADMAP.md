@@ -40,7 +40,8 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
   - **R0 stopped at its first kill, K0.2** (`experiments/euroc-top1-card.md` "Results"): SYNC with one rayon
     thread hit the 300 s cap on MH_04 (1666 of 2033 frames) and V1_02 (1479 of 1710). The synchronous local BA
     carries 90-92 % of the frame time. The same config without the thread pin finished V1_02 in 190 s, and
-    its first 1432 poses are byte-identical to the pinned run. Determinism pairs not run; owner decides at Stop S1.
+    its first 1432 poses are byte-identical to the pinned run. Owner: drop the pin (it cost about 1.9x wall);
+    SYNC keeps synchronous mapping, all threads, no pacing and the 300 s cap. Determinism is re-checked unpinned.
   - Body-centre re-score of the async runs: default fails V2_02 and V2_03 too (59.6 and 242.7 m, G54); the preset
     smoothed output reaches 0.055 and 0.462 there. The smoothed proxy equals the app output to 3 decimals on 5 runs.
 - **Re-plan: the global stage comes first, and the loss cards are paused** (owner, 2026-11-23).

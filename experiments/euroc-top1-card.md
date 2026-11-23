@@ -55,13 +55,17 @@ rooms are 1.5-3x behind even smoothed; that is the part with no diagnosis yet.
 
 - **Experiment dir:** `E` (do not write into `P/euroc/`). Binary for R0-R6: `P/euroc/bin/kornia-slam-euroc`,
   md5 `cea7646298a68ddb948b16835472b2e3` (code c21299b). No build.
-- **SYNC mode (decides every A/B):** `mapping: ( execution: Synchronous )`, env `RAYON_NUM_THREADS=1`,
-  `--no-pace`. Synchronous has no stale keyframes, so G54 cannot hide an effect. It matches how the Basalt
+- **SYNC mode (decides every A/B):** `mapping: ( execution: Synchronous )`, all rayon threads (no pin, see the
+  change below), `--no-pace`. Synchronous has no stale keyframes, so G54 cannot hide an effect. It matches how the Basalt
   reference ran (blocking).
+- **Protocol change (owner, 2026-11-23, after K0.2):** the `RAYON_NUM_THREADS=1` pin is dropped. The pin cost
+  about 1.9x wall (V1_02 projected 347 s pinned against 190 s for the other agent's unpinned T3 run of the same
+  config), and T3 matched the pinned run's first 1432 poses byte for byte. Determinism is re-checked unpinned
+  (P0.1) before any arm runs.
 - **ASYNC mode (deployment check, batch gates only):** `--pace-timestamps`, no thread pin, 3 runs per sequence
   for the band. Unpaced async is dropped: it starves BA (1.4-1.75 keyframes inserted per solve) and is neither
   deterministic nor the deployed regime.
-- **Command:** `RAYON_NUM_THREADS=1 timeout 300 bin/kornia-slam-euroc --config $d/run.ron --no-tui --no-pace
+- **Command:** `timeout 300 bin/kornia-slam-euroc --config $d/run.ron --no-tui --no-pace
   --trajectory-out $d/traj.txt --trajectory-smoothed $d/traj_smoothed.txt --session-out $d/session.cbor`.
   No `--evaluate --eval-out` (camera-centre csv). `rc=124` means the 5 min cap fired: run invalid.
 - **Scoring, both outputs:** `B/venv/bin/python -I B/eval.py <euroc>/$seq $d/traj.txt --fmt tum --rpe 1,10`,
@@ -97,7 +101,7 @@ everything. R3, then R4 on top. R5 replaces part of R3, never both. R6 and R8 st
   `loop_closing: Disabled`, 11 × 1 (VIO against Basalt's VIO, and the size of what loops give).
 - **Baselines:** `P/euroc/runs/default_*_r1`, `preset_*_r1` (async unpaced, load 8-24), re-scored body-centre.
 - **Predictions:**
-  - P0.1 repeats are `cmp`-identical (MH_04, V1_02, 2 runs each).
+  - P0.1 repeats are `cmp`-identical (MH_04, V1_02, 2 runs each; unpinned since the K0.2 protocol change).
   - P0.2 `ba_stale_keyframes=0` and `ba_keyframe_shifts ≤ 5` on all 11; Vicon rooms Sim3 scale 0.98-1.02;
     V1_02 causal 0.05-0.10 (2026-11-10 sync run: 0.075 camera-centre).
   - P0.3 `tracked == frames` on all 11, give-ups 0.
