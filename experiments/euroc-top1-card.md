@@ -280,3 +280,61 @@ or code-default change.
 ## Results
 
 (Filled as runs land; nothing below is re-worded after the run.)
+
+### Results: body-centre re-score of the async unpaced runs (2026-11-23)
+
+`E/rescore_old.py` (python only, read-only on `P/euroc/runs/*_r1`): SE(3) ATE RMSE, m, `eval.py --fmt tum`.
+Causal = `traj.txt`. Smoothed: "app" = the run's own `--trajectory-smoothed` output, where the driver passed it;
+"proxy" = `E/proxy.py` (a copy of `P/euroc/recover.py`: frames re-anchored on the final keyframe poses of
+`session.cbor`). One run per cell, load 8-24. Scale = Sim(3) scale of the causal fit.
+
+| seq | default causal | default smoothed (app / proxy) | default scale | preset causal | preset smoothed (app / proxy) | preset scale | Basalt | ORB-SLAM3 |
+|---|---|---|---|---|---|---|---|---|
+| MH_01_easy | 0.080 | - / 0.041 | 1.008 | 0.083 | - / 0.034 | 1.006 | 0.067 | 0.046 |
+| MH_02_easy | 0.064 | - / 0.027 | 1.002 | 0.052 | - / 0.025 | 0.998 | 0.048 | 0.034 |
+| MH_03_medium | 0.048 | - / 0.050 | 1.006 | 0.070 | - / 0.085 | 0.999 | 0.062 | 0.028 |
+| MH_04_difficult | 0.306 | - / 0.165 | 1.008 | 0.471 | - / 0.213 | 0.998 | 0.114 | 0.045 |
+| MH_05_difficult | 0.178 | - / 0.080 | 1.008 | 0.164 | - / 0.107 | 1.003 | 0.144 | 0.050 |
+| V1_01_easy | 0.141 | - / 0.137 | 1.007 | 0.074 | - / 0.059 | 1.016 | 0.043 | 0.039 |
+| V1_02_medium | 2.397 | - / 1.005 | 0.369 | 0.095 | - / 0.065 | 1.002 | 0.045 | 0.019 |
+| V1_03_difficult | 114.535 | - / 112.044 | 0.003 | 0.203 | - / 0.077 | 0.988 | 0.053 | 0.026 |
+| V2_01_easy | 19.073 | - / 18.986 | 0.059 | 0.105 | 0.080 / 0.080 | 1.013 | 0.039 | 0.031 |
+| V2_02_medium | 59.607 | 59.947 / 59.947 | 0.005 | 0.103 | 0.055 / 0.055 | 1.028 | 0.049 | 0.037 |
+| V2_03_difficult | 242.678 | 242.457 / 242.457 | 0.001 | 0.658 | 0.462 / 0.462 | 0.969 | 0.230 | 0.027 |
+
+- The MH and preset rows reproduce the gap table. Two proxy cells differ from the planner's proxy: default
+  V1_02 1.005 (planner 1.22) and preset V1_03 0.077 (planner 0.066); both are far from any bar.
+- **Proxy against the app output, same session:** identical to 3 decimals on all 5 runs that have both
+  (preset V2_01/V2_02/V2_03, default V2_02/V2_03). This is P0.4's question answered on old async runs; P0.4 itself
+  stays open for S0.
+- **V2_02 and V2_03 (new):** default fails both (59.6 / 242.7 m, scale 0.005 / 0.001: G54). The preset scores
+  0.103 / 0.658 causal and 0.055 / 0.462 smoothed. V2_03 smoothed is 2.0x Basalt (0.230), the worst preset ratio.
+
+### Results: R0 determinism check, stopped by K0.2 (2026-11-23)
+
+Harness `E/drive.sh` (SYNC: `RAYON_NUM_THREADS=1`, `--no-pace`, `timeout 300`), binary md5
+`cea7646298a68ddb948b16835472b2e3`. Header check clean on both runs (`E/expect/S0.header`: `local mapping:
+synchronous`, no `local BA:` line).
+
+| run | rc | wall s | frames done / total | sum of per-frame ms | frames > 100 ms (time) | load at start |
+|---|---|---|---|---|---|---|
+| `S0_MH_04_difficult_s0_r1` | 124 | 300 | 1666 / 2033 | 161 s | 377 (145 s) | 6.2 |
+| `S0_V1_02_medium_s0_r1` | 124 | 300 | 1479 / 1710 | 187 s | 415 (171 s) | 24.8 |
+
+- **K0.2 fired: both runs hit the 300 s cap.** Linear projection to the full sequence: MH_04 about 366 s,
+  V1_02 about 347 s, at load 20-25 on 12 cores. The determinism pairs (r2) were not run; P0.1 has no verdict.
+- **Diagnosis (why):** the cost is the synchronous local BA in the frame path: 90-92 % of the logged frame time
+  sits in the 23-28 % of frames above 100 ms (p90 336-438 ms, p99 909-927 ms). The rest of the wall (113-139 s)
+  is not in the per-frame figure (start-up and work outside the timed span; not split yet). The one-thread pin
+  is the difference from the earlier SYNC run: the other agent's T3 run (`P/euroc/runs/t3_V1_02_medium_r1`, the
+  same config without the pin and without `start_frame`) finished V1_02 in 190 s (load 14.7 at start, 4.8 at end).
+- **Determinism evidence, not P0.1:** the first 1432 poses of `S0_V1_02_medium_s0_r1/traj.txt` are
+  byte-identical (`cmp`) to the first 1432 lines of T3's `traj.txt`, which ran with all rayon threads at a
+  different load. So up to 84 % of V1_02 the SYNC output does not depend on the thread count.
+- **T3 scored body-centre (read only), V1_02 SYNC unpinned:** causal 0.102, smoothed 0.056 (Basalt 0.045),
+  Sim(3) scale 1.011, `ba_stale_keyframes=0`, `ba_keyframe_shifts=0`, give-ups 0, tracked 1688 of 1710 (22
+  start-up frames skipped). So G54 is gone in SYNC on V1_02 (K0.3 does not fire there), causal sits 0.002 above
+  P0.2's 0.05-0.10 range, and P0.3 would fail on the 22 start-up frames (owner answer 3: a
+  `min_cold_start_points` rung).
+- **Next (owner's call at Stop S1):** the plan's candidate is R4's Basalt solver budget in the base; the T3
+  evidence also points at the thread pin itself (dropping it kept the output identical over the compared prefix).
