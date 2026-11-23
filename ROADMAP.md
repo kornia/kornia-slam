@@ -82,6 +82,15 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
   - Cause: its noise model has no pose/GT endpoint jitter and no gyro scale term (about 0.4 %). A synthetic 30° event is found exactly (30.1°).
   - Owner, 2026-11-23: add the measured endpoint-noise and scale terms, and count only runs of 2 or more same-sign windows. Re-run in progress.
   - The preview's accel-bias excursion reproduces exactly: 30 s median max 1.31 (r1) and 1.26 (r2) m/s^2 on 1_19 at 300-480 s.
+- **EuRoC baseline, first results** (current branch, full length, stereo+IMU; the app's evaluator; `eval.py` SE(3) values to follow): default (knobs off) MH_01 0.081 m, MH_02 0.075 m. The 2026-11-10 table had MH_01 at 0.099 m; Basalt has 0.067 and 0.048 m. The other 9 sequences are running.
+- **The first EuRoC preset arm was invalid, and finding out why exposed two gaps** (ledger G50, G51).
+  - The `pr180-window10` frontend was copied without `klt_rig: AllCameras`. Optical flow was then "unavailable" on 3198 of 3682 MH_01 frames, and MH_01 came out at 0.120 m.
+  - Adding AllCameras still left 3219 unavailable.
+  - **Cause:** `cameras: Stereo` runs flow on the left camera only. Multi-camera flow needs `Rig` mode (`system/mod.rs:320-324`). With 48 tracks per camera and `min_tracks: 48`, flow-only tracking works only on frames where every track survives.
+  - 400-frame debug runs: 17 flow-only frames at 48 tracks; 141 at `per_camera: 96`. The preset arm is re-running at 96 tracks.
+- **Every reference tracks both stereo cameras** (Basalt, OpenVINS, VINS-Fusion, ORB-SLAM3, SLAM Dunk; file and line in G50). Our Stereo mode is the outlier, so on EuRoC we track with half the observations they use.
+  - Next: a small EuRoC source change, so EuRoC can run as `cameras: Rig`, then Stereo against Rig on all 11 sequences (planning).
+  - LaMAria configs already run `Rig` with AllCameras, so there it is a no-regression check.
 - **Break-case test suite** (owner, 2026-11-23: planning): turn each known break (1_19 weak spell at 436-448 s, the start-up turn, the 2_11 runaway velocity, the Held re-seed bias runaway) into a red unit test on a real snippet or a dumped state. The first test compares our LK with OpenCV on the same LaMAria frames.
 
 ### 2026-11-22
