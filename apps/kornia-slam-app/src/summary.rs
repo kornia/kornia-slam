@@ -195,7 +195,8 @@ fn format_estimator_recovery(c: &RunCounters) -> String {
          relocalization_refused_jump={} relocalizations_older_segment={} \
          relocalization_without_vocabulary={} relocalization_ms={:.1} seeded_window_frames={} \
          seeded_window_dropped_points={} vi_ba_base_solves={} vi_ba_base_iterations={} \
-         vi_ba_iterations_max={} vi_ba_rejected_steps={} vi_ba_solves_3plus_rejects={}",
+         vi_ba_iterations_max={} vi_ba_rejected_steps={} vi_ba_solves_3plus_rejects={} \
+         pose_inertial_rejects={}",
         c.ba_keyframe_shifts,
         c.ba_snapbacks,
         c.large_window_solves,
@@ -218,6 +219,7 @@ fn format_estimator_recovery(c: &RunCounters) -> String {
         c.vi_ba_iterations_max,
         c.vi_ba_rejected_steps,
         c.vi_ba_solves_3plus_rejects,
+        c.pose_inertial_rejects,
     )
 }
 
@@ -354,6 +356,7 @@ mod tests {
         counters.vi_ba_iterations_max = 20;
         counters.vi_ba_rejected_steps = 21;
         counters.vi_ba_solves_3plus_rejects = 22;
+        counters.pose_inertial_rejects = 23;
         let text = format(&counters, &FrameTimes::default());
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 8);
@@ -367,7 +370,7 @@ mod tests {
              relocalization_without_vocabulary=14 relocalization_ms=15.0 \
              seeded_window_frames=16 seeded_window_dropped_points=17 vi_ba_base_solves=18 \
              vi_ba_base_iterations=19 vi_ba_iterations_max=20 vi_ba_rejected_steps=21 \
-             vi_ba_solves_3plus_rejects=22"
+             vi_ba_solves_3plus_rejects=22 pose_inertial_rejects=23"
         );
     }
 
