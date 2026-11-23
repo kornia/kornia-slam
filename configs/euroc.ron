@@ -10,7 +10,8 @@
     )),
     system: (
         version: 1,
-        // cameras: Mono | Stereo (a rectified pair; the right image adds depth).
+        // cameras: Mono | Stereo (a rectified pair; the right image adds depth)
+        // | Rig (raw cam0 + cam1, each with its own radtan model).
         // imu: true needs a source with IMU data; EuRoC provides both, e.g.
         // ( cameras: Stereo, imu: true ).
         sensors: ( cameras: Mono, imu: false ),

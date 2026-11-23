@@ -5,9 +5,12 @@ use std::path::{Path, PathBuf};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
+use kornia_image::ImageSize;
 use kornia_io::png::read_image_png_mono8;
-use kornia_sensors::SensorRig;
 use kornia_sensors::imu::ImuMeasurement;
+use kornia_sensors::rig_calibration::rig_cameras_from_body_extrinsics;
+use kornia_sensors::{RigCamera, SensorRig};
+use kornia_slam::CameraSelection;
 use serde::Deserialize;
 
 use super::{
@@ -15,7 +18,7 @@ use super::{
     dataset_summary, non_empty, resolve,
 };
 use crate::datasets::EurocDataset;
-use crate::datasets::euroc::{GroundTruthPose, ImuSample};
+use crate::datasets::euroc::{EurocCameraCalibration, GroundTruthPose, ImuSample};
 use crate::datasets::rectifier_from_euroc;
 
 /// An EuRoC MAV sequence; stereo and IMU calibration come from its `sensor.yaml` files.
@@ -38,14 +41,15 @@ impl EurocConfig {
 
     pub(super) fn open(
         &self,
-        stereo: bool,
+        cameras: CameraSelection,
         rectification: Rectification,
     ) -> Result<OpenedSource, SourceError> {
         let source = EurocSource::open(
             &self.data,
             self.start_frame,
             self.max_frames,
-            stereo.then_some(rectification),
+            cameras,
+            rectification,
         )?;
         Ok(OpenedSource {
             summary: Some(dataset_summary(
@@ -59,8 +63,8 @@ impl EurocConfig {
     }
 }
 
-/// Reads left-camera (and optionally rectified left+right) PNG frames from an
-/// EuRoC dataset in order.
+/// Reads left-camera (and optionally rectified left+right, or raw left+right
+/// as a rig) PNG frames from an EuRoC dataset in order.
 pub struct EurocSource {
     dataset: EurocDataset,
     cursor: usize,
@@ -69,6 +73,8 @@ pub struct EurocSource {
     n_frames: usize,
     /// When `Some`, the source rectifies the left+right pair and yields stereo.
     rectifier: Option<PairRectifier>,
+    /// Yield the raw right image as a second rig camera.
+    rig: bool,
     with_imu: bool,
     imu_cursor: usize,
 }
@@ -78,23 +84,30 @@ impl EurocSource {
     ///
     /// `max_frames == 0` means "until the dataset is exhausted". `start_frame`
     /// is the index into the left-camera samples of the first sample to yield; later
-    /// samples retain their absolute index in `FrameItem::idx`. With `stereo`,
-    /// the left+right pair is rectified that way and yielded together; the
-    /// dataset must then have a usable right camera.
+    /// samples retain their absolute index in `FrameItem::idx`. With `Stereo`,
+    /// the left+right pair is rectified as `rectification` says and yielded
+    /// together; with `Rig`, both raw images are yielded as a two-camera rig.
+    /// Either needs a usable right camera.
     pub fn open(
         root: impl AsRef<Path>,
         start_frame: usize,
         max_frames: usize,
-        stereo: Option<Rectification>,
+        cameras: CameraSelection,
+        rectification: Rectification,
     ) -> Result<Self, SourceError> {
         let dataset = EurocDataset::open(root).map_err(SourceError::other)?;
+        let stereo = cameras == CameraSelection::Stereo;
+        let rig = cameras == CameraSelection::Rig;
+        // Rig, like Stereo, skips left frames without a right partner, so both
+        // images belong to one instant.
+        let paired = cameras != CameraSelection::Mono;
         let n = dataset.samples().len();
         let start = start_frame.min(n);
-        let yields = |idx: usize| yields_frame(&dataset, stereo.is_some(), idx);
+        let yields = |idx: usize| yields_frame(&dataset, paired, idx);
         let end = window_end(start, n, max_frames, yields);
         let n_frames = (start..end).filter(|&idx| yields(idx)).count();
 
-        let rectifier = if let Some(rectification) = stereo {
+        let rectifier = if stereo {
             if !dataset.is_stereo() {
                 return Err(SourceError::other(
                     "stereo requested but dataset has no usable right camera",
@@ -109,6 +122,23 @@ impl EurocSource {
         } else {
             None
         };
+        if rig {
+            let sized = |c: &EurocCameraCalibration| c.width > 0 && c.height > 0;
+            match &dataset.right_calibration {
+                Some(right) if dataset.is_stereo() => {
+                    if !sized(&dataset.left_calibration) || !sized(right) {
+                        return Err(SourceError::other(
+                            "rig requested but a camera sensor.yaml has no resolution",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(SourceError::other(
+                        "rig requested but dataset has no usable right camera",
+                    ));
+                }
+            }
+        }
 
         // IMU samples are yielded whenever the dataset ships them (`imu0`);
         // skip those preceding the first yielded camera frame.
@@ -132,6 +162,7 @@ impl EurocSource {
             end,
             n_frames,
             rectifier,
+            rig,
             with_imu,
             imu_cursor,
         })
@@ -150,6 +181,14 @@ impl EurocSource {
 impl FrameSource for EurocSource {
     fn rig(&self) -> SensorRig {
         let mut rig = SensorRig::new(self.camera());
+        if self.rig {
+            let right = self
+                .dataset
+                .right_calibration
+                .as_ref()
+                .expect("open() checks the right calibration for a rig");
+            rig = rig.with_rig_cameras(rig_cameras(&self.dataset.left_calibration, right));
+        }
         if let Some(rect) = &self.rectifier {
             rig = rig.with_stereo_baseline(rect.baseline());
         }
@@ -173,20 +212,23 @@ impl FrameSource for EurocSource {
             .map_err(SourceError::other)?
             .into_inner();
 
-        let (image, right_image) = match &self.rectifier {
+        let read_right = || -> Result<_, SourceError> {
+            let right_path = &self
+                .dataset
+                .right_sample_for(idx)
+                .ok_or_else(|| SourceError::other("left frame has no right partner"))?
+                .image_path;
+            Ok(read_image_png_mono8(right_path)
+                .map_err(SourceError::other)?
+                .into_inner())
+        };
+        let (image, right_image, rig_images) = match &self.rectifier {
             Some(rect) => {
-                let right_path = &self
-                    .dataset
-                    .right_sample_for(idx)
-                    .ok_or_else(|| SourceError::other("left frame has no right partner"))?
-                    .image_path;
-                let right_raw = read_image_png_mono8(right_path)
-                    .map_err(SourceError::other)?
-                    .into_inner();
-                let (left, right) = rect.rectify(&left_raw, &right_raw)?;
-                (left, Some(right))
+                let (left, right) = rect.rectify(&left_raw, &read_right()?)?;
+                (left, Some(right), Vec::new())
             }
-            None => (left_raw, None),
+            None if self.rig => (left_raw, None, vec![read_right()?]),
+            None => (left_raw, None, Vec::new()),
         };
         let imu_samples = self.imu_samples_until(timestamp_sec);
 
@@ -195,7 +237,7 @@ impl FrameSource for EurocSource {
             timestamp_sec,
             image,
             right_image,
-            rig_images: Vec::new(),
+            rig_images,
             imu_samples,
         }))
     }
@@ -233,7 +275,7 @@ impl EurocSource {
         while self.cursor < self.end {
             let idx = self.cursor;
             self.cursor += 1;
-            if yields_frame(&self.dataset, self.rectifier.is_some(), idx) {
+            if yields_frame(&self.dataset, self.rectifier.is_some() || self.rig, idx) {
                 return Some(idx);
             }
         }
@@ -258,9 +300,9 @@ impl EurocSource {
 }
 
 /// Whether the left sample `idx` is yielded: any sample in mono mode, and in
-/// stereo mode only one with a synchronised right image.
-fn yields_frame(dataset: &EurocDataset, stereo: bool, idx: usize) -> bool {
-    !stereo || dataset.right_sample_for(idx).is_some()
+/// paired (stereo or rig) mode only one with a synchronised right image.
+fn yields_frame(dataset: &EurocDataset, paired: bool, idx: usize) -> bool {
+    !paired || dataset.right_sample_for(idx).is_some()
 }
 
 /// End of the window from `start` that holds `max_frames` yielded samples
@@ -283,9 +325,115 @@ fn imu_measurement(sample: &ImuSample) -> ImuMeasurement {
     }
 }
 
+/// Raw cam0 (primary) and cam1 as rig cameras, each with its own radtan
+/// intrinsics; `T_PC` comes from the two `T_BS` (body = imu0).
+fn rig_cameras(left: &EurocCameraCalibration, right: &EurocCameraCalibration) -> Vec<RigCamera> {
+    let extrinsics: Vec<(PinholeCamera, ImageSize, Pose3d)> = [left, right]
+        .into_iter()
+        .map(|c| {
+            let (rotation, translation) = c.body_from_camera();
+            let size = ImageSize {
+                width: c.width,
+                height: c.height,
+            };
+            (
+                c.to_pinhole_camera(),
+                size,
+                Pose3d::from_rt(rotation, translation),
+            )
+        })
+        .collect();
+    rig_cameras_from_body_extrinsics(&extrinsics, 0)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::window_end;
+    use super::{EurocCameraCalibration, rig_cameras, window_end};
+    use kornia_3d::pose::Pose3d;
+
+    /// MH_01 `cam0` / `cam1` `sensor.yaml`.
+    fn mh01_cameras() -> (EurocCameraCalibration, EurocCameraCalibration) {
+        let cam0 = EurocCameraCalibration {
+            fx: 458.654,
+            fy: 457.296,
+            cx: 367.215,
+            cy: 248.375,
+            k1: -0.28340811,
+            k2: 0.07395907,
+            p1: 0.00019359,
+            p2: 1.76187114e-05,
+            width: 752,
+            height: 480,
+            t_bs: [
+                0.0148655429818,
+                -0.999880929698,
+                0.00414029679422,
+                -0.0216401454975,
+                0.999557249008,
+                0.0149672133247,
+                0.025715529948,
+                -0.064676986768,
+                -0.0257744366974,
+                0.00375618835797,
+                0.999660727178,
+                0.00981073058949,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+            ],
+        };
+        let cam1 = EurocCameraCalibration {
+            fx: 457.587,
+            fy: 456.134,
+            cx: 379.999,
+            cy: 255.238,
+            k1: -0.28368365,
+            k2: 0.07451284,
+            p1: -0.00010473,
+            p2: -3.55590700e-05,
+            width: 752,
+            height: 480,
+            t_bs: [
+                0.0125552670891,
+                -0.999755099723,
+                0.0182237714554,
+                -0.0198435579556,
+                0.999598781151,
+                0.0130119051815,
+                0.0251588363115,
+                0.0453689425024,
+                -0.0253898008918,
+                0.0179005838253,
+                0.999517347078,
+                0.00786212447038,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+            ],
+        };
+        (cam0, cam1)
+    }
+
+    #[test]
+    fn mh01_rig_puts_cam1_eleven_cm_to_the_right_with_its_own_distortion() {
+        let (cam0, cam1) = mh01_cameras();
+        let cameras = rig_cameras(&cam0, &cam1);
+
+        assert_eq!(cameras.len(), 2);
+        assert_eq!(cameras[0].primary_from_camera, Pose3d::IDENTITY);
+        let t = cameras[1].primary_from_camera.translation;
+        let norm = (t.x * t.x + t.y * t.y + t.z * t.z).sqrt();
+        assert!((norm - 0.1101).abs() <= 0.0005, "|t| = {norm}");
+        assert!(t.x > 0.109, "t = {t:?}");
+        assert_eq!(cameras[0].camera.k1, -0.28340811);
+        assert_eq!(cameras[1].camera.k1, -0.28368365);
+        for camera in &cameras {
+            assert_eq!((camera.size.width, camera.size.height), (752, 480));
+            assert!(camera.raw_model.is_none());
+        }
+    }
 
     #[test]
     fn a_bounded_window_counts_only_yielded_samples() {

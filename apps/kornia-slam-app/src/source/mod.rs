@@ -152,7 +152,7 @@ impl SourceConfig {
     ) -> Result<OpenedSource, SourceError> {
         let stereo = sensors.cameras == CameraSelection::Stereo;
         match self {
-            Self::Euroc(euroc) => euroc.open(stereo, rectification),
+            Self::Euroc(euroc) => euroc.open(sensors.cameras, rectification),
             Self::Hilti(hilti) => hilti.open(sensors.imu),
             Self::Lamaria(lamaria) => lamaria.open(sensors),
             Self::Mcap(mcap) => mcap.open(stereo, rectification),
