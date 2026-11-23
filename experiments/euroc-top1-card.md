@@ -552,6 +552,44 @@ The S0 predictions above stand for S0 sessions. Predictions for S0E sessions:
 - **Noise:** SYNC repeats are bit-identical. Scores use 3 starts per sequence (the gate protocol); a full-length
   promotion needs the gate.
 
+#### R11b design and added predictions (2026-11-23, before code)
+
+Base: kornia-slam@b1b7e6b (branch feat/r11b-outlier-erase)   Binary tag: r11b   Baselines: E/runs/S0_*, E/runs/S1_* (md5 cea7646298a68ddb948b16835472b2e3), E/debug/G56a, G56b, D3.
+Reference: ORB-SLAM3 LocalInertialBA erase (Optimizer.cc:2690-2693, 2857-2862, 2879, 2887-2902); tracking outliers reach keyframes
+for BA to decide (Tracking.cc:2259-2267); a landmark at weighted count <= 2 is discarded (MapPoint.cc:168-201).
+Corrections to the sketch above:
+- Knob: local_ba.outlier_erase: Off | ChiSquare((reprojection_chi2: 5.991, stereo_chi2: 7.815, close_factor: 1.5, close_range_m: 10.0)).
+- Stereo rows (depth row in the solve): reprojection + depth chi2 > 7.815, no close factor. Mono rows: 5.991, 1.5x within 10 m range.
+- The existing cull has no observation-count rule (culling.rs:30-70). The knob retires a touched landmark at weighted count <= 2.
+- Sigma is the solver's (1 px on S0): per-solve median / 1.177 = 0.92-1.05 px; the 1.3 px figure is a mean truncated at 25 px2.
+- Screening set for this rung: V2_01, V1_02, V1_03, V2_02, MH_04, guard MH_01 (the six with S0 and S1 baselines). Band = starts only
+  (no IMU time-offset knob); V1_02 has 1 distinct sample, MH_04 2: their verdicts are provisional.
+- visual_information: OctaveScaled also scales the tracking PnP gates (system/build.rs:199).
+Arms: S0E (decides), S0O (alone), S1E (probe).
+Added predictions, S0E, smoothed median of 3 starts, m (S0 band; Basalt):
+  P6a V1_02 0.056 (1 sample; 0.045)        -> 0.045-0.054, ratio to Basalt 1.24 -> 1.00-1.20
+  P6b V2_01 0.110 (0.109-0.124; 0.039)     -> 0.070-0.100
+  P6c V1_03 0.146 (0.143-0.150; 0.053)     -> 0.115-0.146
+  P6d V2_02 0.159 (0.097-0.160; 0.049)     -> median <= 0.150, every start <= 0.160
+  P6e MH_04 0.226 (0.226-0.240; 0.114)     -> 0.200-0.240
+  P6f MH_01 0.045 (0.041-0.045; 0.067)     -> 0.036-0.045
+  P6g causal median not above the S0 band max on all six.      measured by: E/score.py
+  P7  V2_01 tilt, 1 s bin at 21 s (D3: 5.27 deg) -> <= 3.5 deg; tilt median 22-60 s (5.67-6.80) -> <= 4.0.   measured by: E/debug/tilt_t.py on a
+      450-frame debug run of S0E. If it stays >= 5 deg the outlier tail is not the driver of the tilt jump (KD1 narrows to the frozen past, R12).
+  P8  S0O alone: V1_02 VISRES out 11.8 % -> 8.0-11.8 % (mismatches do not shrink with octave sigma); smoothed medians within +-10 % of S0.
+      If out falls below 6 %, the tail was coarse-octave noise, and G56's cause is partly refuted.
+  P9  S1E: V2_01 smoothed 0.108 -> 0.060-0.095; MH_01 <= 0.045; no sequence above max(S0, S1) band.
+Mechanism counters (P3): erase_unlinked_newest / erase_tested_newest 5-15 %; (erase_unlinked - erase_unlinked_newest) /
+  (erase_tested - erase_tested_newest) < 2 %. Floor from the model itself: about 5 % of correct rows fail a 95 % test once.
+K3 measurements: tracked from [summary]; keyframes from [summary]; map points per keyframe = last per-frame pts= / keyframes.
+Also reported, no rule: loops_accepted, ba_solve_ms, frame_ms p90, erase_stale_links, erase_landmarks_retired, against S0.
+Not in this rung: erase after the visual-only BA, after global/offline BA, in the tracker; OctaveScaled stacked on the erase.
+
+Owner answers (2026-11-23): S0 decides, S1E probe; ORB-SLAM3 weighted-count rule; close rule verbatim for the first arm
+(cleanup card ablates close_factor 1.0 if it wins); joint 3-dof stereo test; extra starts 30 and 60 for S0 (new binary,
+knob off) and each arm; config-only arm S0P (keyframe_observations: PnpInliers) after the S0E verdict, not stacked; erase
+after the visual-only BA and OctaveScaled stacked deferred; P6-P9 accepted as written.
+
 ### Experiment R12: Basalt-style windowed marginalization (added 2026-11-23)
 
 - Only if R4 on R3 does not close the keyframe-only piece gap. Code project: dense square-root
