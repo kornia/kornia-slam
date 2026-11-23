@@ -590,6 +590,44 @@ Owner answers (2026-11-23): S0 decides, S1E probe; ORB-SLAM3 weighted-count rule
 knob off) and each arm; config-only arm S0P (keyframe_observations: PnpInliers) after the S0E verdict, not stacked; erase
 after the visual-only BA and OctaveScaled stacked deferred; P6-P9 accepted as written.
 
+### Experiment R11c: real time with PropagateToNewer (RT1E), and S0P + S0E stacked (S0PE) (predictions written 2026-11-23 before the runs)
+
+Base: kornia-slam@0bf7b6f (branch feat/r11b-outlier-erase, code 71a68f9)   Binary: `E/bin-r11b/kornia-slam-euroc`, md5
+`e67615adaf558b4aef7b7d1e35a2fb40` (no rebuild; config-only arms)   Harness: `E/mkcfg.sh` arms RT1, RT1E, S0PE; RT driver
+`E/r11c/rt.sh`; SYNC driver `E/drive.sh` (`BIN` override); golden headers `E/expect/RT1.header`, `RT1E.header`, `S0PE.header`.
+Baselines: RT0/RT0E (`E/runs/RT0*_s0_r[12]`, R11b real-time check), S0E and S0P (`E/runs/S0E_*`, `S0P_*`).
+Sequences: V2_01, V1_02, V1_03, V2_02, MH_04, MH_01.
+
+**Arm 1, RT1E (real time, decides):** RT0E + `mapping: ( local_ba: ( merge: PropagateToNewer ) )`. Asynchronous mapping,
+`--pace-timestamps`, `taskset -c 0,1`, 2 runs per sequence, start 0; causal score on `traj.txt`. Control: RT1 = RT0 + the
+same merge. One run at a time, started at 1-min load ≤ 6 with fewer than 2 `kornia-slam*` processes.
+- Gap tested: G54. In the R11b real-time check each run left 295-424 keyframes stale; T1 (`PropagateToNewer`) removed
+  them before (V102-DIAGNOSIS: the preset propagated 602 of 602 on V1_03).
+- Predictions:
+  - P1 (mechanism): `ba_propagated_keyframes` = `ba_stale_keyframes` on every RT1/RT1E run.
+  - P2 (mechanism): `ba_keyframe_shifts` ≤ 10 on every RT1/RT1E run.
+  - P3: RT1E causal (mean of r1/r2) within 1.5x of S0E SYNC causal median on each sequence: V2_01 ≤ 0.083, V1_02 ≤ 0.060,
+    V1_03 ≤ 0.108, V2_02 ≤ 0.120, MH_04 ≤ 0.47, MH_01 ≤ 0.108.   measured by: `E/score.py`
+  - P4: `frame_ms p90` unchanged, inside 54-77 ms (RT0/RT0E range).
+- Kill rule K1: P2 holds (shifts ≤ 10) but RT1E causal is still above 2x S0E SYNC on 3 or more sequences (V2_01 > 0.110,
+  V1_02 > 0.080, V1_03 > 0.144, V2_02 > 0.160, MH_04 > 0.62, MH_01 > 0.144). Then the real-time loss is not G54: diagnose
+  frame drops and mapping lag before the next card.
+- Kill rule K2 (score moved, mechanism did not): P3 met on 4 or more sequences while propagated < stale on those runs. Another cause.
+
+**Arm 2, S0PE (SYNC, stacked):** S0 + `outlier_erase: ChiSquare(())` + `keyframe_observations: PnpInliers`. Starts 0/1/2 on
+the six, plus starts 30/60 on V1_02 and MH_04 (22 runs). Same SYNC protocol as R11b (unpinned, 900 s cap, 2 at a time).
+- Theory: S0P stops most mismatches at tracking; the erase removes those that still enter later. R11b found the arms
+  complementary (S0P wins V2_01, MH_04, MH_01; S0E wins V1_02, V1_03, V2_02).
+- Predictions:
+  - P5: causal median ≤ min(S0E, S0P) on at least 4 of 6 (V2_01 ≤ 0.050, V1_02 ≤ 0.040, V1_03 ≤ 0.072, V2_02 ≤ 0.080,
+    MH_04 ≤ 0.254, MH_01 ≤ 0.057; medians over the same starts as R11b).
+  - P6: MH_04 causal median ≤ 0.254 (S0P).
+  - Mechanism counter (reported, no rule): `erase_unlinked` per run below S0E on the same start (PnpInliers keeps the
+    mismatches out first).
+- Kill rule K3: causal median worse than both S0E and S0P on 3 or more sequences. Then the two do not stack.
+
+Not in this rung: code changes, the all-11 gate, LaMAria.
+
 ### Experiment R12: Basalt-style windowed marginalization (added 2026-11-23)
 
 - Only if R4 on R3 does not close the keyframe-only piece gap. Code project: dense square-root
