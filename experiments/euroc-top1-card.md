@@ -1265,3 +1265,119 @@ p90 13.0 %, max 16.7 % (kf 431, 434 at 21.5 s); MH_01 p50 2.9 %, max 7.9 %. No m
 - **Verdict:** G56 is confirmed as a score source on the Vicon rooms and V1_02 (causal median gains 2.0-3.7x on
   V2_01, V1_02, V1_03, V2_02; V1_02 below Basalt on both columns), refuted on MH_04, neutral-to-better on MH_01. The knob stays off until the gate
   (all 11, real-time replay, 3 runs, load ≤ 6) and the full-sequence LaMAria guard.
+
+## 2-core real-time budget (profile, 2026-11-23)
+
+Question: why RT0 / RT0E (asynchronous mapping, `--pace-timestamps`, `taskset -c 0,1`) miss the 20 Hz sensor rate.
+Read-only analysis plus two profile runs; no code change. Outputs in `E/prof/` (`logsplit.py`, `stages.py`,
+`threadsamp.py`, `pmp_drive.sh`, `pmp_report.py`, their `.md` outputs). Binary `bin-r11b` (md5 e67615ad…).
+
+- **Runs.** The 12 RT0/RT0E logs (`E/runs/RT0*_s0_r[12]`). Profile 1: `E/prof/RT0E_V1_02_prof_r1`, RT0E V1_02, paced,
+  cores 0,1, `--debug --trace-out` (per-stage `trace/timings.csv`), per-thread CPU and run-queue wait from
+  `/proc/<pid>/task/*/{stat,schedstat}` at 1 Hz. Load 4.7 at start, 1 other `kornia-slam*` process. Result as in
+  the R11b check: wall 122 s, `frame_ms` p90 66.9, 476 keyframes. Profile 2: `E/prof/RT0E_V1_02_pmp_r1`, the same
+  run under a gdb stack sampler (`perf` is blocked: `perf_event_paranoid` 4, no sudo), 1 Hz, 137 samples of all
+  threads. Each sample stops the process for about 0.2 s, so wall was 160 s. Shares are good to about ±4 points
+  (137 samples); absolute times come from profile 1.
+- **The headline metric under-reports.** `[summary] frame_ms` is `SlamSystem::tracking_duration`. That
+  subtracts the deferred ORB extraction (`system/mod.rs:784-790`). It does not see the work the app does before
+  `process_stereo`: PNG decode and stereo rectification (`apps/kornia-slam-app/src/source/mod.rs:246`
+  `rectify_pair`, f32-map bilinear `remap_u8` of both images on every frame). The tracking thread's cost per frame is
+  `frame_ms + fe` plus that untimed source work.
+
+### Where the time goes
+
+Main (tracking) thread, profile 1, per frame class (ms, p50 / p90 / p99; `stages_RT0E_V1_02.md`; rows that join stages add the per-stage percentiles, so they are approximate):
+
+| stage | keyframe (n=476, 28 %) | ORB frame, no keyframe (n=202) | flow-only frame (n=1010) |
+|---|---|---|---|
+| ORB left + right | 8.8 + 8.2 (p90 18.9 + 18.0) | 6.9 + 5.9 | 0 |
+| stereo pyramids + matching | 8.6 / 19.1 / 30.6 | 5.9 / 15.8 / 23.6 | 0 |
+| frontend total (`fe`) | 29.1 / 46.7 / 69.5 | 22.8 / 40.7 / 67.8 | 0 |
+| KLT build + track | 4.0 / 10.1 / 15.0 | 2.5 / 8.3 / 14.1 | 4.8 / 11.7 / 18.9 |
+| pose: projection search, consistency, PnP, local refine | 5.7 / 14.8 / 34.6 | 4.0 / 14.5 / 29.0 | 0.7 / 1.7 / 4.0 |
+| **keyframe insert** (growth + fusion, loop place recognition, BA submit, track refresh) | **40.5 / 71.9 / 257.8** | 0 | 0 |
+| other (flow stages, map-lock waits, IMU) | 3.8 / 8.7 / 19.2 | 2.4 / 7.9 / 18.2 | 1.2 / 3.2 / 15.6 |
+| `frame_ms` (log) | 57.8 / 94.5 / 268.6 | 10.7 / 29.0 / 41.5 | 7.1 / 16.6 / 26.1 |
+| **frame_ms + fe** | **90.3 / 132.0 / 312.1** | 33.3 / 65.0 / 94.1 | 7.1 / 16.6 / 26.1 |
+
+Every frame above 50 ms is a keyframe or an ORB frame. 0-1 flow frames per run exceed 50 ms. For all 12 RT logs
+(`logsplit.md`; `frame_ms + fe`):
+
+| seq / arm | KF share | all frames p50 / p90 / p99 | KF frames p50 / p90 / p99 | KF `fe` p50 | flow frames p90 | BA thread (cores) | mean BA solve, iterations |
+|---|---|---|---|---|---|---|---|
+| V1_02 S0 (r1, r2) | 0.29 | 18/119/227, 17/110/186 | 104/158/306, 97/146/370 | 38, 36 | 20, 20 | 0.74, 0.74 | 259, 242 ms; 31 |
+| V1_02 S0E | 0.28 | 16/109/187, 14/103/166 | 97/148/587, 91/130/318 | 34, 32 | 18, 17 | 0.65, 0.69 | 214, 196 ms; 31-32 |
+| MH_04 S0 | 0.24 | 7/85/143, 8/89/139 | 81/116/170, 83/119/192 | 23, 26 | 11, 12 | 0.42, 0.44 | 105, 115 ms; 19-20 |
+| MH_04 S0E | 0.18-0.19 | 5/78/131, 6/80/145 | 80/120/178, 81/125/224 | 21, 22 | 8, 9 | 0.29, 0.31 | 81, 87 ms; 21 |
+
+(V2_01 is the same as V1_02: KF p50 91-101 ms, BA 0.58-0.67 core.) BA p50/p90 per solve are not in the logs, only
+`ba_solve_ms` / `ba_solves`.
+
+Whole process on 2 cores, profile 1 (per-thread `schedstat`; 1710 frames in 83.5 s = 97.6 ms of core time per
+frame available):
+
+| thread | CPU s | ms of core per frame | what it does (profile 2 samples) | run-queue wait s |
+|---|---|---|---|---|
+| main (tracking, source) | 46.1 | 27 | blocked 72 % of samples. Of the main thread's wall: rectify 42 %, PNG decode 12 %, loop closing on the tracking thread 10 % (place recognition, `verify_loop_candidate` Hamming scans, 9 loop fusions at 165-1219 ms each), keyframe growth + fusion 10 % (`neighbor_fusion_links`, descriptor matching), ORB 7 %, KLT 6 %, other tracking 8 %. **No pacing sleep in any sample: the thread is always behind.** | 1.5 |
+| 2 rayon workers (unnamed, ORB / pyramid / `remap_u8`) | 79.7 | 47 | non-idle samples: **58 % `sched_yield` spin**, 36 % `remap_u8` (rectification), 6 % ORB / FAST / resize | 103 (51.5 + 51.7) |
+| `kornia-local-mapping` | 81.9 | 48 | 64 % local VI-BA (`vi_ba_schur::assemble` alone 36 % of samples), 5 % merge + cull, 30 % idle | 6.0 |
+| **all** | **207.7** | **121** | demand is 1.24× the 2 cores | |
+
+Wall 122 s on 83.5 s of data. The tracking thread's timed work is 63.7 s (37 ms per frame). That covers ORB 13.2 s,
+stereo 6.6 s, keyframe insert 24.2 s, KLT 9.1 s, pose 5.7 s and other 4.9 s. The untimed source work (rectify +
+decode) is about 55 s (about 32 ms per frame), from the wall minus the timed work minus about 3 s of vocabulary load.
+
+### Diagnosis
+
+1. **The machine is oversubscribed: 121 ms of core time demanded per 97.6 ms frame budget.** Three items take
+   about 0.75 of the 2 cores and are not SLAM work in the usual budget sense:
+   - rayon idle spinning: about 46 s, 0.38 core;
+   - stereo rectification by a scalar f32 `remap_u8` (`floorf` per pixel): about 30 s of worker time, plus the
+     main thread waiting for it;
+   - PNG decode: about 13 s, replay only.
+2. **Fork-join on 2 cores convoys.** ORB and remap fan out to 2 rayon workers. The mapping thread keeps one core
+   busy (0.67), and the workers spin. So each worker waits in the run queue for 51 s, and the main thread blocks on
+   the slowest chunk: main CPU is 46 s against about 118 s busy wall. This is why `fe` p90 is 47 ms for 17 ms of
+   ORB p50.
+3. **Keyframe frames carry mapping work on the tracking thread.** `keyframe_insert` p50 is 40.5 ms: growth + fusion
+   (`system/mod.rs:3221` `grow_keyframe`) and loop place recognition / verification (`:3350`
+   `register_place_recognition`, under the map lock). ORB-SLAM3 runs both in its LocalMapping and LoopClosing
+   threads. Each loop fusion stalls tracking for 0.17-1.2 s, and those stalls make the p99.
+4. **Local BA runs 31 iterations per solve on V1_02 (cap 50, λ 1.0) at about 6.4 ms per iteration.** That is
+   0.65-0.74 core. Basalt runs 7 iterations from λ 1e-4. Faster solves would also cut the G54 stale keyframes: the
+   latest-wins queue drops jobs while a solve runs.
+5. **Keyframe rate: 18-29 % of frames.** `keyframes.min_frames_between: 3` means up to 6.7 keyframes per second, each
+   with stereo ORB (2 × 1000 keypoints) and stereo matching on its own pyramids (`stereo_pyramid: Resized`, 8.6 ms).
+   Another 12 % of frames (202 on V1_02) run ORB without becoming keyframes (G33's mechanism on EuRoC).
+
+**Compared with Basalt** (paper about 5-8 ms frontend per frame; our bench reproduction is not a quiet-machine number,
+`bench/README.md` §Tracking): Basalt never rectifies images (KLT patches on raw images through the camera model). It
+has no descriptors (FAST on new keyframe corners only), so it has no per-keyframe ORB × 2 + stereo match. It has no
+growth or loop work on the frontend thread, and 7 VIO iterations. Our flow-only frame (7.1 ms p50, KLT about 5 ms)
+is already in Basalt's range. Our keyframe frame (90 ms p50) and the untimed source work (about 32 ms per frame) are
+the gap.
+
+### Ranked speed fixes
+
+Savings are for RT0E V1_02 on 2 cores. Core time is per frame (97.6 ms available); KF ms is the keyframe-frame
+critical path.
+
+| # | fix | expected saving | existing knob | accuracy risk | card / rung |
+|---|---|---|---|---|---|
+| 1 | Stop rayon spinning and oversubscription: one rayon worker or none on the tracking path | about 27 ms core per frame (0.38 core); `fe` p90 should drop toward ORB + stereo p50 (≈ 47 → 30 ms) because the convoy goes | `RAYON_NUM_THREADS=1` (env, no code); a pinned or sequential pool needs code | none expected (ORB / remap are per-pixel; check `fe` keypoint counts match) | card T (thread placement, as `dense_parallelism: Sequential`) |
+| 2 | Rectification: precomputed fixed-point maps + SIMD bilinear (OpenCV `convertMaps` 16SC2 + `remap` class, about 1 ms for both 752×480 images), or rectify keypoints instead of images | about 18-20 ms core per frame, and about 25 ms off the main thread's wall per frame | none | low: ≤ 1 LSB pixel change with 5-bit weights; keypoint-only rectification changes ORB input (medium) | frontend track F/K (kernel must match and beat OpenCV) |
+| 3 | Local VI-BA budget `max_iterations: 7`, `initial_lambda: 1e-4` (window 3 kept) | about 36 ms core per frame (BA 0.67 → about 0.15-0.2 core), and fewer stale keyframes (G54) | `local_ba.max_iterations`, `local_ba.initial_lambda` | medium: card V saw no score change at 7 on LaMAria; not run on EuRoC; needs the full-sequence gate | R4 (budget half, without window 10) |
+| 4 | Move keyframe growth + fusion and loop place recognition / verification / fusion off the tracking thread | KF frame −35 to −45 ms (p50 90 → about 50); p99 loses the 0.17-1.2 s loop stalls; core time unchanged | none (`keyframe_orb: Mapping` is parsed but `UNBUILT`, `validation.rs:544`) | medium: growth lands one or more frames later (G54-like staleness for new points) | card T lane / R-C6 (deferred keyframe path) |
+| 5 | Shared stereo pyramid | 2-4 ms per ORB frame (pyramid builds inside the 8.6 ms) | `frontend.stereo_pyramid: Shared` | low-medium: matches differ (`frontend/mod.rs:176`) | track F |
+| 6 | Fewer ORB frames: KLT-only keyframes (FAST corners on keyframes, descriptors on the mapping thread), cut keyframe-due ORB rejects | up to about 30 ms per keyframe frame; 202 ORB non-KF frames × 33 ms | `keyframe_orb: Mapping` (unbuilt); `klt_first` already on; card Z `flow_ratio: TrackSurvival` (not built) | medium-high: loop closing and relocalisation need descriptors | track F/K, card Z (G33) |
+| 7 | Harness: decode PNGs off the 2 cores (prefetch thread unpinned or pre-decoded raw) | about 7.6 ms per frame; replay-only cost, not on the robot | none | none | measurement protocol (§2) |
+| 8 | Keyframe rate: `min_frames_between` 3 → 5 | KF work × 0.6-0.7 | `keyframes.min_frames_between` | high: per-deployment tuning, against the owner's no-tweak rule | not proposed |
+
+Fixes 1 + 2 + 3 together: about 207.7 → about 70 s of CPU (about 41 ms of core per frame against 97.6). That leaves
+the keyframe critical path (90 ms p50) as the only miss against the 50 ms period. Fix 4 then brings it near 50, and
+fix 6 brings it toward Basalt's range. The 20 ms-per-Orin-core rule is met today only by flow frames (p90 16.6 ms on
+this laptop core).
+
+Measurement fix needed first: `[summary] frame_ms` should report `frame_ms + fe` and the source time, or the RT table
+keeps understating. That is a code change and outside this read-only card.
