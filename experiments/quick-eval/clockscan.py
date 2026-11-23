@@ -17,12 +17,6 @@ TimeOffsetSec_Device_Gyro.
 """
 import argparse, json, os, numpy as np
 
-ap = argparse.ArgumentParser()
-ap.add_argument("seq"); ap.add_argument("gt")
-ap.add_argument("--factory"); ap.add_argument("--apply-ns", type=int, default=0)
-ap.add_argument("--max-dt-s", type=float, default=0.31)
-a = ap.parse_args()
-
 
 def q2R(q):  # xyzw rows
     x, y, z, w = (q / np.linalg.norm(q, axis=1)[:, None]).T
@@ -51,9 +45,10 @@ def kabsch(P, Q):  # R with R p ~ q
     return U @ S @ Vt
 
 
-I = np.loadtxt(os.path.join(a.seq, "aria", "imu0", "data.csv"), delimiter=",", comments="#")
-ti = I[:, 0].astype(np.int64) + a.apply_ns; gy = I[:, 1:4]; dti = np.diff(ti) / 1e9
-G = np.loadtxt(a.gt, comments="#", ndmin=2); tg = G[:, 0].astype(np.int64); Rg = q2R(G[:, 4:8])
+def read_gyro(seq, apply_ns=0):  # IMU stamps (ns, shifted by apply_ns), gyro rows, sample spacing (s)
+    I = np.loadtxt(os.path.join(seq, "aria", "imu0", "data.csv"), delimiter=",", comments="#")
+    ti = I[:, 0].astype(np.int64) + apply_ns
+    return ti, I[:, 1:4], np.diff(ti) / 1e9
 
 
 def cumulate(steps):  # orientation at every IMU stamp, re-orthonormalised every 1000 products
@@ -64,52 +59,69 @@ def cumulate(steps):  # orientation at every IMU stamp, re-orthonormalised every
     return C
 
 
-# hold: sample i over (t_{i-1}, t_i]; mid: rate linear between samples, step uses the mean.
-C = {"hold": cumulate(exp(gy[1:] * dti[:, None])), "mid": cumulate(exp(0.5*(gy[1:] + gy[:-1]) * dti[:, None]))}
+def chain(gy, dti, mode):  # hold: sample i over (t_{i-1}, t_i]; mid: rate linear between samples, step uses the mean.
+    return cumulate(exp(gy[1:] * dti[:, None] if mode == "hold" else 0.5*(gy[1:] + gy[:-1]) * dti[:, None]))
 
 
-def orient(mode, t):  # IMU orientation at IMU times t (ns), inside the IMU span
+def orient(ti, gy, dti, Cm, mode, t):  # IMU orientation at IMU times t (ns), inside the IMU span; Cm = chain(.., mode)
     i = np.searchsorted(ti, t).clip(1, len(ti) - 1); h = (t - ti[i-1]) / 1e9
     if mode == "hold": part = gy[i] * h[:, None]
     else:
         f = (h / dti[i-1])[:, None]; part = (gy[i-1] + 0.5*f*(gy[i] - gy[i-1])) * h[:, None]
-    return C[mode][i-1] @ exp(part)
+    return Cm[i-1] @ exp(part)
 
 
-j = np.arange(len(tg) - 1); dt = (tg[1:] - tg[:-1]) / 1e9
-j = j[(dt > 0.02) & (dt <= a.max_dt_s) & (tg[:-1] >= tg[0] + 5_000_000_000)
-      & (tg[:-1] > ti[0] + 20_000_000) & (tg[1:] < ti[-1] - 20_000_000)]
-vg = log(np.einsum('nji,njk->nik', Rg[j], Rg[j+1])); dtp = dt[j]
-third = np.minimum(3 * np.arange(len(j)) // len(j), 2)
-ds = np.arange(-2.0, 10.0001, 0.25)
-
-
-def resid(mode, d):
-    Ra, Rb = orient(mode, tg[j] + int(round(d*1e6))), orient(mode, tg[j+1] + int(round(d*1e6)))
-    vi = log(np.einsum('nji,njk->nik', Ra, Rb)); b = np.zeros(3)
-    for _ in range(3):  # vg ~ X (vi - b dt)
-        X = kabsch(vi - b*dtp[:, None], vg)
+def bias_fit(vi, vg, dtp, X=None):  # constant bias b and rotation X with vg ~ X (vi - b dt); X fixed when given
+    b = np.zeros(3); fixed = X is not None
+    for _ in range(1 if fixed else 3):
+        if not fixed: X = kabsch(vi - b*dtp[:, None], vg)
         b = ((vi - vg @ X) * dtp[:, None]).sum(0) / (dtp**2).sum()
-    return np.linalg.norm(vg - (vi - b*dtp[:, None]) @ X.T, axis=1)**2
+    return b, X
 
 
-def minimum(ms):  # parabola through the lowest scan point and its neighbours
-    k = min(max(int(np.argmin(ms)), 1), len(ds) - 2)
-    c = np.polyfit(ds[k-1:k+2], ms[k-1:k+2], 2)
-    return -c[1] / (2*c[0]) if c[0] > 0 else ds[k]
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("seq"); ap.add_argument("gt")
+    ap.add_argument("--factory"); ap.add_argument("--apply-ns", type=int, default=0)
+    ap.add_argument("--max-dt-s", type=float, default=0.31)
+    a = ap.parse_args()
+    ti, gy, dti = read_gyro(a.seq, a.apply_ns)
+    G = np.loadtxt(a.gt, comments="#", ndmin=2); tg = G[:, 0].astype(np.int64); Rg = q2R(G[:, 4:8])
+    C = {m: chain(gy, dti, m) for m in ("hold", "mid")}
+    orient_ = lambda mode, t: orient(ti, gy, dti, C[mode], mode, t)
+
+    j = np.arange(len(tg) - 1); dt = (tg[1:] - tg[:-1]) / 1e9
+    j = j[(dt > 0.02) & (dt <= a.max_dt_s) & (tg[:-1] >= tg[0] + 5_000_000_000)
+          & (tg[:-1] > ti[0] + 20_000_000) & (tg[1:] < ti[-1] - 20_000_000)]
+    vg = log(np.einsum('nji,njk->nik', Rg[j], Rg[j+1])); dtp = dt[j]
+    third = np.minimum(3 * np.arange(len(j)) // len(j), 2)
+    ds = np.arange(-2.0, 10.0001, 0.25)
+
+    def resid(mode, d):
+        Ra, Rb = orient_(mode, tg[j] + int(round(d*1e6))), orient_(mode, tg[j+1] + int(round(d*1e6)))
+        vi = log(np.einsum('nji,njk->nik', Ra, Rb)); b, X = bias_fit(vi, vg, dtp)
+        return np.linalg.norm(vg - (vi - b*dtp[:, None]) @ X.T, axis=1)**2
+
+    def minimum(ms):  # parabola through the lowest scan point and its neighbours
+        k = min(max(int(np.argmin(ms)), 1), len(ds) - 2)
+        c = np.polyfit(ds[k-1:k+2], ms[k-1:k+2], 2)
+        return -c[1] / (2*c[0]) if c[0] > 0 else ds[k]
+
+    out = {}
+    for mode in ("mid", "hold"):
+        R = np.array([resid(mode, d) for d in ds])  # scan x pairs
+        whole = R.mean(1); thirds = [minimum(R[:, third == t].mean(1)) for t in range(3)]
+        dmin = minimum(whole); out[mode] = dmin
+        print(f"{mode:4s} d={dmin:+.2f} ms (thirds {thirds[0]:.2f} / {thirds[1]:.2f} / {thirds[2]:.2f})  "
+              f"rms {np.sqrt(whole.min())*1e3:.2f} mrad at {ds[np.argmin(whole)]:+.2f} ms, {np.sqrt(whole[np.argmin(np.abs(ds))])*1e3:.2f} at 0  "
+              f"(pairs {len(j)}, dt p50 {np.median(dtp)*1e3:.0f} ms, apply {a.apply_ns} ns)")
+    line = f"d_mid {out['mid']:+.2f} ms  d_hold {out['hold']:+.2f} ms  imu_time_offset_ns = {a.apply_ns - int(round(out['hold']*1e6))}"
+    if a.factory:
+        imu = [i for i in json.load(open(a.factory))["ImuCalibrations"] if i["Label"] == "imu-right"][0]
+        fg = imu["Gyroscope"]["TimeOffsetSec_Device_Gyro"]*1e3; fa = imu["Accelerometer"]["TimeOffsetSec_Device_Accel"]*1e3
+        line += f"  factory gyro {fg:.3f} accel {fa:.3f} ms  d_mid - factory gyro {out['mid'] + a.apply_ns/1e6 - fg:+.2f} ms"
+    print(line)
 
 
-out = {}
-for mode in ("mid", "hold"):
-    R = np.array([resid(mode, d) for d in ds])  # scan x pairs
-    whole = R.mean(1); thirds = [minimum(R[:, third == t].mean(1)) for t in range(3)]
-    dmin = minimum(whole); out[mode] = dmin
-    print(f"{mode:4s} d={dmin:+.2f} ms (thirds {thirds[0]:.2f} / {thirds[1]:.2f} / {thirds[2]:.2f})  "
-          f"rms {np.sqrt(whole.min())*1e3:.2f} mrad at {ds[np.argmin(whole)]:+.2f} ms, {np.sqrt(whole[np.argmin(np.abs(ds))])*1e3:.2f} at 0  "
-          f"(pairs {len(j)}, dt p50 {np.median(dtp)*1e3:.0f} ms, apply {a.apply_ns} ns)")
-line = f"d_mid {out['mid']:+.2f} ms  d_hold {out['hold']:+.2f} ms  imu_time_offset_ns = {a.apply_ns - int(round(out['hold']*1e6))}"
-if a.factory:
-    imu = [i for i in json.load(open(a.factory))["ImuCalibrations"] if i["Label"] == "imu-right"][0]
-    fg = imu["Gyroscope"]["TimeOffsetSec_Device_Gyro"]*1e3; fa = imu["Accelerometer"]["TimeOffsetSec_Device_Accel"]*1e3
-    line += f"  factory gyro {fg:.3f} accel {fa:.3f} ms  d_mid - factory gyro {out['mid'] + a.apply_ns/1e6 - fg:+.2f} ms"
-print(line)
+if __name__ == "__main__":
+    main()
