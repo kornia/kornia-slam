@@ -110,7 +110,7 @@ Values that differ from the catalogue's symptom column, reported and not adjuste
 
 ## EuRoC cases (BC-E)
 
-Pending baseline. The EuRoC baseline of today's head (`.pr180-fix/euroc/RESULTS.md`) did not exist at stage 0, so no value or bound is filled.
+Pending baseline: the rows stay pending until the EuRoC baseline of today's head (`.pr180-fix/euroc/RESULTS.md`) exists. EuRoC data stays T2 (InC-NC rights statement, below).
 
 | id | sequence | stage | symptom today | pass condition | tier | status |
 |---|---|---|---|---|---|---|
@@ -121,3 +121,14 @@ Pending baseline. The EuRoC baseline of today's head (`.pr180-fix/euroc/RESULTS.
 **Licence.** The ETH Research Collection record of the EuRoC MAV datasets (https://doi.org/10.3929/ethz-b-000690084, https://www.research-collection.ethz.ch/handle/20.500.11850/690084) gives "Rights / License: In Copyright - Non-Commercial Use Permitted" (http://rightsstatements.org/page/InC-NC/1.0/).
 The ASL dataset pages (https://projects.asl.ethz.ch/datasets/euroc-mav/) state no licence.
 This is not CC BY. No EuRoC snippet is committed until the owner decides; EuRoC cases stay T2 (read from the data directory) until then.
+
+## Robot cases (BC-R)
+
+Robot data stays out of the public repository: T2 only.
+
+| id | source | stage | symptom today | pass condition | tier | gates | status |
+|---|---|---|---|---|---|---|---|
+| BC-R1 | dark-room parked loss: `~/handoff/dark-room-2026-11-22/blackbox_20261122T204322Z_vio_lost.mcap` and `blackbox_20261122T214730Z_vio_lost.mcap` | parked loss, reset, bootstrap | 19 map drops in about 2 h: the 0.5 s give-up fires, then a reset, then a bootstrap on noise frames | 0 map drops; state StationaryHold; no bootstrap on noise frames | T2 (robot data) | card AI part (a) | red |
+
+Clip format: 60 s each, ROS2 CDR.
+Topics: `/xle0/head/{left,right}/image_rect/compressed` (about 13 Hz, luma about 7/255), `/xle0/imu/data_raw` (about 200 Hz), `/xle0/odom` (about 75 Hz, twist 0), `/xle0/vio_diag/status`.
