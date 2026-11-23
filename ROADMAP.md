@@ -46,6 +46,13 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
     frames, V1_02 628-779 of 1710. Every common prefix is byte-identical (r1 against r2, and against the pinned
     run). The wall is set by machine load; owner decides between a quiet machine, a larger SYNC cap or R4's budget.
     Owner: SYNC runs get a 900 s cap (outputs do not depend on load); all other runs keep 300 s.
+  - **R0 done, Stop S1** (46 SYNC runs, all `rc=0`, walls 79-228 s at load 3-10). Repeats are `cmp`-identical
+    (P0.1). No stale keyframes anywhere and no Vicon room fails, so G54 is gone in SYNC. Smoothed (median of 3
+    starts) is below Basalt on MH_01, MH_02, MH_03, MH_05 (P0.6 as predicted) and 1.2-3.2x above it on MH_04 and
+    all six Vicon rooms. Missed: P0.2 (keyframe shifts on V1_03/V2_03 with no stale keyframes, scale out of band on
+    V1_03/V2_02/V2_03) and P0.3 (V1_02 start-up skips, IMU coasts on V1_03/V2_01/V2_03). The app smoothed output
+    equals the proxy on all 11. Loops lower the smoothed error on 11 of 11. The start-offset band is partly
+    degenerate (starts 0 and 1 give identical output on MH_04/V2_03; all three on V1_02).
   - Body-centre re-score of the async runs: default fails V2_02 and V2_03 too (59.6 and 242.7 m, G54); the preset
     smoothed output reaches 0.055 and 0.462 there. The smoothed proxy equals the app output to 3 decimals on 5 runs.
 - **Re-plan: the global stage comes first, and the loss cards are paused** (owner, 2026-11-23).

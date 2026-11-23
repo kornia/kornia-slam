@@ -461,3 +461,65 @@ Unpinned SYNC, cap 900 s, load 3-10. Header check clean on all four runs.
   not fire.
 - At load 3-10 every wall is well under 300 s: the earlier K0.2 stops were caused by load 15-33, not by the
   pipeline. R0 arms started 14:21.
+
+### Results: R0, S0 × 3 starts and S0-noloop × 1 on all 11 (2026-11-23, Stop S1)
+
+SYNC unpinned, cap 900 s, binary md5 `cea7646298a68ddb948b16835472b2e3`, 14:16-15:10, load 3-10 at start.
+46 runs, all `rc=0`, header check clean on every run (no `invalid`). Scores: `E/score.py` (`E/scores.jsonl`),
+table `E/r0report.py` (`E/r0table.md`). SE(3) ATE RMSE, m, body centre. "ORB span" = ours scored on the frames
+ORB-SLAM3 kept. Ratios use the smoothed median of the 3 starts.
+
+| seq | S0 causal s0 / s1 / s2 | S0 smoothed s0 / s1 / s2 | smoothed median | noloop causal / smoothed | Basalt | ORB-SLAM3 (README span) | ours smoothed on ORB span (s0) | sm ÷ Basalt | sm ÷ ORB-SLAM3 |
+|---|---|---|---|---|---|---|---|---|---|
+| MH_01_easy | 0.090 / 0.086 / 0.094 | 0.045 / 0.041 / 0.045 | 0.045 | 0.116 / 0.116 | 0.067 | 0.046 | 0.045 | 0.67 | 0.98 |
+| MH_02_easy | 0.057 / 0.060 / 0.070 | 0.035 / 0.028 / 0.028 | 0.028 | 0.060 / 0.060 | 0.048 | 0.034 | 0.035 | 0.58 | 0.82 |
+| MH_03_medium | 0.073 / 0.062 / 0.071 | 0.041 / 0.048 / 0.052 | 0.048 | 0.091 / 0.090 | 0.062 | 0.028 | 0.044 | 0.77 | 1.73 |
+| MH_04_difficult | 0.302 / 0.302 / 0.316 | 0.226 / 0.226 / 0.240 | 0.226 | 0.609 / 0.609 | 0.114 | 0.045 | 0.229 | 1.98 | 4.96 |
+| MH_05_difficult | 0.174 / 0.231 / 0.178 | 0.082 / 0.088 / 0.079 | 0.082 | 0.295 / 0.295 | 0.144 | 0.050 | 0.089 | 0.57 | 1.64 |
+| V1_01_easy | 0.090 / 0.079 / 0.071 | 0.088 / 0.068 / 0.064 | 0.068 | 0.288 / 0.288 | 0.043 | 0.039 | 0.089 | 1.57 | 1.76 |
+| V1_02_medium | 0.102 / 0.102 / 0.102 | 0.056 / 0.056 / 0.056 | 0.056 | 0.212 / 0.215 | 0.045 | 0.019 | 0.054 | 1.23 | 2.88 |
+| V1_03_difficult | 0.181 / 0.201 / 0.188 | 0.143 / 0.146 / 0.150 | 0.146 | 0.203 / 0.202 | 0.053 | 0.026 | 0.147 | 2.73 | 5.56 |
+| V2_01_easy | 0.193 / 0.213 / 0.200 | 0.109 / 0.124 / 0.110 | 0.110 | 0.294 / 0.294 | 0.039 | 0.031 | 0.109 | 2.82 | 3.52 |
+| V2_02_medium | 0.176 / 0.162 / 0.161 | 0.097 / 0.160 / 0.159 | 0.159 | 0.179 / 0.178 | 0.049 | 0.037 | 0.096 | 3.23 | 4.24 |
+| V2_03_difficult | 0.605 / 0.605 / 0.869 | 0.436 / 0.436 / 0.271 | 0.436 | 1.148 / 1.140 | 0.230 | 0.027 | 0.446 | 1.90 | 16.32 |
+
+Per-run counters (frames, tracked, stale and propagated keyframes, keyframe shifts, scale, loops, PGO
+failures): `E/r0table.md`, second table.
+
+| P/K | prediction | baseline | measured | verdict |
+|---|---|---|---|---|
+| P0.1 | `cmp`-identical repeats | - | MH_04 and V1_02 pairs: `traj.txt` and `traj_smoothed.txt` identical | as predicted |
+| P0.2 | stale = 0 and shifts ≤ 5 on all 11; Vicon scale 0.98-1.02; V1_02 causal 0.05-0.10 | async default: stale 346-376, shifts 84-161 in Vicon rooms | stale 0 on all 46 runs. Shifts 0 except V1_03 6/6/6 (noloop 8) and V2_03 9/9/11 (noloop 8). Scale: V1_01 1.015-1.017, V1_02 1.011, V2_01 1.011-1.014 in range; V1_03 0.967-0.975, V2_02 1.017-1.043, V2_03 0.920-1.046 out. V1_02 causal 0.102 ×3 | missed (shifts on V1_03/V2_03, scale on V1_03/V2_02/V2_03, V1_02 causal by 0.002) |
+| P0.3 | `tracked == frames` on all 11, give-ups 0 | - | give-ups 0 and re-seeds 0 everywhere. tracked < frames on V1_02 (20-22 start-up `skipped_bootstrap`), V1_03 (1-2 inertial coasts), V2_01 (5-6), V2_03 (89-94) | missed |
+| P0.4 | app smoothed within 0.005 m of the proxy | - | 0.0000 difference on all 11 S0 s0 sessions (`E/p04.py`) | as predicted |
+| P0.5 | every wall ≤ 300 s | - | S0 79-228 s, noloop 86-179 s (frame-time sum 55-181 s; no suspend in the window) | as predicted |
+| P0.6 | S0 smoothed below Basalt on MH_01, MH_02, MH_03, MH_05 | Basalt 0.067 / 0.048 / 0.062 / 0.144 | medians 0.045 / 0.028 / 0.048 / 0.082; every start below too | as predicted |
+| K0.1 | not bit-identical: stop | - | identical | not fired |
+| K0.2 | any wall > 300 s: stop | - | max 228 s under the 900 s SYNC cap | not fired |
+| K0.3 | a Vicon room fails in SYNC: G54 is not the cause | async default fails V1_02-V2_03 | no Vicon room fails: stale 0, scale 0.92-1.05, worst causal 0.869 (V2_03 s2) against 19-243 m async | not fired |
+
+**Diagnosis of the misses (owner rule; the parts marked unverified are hypotheses, not measured):**
+- **Shifts on V1_03 and V2_03 are not G54:** `ba_stale_keyframes=0` on those runs, and the loops-off arm shifts
+  too (8 and 8). They sit on the two sequences with the most inertial coasts and the most flow-unavailable
+  frames (V2_03 218-236, V1_03 76-118). Unverified: the shifts follow the coasts (G39/G50/G51 class).
+- **tracked < frames** has two causes. V1_02: 20-22 frames before the first stereo map (owner answer 3 gives it
+  a `min_cold_start_points` rung). V1_03/V2_01/V2_03: frames skipped while coasting on the IMU
+  (`coast_inertial` 1-94, `coast_visual` 0, no runaway). V2_03 carries 4.6-4.9 % of its frames on coasts.
+- **Scale out of band on V1_03/V2_02/V2_03** comes with the largest causal errors (0.16-0.87 m); the V2_03 s2 run
+  scale 0.920 is the outlier start. No mechanism measured yet; the R10 audit is the place.
+- **V1_02 causal 0.102** is 0.002 over the range; smoothed is 0.056.
+
+**Further findings:**
+- **The start-offset band is partly degenerate.** `start_frame: 0` and `1` give byte-identical outputs on
+  MH_04 and V2_03 (frame 0 adds nothing; `Dataset: ... (processing 0..2032)` against `1..2033`), and all three
+  starts are identical on V1_02 (the offsets fall inside the 20-22 start-up skips). The band has 2 distinct
+  samples on MH_04/V2_03 and 1 on V1_02. The owner should pick offsets past the start-up (or the skill's
+  ±50 µs IMU time shift) before the band gates anything.
+- **Loops help on every sequence** (S0 smoothed against noloop smoothed): 11 of 11, R9's "≥ 9 of 11" holds on
+  this base. PGO failures: 1 each on MH_05 s0 and s2, else 0.
+- **SYNC is not better than the async arms everywhere.** MH_04 smoothed 0.226 against the async default proxy
+  0.165; V1_01-V2_02 smoothed 0.056-0.159 against the preset's 0.055-0.080 (async, window 10). Not diagnosed;
+  these are the R3/R4 targets.
+- **Against Basalt (smoothed median):** below on MH_01, MH_02, MH_03, MH_05 (0.57-0.77x); above on MH_04
+  (1.98x), V1_01 (1.57x), V1_02 (1.23x), V1_03 (2.73x), V2_01 (2.82x), V2_02 (3.23x), V2_03 (1.90x). Against
+  ORB-SLAM3: below on MH_02 only (0.82x); MH_01 0.98x.
