@@ -70,9 +70,9 @@ rooms are 1.5-3x behind even smoothed; that is the part with no diagnosis yet.
 - **ASYNC mode (deployment check, batch gates only):** `--pace-timestamps`, no thread pin, 3 runs per sequence
   for the band. Unpaced async is dropped: it starves BA (1.4-1.75 keyframes inserted per solve) and is neither
   deterministic nor the deployed regime.
-- **Command:** `timeout 300 bin/kornia-slam-euroc --config $d/run.ron --no-tui --no-pace
+- **Command:** `timeout $cap bin/kornia-slam-euroc --config $d/run.ron --no-tui --no-pace
   --trajectory-out $d/traj.txt --trajectory-smoothed $d/traj_smoothed.txt --session-out $d/session.cbor`.
-  No `--evaluate --eval-out` (camera-centre csv). `rc=124` means the 5 min cap fired: run invalid.
+  No `--evaluate --eval-out` (camera-centre csv). `$cap` is 900 s for SYNC arms, 300 s otherwise; `rc=124` means the cap fired: run invalid.
 - **Scoring, both outputs:** `B/venv/bin/python -I B/eval.py <euroc>/$seq $d/traj.txt --fmt tum --rpe 1,10`,
   same for `traj_smoothed.txt`. Also ours cropped to ORB-SLAM3's covered span (`B/results/orbslam3/$seq/f_run.txt`
   timestamps). `E/score.py` refuses any other input file.
