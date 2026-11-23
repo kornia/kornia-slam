@@ -105,6 +105,16 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
     5. A small event near 43 s, not yet diagnosed.
   - The 4-DoF loop correction cannot remove tilt.
   - G50 and G51 cost nothing on MH_04: 36 frames without flow.
+- **EuRoC Vicon-room failure on the default config diagnosed (ledger G54, suspected).** Report: `.pr180-fix/euroc/V102-DIAGNOSIS.md`.
+  - **Symptom:** V1_02, V1_03 and V2_01 score 1.36 / 1.53 / 1.99 m, with Sim(3) scale 0.345 / 0.003 / 0.057.
+  - **The scale itself is fine:** 1.00-1.04 per 5 s piece while tracking is healthy. The 1-10 m jumps at BA write-backs make the Sim(3) fit shrink the trajectory.
+  - **Mechanism:**
+    - Mapping falls behind: 296 ms per solve, with a keyframe every 150 ms.
+    - `merge: SnapshotOnly` leaves the keyframes inserted during each solve on stale seeds.
+    - BA then shifts the newest keyframe by more than 0.3 m: 84-161 shifts per run against 0-2 on MH.
+  - **The preset (`PropagateToNewer`) is healthy:** 0.120 / 0.203 m. The 2026-11-10 runs (synchronous mapping, same BA) scored 0.075 m.
+  - **Tests:** one V1_02 run per knob: T1 `PropagateToNewer`, T2 window 10, T3 Synchronous, T4 7 iterations.
+  - Until then the default arm's Vicon-room numbers are invalid as a measure of the estimator.
 - **Every reference tracks both stereo cameras** (Basalt, OpenVINS, VINS-Fusion, ORB-SLAM3, SLAM Dunk; file and line in G50). Our Stereo mode is the outlier, so on EuRoC we track with half the observations they use.
   - Next: a small EuRoC source change, so EuRoC can run as `cameras: Rig`, then Stereo against Rig on all 11 sequences (planning).
   - LaMAria configs already run `Rig` with AllCameras, so there it is a no-regression check.
