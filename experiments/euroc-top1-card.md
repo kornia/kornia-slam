@@ -904,3 +904,17 @@ D4 (S1) against D3 (S0), V2_01, frames 0-450 (`E/r3/d4stats.py`, `E/r3/vischi2.p
   marginalization in place of the frozen past). The cheapest config-only arm to price first:
   S1 + `imu_huber: BoundaryOnly` on V2_01 and MH_04. It tests whether the pinned IMU wins once the Huber
   cut on its interior edges is removed (D4: interior χ² p90 13037).
+
+
+## Owner decision 2026-11-23: the score models real time
+
+"there's never a final global in real time... we should model this."
+
+- **Primary metric (replaces open-question answer 1, "smoothed ranks"):** the real-time causal pose.
+  - Replay paced at sensor rate (`--pace-timestamps`), asynchronous mapping, the process pinned to 2 cores (`taskset -c <2 cores>`, per the 2-core real-time rule).
+  - Scored on `traj.txt` (each frame's pose as output at that time), SE(3) body-centre, `eval.py --fmt tum`.
+  - M1 = below Basalt on all 11 sequences on this metric. Basalt is itself an online VIO, so the comparison is like for like.
+- **Background global stage:** counted only through what it delivers in time. It runs inside the same 2-core budget, and its correction reaches the live pose through map-to-odom from the moment it lands. No retroactive fix of past frames.
+- **Synchronous runs:** stay the A/B mechanism instrument (deterministic, fast to compare). They no longer carry the score.
+- **Smoothed and offline-global trajectories:** reported only as "benchmark-style (non-causal)", next to ORB-SLAM3 and SLAM Dunk, which also score that way. R6 measures the ceiling of a global solve under this label.
+- **Gate:** each batch of winners runs on all 11 sequences in the real-time replay, 3 runs (async runs differ run to run), at load ≤ 6. Pass = causal median below the baseline band max on every sequence, plus tracked frames and give-up counts.
