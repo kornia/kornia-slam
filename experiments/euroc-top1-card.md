@@ -319,6 +319,42 @@ everything. R3, then R4 on top. R5 replaces part of R3, never both. R6 and R8 st
   fixes from card AI come first. Unverified: `offline-ba` has never run on a Stereo-mode EuRoC session.
 - Affects the smoothed output only. Stacks on everything.
 
+#### R6 baselines and S0E predictions (written 2026-11-23, before any offline solve)
+
+- **Runs:** `offline-ba` with the default `offline_ba: ()` block (60 iterations, 10 px pre-drop, 3 px from
+  iteration 8, no IMU kernel, no bridge, no calibration states), on the start-0 session of each arm. Binary
+  `E/bin-r11b/kornia-slam-euroc` (md5 e67615ad; offline-ba code unchanged from the base). Each session's own
+  `run.ron` gives the visual error model. Outputs in `E/r6/`.
+- **A/B is clean:** the online smoothed output is the frames re-anchored on the final-map keyframes (P0.4), and
+  `reanchor_frames` uses the same `frame_from_kf`. Only the keyframe poses differ between the two outputs.
+- **S0E** = S0 + `local_ba.outlier_erase: ChiSquare(())` (R11b). The erase removes map observations above
+  χ² 5.991 at σ 1 px (2.45 px) after each local solve, so an S0E session starts with a much smaller tail.
+
+Baselines, start 0 (SE(3) ATE RMSE, m, body centre; tilt absolute, median of 1 s bins of the smoothed output):
+
+| seq | S0 smoothed | S0E smoothed | S0 kf | S0E kf | Basalt | ORB-SLAM3 |
+|---|---|---|---|---|---|---|
+| MH_01 | 0.045 | 0.036 | 674 | 579 | 0.067 | 0.046 |
+| MH_04 | 0.226 (tilt 60-80 s 3.64°) | 0.250 (tilt 60-80 s 3.15°) | 466 | 359 | 0.114 | 0.045 |
+| V1_02 | 0.056 | 0.038 | 491 | 407 | 0.045 | 0.019 |
+| V1_03 | 0.143 | 0.062 | 605 | 496 | 0.053 | 0.026 |
+| V2_01 | 0.109 | 0.047 | 506 | 354 | 0.039 | 0.031 |
+| V2_02 | 0.097 | 0.079 | 696 | 562 | 0.049 | 0.037 |
+
+The S0 predictions above stand for S0 sessions. Predictions for S0E sessions:
+- **P6.1 (drop share):** S0E total drop (10 px + 3 px) 2-6 % of observations; S0 8-20 % (the G56 tail of about
+  10 % at 5-20 px, plus the 3 px cut on a 1.3 px core, about 7 % of a 2D Gaussian beyond 2.3 σ).
+  The G41 kill (> 5 %) is likely to fire on S0 by the 3 px cut alone; that is the ratchet, not the data.
+- **P6.2 (MH_04):** S0E 0.250 → 0.08-0.15, tilt at 60-80 s 3.15° → ≤ 1°. Full inertial BA over all keyframes
+  is the one stage that can rotate the dark span back to gravity.
+- **P6.3 (Vicon rooms, S0E):** −10 to −30 % (smaller than the S0 −20 to −40 %, because R11b already took half the
+  error): V1_02 0.030-0.034, V1_03 0.043-0.056, V2_01 0.033-0.042, V2_02 0.055-0.071.
+- **P6.4 (MH_01, S0E):** within ±0.005 of 0.036.
+- **P6.5 (convergence):** S0E `stop=Converged` in ≤ 30 iterations; S0 may run to the 60 cap (the ratchet keeps
+  changing the active set after iteration 8). Each solve ≤ 60 s.
+- **Kill rules (both arms):** as above (drop > 5 %, worse on ≥ 3 sequences, a solve > 60 s, or offline-ba fails on
+  a Stereo session). One extra reading: S0E better but S0 worse means the S0 tail, not the solve, is at fault.
+
 ### Experiment R7: per-frame pose-inertial solve (card AJ)
 
 - Code built in the `kornia-slam-aj` worktree (4 commits). **Gap tested:** G13, G30.
