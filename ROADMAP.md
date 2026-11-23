@@ -23,6 +23,20 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 
 ### 2026-11-23
 
+- **EuRoC top-1 comes before LaMAria** (owner, 2026-11-23; master card `experiments/euroc-top1-card.md`).
+  - **Goal:** one stereo+IMU config, 100 % tracked, below Basalt on all 11 EuRoC sequences (M1), then below
+    ORB-SLAM3 (M2).
+  - **Three findings behind it:**
+    - the harness scored the camera centre, not the body (G55; 0.003-0.025 m per sequence);
+    - the smoothed output (G53) is already below Basalt on MH_01, MH_02, MH_03 and MH_05 (planner proxy);
+    - no single config is healthy on all 11: default fails the Vicon rooms (G54), the preset is worse on MH_03/MH_04 (G49, G6).
+  - **Instrument:** synchronous mapping with one thread and no pacing decides every A/B; it must repeat
+    bit-for-bit. Async paced runs check deployment at the batch gates.
+  - **Ladder:** R0 harness and SYNC baseline, R1 merge fix (G54), R3 full-weight bias rows (G49), R4 window 10 and
+    the Basalt solver budget, R6 offline global inertial BA, then R5/R7/R8/R9/R10 as the gate table says.
+  - **Owner answers:** smoothed ranks, loops on, SYNC carries M1, one config for all 11. SLAM Dunk is compared
+    in theory only (no run); the card's estimate puts it at the ORB-SLAM3-with-full-BA level on EuRoC, so M2 is
+    that bar and R6 is the rung that buys it.
 - **Re-plan: the global stage comes first, and the loss cards are paused** (owner, 2026-11-23).
   - **Why:**
     - Every top LaMAria method scores from a global solve over the whole sequence, with time-varying calibration (`experiments/lamaria-handoff.md` "The current leader: SLAM Dunk"; bench notes on visloc-rs and the top entries).
