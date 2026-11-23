@@ -45,6 +45,7 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
     Unpinned at load 15-33, all four pair runs hit the cap again (K0.2): MH_04 reached 1095-1300 of 2033
     frames, V1_02 628-779 of 1710. Every common prefix is byte-identical (r1 against r2, and against the pinned
     run). The wall is set by machine load; owner decides between a quiet machine, a larger SYNC cap or R4's budget.
+    Owner: SYNC runs get a 900 s cap (outputs do not depend on load); all other runs keep 300 s.
   - Body-centre re-score of the async runs: default fails V2_02 and V2_03 too (59.6 and 242.7 m, G54); the preset
     smoothed output reaches 0.055 and 0.462 there. The smoothed proxy equals the app output to 3 decimals on 5 runs.
 - **Re-plan: the global stage comes first, and the loss cards are paused** (owner, 2026-11-23).

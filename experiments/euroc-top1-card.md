@@ -62,6 +62,11 @@ rooms are 1.5-3x behind even smoothed; that is the part with no diagnosis yet.
   about 1.9x wall (V1_02 projected 347 s pinned against 190 s for the other agent's unpinned T3 run of the same
   config), and T3 matched the pinned run's first 1432 poses byte for byte. Determinism is re-checked unpinned
   (P0.1) before any arm runs.
+- **Protocol change (owner, 2026-11-23, after the second K0.2):** SYNC runs get a 900 s cap; every other run
+  keeps 300 s. SYNC outputs do not depend on load, only wall time does (every common prefix of pinned, unpinned
+  and repeated runs was byte-identical), and at load 15-33 no SYNC run fit 300 s. The laptop can suspend, so
+  `score.py` also records the per-frame time sum; where a suspend inflates the wall, that sum is the wall
+  figure. P0.5 and K0.2 are read against the cap of the run's mode.
 - **ASYNC mode (deployment check, batch gates only):** `--pace-timestamps`, no thread pin, 3 runs per sequence
   for the band. Unpaced async is dropped: it starves BA (1.4-1.75 keyframes inserted per solve) and is neither
   deterministic nor the deployed regime.
