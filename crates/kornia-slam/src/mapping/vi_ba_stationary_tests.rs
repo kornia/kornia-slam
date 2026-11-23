@@ -122,7 +122,7 @@ fn stacked(edge: &StationaryFactor, kfs: &[ViBaKeyframe]) -> (Vec<f64>, Vec<f64>
 /// `−JᵀWΩr` from a central-difference Jacobian of the residual over both
 /// 15-DOF tangents (the robust weight held at the linearization point, as
 /// IRLS does), its cost against the Huber objective `½ρ(chi²_nav) + ½ chi²_bias`
-/// ([`crate::mapping::robust`]), and its gradient against a central difference
+/// ([`kornia_3d::ransac::RobustKernel::rho`]), and its gradient against a central difference
 /// of that cost (so cost and weight are one objective). Each entry is judged
 /// against its Cauchy–Schwarz scale (`√(H_aa H_bb)`, `√H_aa · √(rᵀWΩr)`), so
 /// the stiff bias rows cannot hide an error in the pose rows. Returns the
