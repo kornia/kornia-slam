@@ -1,6 +1,8 @@
 # Card AC-2b: pose innovation gate
 
-Status: 2026-11-22. Card written; stage 0a (jumps.py) next. Plan: planner (Fable), owner answers 2026-11-22. Worktree `/home/edgar/dev/split/kornia-slam-loss`, branch
+Status: 2026-11-23. Stage 0a scored; code built and verified (binary md5 79f4db830c30b6af73baf37c5607d41e);
+no SLAM run yet. The H0 gate was stopped by the owner; stage 0 and 1 are re-planned for the 5-minute rule below and
+wait for the go. Plan: planner (Fable), owner answers 2026-11-22. Worktree `/home/edgar/dev/split/kornia-slam-loss`, branch
 `feat/loss-one-world`, base 530f2be.
 
 Paths: `P=/home/edgar/dev/split/.pr180-fix`, `O=$P/cardAC2b`.
@@ -118,4 +120,26 @@ A primary loss here is a coast episode of at least 0.5 s in a segment at least 3
   11.21 -> 12.13 m/s against GT 1.15 m/s; slope of the speed error +1.64 m/s^2 over 3.6 s.
 - Slope on W211c-KIU loss 7 reads +0.06 m/s^2, not +1.1: the 0.25 s speed window starts on the 6.36 m step, so the
   first samples already read 3-4 m/s; the start-to-end SLAM speeds (3.1 -> 6.9 m/s) carry the ramp.
+
+### Run plan under the owner's 5-minute rule (2026-11-23, waiting for the go)
+
+Rule: every experiment at most 5 min wall time, short windows or prefixes, `--no-pace`, 2 runs in parallel, at least
+3 repeats. Repeats are the clock offsets 0, -50000, +50000 ns (as card AC). Paced card AC pairs took about 3 min for
+1100 frames, so an unpaced window of at most about 1100 frames fits three rounds of two in 5 min; the first
+experiment times one round and the windows shrink if it runs over.
+
+| exp | runs (2 at a time) | what it scores |
+|---|---|---|
+| I | r01full-S10-7 prefix (max_frames 1200, synchronous, RAYON 1): knob off, H0, H0+OBS | identity: the three cmp-identical to each other (the d4f77b56 baseline is full length; a prefix cannot match it) |
+| 0-1 | W211c H+OBS x3, H0+OBS x3 (1100 frames) | M0, K5m, P0b on the K4 events |
+| 0-2 | W211aP window frames 3000-3900 (onset 3444, the 11 m steps at 3338-3342), H+OBS x3; BK 25:6 H0+OBS x3 | K5m, P0b; BK would-reject share |
+| 0-3 | W511 H0+OBS x3 (1300 frames, or 1100 if 0-1 runs over); R_03 window H0+OBS x3 (800) | P0a, M0 |
+| 0-4 | R_01 prefix 1200 H0+OBS x3; R_11 window H0+OBS x3 (800) | P0a |
+| 0-5 | W211c H+OBS x3 and R_01 prefix 1200 H0+OBS x3, both at the per-sequence clock offset (2_11 -4720000, R_01 -3930000 ns) | K6 |
+| 0-6 | R_11 BASE against U, DEBUG: frames 0-7600 do not fit; frames 5600-7600 x3 per arm, or a 0-3000 prefix | U bias walk (owner answer 2); the window choice needs the coordinator's call |
+| 1-x | stage 1: W211c H vs H+G and H0 vs H0+G in experiments of 3 offsets each (6 samples per arm over two experiments); W211aP window and W511 3 each; BK 25:6 and 25:2 | P1-P4, K1-K3 |
+
+Not possible inside 5 min: R_01 full and R_11_5cp full (P5, the R_11 guard pair) and every full-sequence item (P6,
+step 7). They move to the full-sequence gate, or to R_11 windows around the 370 s loss if the coordinator prefers.
+Caveat: `--no-pace` makes a run depend on load (run.sh); pairs still start at load <= 4 with no other kornia-slam.
 
