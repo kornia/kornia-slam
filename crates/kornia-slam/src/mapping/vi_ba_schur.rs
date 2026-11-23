@@ -289,6 +289,8 @@ pub struct ViBaParams {
     pub imu_recently_initialized: bool,
     /// Threads the reduced system's Cholesky factor and solves run on.
     pub dense_parallelism: DenseParallelism,
+    /// Fill [`ViBaResult::residuals`] at the final state.
+    pub report_residuals: bool,
 }
 
 /// IMU edges whose nav residual gets the Huber kernel.
@@ -401,8 +403,23 @@ impl Default for ViBaParams {
             newest_marginal: false,
             imu_recently_initialized: false,
             dense_parallelism: DenseParallelism::Global,
+            report_residuals: false,
         }
     }
+}
+
+/// One observation's residual at the final state, whitened by the solve's
+/// own sigmas.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObservationResidual {
+    /// Reprojection χ², 2 dof.
+    pub reprojection_chi2: f64,
+    /// Stereo depth row χ², when that row was in the solve.
+    pub depth_chi2: Option<f64>,
+    /// Landmark depth along the observing camera's axis, metres.
+    pub depth_m: f64,
+    /// Landmark distance from the observing camera's centre, metres.
+    pub range_m: f64,
 }
 
 /// Output of VI-BA. `#[non_exhaustive]`, so a figure can be added without a
@@ -452,6 +469,9 @@ pub struct ViBaResult {
     pub calibration_gated: bool,
     /// Calibration columns the solve added.
     pub calibration_columns: usize,
+    /// Per observation, in input order, when [`ViBaParams::report_residuals`]
+    /// asked; `None` for an observation out of range. Empty otherwise.
+    pub residuals: Vec<Option<ObservationResidual>>,
 }
 
 /// Upper bound of the depth gate for a measured depth `d`, metres.
@@ -2953,6 +2973,50 @@ fn solve_vi_ba(
             is_boundary_edge(edge, &kf_local),
         );
     }
+    // The final state's residual of observation `o` and its incidence bin:
+    // one path for the VISRES samples and the outlier erase, so they agree.
+    let final_residual = |o: usize, obs: &BaObservation| {
+        if obs.pose_idx >= n_kf || obs.point_idx >= n_pts {
+            return None;
+        }
+        let (obs_camera, obs_pose) = views.camera_pose(o, camera, &se3s[obs.pose_idx]);
+        let view = calibration.map(|c| {
+            CalibratedView::new(
+                &c.layout,
+                &calib,
+                views.camera_index(o),
+                obs_camera,
+                obs_pose,
+            )
+        });
+        let (obs_camera, obs_pose) = view
+            .as_ref()
+            .map_or((obs_camera, obs_pose), |v| (&v.camera, v.pose));
+        let (r, _, _) =
+            residual_and_jacobians(&obs_pose, &xyz[obs.point_idx], obs.pixel, obs_camera);
+        let mut chi2 = (r[0] * r[0] + r[1] * r[1]) as f64;
+        if let Some(&sigma) = params.observation_sigma_px.get(o) {
+            chi2 /= (sigma as f64).powi(2);
+        }
+        let in_camera = obs_pose * vec3_to_f32(xyz[obs.point_idx]);
+        let depth_chi2 = obs.depth_meas.filter(|_| depth_on[o]).map(|d_meas| {
+            let sigma = (obs.depth_sigma as f64).max(1e-6);
+            let (r_z, _, _) = depth_residual_and_jacobian(
+                &se3s[obs.pose_idx],
+                &xyz[obs.point_idx],
+                d_meas as f64,
+                sigma,
+            );
+            r_z * r_z
+        });
+        let residual = ObservationResidual {
+            reprojection_chi2: chi2,
+            depth_chi2,
+            depth_m: in_camera.z as f64,
+            range_m: in_camera.length() as f64,
+        };
+        Some((residual, incidence_bin(obs_camera, obs.pixel)))
+    };
     // FP5 (card F): whitened reprojection chi² of the accepted state by the
     // incidence of each observation's undistorted pixel, to see whether the
     // raw fisheye weights flatten it across the lens.
@@ -2970,49 +3034,21 @@ fn solve_vi_ba(
         let mut samples = Vec::with_capacity(observations.len());
         let mut depth_chi2 = Vec::new();
         for (o, obs) in observations.iter().enumerate() {
-            if obs.pose_idx >= n_kf || obs.point_idx >= n_pts {
+            let Some((residual, bin)) = final_residual(o, obs) else {
                 continue;
-            }
-            let (obs_camera, obs_pose) = views.camera_pose(o, camera, &se3s[obs.pose_idx]);
-            let view = calibration.map(|c| {
-                CalibratedView::new(
-                    &c.layout,
-                    &calib,
-                    views.camera_index(o),
-                    obs_camera,
-                    obs_pose,
-                )
-            });
-            let (obs_camera, obs_pose) = view
-                .as_ref()
-                .map_or((obs_camera, obs_pose), |v| (&v.camera, v.pose));
-            let (r, _, _) =
-                residual_and_jacobians(&obs_pose, &xyz[obs.point_idx], obs.pixel, obs_camera);
-            let mut chi2 = (r[0] * r[0] + r[1] * r[1]) as f64;
-            if let Some(&sigma) = params.observation_sigma_px.get(o) {
-                chi2 /= (sigma as f64).powi(2);
-            }
-            let bin = &mut bins[incidence_bin(obs_camera, obs.pixel)];
+            };
+            let chi2 = residual.reprojection_chi2;
+            let bin = &mut bins[bin];
             bin.0 += 1;
             bin.1 += chi2;
-            let behind = (obs_pose * vec3_to_f32(xyz[obs.point_idx])).z <= 0.0;
             samples.push(VisualSample {
                 chi2,
                 secondary: views.camera_index(o) != 0,
                 fixed_pose: kf_local[obs.pose_idx] < 0,
                 young: kf_local[first_seen[obs.point_idx]] >= 0,
-                behind,
+                behind: residual.depth_m <= 0.0,
             });
-            if let Some(d_meas) = obs.depth_meas.filter(|_| depth_on[o]) {
-                let sigma = (obs.depth_sigma as f64).max(1e-6);
-                let (r_z, _, _) = depth_residual_and_jacobian(
-                    &se3s[obs.pose_idx],
-                    &xyz[obs.point_idx],
-                    d_meas as f64,
-                    sigma,
-                );
-                depth_chi2.push(r_z * r_z);
-            }
+            depth_chi2.extend(residual.depth_chi2);
         }
         eprintln!("[vi_ba] INCIDENCE{}", incidence_chi2_line(&bins));
         eprintln!(
@@ -3025,6 +3061,15 @@ fn solve_vi_ba(
             )
         );
     }
+    let residuals: Vec<Option<ObservationResidual>> = if params.report_residuals {
+        observations
+            .iter()
+            .enumerate()
+            .map(|(o, obs)| final_residual(o, obs).map(|(residual, _)| residual))
+            .collect()
+    } else {
+        Vec::new()
+    };
     if let Some(i) = (0..n_kf).rev().find(|&i| kf_local[i] >= 0) {
         let (v, b) = (kfs[i].velocity, kfs[i].bias);
         debug_eprintln!(
@@ -3169,6 +3214,7 @@ fn solve_vi_ba(
             newest_marginal,
             calibration_gated: calibration.is_some_and(|c| !c.free),
             calibration_columns: n_cal,
+            residuals,
         },
         outcome,
     ))

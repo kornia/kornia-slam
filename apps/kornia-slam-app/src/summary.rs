@@ -30,6 +30,7 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
          [summary] frame_ms {}\n\
          [summary] frontend_ms {}\n\
          {}\n\
+         {}\n\
          {}",
         c.frames,
         c.tracked,
@@ -62,6 +63,22 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
         format_percentiles(&times.frontend_ms),
         format_estimator_recovery(c),
         format_flow_coast(c),
+        format_outlier_erase(c),
+    )
+}
+
+/// The local VI-BA outlier erase counters (G56), in a fixed order; zero when
+/// the erase is off.
+fn format_outlier_erase(c: &RunCounters) -> String {
+    format!(
+        "[summary] outlier_erase erase_tested={} erase_unlinked={} erase_tested_newest={} \
+         erase_unlinked_newest={} erase_landmarks_retired={} erase_stale_links={}",
+        c.erase_tested,
+        c.erase_unlinked,
+        c.erase_tested_newest,
+        c.erase_unlinked_newest,
+        c.erase_landmarks_retired,
+        c.erase_stale_links,
     )
 }
 
@@ -206,7 +223,7 @@ mod tests {
         counters.vi_ba_solves_3plus_rejects = 22;
         let text = format(&counters, &FrameTimes::default());
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines.len(), 6);
         assert_eq!(
             lines[3],
             "[summary] estimator_recovery ba_keyframe_shifts=1 ba_snapbacks=2 \
@@ -222,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn the_last_line_holds_the_flow_and_coast_counters_in_order() {
+    fn the_fifth_line_holds_the_flow_and_coast_counters_in_order() {
         let mut counters = RunCounters::default();
         counters.flow_frames = 1;
         counters.flow_keyframe_due = 2;
@@ -233,10 +250,27 @@ mod tests {
         counters.lost_keyframes_at_runaway = 7;
         let text = format(&counters, &FrameTimes::default());
         assert_eq!(
-            text.lines().last().unwrap(),
+            text.lines().nth(4).unwrap(),
             "[summary] flow_coast flow_frames=1 flow_keyframe_due=2 flow_refused=3 \
              flow_unavailable=4 flow_due_orb_rejected=5 coast_runaway_frames=6 \
              lost_keyframes_at_runaway=7"
+        );
+    }
+
+    #[test]
+    fn the_last_line_holds_the_outlier_erase_counters_in_order() {
+        let mut counters = RunCounters::default();
+        counters.erase_tested = 1;
+        counters.erase_unlinked = 2;
+        counters.erase_tested_newest = 3;
+        counters.erase_unlinked_newest = 4;
+        counters.erase_landmarks_retired = 5;
+        counters.erase_stale_links = 6;
+        let text = format(&counters, &FrameTimes::default());
+        assert_eq!(
+            text.lines().last().unwrap(),
+            "[summary] outlier_erase erase_tested=1 erase_unlinked=2 erase_tested_newest=3 \
+             erase_unlinked_newest=4 erase_landmarks_retired=5 erase_stale_links=6"
         );
     }
 }

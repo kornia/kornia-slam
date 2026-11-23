@@ -4,6 +4,7 @@
 //! map owns capture and writeback; the local-mapping worker owns scheduling.
 
 use crate::mapping::dense_llt::DenseParallelism;
+use crate::mapping::map::ObservationKey;
 use crate::mapping::map::{
     BaSnapshot, BaSolve, BaUpdate, BaUpdateError, BaWindow, ImuFactor as MapImuFactor, Keyframe,
     LocalBaMerge, LocalBaStats, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR, StateEnvelope,
@@ -12,6 +13,9 @@ use crate::mapping::marginalization::{
     BoundaryPrior, FrozenPoseSigma, MarginalPrior, marginalize_frozen,
 };
 use crate::mapping::online_calibration::{OnlineCalibrationInput, OnlineCalibrationState};
+use crate::mapping::outlier_erase::{
+    EraseCandidate, OutlierErase, OutlierLink, OutlierSelection, select_outliers,
+};
 use crate::mapping::vi_ba_schur::{
     ImuHuber, RigObservationCamera, ViBaKeyframe, ViBaParams, ViBaResult,
 };
@@ -73,6 +77,8 @@ pub struct LocalBaParams {
     pub newest_marginal: bool,
     /// Threads of VI-BA's dense factor and solves; the visual-only BA ignores it.
     pub dense_parallelism: DenseParallelism,
+    /// Unlink the observations the solution rejects; VI-BA only.
+    pub outlier_erase: OutlierErase,
 }
 
 /// ORB-SLAM3's larger window when tracking is strong (`LocalMapping.cc:148`,
@@ -141,6 +147,7 @@ impl Default for LocalBaParams {
             recently_initialized: false,
             newest_marginal: false,
             dense_parallelism: DenseParallelism::Global,
+            outlier_erase: OutlierErase::Off,
         }
     }
 }
@@ -700,6 +707,7 @@ fn run_local_inertial_ba_inner(
         observations,
         views: observation_views,
         sigma_px: observation_sigma_px,
+        links,
     } = window.observations_with_views(
         snapshot
             .keyframes()
@@ -846,6 +854,7 @@ fn run_local_inertial_ba_inner(
         rig_views: rig_views.clone(),
         observation_views: observation_views.clone(),
         observation_sigma_px,
+        report_residuals: params.outlier_erase.is_enabled(),
         ..ViBaParams::default()
     };
     let calibration_input = calibration.map(|(start, config)| OnlineCalibrationInput {
@@ -962,6 +971,19 @@ fn run_local_inertial_ba_inner(
         );
     }
     window.write_back_where(&vi_result.points, &keep, &mut update.map_points);
+    if params.outlier_erase.is_enabled() {
+        let selection = window_outliers(
+            &params.outlier_erase,
+            &observations,
+            &links,
+            &vi_result,
+            &keep,
+            n_kfs - 1,
+        );
+        debug_erase_line(snapshot.keyframes()[n_kfs - 1].frame.idx, &selection);
+        update.outlier_links = selection.links;
+        update.erase_tested = selection.tested;
+    }
     update.newest_marginal = vi_result
         .newest_marginal
         .map(|marginal| (snapshot.keyframes()[n_kfs - 1].frame.idx, marginal));
@@ -1007,6 +1029,50 @@ fn run_local_inertial_ba_inner(
     update.online_calibration = online_calibration;
     update.outcome.solve = BaSolve::Solved;
     update
+}
+
+/// The window observations `rule` erases at the solution. `links[o]` is
+/// observation `o`'s map link; `newest_slot` the newest keyframe's slot.
+fn window_outliers(
+    rule: &OutlierErase,
+    observations: &[BaObservation],
+    links: &[(ObservationKey, usize)],
+    result: &ViBaResult,
+    keep: &[bool],
+    newest_slot: usize,
+) -> OutlierSelection {
+    debug_assert_eq!(links.len(), observations.len());
+    let candidates =
+        observations
+            .iter()
+            .zip(links)
+            .enumerate()
+            .map(|(o, (obs, &(key, landmark)))| EraseCandidate {
+                link: OutlierLink {
+                    key,
+                    landmark,
+                    newest: obs.pose_idx == newest_slot,
+                },
+                fixed_pose: obs.fixed_pose,
+                residual: result.residuals.get(o).and_then(Option::as_ref),
+                guarded: !keep.get(obs.point_idx).copied().unwrap_or(true),
+            });
+    select_outliers(rule, candidates)
+}
+
+fn debug_erase_line(newest_kf: usize, s: &OutlierSelection) {
+    debug_eprintln!(
+        "[vi_ba] ERASE kf={newest_kf} tested={} erase={} newest={}/{} fixed={}/{} \
+            depth_nonpositive={} guard_skipped={}",
+        s.tested.tested,
+        s.links.len(),
+        s.erased_newest,
+        s.tested.tested_newest,
+        s.erased_fixed,
+        s.tested_fixed,
+        s.depth_nonpositive,
+        s.guard_skipped,
+    );
 }
 
 /// One `[vi_ba] WINDOW` line per solve: what the solve held fixed, and how far
@@ -1265,12 +1331,14 @@ fn rig_observation_cameras(keyframes: &[Keyframe]) -> Vec<RigObservationCamera> 
         .unwrap_or_default()
 }
 
-/// Observations of a window with, per observation, its rig camera and its
-/// pixel sigma (empty at unit information).
+/// Observations of a window with, per observation, its rig camera, its
+/// pixel sigma (empty at unit information) and its map link
+/// `(keyframe feature, landmark id)`.
 struct WindowObservations {
     observations: Vec<BaObservation>,
     views: Vec<u8>,
     sigma_px: Vec<f32>,
+    links: Vec<(ObservationKey, usize)>,
 }
 
 /// Live landmarks a BA window observes, ordered by ascending map index; a
@@ -1371,9 +1439,12 @@ impl WindowPoints {
         let mut observations = Vec::new();
         let mut views = Vec::new();
         let mut sigma_px = Vec::new();
+        let mut links = Vec::new();
         for (pose_idx, kf, fixed_pose) in poses {
             for (desc_idx, mp_opt) in kf.map_point_by_desc_idx.iter().enumerate() {
-                let Some(&point_idx) = mp_opt.and_then(|mp_idx| self.local_of.get(&mp_idx)) else {
+                let Some((mp_idx, &point_idx)) =
+                    mp_opt.and_then(|mp_idx| Some((mp_idx, self.local_of.get(&mp_idx)?)))
+                else {
                     continue;
                 };
                 let view = kf.frame.camera_of(desc_idx);
@@ -1402,6 +1473,11 @@ impl WindowPoints {
                         pixel_sigma,
                     ));
                     views.push(view as u8);
+                    let key = ObservationKey {
+                        keyframe_idx: kf.frame.idx,
+                        feature_idx: desc_idx,
+                    };
+                    links.push((key, mp_idx));
                 }
             }
         }
@@ -1409,6 +1485,7 @@ impl WindowPoints {
             observations,
             views,
             sigma_px,
+            links,
         }
     }
 

@@ -20,6 +20,7 @@ use crate::mapping::map::{
     BaOutcome, BaSnapshot, BaSolve, BaUpdate, BaUpdateError, LocalBaMergeResult, LocalBaStats, Map,
 };
 use crate::mapping::online_calibration::OnlineCalibrationState;
+use crate::mapping::outlier_erase::{self, EraseReport};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -129,6 +130,12 @@ pub(crate) struct LocalMappingCounts {
     pub ba_stale_keyframes: u64,
     pub ba_propagated_keyframes: u64,
     pub ba_propagations_stopped_at_bridge: u64,
+    pub erase_tested: u64,
+    pub erase_unlinked: u64,
+    pub erase_tested_newest: u64,
+    pub erase_unlinked_newest: u64,
+    pub erase_landmarks_retired: u64,
+    pub erase_stale_links: u64,
 }
 
 // Atomics because the asynchronous worker writes them while tracking reads.
@@ -149,6 +156,12 @@ struct LocalMappingCounters {
     ba_stale_keyframes: AtomicU64,
     ba_propagated_keyframes: AtomicU64,
     ba_propagations_stopped_at_bridge: AtomicU64,
+    erase_tested: AtomicU64,
+    erase_unlinked: AtomicU64,
+    erase_tested_newest: AtomicU64,
+    erase_unlinked_newest: AtomicU64,
+    erase_landmarks_retired: AtomicU64,
+    erase_stale_links: AtomicU64,
 }
 
 impl LocalMappingCounters {
@@ -213,6 +226,13 @@ impl LocalMappingCounters {
                     &self.ba_propagations_stopped_at_bridge,
                     usize::from(result.stopped_at_bridge),
                 );
+                let erase = &result.erase;
+                add(&self.erase_tested, erase.tested);
+                add(&self.erase_unlinked, erase.unlinked);
+                add(&self.erase_tested_newest, erase.tested_newest);
+                add(&self.erase_unlinked_newest, erase.unlinked_newest);
+                add(&self.erase_landmarks_retired, erase.landmarks_retired);
+                add(&self.erase_stale_links, erase.stale_links);
             }
             Err(_) => {
                 add(&self.ba_updates_rejected, 1);
@@ -238,6 +258,12 @@ impl LocalMappingCounters {
             ba_stale_keyframes: read(&self.ba_stale_keyframes),
             ba_propagated_keyframes: read(&self.ba_propagated_keyframes),
             ba_propagations_stopped_at_bridge: read(&self.ba_propagations_stopped_at_bridge),
+            erase_tested: read(&self.erase_tested),
+            erase_unlinked: read(&self.erase_unlinked),
+            erase_tested_newest: read(&self.erase_tested_newest),
+            erase_unlinked_newest: read(&self.erase_unlinked_newest),
+            erase_landmarks_retired: read(&self.erase_landmarks_retired),
+            erase_stale_links: read(&self.erase_stale_links),
         }
     }
 }
@@ -283,9 +309,20 @@ enum LocalMappingBackend {
 /// Culling runs under the caller's map lock, immediately after an accepted
 /// merge and before the result is published, so a completed result is never
 /// observable ahead of its cleanup. A refused snapshot — one whose world epoch
-/// no longer matches — publishes nothing and must therefore cull nothing.
-fn merge_and_cull(map: &mut Map, update: BaUpdate) -> Result<LocalBaMergeResult, BaUpdateError> {
-    let merged = map.apply_ba_update(update)?;
+/// no longer matches — publishes nothing and must therefore cull nothing; nor
+/// does it erase the outliers its solve found.
+fn merge_and_cull(
+    map: &mut Map,
+    mut update: BaUpdate,
+) -> Result<LocalBaMergeResult, BaUpdateError> {
+    let links = std::mem::take(&mut update.outlier_links);
+    let tested = update.erase_tested;
+    let mut merged = map.apply_ba_update(update)?;
+    merged.erase = EraseReport {
+        tested: tested.tested,
+        tested_newest: tested.tested_newest,
+        ..outlier_erase::erase(map, &links)
+    };
     crate::mapping::culling::cull_landmarks(map);
     Ok(merged)
 }
@@ -908,6 +945,43 @@ mod tests {
         let map = map.lock().unwrap();
         assert!(!map.map_points()[doomed].culled, "no cull after a refusal");
         assert_eq!(map.get_keyframe(0).unwrap().map_point(0), Some(doomed));
+    }
+
+    /// R11b: the outliers a refused update found are not erased either.
+    #[test]
+    fn the_coordinator_does_not_erase_after_a_refused_merge() {
+        use crate::mapping::map::ObservationKey;
+        use crate::mapping::outlier_erase::OutlierLink;
+
+        let (map, doomed) = map_with_a_cullable_landmark();
+        let mut update = map.lock().unwrap().full_ba_snapshot().into_update();
+        update.outlier_links = vec![OutlierLink {
+            key: ObservationKey {
+                keyframe_idx: 0,
+                feature_idx: 0,
+            },
+            landmark: doomed,
+            newest: true,
+        }];
+        map.lock()
+            .unwrap()
+            .apply_inertial_alignment(InertialAlignment {
+                scale: 2.0,
+                rotation: SO3F64::IDENTITY,
+                keyframe_velocities: vec![KeyframeVelocity {
+                    keyframe_idx: 0,
+                    velocity_world: Vec3F64::ZERO,
+                }],
+                bias: ImuBias::default(),
+            })
+            .expect("a valid alignment advances the world epoch");
+
+        let merged = super::merge_and_cull(&mut map.lock().unwrap(), update);
+
+        assert!(matches!(merged, Err(BaUpdateError::ObsoleteWorldFrame)));
+        let map = map.lock().unwrap();
+        assert_eq!(map.get_keyframe(0).unwrap().map_point(0), Some(doomed));
+        assert!(map.map_points()[doomed].is_observed_by(0));
     }
 
     /// A malformed result is refused at the same seam, and a refusal must not

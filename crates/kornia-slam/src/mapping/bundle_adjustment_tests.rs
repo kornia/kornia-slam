@@ -1463,3 +1463,192 @@ fn a_propagating_merge_still_rejects_another_world_epoch() {
         before
     );
 }
+
+fn erase_gravity() -> Vec3F64 {
+    Vec3F64::new(0.0, 9.81, 0.0)
+}
+
+/// Five cruise keyframes whose feature 0 is unlinked and feature `f + 1`
+/// images landmark `f`; on the newest keyframe, landmark 5's feature is
+/// displaced down by `displace_px` and found at `octave`. Returns the map and
+/// landmark 5's id.
+fn erase_cruise_map(displace_px: f32, octave: u8) -> (Map, usize) {
+    const COUNT: usize = 5;
+    let gravity = erase_gravity();
+    let points = cruise_points();
+    let imaged: Vec<Vec3F64> = std::iter::once(points[0])
+        .chain(points.iter().copied())
+        .collect();
+    let mut map = Map::new();
+    for id in 0..COUNT {
+        let mut keyframe = cruise_keyframe(id, &imaged, imaged.len());
+        if id == COUNT - 1 {
+            keyframe.frame.features.keypoints_xy[6][1] += displace_px;
+            keyframe.frame.features.octaves[6] = octave;
+        }
+        map.insert_keyframe(keyframe).unwrap();
+    }
+    let mut ids = Vec::new();
+    for (landmark, point) in points.into_iter().enumerate() {
+        let id = map
+            .insert_landmark(LandmarkSeed {
+                position: point,
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx: landmark + 1,
+                },
+            })
+            .unwrap();
+        for kf in 1..COUNT {
+            map.link_observation(kf, landmark + 1, id).unwrap();
+        }
+        ids.push(id);
+    }
+    map.apply_insertion(MapInsertion {
+        imu_factors: (0..COUNT - 1)
+            .map(|k| cruise_edge(k, gravity, Vec3F64::ZERO))
+            .collect(),
+        ..Default::default()
+    })
+    .unwrap();
+    (map, ids[5])
+}
+
+/// One solve of [`erase_cruise_map`]: its update and landmark 5's id.
+fn erase_cruise(
+    displace_px: f32,
+    octave: u8,
+    information: VisualInformation,
+    outlier_erase: OutlierErase,
+) -> (BaUpdate, usize) {
+    let (map, landmark) = erase_cruise_map(displace_px, octave);
+    let params = LocalBaParams {
+        visual_information: information,
+        outlier_erase,
+        ..LocalBaParams::default()
+    };
+    let update = run_local_inertial_ba_with(
+        map.ba_snapshot(&local_window_of(&map, params.active_keyframes, [])),
+        &camera(),
+        None,
+        erase_gravity(),
+        &[],
+        &[],
+        &params,
+    );
+    (update, landmark)
+}
+
+fn chi_square_erase() -> OutlierErase {
+    OutlierErase::ChiSquare(Default::default())
+}
+
+/// R11b: the displaced observation is the only one listed, under its own
+/// keyframe feature, though an unlinked feature precedes it.
+#[test]
+fn the_erase_lists_exactly_the_displaced_observation() {
+    let (update, landmark) = erase_cruise(20.0, 0, VisualInformation::Unit, chi_square_erase());
+    assert_eq!(update.outcome.solve, BaSolve::Solved);
+    assert_eq!(
+        update.outlier_links,
+        [OutlierLink {
+            key: ObservationKey {
+                keyframe_idx: 4,
+                feature_idx: 6,
+            },
+            landmark,
+            newest: true,
+        }]
+    );
+    // Every window row of the 12 landmarks: 5 keyframes, the oldest
+    // context ones included.
+    assert_eq!(update.erase_tested.tested, 60);
+    assert_eq!(update.erase_tested.tested_newest, 12);
+}
+
+#[test]
+fn with_the_erase_off_nothing_is_listed() {
+    let (update, _) = erase_cruise(20.0, 0, VisualInformation::Unit, OutlierErase::Off);
+    assert_eq!(update.outcome.solve, BaSolve::Solved);
+    assert!(update.outlier_links.is_empty());
+    assert_eq!(update.erase_tested, Default::default());
+}
+
+/// The test is on the whitened residual: 6 px at octave 7 (sigma 3.6 px) is
+/// an inlier under `OctaveScaled`, an outlier at unit sigma.
+#[test]
+fn the_erase_tests_the_residual_whitened_by_the_solve_sigma() {
+    let (scaled, _) = erase_cruise(6.0, 7, VisualInformation::OctaveScaled, chi_square_erase());
+    assert_eq!(scaled.outcome.solve, BaSolve::Solved);
+    assert!(scaled.erase_tested.tested > 0);
+    assert!(
+        scaled.outlier_links.is_empty(),
+        "{:?}",
+        scaled.outlier_links
+    );
+    let (unit, _) = erase_cruise(6.0, 7, VisualInformation::Unit, chi_square_erase());
+    assert_eq!(unit.outlier_links.len(), 1, "{:?}", unit.outlier_links);
+}
+
+/// Through the synchronous coordinator: the erase follows the accepted merge
+/// and is counted; off, the links are those of the plain merge and cull.
+#[test]
+fn a_synchronous_job_erases_the_displaced_link_and_counts_it() {
+    use crate::mapping::{KeyframeJob, LocalMapping, LocalMappingMode};
+    use std::sync::{Arc, Mutex};
+
+    let run = |outlier_erase| {
+        let (map, landmark) = erase_cruise_map(20.0, 0);
+        let map = Arc::new(Mutex::new(map));
+        let mapping = LocalMapping::new(LocalMappingMode::Synchronous, Arc::clone(&map), camera());
+        assert!(mapping.submit(KeyframeJob {
+            imu_initialized: true,
+            imu_t_bc: None,
+            gravity_world: erase_gravity(),
+            local_ba: LocalBaParams {
+                outlier_erase,
+                ..LocalBaParams::default()
+            },
+            wheel_factors: Vec::new(),
+            tracked_inliers: 0,
+        }));
+        let (results, counts) = (mapping.drain_results(), mapping.counts());
+        drop(mapping);
+        let map = Arc::try_unwrap(map).ok().unwrap().into_inner().unwrap();
+        (map, landmark, results, counts)
+    };
+
+    let (map, landmark, results, counts) = run(chi_square_erase());
+    assert_eq!(map.get_keyframe(4).unwrap().map_point(6), None);
+    assert!(!map.map_points()[landmark].culled, "four views left");
+    assert_eq!(map.map_points()[landmark].observations().len(), 4);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].erase.unlinked, 1);
+    assert_eq!(
+        (counts.erase_unlinked, counts.erase_unlinked_newest),
+        (1, 1)
+    );
+    assert!(counts.erase_tested > 0);
+
+    let (off, _, results, counts) = run(OutlierErase::Off);
+    assert_eq!(results[0].erase, Default::default());
+    assert_eq!((counts.erase_tested, counts.erase_unlinked), (0, 0));
+    // Off is the plain merge and cull, link for link.
+    let (mut plain, _) = erase_cruise_map(20.0, 0);
+    let update = run_local_inertial_ba_with(
+        plain.ba_snapshot(&local_window_of(&plain, 3, [])),
+        &camera(),
+        None,
+        erase_gravity(),
+        &[],
+        &[],
+        &LocalBaParams::default(),
+    );
+    plain.apply_ba_update(update).unwrap();
+    crate::mapping::culling::cull_landmarks(&mut plain);
+    for (a, b) in off.keyframes().iter().zip(plain.keyframes()) {
+        assert_eq!(a.map_point_by_desc_idx, b.map_point_by_desc_idx);
+    }
+    assert_eq!(off.keyframes().len(), plain.keyframes().len());
+}

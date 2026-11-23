@@ -8,6 +8,7 @@
 
 use super::snapshot::KeyframeBaState;
 use crate::mapping::map::{BaUpdate, ImuFactor, Map};
+use crate::mapping::outlier_erase::EraseReport;
 use crate::pose_conversion::{apply_reference_pose_correction, rigid};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat15F64, SO3F64, Vec3F64};
@@ -657,6 +658,8 @@ pub struct LocalBaMergeResult {
     /// The propagation stopped at a re-seeded segment's first keyframe that
     /// a bridge edge reaches (card V, E-2).
     pub stopped_at_bridge: bool,
+    /// What the outlier erase after this merge did; zero when it is off.
+    pub erase: EraseReport,
 }
 
 impl Map {

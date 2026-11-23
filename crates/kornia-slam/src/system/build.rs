@@ -177,6 +177,7 @@ impl LocalBaConfig {
             recently_initialized: false,
             newest_marginal: false,
             dense_parallelism: self.dense_parallelism,
+            outlier_erase: self.outlier_erase,
         }
     }
 }

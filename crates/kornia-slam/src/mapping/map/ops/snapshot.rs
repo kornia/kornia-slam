@@ -7,6 +7,7 @@ use super::correction::{LocalBaMerge, StateEnvelope};
 use crate::mapping::map::{ImuFactor, Keyframe, Map, MapPoint};
 use crate::mapping::marginalization::MarginalPrior;
 use crate::mapping::online_calibration::OnlineCalibrationState;
+use crate::mapping::outlier_erase::{ErasedTested, OutlierLink};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat15F64, Vec3F64};
 use kornia_sensors::imu::{ImuBias, PreintegratedImu};
@@ -46,9 +47,11 @@ pub(crate) struct KeyframeBaState {
 
 /// Numerical output tied to its immutable capture and world epoch.
 ///
-/// Only numeric estimates and refreshed preintegrations can be published;
-/// observations, landmark lifetimes and other live structure are never copied
-/// back. An unchanged update is still an accepted local-mapping completion.
+/// Only numeric estimates and refreshed preintegrations are written by
+/// [`Map::apply_ba_update`]; observations, landmark lifetimes and other live
+/// structure are never copied back. The one structural output, the outlier
+/// links, is applied after the merge and only to links the live map still
+/// holds. An unchanged update is still an accepted local-mapping completion.
 #[derive(Debug)]
 pub struct BaUpdate {
     pub(crate) keyframes: Vec<KeyframeBaState>,
@@ -74,6 +77,9 @@ pub struct BaUpdate {
     /// The calibration state the next solve starts from, set by a calibrated
     /// solve; stored only if this update is applied.
     pub(crate) online_calibration: Option<OnlineCalibrationState>,
+    /// Snapshot links the solution rejects, erased after an accepted merge.
+    pub(crate) outlier_links: Vec<OutlierLink>,
+    pub(crate) erase_tested: ErasedTested,
 }
 
 /// Whether the solver ran on an update, for the run counters.
@@ -211,6 +217,8 @@ impl BaSnapshot {
             outcome: BaOutcome::default(),
             newest_marginal: None,
             online_calibration: None,
+            outlier_links: Vec::new(),
+            erase_tested: ErasedTested::default(),
         }
     }
 }

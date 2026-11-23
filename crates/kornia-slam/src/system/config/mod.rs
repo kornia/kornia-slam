@@ -15,6 +15,7 @@ use crate::mapping::global_vi_ba::{
 };
 use crate::mapping::map::{LocalBaMerge, StateEnvelope};
 use crate::mapping::marginalization::BoundaryPrior;
+use crate::mapping::outlier_erase::OutlierErase;
 use crate::mapping::vi_ba_schur::ImuHuber;
 use crate::mapping::visual_information::{FisheyeWeight, VisualInformation};
 use crate::mapping::{GrowthNeighbours, KeyframeSeed, LocalMappingMode};
@@ -590,6 +591,9 @@ pub struct LocalBaConfig {
     pub online_calibration: OnlineCalibrationConfig,
     /// Threads of VI-BA's dense factor and solves.
     pub dense_parallelism: DenseParallelism,
+    /// Unlink the observations a VI-BA solution rejects (ORB-SLAM3
+    /// `LocalInertialBA`); VI-BA only, needs the IMU.
+    pub outlier_erase: OutlierErase,
 }
 
 /// Calibration states the local VI-BA estimates online; each is off when `None`.
@@ -635,6 +639,7 @@ impl Default for LocalBaConfig {
             large_window: LargeWindow::Off,
             online_calibration: OnlineCalibrationConfig::default(),
             dense_parallelism: DenseParallelism::Global,
+            outlier_erase: OutlierErase::Off,
         }
     }
 }
@@ -888,6 +893,9 @@ impl fmt::Display for SystemConfig {
         }
         if ba.online_calibration.is_enabled() {
             writeln!(f, "  online calibration: {:?}", ba.online_calibration)?;
+        }
+        if ba.outlier_erase != OutlierErase::default() {
+            writeln!(f, "  local BA outlier erase: {:?}", ba.outlier_erase)?;
         }
         if let LoopClosingMode::Enabled {
             vocabulary,

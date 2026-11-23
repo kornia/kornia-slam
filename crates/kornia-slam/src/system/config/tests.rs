@@ -1433,12 +1433,100 @@ mod runtime_settings {
     }
 }
 
+/// R11b: the outlier erase prints its own header line, leaves the
+/// `local BA:` line's format alone, and is range checked.
+#[test]
+fn the_outlier_erase_is_named_in_the_header_and_range_checked() {
+    use crate::mapping::outlier_erase::{ChiSquareErase, OutlierErase};
+    let with = |outlier_erase| {
+        let mut config = SystemConfig {
+            sensors: sensors(CameraSelection::Stereo, true),
+            ..SystemConfig::default()
+        };
+        orb_mut(&mut config).mapping.local_ba.outlier_erase = outlier_erase;
+        config
+    };
+    assert!(
+        !with(OutlierErase::Off)
+            .to_string()
+            .contains("outlier erase")
+    );
+    let on = with(OutlierErase::ChiSquare(ChiSquareErase::default()));
+    assert_eq!(on.validate(), Ok(()));
+    assert!(on.to_string().contains(
+        "  local BA outlier erase: ChiSquare(ChiSquareErase { reprojection_chi2: 5.991, \
+         stereo_chi2: 7.815, close_factor: 1.5, close_range_m: 10.0 })\n"
+    ));
+    for rule in [
+        ChiSquareErase {
+            reprojection_chi2: 0.0,
+            ..ChiSquareErase::default()
+        },
+        ChiSquareErase {
+            stereo_chi2: f64::NAN,
+            ..ChiSquareErase::default()
+        },
+        ChiSquareErase {
+            close_factor: 0.5,
+            ..ChiSquareErase::default()
+        },
+        ChiSquareErase {
+            close_range_m: -1.0,
+            ..ChiSquareErase::default()
+        },
+    ] {
+        assert_eq!(
+            invalid_setting(&with(OutlierErase::ChiSquare(rule))).as_deref(),
+            Some("mapping.local_ba.outlier_erase"),
+            "{rule:?}"
+        );
+    }
+    let mut visual = on;
+    visual.sensors = sensors(CameraSelection::Stereo, false);
+    assert_eq!(
+        visual.validate(),
+        Err(ConfigError::InertialKnobWithoutImu(
+            "mapping.local_ba.outlier_erase"
+        ))
+    );
+}
+
 #[cfg(feature = "serde")]
 mod ron_files {
     use std::path::Path;
 
     use super::*;
     use crate::loop_closure::OdometryRandomWalk;
+
+    #[test]
+    fn the_outlier_erase_parses_to_orb_slam3s_thresholds() {
+        use crate::mapping::outlier_erase::{ChiSquareErase, OutlierErase};
+        assert_eq!(
+            orb(&parse("(version: 1)").unwrap())
+                .mapping
+                .local_ba
+                .outlier_erase,
+            OutlierErase::Off
+        );
+        let config = parse(
+            "(version: 1, sensors: (cameras: Stereo, imu: true), pipeline: OrbSlam((mapping: (local_ba: (outlier_erase: ChiSquare(()))))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).mapping.local_ba.outlier_erase,
+            OutlierErase::ChiSquare(ChiSquareErase {
+                reprojection_chi2: 5.991,
+                stereo_chi2: 7.815,
+                close_factor: 1.5,
+                close_range_m: 10.0,
+            })
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+        assert!(rejects_field(
+            "(version: 1, sensors: (cameras: Stereo, imu: true), pipeline: OrbSlam((mapping: (local_ba: (outlier_erase: ChiSquare((chi2: 3.0)))))))",
+            "chi2"
+        ));
+    }
 
     const EXPLICIT_DEFAULTS: &str = r#"
         (

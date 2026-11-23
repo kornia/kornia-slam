@@ -20,6 +20,7 @@ use crate::mapping::bundle_adjustment::{LargeWindow, LostKeyframes};
 use crate::mapping::global_vi_ba::OfflineBaConfig;
 use crate::mapping::map::StateEnvelope;
 use crate::mapping::marginalization::BoundaryPrior;
+use crate::mapping::outlier_erase::OutlierErase;
 use crate::mapping::{GrowthNeighbours, KeyframeSeed};
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
@@ -143,6 +144,11 @@ impl OrbSlamPipeline {
         if self.mapping.local_ba.online_calibration.is_enabled() && !sensors.imu {
             return Err(ConfigError::InertialKnobWithoutImu(
                 "mapping.local_ba.online_calibration",
+            ));
+        }
+        if self.mapping.local_ba.outlier_erase.is_enabled() && !sensors.imu {
+            return Err(ConfigError::InertialKnobWithoutImu(
+                "mapping.local_ba.outlier_erase",
             ));
         }
         validate_loop_closing(&self.loop_closing, sensors)?;
@@ -652,6 +658,12 @@ fn validate_local_ba(config: &LocalBaConfig) -> Result<(), ConfigError> {
         StereoDepthSigma::RelativeDepth(value) | StereoDepthSigma::Disparity { px: value } => {
             check(at("stereo_depth_sigma"), value, POSITIVE)?;
         }
+    }
+    if let OutlierErase::ChiSquare(rule) = config.outlier_erase {
+        check(at("outlier_erase"), rule.reprojection_chi2, POSITIVE)?;
+        check(at("outlier_erase"), rule.stereo_chi2, POSITIVE)?;
+        check(at("outlier_erase"), rule.close_factor, AT_LEAST_ONE)?;
+        check(at("outlier_erase"), rule.close_range_m, NON_NEGATIVE)?;
     }
     validate_online_calibration(&config.online_calibration)
 }

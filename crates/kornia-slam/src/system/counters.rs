@@ -94,6 +94,15 @@ pub struct RunCounters {
     /// Merges whose propagation stopped at a re-seeded segment's first
     /// keyframe that a bridge edge reaches (card V).
     pub ba_propagations_stopped_at_bridge: u64,
+    /// Local VI-BA outlier erase (G56): observations tested at accepted
+    /// merges and unlinked, the same on each solve's newest keyframe, the
+    /// landmarks retired, and links stale by the merge.
+    pub erase_tested: u64,
+    pub erase_unlinked: u64,
+    pub erase_tested_newest: u64,
+    pub erase_unlinked_newest: u64,
+    pub erase_landmarks_retired: u64,
+    pub erase_stale_links: u64,
     /// Frames tracked by the pose-inertial solve.
     pub pose_inertial_solves: u64,
     /// Of those, solves anchored at a keyframe rather than the previous frame.
