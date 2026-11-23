@@ -157,9 +157,53 @@ everything. R3, then R4 on top. R5 replaces part of R3, never both. R6 and R8 st
   (async default: 11.2 / 4.2 on MH_04). MH_04: tilt at 65-79 s ≤ 1.5°, loop `map_from_odometry` |t_y| ≤ 0.4 m,
   vertical RMS ≤ 0.10 m, causal ≤ 0.20 m, smoothed 0.08-0.13 m. Other sequences within ±15 %. Tracked unchanged.
   Mechanism counter: walk z p50 (`P/euroc/sessbias.py`).
+  - **S0 values for these (SYNC, starts 0/1/2, filled 2026-11-23 before the S1 runs, `E/r3/r3metrics.py`,
+    `E/r3/s0metrics.jsonl`):** walk z p50 accel / gyro: MH_04 6.25 / 6.25 / 6.39 and 2.54 / 2.54 / 2.44; over the
+    six R3 sequences accel 6.3-19.9, gyro 2.0-3.9. MH_04: absolute tilt median 65-79 s 3.74 / 3.74 / 3.39°
+    (at 70 s 3.65 / 3.65 / 3.27°); first loop `map_from_odometry` |t_y| 1.079 / 1.079 / 1.104 m; vertical RMS
+    after SE(3) alignment causal 0.264 / 0.264 / 0.274 m, smoothed 0.106 / 0.106 / 0.102 m (the prediction is read
+    on the causal output); causal 0.302 / 0.302 / 0.316 m; smoothed 0.226 / 0.226 / 0.240 m. Tracked 2032 / 2032 /
+    2031 of 2032 / 2032 / 2031.
 - **Kill rules:** K1 walk z holds and MH_04 tilt ≥ 3° at 70 s: the tilt is held by map rigidity; go to R5.
   K2 walk z holds, gain < 3 % everywhere: bias memory is not where EuRoC error enters (as card S on R_01).
   K3 any sequence worse > 15 %: knob stays off.
+- **Predictions, written before the S1 runs (2026-11-23; the debug agent's recommended arm from D1-D3,
+  commit 344feda, plus the R3 rows above; not re-worded after the runs).** Arm `S1` = S0 +
+  `mapping: ( local_ba: ( boundary_scales_bias_rows: false ) )`, SYNC, 900 s cap; header must show
+  `(bias rows full)` (`E/expect/S1.header`). Runs: V2_01, V1_02, MH_04, MH_01 (guard), V1_03, V2_02 × starts
+  0/1/2, plus one DEBUG V2_01 run to frame 450 (`E/debug/D4`). Smoothed and causal are SE(3) ATE RMSE, body
+  centre; "band" is the min..max of the 3 starts; tilt is absolute (as D1-D3).
+
+  | id | prediction (S1) | S0 baseline | measured by |
+  |---|---|---|---|
+  | P3.1 | V2_01 b_a step per keyframe over 19-22.5 s ≤ 0.01 m/s² | 0.02-0.07 (D3) | D4, `[vi_ba] STATE` (`E/debug/solves.py`) |
+  | P3.2 | V2_01 b_a error against GT at 22.3 s ≤ 0.3 m/s² | 0.63 (D3) | D4, `E/debug/viba_ba.py` |
+  | P3.3 | V2_01 causal tilt median 22-60 s ≤ 2.5° | 5.5-5.8° (D3 agent); 5.67 / 6.80 / 6.05° (`r3metrics.py`) | `r3metrics.py` |
+  | P3.4 | V2_01 smoothed ≤ 0.10 m | 0.109 / 0.124 / 0.110 | `score.py` |
+  | P3.5 | V1_02 tilt median 50-75 s ≤ 1.5°, smoothed ≤ 0.056 m | 2.2-2.7° (agent); 2.32° × 3; smoothed 0.056 × 3 | `r3metrics.py`, `score.py` |
+  | P3.6 | MH_01 smoothed ≤ 0.052 m (0.041-0.045 + 15 %) | 0.045 / 0.041 / 0.045 | `score.py` |
+  | P3.7 | MH_04 as R3: tilt 65-79 s ≤ 1.5°, \|t_y\| ≤ 0.4 m, causal vertical RMS ≤ 0.10 m, causal ≤ 0.20 m, smoothed 0.08-0.13 m | see S0 values above | `r3metrics.py`, `score.py` |
+  | P3.8 | accel and gyro walk z p50 ≤ 2.0 on all six (mechanism counter) | accel 6.3-19.9, gyro 2.0-3.9 | `sessbias.py` via `r3metrics.py` |
+  | P3.9 | V1_03, V2_02 smoothed median within ±15 % of S0 | 0.146, 0.159 | `score.py` |
+  | P3.10 | tracked unchanged (± 2 frames) on all six | `E/r0table.md` | `[summary]` |
+
+  Kill rules:
+  - KD1 b_a held (P3.1 step ≤ 0.01) and V2_01 tilt still ≥ 4° at 22-40 s: the tilt enters through the visual side
+    and the frozen past (G56, §9 b2). Go to the visual log line, then R12.
+  - KD2 b_a not held (step > 0.01): the 50-iteration-cap solves dominate; diagnose before R5.
+  - K1, K2, K3 as above (K3: any of the six sequences' smoothed median worse than S0's by > 15 %).
+  - Mechanism without score (theory incomplete): P3.8 and P3.1 pass but P3.4, P3.5 and P3.7 ATE all miss (K2 form).
+    Score without mechanism (luck or another cause): any ATE gain > 15 % with walk z p50 and P3.1 unchanged.
+
+  Recorded with no numeric prediction: χ² of the boundary IMU edges and iterations per solve (D4 against D3, and
+  `vi_ba_base_iterations / vi_ba_base_solves` on every run), keyframe shifts, b_a error against GT on the final
+  map keyframes (S0 medians: V2_01 0.89-1.05, V1_02 0.19, MH_04 0.15-0.17, MH_01 0.10-0.12, V1_03 0.19-0.30,
+  V2_02 0.37-0.38 m/s²).
+
+  Noise: the brief asked for an IMU time shift of ±50 µs per S0/S1 pair. The EuRoC source has no such knob at
+  c21299b (`EurocConfig` holds `data`, `start_frame`, `max_frames` only, `deny_unknown_fields`;
+  `imu_time_offset_ns` exists for LaMAria only, `A/main.rs:245-248`), so the band is the start offsets only.
+  It is degenerate: V1_02 has 1 distinct sample, MH_04 2. Verdicts on V1_02 and MH_04 are provisional.
 
 ### Experiment R3b: accel-bias priors (added 2026-11-23, `experiments/vi-ba-vs-basalt.md` §9 b1, c3)
 
