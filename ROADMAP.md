@@ -88,6 +88,23 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
   - Adding AllCameras still left 3219 unavailable.
   - **Cause:** `cameras: Stereo` runs flow on the left camera only. Multi-camera flow needs `Rig` mode (`system/mod.rs:320-324`). With 48 tracks per camera and `min_tracks: 48`, flow-only tracking works only on frames where every track survives.
   - 400-frame debug runs: 17 flow-only frames at 48 tracks; 141 at `per_camera: 96`. The preset arm is re-running at 96 tracks.
+- **EuRoC MH_04 diagnosed** (default 0.297 m against Basalt 0.114 and ORB-SLAM3 loops-off 0.070 over the full sequence; the README's 0.045 for ORB-SLAM3 covers only 80 % of frames, after 3 resets). Full report: `.pr180-fix/euroc/MH04-DIAGNOSIS.md`.
+  - **Tracking is clean:** 2032 of 2032 frames, one segment, scale 0.99-1.01, yaw within ±0.8°.
+  - **The error is one event plus a reporting convention.**
+    - In the dark section (56-68 s) roll and pitch error grows from 0.6° to 3.2-3.8° and stays there until the loop at 79.4 s. Basalt stays at or below 0.35°.
+    - The tilt turns horizontal motion into about 1.08 m of vertical drift. The vertical part is 0.265 of 0.306 m SE3, and the loop measures t_y -1.076 m.
+    - Cutting the trajectory at 65 s and 80 s takes the ATE from 0.306 to 0.131 m.
+  - **Ranked causes:**
+    1. The tilt is hidden in the accel bias, as on LaMAria 1_19.
+       - The accel-bias error lines up with the bias a tilt that size needs: cos 0.84 on default, 0.94-0.99 on the preset.
+       - Accel walk z p50 is 11.2 (about 1.5 expected).
+       - This is card AH's mechanism (G49, G35, G6), and card AH's EuRoC arm E1 tests it.
+    2. The causal trajectory keeps pre-loop drift (G53). Re-expressing on the final map gives 0.165 m.
+    3. Four dark-section keyframes carry a stale state (`ba_stale_keyframes=346`, `ba_propagated_keyframes=0`; G36). Their speed collapses to 0.23-0.26 m/s against GT 0.93-1.12.
+    4. The 10-keyframe preset makes cause 1 worse: tilt 4.4-4.9° and gyro walk z 15.2 (card W).
+    5. A small event near 43 s, not yet diagnosed.
+  - The 4-DoF loop correction cannot remove tilt.
+  - G50 and G51 cost nothing on MH_04: 36 frames without flow.
 - **Every reference tracks both stereo cameras** (Basalt, OpenVINS, VINS-Fusion, ORB-SLAM3, SLAM Dunk; file and line in G50). Our Stereo mode is the outlier, so on EuRoC we track with half the observations they use.
   - Next: a small EuRoC source change, so EuRoC can run as `cameras: Rig`, then Stereo against Rig on all 11 sequences (planning).
   - LaMAria configs already run `Rig` with AllCameras, so there it is a no-regression check.
