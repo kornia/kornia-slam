@@ -656,7 +656,7 @@ S0E SYNC 353-568 on the Vicon rooms.
 - Predictions:
   - P1 (mechanism): solves per keyframe ≥ 0.97 on every sequence.
   - P2 (mechanism): keyframes within 1.10x of S0E SYNC (start 0) on every sequence (V2_01 ≤ 389, V1_02 ≤ 448,
-    V1_03 ≤ 558, V2_02 ≤ 625, MH_04 ≤ 395, MH_01 ≤ 637).
+    V1_03 ≤ 546, V2_02 ≤ 618, MH_04 ≤ 395, MH_01 ≤ 637).
   - P3: BA solve mean ≤ 80 ms on every run.
   - P4: `[summary] frame_ms` p90 ≤ 50 ms on every run.
   - P5: causal mean within 1.2x of S0E SYNC on V2_01 (≤ 0.066) and V1_03 (≤ 0.086), and not worse than RT1E by more
