@@ -776,3 +776,95 @@ failures): `E/r0table.md`, second table.
 - **Against Basalt (smoothed median):** below on MH_01, MH_02, MH_03, MH_05 (0.57-0.77x); above on MH_04
   (1.98x), V1_01 (1.57x), V1_02 (1.23x), V1_03 (2.73x), V2_01 (2.82x), V2_02 (3.23x), V2_03 (1.90x). Against
   ORB-SLAM3: below on MH_02 only (0.82x); MH_01 0.98x.
+
+### Results: R3, arm S1 (`boundary_scales_bias_rows: false`) against S0 (2026-11-23)
+
+SYNC unpinned, 900 s cap, binary md5 `cea7646298a68ddb948b16835472b2e3`, 15:23-15:56, load 6-16 at start.
+18 S1 runs (6 sequences × starts 0/1/2), all `rc=0`, walls 87-258 s, header check clean on every run
+(`E/expect/S1.header` shows `(bias rows full)`). S1 V1_03 s1 was finished by `E/finish_claim.sh` after its
+second driver was stopped to free a slot for G56 (rc from the `[summary]` block). Debug run `E/debug/D4` = S1,
+V2_01, `max_frames: 450`, `--debug`, `KORNIA_SLAM_DEBUG=1`, rc 0, 51 s. No IMU time shift (no knob, see the
+predictions): the band is the starts only, so V1_02 has 1 sample and MH_04 2. Scores: `E/score.py`
+(`E/scores.jsonl`); mechanism: `E/r3/r3metrics.py` (`E/r3/s0metrics.jsonl`, `E/r3/s1metrics.jsonl`), table
+`E/r3/r3report.py` (`E/r3/r3table.md`); debug: `E/r3/d4stats.py`, `E/r3/vischi2.py`, `E/debug/viba_ba.py`,
+`E/debug/tilt_t.py`. SE(3) ATE RMSE, m, body centre; tilt absolute (as D1-D3).
+
+| seq | arm | causal s0 / s1 / s2 | smoothed s0 / s1 / s2 | smoothed median (band) | ÷ Basalt | tilt median (window) | causal vertical RMS | final-map b_a error median | walk z p50 accel / gyro | iterations per solve | shifts |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| V2_01 | S0 | 0.193 / 0.213 / 0.200 | 0.109 / 0.124 / 0.110 | 0.110 (0.109-0.124) | 2.82 | 5.67 / 6.80 / 6.05 (22-60 s) | 0.151-0.154 | 0.89-1.05 | 19.8 / 3.4 | 25.4-27.5 | 0 |
+| V2_01 | S1 | 0.174 / 0.144 / 0.149 | 0.120 / 0.108 / 0.108 | 0.108 (0.108-0.120) | 2.78 | 5.97 / 4.84 / 4.95 | 0.107-0.136 | 0.21-0.23 | 0.7 / 0.02 | 29.1-29.8 | 1 / 0 / 0 |
+| V1_02 | S0 | 0.102 × 3 | 0.056 × 3 | 0.056 (1 sample) | 1.24 | 2.32 × 3 (50-75 s) | 0.057 | 0.19 | 12.9 / 2.0 | 29.2 | 0 |
+| V1_02 | S1 | 0.127 × 3 | 0.058 × 3 | 0.058 (1 sample) | 1.30 | 1.20 × 3 | 0.041 | 0.22 | 0.2 / 0.02 | 28.6 | 0 |
+| MH_04 | S0 | 0.302 / 0.302 / 0.316 | 0.226 / 0.226 / 0.240 | 0.226 (0.226-0.240) | 1.98 | 3.74 / 3.74 / 3.39 (65-79 s) | 0.264-0.274 | 0.15-0.17 | 6.3 / 2.5 | 20.0-20.2 | 0 |
+| MH_04 | S1 | 0.327 / 0.327 / 0.308 | 0.245 / 0.245 / 0.235 | 0.245 (0.235-0.245) | 2.15 | 2.46 / 2.46 / 2.26 | 0.232-0.243 | 0.12 | 0.1 / 0.01 | 20.6-21.0 | 0 |
+| MH_01 | S0 | 0.090 / 0.086 / 0.094 | 0.045 / 0.041 / 0.045 | 0.045 (0.041-0.045) | 0.67 | 0.49 / 0.56 / 0.67 (all) | 0.036-0.053 | 0.10-0.12 | 11.1 / 2.7 | 18.7-19.9 | 0 |
+| MH_01 | S1 | 0.077 / 0.081 / 0.066 | 0.039 / 0.039 / 0.039 | 0.039 (0.039-0.039) | 0.58 | 0.50 / 0.52 / 0.47 | 0.043-0.046 | 0.09 | 0.3 / 0.01 | 19.3-19.7 | 0 |
+| V1_03 | S0 | 0.181 / 0.201 / 0.188 | 0.143 / 0.146 / 0.150 | 0.146 (0.143-0.150) | 2.75 | 1.66 / 2.38 / 1.79 (all) | 0.077-0.093 | 0.19-0.30 | 16.6 / 3.8 | 28.7-29.0 | 6 / 6 / 6 |
+| V1_03 | S1 | 0.487 / 0.224 / 0.221 | 0.192 / 0.155 / 0.162 | 0.162 (0.155-0.192) | 3.06 | 2.03 / 1.70 / 1.30 | 0.081-0.091 | 0.05-0.09 | 0.2 / 0.01 | 29.6-30.4 | 7 / 10 / 8 |
+| V2_02 | S0 | 0.176 / 0.162 / 0.161 | 0.097 / 0.160 / 0.159 | 0.159 (0.097-0.160) | 3.24 | 3.03 / 2.94 / 2.99 (all) | 0.103-0.110 | 0.37-0.38 | 15.6 / 3.0 | 25.3-25.7 | 0 |
+| V2_02 | S1 | 0.159 / 0.156 / 0.165 | 0.155 / 0.076 / 0.153 | 0.153 (0.076-0.155) | 3.12 | 1.18 / 1.33 / 1.46 | 0.099-0.101 | 0.19-0.20 | 0.2 / 0.01 | 26.0-26.3 | 0 |
+
+V1_03 S1 s0 is an outlier: causal 0.487, Sim3 scale 0.853. Tracked S1 against S0: equal except V2_01 s1
+(2268 against 2273), V1_03 s0/s1 (+2 / +1) and V1_03 s2 (2142 against 2146).
+
+D4 (S1) against D3 (S0), V2_01, frames 0-450 (`E/r3/d4stats.py`, `E/r3/vischi2.py`):
+
+| quantity | D3 S0 | D4 S1 |
+|---|---|---|
+| newest-keyframe b_a step per solve, 19-22.5 s (median / max, m/s²) | 0.036 / 0.072 | 0.0008 / 0.0012 |
+| b_a error against GT at 22.3 s | 0.63 | 0.05 |
+| local-BA b_a error, 0.5 s bins 15-22 s | 0.06 → 0.58 | 0.06 → 0.05 (flat) |
+| tilt per 1 s bin, 17 / 19 / 20 / 21 / 22 s (deg) | 0.21 / 0.85 / 1.53 / 5.27 / 6.01 | 0.44 / 1.01 / 1.95 / 6.24 / 6.83 |
+| visual mean χ² per observation, 20.5 / 21.0 / 21.5 / 22.0 s (px²) | 30.3 / 36.4 / 47.6 / 44.6 | 30.3 / 37.2 / 47.9 / 42.7 |
+| boundary IMU edge χ² p50 / p90, 5-19 s | 7.4 / 27.5 | 21.8 / 87.6 |
+| boundary IMU edge χ² p50 / p90, 19-22.5 s | 226 / 5816 | 1174 / 17168 |
+| interior IMU edge χ² p50 / p90, 19-22.5 s | 8.4 / 1280 | 15.4 / 13037 |
+| iterations per solve, 19-22.5 s (mean; solves at the 50 cap) | 44.6 (12 of 23) | 42.9 (9 of 23) |
+
+| P/K | prediction | baseline (S0) | measured (S1, each sample) | verdict |
+|---|---|---|---|---|
+| P3.1 | V2_01 b_a step per keyframe, 19-22.5 s ≤ 0.01 | 0.02-0.07 | median 0.0008, max 0.0012 (D4) | as predicted |
+| P3.2 | V2_01 b_a error at 22.3 s ≤ 0.3 | 0.63 | 0.046 (D4) | as predicted |
+| P3.3 | V2_01 tilt median 22-60 s ≤ 2.5° | 5.67 / 6.80 / 6.05 | 5.97 / 4.84 / 4.95 | missed |
+| P3.4 | V2_01 smoothed ≤ 0.10 | 0.109 / 0.124 / 0.110 | 0.120 / 0.108 / 0.108 | missed (median 0.108 sits inside the S0 band) |
+| P3.5 | V1_02 tilt 50-75 s ≤ 1.5°, smoothed ≤ 0.056 | 2.32°, 0.056 | 1.20°, 0.058 (1 distinct sample) | tilt as predicted; smoothed missed by 0.002 (provisional) |
+| P3.6 | MH_01 smoothed ≤ 0.052 | 0.045 / 0.041 / 0.045 | 0.039 × 3 | as predicted (below the S0 band) |
+| P3.7 | MH_04 tilt 65-79 s ≤ 1.5°, \|t_y\| ≤ 0.4, causal vertical RMS ≤ 0.10, causal ≤ 0.20, smoothed 0.08-0.13 | 3.74 / 3.74 / 3.39°; 1.079 / 1.079 / 1.104; 0.264-0.274; 0.302-0.316; 0.226-0.240 | 2.46 / 2.46 / 2.26°; 0.918 / 0.918 / 0.834; 0.243 / 0.243 / 0.232; 0.327 / 0.327 / 0.308; 0.245 / 0.245 / 0.235 | missed on all five (tilt −1.1 to −1.3°, ATE worse) |
+| P3.8 | walk z p50 ≤ 2.0, accel and gyro, all six | accel 6.3-19.9, gyro 2.0-3.9 | accel 0.1-0.7, gyro 0.01-0.02 | as predicted |
+| P3.9 | V1_03, V2_02 smoothed median within ±15 % | 0.146, 0.159 | 0.162 (+11 %), 0.153 (−4 %) | as predicted |
+| P3.10 | tracked unchanged ± 2 | - | V2_01 s1 −5, V1_03 s2 −4 | missed |
+| KD1 | b_a held and V2_01 tilt ≥ 4° at 22-40 s | 5.71 / 6.90 / 6.13° | b_a held (P3.1); tilt 6.13 / 4.96 / 5.08° | **kill fired** |
+| KD2 | b_a not held | - | held | not fired |
+| K1 | walk z holds and MH_04 tilt ≥ 3° at 70 s | 3.65 / 3.65 / 3.27° | 2.44 / 2.44 / 2.18° | not fired |
+| K2 | walk z holds, gain < 3 % everywhere | - | smoothed median change V2_01 −2 %, V1_02 +4 %, MH_04 +8 %, MH_01 −13 %, V1_03 +11 %, V2_02 −4 % | not fired (MH_01 gains 13 %) |
+| K3 | any sequence's smoothed median worse > 15 % | - | worst V1_03 +11 %, MH_04 +8 %; causal median worse > 15 % on V1_02 (+25 %) and V1_03 (+19 %), outside K3's wording | not fired |
+| mechanism without score | P3.8 and P3.1 pass; P3.4, P3.5, P3.7 ATE all miss | - | all three ATE predictions miss | **fired: theory incomplete** |
+| score without mechanism | ATE gain > 15 % with the mechanism unchanged | - | mechanism moved | not fired |
+
+**Diagnosis (KD1 and "mechanism without score" fired; written before anything else).**
+- The 1e-2 bias rows are the conduit of the bias walk: with them at full weight b_a stops moving (step 0.0008
+  m/s² per keyframe against 0.036, walk z 0.1-0.7 against 6-20 everywhere), and the final-map b_a error falls
+  on five of six sequences (V2_01 0.9-1.05 → 0.21-0.23, V2_02 0.37 → 0.19, V1_03 0.19-0.30 → 0.05-0.09).
+- They are not the source of the tilt. On V2_01 the tilt jump at 20-21 s is the same with b_a held: 1.95 → 6.24°
+  in D4 against 1.53 → 5.27° in D3. The visual mean χ² rises the same way in both (30 → 48 px² over 20.5-21.5 s),
+  so the driver is on the visual side (G56), as KD1 says. With b_a pinned, the disagreement goes into the IMU
+  edges instead: boundary χ² p50 226 → 1174 and interior χ² p90 1280 → 13037 over 19-22.5 s. Those edges then
+  lose to `IMU Huber AllEdges`, and the frozen past (§9 b2) keeps the tilted map. The IMU is pinned but
+  outvoted, not ignored.
+- After the event S1 recovers part of the tilt and S0 does not (V2_01 at 60-110 s: S1 3.4-5.9°, S0 7.0-8.7°).
+  Tilt falls on every tilted sequence (V1_02 2.32 → 1.20°, MH_04 3.4-3.7 → 2.3-2.5°, V2_02 3.0 → 1.2-1.5°).
+  ATE does not follow: MH_04 causal vertical RMS only 0.264 → 0.243 m, and MH_04, V1_02 and V1_03 get worse.
+  MH_04's first loop still carries |t_y| 0.83-0.92 m of vertical drift. So most of the vertical error is not
+  the steady tilt of the bias. Unverified: it is built during the dark span (57-67 s), when a visual-led
+  window drifts and the IMU edges are Huber-cut.
+- Ledger effect: G49's "tilt hidden in the accel bias" is refuted as the cause of lost score on EuRoC. The bias
+  carries the tilt only while it is free; pinning it moves the same error into Huber-cut IMU edges. The cause
+  moves to G56 (visual error model) and §9 b2 (frozen past).
+- Knob: stays off for now (mixed: MH_01 −13 %, V2_02 −4 %, V2_01 −2 %; MH_04 +8 %, V1_03 +11 %, V1_02 +4 %
+  smoothed, and causal +25 % on V1_02). Full weight is what ORB-SLAM3 and Basalt use, so S1 stays the
+  candidate base for the R11/R12 arms. It is not promoted without the full-sequence gate.
+- **Next rung (from KD1):** the visual log line (G56: per-solve reprojection χ² median and share above
+  `huber_reproj_px_sq`, running in the G56 chain), then R11 (visual σ / Huber). Then R12 (windowed
+  marginalization in place of the frozen past). The cheapest config-only arm to price first:
+  S1 + `imu_huber: BoundaryOnly` on V2_01 and MH_04. It tests whether the pinned IMU wins once the Huber
+  cut on its interior edges is removed (D4: interior χ² p90 13037).

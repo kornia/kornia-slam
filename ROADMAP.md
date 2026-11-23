@@ -53,6 +53,12 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
     V1_03/V2_02/V2_03) and P0.3 (V1_02 start-up skips, IMU coasts on V1_03/V2_01/V2_03). The app smoothed output
     equals the proxy on all 11. Loops lower the smoothed error on 11 of 11. The start-offset band is partly
     degenerate (starts 0 and 1 give identical output on MH_04/V2_03; all three on V1_02).
+  - **R3 S1 done: KD1 fired** (`experiments/euroc-top1-card.md` "Results: R3"; 18 SYNC runs plus debug D4).
+    - Full-weight boundary bias rows pin the accel bias: walk z p50 drops from 6-20 to 0.1-0.7, and the V2_01 b_a error at 22 s from 0.63 to 0.05 m/s².
+    - The V2_01 tilt jump at 20-21 s is unchanged (to 6.2°). Visual χ² rises the same way in both arms. The error moves into Huber-cut IMU edges.
+    - Tilt falls on MH_04, V1_02 and V2_02 (by 1.1-1.8°), but smoothed ATE moves only −13 % to +11 % (MH_01 0.039, MH_04 0.245, V2_01 0.108).
+    - G49 is refuted as the EuRoC score cause. The knob stays off. Next: the G56 visual log line, then R11, then R12; config-only probe S1 + `imu_huber: BoundaryOnly`.
+    - No IMU time-offset knob exists for EuRoC, so the band is the start offsets only (1-3 samples).
   - Body-centre re-score of the async runs: default fails V2_02 and V2_03 too (59.6 and 242.7 m, G54); the preset
     smoothed output reaches 0.055 and 0.462 there. The smoothed proxy equals the app output to 3 decimals on 5 runs.
 - **Re-plan: the global stage comes first, and the loss cards are paused** (owner, 2026-11-23).
