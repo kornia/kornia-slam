@@ -2958,6 +2958,17 @@ fn solve_vi_ba(
     // raw fisheye weights flatten it across the lens.
     if crate::debug_enabled() {
         let mut bins = [(0usize, 0.0f64); INCIDENCE_BINS];
+        // G56: the residual distribution behind the INCIDENCE means, by
+        // camera, pose (free or fixed) and landmark age. A landmark is young
+        // when the oldest keyframe of this solve that sees it is free.
+        let mut first_seen = vec![usize::MAX; n_pts];
+        for obs in observations.iter().filter(|o| o.pose_idx < n_kf) {
+            if let Some(first) = first_seen.get_mut(obs.point_idx) {
+                *first = (*first).min(obs.pose_idx);
+            }
+        }
+        let mut samples = Vec::with_capacity(observations.len());
+        let mut depth_chi2 = Vec::new();
         for (o, obs) in observations.iter().enumerate() {
             if obs.pose_idx >= n_kf || obs.point_idx >= n_pts {
                 continue;
@@ -2984,8 +2995,35 @@ fn solve_vi_ba(
             let bin = &mut bins[incidence_bin(obs_camera, obs.pixel)];
             bin.0 += 1;
             bin.1 += chi2;
+            let behind = (obs_pose * vec3_to_f32(xyz[obs.point_idx])).z <= 0.0;
+            samples.push(VisualSample {
+                chi2,
+                secondary: views.camera_index(o) != 0,
+                fixed_pose: kf_local[obs.pose_idx] < 0,
+                young: kf_local[first_seen[obs.point_idx]] >= 0,
+                behind,
+            });
+            if let Some(d_meas) = obs.depth_meas.filter(|_| depth_on[o]) {
+                let sigma = (obs.depth_sigma as f64).max(1e-6);
+                let (r_z, _, _) = depth_residual_and_jacobian(
+                    &se3s[obs.pose_idx],
+                    &xyz[obs.point_idx],
+                    d_meas as f64,
+                    sigma,
+                );
+                depth_chi2.push(r_z * r_z);
+            }
         }
         eprintln!("[vi_ba] INCIDENCE{}", incidence_chi2_line(&bins));
+        eprintln!(
+            "[vi_ba] VISRES{}",
+            visual_residual_line(
+                &mut samples,
+                &mut depth_chi2,
+                params.huber_reproj_px_sq,
+                params.huber_depth_sigma_sq
+            )
+        );
     }
     if let Some(i) = (0..n_kf).rev().find(|&i| kf_local[i] >= 0) {
         let (v, b) = (kfs[i].velocity, kfs[i].bias);
@@ -3182,6 +3220,103 @@ fn incidence_chi2_line(bins: &[(usize, f64)]) -> String {
             )
         })
         .collect()
+}
+
+/// One reprojection of the G56 debug line: its whitened chi² (px² at unit
+/// sigma) before Huber, and the groups it is counted in.
+struct VisualSample {
+    chi2: f64,
+    secondary: bool,
+    fixed_pose: bool,
+    young: bool,
+    behind: bool,
+}
+
+/// A named filter of [`VisualSample`]s.
+type SampleGroup = (&'static str, fn(&VisualSample) -> bool);
+
+/// `  <group> n=.. med=.. p90=.. p99=.. mean=.. out=..% in_mean=..` per
+/// non-empty group of `samples`, then the stereo depth rows in sigma. `med`,
+/// `p90` and `p99` are whitened residual norms (px at unit sigma), `out` the
+/// share above `huber_px_sq`, `in_mean` the mean chi² of the others.
+fn visual_residual_line(
+    samples: &mut [VisualSample],
+    depth_chi2: &mut [f64],
+    huber_px_sq: f64,
+    huber_depth_sq: f64,
+) -> String {
+    samples.sort_by(|a, b| a.chi2.total_cmp(&b.chi2));
+    let groups: [SampleGroup; 7] = [
+        ("all", |_| true),
+        ("left", |s| !s.secondary),
+        ("right", |s| s.secondary),
+        ("free", |s| !s.fixed_pose),
+        ("fixed", |s| s.fixed_pose),
+        ("young", |s| s.young),
+        ("old", |s| !s.young),
+    ];
+    let mut line: String = groups
+        .iter()
+        .filter_map(|(name, keep)| {
+            let chi2: Vec<f64> = samples.iter().filter(|s| keep(s)).map(|s| s.chi2).collect();
+            chi2_summary(&chi2, huber_px_sq).map(|summary| format!("  {name}{summary}"))
+        })
+        .collect();
+    let behind = samples.iter().filter(|s| s.behind).count();
+    line.push_str(&format!("  behind={behind}"));
+    depth_chi2.sort_by(f64::total_cmp);
+    if let Some(summary) = chi2_summary(depth_chi2, huber_depth_sq) {
+        line.push_str(&format!("  depth{summary}"));
+    }
+    line
+}
+
+/// ` n=.. med=.. p90=.. p99=.. mean=.. out=..% in_mean=..` of ascending
+/// `chi2`; `None` when empty.
+fn chi2_summary(chi2: &[f64], huber_sq: f64) -> Option<String> {
+    let n = chi2.len();
+    if n == 0 {
+        return None;
+    }
+    let norm_at = |p: f64| chi2[((p * n as f64) as usize).min(n - 1)].sqrt();
+    let inliers: Vec<f64> = chi2.iter().copied().filter(|&c| c <= huber_sq).collect();
+    let in_mean = inliers.iter().fold(0.0, |sum, c| sum + c) / inliers.len().max(1) as f64;
+    Some(format!(
+        " n={n} med={:.3} p90={:.3} p99={:.3} mean={:.3} out={:.1}% in_mean={in_mean:.3}",
+        norm_at(0.5),
+        norm_at(0.9),
+        norm_at(0.99),
+        chi2.iter().sum::<f64>() / n as f64,
+        100.0 * (n - inliers.len()) as f64 / n as f64,
+    ))
+}
+
+#[cfg(test)]
+mod visual_residual_tests {
+    use super::{VisualSample, visual_residual_line};
+
+    #[test]
+    fn groups_split_the_residual_tail_from_the_core() {
+        let sample = |chi2: f64, young: bool| VisualSample {
+            chi2,
+            secondary: false,
+            fixed_pose: !young,
+            young,
+            behind: false,
+        };
+        let mut samples = [sample(100.0, true), sample(1.0, false), sample(4.0, false)];
+        let mut depth = [16.0, 1.0];
+        assert_eq!(
+            visual_residual_line(&mut samples, &mut depth, 25.0, 9.0),
+            "  all n=3 med=2.000 p90=10.000 p99=10.000 mean=35.000 out=33.3% in_mean=2.500  \
+             left n=3 med=2.000 p90=10.000 p99=10.000 mean=35.000 out=33.3% in_mean=2.500  \
+             free n=1 med=10.000 p90=10.000 p99=10.000 mean=100.000 out=100.0% in_mean=0.000  \
+             fixed n=2 med=2.000 p90=2.000 p99=2.000 mean=2.500 out=0.0% in_mean=2.500  \
+             young n=1 med=10.000 p90=10.000 p99=10.000 mean=100.000 out=100.0% in_mean=0.000  \
+             old n=2 med=2.000 p90=2.000 p99=2.000 mean=2.500 out=0.0% in_mean=2.500  \
+             behind=0  depth n=2 med=4.000 p90=4.000 p99=4.000 mean=8.500 out=50.0% in_mean=1.000"
+        );
+    }
 }
 
 #[cfg(test)]
