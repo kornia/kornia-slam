@@ -373,3 +373,19 @@ parallel (one per pair, the 2-job throttle held). Header check clean on all four
   a different load and is not confirmed.
 - **Next (owner's call):** a quiet machine (load ≤ 6) for R0, a larger cap for SYNC runs (outputs do not depend
   on load, only wall does), or R4's solver budget in the base.
+
+### Results: P0.1 determinism, 900 s SYNC cap (2026-11-23)
+
+Unpinned SYNC, cap 900 s, load 3-10. Header check clean on all four runs.
+
+| run | rc | wall s | load at start |
+|---|---|---|---|
+| `S0_MH_04_difficult_s0_r1` | 0 | 116 | 3.1 |
+| `S0_MH_04_difficult_s0_r2` | 0 | 116 | 8.8 |
+| `S0_V1_02_medium_s0_r1` | 0 | 170 | 3.1 |
+| `S0_V1_02_medium_s0_r2` | 0 | 132 | 10.2 |
+
+- **P0.1 as predicted:** `cmp` prints nothing for `traj.txt` and `traj_smoothed.txt` on both pairs. K0.1 does
+  not fire.
+- At load 3-10 every wall is well under 300 s: the earlier K0.2 stops were caused by load 15-33, not by the
+  pipeline. R0 arms started 14:21.
