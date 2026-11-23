@@ -136,3 +136,21 @@ All arms: tracked = frames = 400, no give-up. rp48 flow_secondary_inliers / flow
 
 Run times: the laptop suspended from 09:33:25 to 13:42:01 (lid closed, 14916 s). B1 and sdef MH_01 r1 ran
 across it. Their recorded walls (15738 s, 15042 s) include it; corrected about 822 s and 126 s.
+
+### Decisions after S2 (coordinator, 2026-11-23, per the owner-approved EuRoC top-1 master plan)
+- B2 accepted on the synchronous variant. Synchronous local mapping is the A/B instrument, because the
+  async default arm does not repeat itself (above).
+- Sweep mode changes from the card: every arm runs with `mapping: ( execution: Synchronous )`, all rayon
+  threads, unpaced, 900 s cap per run (owner raised the cap for synchronous runs only). sp48/rp48 switch
+  their `execution: Asynchronous` to `Synchronous`; nothing else in the arms changes.
+  Arms sdef, rdef, sp48, rp48 on all 11 sequences (rdef on all 11 too).
+- Noise: synchronous runs are deterministic, so plain repeats are useless; start_frame 0/1/2 on MH_01,
+  MH_03, V1_02 for every arm (24 extra runs).
+- K5 for this sweep is the 900 s cap.
+- The sweep waits for the top-1 harness's R0 baseline (`.pr180-fix/euroc-top1/lists/r0.txt`), then runs at most
+  2 kornia-slam processes. Driver `$E/drive_sync.sh sweep.txt`, run dirs `$E/sync/<arm>_<seq>_s<start>_r1`.
+- Scoring follows G55: body-frame `traj.txt` (and `traj_smoothed.txt`) through `euroc-top1/score.py`, never the
+  `--evaluate` csv. The 400-frame ATE and scale figures above came from `kornia_slam_raw.csv`, the camera
+  centre. They compare arms against each other on one footing but are not body-frame scores; the rdef
+  scale watch item is re-read on `traj.txt` at full length.
+- Stop at S3 with the P/K table.
