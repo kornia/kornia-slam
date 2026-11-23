@@ -1080,3 +1080,150 @@ Config-only diagnostic, 10 px pre-drop off (`outlier_px: 1000.0`), `E/r6/nopre_*
 - **Synchronous runs:** stay the A/B mechanism instrument (deterministic, fast to compare). They no longer carry the score.
 - **Smoothed and offline-global trajectories:** reported only as "benchmark-style (non-causal)", next to ORB-SLAM3 and SLAM Dunk, which also score that way. R6 measures the ceiling of a global solve under this label.
 - **Gate:** each batch of winners runs on all 11 sequences in the real-time replay, 3 runs (async runs differ run to run), at load ≤ 6. Pass = causal median below the baseline band max on every sequence, plus tracked frames and give-up counts.
+
+### Results: R11b, post-solve outlier erase (S0E), with S0O, S1E and S0P (2026-11-23)
+
+Code: `feat/r11b-outlier-erase` 71a68f9 (on `feat/global-pose-graph` a0c08d6 + the VISRES commit), knob
+`mapping.local_ba.outlier_erase`, default `Off`. Binary `E/bin-r11b/kornia-slam-euroc`, md5
+`e67615adaf558b4aef7b7d1e35a2fb40`. SYNC unpinned, 900 s cap, 2 runs at a time, 17:19-19:45, load 3-14.
+92 batch runs (S0 starts 30/60 on V1_02 and MH_04 with the new binary, knob off: 4; S0E, S0O, S1E, S0P: 22
+each = 6 sequences × starts 0/1/2, plus starts 30/60 on V1_02 and MH_04), all `rc=0`, walls 104-251 s, header
+check clean on every run (`E/expect/S0E.header` shows `local BA outlier erase: ChiSquare(...)`, `S1E` adds
+`(bias rows full)`, `S0O` `visual information OctaveScaled`, `S0P` `keyframe observations: PnpInliers`).
+Debug runs (`--debug`, `KORNIA_SLAM_DEBUG=1`): `E/debug/R11b-V102` (S0E V1_02 full), `R11b-MH01` (S0E MH_01
+400), `R11b-V201` (S0E V2_01 450), `R11b-S0O-V102` (S0O V1_02 full), `R11b-S0-MH04` and `R11b-S0E-MH04`
+(MH_04 full). Each full debug trajectory is `cmp`-identical to its batch run. Scores: `E/score.py`
+(`E/r11b/scores.jsonl`); tables `E/r11b/report.py` (`E/r11b/report_all.md`); P4 `E/r11b/kfpieces.py`; tilt
+`E/r11b/tiltwin.py` over `E/debug/tilt_t.py`; MH_04 error by time `E/r11b/errtime.py`. SE(3) ATE RMSE, m, body
+centre. Per the owner decision of 2026-11-23 the causal output (`traj.txt`) is the primary column; smoothed is
+non-causal (benchmark-style).
+
+**Bit-identity, knob off:** S0 V1_02 (`E/r11b/ident-V1_02`): `traj.txt` and `traj_smoothed.txt` `cmp`-identical
+to `E/runs/S0_V1_02_medium_s0_r1`, header identical to `E/expect/S0.header`. R_01 (`E/r11b/ident-r01`,
+`RAYON_NUM_THREADS=1`): md5 `d4f77b567b912b5a4caa2af6085a35b1`, `cmp`-identical to `P/baseline/traj.txt`. Both
+print `erase_tested=0 erase_unlinked=0`.
+
+**Arms against S0, S1 and Basalt.** Median over starts 0/1/2 and, for V1_02 and MH_04, over all five starts.
+Bands are min-max over starts; S0 has 5 starts on V1_02 and MH_04, S1 3.
+
+| seq | Basalt | S0 causal band | S0E causal (med) | S0O causal | S1E causal | S0P causal | S0 smoothed band | S0E smoothed | S0O smoothed | S1E smoothed | S0P smoothed |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| V2_01 | 0.039 | 0.193-0.213 | **0.055** (0.052-0.058) | 0.146 | 0.077 | 0.050 | 0.109-0.124 | 0.047 | 0.098 | 0.043 | 0.044 |
+| V1_02 | 0.045 | 0.069-0.387 | **0.040** (0.040-0.151) | 0.067 | 0.055 | 0.063 | 0.050-0.203 | 0.038 | 0.060 | 0.040 | 0.046 |
+| V1_03 | 0.053 | 0.181-0.201 | **0.072** (0.069-0.080) | 0.186 | 0.101 | 0.118 | 0.143-0.150 | 0.063 | 0.126 | 0.092 | 0.087 |
+| V2_02 | 0.049 | 0.161-0.176 | **0.080** (0.080-0.084) | 0.181 | 0.095 | 0.120 | 0.097-0.160 | 0.079 | 0.166 | 0.092 | 0.115 |
+| MH_04 | 0.114 | 0.302-0.324 | **0.325** (0.311-0.342) | 0.361 | 0.362 | 0.254 | 0.226-0.265 | 0.250 | 0.335 | 0.238 | 0.179 |
+| MH_01 | 0.067 | 0.086-0.094 | **0.072** (0.072-0.076) | 0.073 | 0.068 | 0.057 | 0.041-0.045 | 0.036 | 0.043 | 0.033 | 0.028 |
+
+S0E causal ÷ Basalt: V2_01 1.41, V1_02 0.89, V1_03 1.34, V2_02 1.63, MH_04 2.84, MH_01 1.07 (S0 causal median of starts 0-2: 5.13, 2.24,
+3.52, 3.28, 2.65, 1.34). V1_02 starts 30/60: S0 0.069/0.387, S0E 0.043/0.151 causal.
+
+**Run health (K3 inputs, S0E against S0, same start):** tracked −2 to +1 frames on every run, give-ups 0 on all
+88 arm runs. Keyframes 0.69-0.86x of S0 (fewer, not more). Map points per keyframe (last `pts=` ÷ keyframes):
+−14 % worst (V1_03 s0 86.2 against 100.2), +8 % best. Loops accepted 2-10 against 2-9. `ba_solve_ms` S0E
+28-99 s against 29-109 s. `frame_ms p90` 137-345 ms against 104-348 ms (SYNC, load 6-14: not a real-time
+figure). Erase: 4-22 k landmarks retired per run, `erase_stale_links` 0 everywhere (SYNC has no stale update).
+
+**Debug runs (mechanism).**
+
+| run | VISRES out % | mean χ² | in_mean | tested | unlinked newest / tested newest | unlinked older / tested older | tilt bin 21 s |
+|---|---|---|---|---|---|---|---|
+| V1_02 full, S0 (`G56a`) | 11.8 | 25.11 | 3.40 | - | - | - | - |
+| V1_02 full, S0E | 1.1 | 3.62 | 1.63 | 2139862 | 11.6 % | 3.3 % | - |
+| V1_02 full, S0O | 8.8 | 17.95 | 2.24 | - | - | - | - |
+| MH_01 400, S0 (`G56b`) | 8.4 | 16.44 | 3.35 | - | - | - | - |
+| MH_01 400, S0E | 0.6 | 2.45 | 1.68 | 415239 | 11.1 % | 2.1 % | - |
+| MH_04 full, S0 | 14.6 | 26.83 | 3.87 | - | - | - | - |
+| MH_04 full, S0E | 1.0 | 3.31 | 1.58 | 1192705 | - | - | - |
+| V2_01 450, S0 (D3) / S0E | - / 1.5 | - / 3.51 | - / 1.76 | - | - | - | 5.27 / 1.38° |
+
+Per-solve erase share (ERASE lines): V1_02 p50 4.1 %, p90 6.6 %, max 16.3 % (one solve); V2_01 450 p50 8.3 %,
+p90 13.0 %, max 16.7 % (kf 431, 434 at 21.5 s); MH_01 p50 2.9 %, max 7.9 %. No mass erase: no solve above 17 %.
+`depth_nonpositive` 0 and `guard_skipped` 0 on all three.
+
+| P/K | prediction | baseline | measured | verdict |
+|---|---|---|---|---|
+| P1 | V1_02 out ≤ 3 %, mean χ² ≤ 5, in_mean 2.0-2.8 | 11.8 %, 25.1, 3.40 | 1.1 %, 3.62, 1.63 | missed on in_mean (below the range); out and mean as predicted |
+| P2 | MH_01 400 out ≤ 2 %, mean χ² ≤ 4 | 8.4 %, 16.4 | 0.6 %, 2.45 | as predicted |
+| P3 | newest unlinked 5-15 %; older < 2 % | - | debug: newest 11.6 / 11.1 %, older 3.3 / 2.1 % (V1_02 / MH_01). Batch: newest 8.4-16.0 % (above 15 on V2_01, V1_03, V2_02, MH_04), older 1.4-6.1 % (below 2 only on MH_01) | missed |
+| P4 | V1_02 keyframe-only 10 s piece median ≤ 0.019 | 0.0226 (s0), 0.0228 (s30), 0.0443 (s60) | 0.0105, 0.0123, 0.0172 | as predicted on every start |
+| P5 | MH_01 inside its S0 band; no sequence lost or above its S0 band | smoothed 0.041-0.045 | MH_01 0.034-0.037 smoothed (below the band), 0.072-0.076 causal (below 0.086); no loss; no smoothed median above the S0 band max; causal MH_04 median of 5 0.325 against max 0.324 | missed by letter (MH_01 below, not inside; MH_04 causal +0.0005 m) |
+| P6a | V1_02 0.045-0.054, ÷ Basalt 1.00-1.20 | smoothed 0.056 (1 sample); causal 0.102 | smoothed 0.038 (0.84x); causal 0.040 (0.89x) | missed (better than the range), both columns |
+| P6b | V2_01 0.070-0.100 | 0.110; causal 0.193-0.213 | smoothed 0.047; causal 0.055 | missed (better), both |
+| P6c | V1_03 0.115-0.146 | 0.146; causal 0.181-0.201 | smoothed 0.063; causal 0.072 | missed (better), both |
+| P6d | V2_02 median ≤ 0.150, every start ≤ 0.160 | 0.159; causal 0.161-0.176 | smoothed 0.079 (max 0.082); causal 0.080 (max 0.084) | as predicted, both |
+| P6e | MH_04 0.200-0.240 | 0.226 (0.226-0.265 over 5 starts); causal 0.302-0.324 | smoothed 0.250 (0.250-0.266); causal 0.311 (0-2) / 0.325 (5) | missed, both (unchanged within the start band) |
+| P6f | MH_01 0.036-0.045 | 0.045; causal 0.086-0.094 | smoothed 0.036; causal 0.072 | as predicted on smoothed; missed on causal (0.072 is outside the range, though below S0) |
+| P6g | causal median not above the S0 band max, all six | - | V2_01 0.055/0.213, V1_02 0.040/0.387, V1_03 0.072/0.201, V2_02 0.080/0.176, MH_01 0.072/0.094; MH_04 0.3246 against 0.3241 (5 starts), 0.311 against 0.316 (starts 0-2) | missed on MH_04 by 0.0005 m over 5 starts |
+| P7 | V2_01 tilt bin 21 s ≤ 3.5°; median 22-60 s ≤ 4.0° | 5.27°; 5.68 / 6.83 / 6.08° | 1.38° (debug); batch 1.38 / 1.08 / 1.40° and 1.30 / 1.23 / 1.48° | as predicted |
+| P8 | S0O V1_02 out 8.0-11.8 %; smoothed medians within ±10 % of S0 | 11.8 % | out 8.8 %; smoothed V2_01 −11 %, V1_02 +7 %, V1_03 −14 %, V2_02 +4 %, MH_04 +54 %, MH_01 +2 % | out as predicted; medians missed (V2_01, V1_03, MH_04) |
+| P9 | S1E V2_01 smoothed 0.060-0.095, MH_01 ≤ 0.045, no sequence above max(S0, S1) band | - | V2_01 0.043; MH_01 0.033; smoothed all inside; causal MH_04 0.362 against max 0.327 | missed (V2_01 better than the range; MH_04 causal above) |
+| K1 | out ≤ 3 % and P4 not met | - | P4 met | not fired |
+| K2 | P4 met and out > 6 % | - | out 1.1 % | not fired |
+| K3 | tracking loss, keyframes up > 10 %, or map points per keyframe down > 25 % | - | no loss; keyframes 0.69-0.86x; worst map points per keyframe −14 % | not fired |
+
+**Diagnosis of the misses (owner rule; written before anything else; unverified parts marked).**
+- **P6a-c, P6b and P9 better than their ranges.** The predictions credited the erase with the keyframe
+  precision gap only (the 10 s pieces). It also removes the V2_01 tilt event: the 21 s tilt bin falls from 5.27°
+  to 1.08-1.40° and the 22-60 s median from 5.7-6.8° to 1.2-1.5°. The visual χ² rise that KD1 found behind the
+  tilt (R3) is this tail: per-solve erase share peaks at 13-17 % on V2_01 at 21.5 s. So the tail drove the drift
+  on the Vicon rooms too, and the score moved by the drift term, not only by precision. The largest gains are on
+  causal (V2_01 0.200 → 0.055, V1_03 0.188 → 0.072, V2_02 0.162 → 0.080), where drift dominates.
+- **P6e, P6g and P5 on MH_04: mechanism moved, score did not.** MH_04 out 14.6 % → 1.0 %, mean χ² 26.8 → 3.3,
+  yet causal 0.302 → 0.311 (s0) and smoothed 0.226 → 0.250. The S0 5-start band (0.226-0.265 smoothed,
+  0.302-0.324 causal) holds the S0E values, so MH_04 is unchanged within start noise. The error by 10 s bin
+  (whole-run SE(3) alignment, causal) is the same in both arms: 0.48/0.45 m at 40-50 s and 0.63/0.65 m at
+  70-80 s, after the dark span (57-67 s). The tail is not what builds MH_04's error. S0P lowers every bin
+  (0.40 and 0.53 m there; causal 0.254). Unverified: on MH_04 the mismatches do their damage in the newest
+  keyframe's first solve, before any erase, and the dark span leaves too few correct rows to absorb it.
+- **P6f causal.** The range was written for the smoothed column; causal MH_01 0.072 is 20 % below the S0 causal
+  band, not a regression.
+- **P1 in_mean below 2.0-2.8.** in_mean is the mean χ² of rows under the 25 px² Huber knee. The erase removes
+  the 6-25 px² shoulder as well (the test is at 2.45-3.0 px). With the shoulder gone, a 2-dof χ² at the
+  measured σ (median 0.84 px → σ ≈ 0.71 px) gives in_mean about 1.6. The prediction kept the shoulder.
+- **P3 above both bounds.** The older-row bound (< 2 %) sat below the floor written next to it in the card
+  ("about 5 % of correct rows fail a 95 % test once"). Older rows are tested again in every solve while they are
+  in the window (3 free keyframes plus fixed context), so correct rows keep failing at that rate. Measured
+  older shares of 1.4-6.1 % lie at that floor. Newest shares of 15.5-16.0 % on four sequences are 0.5-1 point over
+  the 15 % bound; they track the tail size of each sequence (MH_01 8.4 %, V2_02 15.8 %). The bound was too
+  tight, not the mechanism wrong.
+- **P8 medians.** S0O (octave σ) shrinks the tail only to 8.8 % (as predicted: mismatches do not shrink with
+  octave σ) but moves scores both ways: −11 to −14 % on V2_01 and V1_03, +54 % on MH_04 (smoothed 0.347;
+  causal 0.361). It also scales the tracking PnP gates (system/build.rs:199). Unverified: on MH_04 the looser
+  gates for coarse octaves admit more mismatches into tracking. S0O is not pursued alone.
+
+**Further findings.**
+- **S0P (`keyframe_observations: PnpInliers`, config only) takes most of the gain without the erase:** causal
+  V2_01 0.050, V1_02 0.063, V1_03 0.118, V2_02 0.120, MH_04 0.254, MH_01 0.057. It beats S0E on V2_01, MH_04
+  (both columns) and MH_01, and loses on V1_02, V1_03 and V2_02 (causal). The mismatches enter mostly at tracking
+  (ORB-SLAM3 keeps them on purpose and erases later; with our 3-keyframe window that ordering loses on MH_04).
+  The arms are complementary in where they win; S0P + S0E stacked is the obvious next arm (not run: stacking
+  is outside this rung).
+- **S1E (full-weight bias rows + erase)** is near S0E on smoothed (V2_01 0.043, MH_01 0.033) but worse on causal
+  everywhere except MH_01 (V2_01 0.077, V1_03 0.101, MH_04 0.362). KD1's follow-up: S1 does not add to the erase.
+- **Start offsets 30 and 60 widen the S0 band a lot on V1_02:** S0 causal 0.069 (s30) and 0.387 (s60) against
+  0.102 at starts 0-2. The single-sample band of R0 understated V1_02's noise. S0E s60 is also the worst S0E
+  start (causal 0.151, smoothed 0.101).
+- **Real-time check (owner decision 2026-11-23; `E/r11b/rt.sh`, `E/r11b/rtreport.py`, `E/r11b/rt_table.md`).**
+  S0 (`RT0`) and S0E (`RT0E`) with asynchronous mapping, `--pace-timestamps`, `taskset -c 0,1`, start 0, 2 runs
+  each, one run at a time, started at load 3.3-5.6 with fewer than 2 `kornia-slam*` processes (another job's
+  `offline-ba` process shared the machine for part of it). All 12 `rc=0`, headers show `local mapping:
+  asynchronous` and, for RT0E, the erase line. Causal (primary) r1 / r2, then smoothed (non-causal):
+
+  | seq | S0 causal | S0E causal | S0E causal mean ÷ Basalt | S0 smoothed | S0E smoothed | stale kf S0 / S0E | keyframes S0 / S0E |
+  |---|---|---|---|---|---|---|---|
+  | V1_02 | 0.405 / 0.258 | 0.115 / 0.169 | 3.13 (S0 7.30) | 0.114 / 0.131 | 0.081 / 0.069 | 416-421 / 357-374 | 498-500 / 474-476 |
+  | V2_01 | 0.610 / 0.616 | 0.078 / 0.087 | 2.12 (S0 15.72) | 0.213 / 0.423 | 0.095 / 0.068 | 399-424 / 295-304 | 560-568 / 488 |
+  | MH_04 | 0.329 / 0.339 | 0.322 / 0.312 | 2.78 (S0 2.93) | 0.302 / 0.260 | 0.266 / 0.237 | 163-185 / 50-82 | 480-481 / 374-381 |
+
+  - The SYNC ranking holds in real time: V2_01 causal 0.61 → 0.08, V1_02 0.33 → 0.14 (means), MH_04 unchanged
+    (0.33 → 0.32). Tracked 1683-2274 frames, the same in both arms.
+  - Real time is worse than SYNC in both arms on V1_02 (S0E 0.115-0.169 against 0.040) and V2_01 (0.078-0.087
+    against 0.055): the async worker leaves 295-424 keyframes stale per run (G54), and erases nothing on them
+    until their own window. `erase_stale_links` stays 0 (RT0E V1_02 r1: 108161 unlinked).
+  - Neither arm keeps the sensor rate on 2 cores: `frame_ms p90` 54-77 ms against the 50 ms frame period, and
+    walls 104-180 s against 85-114 s of data (vocabulary load included). Not diagnosed here; it is the same in
+    both arms, and S0E is not slower (p90 −1 to −7 ms, walls −14 to −29 s, fewer keyframes).
+- **Verdict:** G56 is confirmed as a score source on the Vicon rooms and V1_02 (causal median gains 2.0-3.7x on
+  V2_01, V1_02, V1_03, V2_02; V1_02 below Basalt on both columns), refuted on MH_04, neutral-to-better on MH_01. The knob stays off until the gate
+  (all 11, real-time replay, 3 runs, load ≤ 6) and the full-sequence LaMAria guard.

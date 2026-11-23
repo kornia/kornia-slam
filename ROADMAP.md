@@ -23,6 +23,19 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 
 ### 2026-11-23
 
+- **R11b: the local VI-BA outlier erase (G56) closes most of the Vicon-room gap** (`experiments/euroc-top1-card.md`
+  "Results: R11b"; branch `feat/r11b-outlier-erase`, knob `mapping.local_ba.outlier_erase`, default off,
+  bit-identical when off on V1_02 and R_01).
+  - ORB-SLAM3's `LocalInertialBA` rule after each accepted merge: unlink observations whose whitened residual fails
+    the solve's own 95 % χ² test, retire landmarks left at weighted count ≤ 2.
+  - SYNC, causal median of 3 starts, S0 → S0E: V2_01 0.200 → 0.055, V1_02 0.102 → 0.040 (below Basalt), V1_03
+    0.188 → 0.072, V2_02 0.162 → 0.080, MH_01 0.090 → 0.072. MH_04 unchanged (0.302 → 0.311): the tail goes, the
+    error built after the dark span stays.
+  - The V2_01 tilt event at 21 s goes away (5.3 → 1.4°): the visual tail was the driver KD1 pointed to.
+  - Config-only `keyframe_observations: PnpInliers` gets most of the gain on its own and is better on MH_04 (0.254).
+    Octave σ alone does not help. No kill rule fired; misses are diagnosed in the card (most were better than the
+    predicted ranges).
+  - Next: S0P + S0E stacked, then the real-time gate on all 11 (paced, async, 2 cores, 3 runs), then LaMAria.
 - **EuRoC top-1 comes before LaMAria** (owner, 2026-11-23; master card `experiments/euroc-top1-card.md`).
   - **Goal:** one stereo+IMU config, 100 % tracked, below Basalt on all 11 EuRoC sequences (M1), then below
     ORB-SLAM3 (M2).
