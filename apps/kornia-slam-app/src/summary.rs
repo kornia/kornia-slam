@@ -56,6 +56,7 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
          {}\n\
          {}\n\
          {}\n\
+         {}\n\
          {}",
         c.frames,
         c.tracked,
@@ -89,6 +90,7 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
         format_estimator_recovery(c),
         format_flow_coast(c),
         format_outlier_erase(c),
+        format_flow_tracks(c),
         format_mapping_load(c),
     )
 }
@@ -148,6 +150,20 @@ fn format_outlier_erase(c: &RunCounters) -> String {
         c.erase_unlinked_newest,
         c.erase_landmarks_retired,
         c.erase_stale_links,
+    )
+}
+
+/// What flow-only frames rest on: seeds, inliers (and how many came from rig
+/// cameras 1 and up), tried tracks and refill spawns; G50 reads these.
+fn format_flow_tracks(c: &RunCounters) -> String {
+    format!(
+        "[summary] flow_tracks flow_seeds={} flow_inliers={} flow_secondary_inliers={} \
+         flow_tracks_tried={} flow_refill_spawns={}",
+        c.flow_seeds,
+        c.flow_inliers,
+        c.flow_secondary_inliers,
+        c.flow_tracks_tried,
+        c.flow_refill_spawns,
     )
 }
 
@@ -340,7 +356,7 @@ mod tests {
         counters.vi_ba_solves_3plus_rejects = 22;
         let text = format(&counters, &FrameTimes::default());
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 7);
+        assert_eq!(lines.len(), 8);
         assert_eq!(
             lines[3],
             "[summary] estimator_recovery ba_keyframe_shifts=1 ba_snapbacks=2 \
@@ -356,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn the_fifth_line_holds_the_flow_and_coast_counters_in_order() {
+    fn the_flow_coast_and_flow_track_lines_hold_their_counters_in_order() {
         let mut counters = RunCounters::default();
         counters.flow_frames = 1;
         counters.flow_keyframe_due = 2;
@@ -365,12 +381,23 @@ mod tests {
         counters.flow_due_orb_rejected = 5;
         counters.coast_runaway_frames = 6;
         counters.lost_keyframes_at_runaway = 7;
+        counters.flow_seeds = 8;
+        counters.flow_inliers = 9;
+        counters.flow_secondary_inliers = 10;
+        counters.flow_tracks_tried = 11;
+        counters.flow_refill_spawns = 12;
         let text = format(&counters, &FrameTimes::default());
+        let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
-            text.lines().nth(4).unwrap(),
+            lines[4],
             "[summary] flow_coast flow_frames=1 flow_keyframe_due=2 flow_refused=3 \
              flow_unavailable=4 flow_due_orb_rejected=5 coast_runaway_frames=6 \
              lost_keyframes_at_runaway=7"
+        );
+        assert_eq!(
+            lines[6],
+            "[summary] flow_tracks flow_seeds=8 flow_inliers=9 flow_secondary_inliers=10 \
+             flow_tracks_tried=11 flow_refill_spawns=12"
         );
     }
 
