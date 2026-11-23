@@ -628,6 +628,55 @@ the six, plus starts 30/60 on V1_02 and MH_04 (22 runs). Same SYNC protocol as R
 
 Not in this rung: code changes, the all-11 gate, LaMAria.
 
+### Experiment R11d: mapping lag under real time (RT2E, RT2E-r) and S0PE under real time (RT1PE) (predictions written 2026-11-23 before the runs)
+
+Owner decision (2026-11-23): the score models real time, so the real-time causal score (`traj.txt`, async, paced,
+2 cores) is the number that must beat Basalt on every sequence. Base and binary as R11c: `E/bin-r11b/kornia-slam-euroc`,
+md5 `e67615adaf558b4aef7b7d1e35a2fb40`, config and environment only. Harness: `E/mkcfg.sh` arms RT2E, RT2E-r, RT1PE;
+driver `E/r11d/rt.sh` (sets `RAYON_NUM_THREADS=1` for RT2E and RT2E-r only); golden headers `E/expect/RT2E.header`
+(`7 iterations from lambda 0.0001`), `RT2E-r.header` (= `RT1E.header`; the env var does not print), `RT1PE.header`
+(`keyframe observations: PnpInliers`). Async, `--pace-timestamps`, `taskset -c 0,1`, start 0, r1 and r2, one RT run at
+a time, started at 1-min load ≤ 6 with fewer than 2 `kornia-slam*` processes; load and wall recorded per run.
+Sequences: V2_01, V1_02, V1_03, V2_02, MH_04, MH_01. RT2E adds MH_02, MH_03, MH_05, V1_01, V2_03 only if it beats RT1E
+(causal mean) on at least 4 of the 6. Baseline: RT1E (`E/runs/RT1E_*_s0_r[12]`), S0E SYNC.
+
+Counters: solves per keyframe = `ba_solves / keyframes`; BA solve mean = `ba_solve_ms / ba_solves`; iterations per
+solve = `vi_ba_base_iterations / vi_ba_base_solves`. RT1E measured: solves per keyframe 0.84-0.93 on the Vicon rooms,
+1.01 on MH; BA mean 109-226 ms (Vicon), 53-65 ms (MH); 29-32 iterations (Vicon), 19-21 (MH); keyframes 466-657 against
+S0E SYNC 353-568 on the Vicon rooms.
+
+**Arm RT2E (decides):** RT1E (erase + `PropagateToNewer`) + `local_ba: ( max_iterations: 7, initial_lambda: 1e-4 )`
+(Basalt's budget) + env `RAYON_NUM_THREADS=1`.
+- Gaps tested: G57 mapping lag (0.83-0.92 solves per keyframe on V2_01 / V1_03; a solve takes 109-225 ms against a
+  keyframe every 150-400 ms) and profile fix 1 (rayon spinning, 0.38 core).
+- Theory: a 7-iteration solve at about 6 ms per iteration costs about 40-60 ms, below the keyframe interval, so the
+  latest-wins queue stops dropping jobs and every keyframe is solved as newest, as in SYNC. One rayon worker removes
+  the spin that competes with the mapping thread for the 2 cores. If lag is what separates RT1E from SYNC, RT2E lands
+  near S0E SYNC on the Vicon rooms.
+- Predictions:
+  - P1 (mechanism): solves per keyframe ≥ 0.97 on every sequence.
+  - P2 (mechanism): keyframes within 1.10x of S0E SYNC (start 0) on every sequence (V2_01 ≤ 389, V1_02 ≤ 448,
+    V1_03 ≤ 558, V2_02 ≤ 625, MH_04 ≤ 395, MH_01 ≤ 637).
+  - P3: BA solve mean ≤ 80 ms on every run.
+  - P4: `[summary] frame_ms` p90 ≤ 50 ms on every run.
+  - P5: causal mean within 1.2x of S0E SYNC on V2_01 (≤ 0.066) and V1_03 (≤ 0.086), and not worse than RT1E by more
+    than its band elsewhere (≤ RT1E's worse run: V1_02 ≤ 0.056, V2_02 ≤ 0.119, MH_04 ≤ 0.332, MH_01 ≤ 0.083).
+- Kill rule K1 (lag is not the cause): P1 holds (solves per keyframe ≥ 0.97) but V2_01 causal mean is still ≥ 1.5x
+  S0E SYNC (≥ 0.083). Then diagnose before the next card.
+- Kill rule K2 (the budget is harmful): the 7-iteration budget worsens synchronous-equivalent accuracy by more than
+  15 % on MH. On MH_04 and MH_01 mapping keeps up already (RT1E solves per keyframe 1.01, RT1E = SYNC), so RT2E against
+  RT2E-r there isolates the budget: fired if RT2E causal mean > 1.15x RT2E-r on MH_04 or MH_01.
+
+**Arm RT2E-r (control, separates the two changes):** RT1E + env `RAYON_NUM_THREADS=1` only. Reported, no rule:
+solves per keyframe, BA mean and causal against RT1E (the rayon share) and RT2E (the budget share).
+
+**Arm RT1PE (stacked candidate under real time):** RT1E + `keyframe_observations: PnpInliers` (the S0PE stack), rayon
+default. Prediction P6: causal mean ≤ RT1E on MH_04 and MH_01, where S0PE beat S0E in SYNC (0.227 against 0.325,
+0.049 against 0.072). Reported beside RT1E on all six; no kill rule.
+
+Not in this rung: code changes, the keyframe-acceptance rule (next, if K1 does not fire), LaMAria, promotion of any knob
+(the full-sequence gate comes first).
+
 ### Experiment R12: Basalt-style windowed marginalization (added 2026-11-23)
 
 - Only if R4 on R3 does not close the keyframe-only piece gap. Code project: dense square-root
