@@ -46,6 +46,43 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 - **Process: every experiment now takes at most 5 min of wall time** (owner, 2026-11-23). Experiments replay short windows (`start_sec`/`end_sec` on the LaMAria source, commit c21299b) unpaced, 2 in parallel, with at least 3 repeats, or offline runs on saved sessions. The full-sequence gate runs once per batch of stacked winners, not per card. A warm-start knob gets built if a cold window does not reproduce an event (card AH: a cold start at 400 s does not reproduce the 1_19 event).
 - **Card AH planned and approved** (bias memory across the VI-BA window boundary). The boundary edge's bias rows are scaled by 1e-2, so the bias walks 10-12σ per keyframe pair (gyro) and 5.8σ (accel) everywhere, not only at events. On 1_19 the accel bias leaves about 100 s before the heading event and hides a 6-14° tilt. Stage 0 (offline) is running.
 - **Card AG:** the ORB-SLAM3 reference runs are dropped. Its one existing 1_19 run is the control: heading within ±1°, window RMS 1.46 m against our 10-18 m.
+- **Camera input, checked 2026-11-23: no LaMAria run has ever used the raw fisheye.**
+  - Every run so far reads the pinhole export shipped with LaMAria: `pinhole_calibrations`, 780×584 at f 242. That is about 116° horizontal and 127° diagonal.
+  - The raw Aria SLAM cameras are 640×480 fisheye (Fisheye624) with about a 150° field of view. So the export cuts off the periphery, and it upsamples the centre.
+  - **Card F is partly built:**
+    - the `Fisheye624` camera model is in (commit e50b8b6);
+    - an oracle fixture from projectaria_tools exists for R_11;
+    - raw ASL extractions (`asl_raw`) exist for R_01, R_03 and R_11 only (2026-11-21).
+  - Not done: the loader, the undistortion path, the validation runs, and the raw data for the 10 challenge sequences.
+- **EuRoC shows the same estimator weakness on uncropped images.**
+  - The last full table (bench notes, 2026-11-10, config `lws9_async`; older than window 10 and the review fixes) gives SE(3) ATE:
+
+    | | ours | Basalt | ORB-SLAM3 |
+    |---|---|---|---|
+    | MH_01 | 0.099 m | 0.067 m | |
+    | MH_04 | 0.30 m | 0.114 m | |
+    | V1_03 | 0.44 m | 0.045 m | |
+    | V2_03 | 0.95 m | 0.23 m | |
+    | mean | about 0.2 m | 0.065 m | 0.035 m |
+
+  - The window-10 runs (2026-11-15) made MH_03 35-59 % worse, with a gyro-bias error 5-6x larger. That is the same boundary bias-row mechanism as card AH.
+  - So the fisheye crop is not the main cause: we are 2-10x behind Basalt without any crop.
+  - Not re-measured on the current branch.
+- **Top LaMAria entries, researched 2026-11-23** (bench notes `lamaria-top-entries-2026-11-23.md`):
+  - Sinanju 78.3, nm-SLAM 77.9 and Sloop 77.5 are anonymous; nothing is public about their methods.
+  - The top cluster agrees within about 1 point per group, and dunkVIO calls itself a SLAM Dunk variant. So the leaders are likely SLAM Dunk derivatives (inferred).
+  - SLAM Dunk, from its paper page and CHANGELOG:
+    - an offline VI-BA over the whole recording, seeded by a separate VIO;
+    - a camera state per 5 s chunk: the camera-1-to-camera-0 pose and both focal lengths, with a random-walk prior;
+    - one full 3x3 gyro matrix.
+  - Its training ablation: time-varying camera +8.0 CP, gyro +2.3, both together 69.1 to 82.4 (ATE 1.02 m to 0.43 m). BA takes about 2 min per recording on 6 threads. Focal length tracks IMU temperature in 22-23 of 23 recordings.
+  - None of this needs learned features, GPS or joint solving.
+- **Card AH stage 0 self-tests failed.**
+  - The heading-event marker M2 flags 12 % of windows with GT as the estimate (target 0) and 26.5 % on ORB-SLAM3 (target at most 5 %).
+  - Cause: its noise model has no pose/GT endpoint jitter and no gyro scale term (about 0.4 %). A synthetic 30° event is found exactly (30.1°).
+  - Owner, 2026-11-23: add the measured endpoint-noise and scale terms, and count only runs of 2 or more same-sign windows. Re-run in progress.
+  - The preview's accel-bias excursion reproduces exactly: 30 s median max 1.31 (r1) and 1.26 (r2) m/s^2 on 1_19 at 300-480 s.
+- **Break-case test suite** (owner, 2026-11-23: planning): turn each known break (1_19 weak spell at 436-448 s, the start-up turn, the 2_11 runaway velocity, the Held re-seed bias runaway) into a red unit test on a real snippet or a dumped state. The first test compares our LK with OpenCV on the same LaMAria frames.
 
 ### 2026-11-22
 - **#180, card AG planned and approved; stage 0 running** (worktree `kornia-slam-drift`, branch `feat/drift-budget`; python and evaluator only, during the gate). Planner preview, one run per arm:
