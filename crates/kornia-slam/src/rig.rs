@@ -196,6 +196,15 @@ impl RigGeometry {
         self.views.iter().any(RigView::is_raw)
     }
 
+    /// Whether some camera's pixels are not ideal pinhole pixels: a raw
+    /// fisheye view, or a pinhole with radtan distortion (EuRoC).
+    pub fn needs_undistortion(&self) -> bool {
+        self.views.iter().any(|view| {
+            let c = &view.camera;
+            view.is_raw() || c.k1 != 0.0 || c.k2 != 0.0 || c.p1 != 0.0 || c.p2 != 0.0
+        })
+    }
+
     pub fn views(&self) -> &[RigView] {
         &self.views
     }
@@ -426,6 +435,22 @@ pub(crate) mod tests {
         let right = rig.view(1).unwrap().overlap.unwrap();
         assert!(left.min[0] > 200.0, "{left:?}");
         assert!(right.max[0] < 440.0, "{right:?}");
+    }
+
+    #[test]
+    fn only_raw_or_distorted_views_need_undistortion() {
+        assert!(!two_camera_rig(75.0).needs_undistortion());
+        assert!(raw_two_camera_rig(75.0).needs_undistortion());
+        let radtan = RigCamera {
+            camera: PinholeCamera {
+                k1: -0.28,
+                ..camera()
+            },
+            ..rig_camera(Pose3d::new(yaw(0.0), Vec3F64::new(0.1, 0.0, 0.0)))
+        };
+        let rig =
+            SensorRig::new(camera()).with_rig_cameras(vec![rig_camera(Pose3d::IDENTITY), radtan]);
+        assert!(RigGeometry::from_rig(&rig).unwrap().needs_undistortion());
     }
 
     #[test]

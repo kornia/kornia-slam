@@ -286,10 +286,10 @@ impl OrbFrontend {
                 stereo_points: Vec::new(),
             },
         };
-        // Raw fisheye pixels are not pinhole pixels: the overlap's epipolar
-        // geometry and triangulation need the virtual-pinhole cache (D5).
-        // Pinhole rigs keep reading raw keypoints.
-        if let (true, Some(view0)) = (rig.has_raw_views(), rig.view(0)) {
+        // Raw fisheye or radtan pixels are not pinhole pixels: the overlap's
+        // epipolar geometry and triangulation need the undistorted cache (D5).
+        // A zero-distortion pinhole rig keeps reading raw keypoints.
+        if let (true, Some(view0)) = (rig.needs_undistortion(), rig.view(0)) {
             frame.ensure_undistorted(&view0.camera);
         }
         let pixels = if frame.keypoints_undist.is_empty() {

@@ -324,6 +324,8 @@ fn a_rig_frame_splits_features_per_camera_and_keeps_depth_empty() {
 
     assert!(frame.is_rig());
     assert!(frame.depth.is_empty() && frame.u_right.is_empty());
+    // A zero-distortion pinhole rig (LaMAria pinhole) reads raw keypoints.
+    assert!(frame.keypoints_undist.is_empty());
     let ranges = &frame.rig.camera_ranges;
     assert_eq!(ranges.len(), 2);
     assert_eq!(ranges[0].start, 0);
@@ -349,6 +351,40 @@ fn a_rig_frame_splits_features_per_camera_and_keeps_depth_empty() {
         close * 10 >= depths.len() * 8,
         "{close} of {} near 3.3 m",
         depths.len()
+    );
+}
+
+#[test]
+fn a_distorted_pinhole_rig_frame_undistorts_every_keypoint() {
+    let camera = PinholeCamera {
+        k1: -0.28,
+        ..pinhole(240.0, 240.0, 188.0, 120.0)
+    };
+    let size = ImageSize {
+        width: 376,
+        height: 240,
+    };
+    let view = |primary_from_camera| kornia_sensors::RigCamera {
+        camera: camera.clone(),
+        size,
+        primary_from_camera,
+        raw_model: None,
+    };
+    let rig = SensorRig::new(camera.clone()).with_rig_cameras(vec![
+        view(Pose3d::IDENTITY),
+        view(Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            kornia_algebra::Vec3F64::new(0.11, 0.0, 0.0),
+        )),
+    ]);
+    let mut frontend = OrbFrontend::new(OrbDetector::default(), &rig);
+    let (left, right) = synthetic_pair(376, 240, 8);
+    let frame = frontend.prepare_rig(1, &[&left, &right]).unwrap();
+
+    assert!(!frame.features.keypoints_xy.is_empty());
+    assert_eq!(
+        frame.keypoints_undist.len(),
+        frame.features.keypoints_xy.len()
     );
 }
 

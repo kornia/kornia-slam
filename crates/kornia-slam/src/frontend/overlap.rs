@@ -345,6 +345,84 @@ mod tests {
         }
     }
 
+    /// EuRoC-like radtan pair (k1 -0.283, 0.11 m parallel baseline): the
+    /// overlap triangulates corner points from undistorted pixels, and reading
+    /// the raw pixels as pinhole ones matches none of them (G52).
+    #[test]
+    fn radtan_overlap_needs_undistorted_pixels() {
+        use kornia_3d::camera::CameraModel;
+        let camera = PinholeCamera {
+            fx: 458.0,
+            fy: 458.0,
+            cx: 376.0,
+            cy: 240.0,
+            k1: -0.2834,
+            k2: 0.0740,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let size = ImageSize {
+            width: 752,
+            height: 480,
+        };
+        let view = |primary_from_camera| RigCamera {
+            camera: camera.clone(),
+            size,
+            primary_from_camera,
+            raw_model: None,
+        };
+        let rig = RigGeometry::from_rig(&SensorRig::new(camera.clone()).with_rig_cameras(vec![
+            view(Pose3d::IDENTITY),
+            view(Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.11, 0.0, 0.0))),
+        ]))
+        .unwrap();
+        let right_from_left = rig.b_from_a(0, 1).unwrap();
+        // Near the four image corners, 1.6-1.9 m away: the raw pair is 3.0-3.5 px
+        // off its epipolar line there, outside the 2 px band.
+        let scene = [
+            Vec3F64::new(1.2, 0.75, 1.7),
+            Vec3F64::new(-1.1, 0.75, 1.7),
+            Vec3F64::new(1.35, -0.85, 1.9),
+            Vec3F64::new(-1.0, -0.72, 1.6),
+        ];
+        let mut raw_xy = Vec::new();
+        let mut right_xy = Vec::new();
+        for p in &scene {
+            let l = camera.project(p).unwrap();
+            let r = camera.project(&right_from_left.transform_point(p)).unwrap();
+            raw_xy.push([l.x as f32, l.y as f32]);
+            right_xy.push([r.x as f32, r.y as f32]);
+        }
+        let n = scene.len();
+        raw_xy.extend(right_xy);
+        let undist_xy: Vec<[f32; 2]> = raw_xy
+            .iter()
+            .map(|kp| crate::frame::undistort_keypoint(&camera, kp))
+            .collect();
+        let descriptors: Vec<[u8; 32]> = (0..n as u8).chain(0..n as u8).map(descriptor).collect();
+        let features = OrbFeatures {
+            keypoints_xy: raw_xy,
+            orientations: vec![0.0; 2 * n],
+            descriptors,
+            octaves: vec![0; 2 * n],
+        };
+        let ranges = [0..n, n..2 * n];
+        let matches = match_overlap(&features, &undist_xy, &ranges, &rig, FisheyeWeight::Uniform);
+        assert_eq!(matches.num_matched(), n);
+        for (i, p) in scene.iter().enumerate() {
+            let got = matches.points[i].unwrap();
+            assert!((got - *p).length() < 0.02, "{got:?} vs {p:?}");
+        }
+        let raw = match_overlap(
+            &features,
+            &features.keypoints_xy,
+            &ranges,
+            &rig,
+            FisheyeWeight::Uniform,
+        );
+        assert_eq!(raw.num_matched(), 0);
+    }
+
     /// Raw fisheye pair: the overlap triangulates virtual-pinhole pixels, and
     /// reading the raw pixels as pinhole ones recovers none of the points.
     #[test]

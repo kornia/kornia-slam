@@ -10,6 +10,11 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+- EuRoC runs as `cameras: Rig`: raw cam0 and cam1, each with its own radtan
+  intrinsics and `T_BS`, so flow can track both cameras
+  (`configs/euroc-rig-imu-loop.ron`). A distorted pinhole rig now matches its
+  camera overlap on undistorted keypoints.
+
 **New settings for a 1 ms frontend frame and for online calibration, all off by
 default.** Every default is today's behaviour, so existing run files load and
 run unchanged. Built, not validated: no benchmark has run on them. Not built:
