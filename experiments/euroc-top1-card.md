@@ -161,6 +161,25 @@ everything. R3, then R4 on top. R5 replaces part of R3, never both. R6 and R8 st
   K2 walk z holds, gain < 3 % everywhere: bias memory is not where EuRoC error enters (as card S on R_01).
   K3 any sequence worse > 15 %: knob stays off.
 
+### Experiment R3b: accel-bias priors (added 2026-11-23, `experiments/vi-ba-vs-basalt.md` §9 b1, c3)
+
+- **Gap tested:** G49 (tilt hidden in the accel bias). **Base:** S0; stacks with R3.
+- **Mechanism:** VIBA0/1/2 put a zero-mean accel-bias prior of weight 1e5 (σ about 3 mm/s²) on b_a
+  (`K/inertial/schedule.rs:28`, `K/inertial/initialization/solve.rs:166-173`), and each local solve adds 1e2 per
+  free keyframe (σ 0.1 m/s², `K/mapping/vi_ba_schur.rs:2845-2854`). EuRoC's true b_a is about 0.15 m/s² and
+  horizontal (y/z), so a b_a held at 0 leaves 0.82-0.92° of world tilt, and later solves can only trade
+  `g·θ_map` into the bias.
+- **Reference:** ORB-SLAM3 frees b_a at VIBA2 (`LocalMapping.cc:200-228`) and follows with `FullInertialBA`
+  (kornia-slam#51); Basalt starts from calibrated b_a (within 0.03 m/s² of GT).
+- **Knob:** none today; a small code arm: VIBA2 `prior_a` 0 plus local `accel_bias_prior_weight` 0. Card S
+  stage B is not built.
+- **Predictions (MH_04, V1_02, SYNC):** keyframe tilt median ≤ 0.5°; b_a error median ≤ 0.05 m/s²; ATE
+  within the S0 band or better.
+- **Kill:** b_a error unchanged with the priors off: the prior is not the force; the map rigidity
+  (§9 b2) is. Tilt worse or ATE > band: the b_a/tilt direction is unobservable without the post-init full
+  inertial BA; build kornia-slam#51 first.
+- **Gate first:** debug run D1 (below).
+
 ### Experiment R4: reference window and solver budget
 
 - **Gap tested:** G6, G37. Run only on top of R3.
@@ -225,6 +244,59 @@ everything. R3, then R4 on top. R5 replaces part of R3, never both. R6 and R8 st
 - Python on the stack's runs; no build. Per sequence: 10 s-piece error, RPE 1 s, first-15 s error against
   ORB-SLAM3's VIBA1/VIBA2 timing (`LocalMapping.cc:200-224`), tilt and bias error over time, observations per
   keyframe. It names the next mechanism for the Vicon-room residual, which is unknown today.
+
+### Experiment R11: error model (added 2026-11-23, `experiments/vi-ba-vs-basalt.md` §9 a2, a5, a6, b4)
+
+- **Gap tested:** the 10 s-piece precision gap on healthy SYNC runs (keyframe-only pieces 1.5-2.5x Basalt).
+- **Mechanism:** accel information is 64x Basalt's and gyro 2.8x; a Huber at χ² 16.9 sits on every IMU edge
+  (Basalt has none); visual σ is 1 px against Basalt's 0.5, visual Huber at 5σ against 2σ; stereo depth σ is
+  5 % of depth; Hold integration lags 2.5 ms (A5). When IMU and map disagree, the solve either bends the
+  keyframes or switches the IMU edge off.
+- **Arms (existing knobs, SYNC, each alone on S0):** `imu_huber: BoundaryOnly`; Basalt EuRoC IMU noise via
+  `rig_calibration` (untested with `cameras: Stereo`: check the header); `stereo_depth_sigma: Disparity(px:
+  0.5)`; `inertial: (sample_interpolation: Midpoint)`. Visual σ/Huber needs code (`huber_reproj_px_sq` is not a
+  knob).
+- **Predictions:** keyframe-only 10 s piece median −20 % or more on V1_02 (0.023 → ≤ 0.018) for the winning
+  arm; MH_01 guard within the band.
+- **Kill:** hw ≥ 0.9 on > 95 % of interior IMU edges (D2) rules out the IMU kernel arm.
+- **Gate first:** debug run D2 (below).
+
+### Experiment R12: Basalt-style windowed marginalization (added 2026-11-23)
+
+- Only if R4 on R3 does not close the keyframe-only piece gap. Code project: dense square-root
+  visual + inertial prior with FEJ and a non-frozen context (Basalt `sqrt_keypoint_vio.cpp:552-760`), in place
+  of 3 keyframes clamped to a frozen past and a 1e-2 boundary edge (`experiments/vi-ba-vs-basalt.md` §4, §9 a1,
+  b2, c2). Predictions are written when R4 on R3 has a verdict.
+
+### Debug runs D1-D3 (before R3b and R11; predictions written 2026-11-23 before the runs)
+
+Binary md5 `cea7646298a68ddb948b16835472b2e3`, S0 config (`E/mkcfg.sh S0`) plus `max_frames` where stated,
+`--no-tui --no-pace --debug`, `KORNIA_SLAM_DEBUG=1`, 900 s cap; output `E/debug/<id>/`. No score claims: these
+runs are instruments. Tilt here is absolute: the angle between our gravity direction in the body frame
+(`R_wb^T·(0,1,0)`, our world has gravity on +Y after VIBA0) and GT's (`R_wb,GT^T·(0,0,−1)`), with no
+alignment; it carries the 0.16-0.49° hand-eye floor (report §10.2). Source of the VIBA values: the
+`[imu_init] accepted ... gravity=(..) bg=(..) ba=(..)` and `[imu_init] VIBAn accepted: scale_correction=..` lines;
+the world rotation of a VIBA is the angle between its printed gravity and the current world gravity (0, 9.81, 0).
+
+- **D1, MH_01_easy, `max_frames: 400` (R3b).**
+  - D1.1 |b_a| ≤ 0.02 m/s² at VIBA0, VIBA1 and VIBA2 (GT |b_a| 0.158, |b_a,yz| 0.157).
+  - D1.2 tilt over the 1 s after VIBA2: 0.72-1.12° (|b_a,GT,yz|/g = 0.92° ± 0.2°).
+  - D1.3 VIBA1 and VIBA2 rotate the world by ≤ 1° each; scale correction 0.98-1.02.
+  - D1.4 VIBA2 fires before frame 400 (VIBA0 + 15 s). If it does not, D1.2 is read at VIBA1.
+  - Refuted if: |b_a| ≥ 0.08 at VIBA2 (the prior does not pin b_a), or tilt ≤ 0.4° (the bias is not forced
+    into tilt at init).
+- **D2, V1_02_medium, full length (R11).**
+  - D2.1 interior IMU edges (`[vi_ba] FINAL edge ... boundary=false`) with hw < 1: 15-45 % (LaMAria R_01:
+    34-41 %, mostly clock; EuRoC's clock is better, the noise is datasheet).
+  - D2.2 interior IMU χ² median 8-25 (9 dof: a consistent model gives about 8.3).
+  - D2.3 visual: mean whitened reprojection χ² per observation (from `[vi_ba] INCIDENCE`) 0.5-1.5 at σ 1 px.
+  - Action rule (report): > 10 % with hw < 1 opens the `imu_huber: BoundaryOnly` arm. Kill: hw ≥ 0.9 on > 95 %.
+- **D3, V2_01_easy, `max_frames: 450` (R3b, map rigidity).**
+  - D3.1 VIBA2 fires at 19.0-20.5 s (sequence time from the first frame).
+  - D3.2 VIBA2 rotates the world by ≥ 2°.
+  - D3.3 the local-BA b_a error against GT (`[vi_ba] STATE` lines) jumps from ≤ 0.15 to ≥ 0.8 m/s² within 1 s
+    after VIBA2.
+  - Kill: no VIBA event within 19-21 s means a visual event; then read the window logs around kf 382-418.
 
 ## 4. EuRoC gate
 
