@@ -397,6 +397,122 @@ everything. R3, then R4 on top. R5 replaces part of R3, never both. R6 and R8 st
   prints only the mean whitened χ² per incidence bin, before Huber. The median, the share with
   `chi2_vis > huber_reproj_px_sq` (the inlier flag set at about line 2082 is not printed) and the visual Huber
   weights would need one more line in that block. Visual Huber shares per solve are therefore not measured.
+- **Results G56 (2026-11-23, `E/debug/G56a`, `E/debug/G56b`).** The line was added on branch `diag/g56`
+  (27a654c, `[vi_ba] VISRES`, debug only, in the INCIDENCE block). Binary md5 `7352d0c311b3509186fd06c037e8d2b8`.
+  Runs: S0 config, `--debug`, `KORNIA_SLAM_DEBUG=1`.
+  - **Bit-identity:**
+    - V1_02 full `traj.txt` is `cmp`-identical to `E/runs/S0_V1_02_medium_s0_r1`.
+    - MH_01 (`max_frames: 400`) is `cmp`-identical to `E/debug/D1`.
+    - R_01 knobs-off (`P/baseline/r01full-S10-7.ron`, `RAYON_NUM_THREADS=1`, non-debug) gives md5
+      d4f77b567b912b5a4caa2af6085a35b1, `cmp`-identical to `P/baseline/traj.txt`.
+  - **Script:** `E/debug/visres.py`. Values are at the final iterate, before Huber, at σ 1 px:
+    - `obs`, mean χ², `out` (share above 25 px²) and `in_mean` are weighted over all observations of all solves;
+    - med, p90 and p99 are the median over solves of each solve's quantile.
+  - **Groups:**
+    - "young": the oldest keyframe in the solve that sees the landmark is free;
+    - "fixed": the observing keyframe is fixed context.
+
+  | run | group | obs (share) | mean χ² | out | in_mean | med / p90 / p99 px |
+  |---|---|---|---|---|---|---|
+  | V1_02 (488 solves) | all | 3.34 M | 25.11 | 11.8 % | 3.40 | 1.08 / 4.22 / 18.44 |
+  | | free pose | 33.5 % | 17.41 | 7.6 % | 2.25 | 0.79 / 3.44 / 18.22 |
+  | | fixed pose | 66.5 % | 28.99 | 13.9 % | 4.02 | 1.25 / 4.52 / 18.65 |
+  | | young landmark | 12.8 % | 4.15 | 1.7 % | 0.98 | 0.23 / 1.53 / 6.27 |
+  | | old landmark | 87.2 % | 28.19 | 13.2 % | 3.80 | 1.20 / 4.62 / 19.56 |
+  | | stereo depth rows (σ) | 2.88 M | 2.26 | 2.2 % (> 3σ) | 0.48 | 0.30 / 1.13 / 3.54 |
+  | MH_01 400 (90 solves) | all | 0.70 M | 16.44 | 8.4 % | 3.35 | 1.23 / 4.05 / 18.52 |
+  | | free pose | 18.9 % | 13.11 | 6.2 % | 2.37 | 0.87 / 3.57 / 17.32 |
+  | | fixed pose | 81.1 % | 17.21 | 8.9 % | 3.58 | 1.31 / 4.12 / 19.24 |
+  | | young landmark | 5.2 % | 1.61 | 0.8 % | 0.57 | 0.00 / 1.03 / 4.55 |
+  | | old landmark | 94.8 % | 17.26 | 8.8 % | 3.51 | 1.31 / 4.18 / 19.44 |
+  | | stereo depth rows (σ) | 0.44 M | 1.10 | 0.7 % (> 3σ) | 0.25 | 0.20 / 0.81 / 2.34 |
+
+  - **Other counts:**
+    - Observations behind the camera: 0 in every solve.
+    - Right-camera rows: none. EuRoC `Stereo` adds a depth row to the left observation
+      (`K/mapping/bundle_adjustment.rs:1440-1455`).
+- **Verdict G56: the 25 px² is mostly an artefact of the statistic, with a real outlier tail underneath.**
+  - **The core is not 10x off.**
+    - The per-solve median residual is 1.1-1.2 px.
+    - The inlier mean χ² is 3.4 against 2 for a 2-dof σ = 1 px model. That gives a core σ of about 1.3 px.
+  - **The mean is carried by a tail.**
+    - 8-12 % of observations sit above the 5 px Huber threshold, with p99 of 18-19 px.
+    - The tail sits on old landmarks: 13 % out, against 1.7 % on young ones.
+    - It sits on fixed-context keyframes: 14 % out, against 7.6 % on free ones.
+    - The mean is the mean of a heavy tail. Huber's linear ρ still lets those rows pull: on D2 the final visual
+      cost per observation is 7.6, so mean ρ is about 15.
+  - **Ruled out by code read:**
+    - units: the undistorted pixel uses the feature's own camera (`K/frame.rs:138-177`), and the pinhole
+      residual uses the same fx, fy, cx, cy (`K/mapping/vi_ba_schur.rs:685-710`);
+    - a double square: χ² is r²/σ² once, and the inlier flag is at about line 2082;
+    - stereo rows: there are none;
+    - f32 world coordinates: about 1e-4 px at 10 m;
+    - cheirality: the behind-camera count is 0.
+  - **Stereo depth rows are over-dispersed below 1** (mean 1.1-2.3 in σ, median 0.2-0.3): the 5 %-of-depth σ is
+    loose, not tight.
+- **Cause: no observation is ever erased for its reprojection error.**
+  - **What the local VI-BA does after its solve:**
+    - It writes back poses, velocities and biases. Landmarks go back through the guard
+      `landmarks_to_write_back` (`K/mapping/bundle_adjustment.rs:941-964, 1204-`). That guard keeps a landmark
+      at its old position when it went behind a camera or jumped; it unlinks nothing.
+    - The merge (`K/mapping/map/ops/correction.rs:674`) unlinks nothing either.
+    - `merge_and_cull` (`K/mapping/local_mapping.rs:287-291`) then runs `cull_landmarks`
+      (`K/mapping/culling.rs:28-87`). That removes whole landmarks only for three reasons:
+      - a found ratio below 0.20 after 5 views;
+      - behind an observing keyframe;
+      - farther than 1e4 m.
+    - It has no reprojection test.
+  - **No production caller unlinks an observation:** `Map::unlink_observation`
+    (`K/mapping/map/ops/mutation.rs:323`) is called only from tests.
+  - **What ORB-SLAM3 does:** after `LocalInertialBA` it erases every edge above χ² 5.991, or 1.5x that for points
+    closer than 10 m, or with depth ≤ 0 (`Optimizer.cc:2691, 2850-2910`). Edges to fixed keyframes are built and
+    erased the same way (`:2718-2725`).
+  - **Why the tail survives here:**
+    - A mismatch that enters a keyframe stays linked for the landmark's life. It joins every later window, first
+      on a free keyframe, then as fixed context.
+    - So the tail grows with landmark age, and sits mostly on fixed keyframes (66-81 % of rows).
+    - The found-ratio cull does not catch it: the landmark is still found by tracking through its good views.
+  - **Basalt reaches a low tail by another route** (`BA/data/euroc_config.json`):
+    - VIO never calls `filterOutliers` (`sqrt_keypoint_vio.cpp:1405`, TODO).
+    - Its KLT frontend keeps only tracks whose round trip is within 0.2 px (`optical_flow_max_recovered_dist2`
+      0.04), with an epipolar gate of 0.005.
+    - Its Huber is 1 px on the raw residual at σ 0.5 px (`landmark_block_abs_dynamic.hpp:171-174, 478-484`).
+    - Its residual distribution is not derivable without a Basalt run that logs it.
+
+### Experiment R11b: post-solve outlier erase (G56; predictions written 2026-11-23 before code)
+
+- **Gap tested:** G56, and through it the 10 s-piece precision gap (keyframe-only pieces 1.5-2.5x Basalt).
+- **Mechanism:** about 10 % of local VI-BA reprojection rows are mismatches at 5-20 px that are never unlinked
+  (above). Under Huber they keep pulling the window toward the frozen past, at a cost of about 15 per row on
+  V1_02.
+- **Reference:** ORB-SLAM3 `LocalInertialBA` erase (`Optimizer.cc:2850-2910`), over local and fixed keyframes
+  alike. It is chosen over Basalt's frontend gate because our ORB/descriptor matches already enter the map; an
+  erase after the solve is the cheaper place to catch them.
+- **Knob:** `local_ba: ( outlier_erase: Disabled | Chi2(threshold: 5.991, close_factor: 1.5, close_depth_m: 10.0) )`,
+  default `Disabled`.
+  - After an accepted merge, unlink (through `Map::unlink_observation`) each window observation whose final χ²
+    exceeds the threshold, or whose depth is ≤ 0.
+  - Fixed keyframes are included.
+  - A landmark left without observations is retired by the existing path.
+  - The threshold is at σ = 1 px; the 1.3 px core is the separate octave arm below.
+- **Second arm, alone:** `visual_information: OctaveScaled` (existing knob), for the 1.3 px core.
+- **Predictions (S0 + knob, SYNC; VISRES on a debug run, scores on the gate protocol):**
+  - P1: V1_02 VISRES `out` 11.8 % → ≤ 3 %, mean χ² 25.1 → ≤ 5, `in_mean` 3.4 → 2.0-2.8.
+  - P2: MH_01 400 `out` 8.4 % → ≤ 2 %, mean χ² 16.4 → ≤ 4.
+  - P3 (mechanism counter): unlinked observations per keyframe 5-15 % of the new keyframe's rows in the first
+    solve after insertion, falling below 2 % per solve after.
+  - P4: V1_02 keyframe-only 10 s-piece median 0.023 → ≤ 0.019.
+  - P5: MH_01 inside its S0 band. No sequence lost or above its S0 band (3 starts).
+- **Kill rules:**
+  - K1 (mechanism moved, score did not): `out` ≤ 3 % but P4 is not met. The tail is not the precision gap.
+    Record G56 as fixed for the statistic and refuted as a score source; go to R12/G49.
+  - K2 (score moved, mechanism did not): P4 is met while `out` stays above 6 %. Another cause; do not credit.
+  - K3 (over-culling): tracking loss, or the keyframe count up more than 10 %, or map points per keyframe down
+    more than 25 % on any sequence. The threshold is too tight at σ 1 px: retry at 2x, or after the octave arm.
+- **Bit-identity:** with the knob off, `cmp`-identical on S0 V1_02 (`E/runs/S0_V1_02_medium_s0_r1`) and on R_01
+  (`P/baseline/r01full-S10-7.ron`, `RAYON_NUM_THREADS=1`, md5 d4f77b567b912b5a4caa2af6085a35b1).
+- **Noise:** SYNC repeats are bit-identical. Scores use 3 starts per sequence (the gate protocol); a full-length
+  promotion needs the gate.
 
 ### Experiment R12: Basalt-style windowed marginalization (added 2026-11-23)
 
