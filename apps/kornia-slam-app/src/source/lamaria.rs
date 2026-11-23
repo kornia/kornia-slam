@@ -23,6 +23,7 @@ use super::{
     FrameItem, FrameSource, OpenedSource, SourceError, dataset_summary, decode_jpeg_to_luma,
     resolve,
 };
+use crate::datasets::euroc::ImuSample;
 use crate::datasets::lamaria::{LamariaDataset, RawImages};
 
 /// Which images of a LaMAria sequence the cameras read.
@@ -59,6 +60,15 @@ pub struct LamariaConfig {
     /// 0 processes the whole sequence.
     #[serde(default)]
     pub max_frames: usize,
+    /// Short-experiment window, in seconds since the sequence's first frame:
+    /// frames before `start_sec` are skipped (their IMU too, except the
+    /// interval up to the first kept frame) and frames after `end_sec` are
+    /// not read. Combines with `start_frame`/`max_frames` by taking the
+    /// narrower range. `None` keeps the whole range.
+    #[serde(default)]
+    pub start_sec: Option<f64>,
+    #[serde(default)]
+    pub end_sec: Option<f64>,
     #[serde(default)]
     pub images: LamariaImages,
 }
@@ -107,11 +117,11 @@ impl LamariaConfig {
         )
         .map_err(SourceError::other)?;
         let total = dataset.len();
-        let start = self.start_frame.min(total);
-        let end = match self.max_frames {
-            0 => total,
-            n => (start + n).min(total),
-        };
+        let times: Vec<f64> = dataset.cameras[0]
+            .iter()
+            .map(|sample| sample.timestamp_sec)
+            .collect();
+        let (start, end) = self.frame_range(&times);
         let summary = format!(
             "{} (cam{}, IMU {}, offset {} ns)",
             dataset_summary(total, start, Some(end - start)),
@@ -123,14 +133,9 @@ impl LamariaConfig {
             },
             self.imu_time_offset_ns,
         );
-        let imu_cursor = match start.checked_sub(1) {
-            Some(prev) if imu => {
-                let boundary = dataset.cameras[0][prev].timestamp_sec;
-                dataset
-                    .imu_samples
-                    .partition_point(|sample| sample.timestamp_sec <= boundary)
-            }
-            _ => 0,
+        let imu_cursor = match imu {
+            true => imu_start(&times, &dataset.imu_samples, start),
+            false => 0,
         };
         let source = LamariaSource {
             dataset,
@@ -146,6 +151,24 @@ impl LamariaConfig {
             ground_truth: None,
             summary: Some(summary),
         })
+    }
+
+    /// Frames `[start, end)` to read, given every frame's timestamp.
+    fn frame_range(&self, times: &[f64]) -> (usize, usize) {
+        let total = times.len();
+        let mut start = self.start_frame.min(total);
+        let mut end = match self.max_frames {
+            0 => total,
+            n => (start + n).min(total),
+        };
+        let first = times.first().copied().unwrap_or(0.0);
+        if let Some(sec) = self.start_sec {
+            start = start.max(times.partition_point(|t| t - first < sec));
+        }
+        if let Some(sec) = self.end_sec {
+            end = end.min(times.partition_point(|t| t - first <= sec));
+        }
+        (start, end.max(start))
     }
 }
 
@@ -242,6 +265,18 @@ impl LamariaSource {
     }
 }
 
+/// First IMU sample after frame `start - 1`, so the first kept frame gets
+/// the interval since the frame before it, as in a full run.
+fn imu_start(frame_times: &[f64], imu: &[ImuSample], start: usize) -> usize {
+    match start.checked_sub(1) {
+        Some(prev) => {
+            let boundary = frame_times[prev];
+            imu.partition_point(|sample| sample.timestamp_sec <= boundary)
+        }
+        None => 0,
+    }
+}
+
 fn read_gray(path: &Path) -> Result<Image<u8, 1>, SourceError> {
     let jpeg = path
         .extension()
@@ -287,6 +322,54 @@ mod tests {
                 root: PathBuf::from("raw"),
             }
         );
+    }
+
+    #[test]
+    fn time_window_selects_frames_and_none_changes_nothing() {
+        // 10 frames at 0.5 s from t0 = 100 s.
+        let times: Vec<f64> = (0..10).map(|i| 100.0 + 0.5 * i as f64).collect();
+        assert_eq!(config("").frame_range(&times), (0, 10));
+        assert_eq!(
+            config(", start_frame: 2, max_frames: 3").frame_range(&times),
+            (2, 5)
+        );
+        assert_eq!(
+            config(", start_sec: Some(1.0), end_sec: Some(3.0)").frame_range(&times),
+            (2, 7)
+        );
+        assert_eq!(
+            config(", start_sec: Some(1.2)").frame_range(&times),
+            (3, 10)
+        );
+        // The narrower of the frame and time limits wins.
+        assert_eq!(
+            config(", start_frame: 4, max_frames: 2, start_sec: Some(1.0)").frame_range(&times),
+            (4, 6)
+        );
+        assert_eq!(
+            config(", start_sec: Some(9.0), end_sec: Some(1.0)").frame_range(&times),
+            (10, 10)
+        );
+    }
+
+    #[test]
+    fn time_window_keeps_imu_from_the_frame_before_the_window() {
+        let frames: Vec<f64> = (0..10).map(|i| 0.5 * i as f64).collect();
+        // IMU at 0.1 s steps from 0.0 to 4.9 s.
+        let imu: Vec<ImuSample> = (0..50)
+            .map(|i| ImuSample {
+                timestamp_sec: 0.1 * i as f64,
+                gyro: [0.0; 3],
+                accel: [0.0; 3],
+            })
+            .collect();
+        let (start, _) = config(", start_sec: Some(1.0)").frame_range(&frames);
+        assert_eq!(start, 2);
+        // Frame 1 is at 0.5 s: the first kept sample is the one after it.
+        let first = imu_start(&frames, &imu, start);
+        assert!(imu[first - 1].timestamp_sec <= 0.5);
+        assert!(imu[first].timestamp_sec > 0.5 && imu[first].timestamp_sec < 1.0);
+        assert_eq!(imu_start(&frames, &imu, 0), 0);
     }
 
     #[test]
