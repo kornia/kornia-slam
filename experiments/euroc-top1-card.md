@@ -342,3 +342,29 @@ synchronous`, no `local BA:` line).
   `min_cold_start_points` rung).
 - **Next (owner's call at Stop S1):** the plan's candidate is R4's Basalt solver budget in the base; the T3
   evidence also points at the thread pin itself (dropping it kept the output identical over the compared prefix).
+
+### Results: R0 determinism pairs unpinned, K0.2 fired again (2026-11-23)
+
+Protocol after the change: all rayon threads, synchronous mapping, `--no-pace`, `timeout 300`; two drivers in
+parallel (one per pair, the 2-job throttle held). Header check clean on all four runs.
+
+| run | rc | wall s | frames reached / total | poses written | load at start | load at end |
+|---|---|---|---|---|---|---|
+| `S0_MH_04_difficult_s0_r1` | 124 | 300 | 1095 / 2033 | 1052 | 15.4 | 33.4 |
+| `S0_MH_04_difficult_s0_r2` | 124 | 300 | 1300 / 2033 | 1279 | 33.4 | 20.1 |
+| `S0_V1_02_medium_s0_r1` | 124 | 301 | 628 / 1710 | 603 | 14.8 | 31.2 |
+| `S0_V1_02_medium_s0_r2` | 124 | 300 | 779 / 1710 | 753 | 31.2 | 18.3 |
+
+- **K0.2 fired again; no run finished, so P0.1 has no verdict on full outputs.** `traj_smoothed.txt` is written
+  at shutdown, so none exists to `cmp`.
+- **Prefix evidence (`cmp` on the common prefix of `traj.txt`, silent in every case):** MH_04 r1 against r2
+  over 1052 poses; V1_02 r1 against r2 over 603; each unpinned r1 against the pinned run over the same prefix
+  (1052 and 603 poses). No divergence was found anywhere both runs reached.
+- **Why the cap fired (diagnosis):** machine load, not the thread count. The machine ran at load 15-33 on 12
+  cores, from other sessions (cargo/rustc, flux-web, python, the other EuRoC driver). Unpinned runs reached fewer
+  frames in 300 s than the pinned ones did at load 6-25 (MH_04 1095-1300 against 1666; V1_02 628-779 against
+  1479): with all threads the process competes for cores it cannot get. T3's 190 s for V1_02 unpinned ran at
+  load 14.7 falling to 4.8. So under this load neither variant fits 300 s; the 1.9x pin cost was measured at
+  a different load and is not confirmed.
+- **Next (owner's call):** a quiet machine (load ≤ 6) for R0, a larger cap for SYNC runs (outputs do not depend
+  on load, only wall does), or R4's solver budget in the base.
