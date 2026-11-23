@@ -21,6 +21,32 @@ Newest first, one entry per working day. "main" means a merged PR; "#180" means 
 `feat/global-pose-graph` branch (PR #180), which is not merged. Unless marked validated, branch work
 sits behind config knobs that default to the old behaviour, and nothing in it has been benchmarked yet.
 
+### 2026-11-23
+
+- **Re-plan: the global stage comes first, and the loss cards are paused** (owner, 2026-11-23).
+  - **Why:**
+    - Every top LaMAria method scores from a global solve over the whole sequence, with time-varying calibration (`experiments/lamaria-handoff.md` "The current leader: SLAM Dunk"; bench notes on visloc-rs and the top entries).
+    - SLAM Dunk's offline global BA alone gives about 69 on the training set, and 82.4 with camera calibration that drifts over time plus gyro intrinsics.
+    - The 2026-11-15 handoff already recommended this first. The online loss cards since then (AB, AC, AC-2b, AE, H0) patched symptoms of a give-up and re-seed design that Basalt, OKVIS2 and MSCKF-style VIO do not have.
+  - **Evidence from our runs:**
+    - With 60 s pieces aligned, CP reaches 93-96 on 1_19 and 80-85 on 1_20 (card AG). The relative motion is good; global consistency is missing.
+    - In both BASE and H0, the best single segment explains only 9-41 % of frames, so one global Sim3 fails either way.
+    - Our offline BA (built 2026-11-17) has only run on 7-110 unjoined segments with runaway seeds. It is untested, not refuted.
+  - **New main card AI** (planning):
+    - **(a)** a VIO that never resets: it coasts on the IMU with honest covariance and re-acquires vision into the same state;
+    - **(b)** a background global graph: IMU bridges and cross-segment matches join the segments, then a bounded global VI-BA runs. Corrections reach the live pose as a map-to-odom transform, so the live pose stays real time.
+    - The end-of-sequence batch for scoring is the same code, run once more.
+    - Ladder after joining: global BA, then camera calibration over time, then gyro intrinsics, then accel, clock and thermal terms.
+  - **Paused:** card AC-2b (built and tested, no runs), card AE, the H0 kept-state bias fix, card AD, and "keep one world through a tracking loss" (folded into AI (a)). AH stage 0 continues, because the bias walk at the window boundary matters for the global BA too.
+- **#180, H0 gate stopped after round 2 reached 6 of 11 sequences** (owner, 2026-11-23: too slow; 14 h for one verdict). H0 is not promoted. Diagnosis (gate directory, `DIAGNOSIS.md`):
+  - **H0's own bug:** after a Held re-seed nothing re-estimates the bias. VIBA0 never re-runs and VIBA1/2 are already spent, so the gyro bias runs to 0.3-1.4 rad/s (a healthy run stays at 0.04). The re-seeded segments then lose tracking at once (4_10: 3-10 s losses 68 against 35).
+  - **The Sim3 failures on 2_11, 2_12, 4_10 and 4_11 cannot separate the arms:** both are equally fragmented. The fall in `later_alignments` is not the cause: BASE's later alignments rotate the world by 188-848 m jumps.
+  - **1_20 and 3_17 are noise or better under H0:** on 1_20 the knob never fires, and 3_17 has 11 segments against 19.
+  - **Load:** every run averaged above 4 (5.3-7.7, 1_20 r1 13).
+- **Process: every experiment now takes at most 5 min of wall time** (owner, 2026-11-23). Experiments replay short windows (`start_sec`/`end_sec` on the LaMAria source, commit c21299b) unpaced, 2 in parallel, with at least 3 repeats, or offline runs on saved sessions. The full-sequence gate runs once per batch of stacked winners, not per card. A warm-start knob gets built if a cold window does not reproduce an event (card AH: a cold start at 400 s does not reproduce the 1_19 event).
+- **Card AH planned and approved** (bias memory across the VI-BA window boundary). The boundary edge's bias rows are scaled by 1e-2, so the bias walks 10-12σ per keyframe pair (gyro) and 5.8σ (accel) everywhere, not only at events. On 1_19 the accel bias leaves about 100 s before the heading event and hides a 6-14° tilt. Stage 0 (offline) is running.
+- **Card AG:** the ORB-SLAM3 reference runs are dropped. Its one existing 1_19 run is the control: heading within ±1°, window RMS 1.46 m against our 10-18 m.
+
 ### 2026-11-22
 - **#180, card AG planned and approved; stage 0 running** (worktree `kornia-slam-drift`, branch `feat/drift-budget`; python and evaluator only, during the gate). Planner preview, one run per arm:
   - **Revisits from GT:** 7 of 9 sequences with GT have no loop of 50 m or more of path (R_11, 1_19, 2_12, 3_17, 3_18, 4_10, 4_11). Only 2_11 (24.6 % of path enclosed, longest loop 247 m) and 1_20 (11.9 %, 114 m) have one. G10 is confirmed: loop closure cannot reach most of the loss.
@@ -299,6 +325,8 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 
 ## Now — egocentric accuracy on LaMAria
 
+**Experiments take at most 5 min (owner, 2026-11-23):** short unpaced windows or offline runs on saved sessions, at least 3 repeats. The gate below runs once per batch of stacked winners, not per card.
+
 **Regression gate (owner, 2026-11-22).** No knob is promoted into a preset or a code default until it passes the full-sequence gate:
 - **Runs:** all 11 validation sequences (R_11_5cp, 1_19, 1_20, 2_11, 2_12, 3_17, 3_18, 4_10, 4_11, 5_11, 5_12), full length, paced at sensor timestamps, on a quiet machine (load ≤ 4, no other SLAM job).
 - **Samples:** 2 runs of the candidate against 2 runs of the current baseline.
@@ -310,11 +338,16 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 We are working toward top results on the [LaMAria](https://github.com/cvg/lamaria) egocentric benchmark ([#78](https://github.com/kornia/kornia-slam/issues/78)), using the Aria rig and IMU and no GPS. The work is sequenced by where the benchmark score is lost: each change states its theory and predictions first, ships behind a config knob that defaults to the old behaviour, and is compared window by window against ORB-SLAM3 in the same harness.
 
 General purpose, not tuned per deployment (owner, 2026-11-21). A new rig or dataset should need its sensor model only: calibration, IMU noise and frame rate. Knobs are how a change lands and is measured; after each validation round a cleanup card makes the winners the code default and deletes the refuted or redundant knobs.
-- [ ] **Card AG: drift budget and loop closure on the challenge sequences** (owner, 2026-11-22: next; stage 0 running). It splits each sequence's CP loss into breaks, events, smooth drift, coasts and scale, with oracle scores, and checks GT for revisits. Then ORB-SLAM3 reference runs on 1_19, 2_11 and 1_20 (2 each, after the gate), and the #180 loop closer observe-only on 2_11 and 1_20, with 1_19 as the control (on the owner's go). No apply arm: it needs loop and odometry sigmas derived from the sensor model first.
-- [ ] **Card AH: the window bias absorbs vision errors** (owner, 2026-11-22: after AG stage 0, if round 2 confirms the link; to plan). In weak vision the local VI-BA moves the gyro bias about 40σ beyond its random walk, and heading steps 10-30° (1_19, 1_20, R_11). First test: card S's `mapping.local_ba.boundary_scales_bias_rows: false` on the event windows. References: ORB-SLAM3 bias-walk edges at full strength, Basalt's marginalisation prior, OpenVINS first-estimate Jacobians. Target: 1_19 heading step ≤ 3°, CP 30-40.
-- [ ] **Card AE: trusted inertial state for a Held re-seed** (planned and approved 2026-11-22, after AH): the median bias over vision-anchored keyframes plus a gyro attitude chain. It fixes the R_11 and 4_11 seed-bias deaths found by the H0 gate.
-- [ ] **Keep one world through a tracking loss** (owner, 2026-11-22: next, before the cleanup card): carry the gyro attitude across a give-up, give a new segment the kept inertial state, refuse visual velocities the IMU contradicts, link or merge the segments (ORB-SLAM3 RECENTLY_LOST and Atlas merge; Basalt and OpenVINS never reset). See `experiments/pr180-validation-diagnosis.md`.
-- [ ] **Card AD: gyro rotation prediction before IMU init** (owner, 2026-11-22: after cards AG, AH and AE, before the cleanup card). Before VIBA0 the tracker predicts each frame with zero motion (`predict_frame_pose` needs `imu_initialized`; the RotatedRay guess needs a predicted velocity), so a start-up turn of 3-4.4° per frame leaves a 29-32 px PnP residual against the 25 px gate and resets 19-56-point maps at once (1_19 frames 0-13; G31 class). The previous-frame timestamp (`state.last_frame_timestamp_sec`) also stays stale across cold bootstraps. Plan approved 2026-11-22 (knob `tracking.prediction_before_init: Visual | Gyro | GyroHeld`, timestamp refresh unconditional); starts when card AC lands.
+- [ ] **Card AI: global stage (owner, 2026-11-23: main card; planning).** Every top entry scores from a global solve (SLAM Dunk: global BA about 69, then 82.4 with calibration over time and gyro intrinsics). Two parts:
+  - **(a)** a VIO that never resets: IMU coasting with honest covariance, then re-acquiring vision into the same state (Basalt, OKVIS2, OpenVINS). It replaces the give-up and re-seed path.
+  - **(b)** a background global graph: IMU bridges and cross-segment matches join the segments, then a bounded global VI-BA runs. Corrections go through a map-to-odom transform. The same code runs as the end-of-sequence batch.
+  - **Then the calibration ladder:** camera calibration over time, gyro intrinsics, accel, clock and thermal terms (the `offline_ba.calibration.*` knobs are built).
+  - Stage 0: join the segments of saved sessions offline and score CP.
+- [ ] **Card AG: drift budget and loop closure on the challenge sequences** (owner, 2026-11-22; stage 0 done 2026-11-23, oracles feed card AI; ORB-SLAM3 reference runs dropped). It splits each sequence's CP loss into breaks, events, smooth drift, coasts and scale, with oracle scores, and checks GT for revisits. Then ORB-SLAM3 reference runs on 1_19, 2_11 and 1_20 (2 each, after the gate), and the #180 loop closer observe-only on 2_11 and 1_20, with 1_19 as the control (on the owner's go). No apply arm: it needs loop and odometry sigmas derived from the sensor model first.
+- [ ] **Card AH: the window bias absorbs vision errors** (planned and approved 2026-11-23; stage 0 running; 5-minute windows). In weak vision the local VI-BA moves the gyro bias about 40σ beyond its random walk, and heading steps 10-30° (1_19, 1_20, R_11). First test: card S's `mapping.local_ba.boundary_scales_bias_rows: false` on the event windows. References: ORB-SLAM3 bias-walk edges at full strength, Basalt's marginalisation prior, OpenVINS first-estimate Jacobians. Target: 1_19 heading step ≤ 3°, CP 30-40.
+- [ ] **Paused 2026-11-23 (card AI first). Card AE: trusted inertial state for a Held re-seed** (planned and approved 2026-11-22): the median bias over vision-anchored keyframes plus a gyro attitude chain. It fixes the R_11 and 4_11 seed-bias deaths found by the H0 gate.
+- [ ] **Paused 2026-11-23, folded into card AI (a). Keep one world through a tracking loss** (owner, 2026-11-22): carry the gyro attitude across a give-up, give a new segment the kept inertial state, refuse visual velocities the IMU contradicts, link or merge the segments (ORB-SLAM3 RECENTLY_LOST and Atlas merge; Basalt and OpenVINS never reset). See `experiments/pr180-validation-diagnosis.md`.
+- [ ] **Paused 2026-11-23 (card AI first). Card AD: gyro rotation prediction before IMU init** (owner, 2026-11-22). Before VIBA0 the tracker predicts each frame with zero motion (`predict_frame_pose` needs `imu_initialized`; the RotatedRay guess needs a predicted velocity), so a start-up turn of 3-4.4° per frame leaves a 29-32 px PnP residual against the 25 px gate and resets 19-56-point maps at once (1_19 frames 0-13; G31 class). The previous-frame timestamp (`state.last_frame_timestamp_sec`) also stays stale across cold bootstraps. Plan approved 2026-11-22 (knob `tracking.prediction_before_init: Visual | Gyro | GyroHeld`, timestamp refresh unconditional); starts when card AC lands.
 - [ ] **Diagnose the first-map resets on R_01, R_03, R_11** (owner, 2026-11-22, read-only): the first map is lost on the 2nd or 3rd frame after a cold bootstrap at under 0.8° per frame, with 2-9 projected matches; not rotation, so card AD does not cover it. Ledger row to add with the diagnosis.
 - [ ] **Cleanup after the first validation run** (owner, 2026-11-22: after the loss card, then card F).
   - **Make the fixes the only path:** `dense_parallelism: Sequential`, `merge: PropagateToNewer` (with the stop at a re-seed), `frame_velocity: PropagatedFromKeyframe` (card U), and the coasted-pose output.
