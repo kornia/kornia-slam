@@ -1381,3 +1381,100 @@ this laptop core).
 
 Measurement fix needed first: `[summary] frame_ms` should report `frame_ms + fe` and the source time, or the RT table
 keeps understating. That is a code change and outside this read-only card.
+
+### Results: R11c, RT1E real time with PropagateToNewer, and S0PE stacked (2026-11-23)
+
+Binary `E/bin-r11b/kornia-slam-euroc`, md5 `e67615adaf558b4aef7b7d1e35a2fb40` (unchanged, config-only arms). Predictions
+committed in 83b2c98 before the runs. All 46 runs `rc=0`; every header `diff`-identical to its golden file
+(`E/expect/RT1.header`, `RT1E.header`, `S0PE.header`: `local BA merge: PropagateToNewer` and/or the erase line).
+Scores `E/score.py` (`E/r11b/scores.jsonl`); tables `E/r11c/rtreport.py` (`E/r11c/rt_table.md`) and
+`E/r11b/report.py S0PE` (`E/r11c/report_S0PE.md`). SE(3) ATE RMSE, m, body centre; causal (`traj.txt`) primary.
+
+**RT1 / RT1E (real time).** `E/r11c/rt.sh`: async, `--pace-timestamps`, `taskset -c 0,1`, start 0, r1 and r2,
+one RT run at a time, 21:01-21:52, started at 1-min load 1.9-5.8 with < 2 `kornia-slam*` processes (a profiling
+run of RT0E V1_02 and the rig sweep's last run overlapped the first RT1E V2_01 run). Causal r1 / r2 (mean):
+
+| seq | Basalt | S0E SYNC causal med | P3 bound | RT0 | RT0E | RT1 | RT1E | RT1E ÷ S0E sync | RT1E ÷ Basalt | stale = propagated (RT1E) | kf shifts RT1 / RT1E | frame_ms p90 RT1E |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| V2_01 | 0.039 | 0.055 | 0.083 | 0.610 / 0.616 | 0.078 / 0.087 | 0.134 / 0.196 (0.165) | 0.122 / 0.128 (**0.125**) | 2.28 | 3.20 | 285, 295 | 0, 0 / 0, 0 | 61.8 / 54.3 |
+| V1_02 | 0.045 | 0.040 | 0.060 | 0.405 / 0.258 | 0.115 / 0.169 | 0.073 / 0.057 (0.065) | 0.044 / 0.056 (**0.050**) | 1.24 | 1.10 | 337, 341 | 0, 0 / 0, 0 | 69.5 / 43.6 |
+| V1_03 | 0.053 | 0.072 | 0.108 | - | - | 0.195 / 0.242 (0.218) | 0.153 / 0.124 (**0.139**) | 1.94 | 2.62 | 434, 425 | 10, 11 / 10, 11 | 46.7 / 43.5 |
+| V2_02 | 0.049 | 0.080 | 0.120 | - | - | 0.154 / 0.155 (0.154) | 0.119 / 0.100 (**0.109**) | 1.36 | 2.22 | 458, 428 | 0, 0 / 0, 0 | 58.1 / 52.8 |
+| MH_04 | 0.114 | 0.311 (0-2) | 0.47 | 0.329 / 0.339 | 0.322 / 0.312 | 0.326 / 0.309 (0.317) | 0.332 / 0.299 (**0.316**) | 1.02 | 2.77 | 44, 30 | 0, 0 / 0, 1 | 41.0 / 36.6 |
+| MH_01 | 0.067 | 0.072 | 0.108 | - | - | 0.078 / 0.098 (0.088) | 0.066 / 0.083 (**0.075**) | 1.04 | 1.12 | 43, 38 | 0, 0 / 0, 0 | 43.9 / 40.0 |
+
+Smoothed (non-causal) RT1E r1 / r2: V2_01 0.070 / 0.077, V1_02 0.038 / 0.046, V1_03 0.075 / 0.085, V2_02 0.051 / 0.093,
+MH_04 0.229 / 0.240, MH_01 0.038 / 0.035. Tracked 2144-3682 frames, within 3 of SYNC on every run; frames read =
+dataset length on every run (no frame drops). Walls 87-143 s (Vicon), 103 s (MH_04), 186 s (MH_01).
+
+| P/K | prediction | measured | verdict |
+|---|---|---|---|
+| P1 | propagated = stale, every RT1/RT1E run | RT1E 12 of 12 equal (30-458). RT1 10 of 12; MH_01 r1 105/104, MH_04 r2 147/146 (`stopped_at_bridge` 0) | missed by letter (2 control runs off by 1) |
+| P2 | `ba_keyframe_shifts` ≤ 10, every run | 0-1 on five sequences; V1_03 10 (r1) and 11 (r2) in both arms (RT0 had 32/16 on V2_01, 13/3 on V1_02) | missed (V1_03 r2, 11) |
+| P3 | RT1E causal mean within 1.5x of S0E SYNC on each | V1_02 0.050, V2_02 0.109, MH_04 0.316, MH_01 0.075 inside; V2_01 0.125 (> 0.083), V1_03 0.139 (> 0.108) | missed (4 of 6) |
+| P4 | frame_ms p90 inside 54-77 ms | 36.6-69.5 ms; 16 of 24 runs below 54 | missed (below the range) |
+| K1 | shifts ≤ 10 and > 2x S0E SYNC on ≥ 3 | above 2x only on V2_01 (0.125 > 0.110); V1_03 0.139 < 0.144 | not fired |
+| K2 | P3 met on ≥ 4 with propagated < stale | propagated = stale on RT1E | not fired |
+
+**Diagnosis of the misses (owner rule; unverified parts marked).**
+- **G54 is fixed in real time; it is not the whole real-time loss.** RT1E propagates every stale keyframe and
+  shifts are gone outside V1_03. RT1 against RT0 is the G54 effect alone: V2_01 0.613 → 0.165, V1_02 0.331 → 0.065.
+  With the erase on, V1_02 goes 0.142 → 0.050 (1.10x Basalt), but **V2_01 gets worse, 0.083 → 0.125** (both RT1E runs
+  above both RT0E runs). By 10 s bin (whole-run SE(3) alignment) RT1E V2_01 is above RT0E at 0-20 s (0.14-0.17
+  against 0.08-0.09 m) and 100-130 s (0.17-0.20 against 0.10-0.12). Unverified: the rigid propagation carries the
+  window's correction into keyframes whose own solve then never comes (next item), so early, large corrections
+  (before and around the inertial init) persist.
+- **What remains is mapping lag on the Vicon rooms.** No frames are dropped and tracking is the same as SYNC. The
+  measurable difference to SYNC is the mapping worker: on V2_01, V1_02, V1_03 and V2_02 async inserts 16-34 % more
+  keyframes than S0E SYNC (V2_01 475-483 against 354; V1_03 593-595 against 496) and runs 0.83-0.92 solves per
+  keyframe (SYNC 1.00), so 8-17 % of keyframes never get a solve as the newest keyframe. A solve takes 109-225 ms
+  on 2 cores against a keyframe every 3-8 frames (150-400 ms). On MH_04 and MH_01 solves per keyframe are
+  1.00-1.01, keyframes +1-3 %, and RT1E equals SYNC (0.316 against 0.311, 0.075 against 0.072). The residual gap
+  follows the lag sequence by sequence. Unverified as the cause: more keyframes are inserted because the tracker
+  sees fewer refined map points while mapping is behind.
+- **P2 on V1_03:** 10-11 shifts in both arms (V1_03 has no RT0 baseline); RT1 and RT1E alike, so not the erase.
+  Not traced to keyframes here.
+- **P4:** frame time fell, it did not rise. Load at start was 1.9-5.8 (RT0/RT0E: 3.3-5.6 with another job's
+  `offline-ba` process for part of it), and per-solve time fell on MH (MH_04 53-59 ms against 79 ms in SYNC under
+  load 6-14). The range was a machine-state number, not a property of the arm.
+
+**S0PE (SYNC, S0P + S0E stacked).** `E/drive.sh` with `BIN=bin-r11b/kornia-slam-euroc`, lists `E/lists/r11c_S0PE{a,b}.txt`,
+2 at a time, 21:52-22:17, load 2.6-9.2. Causal median (per start) against S0E and S0P on the same starts:
+
+| seq | Basalt | S0E causal | S0P causal | S0PE causal per start | S0PE median | ≤ min(S0E, S0P)? | S0PE ÷ Basalt | smoothed S0E / S0P / S0PE |
+|---|---|---|---|---|---|---|---|---|
+| V2_01 | 0.039 | 0.055 | 0.050 | 0.049 / 0.056 / 0.066 | 0.056 | no (worse than both, by 0.001 against S0E) | 1.43 | 0.047 / 0.044 / 0.045 |
+| V1_02 | 0.045 | 0.040 | 0.063 | 0.036 / 0.036 / 0.036 / 0.042 / 0.110 | 0.036 | yes | 0.80 | 0.038 / 0.046 / 0.030 |
+| V1_03 | 0.053 | 0.072 | 0.118 | 0.111 / 0.166 / 0.085 | 0.111 | no (between) | 2.08 | 0.063 / 0.087 / 0.070 |
+| V2_02 | 0.049 | 0.080 | 0.120 | 0.099 / 0.091 / 0.091 | 0.091 | no (between) | 1.86 | 0.079 / 0.115 / 0.089 |
+| MH_04 | 0.114 | 0.325 | 0.254 | 0.227 / 0.227 / 0.229 / 0.225 / 0.235 | 0.227 | yes | 1.99 | 0.250 / 0.179 / 0.156 |
+| MH_01 | 0.067 | 0.072 | 0.057 | 0.042 / 0.050 / 0.049 | 0.049 | yes | 0.73 | 0.036 / 0.028 / 0.029 |
+
+Run health against S0: tracked −6 to +4 frames, give-ups 0; keyframes 0.78-0.92x; map points per keyframe −16 % worst
+(V1_02 s0 98.5 against 116.7). Erase `erase_unlinked` (start 0) 0.30-0.60x of S0E (V1_02 30 350 against 95 781,
+MH_01 19 561 against 60 724, V2_01 76 663 against 128 734): PnpInliers keeps most mismatches out first, as stated.
+
+| P/K | prediction | measured | verdict |
+|---|---|---|---|
+| P5 | causal median ≤ min(S0E, S0P) on ≥ 4 of 6 | 3 of 6 (V1_02, MH_04, MH_01) | missed |
+| P6 | MH_04 causal median ≤ 0.254 | 0.227 (0.225-0.235 over 5 starts; S0P s60 was 0.419) | as predicted |
+| counter | `erase_unlinked` below S0E on the same start | 0.30-0.60x on all six | as predicted |
+| K3 | worse than both on ≥ 3 | 1 (V2_01, by 0.001 m; per-start values overlap both bands) | not fired |
+
+**Diagnosis of the P5 miss (unverified parts marked).** The stack wins where S0P beat S0E (MH_04, MH_01) and on V1_02,
+and lands between the two where S0E beat S0P (V1_03, V2_02). So what S0P loses on those two is not mismatches the erase
+would have caught: the erase can only remove rows, and with PnpInliers it removes 0.30-0.48x as many there. Unverified:
+on the fast Vicon sequences the tracking PnP gate rejects correct observations (motion-blurred or prediction-shifted
+matches) that S0E keeps and BA then uses. V2_01 is inside noise (per-start 0.049-0.066 overlaps S0E 0.052-0.058).
+
+**Verdict.**
+- RT1E: G54 fixed under real time (P1, shifts), real-time ÷ SYNC 1.02-1.36 on V1_02, V2_02, MH_04, MH_01, but 1.94-2.28
+  on V1_03 and V2_01. K1 not fired; the remainder is diagnosed as mapping lag (unverified as cause). PropagateToNewer
+  is kept for the real-time arms (RT0 → RT1 removes the 0.3-0.6 m failures) but it costs V2_01 with the erase on.
+- S0PE: best SYNC arm on V1_02 (0.036, 0.80x Basalt), MH_04 (0.227) and MH_01 (0.049, 0.73x); worse than S0E on V1_03
+  and V2_02. Not promoted over S0E; neither knob is promoted (gate and LaMAria guard first).
+- Next: a mapping-lag rung under real time before the gate. Config-only first: RT1E with a smaller local-BA iteration
+  budget (solve time below the keyframe interval), measuring solves per keyframe and keyframes against SYNC; then, if
+  lag is the cause, ORB-SLAM3's rule that tracking inserts a keyframe only when local mapping accepts one
+  (`Tracking::NeedNewKeyFrame`, `LocalMapping::AcceptKeyFrames`) behind a knob. RT1PE (S0PE under real time) is run in
+  the same rung as the stacked candidate.

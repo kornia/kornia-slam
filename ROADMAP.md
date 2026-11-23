@@ -23,6 +23,16 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 
 ### 2026-11-23
 
+- **R11c: PropagateToNewer fixes G54 in real time; S0P + S0E stacked is the best SYNC arm on V1_02 and MH**
+  (`experiments/euroc-top1-card.md` "Results: R11c"; config only, binary unchanged).
+  - Real time (async, paced, 2 cores, 2 runs): every stale keyframe is propagated, shifts 0-1. RT1E causal: V1_02
+    0.050, V2_02 0.109, MH_04 0.316, MH_01 0.075 (1.02-1.36x SYNC); V2_01 0.125 and V1_03 0.139 (1.9-2.3x). No kill
+    fired. The rest of the gap follows mapping lag on the Vicon rooms (8-17 % of keyframes never solved as newest,
+    16-34 % more keyframes than SYNC; G57), not G54.
+  - S0PE (SYNC): V1_02 0.036 (0.80x Basalt), MH_04 0.227, MH_01 0.049; V1_03 0.111 and V2_02 0.091 stay worse than
+    S0E. Predicted "≤ both on 4 of 6" missed (3 of 6). Nothing promoted.
+  - Next: a mapping-lag rung under real time (smaller BA iteration budget first, then ORB-SLAM3's keyframe
+    acceptance rule), with S0PE under real time beside it; then the all-11 gate.
 - **R11b: the local VI-BA outlier erase (G56) closes most of the Vicon-room gap** (`experiments/euroc-top1-card.md`
   "Results: R11b"; branch `feat/r11b-outlier-erase`, knob `mapping.local_ba.outlier_erase`, default off,
   bit-identical when off on V1_02 and R_01).
