@@ -123,6 +123,11 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
     - No IMU time-offset knob exists for EuRoC, so the band is the start offsets only (1-3 samples).
   - Body-centre re-score of the async runs: default fails V2_02 and V2_03 too (59.6 and 242.7 m, G54); the preset
     smoothed output reaches 0.055 and 0.462 there. The smoothed proxy equals the app output to 3 decimals on 5 runs.
+- **#180 (branch feat/euroc-rig, not pushed), EuRoC as a two-camera rig scored** (`experiments/euroc-rig-results.md`, ledger G50, G51, G52, G61).
+  - EuRoC runs as `cameras: Rig`. A distorted pinhole rig now matches its overlap on undistorted keypoints (G52 fix). Stereo is byte-identical to the baseline binary on all 11 sequences (synchronous mapping); LaMAria R_01 is identical.
+  - 68 synchronous runs. Two-camera flow (rp48) against one-camera flow (sp48): mean ATE 0.128 against 0.171 m; about 47 % of flow inliers from camera 1. The rig default (rdef) against Stereo (sdef): mean 0.160 against 0.186 m. Better on V1/V2, worse on MH_02, MH_04, MH_05 (rig scale, G61).
+  - K2 fires for rdef: it gains without flow, so part of the rig gain is the rig backend. The loop-off split comes next. Best arm 0.128 against Basalt 0.081: no top-1 from this card.
+  - Noise (start_frame 0/1/2) is 9-78 %, much wider than the card's 15 % guess; most per-sequence differences are inside it.
 - **Re-plan: the global stage comes first, and the loss cards are paused** (owner, 2026-11-23).
   - **Why:**
     - Every top LaMAria method scores from a global solve over the whole sequence, with time-varying calibration (`experiments/lamaria-handoff.md` "The current leader: SLAM Dunk"; bench notes on visloc-rs and the top entries).
