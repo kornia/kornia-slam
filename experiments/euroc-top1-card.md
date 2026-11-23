@@ -179,6 +179,65 @@ everything. R3, then R4 on top. R5 replaces part of R3, never both. R6 and R8 st
   (§9 b2) is. Tilt worse or ATE > band: the b_a/tilt direction is unobservable without the post-init full
   inertial BA; build kornia-slam#51 first.
 - **Gate first:** debug run D1 (below).
+- **Results D1 and D3 (2026-11-23, `E/debug/D1`, `E/debug/D3`; nothing below re-worded after the run).**
+  Both runs exit 0 (13 s and 26 s wall). `traj.txt` is byte-identical to the S0 s0 run over the same prefix
+  (400 and 450 poses), so `--debug` does not change the estimate. Scripts: `E/debug/viba_ba.py` (VIBA lines and
+  `[vi_ba] STATE` b_a against GT, the frame taken from the last `frame=` tag), `E/debug/tilt_t.py` (absolute
+  tilt from `traj.txt`), `E/debug/solves.py` (per-solve cost, interior IMU χ² and hw, b_a).
+
+  | run | stage | frame / t (s) | b_a (m/s²) | GT b_a | error, y/z share (implied tilt) | world rotation | tilt after (deg) |
+  |---|---|---|---|---|---|---|---|
+  | D1 MH_01 | VIBA0 | 43 / 2.15 | (−0.039, 0.001, 0.015), norm 0.042 | (−0.025, 0.137, 0.076) | 0.149, yz 0.149 (0.87°) | 17.45° (first alignment) | 0.80-0.87 (2.0-6.0 s) |
+  | D1 MH_01 | VIBA1 | 102 / 5.10 | (−0.050, 0.000, 0.018), norm 0.053 | same | 0.150 (0.86°) | 0.02° | 0.64-0.83 (5-7 s) |
+  | D1 MH_01 | VIBA2 | 303 / 15.15 | (−0.028, 0.014, 0.090), norm 0.095 | same | 0.124 (0.72°) | 0.45° | 0.51-0.61 (15-19 s) |
+  | D3 V2_01 | VIBA0 | 104 / 5.20 | (−0.026, 0.000, 0.008), norm 0.028 | (−0.024, 0.121, 0.075) | 0.138 (0.81°) | 15.29° | 0.81-0.89 |
+  | D3 V2_01 | VIBA1 | 111 / 5.55 | (−0.031, −0.001, 0.010), norm 0.032 | same | 0.139 (0.81°) | 0.00° | 0.53-0.89 (5.5-10 s) |
+  | D3 V2_01 | VIBA2 | 304 / 15.20 | (−0.015, 0.086, 0.130), norm 0.156 | same | 0.065 (0.37°) | 0.88° | 0.21-0.32 (15-18 s) |
+  | D2 V1_02 | VIBA0 / 1 / 2 | 97, 123, 324 / 4.85, 6.15, 16.20 | norms 0.034 / 0.029 / 0.277; VIBA2 (−0.037, 0.275, −0.006) | (−0.013, 0.104, 0.093) | 0.134 / 0.127 / 0.198 (0.77 / 0.74 / 1.15°) | 18.58 / 0.17 / 1.94° | 0.62 (5-10 s), 1.24-1.33 (15-30 s) |
+
+  | id | prediction | measured | verdict |
+  |---|---|---|---|
+  | D1.1 | \|b_a\| ≤ 0.02 at VIBA0/1/2 | 0.042 / 0.053 / 0.095 | missed. At VIBA0/1 b_a y/z stays near 0 (y 0.001 against GT 0.137), so the bias is pinned as the mechanism says, but not to 0.02. At VIBA2 the refutation rule (≥ 0.08) fires: VIBA2 is not held by the prior |
+  | D1.2 | tilt over 1 s after VIBA2 0.72-1.12° | 0.51-0.61° | missed (lower). Tilt after VIBA0 is 0.80-0.87° against 0.87° implied by the b_a error: the init tilt is the bias error, to 0.01-0.07° |
+  | D1.3 | VIBA1/2 rotate ≤ 1°, scale 0.98-1.02 | 0.02° / 0.45°, scale 1.0000 | as predicted |
+  | D1.4 | VIBA2 before frame 400 | frame 303 | as predicted |
+  | D3.1 | VIBA2 at 19.0-20.5 s | 15.20 s | refuted |
+  | D3.2 | VIBA2 rotates the world ≥ 2° | 0.88°, and it lowers the b_a error 0.139 → 0.065 and the tilt to 0.21-0.32° | refuted |
+  | D3.3 | b_a error jumps ≤ 0.15 → ≥ 0.8 within 1 s after VIBA2 | 0.06-0.08 for 3 s after VIBA2; the rise starts at 19.3 s: 0.09 (19.0) → 0.13 (19.35) → 0.18 (20.1) → 0.25 (20.7) → 0.31 (21.3) → 0.48 (21.9) → 0.63 (22.35) | refuted; kill fired (no VIBA event in 19-21 s) |
+
+  **Diagnosis.**
+  - The zero-mean prior story (§9 b1) holds for VIBA0 and VIBA1 only: they keep b_a y/z near 0, and the world is
+    built with exactly the bias error as tilt (MH_01 0.87° measured against 0.87° implied; V2_01 0.81-0.89°).
+    VIBA2 (prior_g 0, 15 s of data) is not prior-bound: |b_a| 0.095 / 0.156 / 0.277, and it moves the tilt both
+    ways (MH_01 0.8 → 0.55°, V2_01 0.85 → 0.25°, V1_02 0.62 → 1.24-1.33°, an overshoot of b_a y to 0.275
+    against GT 0.104). So the init prior costs about 0.3-0.6° for the first 10-15 s; after VIBA2 the error is
+    VIBA2's own noise (one 15 s solve, no full inertial BA after it: kornia-slam#51), not the prior. Turning
+    VIBA2's `prior_a` to 0 (half of the R3b arm) is not expected to change much; the local-BA prior half is
+    untested.
+  - The V2_01 20 s event is a local-BA event, not a VIBA one. From 19.3 s the b_a of each solve walks by
+    0.01-0.07 m/s² per keyframe (0.15 s), 0.09 → 0.63 in 3 s. The visual cost rises first: the centre incidence
+    bin's mean χ² goes 7 → 19 (20.25 s) → 35 → 49 → 77 px² (21.6 s), and every solve from 20.25 s hits the
+    50-iteration cap (`[vi_ba] TIME iters=50`). Only after that, from 21.3 s, the newest interior IMU edge reaches
+    χ² 377-4023 and Huber cuts it to hw 0.06-0.25. The tracker keeps 450-480 inliers until 21.0 s and drops to
+    236-270 after 21.3 s. Tilt goes 0.2 (17 s) → 0.9 (19.5) → 1.8 (20.5) → 6.4° (21.5). IMU excitation is
+    ordinary (gyro peak 0.26-0.65 rad/s, the 22 s peak is 1.04). A bias walk of 0.02-0.07 per 0.15 s is
+    about 20-60σ of the datasheet accel random walk (3e-3 m/s³/√Hz) inside the full-weight interior edges, so the freedom comes from the 1e-2
+    boundary bias rows (G49) plus the frozen past (§9 b2), with the visual disagreement as the driver.
+  - Root candidates: b1 supported for VIBA0/1, small at stake (≤ 0.6° for 10-15 s); b2 + G49 (map rigidity and the
+    loose boundary bias rows) supported as the V2_01 mechanism; the VIBA2 timing hypothesis refuted.
+  - **Next SYNC arm (recommended): R3 `S1` (`boundary_scales_bias_rows: false`) on V2_01, V1_02, MH_04, MH_01 guard,
+    3 starts, plus one DEBUG V2_01 run to frame 450.** Predictions against S0: V2_01 b_a step per keyframe over
+    19-22.5 s ≤ 0.01 m/s² (S0 0.02-0.07), b_a error at 22.3 s ≤ 0.3 (S0 0.63), causal tilt median 22-60 s ≤ 2.5°
+    (S0 5.5-5.8°), smoothed ≤ 0.10 (S0 band 0.109-0.124); V1_02 tilt median 50-75 s ≤ 1.5° (S0 2.2-2.7°), smoothed
+    ≤ 0.056; MH_01 smoothed within 0.041-0.045 + 15 %; MH_04 as R3. Kill: b_a held (step ≤ 0.01) and V2_01 tilt
+    still ≥ 4° at 22-40 s means the tilt enters through the visual side and the frozen past (G56, b2): go to
+    the visual log line, then R12. b_a not held: the 50-iteration-cap solves dominate; diagnose before R5.
+- **Missing from the debug output (no code edited):** the `[imu_init] VIBAn accepted` line
+  (`K/system/mod.rs`, `refine_inertial_init`, about line 3313 at c21299b) and `[imu_init] accepted`
+  (`K/inertial/initialization/solve.rs:462`) print no frame or timestamp; the frame was inferred from the last
+  `frame=` tag (± 1 frame). `[vi_ba] STATE` (`K/mapping/vi_ba_schur.rs`, `solve_vi_ba`, about line 2992) prints the
+  window-local `kf=` index, not the keyframe id or timestamp. Tilt is not logged anywhere; it was computed from
+  `traj.txt`.
 
 ### Experiment R4: reference window and solver budget
 
@@ -260,6 +319,40 @@ everything. R3, then R4 on top. R5 replaces part of R3, never both. R6 and R8 st
   arm; MH_01 guard within the band.
 - **Kill:** hw ≥ 0.9 on > 95 % of interior IMU edges (D2) rules out the IMU kernel arm.
 - **Gate first:** debug run D2 (below).
+- **Results D2 (2026-11-23, `E/debug/D2`, V1_02 full, 1688 poses, rc 0, 137 s; `traj.txt` byte-identical to
+  S0 s0).** Script `E/debug/imu_chi2.py` over all 488 local solves (`[vi_ba] FINAL edge` and
+  `[vi_ba] INCIDENCE` lines). The same script on D1/D3 is given for scale.
+
+  | run | interior IMU edges: n, χ² p10/p50/p90/p99, hw < 1, hw ≥ 0.9 | boundary IMU edges: n, χ² p50/p90, hw < 1 | visual mean χ² per observation (px², σ 1 px, no Huber) |
+  |---|---|---|---|
+  | D2 V1_02 | 976; 0.8 / 4.0 / 14.7 / 2469; 8.2 %; 92.1 % | 488; 15.1 / 329; 45.1 % | 25.1 over 3.34 M |
+  | D1 MH_01 (400 frames) | 180; 0.6 / 1.9 / 6.2 / 15; 0.0 %; 100 % | 90; 4.1 / 15.8; 8.9 % | 16.4 |
+  | D3 V2_01 (450 frames) | 170; 1.4 / 4.8 / 16.8 / 3270; 9.4 %; 91.2 % | 85; 10.8 / 553; 30.6 % | 18.5 |
+
+  | id | prediction | measured | verdict |
+  |---|---|---|---|
+  | D2.1 | interior hw < 1 on 15-45 % | 8.2 % | missed (lower). Below the report's 10 % action rule, and not the kill (hw ≥ 0.9 on 92.1 %, not > 95 %) |
+  | D2.2 | interior χ² median 8-25 | 4.0 | missed (lower): typical interior IMU edges are not over-stiff (a consistent 9-dof model gives 8.3); the down-weighted 8 % are tail events (p99 2469) |
+  | D2.3 | visual mean χ² 0.5-1.5 | 25.1 | refuted: the mean sits at the 5σ Huber threshold (25 px²), a heavy tail or a σ far from 1 px |
+
+  **Diagnosis.**
+  - The IMU kernel on interior edges is not the general lever: median χ² 4.0, 92 % at full weight. The IMU Huber
+    cuts edges in bursts: on V1_02, 7-10 of 32-35 solves per 5 s carry a cut edge at 5-15 s, 45-50 s and
+    70-80 s, 0-5 elsewhere. On V2_01 the cuts follow the visual breakdown (R3b results). So `imu_huber: BoundaryOnly` would
+    act only in those bursts, where it would force the IMU against a map that has gone wrong.
+  - The disagreement sits at the boundary: boundary χ² median 15.1 against 4.0 interior, 45 % down-weighted. The
+    boundary edge ties the window to the frozen past, so this supports §9 a1/b2 (frozen context, R4/R12) and
+    G49, not the IMU noise level.
+  - Visual: a mean of 25 px² per observation is far from the σ = 1 px model and from Basalt's 0.5 px. Whether it
+    is a tail (mismatches near the 5 px Huber) or a broad core is not in the log (below). This supports the visual
+    half of R11 (σ/Huber), which needs code.
+  - V1_02 also shows the tilt growing when b_a drifts: 0.85-1.33° until 45 s, 2.2-2.7° at 50-75 s with the b_a
+    error 0.30-0.37, back to 0.2-0.6° after 75 s.
+- **Missing from the debug output (no code edited):** the visual residual distribution. `[vi_ba] INCIDENCE`
+  (`K/mapping/vi_ba_schur.rs`, `solve_vi_ba`, about lines 2955-2988 at c21299b, `incidence_chi2_line` at 3172)
+  prints only the mean whitened χ² per incidence bin, before Huber. The median, the share with
+  `chi2_vis > huber_reproj_px_sq` (the inlier flag set at about line 2082 is not printed) and the visual Huber
+  weights would need one more line in that block. Visual Huber shares per solve are therefore not measured.
 
 ### Experiment R12: Basalt-style windowed marginalization (added 2026-11-23)
 
