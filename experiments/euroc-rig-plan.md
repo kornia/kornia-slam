@@ -68,3 +68,71 @@ Noise: 3 samples per arm on MH_01, MH_03, V1_02 (repeats for the asynchronous pr
   for the deterministic default arms). Band = spread of those samples; until measured, a difference under 15%
   on one sequence is "inside noise". Verdicts on the other 8 sequences are provisional.
   Timing samples are valid only against runs of the same session with load within +-2.
+
+## Results 2026-11-23: steps 0-6 (stop point S2, before the 44-run sweep)
+
+Commits on feat/euroc-rig (base 82f61a0): 3331f5f card, 1bbd821 EuRoC source as a rig, f791b1d overlap
+undistortion fix (G52), 9cfba6e summary flow_tracks line. Binary `$E/bin/kornia-slam-eurocrig`,
+md5 344317b26a368a528f5ab1bb9bf8be21, toolchain 1.100.0, release.
+
+Build gates: fmt clean; the four clippy runs (workspace, kornia-slam, app no-default, app uvc) give no
+warning; `test --workspace` and `test -p kornia-slam` pass, the app's new tests included (largest
+binary: 778 passed, 4 ignored under --workspace; 755 passed, 4 ignored under -p kornia-slam). The first test run failed in the new `radtan_overlap_needs_undistorted_pixels`: one of
+the four raw corner pairs matched. The plan's points sat only 1.8-2.7 px off the epipolar line in raw
+pixels, inside the 2 px band. Moved to corner points 1.6-1.9 m away (3.0-3.5 px off); the test passes.
+Finding from that arithmetic: on EuRoC's near-parallel pair, distortion moves a corner pair only a few
+pixels off the row, so many raw pairs pass the band. The larger error is disparity: at 2.5 m near a corner
+the raw disparity is 13.6 px against 20.2 px undistorted, so a raw match gives ~1.5x depth. Without the fix
+G52 would have biased depth more than it removed matches.
+
+### Identity
+- B1 LaMAria R_01 (`r01full-S10-7.ron`, RAYON_NUM_THREADS=1): traj md5 d4f77b567b912b5a4caa2af6085a35b1,
+  `cmp` silent. Pass.
+- B2 as written fails, and the cause is not the code: the baseline binary does not repeat itself.
+  The default arm runs local mapping asynchronously. Baseline default r1 against r2 differs on all 5
+  sequences with both; with RAYON_NUM_THREADS=1, baseline MH_01 run twice still differs (byte 8944).
+  All 11 `sdef_*_r1` differ from `default_*_r1` (first diff at lines 8-84).
+- B2 on a deterministic variant (sdef + `mapping: ( execution: Synchronous )`, RAYON_NUM_THREADS=1,
+  `$E/id/b2sync`): baseline binary x2 and the new binary give one md5 per sequence, MH_01
+  c197ef84d7fdb3eee0b4c72e881ce1c2, V1_02 (unequal camera counts) 0665a842b7897b239a851c29e01cce16.
+  Stereo is bit-identical. Pass on that variant.
+- Side finding (baseline, not this card): the async default arm is far from repeatable on V1/V2. ATE SE3
+  r1 / r2: V1_03 121 / 270 m, V2_02 59.4 / 5.95 m, V2_03 250 / 2.7 m; sdef r1 here 17.8, 3.36, 9.75 m.
+  Per-sequence verdicts on those sequences need many samples, or the synchronous mode.
+
+### 400-frame MH_01 (`$E/q400`, --debug, max_frames 400)
+Two rounds: r1 at load 12-16, r2 at load 2-3.5.
+
+| arm | r1 / r2 flow-only frames | flow_unavailable | median tracks shard 0 / 1 | secondary inliers per flow frame | overlap triangulated p50 | wall s r1 / r2 | ATE SE3 r1 / r2 | Sim3 scale r1 / r2 |
+|---|---|---|---|---|---|---|---|---|
+| sdef | - / 0 (flow_frames 218) | - / 3 | - | 0 | - | - / 8 | - / 0.0119 | - / 1.010 |
+| sp48 | 15 / 14 | 355 / 357 | 48 / none | 0 | - | 61 / 10 | 0.0125 / 0.0124 | 1.010 / 1.009 |
+| rp48 | 151 / 147 | 78 / 92 | 48 / 48 | 23.7 / 23.9 | 316 / 318 | 64 / 12 | 0.0115 / 0.0114 | 1.017 / 1.016 |
+| rdef | 0 / 0 | 0 / 0 | - | - | 316 / 316 | 85 / 16 | 0.0124 / 0.0126 | 1.029 / 1.030 |
+
+All arms: tracked = frames = 400, no give-up. rp48 flow_secondary_inliers / flow_inliers = 0.46 / 0.47.
+
+- P1 holds: rp48 flow-only 151 / 147 (pred 110-220), flow_unavailable 78 / 92 (pred <= 110). sp48 matches the
+  card's base (15 / 14 against 17; 355 / 357 against 346).
+- P2 holds: both shards median 48 (pred 30-48). At the 48 cap: refill keeps both cameras full.
+- P3 holds: 23.7 / 23.9 secondary inliers per flow-only frame (pred >= 12).
+- P4 holds: rdef and rp48 median 316-318 overlap points per ORB frame (pred >= 150).
+- P5 holds: `$E/mh01-rig.ron`: camera 1 t = (0.11007, -0.00016, 0.00089), |t| = 0.11008 m; 752x480 both;
+  k1 -0.28340811 / -0.28368365; camera_to_body = cam0 T_BS.
+- K3 does not fire on its listed tests: P4 >= 80, P5 holds, tracked = frames. P10 is a full-length test.
+  Watch item: rdef Sim3 scale is 1.029-1.030 in both rounds, against 1.009-1.010 for the Stereo arms and
+  1.016-1.017 for rp48. The window has 7.5 m of path but only 0.37 m maximum excursion, so scale is weakly
+  observed. Still, the order repeats. Hypothesis, unverified: the overlap depth has no sub-pixel step, and
+  inverse-disparity noise biases depth upward (E[1/d] > 1/E[d]); rectified SAD with sub-pixel refinement has
+  less noise. That is K4's first suspect. Full-length P10 (0.98-1.02) decides.
+- K5 / wall extrapolation (`wall_400 x 3682 / 400`): r1 (load 12-16) sp48 562 s, rp48 589 s, rdef 782 s, all
+  over 300 s. r2 (load 2-3.5) sdef 74 s, sp48 92 s, rp48 110 s, rdef 147 s, all under. The linear rule
+  also overstates: the first 400 frames hold about one keyframe in 4 frames (98-105 keyframes). Calibrated
+  on sp48 r1 against the baseline preset48all full run (61 s -> 221 s, factor 3.6): rp48 about 232 s, rdef
+  about 308 s at load 12-16. So the gate passes at low load and fails at the shared-machine load. The sweep
+  needs a quiet machine, or the owner's call per plan answer 2 (rdef on 4 sequences only).
+- Time (P11 is full length, not scored): at load 2-3.5, frontend_ms p50 sp48 6.8, rp48 8.5, rdef 8.9;
+  frame_ms p50 sp48 4.5, rp48 8.5, rdef 11.2, sdef 2.7.
+
+Run times: the laptop suspended from 09:33:25 to 13:42:01 (lid closed, 14916 s). B1 and sdef MH_01 r1 ran
+across it. Their recorded walls (15738 s, 15042 s) include it; corrected about 822 s and 126 s.
