@@ -318,6 +318,8 @@ everything. R3, then R4 on top. R5 replaces part of R3, never both. R6 and R8 st
 - **Kill rules:** dropped-observation share > 5 % (G41) or worse on ≥ 3 sequences: the seed and drop-ratchet
   fixes from card AI come first. Unverified: `offline-ba` has never run on a Stereo-mode EuRoC session.
 - Affects the smoothed output only. Stacks on everything.
+- **Label (owner decision 2026-11-23):** every R6 number is "benchmark-style (non-causal)", a ceiling of a final
+  global solve. A robot never gets one. The claim is the causal real-time pose. Results: "Results: R6" below.
 
 #### R6 baselines and S0E predictions (written 2026-11-23, before any offline solve)
 
@@ -905,6 +907,128 @@ D4 (S1) against D3 (S0), V2_01, frames 0-450 (`E/r3/d4stats.py`, `E/r3/vischi2.p
   S1 + `imu_huber: BoundaryOnly` on V2_01 and MH_04. It tests whether the pinned IMU wins once the Huber
   cut on its interior edges is removed (D4: interior χ² p90 13037).
 
+### Results: R6, offline global inertial BA on S0 and S0E sessions (2026-11-23) — benchmark-style (non-causal)
+
+**Label: benchmark-style (non-causal).** A final global solve over the whole session. It is a ceiling, not the
+score: the owner's score is the causal real-time pose (decision below). ORB-SLAM3 and SLAM Dunk report their
+EuRoC numbers this way too.
+
+Binary `E/bin-r11b/kornia-slam-euroc` (md5 e67615ad), default `offline_ba: ()` block, start-0 session of each arm,
+one thread (faer sequential), slot-gated (≤ 2 `kornia-slam*`). All 17 solves rc 0, every frame written
+(`rows == session_frames`), 1 component each. Outputs, scripts and scores: `E/r6/` (`run_r6.sh`, `score_r6.py`,
+`scores_r6.jsonl`). Score: `eval.py --fmt tum`, SE(3) ATE RMSE, m, body centre, against the same session's online
+`traj_smoothed.txt`. Tilt: `E/r11b/tiltwin.py`, median of 1 s bins, 60-80 s. Drop = observations dropped at
+10 px (start state) + at 3 px (from iteration 8), share of all observations.
+
+| seq | S0 online sm | S0 offline | S0E online sm | S0E offline | Basalt | ORB-SLAM3 | S0 drop 10 / 3 px % | S0E drop 10 / 3 px % | iterations S0 / S0E (all `Converged`) | solve s S0 / S0E |
+|---|---|---|---|---|---|---|---|---|---|---|
+| MH_01 | 0.045 | **0.031** | 0.036 | **0.032** | 0.067 | 0.046 | 4.65 / 9.26 | 0.13 / 0.27 | 16 / 13 | 46.5 / 22.9 |
+| MH_02 | 0.035 | **0.020** | - | - | 0.048 | 0.034 | 3.30 / 10.64 | - | 16 | 27.0 |
+| MH_03 | 0.041 | **0.027** | - | - | 0.062 | 0.028 | 3.54 / 10.24 | - | 16 | 23.5 |
+| MH_04 | 0.226 | **0.070** | 0.250 | **0.075** | 0.114 | 0.045 | 8.94 / 14.16 | 5.16 / 0.51 | 18 / 13 | 13.0 / 4.3 |
+| MH_05 | 0.082 | **0.081** | - | - | 0.144 | 0.050 | 10.00 / 15.60 | - | 19 | 21.3 |
+| V1_01 | 0.088 | **0.043** | - | - | 0.043 | 0.039 | 10.87 / 9.75 | - | 23 | 48.0 |
+| V1_02 | 0.056 | **0.024** | 0.038 | **0.024** | 0.045 | 0.019 | 8.21 / 10.78 | 4.18 / 0.23 | 15 / 12 | 12.2 / 6.6 |
+| V1_03 | 0.143 | **0.064** | 0.062 | **0.049** | 0.053 | 0.026 | 6.88 / 17.15 | 0.16 / 0.74 | 20 / 13 | 19.3 / 12.5 |
+| V2_01 | 0.109 | **0.043** | 0.047 | **0.035** | 0.039 | 0.031 | 16.04 / 11.91 | 0.36 / 0.32 | 24 / 18 | 26.3 / 12.9 |
+| V2_02 | 0.097 | **0.042** | 0.079 | **0.043** | 0.049 | 0.037 | 6.72 / 15.70 | 0.00 / 0.73 | 22 / 14 | 36.2 / 11.1 |
+| V2_03 | 0.436 | **0.120** | - | - | 0.230 | 0.027 | 19.14 / 14.64 | - | 26 | 22.6 |
+| mean (11) | 0.123 | **0.051** | | | 0.081 | 0.035 | | | | |
+| mean (6 with S0E) | 0.113 | 0.046 | 0.085 | **0.043** | 0.061 | 0.034 | | | | |
+
+MH_02/03/05, V1_01 and V2_03 have no S0E session yet. MH_04 tilt at 60-80 s: S0 3.64° → 0.20°, S0E 3.15° → 0.25°.
+Mean whitened IMU rotation residual falls 8-65 → 2.4-4.1 on every solve. Peak RSS 54-264 MB.
+
+Against the references (S0 offline, 11 sequences): below Basalt on 9 (V1_01 0.0427 against 0.043 is a tie; above on
+V1_03 and V2_01). Below ORB-SLAM3 on MH_01, MH_02, MH_03. Mean 0.051 against Basalt 0.081, ORB-SLAM3 0.035, the
+owner's target about 0.03. The S0E six: mean 0.043; above ORB-SLAM3 on all six except MH_01.
+
+Config-only diagnostic, 10 px pre-drop off (`outlier_px: 1000.0`), `E/r6/nopre_*`:
+
+| session | drop 10 / 3 px % | ATE (default → pre-drop off) |
+|---|---|---|
+| S0E MH_04 | 0 / 0.50 (was 5.16 / 0.51) | 0.0745 → 0.0738 |
+| S0E V1_02 | 0 / 0.31 (was 4.18 / 0.23) | 0.0235 → 0.0228 |
+| S0 V2_01 | 0 / 24.84 (was 16.04 / 11.91) | 0.043 → 0.0375 |
+| S0 V2_03 | 0 / 24.77 (was 19.14 / 14.64) | 0.120 → 0.132 |
+
+| P/K | prediction | baseline | measured | verdict |
+|---|---|---|---|---|
+| R6 (S0) MH_04 | smoothed 0.06-0.10, tilt 60-80 s ≤ 1° | 0.226 (the 0.165 in the R6 text is the async proxy), 3.64° | 0.070, 0.20° | as predicted |
+| R6 (S0) Vicon | −20 to −40 % | 0.056-0.436 | −52 % (V1_01), −58, −56, −60, −57, −72 % (V2_03) | beat (larger gain than predicted) |
+| R6 (S0) MH_01/MH_02 | within ±0.005 | 0.045 / 0.035 | 0.031 / 0.020 (−0.014 / −0.015) | missed (better) |
+| R6 solve time | each ≤ 60 s | - | 4.3-48.0 s wall, one thread | as predicted |
+| P6.1 drop share | S0E 2-6 %, S0 8-20 % | - | S0E 0.40-5.67 % (four below 2 %); S0 13.8-33.8 % | missed (S0E lower, S0 higher) |
+| P6.2 MH_04 S0E | 0.08-0.15, tilt ≤ 1° | 0.250, 3.15° | 0.075, 0.25° | beat (below the range) |
+| P6.3 Vicon S0E | −10 to −30 % | 0.038 / 0.062 / 0.047 / 0.079 | 0.024 (−39 %) / 0.049 (−21 %) / 0.035 (−27 %) / 0.043 (−46 %) | two in range, two beat |
+| P6.4 MH_01 S0E | ±0.005 of 0.036 | 0.036 | 0.032 | as predicted |
+| P6.5 convergence | S0E `Converged` ≤ 30 iterations; S0 may hit the cap | - | all 17 `Converged`, 12-26 iterations | as predicted (S0 too) |
+| K drop > 5 % (G41) | - | - | fired: all 11 S0 sessions, and S0E MH_04 (5.67 %) | **fired** |
+| K worse on ≥ 3 | - | - | worse on 0 of 17 | not fired |
+| K solve > 60 s | - | - | max 48.0 s | not fired |
+| K Stereo session fails | - | - | works on all 17 | not fired |
+
+**Diagnosis (the G41 kill fired, and three predictions missed).**
+- **The drop kill fired without the harm it guards against.** ATE improved on all 17 sessions.
+  - On S0E the excess is the 10 px pre-drop (`global_vi_ba/mod.rs:267`) on the start state. The start is the
+    final map after 4-DoF loop corrections, so reprojections are bent: cost0 is 6.2e6 against 7.6e4 at the end,
+    and IMU rotation residual 14 → 2.4. With the pre-drop off, MH_04 and V1_02 drop only 0.3-0.5 % at 3 px and
+    the ATE is the same or better. So the dropped rows were inliers of the solved state.
+  - On S0 the 3 px share (9-17 %, 25 % with pre-drop off) is the unculled G56 tail (about 10 % of rows at
+    5-20 px), plus the 3 px cut on a 1.3 px core. R11b's online erase removes the tail first: S0E 3 px drop is
+    0.2-0.7 %.
+  - Pre-drop off helps S0 V2_01 (0.043 → 0.038) and hurts S0 V2_03 (0.120 → 0.132). With a heavy tail
+    (V2_03: 89-94 coasted frames, most flow-unavailable frames), a full solve with every outlier active is
+    pulled before the 3 px stage starts. So the fix is to drop after a first solve, not on the raw start.
+- **The 3 px "ratchet" (`mod.rs:419`) did no visible harm here.** Every solve converged in 12-26 iterations,
+  and the 3 px drop on S0E is under 1 %. Card AI's ratchet finding came from LaMAria sessions with 23-76 % drops.
+  It stays a risk for heavy-tail sessions, not a cause of loss on EuRoC.
+- **MH_01/MH_02 gain more than predicted (−0.014 m).** My S0 prediction assumed the easy sequences had no global
+  error left. Sim3 ATE offline is 0.014-0.018 against SE(3) 0.020-0.031, so part of the remaining error is scale
+  or a rigid offset. The online map still carries 0.01-0.02 m of globally inconsistent error after 4-DoF loops.
+  Unverified: it is the roll/pitch and scale that a 4-DoF pose graph cannot correct.
+- **S0 and S0E converge to the same ceiling** (6-sequence mean 0.046 against 0.043). R11b mostly helps the online
+  output. Offline it changes V1_03 (0.064 → 0.049) and V2_01 (0.043 → 0.035), and costs MH_04 +0.005.
+- **The ceiling is still 1.3-4.4x above ORB-SLAM3 on MH_04, MH_05, V1_02, V1_03, V2_03** (S0; MH_05 gains nothing:
+  0.082 → 0.081). R6 removes tilt and loop inconsistency. It does not remove what the observations themselves
+  carry: G56, the frontend (flow unavailable on V1_03/V2_03, G50/G51), the 1.3 px core.
+
+**Fix plan for card AI rung 2 (planner/implementer; no code here). Predictions on these 17 sessions:**
+1. **Drop schedule:** solve first with every observation under a Huber kernel. Then drop once at `outlier_px` on
+   the converged state, re-solve, drop once at `tight_outlier_px`, re-solve. Replaces the pre-drop at `:267` and
+   the per-iteration re-drop at `:419`. Config: `outlier_schedule: AfterConvergence | Legacy`.
+   - Predict: total drop on S0E ≤ 1 % on all six; S0 drop ≤ the 3 px share with pre-drop off (≈ 25 %) and no S0
+     session worse than its default by > 0.003; S0 V2_03 ≤ 0.120; S0 V2_01 ≤ 0.040.
+   - Kill: any session worse than its default by > 0.005, or a solve > 60 s.
+2. **Seeds:** none needed on EuRoC yet (1 component per session, every solve
+   converges; the `inserted_while_lost` count in these sessions is not read). Keep card AI's seed fixes for LaMAria; do not spend on them for EuRoC.
+3. **Ceiling stack:** the R6 ceiling then follows the online improvements (R11 error model, R12, frontend), because
+   the offline solve cannot fix what the observations carry.
+
+**Background stage in real time (owner's question for card AI (b); estimate, not a measurement).**
+- **Cost model, from the 17 solves (one thread):** per LM iteration 0.30-0.91 s for 354-562 keyframes at
+  covisibility 24-37 (S0E). MH_01 is 1.7 s at 579 keyframes and covisibility 74, because loop revisits densify the
+  reduced system (factor nnz 9.2M against 1.1-2.4M). About 13 iterations per solve. Full solve: 4-23 s CPU (S0E),
+  12-48 s (S0).
+- **0.25 of a core:** wall time is 4x CPU, so a full end-of-sequence solve lands 16-92 s after it starts.
+  - **Full-map stage after each loop** (ORB-SLAM3's pattern): 1-5 runs per sequence. MH_04 (100 s, 4 loops):
+    about 4 s CPU, so 16 s wall. The tilt fix would land about 16 s after the loop that triggers it.
+  - **Bounded window:** 60 keyframes (about 15-20 s of motion), covisibility ≤ 60. Estimated 50-150 ms per
+    iteration, 0.7-2 s CPU per solve, so 3-8 s wall at 0.25 core. It runs every 3-8 s, about every 10-30 keyframes.
+- **Share of the offline gain that reaches the causal pose:** unmeasured; three cases.
+  - Tilt, gravity and bias (MH_04, Vicon rooms): a correction stays valid going forward. The live pose gets it
+    through map-to-odom once it lands, 3-16 s late. Estimate 50-80 % of the smoothed-to-offline gain on poses after
+    the first correction, and none before it.
+  - Loop consistency (MH_01/MH_02, V1_01): the causal output already loses 0.03-0.04 m to loop jumps (G53, S0E
+    causal 0.072 against smoothed 0.036 on MH_01). A background solve does not remove the jump; it moves it.
+    Estimate 0-30 %.
+  - Refined past keyframes: 0 % causal by definition.
+  - Overall guess: 30-50 % of the offline gain reaches the causal score. On the S0E six that would take the
+    causal mean from about 0.105 to 0.08-0.09. It needs a measurement.
+- **Measurement that settles it (card AI (b)):** a prefix replay, no robot needed. Run offline-ba on the session
+  truncated at time t (`--until <t>` on `offline-ba`; a small app change). Re-anchor only frames in
+  [t + lag, t + lag + Δ] on that solve, where lag = 4 x CPU time of the solve. Score the stitched causal
+  trajectory. Cost: about 10-30 solves per sequence at 4-23 s CPU each.
 
 ## Owner decision 2026-11-23: the score models real time
 
