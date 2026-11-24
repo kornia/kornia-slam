@@ -1838,3 +1838,41 @@ shifts 0-2 except V1_03 (RT2E 5-6, RT2E-r 7, RT1PE 3-6, RT1E 10-11). Below Basal
 - Next (proposal, not run): RT3E = RT1PE + 7 iterations at default rayon, to test the budget without the rayon
   confound and on top of PnpInliers; and the R13c keyframe-acceptance rung (its trigger holds: RT2E misses the 2-core
   budget, P4 and lag). Nothing promoted.
+
+### Experiment R13a (S0PEI, SYNC) and RT3E (real time): protocol and RT3E predictions (written 2026-11-24 before the runs)
+
+Binary `E/bin-r11b/kornia-slam-euroc`, md5 `e67615adaf558b4aef7b7d1e35a2fb40` (unchanged); config only, no code, no
+build. Harness `E/mkcfg.sh` gains arms S0PEI and RT3E; every earlier arm's `run.ron` is byte-identical to its earlier
+runs (checked for S0, S0PE, RT1PE, RT2E).
+
+**R13a (S0PEI = S0PE + `tracking: ( pose_inertial: OrbSlam3 )`).** Predictions and kill rules P1-P5, K1-K3 as written
+under "Fix rungs" above (committed in ac679ce). Driver `E/r13/drive.sh` (= `E/drive.sh` SYNC protocol, unpaced, all
+rayon threads, 900 s cap, plus a gate of at most 3 heavy jobs counting `cargo`). Golden header
+`E/expect/S0PEI.header` = `E/expect/S0PE.header` (the knob does not print). A run counts only with
+`pose_inertial_solves` > 0 in its `[summary]`. Runs: MH_04 starts 0/1/2/30/60; guards V1_02, V2_01, MH_01 starts
+0/1/2.
+
+**RT3E = RT1PE + `local_ba: ( max_iterations: 7, initial_lambda: 1e-4 )` (Basalt's budget), default rayon.**
+- Gap tested: the 2-core budget (G57 lag, R13c trigger) without R11d's `RAYON_NUM_THREADS=1` confound, on top of
+  PnpInliers.
+- Theory: RT1PE already solves every keyframe (1.00-1.01 per keyframe) at 14.7-17.7 iterations per solve. A 7-iteration
+  cap cuts each solve by about 2x, which frees mapping CPU on the 2 cores for tracking, so tracking ends closer to the
+  sensor. Against that, R11d K2 showed the cap stops the MH VI-BA early (about 20 iterations to converge) and cost
+  accuracy on MH_04. PnpInliers starts each solve from cleaner rows (fewer erased), so convergence in 7 may hold better
+  than on RT1E; this run tests that.
+- Driver `E/r13/rt.sh` (= `E/r11d/rt.sh`, `RAYON_NUM_THREADS` unset): async, `--pace-timestamps`, `taskset -c 0,1`,
+  start 0, r1 and r2, one `kornia-slam*` run at a time, started at 1-min load ≤ 6 and with no `cargo` process. Golden
+  header `E/expect/RT3E.header` = `RT1PE.header` with `7 iterations from lambda 0.0001`. Sequences V2_01, V1_02,
+  V1_03, V2_02, MH_04, MH_01. Baseline RT1PE (`E/runs/RT1PE_*_s0_r[12]`).
+- Predictions:
+  - P1 (mechanism): solves per keyframe ≥ 0.97 on every run.
+  - P2: MH_04 causal mean within RT1PE's band (RT1PE 0.341 / 0.212, mean 0.277).
+  - P3: V2_01 causal mean ≤ 0.050.
+  - P4: lag (wall minus frames / 20 Hz) lower than RT1PE. Per-sequence mean lag below RT1PE's (V2_01 7.5 s, V1_02 33,
+    V1_03 20, V2_02 31) on the Vicon rooms; on MH_04 / MH_01, where RT1PE is at the floor (1 / 4.5 s, mostly
+    vocabulary load), not above RT1PE + 2 s. Sum of the six means below RT1PE's 97 s.
+- Kill rule K2 (the budget is harmful, same as R11d K2): MH_04 causal mean > 1.15x RT1PE (> 0.319).
+- Reported, no rule: iterations per solve, BA mean ms, `frame_ms` p90, keyframes, all six causal against RT1PE and
+  Basalt.
+
+Not in this rung: code, R13c (keyframe acceptance), promotion (full-sequence gate first).
