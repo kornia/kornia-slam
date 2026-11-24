@@ -316,6 +316,99 @@ pub(super) fn marginalize_frozen(
     })
 }
 
+/// The prior `(H', b')` left when the variables at `marg` are eliminated
+/// from the quadratic `½ xᵀHx + bᵀx` over `keep ∪ marg`, `b` the gradient:
+/// `H' = H_kk − H_km H_mm⁻¹ H_mk`, `b' = b_k − H_km H_mm⁻¹ b_m`, symmetrized.
+// Test-only until the odometry window calls it from the system.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct SchurComplement {
+    pub h: Mat<f64>,
+    pub b: Vec<f64>,
+    /// `H_mm` was not positive definite, so its pseudo-inverse was used.
+    pub pseudo_inverse: bool,
+}
+
+/// [`SchurComplement`] of `h`, `b` onto the indices `keep`, eliminating
+/// `marg`, in the order given. `H_mm` is factored by Cholesky; when it is
+/// not positive definite, its pseudo-inverse from a symmetric
+/// eigendecomposition is used, cut at `n · ε · λ_max` (Basalt always
+/// pseudo-inverts, `marg_helper.cpp:103-104`).
+#[cfg(test)]
+pub(crate) fn schur_complement(
+    h: &Mat<f64>,
+    b: &[f64],
+    keep: &[usize],
+    marg: &[usize],
+) -> Result<SchurComplement, MarginalizationError> {
+    let (nk, nm) = (keep.len(), marg.len());
+    if nm == 0 {
+        return Ok(SchurComplement {
+            h: Mat::<f64>::from_fn(nk, nk, |r, c| h[(keep[r], keep[c])]),
+            b: keep.iter().map(|&k| b[k]).collect(),
+            pseudo_inverse: false,
+        });
+    }
+    let h_mm = Mat::<f64>::from_fn(nm, nm, |r, c| h[(marg[r], marg[c])]);
+    // [H_mk | b_m]: one solve gives H_mm⁻¹ H_mk and H_mm⁻¹ b_m.
+    let rhs = Mat::<f64>::from_fn(nm, nk + 1, |r, c| match c {
+        c if c == nk => b[marg[r]],
+        c => h[(marg[r], keep[c])],
+    });
+    let (x, pseudo_inverse) = match h_mm.llt(faer::Side::Lower) {
+        Ok(chol) => (chol.solve(&rhs), false),
+        Err(_) => (pseudo_inverse(&h_mm)? * &rhs, true),
+    };
+    let correction = |r: usize, c: usize| {
+        (0..nm)
+            .map(|k| h[(keep[r], marg[k])] * x[(k, c)])
+            .sum::<f64>()
+    };
+    let mut out = Mat::<f64>::from_fn(nk, nk, |r, c| h[(keep[r], keep[c])] - correction(r, c));
+    for r in 0..nk {
+        for c in (r + 1)..nk {
+            let avg = 0.5 * (out[(r, c)] + out[(c, r)]);
+            out[(r, c)] = avg;
+            out[(c, r)] = avg;
+        }
+    }
+    let b_out: Vec<f64> = (0..nk).map(|r| b[keep[r]] - correction(r, nk)).collect();
+    let finite = (0..nk).all(|c| out.col_as_slice(c).iter().all(|v| v.is_finite()))
+        && b_out.iter().all(|v| v.is_finite());
+    if !finite {
+        return Err(MarginalizationError::NonFinite);
+    }
+    Ok(SchurComplement {
+        h: out,
+        b: b_out,
+        pseudo_inverse,
+    })
+}
+
+/// Pseudo-inverse of the symmetric `a`, eigenvalues at or below
+/// `n · ε · λ_max` cut.
+#[cfg(test)]
+fn pseudo_inverse(a: &Mat<f64>) -> Result<Mat<f64>, MarginalizationError> {
+    let n = a.nrows();
+    let eigen = a
+        .self_adjoint_eigen(faer::Side::Lower)
+        .map_err(|_| MarginalizationError::NotPositiveDefinite)?;
+    let values = eigen.S().column_vector();
+    let vectors = eigen.U();
+    let largest = (0..n).map(|i| values[i]).fold(0.0f64, f64::max);
+    let cut = n as f64 * f64::EPSILON * largest;
+    let mut out = Mat::<f64>::zeros(n, n);
+    for i in (0..n).filter(|&i| values[i] > cut) {
+        let inv = 1.0 / values[i];
+        for c in 0..n {
+            for r in 0..n {
+                out[(r, c)] += vectors[(r, i)] * inv * vectors[(c, i)];
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,6 +620,90 @@ mod tests {
         }
         let last_v = batch[5 * DOF + 6];
         assert!(last_v.abs() > 1e-3, "step too small to test: {last_v}");
+    }
+
+    /// T1b: the generic Schur complement, on the joint `marginalize_frozen`
+    /// builds, gives its prior to 1e-12.
+    #[test]
+    fn the_generic_schur_complement_reproduces_marginalize_frozen() {
+        let (keyframes, edges, params) = chain();
+        let pseudo = FrozenPoseSigma::default();
+        let mut prior: Option<MarginalPrior> = None;
+        for k in 0..3 {
+            let (frozen, next, edge) = (&keyframes[k], &keyframes[k + 1], &edges[k]);
+            let (res, j_frozen, j_next) = preintegration::residual_and_jacobians(
+                frozen.nav_state(),
+                next.nav_state(),
+                &edge.preintegrated,
+                &params.gravity,
+                params.imu_t_bc.as_ref(),
+            );
+            let omega = imu_information_matrix(&edge.preintegrated, params.imu_weight);
+            let mut h = Mat::<f64>::zeros(2 * DOF, 2 * DOF);
+            let mut m = vec![0.0; 2 * DOF];
+            let blocks = [(0, &j_frozen), (DOF, &j_next)];
+            for &(row, j_row) in &blocks {
+                for &(col, j_col) in &blocks {
+                    accum_jt_omega_j(
+                        &mut h,
+                        &mut m,
+                        row,
+                        col,
+                        j_row,
+                        j_col,
+                        &omega,
+                        &res,
+                        row == col,
+                    );
+                }
+            }
+            if let Some(prior) = prior.as_ref() {
+                accumulate_prior(&mut h, &mut m, 0, prior, frozen);
+            }
+            for d in 0..3 {
+                h[(d, d)] += pseudo.frozen_pose_sigma_m.powi(-2);
+                h[(3 + d, 3 + d)] += pseudo.frozen_pose_sigma_rad.powi(-2);
+            }
+            let gradient: Vec<f64> = m.iter().map(|x| -x).collect();
+            let keep: Vec<usize> = (DOF..2 * DOF).collect();
+            let marg: Vec<usize> = (0..DOF).collect();
+            let generic = schur_complement(&h, &gradient, &keep, &marg).unwrap();
+            let expected =
+                marginalize_frozen(prior.as_ref(), frozen, next, edge, &params, pseudo).unwrap();
+            assert!(!generic.pseudo_inverse);
+            let scale = expected.info.iter().fold(0.0f64, |a, v| a.max(v.abs()));
+            for r in 0..DOF {
+                for c in 0..DOF {
+                    let (g, e) = (generic.h[(r, c)], expected.info[idx15(r, c)]);
+                    assert!(
+                        (g - e).abs() <= 1e-12 * scale,
+                        "step {k} H[{r},{c}]: {g} vs {e}"
+                    );
+                }
+                let (g, e) = (generic.b[r], expected.rhs[r]);
+                assert!(
+                    (g - e).abs() <= 1e-12 * scale,
+                    "step {k} b[{r}]: {g} vs {e}"
+                );
+            }
+            prior = Some(expected);
+        }
+    }
+
+    /// A singular `H_mm` falls back to its pseudo-inverse: a marginalized
+    /// variable that nothing constrains leaves the kept block unchanged.
+    #[test]
+    fn a_singular_marginal_block_uses_the_pseudo_inverse() {
+        let mut h = Mat::<f64>::zeros(3, 3);
+        h[(0, 0)] = 2.0;
+        h[(0, 1)] = 1.0;
+        h[(1, 0)] = 1.0;
+        h[(1, 1)] = 1.0;
+        let b = [1.0, 0.5, 0.0];
+        let out = schur_complement(&h, &b, &[0], &[1, 2]).unwrap();
+        assert!(out.pseudo_inverse);
+        assert!((out.h[(0, 0)] - 1.0).abs() < 1e-12);
+        assert!((out.b[0] - 0.5).abs() < 1e-12);
     }
 
     /// The prior's cost at `lin_point ⊕ d` is `½ dᵀHd + bᵀd`, and `⊖` undoes
