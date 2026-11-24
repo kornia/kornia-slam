@@ -1,7 +1,10 @@
 //! `upstream::kornia_imgproc::remap_u8` against kornia-rs `remap_u8` and,
 //! with `opencv_bench`, OpenCV's `remap` on `convertMaps` `CV_16SC2` maps.
 //! One EuRoC `cam0` rectification: 752×480, radtan (k1 −0.283). The tables
-//! and OpenCV's fixed maps are built once, outside the timed loop.
+//! and OpenCV's fixed maps are built once, outside the timed loop. With
+//! `opencv_bench` a paired run also alternates the arms call by call, so a
+//! clock change on a busy laptop hits every arm alike, and prints the medians
+//! and the ratios to OpenCV.
 //!
 //! `RAYON_NUM_THREADS=1 taskset -c 8 cargo bench -j2 -p kornia-slam
 //! --features bench_internals,opencv_bench --bench bench_upstream_remap_u8`
@@ -151,6 +154,9 @@ fn bench_remap(c: &mut Criterion) {
     opencv_arm::bench(&mut group, &src, map_x, map_y);
 
     group.finish();
+
+    #[cfg(feature = "opencv_bench")]
+    opencv_arm::paired(&src, map_x, map_y);
 }
 
 #[cfg(feature = "opencv_bench")]
@@ -171,40 +177,98 @@ mod opencv_arm {
         mat
     }
 
+    /// OpenCV's `remap` of `src` on `convertMaps` `CV_16SC2` maps, or on the
+    /// f32 maps themselves.
+    struct OpencvRemap {
+        src: core::Mat,
+        xy: core::Mat,
+        frac: core::Mat,
+        fx: core::Mat,
+        fy: core::Mat,
+        out: core::Mat,
+    }
+
+    impl OpencvRemap {
+        fn new(src: &Image<u8, 1>, map_x: &Image<f32, 1>, map_y: &Image<f32, 1>) -> Self {
+            core::set_num_threads(1).unwrap();
+            let (fx, fy) = (mat(map_x, core::CV_32FC1), mat(map_y, core::CV_32FC1));
+            let (mut xy, mut frac) = (core::Mat::default(), core::Mat::default());
+            imgproc::convert_maps(&fx, &fy, &mut xy, &mut frac, core::CV_16SC2, false).unwrap();
+            Self {
+                src: mat(src, core::CV_8UC1),
+                xy,
+                frac,
+                fx,
+                fy,
+                out: core::Mat::default(),
+            }
+        }
+
+        fn run(&mut self, fixed: bool) {
+            let (m1, m2) = if fixed {
+                (&self.xy, &self.frac)
+            } else {
+                (&self.fx, &self.fy)
+            };
+            imgproc::remap(
+                black_box(&self.src),
+                &mut self.out,
+                m1,
+                m2,
+                imgproc::INTER_LINEAR,
+                core::BORDER_CONSTANT,
+                core::Scalar::all(0.0),
+            )
+            .unwrap();
+            black_box(&self.out);
+        }
+    }
+
     pub(super) fn bench(
         group: &mut BenchmarkGroup<'_, WallTime>,
         src: &Image<u8, 1>,
         map_x: &Image<f32, 1>,
         map_y: &Image<f32, 1>,
     ) {
-        core::set_num_threads(1).unwrap();
-        let cv_src = mat(src, core::CV_8UC1);
-        let (mut xy, mut frac) = (core::Mat::default(), core::Mat::default());
-        imgproc::convert_maps(
-            &mat(map_x, core::CV_32FC1),
-            &mat(map_y, core::CV_32FC1),
-            &mut xy,
-            &mut frac,
-            core::CV_16SC2,
-            false,
-        )
-        .unwrap();
-        let mut out = core::Mat::default();
-        group.bench_function("opencv_remap_16sc2", |b| {
-            b.iter(|| {
-                imgproc::remap(
-                    black_box(&cv_src),
-                    &mut out,
-                    &xy,
-                    &frac,
-                    imgproc::INTER_LINEAR,
-                    core::BORDER_CONSTANT,
-                    core::Scalar::all(0.0),
-                )
-                .unwrap();
-                black_box(&out);
-            });
+        let mut cv = OpencvRemap::new(src, map_x, map_y);
+        group.bench_function("opencv_remap_16sc2", |b| b.iter(|| cv.run(true)));
+        group.bench_function("opencv_remap_32fc1", |b| b.iter(|| cv.run(false)));
+    }
+
+    /// Medians of `ROUNDS` calls per arm, the arms alternating call by call.
+    pub(super) fn paired(src: &Image<u8, 1>, map_x: &Image<f32, 1>, map_y: &Image<f32, 1>) {
+        const ROUNDS: usize = 400;
+        let mut cv = OpencvRemap::new(src, map_x, map_y);
+        let tables = [RemapQuantisation::Q10Trunc, RemapQuantisation::OpenCvQ5]
+            .map(|q| RemapTable::from_maps(map_x, map_y, SIZE, q).unwrap());
+        let mut dst = Image::from_size_val(SIZE, 0u8).unwrap();
+        let mut times = [(); 4].map(|_| Vec::with_capacity(ROUNDS));
+        for _ in 0..ROUNDS {
+            for (arm, t) in times.iter_mut().enumerate() {
+                let start = std::time::Instant::now();
+                match arm {
+                    0 | 1 => remap_u8_table(black_box(src), &mut dst, &tables[arm]).unwrap(),
+                    2 => cv.run(true),
+                    _ => cv.run(false),
+                }
+                t.push(start.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        let sorted = times.map(|mut t| {
+            t.sort_by(f64::total_cmp);
+            t
         });
+        let [q10, q5, cv16, cv32] = sorted.each_ref().map(|t| t[ROUNDS / 2]);
+        let [q10_min, q5_min, cv16_min, cv32_min] = sorted.each_ref().map(|t| t[0]);
+        eprintln!(
+            "paired medians ({ROUNDS} rounds): q10 {q10:.3} ms, q5 {q5:.3} ms, \
+             opencv 16sc2 {cv16:.3} ms, opencv 32fc1 {cv32:.3} ms; \
+             q10 / 16sc2 {:.2}, q10 / 32fc1 {:.2}, q5 / 16sc2 {:.2}; minima q10 {q10_min:.3}, \
+             q5 {q5_min:.3}, 16sc2 {cv16_min:.3}, 32fc1 {cv32_min:.3} ms",
+            q10 / cv16,
+            q10 / cv32,
+            q5 / cv16,
+        );
     }
 }
 

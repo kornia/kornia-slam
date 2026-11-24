@@ -2445,3 +2445,41 @@ version would: read the two taps of a row as one `u16`; blend in `i16x8` multipl
 needs `(p01 − p00)·fx` style blends to stay in i16, or i32 for the vertical step only); drop the per-pixel slice check
 (the offsets are proven in range at build). Whether that reaches OpenCV is not known. Waiting for the owner before
 any more F3 work; the knob stays at `RemapF32`.
+
+### Results: F3 kernel rewrite 1, K2 cleared (owner decision 2026-11-24: optimize until it beats OpenCV)
+
+Rewrite 1 (one rewrite was enough). The laptop's x86_64 target is baseline SSE2, which has no 32-bit lane multiply, so the
+first kernel's six `i32x8` multiplies per pixel were emulated. Now, as in OpenCV's `remap`, each pixel reads its two
+taps per source row as one 16-bit load. The 16 bytes of 8 pixels widen to `i16x16`, and one `dot` (`pmaddwd`; NEON
+multiply-add) with the stored `[S − fx, fx]` pairs gives each row. A Q10 row reaches 2^18, past i16. So the vertical
+step splits each row into `1024·hi + lo` and runs two more multiply-adds with `[S − fy, fy]`:
+`Σ row·w = 1024·Σ hi·w + Σ lo·w`, exact. Q10 stays byte-identical to `remap_u8`. Q5 takes the same path. The
+interior/edge split is unchanged. The tap loads are unchecked reads, justified once per table: `from_maps` admits a lane
+pixel only when `off + w + 2 ≤ w·h`. All 6 kernel tests pass, including the OpenCV fixture (≤ 1 LSB). No `std::arch`
+under `upstream/`, and `cargo check --target aarch64-unknown-linux-gnu` passes.
+
+Bench `benches/bench_upstream_remap_u8.rs` now also has an OpenCV `CV_32FC1` arm. It also runs a paired series: 400
+rounds, the four arms alternating call by call, medians and minima. That way a clock change hits every arm alike. The
+laptop was loaded (1-min load 14-21, other agents' SLAM runs) and clocked at 0.8 GHz. The governor was `powersave`,
+EPP `balance_performance`, `scaling_cur_freq` 799 952-842 687 kHz during the runs. Core 5 was used: its sibling 11
+was the least busy pair; core 8's sibling 2 was busy. `RAYON_NUM_THREADS=1`. Logs are in the lane's scratch
+(`bench_r1b.txt`, `bench_r1_cycles.txt`, `bench_r1_cycles2.txt`) and summarised here.
+
+| comparison | measured | ratio |
+|---|---|---|
+| ours Q10 against C++ OpenCV 4.5.3 `CV_16SC2`, paired medians, 6 series | 2.43-4.49 ms against 6.07-11.33 ms | 0.39-0.42 |
+| ours Q10 against C++ OpenCV 4.5.3 `CV_32FC1`, paired medians | against 6.04-11.81 ms | 0.38-0.40 |
+| ours Q5 against C++ OpenCV 4.5.3 `CV_16SC2`, paired medians | 2.47-4.48 ms | 0.38-0.41 |
+| ours Q10 against OpenCV 5.0.0 (Python, `CV_32FC1`, the fastest OpenCV arm), alternating process by process, 8 cycles, minima | 0.77-1.87 ms against 2.78-6.28 ms | 0.24-0.40 per cycle (the slowest of ours 1.87 is below the fastest OpenCV 5.0 2.78) |
+| same, medians (5 cycles; the OpenCV 5.0 run is not paired with ours, so these swing with the neighbours' load) | ours 2.53-4.49 ms (paired series), cv2 3.31-6.90 ms | 0.42-1.34 |
+| ours Q10 against kornia-rs `remap_u8` (criterion, sequential arms) | 3.79 ms against 43.19 ms | 11.4x faster |
+
+| P/K | prediction | measured | verdict |
+|---|---|---|---|
+| bench P1 | ≤ 1.0 ms per image on one laptop core | paired medians 2.43-4.49 ms, minima 0.77-1.87 ms, at 0.8 GHz on a loaded core | missed, provisional (minima ≤ 1.0 in 3 of 8 cycles; no quiet full-clock sample) |
+| bench P2 | ≥ 5x faster than `remap_u8` | 11.4x | as predicted |
+| bench P3 | time ÷ OpenCV ≤ 1.0 | 0.38-0.42 paired against 4.5.3; 0.24-0.40 minima against 5.0 | as predicted |
+| K2 | slower than OpenCV | no, against both | not fired (rewrite 1) |
+
+The medians against OpenCV 5.0 overlap 1.0 in 2 of 5 cycles. That is the unpaired measurement on a loaded machine; the
+paired series and every minimum are below 1.0. Next: the 2-core F3 system run.

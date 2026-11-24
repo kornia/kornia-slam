@@ -5,9 +5,13 @@
 //! scalar pixel at a time. A rectification map is constant, so the integer
 //! taps and fixed-point weights are computed once here and the blend runs on
 //! `wide` lanes, on the calling thread.
+//!
+//! As OpenCV's `remap`, each output pixel reads its two taps per source row
+//! as one 16-bit load and blends them with 16-bit multiply-adds (`pmaddwd`,
+//! NEON `vmlal`), which baseline SSE2 has; it has no 32-bit lane multiply.
 
 use kornia_image::{Image, ImageError, ImageSize};
-use wide::i32x8;
+use wide::{i16x8, i16x16, i32x8, u8x16};
 
 use super::lanes::{LANES, lane_starts};
 
@@ -50,8 +54,11 @@ pub struct RemapTable {
     bits: u32,
     /// Top-left tap per output pixel; its neighbours are `+1`, `+w`, `+w+1`.
     offsets: Vec<u32>,
-    /// `[fx, fy]` per output pixel; `fx = 0` where the right tap is clamped.
-    weights: Vec<[u16; 2]>,
+    /// `[S - fx, fx]` per output pixel, `S = 2^bits`; `fx = 0` where the
+    /// right tap is clamped.
+    weights_x: Vec<[i16; 2]>,
+    /// `[S - fy, fy]` per output pixel.
+    weights_y: Vec<[i16; 2]>,
     /// Output pixels whose top-left tap is outside the source: zero.
     zeros: Vec<u32>,
     edges: Vec<EdgeTap>,
@@ -108,10 +115,12 @@ impl RemapTable {
             dst_size: map_x.size(),
             bits: quant.bits(),
             offsets: vec![0; n],
-            weights: vec![[0; 2]; n],
+            weights_x: vec![[1 << quant.bits(), 0]; n],
+            weights_y: vec![[1 << quant.bits(), 0]; n],
             zeros: Vec::new(),
             edges: Vec::new(),
         };
+        let scale = 1i16 << quant.bits();
         for (dst, (&xf, &yf)) in map_x.as_slice().iter().zip(map_y.as_slice()).enumerate() {
             let taps = tap(xf, w as i32, quant).zip(tap(yf, h as i32, quant));
             let Some(((xi, fx), (yi, fy))) = taps else {
@@ -128,8 +137,10 @@ impl RemapTable {
             // The lane loop reads `off ..= off + w + 1`; only the last row and
             // the last pixel of the row above it reach past the source.
             if off + w + 2 <= w * h {
+                let pair = |f: u16| [scale - f as i16, f as i16];
                 table.offsets[dst] = off as u32;
-                table.weights[dst] = [fx, fy];
+                table.weights_x[dst] = pair(fx);
+                table.weights_y[dst] = pair(fy);
             } else {
                 table.edges.push(EdgeTap {
                     dst: dst as u32,
@@ -151,14 +162,31 @@ impl RemapTable {
     }
 }
 
-/// `(top·(S - fy) + bottom·fy + S²/2) >> 2·bits` with `top`, `bottom` the
-/// horizontal blends; exact in i32 for 10-bit weights (≤ 255·2^20 + 2^19).
+/// Reinterprets each i32 lane `lo | hi << 16` as the i16 pair `[lo, hi]`.
 #[inline(always)]
-fn blend(p: [i32x8; 4], fx: i32x8, fy: i32x8, bits: u32) -> i32x8 {
-    let scale = i32x8::splat(1 << bits);
-    let top = p[0] * (scale - fx) + p[1] * fx;
-    let bottom = p[2] * (scale - fx) + p[3] * fx;
-    (top * (scale - fy) + bottom * fy + i32x8::splat(1 << (2 * bits - 1))) >> (2 * bits) as i32
+fn as_pairs(v: i32x8) -> i16x16 {
+    // SAFETY: both are 32-byte vectors of plain integers (`bytemuck::Pod` in
+    // `wide`), so every bit pattern is a valid value of either. Lane order is
+    // little-endian, as on x86_64 and aarch64.
+    unsafe { std::mem::transmute::<i32x8, i16x16>(v) }
+}
+
+/// Eight output pixels from their tap pairs: `top`/`bottom` hold
+/// `[p00, p01]` / `[p10, p11]` per pixel. The rows are `[p0, p1]·[S - fx, fx]`
+/// in one multiply-add. A Q10 row reaches 2^18, past i16, so the vertical
+/// step splits each row into `1024·hi + lo` and runs two multiply-adds:
+/// `Σ row·w = 1024·Σ hi·w + Σ lo·w`, exact, as the reference's
+/// `(top·(S - fy) + bottom·fy + S²/2) >> 2·bits`.
+#[inline(always)]
+fn blend8(top: u8x16, bottom: u8x16, wx: i16x16, wy: i16x16, bits: u32) -> [u8; LANES] {
+    let t = i16x16::from(top).dot(wx);
+    let b = i16x16::from(bottom).dot(wx);
+    let low = i32x8::splat(1023);
+    let hi = as_pairs((t >> 10) | ((b >> 10) << 16)).dot(wy);
+    let lo = as_pairs((t & low) | ((b & low) << 16)).dot(wy);
+    let v = ((hi << 10) + lo + i32x8::splat(1 << (2 * bits - 1))) >> (2 * bits) as i32;
+    let bytes = u8x16::narrow_i16x8(i16x8::from_i32x8_saturate(v), i16x8::ZERO).to_array();
+    std::array::from_fn(|k| bytes[k])
 }
 
 #[inline(always)]
@@ -195,36 +223,42 @@ pub fn remap_u8_table(
     let out = dst.as_slice_mut();
     let n = out.len();
     let lanes = |start: usize, out: &mut [u8]| {
-        let mut p = [[0i32; LANES]; 4];
-        let (mut fx, mut fy) = ([0i32; LANES], [0i32; LANES]);
+        let (mut top, mut bottom) = ([0u8; 16], [0u8; 16]);
         for k in 0..LANES {
             let off = table.offsets[start + k] as usize;
-            // One bounds check for the four taps; `from_maps` keeps
-            // `off + stride + 1` inside the source.
-            let quad = &src[off..off + stride + 2];
-            p[0][k] = i32::from(quad[0]);
-            p[1][k] = i32::from(quad[1]);
-            p[2][k] = i32::from(quad[stride]);
-            p[3][k] = i32::from(quad[stride + 1]);
-            let [wx, wy] = table.weights[start + k];
-            (fx[k], fy[k]) = (i32::from(wx), i32::from(wy));
+            // SAFETY: `from_maps` keeps `off + stride + 2 <= w·h` for every
+            // lane pixel (the rest are fixed up after this pass), and `src`
+            // was checked to be the table's `w × h`.
+            let (t, b) = unsafe {
+                let p = src.as_ptr().add(off);
+                (
+                    p.cast::<[u8; 2]>().read_unaligned(),
+                    p.add(stride).cast::<[u8; 2]>().read_unaligned(),
+                )
+            };
+            top[2 * k..2 * k + 2].copy_from_slice(&t);
+            bottom[2 * k..2 * k + 2].copy_from_slice(&b);
         }
-        let v = blend(
-            p.map(i32x8::new),
-            i32x8::new(fx),
-            i32x8::new(fy),
+        let weights = |w: &[[i16; 2]]| {
+            let mut a = [0i16; 2 * LANES];
+            a.copy_from_slice(w[start..start + LANES].as_flattened());
+            i16x16::new(a)
+        };
+        let v = blend8(
+            u8x16::new(top),
+            u8x16::new(bottom),
+            weights(&table.weights_x),
+            weights(&table.weights_y),
             table.bits,
         );
-        for (o, &v) in out[start..start + LANES].iter_mut().zip(v.as_array()) {
-            *o = v as u8;
-        }
+        out[start..start + LANES].copy_from_slice(&v);
     };
     if n < LANES {
         for (i, o) in out.iter_mut().enumerate() {
             let off = table.offsets[i] as usize;
-            let [wx, wy] = table.weights[i];
+            let (fx, fy) = (table.weights_x[i][1], table.weights_y[i][1]);
             let p = [off, off + 1, off + stride, off + stride + 1].map(|t| i32::from(src[t]));
-            *o = blend_scalar(p, i32::from(wx), i32::from(wy), table.bits);
+            *o = blend_scalar(p, i32::from(fx), i32::from(fy), table.bits);
         }
     }
     for start in lane_starts(n) {
