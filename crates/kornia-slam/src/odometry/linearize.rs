@@ -3,9 +3,19 @@
 //! complement (Basalt `landmark_block_abs_dynamic.hpp`).
 
 use faer::Mat;
-use kornia_algebra::{SMatF64, SVecF64};
+use kornia_3d::pose::Pose3d;
+use kornia_3d::ransac::{HuberKernel, RobustKernel};
+use kornia_algebra::{Mat15F64, SMatF64, SVecF64, Vec15F64};
+use kornia_factors::inertial::preintegration::residual_and_jacobians;
+use kornia_factors::reprojection::{anchored_residual, anchored_residual_and_jacobians};
 
+use super::landmarks::{Landmark, LandmarkId};
+use super::marginalize::MissingVariable;
 use super::state::{FrameId, POSE_DOF, STATE_DOF};
+use super::window::{ImuEdge, Window};
+
+/// Rows of points closer than this to the target camera are skipped, m.
+const MIN_DEPTH_M: f64 = 1e-3;
 
 /// What a frame contributes to the order: its 6-DOF pose or its 15-DOF state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,6 +322,21 @@ impl LandmarkBlock {
         }
     }
 
+    /// `(H_pl H_ll⁻¹ b_l)[i]` at system index `i`: what elimination took
+    /// from the gradient there.
+    #[cfg(test)]
+    pub(crate) fn schur_gradient(&self, i: usize) -> f64 {
+        let Some(inv) = self.h_ll_inv else {
+            return 0.0;
+        };
+        self.frames
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| (**o..**o + 6).contains(&i))
+            .map(|(a, o)| (self.h_pl[a] * inv * self.b_l)[i - o])
+            .sum()
+    }
+
     /// `δ_l = −H_ll⁻¹ (b_l + H_lp δ_p)` for the pose step `inc`; zero when
     /// the landmark is fixed.
     pub(crate) fn back_substitute(&self, inc: &[f64]) -> SVecF64<3> {
@@ -325,4 +350,246 @@ impl LandmarkBlock {
         }
         -(inv * rhs)
     }
+}
+
+/// Cost of the window: Huber vision, IMU with its bias walk, and the prior
+/// at the current deltas (`sqrt_keypoint_vio.cpp:1269-1291`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct Cost {
+    pub vision: f64,
+    pub imu: f64,
+    pub prior: f64,
+    /// Visual rows used, per camera, and rows skipped for cheirality.
+    pub rows: [usize; 2],
+    pub skipped: usize,
+}
+
+impl Cost {
+    pub(crate) fn total(&self) -> f64 {
+        self.vision + self.imu + self.prior
+    }
+}
+
+/// `w = ρ'(s) / σ²` and `½ ρ(s)` of a pixel residual under Huber, `s` the
+/// squared residual in units of `σ` and the knee `(huber_px / σ)²`.
+pub(crate) fn huber(residual: &SVecF64<2>, sigma: f64, huber_px: f64) -> (f64, f64) {
+    let s = residual.norm_squared() / (sigma * sigma);
+    let knee = (huber_px / sigma).powi(2);
+    (
+        HuberKernel.weight(s, knee) / (sigma * sigma),
+        0.5 * HuberKernel.rho(s, knee),
+    )
+}
+
+/// Which frames a landmark's rows may use.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Rows<'a> {
+    /// Every window frame (optimization).
+    All,
+    /// Only frames in this order (marginalization, M8).
+    In(&'a Order),
+}
+
+/// The rows of landmark `lm` into `block`, pose blocks at their offsets in
+/// `order`: residual at the current values, Jacobians at the first-estimate
+/// poses (design card section 3). A row whose poses are one variable (host
+/// and stereo rows) has no pose columns. Returns the rows' cost, or `None`
+/// when the host is not in the order.
+pub(crate) fn landmark_rows(
+    window: &Window,
+    lm: &Landmark,
+    order: &Order,
+    rows: Rows<'_>,
+    block: &mut LandmarkBlock,
+    cost: &mut Cost,
+) -> Option<()> {
+    let host_offset = order.pose_offset(lm.host)?;
+    let host = window.frame_pose(lm.host)?;
+    let host_lin = window.frame_jacobian_pose(lm.host)?;
+    let allowed = |frame: FrameId| match rows {
+        Rows::All => true,
+        Rows::In(o) => o.find(frame).is_some(),
+    };
+    block.begin(
+        lm.observations
+            .keys()
+            .filter(|(frame, _)| allowed(*frame))
+            .filter_map(|(frame, _)| order.pose_offset(*frame)),
+    );
+    let tuning = &window.tuning;
+    for (&(frame, camera), &pixel) in &lm.observations {
+        if !allowed(frame) {
+            continue;
+        }
+        let Some(view) = window.cameras.get(usize::from(camera)) else {
+            continue;
+        };
+        let (Some(target), Some(target_lin)) =
+            (window.frame_pose(frame), window.frame_jacobian_pose(frame))
+        else {
+            continue;
+        };
+        let to_camera = |pose: &Pose3d| view.camera_from_primary.compose(pose);
+        let residual = anchored_residual(
+            &host,
+            &to_camera(&target),
+            &lm.value,
+            pixel,
+            &view.camera,
+            MIN_DEPTH_M,
+        );
+        let jacobians = anchored_residual_and_jacobians(
+            &host_lin,
+            &to_camera(&target_lin),
+            &lm.value,
+            pixel,
+            &view.camera,
+            MIN_DEPTH_M,
+        );
+        let (Some(residual), Some(row)) = (residual, jacobians) else {
+            cost.skipped += 1;
+            continue;
+        };
+        let (weight, row_cost) = huber(&residual, tuning.pixel_sigma, tuning.huber_px);
+        cost.vision += row_cost;
+        cost.rows[usize::from(camera).min(1)] += 1;
+        let (t, h) = if frame == lm.host {
+            (None, None)
+        } else {
+            (order.pose_offset(frame), Some(host_offset))
+        };
+        block.add_row(t, h, &row.d_target, &row.d_landmark, &residual, weight);
+    }
+    Some(())
+}
+
+/// The cost of landmark `lm`'s rows at the current values.
+fn landmark_cost(window: &Window, lm: &Landmark, cost: &mut Cost) {
+    let Some(host) = window.frame_pose(lm.host) else {
+        return;
+    };
+    let tuning = &window.tuning;
+    for (&(frame, camera), &pixel) in &lm.observations {
+        let (Some(view), Some(target)) = (
+            window.cameras.get(usize::from(camera)),
+            window.frame_pose(frame),
+        ) else {
+            continue;
+        };
+        let target = view.camera_from_primary.compose(&target);
+        match anchored_residual(&host, &target, &lm.value, pixel, &view.camera, MIN_DEPTH_M) {
+            Some(residual) => {
+                cost.vision += huber(&residual, tuning.pixel_sigma, tuning.huber_px).1;
+                cost.rows[usize::from(camera).min(1)] += 1;
+            }
+            None => cost.skipped += 1,
+        }
+    }
+}
+
+/// The IMU edge from `from` into `system`: Jacobians from one call with
+/// every state at its linearization point, the residual from a second call
+/// at the current values when either is linearized (`imu_block.hpp:44-54`).
+/// Returns `(cost, residual, J_from, J_to)`; `None` when a state is missing.
+pub(crate) fn imu_edge(
+    window: &Window,
+    from: FrameId,
+    edge: &ImuEdge,
+) -> Option<(f64, Vec15F64, Mat15F64, Mat15F64)> {
+    let (i, j) = (window.states.get(&from)?, window.states.get(&edge.to)?);
+    let (li, lj) = (i.jacobian_point(), j.jacobian_point());
+    let (mut residual, j_i, j_j) = residual_and_jacobians(
+        li.nav_state(),
+        lj.nav_state(),
+        &edge.pim,
+        &window.gravity,
+        Some(&window.t_bc),
+    );
+    if i.is_linearized() || j.is_linearized() {
+        let (vi, vj) = (i.value(), j.value());
+        residual = residual_and_jacobians(
+            vi.nav_state(),
+            vj.nav_state(),
+            &edge.pim,
+            &window.gravity,
+            Some(&window.t_bc),
+        )
+        .0;
+    }
+    let cost = 0.5 * residual.dot(&(edge.omega * residual));
+    Some((cost, residual, j_i, j_j))
+}
+
+/// Everything one linearization leaves for the solve.
+#[derive(Debug, Default)]
+pub(crate) struct Linearization {
+    pub order: Order,
+    pub system: DenseSystem,
+    pub blocks: Vec<(LandmarkId, LandmarkBlock)>,
+    pub used_blocks: usize,
+    /// `½ Σ b_lᵀ H_ll⁻¹ b_l`, the landmarks' share of the model decrease.
+    pub landmark_model: f64,
+    pub fixed_landmarks: usize,
+    pub cost: Cost,
+}
+
+/// Linearizes the whole window at its current values (`linearize` of the
+/// design card); the cost is `lin.cost`.
+pub(crate) fn linearize(window: &Window, lin: &mut Linearization) -> Result<(), MissingVariable> {
+    window.order(&mut lin.order);
+    lin.system.reset(lin.order.dim());
+    lin.cost = Cost::default();
+    lin.landmark_model = 0.0;
+    lin.fixed_landmarks = 0;
+    lin.used_blocks = 0;
+    lin.cost.prior = window.prior.accumulate(
+        &window.prior_delta(&window.prior),
+        &lin.order,
+        &mut lin.system,
+    )?;
+    for (&from, edge) in &window.imu {
+        let (Some((cost, residual, j_i, j_j)), Some(oi), Some(oj)) = (
+            imu_edge(window, from, edge),
+            lin.order.pose_offset(from),
+            lin.order.pose_offset(edge.to),
+        ) else {
+            continue;
+        };
+        lin.cost.imu += cost;
+        lin.system
+            .add_pair(Some((oi, &j_i)), Some((oj, &j_j)), &edge.omega, &residual);
+    }
+    for (&id, lm) in window.landmarks.iter() {
+        if lin.used_blocks == lin.blocks.len() {
+            lin.blocks.push((id, LandmarkBlock::default()));
+        }
+        let (slot_id, block) = &mut lin.blocks[lin.used_blocks];
+        *slot_id = id;
+        if landmark_rows(window, lm, &lin.order, Rows::All, block, &mut lin.cost).is_none() {
+            continue;
+        }
+        match block.eliminate_into(&mut lin.system) {
+            Some(model) => lin.landmark_model += model,
+            None => lin.fixed_landmarks += 1,
+        }
+        lin.used_blocks += 1;
+    }
+    Ok(())
+}
+
+/// The window's cost at its current values (`cost` of the design card).
+pub(crate) fn cost(window: &Window) -> Cost {
+    let mut cost = Cost {
+        prior: window.prior.cost(&window.prior_delta(&window.prior)),
+        ..Cost::default()
+    };
+    for (&from, edge) in &window.imu {
+        if let Some((c, ..)) = imu_edge(window, from, edge) {
+            cost.imu += c;
+        }
+    }
+    for (_, lm) in window.landmarks.iter() {
+        landmark_cost(window, lm, &mut cost);
+    }
+    cost
 }

@@ -4,12 +4,18 @@
 mod config;
 // Test-only until the Observe hook runs the window from the system.
 #[cfg(test)]
+mod landmarks;
+#[cfg(test)]
 mod linearize;
 #[cfg(test)]
 mod marginalize;
 #[cfg(test)]
+mod solve;
+#[cfg(test)]
 mod state;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod window;
 
 pub use config::{Odometry, OdometryImuNoise, OdometryMode, OdometryTuning, SlidingWindowConfig};
