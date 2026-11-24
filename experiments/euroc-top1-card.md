@@ -2093,3 +2093,92 @@ promoted. Next:
    predictions.
 2. Then this rerun again, plus a debug run of MH_04 start 30.
 3. If the step stays at about −0.25 m with K1 clean, R12 (the non-frozen window) is the map-rigidity lever.
+
+### Results: card H fix (`tracking.pose_inertial_min_inliers`) and R13a rerun as S0PEIH (2026-11-24)
+
+Code: `feat/cardh-pi-bar` c0342ac (on `feat/r11b-outlier-erase` c0c4069). Knob `tracking.pose_inertial_min_inliers:
+Visual | WithPrediction`, default `Visual` (`pnp.min_inliers`, 30); `WithPrediction` reads
+`min_inliers_with_prediction` (15) after the pose-inertial solve. The header prints `pose-inertial min inliers:
+WithPrediction` when it is not the default; validation refuses it with `pose_inertial: Off`. Unit test: a 29-inlier
+solve is rejected under `Visual` and kept under `WithPrediction`. Binary `E/bin-cardh/kornia-slam-euroc`, md5
+`7f09cc6161c83583739d7f4d23eb89af`. Knob off is bit-identical (`E/cardh/ident.sh`): S0 V1_02 `traj.txt` and
+`traj_smoothed.txt` `cmp`-identical to `E/runs/S0_V1_02_medium_s0_r1`, header identical to `E/expect/S0.header`,
+R_01 md5 `d4f77b567b912b5a4caa2af6085a35b1`.
+
+Arm S0PEIH = S0PEI + `pose_inertial_min_inliers: WithPrediction` (`E/mkcfg.sh`, golden header
+`E/expect/S0PEIH.header`). Driver `E/r13/drive_h.sh` (= `E/r13/drive.sh` on the new binary), lists
+`E/r13/r13h_{A,B}.txt`, SYNC, unpaced, 17:02-17:24, beside lane B's pinned real-time runs; 1-min load 3.3-9.4 at
+start. 14 of 14 runs `rc=0`, every header `diff`-identical, `pose_inertial_solves` 1614-3637. Table
+`E/r13/report.py S0PEIH` → `E/r13/r13h_table.md`. SE(3) ATE RMSE, m, body centre, causal (`traj.txt`).
+
+| seq | start | S0PE | S0PEI | S0PEIH | S0PEIH smoothed | tracked (S0PE) | coast_inertial (S0PEI; S0PE) | K1 restated | step 63.3-66.7 s, m | cf floor | tilt 65-79 s |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| MH_04 | 0 | 0.227 | 0.177 | 0.178 | 0.095 | 2032 (2032) | 0 (1; 0) | no | −0.22 | 0.134 | 1.80° |
+| MH_04 | 1 | 0.227 | 0.177 | 0.178 | 0.095 | 2032 (2032) | 0 (1; 0) | no | −0.22 | 0.134 | 1.80° |
+| MH_04 | 2 | 0.229 | 0.194 | 0.194 | 0.147 | 2024 (2031) | 7 (8; 0) | fired | −0.29 | 0.129 | 1.88° |
+| MH_04 | 30 | 0.225 | 0.273 | 0.173 | 0.126 | 1999 (2003) | 4 (1; 0) | fired | −0.28 | 0.103 | 2.04° |
+| MH_04 | 60 | 0.235 | 0.173 | 0.251 | 0.126 | 1965 (1973) | 8 (4; 0) | fired | −0.24 | 0.226 | 1.92° |
+| **MH_04** | median | 0.227 | 0.177 | **0.178** (1.56x Basalt 0.114) | | | | | | | |
+| V1_02 | 0 / 1 / 2 | 0.036 | 0.035 | 0.035 / 0.035 / 0.035 (**0.035**, 0.76x Basalt 0.045) | 0.025 | 1687 (1687) | 1 (1; 1) | no | - | - | - |
+| V2_01 | 0 / 1 / 2 | 0.049 / 0.056 / 0.066 | 0.046 / 0.050 / 0.040 | 0.046 / 0.050 / 0.040 (**0.046**, 1.19x Basalt 0.039) | 0.035-0.041 | 2276 / 2275 / 2274 (2275 / 2277 / 2273) | 4 / 4 / 4 (4 / 13 / 10; 5 / 2 / 5) | no / fired / no | - | - | - |
+| MH_01 | 0 / 1 / 2 | 0.042 / 0.050 / 0.049 | 0.050 / 0.049 / 0.041 | 0.050 / 0.049 / 0.041 (**0.049**, 0.73x Basalt 0.067) | 0.030-0.033 | = | 0 (0; 0) | no | - | - | - |
+
+`give_ups=0` on every run. MH_04 start 1 is byte-identical to start 0, as before. Coasted frames (status-line
+numbers): MH_04 start 2 frames 1509-1515 (S0PEI also 1976); start 30 frames 1500-1503 (S0PEI 1496); start 60 frames
+1509-1516 (S0PEI 1329-1330, 1494-1495).
+
+| P/K | prediction | measured | verdict |
+|---|---|---|---|
+| H-1 | MH_04 start 0: 2032 / 2032, `coast_inertial=0`; frame 1494 kept with 29 inliers | 2032 / 2032, 0 coasts; the 29 is not observed (no debug log at start 0) | as predicted (counts) |
+| H-2 | MH_04 start 0 causal within ±0.005 of 0.177 | 0.178 | as predicted |
+| H-3 | no run gains a coast against S0PE on the same start | MH_04 starts 2, 30, 60 (7, 4, 8 against 0); V2_01 start 1 (4 against 2) | missed |
+| H-kill | any new coast or `give_ups` > 0 with the lower bar (a 15-29-inlier frame that then diverges) | `give_ups=0`; against S0PEI new coasts on MH_04 start 30 (1 → 4) and start 60 (4 → 8); no divergence (below) | **fired** on the wording; the divergence it names is not seen |
+| P1 | MH_04 step ≥ −0.25 m, every start | −0.22, −0.22, −0.29, −0.28, −0.24 | missed (3 of 5) |
+| P2 | MH_04 median 0.12-0.17, every start ≤ 0.19 | median 0.178; start 2 0.194, start 60 0.251 | missed |
+| P3 | MH_04 tilt 65-79 s ≤ 1.5° | 1.80-2.04° | missed |
+| P4 (restated) | coasts and tracked no worse than S0PE, same start | worse on MH_04 starts 2, 30, 60 and V2_01 start 1 | missed (4 of 14; S0PEI 7) |
+| P5 | guards ≤ 1.15x S0PE: V1_02 ≤ 0.041, V2_01 ≤ 0.064, MH_01 ≤ 0.056 | 0.035, 0.046, 0.049 | as predicted |
+| K1 (restated) | coast or tracked worse than S0PE, same start | 4 of 14 runs | **fired** |
+| K2 | P1 holds and median > 0.19 | P1 does not hold | not fired |
+| K3 | median ≤ 0.17 with step ≤ −0.40 | median 0.178, step ≥ −0.29 | not fired |
+
+**Diagnosis (owner rule; unverified parts marked).** Debug run `E/debug/R13a-S0PEIH-MH04-s30` (S0PEIH, start 30, full,
+`E/debug/run_debug_cardh.sh`); its `traj.txt` is byte-identical to the batch run.
+- **The fix works where it was aimed: the pose-inertial count reject is gone.** Start 0 tracks 2032 / 2032. At start 30
+  the drought frames that S0PEI rejected (status 1496, below 30) are now kept: indices 1467-1469 keep 23, 23 and 15
+  inliers after the solve, with `imu_chi2` 0.002-0.024 and `prior_pd=1`.
+- **The remaining coasts are visual rejects, one step earlier in the pipeline.** At start 30, frames 1470-1473
+  (status 1500-1503) fail in map projection before any pose-inertial solve: `[proj] trusted_gate inliers=12, 11, 10,
+  13`, below `min_inliers_with_prediction` 15, then `reject: LowPnpInliers`. At frame 1473 the due keyframe goes in at
+  the inertial prediction (`[lost] keyframe inserted…`, 81 points grown) and frame 1474 tracks 62 / 63. No frame
+  diverged and `give_ups=0`, so the parenthesis of the kill rule (a 15-29-inlier frame that then diverges) is not
+  what happened.
+- **Why the lower bar can add coasts (measured on start 30; the other starts unverified).** In S0PEI, the reject at
+  status 1496 made the due keyframe a lost keyframe at the inertial prediction (kf 1466, map 9458 → 9507 points), and
+  tracking continued on it. In S0PEIH, the same frames track on 15-23 inliers, and the next keyframe (kf 1469) comes
+  from a 15-inlier frame: it grows 29 points and the map shrinks (9458 → 9445). The next three frames then find 10-13
+  matches and coast until the lost-keyframe path inserts kf 1473. So during the drought, a coast was the step that
+  refreshed the map. Accepting weak frames postpones that refresh, and the drought outlasts the weak frames.
+  Unverified: whether starts 2 and 60 (coasts at 1509-1516) follow the same sequence; only start 30 was traced.
+- **The start-30 residual (S0PEI 0.273, floor 0.242) is a failed loop solve, not the start.** Per 10 s bin, the bad
+  runs differ only over 80-100 s. At 80-90 s the error is 0.48-0.56 m and the tilt stays at 1.96-1.99°; the good runs
+  have 0.23-0.25 m and 0.67-1.14°. At 90-100 s the bad runs' piece scale is 0.82-0.85, against 1.00-1.03. The two
+  bad pose-inertial runs, S0PEI start 30 and S0PEIH start 60, are the only MH_04 runs of the three arms with
+  `[pgo] failed … unusable solve: not converged after 30 iterations` for the first loop after the drought (kf 1601 ~
+  731, kf 1584 ~ 690), so it is logged `applied=false`. Every other run applies that loop. The tilt from the dark span
+  then stays until the next loop (about 90 s). S0PEI start 60 applies the same pair (1584 ~ 690) that S0PEIH start 60
+  fails on. The card H fix moved the failure from start 30 to start 60; it did not create it. Unverified: why the
+  solve does not converge in 30 iterations (correction size, the gravity-aligned inertial PGO, or the iteration cap).
+  No PGO trace was taken.
+
+**Verdict.** Card H does what it was written for: the pose-inertial count reject is gone (start 0: 0 coasts, causal
+0.178 for 0.177). K1 (restated) fires on 4 of 14 runs (S0PEI: 7). The card H kill rule fires on its wording: new
+coasts on MH_04 starts 30 and 60 against S0PEI. Those coasts are visual map-projection rejects after a weak keyframe.
+Nothing diverged. P1-P4 missed, P5 held, K2 and K3 did not fire. The MH_04 median stays at 0.178 (1.56x Basalt), and
+the per-start spread comes from a loop PGO that does not converge (new gap G60). Nothing promoted; the knob stays
+`Visual` by default. Next, in order:
+1. G60: trace the non-converging loop solve on S0PEIH MH_04 start 60 (a debug run with the PGO iteration log) before
+   any change to the loop path.
+2. Then R12 (the non-frozen window), the map-rigidity lever, since the step stays at −0.22 to −0.29 m.
+3. Drought keyframes (insert the due keyframe as a lost keyframe when tracking holds under 30 inliers): a candidate
+   only, theory and predictions first.

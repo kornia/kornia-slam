@@ -23,6 +23,16 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 
 ### 2026-11-24
 
+- **Card H fix: the pose-inertial solve's inlier bar becomes a knob; S0PEIH clears the count reject, K1 still fires**
+  (`experiments/euroc-top1-card.md` "Results: card H fix"; `feat/cardh-pi-bar` c0342ac, 14 SYNC runs).
+  - `tracking.pose_inertial_min_inliers: Visual | WithPrediction` (default `Visual` = 30, bit-identical when off:
+    V1_02 S0 `cmp`, R_01 md5 d4f77b56). `WithPrediction` uses 15, ORB-SLAM3's bar after the inertial solve.
+  - MH_04 start 0 now tracks 2032 / 2032 with no coast (0.178). K1 (restated) fires on 4 of 14 (S0PEI 7). The
+    remaining coasts are visual map-projection rejects in the 75 s match drought, after a keyframe made from a
+    15-inlier frame; nothing diverged (`give_ups=0`).
+  - MH_04 median 0.178 (1.56x Basalt); start 30 0.273 → 0.173, start 60 0.173 → 0.251. The spread is a loop
+    pose-graph solve that does not converge at about 80 s, so the loop is dropped (new gap G60), not the start.
+    Guards V1_02 0.035, V2_01 0.046, MH_01 0.049. Nothing promoted. Next: trace G60, then R12.
 - **R13a: per-frame pose-inertial tracking (S0PEI) stopped by K1 on its first MH_04 run**
   (`experiments/euroc-top1-card.md` "Results: R13a"; config only, 3 of 14 SYNC runs).
   - One inertial coast at MH_04 frame 1495 (S0, S0E and S0PE have none on any start), so card H comes first.
