@@ -2483,3 +2483,19 @@ was the least busy pair; core 8's sibling 2 was busy. `RAYON_NUM_THREADS=1`. Log
 
 The medians against OpenCV 5.0 overlap 1.0 in 2 of 5 cycles. That is the unpaired measurement on a loaded machine; the
 paired series and every minimum are below 1.0. Next: the 2-core F3 system run.
+
+**Quiet re-bench after the laptop reboot (2026-11-24 16:27-16:40).** Same bench binary (e788d14), core 3 (sibling 9
+idle), 1-min load 0.9-1.0. The governor is still `powersave` with EPP `balance_performance` and turbo on;
+`scaling_cur_freq` ran 0.8-4.1 GHz across cycles. Scripts and logs: `E/rt-a/bench/` (`cycles.sh`, `cvtime.py`,
+`cycles_postreboot.txt`, `criterion_postreboot.txt`).
+
+| comparison (6 alternating cycles + 1 criterion run) | ours Q10 | OpenCV | ratio |
+|---|---|---|---|
+| C++ OpenCV 4.5.3 `CV_16SC2`, paired medians | 0.573-0.635 ms | 1.321-1.506 ms | 0.42-0.43 |
+| C++ OpenCV 4.5.3 `CV_32FC1`, paired medians | | 1.422-1.618 ms | 0.39-0.40 |
+| OpenCV 5.0.0 `CV_32FC1` (Python), medians per cycle | 0.573-0.635 ms | 0.989-1.276 ms | 0.50-0.59 |
+| OpenCV 5.0.0 `CV_32FC1`, minima | 0.475-0.538 ms | 0.912-1.073 ms | 0.47-0.52 |
+| criterion: kornia-rs `remap_u8` | 0.742 ms (Q5 0.635) | `remap_u8` 6.381 ms; OpenCV 16SC2 1.458, 32FC1 1.991 | 8.6x faster than `remap_u8` |
+
+On the quiet machine bench P1 (≤ 1.0 ms) holds: 0.57-0.74 ms. P2 (≥ 5x, 8.6x) and P3 (≤ 1.0x OpenCV, 0.39-0.59 against
+both OpenCV builds) hold too. All three are **as predicted**, and this sample supersedes the loaded one above.
