@@ -2182,3 +2182,160 @@ the per-start spread comes from a loop PGO that does not converge (new gap G60).
 2. Then R12 (the non-frozen window), the map-rigidity lever, since the step stays at −0.22 to −0.29 m.
 3. Drought keyframes (insert the due keyframe as a lost keyframe when tracking holds under 30 inliers): a candidate
    only, theory and predictions first.
+
+## Real-time fix ladder F1-F6 (card written 2026-11-24, before any code)
+
+Goal: paced, asynchronous, 2-core runs (`taskset -c 0,1`, `--pace-timestamps`) keep up with the 20 Hz sensor and
+score like SYNC on `traj.txt`. Six code rungs, each behind a knob that is bit-identical off. Base
+`feat/r11b-outlier-erase` @ b170b9c (card and ledger only since c1483be). Gap tested: G57 (2-core budget), G59 (mapping
+lag); F6 tests the rig overlap row (G60 at integration, see below). Owner approved 2026-11-24 with the recommended
+answer to every open question.
+
+Paths as at the top of this card, plus `O` = `B/src/ORB_SLAM3/src`, `KRS` =
+`/home/edgar/.cargo/git/checkouts/kornia-rs-0edb86845af2bca0/4ada5a7/crates`, `RIG` =
+`/home/edgar/dev/split/kornia-slam-eurocrig`.
+
+**Limit, stated first.** These rungs move RT ÷ SYNC toward 1.0. They do not beat Basalt alone: S0E SYNC causal is
+already above Basalt on V2_01 (0.055 / 0.039), V1_03 (0.072 / 0.053), V2_02 (0.080 / 0.049), MH_04 (0.311 / 0.114),
+MH_01 (0.072 / 0.067). The accuracy rungs (R3b/R4/R12, two-camera flow) carry the rest.
+
+Order: F1 → F3 → F2 → F4 → F5a → F5b, F6 in its own lane. F1 first: every later prediction is read on its new fields.
+F3 before F2: 36 % of rayon worker samples are `remap_u8`; removing it first lets F2's spin saving be attributed. F4
+before F5: F5 extends F4's mapping-load signal. F5b waits for diagnosis D5b.
+
+Identity for every rung (release, `E/rt/ident.sh` from `E/r11b/ident.sh` with the new binary): `IDENT_V102_OK`
+(`traj.txt` and `traj_smoothed.txt` `cmp`-identical to `E/runs/S0_V1_02_medium_s0_r1`), `HEADER_OK` against
+`E/expect/S0.header`, `IDENT_R01_OK` with md5 `d4f77b567b912b5a4caa2af6085a35b1` (`P/baseline/r01full-S10-7.ron`,
+`RAYON_NUM_THREADS=1`). Knob-on SYNC identity (F2, F3, F4, F5a): S0E V1_02 knob on, `cmp` against the same binary
+knob off.
+
+### Experiment F1: honest frame time (app only)
+- **Mechanism.** `tracking_duration` subtracts deferred ORB (`K/system/mod.rs:784-790`). Ready-path ORB runs before
+  the timer (`:727`). Source work (`A/main.rs:357`) is untimed. Paced replay never drops frames: when behind, the delay
+  is 0 (`A/main.rs:699-707`), so lateness is invisible.
+- **Knob.** None; additive output. `frame_ms` and `frontend_ms` are kept.
+- **Change.** `source_ms` (`source.next_frame()`), `process_ms` (`system.process_*`), `total_ms = source_ms +
+  process_ms`, `latency_ms` = finish time minus the frame's scheduled arrival (`TimestampPacer::lateness`). Summary
+  lines `[summary] source_ms|process_ms|total_ms|latency_ms p50= p90= p99=`, `total_ms_keyframe`, `late_frames=`
+  (latency above one frame period). Per-frame ` src= tot= lat=` after `fe=…ms`; trace columns
+  `source_ms,process_ms,latency_ms` at the end of `timings.csv`.
+- **Predictions (RT0E V1_02 rerun).** `source_ms` p50 28-36. `total_ms_keyframe` p50 115-130. Σ `total_ms` ÷ frames
+  63-75 ms. Final `latency_ms` 30-40 s (wall 122 s on 83.5 s of data).
+- **Kill.** Σ `total_ms` + Σ sleep differs from wall (minus vocabulary load) by more than 5 %: an untimed stage remains.
+  Find it before any other rung.
+- **Stop point.** Re-baseline the RT table on `total_ms` and `latency_ms`: one RT0E V1_02 run plus RT1PE on V2_01 and
+  MH_04, paced, `taskset -c 0,1`, 2 runs each.
+
+### Experiment F3: fixed-point SIMD rectification (option a)
+- **Why not keypoint-only (b).** Stereo matching is a row search with SAD on rectified pyramids (`K/stereo.rs`,
+  `KRS/kornia-3d/src/stereo/matcher.rs:361-456`), and KLT reads rectified images. Keypoint-only rectification already
+  exists as Rig mode (raw images, `RIG/apps/kornia-slam-app/src/source/euroc.rs`), which has its own gap (F6).
+- **Mechanism.** Mono `remap_u8` is a scalar per-pixel loop on rayon rows with `floor` per pixel
+  (`KRS/kornia-imgproc/src/interpolation/remap.rs:281-318`). The AVX2 path is C == 3 only (`:259-279`). No newer
+  kornia-rs worktree has a mono SIMD path.
+- **Theory.** Maps are constant, so precompute integer taps and fixed-point weights once. Blend on `wide` lanes, single
+  thread, no rayon.
+- **Design: one kernel, two quantisations.** `Q10Trunc`: byte-identical to today's `remap_u8` (expressions at
+  `remap.rs:288-300`, sampler `KRS/kornia-imgproc/src/warp/common.rs:105-215`); this is the runtime path, so EuRoC stays
+  `cmp`-identical with the knob on. `OpenCvQ5`: coordinates rounded to 1/32 px, `(Σ w·p + 512) >> 10`; this is the
+  OpenCV parity proof. Q10 cannot be within 1 LSB of OpenCV on sharp edges, because OpenCV quantises coordinates to
+  1/32 px (owner answer 1: Q10 at runtime, Q5 as the tested parity mode). OpenCV internals were not checked; the
+  fixture is the authority.
+- **Knob.** `RunConfig.rectification: RemapF32 | FixedPoint`, default `RemapF32` (`A/config.rs`, `#[serde(default)]`).
+- **Predictions.**
+  - Bench: ≤ 1.0 ms per image on one laptop core; at least 5x faster than `remap_u8` at `RAYON_NUM_THREADS=1`; time ÷
+    OpenCV ≤ 1.0.
+  - System: `source_ms` p50 32 → 8-11; process CPU −17 to −20 ms per frame; `remap_u8` share of worker samples 36 % → 0.
+- **Kill.**
+  - K1: any byte differs from `remap_u8`. No system run.
+  - K2: slower than OpenCV. Stop and report (owner rule).
+  - K3: bench passes but `source_ms` p50 stays above 15. The cost was decode or allocation; profile again.
+
+### Experiment F2: bounded fan-out
+- **Mechanism.** Every rayon idle transition yields 32 times before sleeping (rayon-core 1.13.0 `src/sleep/mod.rs:56-103`).
+  ORB, pyramids and matching fork-join on the global pool (`KRS/kornia-imgproc/src/features/orb/extractor.rs:672,1038`,
+  `features/match.rs:385-397`). On 2 cores the workers yield against the BA thread. `K/tracking/flow_pool.rs:1-3`
+  already avoids rayon for KLT for this reason.
+- **Knob.** `pipeline.fan_out: Global | Bounded(( tracking_threads: 1 ))`, default `Global`.
+- **Predictions (post-F3 base, V1_02, `E/prof/prof_run.sh`, `pmp_drive.sh`).**
+  - `sched_yield` share of worker samples 58 % → ≤ 10 %.
+  - Process CPU within 10 % of the R11d RT2E-r run (same mechanism by env).
+  - Core time per frame 121 → 70-80 ms with F3.
+  - `fe` p90 47 → ≤ 40. `fe` p50 29 → 26-38; it may rise, because ORB loses its 2-way fan-out.
+- **Kill.**
+  - K1: `fe` p50 above 40 ms. Rerun with `tracking_threads: 2`.
+  - K2: CPU falls but `latency_ms` p90 does not. The convoy is not the latency cause.
+  - K3: yield share stays above 20 %. Fan-out outside `extract`: widen the wrap.
+
+### Experiment F4: keyframe acceptance (ORB-SLAM3)
+- **Reference.** `bLocalMappingIdle = AcceptKeyFrames()` (`O/Tracking.cc:3103`); c1a / c1b (`:3156-3158`); busy branch
+  inserts only if `KeyframesInQueue() < 3` (`:3190-3210`), `IsInitializing()` exempt (`:3192`); idle flag at
+  `O/LocalMapping.cc:71, 273, 873-876`; BA and fusion skipped while keyframes queue (`:105, 124`).
+- **Knob.** `keyframes.mapping_acceptance: Ignore | OrbSlam3`, default `Ignore`. Pending bound
+  `local_ba.active_keyframes` (owner answer 5; equals 3 at the default). No `InterruptBA` unless K1 or K3 fires (answer 10).
+- **Predictions (RT base + knob; V2_01, V1_03, V2_02, V1_02; 2 runs).**
+  - Solves per keyframe 0.83-0.92 → ≥ 0.97.
+  - Keyframes async ÷ SYNC 1.16-1.34 → ≤ 1.10.
+  - Causal: V2_01 0.125 → ≤ 0.083; V1_03 0.139 → ≤ 0.108.
+  - MH_04 and MH_01: refusals below 2 % of keyframes, ATE inside the r1/r2 range.
+- **Kill.**
+  - K1: counters met, but V2_01 above 0.110 and V1_03 above 0.144. Lag is not the cause; diagnose the propagation
+    hypothesis (card R11c).
+  - K2: ATE met with solves per keyframe below 0.92. Do not credit.
+  - K3: tracked below frames − 3, any give-up, or more coast frames. Acceptance starves the map.
+
+### Experiment F5a: growth and fusion on the mapping thread
+- **Reference.** ORB-SLAM3 tracking holds `mMutexMapUpdate` for the whole frame (`O/Tracking.cc:1886`); BA writeback
+  takes it (`O/Optimizer.cc:2887`); `CreateNewMapPoints` and `SearchInNeighbors` run without it
+  (`O/LocalMapping.cc:101-108`).
+- **Knob.** `mapping.keyframe_growth: Tracking | Mapping`, default `Tracking`. Lock audit before code (stop point).
+- **Predictions (V1_02).** `keyframe_insert` p50 40.5 → 15-25 ms. Keyframe-frame `frame_ms + fe` p50 90 → 65-75.
+  `map_wait` p90 ≤ 5 ms. Mapping thread +5 to 9 ms of core per frame. Causal inside the pre-rung r1/r2 band.
+- **Kill.**
+  - K1: `map_wait` p90 above 5 ms, or the gain is under 10 ms. Lock convoy: split prepare (snapshot) from apply
+    (revalidate against `world_epoch`).
+  - K2: tracked drops by more than 3, or keyframes rise more than 10 %. The tracker is starved of new points; read
+    `growth_lag_frames_max`.
+  - K3: solves per keyframe fall below pre-rung. Add ORB-SLAM3's skip-fusion-when-queued (`O/LocalMapping.cc:105`).
+
+### Experiment F5b: loop verification and solve off the tracking thread
+- **Found.** Default `execution: Synchronous` solves and fuses inline even with asynchronous mapping; these are the
+  0.17-1.2 s stalls. Verification is a 1000×1000 Hamming match plus PnP per candidate, under the map lock
+  (`K/loop_closure/verification.rs:83-226`). D5b first (config only): SYNC S0E on MH_01 and V1_02, `execution:
+  Deferred(frames: 1)` against `Synchronous`; count accepted and applied loops and explain any difference before code.
+- **Knob.** `loop_closing: Enabled(recognition: Inline | Deferred(frames) | Worker)`, default `Inline`.
+- **Predictions.**
+  - `keyframe_insert` p50 → 5-10 ms. Keyframe-frame `frame_ms + fe` p50 → 50-60; p99 312 → ≤ 120.
+  - Loops accepted within ±1 of `Inline` in SYNC `Deferred(1)`.
+  - MH_01 and V1_02 causal inside band.
+- **Kill.**
+  - K1: loops accepted fall more than 20 %. Stop; the unexplained background-path loss is the cause.
+  - K2: p99 stays above 150 ms. Stalls are elsewhere (writeback fusion apply); profile.
+
+### Experiment F6: rig overlap partners (rig plan R-b)
+- **Reference.** Projection search assigns the map point to the camera-2 partner (`O/ORBmatcher.cc:131-132`, reverse
+  `:198-199`); new points add the partner observation (`O/Tracking.cc:3304-3309`); one observation per assigned index
+  (`O/LocalMapping.cc:312-323`); left and right indices per keyframe (`O/MapPoint.cc:140-158`).
+- **Knob.** `mapping.rig_overlap_links: UnclaimedOnly | PropagateTracked`, default `UnclaimedOnly`. Card block also in
+  `experiments/euroc-rig-plan.md` (R-b).
+- **Predictions (from the rig plan).**
+  - Metric pairs per keyframe 109 → ≥ 220.
+  - MH_01 400-frame Sim3 scale 1.029 → 1.008-1.018.
+  - Full length: scale ≤ 1.007 on MH_02 and MH_03; SE3 ATE rdef ÷ sdef ≤ 1.15.
+  - Active landmarks 73k → ≤ 50k (MH_01).
+- **Kill.**
+  - K1: pairs double but scale stays above 1.022. Read the per-solve scale under `--debug` first.
+  - K2: scale recovers but pairs do not double. Not credited.
+- **Identity.** Knob off: rig runs `cmp`-identical to `P/eurocrig/sync/*_s0_r1`.
+
+### Real-time gate, all 11 sequences (after F5b)
+One config, asynchronous, `--pace-timestamps`, `taskset -c 0,1`, one run at a time, load ≤ 6, no build running, 3 runs
+per sequence. Real-time pass on every run: `rc=0`, header clean, frames read = dataset length; tracked ≥ frames − 3,
+give-ups 0, re-seeds 0; `latency_ms` p99 ≤ 100 and last-frame latency ≤ 100 (owner answer 2; no frame-drop mode);
+solves per keyframe ≥ 0.97; `ba_keyframe_shifts` ≤ 10. PNG decode counts in the budget, reported as `source_ms` (answer
+3). Accuracy pass per sequence: all 3 runs below Basalt; a real-time claim against Basalt needs Basalt rerun with
+`vio_enforce_realtime: true` on `taskset -c 0,1`, 3 runs (answer 4). F2 and F3 may become defaults after the identity
+checks alone; F4-F6 need the full-sequence LaMAria gate (answer 7).
+
+Ledger: G57 and G59 are tested by this ladder. The rig "overlap partners" row from `feat/euroc-rig` (G57 there) is
+renumbered **G60** at integration; no new id on this branch.
