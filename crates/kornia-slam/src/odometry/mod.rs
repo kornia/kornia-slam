@@ -2,5 +2,14 @@
 //! smoother over the rectified stereo pair (`experiments/euroc-2x-vio-design.md`).
 
 mod config;
+// Test-only until the Observe hook runs the window from the system.
+#[cfg(test)]
+mod linearize;
+#[cfg(test)]
+mod marginalize;
+#[cfg(test)]
+mod state;
+#[cfg(test)]
+mod tests;
 
 pub use config::{Odometry, OdometryImuNoise, OdometryMode, OdometryTuning, SlidingWindowConfig};

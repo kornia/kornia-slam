@@ -177,7 +177,7 @@ pub(crate) fn solve_pose_inertial(
 }
 
 impl FrameNavState {
-    fn nav_state(&self) -> NavState<'_> {
+    pub(crate) fn nav_state(&self) -> NavState<'_> {
         NavState {
             pose_cw: &self.pose_cw,
             velocity: self.velocity,
@@ -187,7 +187,7 @@ impl FrameNavState {
 
     /// `self ⊞ δ`, `δ` in `[ρ ω v b_g b_a]`: the pose perturbed on the right,
     /// `T_cw · Exp(ρ, ω)`, the rest additively.
-    fn plus(&self, delta: &SVecF64<15>) -> Self {
+    pub(crate) fn plus(&self, delta: &SVecF64<15>) -> Self {
         let rho = Vec3F64::new(delta[0], delta[1], delta[2]);
         let omega = Vec3F64::new(delta[3], delta[4], delta[5]);
         let rotation = self.pose_cw.rotation;
