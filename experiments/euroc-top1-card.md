@@ -3029,7 +3029,7 @@ Final maps:
 |---|---|---|---|---|
 | 1 | Visual-only tracking frames drift along the rotation-translation ridge under fast rotation and blur, against the gyro (G13; new row G62) | V1_03 (HF 0.041-0.054); V2_02 small (HF 0.010) | saw-tooth 224-232; `[predgap]` 0.40° median / 1.60° p90 per frame; corr 0.74 | V1_03 0.072 → about 0.058-0.062 if HF reaches the rig level (0.015-0.020) at the same LF |
 | 2 | PnpInliers drops 30-53 % of keyframe matches, which then become duplicate stereo seeds | V1_03, V2_02 (and every RT*P* arm) | seeds 326 against 217 per keyframe; landmarks +65 %; LF +0.02 to +0.04 | not in S0E (the best arm does not use it); it is what keeps RT1PE / RT3E at 0.10-0.12 |
-| 3 | Early V2_02 drift event at 26-28.5 s, about 3 % over-scale at 1.2-1.5 m/s; mechanism unverified | V2_02 | span refit 0.041 against Basalt 0.040; 64 % of E² before 28 s | V2_02 0.080 → about 0.045-0.055 if removed |
+| 3 | Early V2_02 drift event at 26-28.5 s, about 2-3 % under-scale at 1.2-1.5 m/s (corrected from "over-scale" by the V-d trace below); carried by the window, root cause unverified | V2_02 | span refit 0.041 against Basalt 0.040; 64 % of E² before 28 s | V2_02 0.080 → about 0.045-0.055 if removed |
 | 4 | Single-frame PnP spikes the IMU does not veto (pose gate disabled) | V1_03 | 25 spikes; 0.98 m at frame 2089 while moving at 0.34 m/s | V1_03 −0.006 (counterfactual) |
 
 Ruled out on these two: mapping lag (SYNC has the gap), flow availability (4.4 % / 1.8 %), time offset, lever arm,
@@ -3084,8 +3084,8 @@ the yaw and tilt held in the past (≤ 0.9° after 20 s in S0E), and scale (piec
 **V-d (diagnosis before any fix): the V2_02 26-28.5 s event.**
 - **Run:** a debug run from `start_frame: 400` with `max_frames: 200`, which covers frames 480-580.
 - **Trace:** keyframe snaps, `[predgap]`, b_a and the window scale through the fast segment.
-- **Question:** whether the 3 % over-scale is born in tracking (V-a then fixes it) or in the window (G6, as rp48's
-  10-keyframe window suggests).
+- **Question:** whether the 3 % over-scale (an under-scale, per the V-d trace below) is born in tracking (V-a then
+  fixes it) or in the window (G6, as rp48's 10-keyframe window suggests).
 - **Rule:** no rung for it before the trace.
 
 The rig alternative (rdef or rp48 plus the erase) also attacks cause 1. It costs ORB on both cameras every frame, about
@@ -3124,3 +3124,255 @@ SYNC pose-inertial factor (0.78x on MH_04, about 1.0x elsewhere).
 - **P-G6:** RT3EIH below RT3E on V1_03 and V2_02, above it on MH_01; below Basalt on 2-5 of 11.
 - **P-G7:** S0EIH below S0PEIH on V1_03 and V2_02, above it on MH_01, MH_02, MH_03 (the PnpInliers hall gain).
 - Stop rules as P-G5 (header, `rc`, `give_ups`), plus `pose_inertial_solves` > 0 on every run.
+
+## Traces V-d (V2_02 early drift) and G60 (MH_04 loop PGO) (2026-11-24)
+
+Read-only, plus three debug runs. No code changed and no cargo run. Each debug run waited for fewer than 2 `kornia-slam`
+processes and a load below 6, with one G11 benchmark run alongside (load 3.1-5.6):
+- `E/debug/G60-S0PEIH-MH04-s60`: `bin-cardh` (md5 `7f09cc61…`, the binary of the failing batch run), S0PEIH, MH_04,
+  start 60, 1600 frames, wall 76 s.
+- `E/debug/V22D-S0E-s400`: `bin-integ2` (md5 `e97329d4…`), S0E, V2_02, start 400, 200 frames.
+- `E/debug/V22D-S0E-600`: `bin-integ2`, S0E, V2_02, start 0, 600 frames.
+
+The G60 and V22D-600 `traj.txt` files are byte-identical to the first 1592 / 600 lines of their batch runs
+(`runs/S0PEIH_MH_04_difficult_s60_r1`, `runs/S0E_V2_02_medium_s0_r1`).
+
+Scripts and outputs are in `E/resid/g60vd/`:
+- `vd.py` / `vd2.py` / `vd3.py`: displacement ratio, along-track error and per-frame error after a fit on one span;
+- `kfscan.py`: per-keyframe VI-BA state, IMU edges, erase, stereo and tracking from a `--debug` log;
+- `depthbias.py`: stereo depth and map depth against landmarks triangulated at Vicon poses;
+- `pgo_rep.py`: an offline replica of the loop pose-graph solve; outputs are `r_*.txt`; `cbor.py` reads `session.cbor`.
+
+### V-d: V2_02 26-28.5 s
+
+**Verdict.** The event is an along-track **under**-scale, not an over-scale.
+- The trajectory travels 2.0-2.6 % short over 24.5-28.5 s. Basalt is 0.9 % short over the same span.
+- The worst bin is 27.5-28.0 s, about 7 % short.
+- It is carried by the VI-BA keyframe states, not by the tracking frames. The window's velocity runs 3-5 % low, and
+  the accel bias jumps across the boundary edge.
+- It is local and deterministic: a fresh start at frame 400 (20 s) reproduces it to the third digit.
+- Ruled out: stereo depth bias (±1-2 %), the boundary bias-row scaling (S1E), tilt or yaw, and tracking quality.
+- Root cause: **unverified.** The leading candidate is the 3-keyframe window (G6), as the rp48 evidence suggests.
+- Correction: the card said "about 3 % over-scale" (ranked causes, rank 3; corrected there). The 1 s piece Sim(3)
+  scale of 1.02-1.05 stretches our trajectory onto GT, so ours is short.
+
+**Along-track error** (`vd2.py`, SE(3) fit on 30-60 s; negative means ours is short; start 0):
+
+| bin, s | GT path, m | S0E along, m | S0E start 1 | Basalt |
+|---|---|---|---|---|
+| 24.0-25.5 | 1.32 | −0.009 | −0.020 | −0.010 |
+| 25.5-27.0 | 1.79 | −0.027 | −0.032 | −0.020 |
+| 27.0-27.5 | 0.64 | −0.014 | −0.011 | −0.011 |
+| 27.5-28.0 | 0.52 | **−0.037** | **−0.034** | −0.007 |
+| 28.0-29.5 | 1.28 | −0.015 | −0.034 | −0.004 |
+| cumulative 24-29.5 | 5.55 | −0.103 (−1.9 %) | −0.131 (−2.4 %) | −0.052 (−0.8 %) |
+
+- Displacement ratio ours / GT per 0.5 s (`vd.py`, SE(3)-invariant): 0.978-0.998 over 24-27.5 s, then **0.930** at
+  27.5-28.0 s. Basalt reads 0.977-1.002, and 0.988 at 27.5-28.0 s.
+- Start 400 reads 0.973-0.992, then **0.935**: the same event from a map 7 s old.
+- The single 0.10 m frame at 28.00 s (frame 561, `[predgap]` 2.43°) is one HF spike. The next frame is back on the
+  track, so the spike is not the drift.
+- Tilt falls 1.1 → 0.3° over 27-29 s in ours and in Basalt alike (`rotdrift.py`, reference 29-31 s), so it is common
+  to both. Yaw stays within ±0.3°.
+
+**The window carries it** (`kfscan.py` on `V22D-S0E-600`; |v| is the newest keyframe's `[vi_ba] STATE`):
+
+| kf | t, s | GT \|v\| | ours / GT | b_a x | boundary edge \|r_ba\| / chi2 / hw | newest IMU edge first \|r_v\| / hw | inl / matches | stereo matched / median depth |
+|---|---|---|---|---|---|---|---|---|
+| 546 | 27.30 | 1.37 | 0.995 | +0.037 | - | 0.194 / 0.008 | 376 / 465 | 608 / 2.78 |
+| 549 | 27.45 | 1.31 | 1.004 | +0.034 | 0.010 / 5.1 / 1.00 | 0.142 / 0.013 | 377 / 458 | 663 / 2.52 |
+| 552 | 27.60 | 1.26 | 0.989 | +0.112 | **0.081** / 15.5 / 1.00 | 0.192 / 0.006 | 378 / 477 | 832 / 2.39 |
+| 555 | 27.75 | 1.19 | 0.971 | +0.132 | 0.027 / **50.3** / 0.58 | 0.222 / 0.005 | 381 / 510 | 840 / 2.69 |
+| 558 | 27.90 | 1.10 | 0.950 | +0.168 | 0.040 / 21.1 / 0.89 | 0.199 / 0.006 | 465 / 633 | 781 / 2.78 |
+| 561 | 28.05 | 1.05 | 0.947 | +0.151 | 0.025 / 4.5 / 1.00 | 0.176 / 0.007 | 327 / 487 | 776 / 2.84 |
+| 564 | 28.20 | 0.99 | 0.959 | +0.093 | 0.059 / 14.9 / 1.00 | 0.155 / 0.011 | 263 / 461 | 772 / 3.51 |
+| 570 | 28.50 | 0.85 | 0.969 | +0.118 | - | 0.062 / 0.012 | 241 / 387 | 745 / 3.51 |
+| 579 | 28.95 | 0.92 | 1.003 | +0.063 | - | 0.048 / 0.022 | 298 / 472 | 739 / 3.40 |
+
+- GT decelerates at about 0.5 m/s² over 27.5-28.5 s. The window's velocity falls faster, to 0.947 of GT at 28.05 s.
+  It recovers by 28.8 s.
+- b_a x steps +0.13 m/s² in 0.45 s (GT b_a x is +0.004, constant). The step sits on the boundary edge:
+  - |r_ba| on the boundary edge is 0.025-0.081;
+  - on the free edges it is about 1e-4;
+  - `bias_prior` cost rises 6.2 → 12.5.
+- Start 400 shows the same: b_a x −0.017 → +0.116 over 27.45-27.90 s, and velocity 0.935-0.942 of GT at 27.9-28.05 s.
+  The b_a starting value differs, but the step is the same. So the event does not depend on the map's history.
+- Tracking is healthy through the span (kf 546-564):
+  - 263-465 inliers;
+  - VISRES above Huber 0.3-0.7 %;
+  - erase of the newest keyframe 8-19 %;
+  - HF 0.010 (Q1 above).
+- The newest IMU edge enters every solve Huber-cut (first hw 0.004-0.03 on kf 476-599), not only in this span. The
+  cause is the carried `KeyframeVelocity`: the first |r_v| (0.03-0.58 m/s) equals `[ba_vel] dv`. Its final hw is
+  1.0, so the final solve includes it. This is general, and not shown to cause the event.
+
+**Ruled out.**
+- *Stereo depth bias* (`depthbias.py`; landmarks seen in 27.3-28.3 s with 3 or more left observations over 0.3 m or
+  more, triangulated at Vicon camera poses):
+  - Seeded at 26-28 s (840 of 1079): seed stereo depth / GT 0.989-1.002, map depth / GT 0.991-0.999.
+  - Seeded at 19-21 s (68): 0.93 / 0.96-0.98.
+  - Whole run per 1 s bin: 0.95-1.04, with no dip at 27-28 s.
+  - A 7 % under-scale would need a ratio near 0.93 on the landmarks in use.
+- *Boundary bias-row scaling* (G49): S1E (`boundary_scales_bias_rows: false`, `runs/S1E_V2_02_medium_s0_r1`) shortens
+  the same or more: cumulative along-track from 25 s −0.105 by 28 s and −0.159 by 29 s, against S0E −0.096 / −0.110. Refit after 28 s 0.051 against
+  0.041, ATE 0.099 against 0.080. b_a is the channel the conflict shows in, not its cause.
+- *Tracking-frame ridge*: HF 0.010, inliers healthy, no yaw change, and the tilt change is common with Basalt.
+
+**Open question.** What pulls the window short? The 3-keyframe window spans 0.45 s here. Its visual rows come from 35
+fixed keyframes with 623-679 pinned points. The IMU's only tie to the past is the boundary edge, Huber-cut to hw 0.58
+at the peak.
+- rp48 (10-keyframe window, `PropagateToNewer`, second camera) halves the E² share before 28 s: 0.32 against 0.64
+  (Q4). The window length is confounded with the second camera there.
+- G6 lists V2_02 for the 3-keyframe window.
+
+**Fix rungs** (written 2026-11-24 before any run; config only first):
+
+- **V-d1 (no new run): read the V-a arm.** When `G-S0EIH_V2_02_*` lands, run `vd.py` / `vd2.py` on it.
+  - Prediction from this trace: window-borne, so per-frame gyro in tracking does not remove it. The displacement ratio
+    at 27.5-28.0 s stays ≤ 0.96 on 2 of 3 starts, and the E² share before 28 s stays ≥ 0.55.
+  - If the ratio is ≥ 0.98 and the share ≤ 0.45, the event was tracking-borne and this trace is wrong about where it is
+    born. Then diagnose before V-d2.
+- **V-d2 (config): R4's window on S0E for V2_02 only.** S0E + `local_ba: ( active_keyframes: 10, max_iterations: 7,
+  initial_lambda: 1e-4 )`. SYNC, starts 0/1/2, about 3 min each, plus one debug run of 600 frames for `kfscan.py`.
+  - Theory: the window then holds 1.5 s of IMU across the deceleration. Velocity and b_a become observable inside it,
+    and the 3-keyframe trade (visual short, b_a jumps across the boundary) costs more IMU chi2.
+
+  | id | prediction |
+  |---|---|
+  | Pd1 (mechanism) | boundary-edge \|r_ba\| at kf 549-564 ≤ 0.02 (S0E 0.025-0.081); b_a x step over 27.45-27.90 s ≤ 0.05 m/s² (S0E +0.13); ours / GT velocity ≥ 0.97 at kf 555-570 (S0E 0.947-0.971) |
+  | Pd2 | displacement ratio at 27.5-28.0 s ≥ 0.96 (S0E 0.930); cumulative along-track over 24-29.5 s ≥ −0.07 m (S0E −0.103 to −0.131) |
+  | Pd3 | V2_02 median of 3 starts 0.058-0.072 (S0E 0.080); E² share before 28 s ≤ 0.50 (0.64) |
+  | Pd4 | refit after 28 s ≤ 0.045 (S0E 0.040-0.042): the rest of the run does not degrade |
+
+  | id | kill rule |
+  |---|---|
+  | Kd1 | Pd1 met but Pd2 missed: the boundary trade was not the carrier. Stop; measure the visual pull itself (per-keyframe window displacement against the GT step) |
+  | Kd2 | Pd1 missed: the window length does not reach the mechanism. Stop; next candidate `imu_huber: Off` on the boundary edge |
+  | Kd3 | refit after 28 s > 0.050, or any start > 0.090: the window costs elsewhere (R4 kill rule for MH_03 / MH_04 still applies before any promotion) |
+
+- **No code rung** before Kd1 or Kd2 resolves.
+
+### G60: MH_04 loop PGO "not converged after 30 iterations"
+
+**Verdict.** The solve converges, and the usability gate then drops it.
+- The cost falls 98.2 % in 3-4 iterations, to the f64 optimum within 1e-5.
+- The remaining 26 iterations are f32 noise. Trial costs go up and down by 1e-5 relative, so:
+  - an accepted step never has a relative change below `cost_tolerance` 1e-6;
+  - the gradient never falls below 1e-6;
+  - rejects raise λ 10× per iteration, and accepts lower it 10× again.
+- The cap of 30 is hit by chance. Then `unusable_reason` rejects the loop for `!converged` alone
+  (`loop_closure/pose_graph.rs:67-69`), although the cost fell and the loop residual fell.
+- Not divergence, and not a bad loop.
+
+**Reproduced.** `E/debug/G60-S0PEIH-MH04-s60` logs the same line (`[pgo] failed kf=1584 ~ kf=690 … not converged after
+30 iterations`, then `[loop-time] … iterations=30 solve_ms=112.4`). The binary prints no per-iteration line, so the
+solve was replicated offline (`pgo_rep.py`). The replica rebuilds the solve as the code does:
+- the snapshot is the 309 keyframes up to kf 1584, from the debug `session.cbor`; the run stopped before the next loop,
+  so only the last few keyframes moved after the solve;
+- odometry edges are the snapshot's relative poses at w = 1 (σ 1 m, 1 rad);
+- the loop edge kf 690 → 1584 is at w = 0.5 (σ 2). Its measurement is the Vicon relative camera pose, because the
+  verified one is not logged;
+- the `GravityManifold` is 4-DoF with node 0 fixed;
+- f32 residuals (`SE3F32`) are taken in world coordinates, with no origin shift under `ScalarWeights`
+  (`graph/mod.rs:843-852`);
+- the numerical Jacobian uses ε 1e-3 in f32 (`sparse_pgo.rs:18`, `:790-811`), with f32 normal equations and an f32
+  cost (`:639`);
+- the LM is as `sparse_pgo.rs:335-470`, with `PgoConfig` max 30, cost tolerance 1e-6, gradient tolerance 1e-6 and
+  λ 1e-3 (`pose_graph.rs:26-35`, passed through `closer.rs:1325-1370`).
+
+**Per-iteration trace** (replica, f32; `r_f32.txt`):
+
+| iteration | outcome | cost | relative change | \|g\| | \|step\| | λ after |
+|---|---|---|---|---|---|---|
+| 0 | - | 8.853e-2 | - | 2.1e-1 | - | 1e-3 |
+| 1 | accept | 3.649e-3 | 9.6e-1 | 2.1e-1 | 1.79 | 1e-4 |
+| 2 | accept | 1.878e-3 | 4.9e-1 | 2.5e-3 | 1.48 | 1e-5 |
+| 3 | accept | 1.626e-3 | 1.3e-1 | 8.6e-4 | 2.07 | 1e-6 |
+| 4 | accept | 1.6109e-3 | 9.4e-3 | 1.2e-3 | 1.12 | 1e-7 |
+| 5-30 | 11 accepts, 15 rejects | 1.6105e-3 → 1.60997e-3 | 2.8e-6 to 2.7e-4 on accepts; trials ±3e-5 | 2.5e-5 to 7.3e-4 | 1.2e-5 to 1.4 | 1e-8 … 1e+1 |
+| end | cap 30, `converged=false` | 1.609973e-3 | | | | |
+
+- **f64, same graph** (`r_f64.txt`): 6 iterations, all accepts. It stops on the gradient tolerance at a cost of
+  1.609987e-3. The capped f32 result equals it to 1e-5 relative. The new loop's whitened residual is 0.0098 in both
+  (0.2975 before).
+- **Cost structure.** Before the solve only the loop edge has a residual (odometry is the snapshot itself). After it,
+  the loop edge holds 6 % of the cost and 308 odometry edges hold 94 %.
+- **What a usable solve could not do anyway.** The loop's rotation residual floor is 0.93° of roll / pitch, which the
+  4-DoF manifold cannot move (yaw is corrected; 1.01° → 0.93° total). So even an applied loop leaves the dark-span
+  tilt (G58). That is by design, and ORB-SLAM3's 4-DoF graph does the same.
+- **It is a lottery near the cap.** The same graph with the loop measurement perturbed by 2 cm / 0.2° (8 seeds,
+  `r_seed*.txt`) ends at 7, 21, 21, 23, 23, 23, 23, 25 iterations. Unperturbed it ends at 30 (fail). Every seed reaches
+  the same cost floor by iteration 4-5.
+- **The logs agree.** The 48 converged `[loop-time]` solves in the harness put the iteration count rising with graph
+  size:
+  - 3 iterations at 56-61 nodes;
+  - 6-21 at 109-216 nodes;
+  - 6-27 at 247-490 nodes;
+  - S0PEIH start 30's applied loop kf 1604 ~ 728 (309 nodes) used 27.
+- **The failures sort by sequence.** The 21 `[pgo] failed` lines in `E/runs/` (20 runs) are all `not converged after
+  30 iterations`, all in long halls:
+  - MH_04: 12;
+  - MH_01: 5;
+  - MH_05: 4.
+- **Origin shift alone is not the fix.** f32 with the world origin moved to node 0's camera centre (`r_f32shift.txt`)
+  converges at 18 iterations, by a lucky small accept. The noise floor stays.
+- **`Drift` information** (replica, `r_drift32.txt`; origin shift, Cauchy 3 on the loop, odometry random walk): the
+  floor is reached at iteration 3, then 10 rejects raise λ until the step tolerance stops it at 13, `converged=true`.
+  The loop residual falls 5.96 → 0.30 whitened.
+
+**ORB-SLAM3** (`Optimizer.cc:5292-5545`, `OptimizeEssentialGraph4DoF`):
+- g2o Levenberg in double precision, with numeric Jacobians in double;
+- `optimizer.optimize(20)`: a fixed 20 iterations, no convergence test, and the result is always written back
+  (`:5541-5560`);
+- the vertices start from `CorrectedSim3` for the loop-connected keyframes, so the start is near the solution;
+- information `matLambda` is 1e3 on two rotation rows, identity otherwise (`:5363-5367`).
+
+So ORB-SLAM3 has no path where a converged-in-fact solve is dropped.
+
+**Fix rungs** (written 2026-11-24, before any run):
+
+- **G60-a (config only): `loop_closing: Enabled(vocabulary: …, graph: ( information: Drift(()) ))` on S0PEIH, MH_04
+  starts 0/1/2/30/60, SYNC.**
+  - This is the only RON lever: `PgoConfig` is not in the system config (`closer.rs:42`, `system/config/mod.rs:731-738`).
+  - It changes the information model too, so a score change is confounded. Its convergence is the test.
+
+  | id | prediction |
+  |---|---|
+  | Pa1 (mechanism) | no `[pgo] failed` line on any of the 5 starts; `[loop-time]` iterations ≤ 20 on every loop (replica 13) |
+  | Pa2 | start 60 0.251 → 0.17-0.20; median of 5 ≤ 0.185 (S0PEIH 0.178) |
+
+  | id | kill rule |
+  |---|---|
+  | Ka1 | any `[pgo] failed`: Drift's endgame hits the same floor on the real measurement. Go to G60-b |
+  | Ka2 | Pa1 met but any start worse than S0PEIH by more than 0.02: the information change costs more than the loop gains. Go to G60-b, which keeps `w*I` |
+
+- **G60-b (code, the smallest change): a capped solve whose cost fell and whose new-loop residual fell is usable.**
+  - The change: drop `!converged` as a reason when the other four checks pass (`pose_graph.rs:59-92`). Log the cap as a
+    counter (`pgo_capped`) instead.
+  - Theory: at the cap the solve sits on the f32 floor. The replica's capped cost equals the f64 optimum (1.609973e-3
+    against 1.609987e-3).
+
+  | id | prediction |
+  |---|---|
+  | Pb1 (mechanism) | all 21 historical failures become `applied=true` when rerun (spot check: S0PEIH MH_04 start 60, S0PEI start 30, S0_MH_05 start 0); `pgo_capped` > 0 on them |
+  | Pb2 | S0PEIH start 60 0.251 → 0.17-0.20; S0PEI start 30 0.273 → 0.17-0.20 |
+  | Pb3 | no run without a failure changes: byte-identical `traj.txt` on S0PEIH MH_04 start 0 and on V1_02 |
+
+  | id | kill rule |
+  |---|---|
+  | Kb1 | an applied capped loop raises the 10 s piece error after the loop by more than 0.05 m against the same run's error before the change, or the gravity check fires: a capped solve can be wrong, so gate on the cost drop as well |
+  | Kb2 | Pb3 fails: the change touched converged solves |
+
+- **G60-c (code, the proper fix, after G60-b): f64 residuals with analytic Jacobians in the sparse PGO.**
+  - Match ORB-SLAM3's precision, and keep a small fixed budget.
+  - Replica f64: 6 iterations.
+
+  | id | prediction |
+  |---|---|
+  | Pc1 | every `[loop-time]` iterations ≤ 10 on MH_01/04/05 (today 6-27 at 247-490 nodes) |
+  | Pc2 | `solve_ms` −50 % or more at 300 nodes (112 ms for 30 iterations) |
+  | Pc3 | no score change beyond noise where no loop failed |
+
+  | id | kill rule |
+  |---|---|
+  | Kc1 | any solve over 15 iterations: the floor is not precision alone (look at the conditioning of the 300-node chain) |
