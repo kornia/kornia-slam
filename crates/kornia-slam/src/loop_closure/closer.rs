@@ -59,6 +59,9 @@ pub struct LoopGraphSettings {
     /// loops that touch it keep constraining the map. `false` builds the graph from the map's
     /// keyframes at each solve and refuses a loop whose keyframe left the map.
     pub persistent: bool,
+    /// Write back a solve stopped at the iteration cap when its cost and the new loop's residual
+    /// both fell. `false` drops every capped solve.
+    pub accept_capped_solves: bool,
 }
 
 /// How a keyframe joins the one before it in map order when tracked odometry does not.
@@ -1126,6 +1129,7 @@ pub(super) fn optimize_through_graph(
     let settings = LoopGraphSettings {
         information,
         persistent: false,
+        accept_capped_solves: false,
     };
     solve_in_graph(
         &mut graph,
@@ -1207,8 +1211,8 @@ pub(super) fn solve_in_graph(
         max_gravity_alignment_error(&original_poses, &optimized_poses, context.gravity_world)
     });
     let unusable_reason = unusable_reason(
-        report.converged,
-        report.iterations,
+        (report.converged, report.iterations, config.max_iterations),
+        settings.accept_capped_solves,
         (report.cost_before, report.cost_after),
         (report.loop_residual_before, report.loop_residual_after),
         gravity_error,

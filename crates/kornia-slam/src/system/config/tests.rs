@@ -563,6 +563,7 @@ fn loop_graph_information_is_range_checked() {
                 graph: LoopGraphSettings {
                     information,
                     persistent: true,
+                    accept_capped_solves: false,
                 },
                 execution: LoopClosingExecution::default(),
             },
@@ -2197,6 +2198,7 @@ mod ron_files {
             Some(LoopGraphSettings {
                 information: LoopGraphInformation::ScalarWeights,
                 persistent: false,
+                accept_capped_solves: false,
             })
         );
         let drift = SystemConfig::from_ron_str(

@@ -1,6 +1,7 @@
 use super::*;
 use crate::Frame;
 use crate::loop_closure::fusion_plan::{FusionOp, FusionSnapshot, apply_fusion};
+use crate::loop_closure::pose_graph::unusable_reason;
 use crate::loop_closure::sparse_pgo::{Se3Manifold, sparse_pose_graph_optimize};
 use crate::mapping::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
 use crate::pose_conversion::pose_to_se3;
@@ -1061,6 +1062,7 @@ fn persistent_graph_keeps_a_loop_whose_keyframe_was_culled() {
     let settings = LoopGraphSettings {
         information,
         persistent: true,
+        accept_capped_solves: false,
     };
     let inertial = Some(InertialPgoContext {
         gravity_world: gravity,
@@ -1231,6 +1233,7 @@ fn persistent_graph_starts_over_on_a_new_world() {
     let settings = LoopGraphSettings {
         information,
         persistent: true,
+        accept_capped_solves: false,
     };
     let inertial = Some(InertialPgoContext {
         gravity_world: gravity,
@@ -1295,6 +1298,7 @@ fn path_after_a_correction_starts_at_the_corrected_keyframe() {
     let settings = LoopGraphSettings {
         information,
         persistent: true,
+        accept_capped_solves: false,
     };
     let inertial = Some(InertialPgoContext {
         gravity_world: gravity,
@@ -1391,6 +1395,7 @@ fn forgotten_node_edges_measure_from_its_solved_pose() {
     let settings = LoopGraphSettings {
         information,
         persistent: true,
+        accept_capped_solves: false,
     };
     let inertial = Some(InertialPgoContext {
         gravity_world: gravity,
@@ -1843,6 +1848,54 @@ fn an_unusable_solve_reports_why() {
         map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
         drifted
     );
+}
+
+/// A solve stopped at the iteration cap with its cost and loop residual fallen is written back
+/// under `accept_capped_solves`, inline and in the background, and dropped without it.
+#[test]
+fn a_capped_solve_that_improved_is_applied_when_accepted() {
+    let mut config = background_config();
+    config.optimizer.max_iterations = 1;
+    config.graph.accept_capped_solves = true;
+    let applied = |events: &[LoopClosureEvent]| {
+        matches!(events, [LoopClosureEvent::Accepted { applied: true, .. }])
+    };
+
+    let (mut closer, mut map) = closing_fixture(config.clone(), false);
+    let context = closing_context(&map);
+    let inline = closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert!(applied(&inline.events), "{:?}", inline.events);
+
+    let (closer, mut map) = closing_fixture(config, false);
+    let mut closer = closer.with_solver(LoopSolver::deferred(1));
+    assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
+    let background = closer.on_frame(&mut map, &camera(), context);
+    assert!(applied(&background.events), "{:?}", background.events);
+    assert!(background.pgo_applied);
+}
+
+/// The cap counts only for a capped solve that improved: a capped solve whose cost or loop
+/// residual did not fall, or one that stopped short of the cap, stays unusable.
+#[test]
+fn capped_solves_are_usable_only_when_accepted_and_improved() {
+    let reason = |end, accept, cost, residual| unusable_reason(end, accept, cost, residual, None);
+    let capped = (false, 30, 30);
+    let (fell, residual_fell) = ((8.9e-2, 1.6e-3), (0.30, 0.01));
+
+    assert_eq!(reason(capped, true, fell, residual_fell), None);
+    assert!(
+        reason(capped, false, fell, residual_fell)
+            .is_some_and(|reason| reason.contains("not converged after 30 iterations"))
+    );
+    let diverged = reason(capped, true, (1.6e-3, 8.9e-2), (0.01, 0.30)).unwrap();
+    assert!(diverged.contains("not converged"), "{diverged}");
+    assert!(diverged.contains("cost did not fall"), "{diverged}");
+    assert!(reason(capped, true, fell, (0.30, 0.30)).is_some_and(|r| r.contains("not converged")));
+    assert!(
+        reason((false, 12, 30), true, fell, residual_fell)
+            .is_some_and(|r| r.contains("not converged after 12 iterations"))
+    );
+    assert_eq!(reason((true, 6, 30), false, fell, residual_fell), None);
 }
 
 /// The fixture with the query keyframe holding its own drifted duplicates of the first 18

@@ -1016,9 +1016,14 @@ impl fmt::Display for SystemConfig {
             } else {
                 "snapshot"
             };
+            let capped = if graph.accept_capped_solves {
+                ", capped solves accepted"
+            } else {
+                ""
+            };
             write!(
                 f,
-                "  loop closing: {} (pose graph: {information}, {kept})",
+                "  loop closing: {} (pose graph: {information}, {kept}{capped})",
                 vocabulary.display()
             )?;
             match execution {
