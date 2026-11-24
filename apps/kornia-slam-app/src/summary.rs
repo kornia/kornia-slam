@@ -93,11 +93,46 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
     )
 }
 
-/// How the tracking thread met local mapping's load (real-time fix ladder F4).
+/// How the tracking thread met local mapping's load (real-time fix ladder F4, F5a).
 fn format_mapping_load(c: &RunCounters) -> String {
     format!(
-        "[summary] mapping_load keyframes_refused_busy={}",
-        c.keyframes_refused_busy
+        "[summary] mapping_load keyframes_refused_busy={} growth_queue_max={} \
+         growth_lag_frames_max={}",
+        c.keyframes_refused_busy, c.growth_queue_max, c.growth_lag_frames_max
+    )
+}
+
+/// Per-frame tracking-thread stages the mapping-thread rungs move (F5a, F5b), in ms.
+#[derive(Default)]
+pub struct StageTimes {
+    keyframe_insert: Vec<f64>,
+    keyframe_growth: Vec<f64>,
+    loop_recognition: Vec<f64>,
+    map_wait: Vec<f64>,
+}
+
+impl StageTimes {
+    pub fn record(&mut self, timings: &kornia_slam::TrackingTimings, keyframe: bool) {
+        if keyframe {
+            self.keyframe_insert.push(ms(timings.keyframe_insert));
+            self.keyframe_growth.push(ms(timings.keyframe_growth));
+            self.loop_recognition.push(ms(timings.loop_recognition));
+        }
+        self.map_wait.push(ms(timings.map_wait));
+    }
+}
+
+/// Keyframe-frame stage percentiles, then the map-lock wait over every frame.
+pub fn format_stages(times: &StageTimes) -> String {
+    format!(
+        "[summary] keyframe_insert_ms_keyframe {}\n\
+         [summary] keyframe_growth_ms_keyframe {}\n\
+         [summary] loop_recognition_ms_keyframe {}\n\
+         [summary] map_wait_ms {}",
+        format_percentiles(&times.keyframe_insert),
+        format_percentiles(&times.keyframe_growth),
+        format_percentiles(&times.loop_recognition),
+        format_percentiles(&times.map_wait),
     )
 }
 
@@ -357,6 +392,40 @@ mod tests {
     }
 
     #[test]
+    fn the_last_line_holds_the_mapping_load_counters() {
+        let mut counters = RunCounters::default();
+        counters.keyframes_refused_busy = 4;
+        let text = format(&counters, &FrameTimes::default());
+        assert_eq!(
+            text.lines().last().unwrap(),
+            "[summary] mapping_load keyframes_refused_busy=4 growth_queue_max=0 \
+             growth_lag_frames_max=0"
+        );
+    }
+
+    #[test]
+    fn the_stage_lines_hold_keyframe_stages_and_every_frames_map_wait() {
+        let ms = Duration::from_millis;
+        let mut times = StageTimes::default();
+        let timings = |insert, growth, wait| kornia_slam::TrackingTimings {
+            keyframe_insert: ms(insert),
+            keyframe_growth: ms(growth),
+            loop_recognition: ms(1),
+            map_wait: ms(wait),
+            ..Default::default()
+        };
+        times.record(&timings(40, 20, 2), true);
+        times.record(&timings(0, 0, 4), false);
+        assert_eq!(
+            format_stages(&times),
+            "[summary] keyframe_insert_ms_keyframe p50=40.0 p90=40.0 p99=40.0\n\
+             [summary] keyframe_growth_ms_keyframe p50=20.0 p90=20.0 p99=20.0\n\
+             [summary] loop_recognition_ms_keyframe p50=1.0 p90=1.0 p99=1.0\n\
+             [summary] map_wait_ms p50=2.0 p90=4.0 p99=4.0"
+        );
+    }
+
+    #[test]
     fn the_wall_lines_hold_source_process_total_and_latency() {
         let ms = Duration::from_millis;
         let mut times = FrameTimes::default();
@@ -393,17 +462,6 @@ mod tests {
                 "[summary] late_frames=0 frame_period_ms=0.0 final_latency_ms=0.0 \
                  sum_total_s=0.000 sum_sleep_s=0.000 loop_wall_s=0.000"
             )
-        );
-    }
-
-    #[test]
-    fn the_last_line_holds_the_mapping_load_counters() {
-        let mut counters = RunCounters::default();
-        counters.keyframes_refused_busy = 4;
-        let text = format(&counters, &FrameTimes::default());
-        assert_eq!(
-            text.lines().last().unwrap(),
-            "[summary] mapping_load keyframes_refused_busy=4"
         );
     }
 }

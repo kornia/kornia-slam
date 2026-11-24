@@ -119,7 +119,7 @@ impl SlamSystem {
         let waited = Instant::now();
         let mut map_wait = Duration::ZERO;
         let ref_points_min_obs = {
-            let map = self.map.lock().unwrap();
+            let map = super::lock_map(&self.map, &self.map_wait);
             map_wait += waited.elapsed();
             // `Tracking.cc:3097-3100`.
             let min_observers = if map.keyframes().len() <= 2 { 2 } else { 3 };
@@ -276,7 +276,7 @@ impl SlamSystem {
         let gravity = self.inertial.gravity_world;
         let t_bc = self.rig.camera_to_body();
         let (mut covariance, last) = {
-            let map = self.map.lock().unwrap();
+            let map = super::lock_map(&self.map, &self.map_wait);
             let mut covariance = marginal;
             let mut current = KeyframeNav::of(map.get_keyframe(marginal_kf)?);
             let mut current_idx = marginal_kf;
@@ -336,7 +336,7 @@ impl SlamSystem {
 
     /// Median camera-frame depth of the reference keyframe's landmarks.
     fn reference_median_depth(&self) -> Option<f64> {
-        let map = self.map.lock().unwrap();
+        let map = super::lock_map(&self.map, &self.map_wait);
         map.scene_median_depth(self.state.current_keyframe_idx?)
     }
 
@@ -422,7 +422,7 @@ impl SlamSystem {
         estimate.inliers = inliers;
         self.state.velocity_world = solution.state.velocity;
         self.inertial.bias = solution.state.bias;
-        let epoch = self.map.lock().unwrap().world_epoch();
+        let epoch = super::lock_map(&self.map, &self.map_wait).world_epoch();
         self.estimator.frame_prior = solution.prior.map(|prior| (frame.idx, epoch, prior));
         self.estimator.map_changed = false;
         true
@@ -477,7 +477,7 @@ impl SlamSystem {
         let (prior_frame, epoch, prior) = self.estimator.frame_prior?;
         (!self.estimator.map_changed
             && prior_frame + 1 == frame_idx
-            && epoch == self.map.lock().unwrap().world_epoch())
+            && epoch == super::lock_map(&self.map, &self.map_wait).world_epoch())
         .then_some(prior)
     }
 
@@ -488,7 +488,7 @@ impl SlamSystem {
             return Some(SolveAnchor::Frame(Box::new(prior)));
         }
         let kf_sec = self.inertial.last_keyframe_timestamp_sec?;
-        let map = self.map.lock().unwrap();
+        let map = super::lock_map(&self.map, &self.map_wait);
         let kf = map.get_keyframe(self.state.last_keyframe_idx?)?;
         Some(SolveAnchor::Keyframe(
             FrameNavState {
@@ -522,7 +522,7 @@ impl SlamSystem {
             .inertial
             .last_keyframe_timestamp_sec
             .and_then(|kf_sec| {
-                let map = self.map.lock().unwrap();
+                let map = super::lock_map(&self.map, &self.map_wait);
                 let kf = map.get_keyframe(self.state.last_keyframe_idx?)?;
                 Some((KeyframeNav::of(kf), kf_sec))
             });
@@ -542,7 +542,7 @@ impl SlamSystem {
         frame: &Frame,
         matches: &[(usize, usize)],
     ) -> Vec<PoseInertialObservation> {
-        let map = self.map.lock().unwrap();
+        let map = super::lock_map(&self.map, &self.map_wait);
         matches
             .iter()
             .filter_map(|&(mp_idx, kp_idx)| {

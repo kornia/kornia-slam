@@ -51,6 +51,14 @@ pub struct TrackingTimings {
     /// Keyframe decision and insertion and, with synchronous mapping, the
     /// mapping work it triggers.
     pub keyframe_insert: Duration,
+    /// Growth and forward fusion inside `keyframe_insert`; only the queueing
+    /// with `keyframe_growth: Mapping`.
+    pub keyframe_growth: Duration,
+    /// Place recognition and inline loop closing inside `keyframe_insert`.
+    pub loop_recognition: Duration,
+    /// Time the tracking thread waited for the map lock, overlapping the
+    /// other stages.
+    pub map_wait: Duration,
     /// Flow path on the tracking core: the IMU guess and the level-0 copies.
     pub flow_prepare: Duration,
     /// Handing the shards to the flow workers.

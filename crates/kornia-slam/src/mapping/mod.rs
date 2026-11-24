@@ -33,6 +33,6 @@ pub(crate) mod synthetic_walk;
 pub mod vi_ba_schur;
 pub mod visual_information;
 
-pub use keyframe_mapping::{GrowthNeighbours, KeyframeSeed};
+pub use keyframe_mapping::{GrowthNeighbours, KeyframeGrowth, KeyframeSeed};
 pub use local_mapping::{KeyframeJob, LocalMapping, LocalMappingMode};
 pub use map::{Keyframe, Map, MapPoint, SegmentId};

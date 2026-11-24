@@ -15,7 +15,7 @@ use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabular
 use crate::loop_closure::{LoopCloser, LoopClosingConfig, LoopSolver};
 use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
 use crate::mapping::visual_information::FisheyeWeight;
-use crate::mapping::{GrowthNeighbours, KeyframeSeed, LocalMappingMode};
+use crate::mapping::{GrowthNeighbours, KeyframeGrowth, KeyframeSeed, LocalMappingMode};
 use crate::tracking::flow_pool::FlowPoolError;
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
@@ -68,6 +68,7 @@ pub(crate) struct SystemSettings {
     pub growth_neighbours: GrowthNeighbours,
     pub growth_min_baseline_ratio: f64,
     pub keyframe_seed: KeyframeSeed,
+    pub keyframe_growth: KeyframeGrowth,
     pub fan_out: FanOut,
 }
 
@@ -237,6 +238,7 @@ impl SystemConfig {
             growth_neighbours: orb.mapping.growth_neighbours,
             growth_min_baseline_ratio: orb.mapping.growth_min_baseline_ratio,
             keyframe_seed: orb.mapping.keyframe_seed,
+            keyframe_growth: orb.mapping.keyframe_growth,
             fan_out: orb.fan_out,
         }
     }

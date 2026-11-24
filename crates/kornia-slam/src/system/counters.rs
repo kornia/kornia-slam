@@ -184,6 +184,10 @@ pub struct RunCounters {
     /// Due keyframes refused because `local_ba.active_keyframes` of them
     /// already waited for a busy mapping (`keyframes.mapping_acceptance`).
     pub keyframes_refused_busy: u64,
+    /// Longest the growth queue has been (`mapping.keyframe_growth: Mapping`).
+    pub growth_queue_max: u64,
+    /// Most frames between a keyframe and the frame that saw its growth done.
+    pub growth_lag_frames_max: u64,
 }
 
 impl RunCounters {

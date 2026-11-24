@@ -358,6 +358,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut trajectory: Vec<[f32; 3]> = Vec::new();
     let mut processed: usize = 0;
     let mut frame_times = summary::FrameTimes::default();
+    let mut stages = summary::StageTimes::default();
     let loop_start = Instant::now();
 
     loop {
@@ -426,6 +427,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let frame_ms = system.tracking_duration().as_secs_f64() * 1000.0;
         let frontend_ms = system.frontend_observation().duration.as_secs_f64() * 1000.0;
         frame_times.record(frame_ms, frontend_ms);
+        stages.record(system.tracking_timings(), wall.keyframe);
         if let Some(writer) = trace_writer.as_mut() {
             writer.write_timings(
                 idx,
@@ -628,6 +630,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     eprintln!("{}", summary::format(&system.run_counters(), &frame_times));
     eprintln!("{}", summary::format_wall(&frame_times, loop_wall));
+    eprintln!("{}", summary::format_stages(&stages));
     if trajectory_out.is_some() {
         eprintln!("[summary] poses_written={poses_written}");
         eprintln!("[summary] poses_non_finite={poses_non_finite}");

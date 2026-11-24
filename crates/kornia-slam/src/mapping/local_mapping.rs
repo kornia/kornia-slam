@@ -7,14 +7,17 @@ use std::time::Instant;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
+use kornia_3d::pose::TriangulationConfig;
 use kornia_algebra::Vec3F64;
+use kornia_imgproc::features::OrbMatchConfig;
 
 use crate::mapping::bundle_adjustment::{
     LocalBaParams, local_window_of, run_local_ba_with, run_local_inertial_ba_calibrated,
     run_local_inertial_ba_with,
 };
 use crate::mapping::keyframe_mapping::{
-    DeferredKeyframe, DeferredKeyframeContext, DeferredKeyframeResult,
+    DeferredKeyframe, DeferredKeyframeContext, DeferredKeyframeResult, KeyframeGrowthPlan,
+    KeyframeGrowthResult, grow_keyframe,
 };
 use crate::mapping::map::{
     BaOutcome, BaSnapshot, BaSolve, BaUpdate, BaUpdateError, LocalBaMergeResult, LocalBaStats, Map,
@@ -294,6 +297,7 @@ enum LocalMappingBackend {
         map: Arc<Mutex<Map>>,
         camera: PinholeCamera,
         results: Mutex<Vec<LocalBaMergeResult>>,
+        growth_results: Mutex<Vec<GrowthOutcome>>,
         /// The online calibration the next solve starts from; boxed, as it
         /// dwarfs the asynchronous variant.
         calibration: Box<Mutex<OnlineCalibrationState>>,
@@ -365,6 +369,7 @@ impl LocalMapping {
                 map,
                 camera,
                 results: Mutex::new(Vec::new()),
+                growth_results: Mutex::new(Vec::new()),
                 calibration: Box::new(Mutex::new(OnlineCalibrationState::default())),
                 deferred: None,
             },
@@ -433,6 +438,51 @@ impl LocalMapping {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .deferred_context
                 .is_some(),
+        }
+    }
+
+    /// Grows `job`'s keyframe: inline in synchronous mode, else queued to the
+    /// worker. Returns the growth queue's length after the submission.
+    pub(crate) fn submit_growth(&self, job: GrowthJob) -> usize {
+        match &self.backend {
+            LocalMappingBackend::Synchronous {
+                map,
+                camera,
+                growth_results,
+                ..
+            } => {
+                let outcome = job.run(map, camera);
+                growth_results
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(outcome);
+                0
+            }
+            LocalMappingBackend::Asynchronous { handle, .. } => handle.submit_growth(job),
+        }
+    }
+
+    /// The growth finished since the last call, in submission order.
+    pub(crate) fn drain_growth(&self) -> Vec<GrowthOutcome> {
+        match &self.backend {
+            LocalMappingBackend::Synchronous { growth_results, .. } => std::mem::take(
+                &mut *growth_results
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            ),
+            LocalMappingBackend::Asynchronous { handle, .. } => handle.drain_growth(),
+        }
+    }
+
+    /// Drops the queued growth and any result not yet drained, for a map that
+    /// was cleared: their keyframes are gone.
+    pub(crate) fn clear_growth(&self) {
+        match &self.backend {
+            LocalMappingBackend::Synchronous { growth_results, .. } => growth_results
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear(),
+            LocalMappingBackend::Asynchronous { handle, .. } => handle.clear_growth(),
         }
     }
 
@@ -509,10 +559,45 @@ impl LocalMapping {
     }
 }
 
+/// One keyframe's growth and forward fusion, queued by `keyframe_growth: Mapping`.
+pub(crate) struct GrowthJob {
+    pub plan: KeyframeGrowthPlan,
+    pub match_config: OrbMatchConfig,
+    pub triangulation_config: TriangulationConfig,
+    pub min_baseline_ratio: f64,
+}
+
+impl GrowthJob {
+    fn run(self, map: &Mutex<Map>, camera: &PinholeCamera) -> GrowthOutcome {
+        let keyframe_idx = self.plan.keyframe_idx;
+        let result = grow_keyframe(
+            map,
+            self.plan,
+            camera,
+            self.match_config,
+            &self.triangulation_config,
+            self.min_baseline_ratio,
+        );
+        GrowthOutcome {
+            keyframe_idx,
+            result,
+            generation: 0,
+        }
+    }
+}
+
+/// A finished [`GrowthJob`].
+pub(crate) struct GrowthOutcome {
+    pub keyframe_idx: usize,
+    pub result: KeyframeGrowthResult,
+    /// The queue generation it was submitted in; a reset discards the older ones.
+    generation: u64,
+}
+
 /// Local mapping's load as tracking sees it, for keyframe acceptance.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct MappingLoad {
-    /// A job is being solved or waits for the worker.
+    /// A job is being solved or grown, or waits for the worker.
     pub busy: bool,
     /// Keyframes submitted since the worker's last snapshot, which the next
     /// solve takes in at once.
@@ -525,6 +610,10 @@ struct PendingState {
     /// The worker took a job and has not merged it yet.
     in_flight: bool,
     pending_keyframes: usize,
+    /// FIFO, drained before `latest`, so a keyframe grows before its BA.
+    growth: VecDeque<GrowthJob>,
+    growing: bool,
+    growth_generation: u64,
     /// Keyframes whose ORB runs here, in order; never replaced.
     deferred: VecDeque<DeferredKeyframe>,
     deferred_context: Option<Arc<DeferredKeyframeContext>>,
@@ -551,6 +640,7 @@ impl Drop for WorkerExit {
         state.shutdown = true;
         state.latest = None;
         state.deferred.clear();
+        state.growth.clear();
         self.pending.ready.notify_all();
     }
 }
@@ -558,6 +648,7 @@ impl Drop for WorkerExit {
 struct LocalMappingHandle {
     pending: Arc<PendingJob>,
     results: mpsc::Receiver<LocalBaMergeResult>,
+    growth_results: mpsc::Receiver<GrowthOutcome>,
     join_handle: Option<JoinHandle<()>>,
 }
 
@@ -572,6 +663,7 @@ impl LocalMappingHandle {
         let pending = Arc::new(PendingJob::default());
         let worker_pending = Arc::clone(&pending);
         let (result_sender, results) = mpsc::channel();
+        let (growth_sender, growth_results) = mpsc::channel();
 
         let join_handle = thread::Builder::new()
             .name("kornia-local-mapping".into())
@@ -588,7 +680,10 @@ impl LocalMappingHandle {
                             .state
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        while state.latest.is_none() && state.deferred.is_empty() && !state.shutdown
+                        while state.latest.is_none()
+                            && state.deferred.is_empty()
+                            && state.growth.is_empty()
+                            && !state.shutdown
                         {
                             state = worker_pending
                                 .ready
@@ -601,11 +696,36 @@ impl LocalMappingHandle {
                         // `submit_deferred` queues nothing until lane T builds
                         // the path; nothing would serve a deferred entry.
                         state.deferred.clear();
-                        let Some(job) = state.latest.take() else {
+                        if let Some(growth) = state.growth.pop_front() {
+                            state.growing = true;
+                            Err((growth, state.growth_generation))
+                        } else {
+                            let Some(job) = state.latest.take() else {
+                                continue;
+                            };
+                            state.in_flight = true;
+                            Ok(job)
+                        }
+                    };
+                    let job = match job {
+                        Ok(job) => job,
+                        Err((growth, generation)) => {
+                            // Map lock only, never the publication gate: the
+                            // tracking thread holds the gate for a whole frame.
+                            let outcome = GrowthOutcome {
+                                generation,
+                                ..growth.run(&map, &camera)
+                            };
+                            worker_pending
+                                .state
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .growing = false;
+                            if growth_sender.send(outcome).is_err() {
+                                break;
+                            }
                             continue;
-                        };
-                        state.in_flight = true;
-                        job
+                        }
                     };
 
                     // The gate makes compound keyframe publication atomic to local
@@ -657,8 +777,46 @@ impl LocalMappingHandle {
         Self {
             pending,
             results,
+            growth_results,
             join_handle: Some(join_handle),
         }
+    }
+
+    fn submit_growth(&self, job: GrowthJob) -> usize {
+        let mut state = self
+            .pending
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.shutdown {
+            return 0;
+        }
+        state.growth.push_back(job);
+        self.pending.ready.notify_one();
+        state.growth.len()
+    }
+
+    fn drain_growth(&self) -> Vec<GrowthOutcome> {
+        let generation = self
+            .pending
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .growth_generation;
+        self.growth_results
+            .try_iter()
+            .filter(|outcome| outcome.generation == generation)
+            .collect()
+    }
+
+    fn clear_growth(&self) {
+        let mut state = self
+            .pending
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.growth.clear();
+        state.growth_generation += 1;
     }
 
     /// Replaces any not-yet-started BA with the newest request.
@@ -684,7 +842,10 @@ impl LocalMappingHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         MappingLoad {
-            busy: state.in_flight || state.latest.is_some(),
+            busy: state.in_flight
+                || state.latest.is_some()
+                || state.growing
+                || !state.growth.is_empty(),
             pending_keyframes: state.pending_keyframes,
         }
     }
@@ -705,6 +866,7 @@ impl Drop for LocalMappingHandle {
             state.shutdown = true;
             state.latest = None;
             state.deferred.clear();
+            state.growth.clear();
         }
         self.pending.ready.notify_one();
 

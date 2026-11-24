@@ -1518,6 +1518,23 @@ fn the_fan_out_is_named_in_the_header_and_range_checked() {
 }
 
 #[test]
+fn the_keyframe_growth_is_named_in_the_header_only_when_set() {
+    use crate::mapping::KeyframeGrowth;
+    let mut config = SystemConfig::default();
+    assert_eq!(
+        orb_mut(&mut config).mapping.keyframe_growth,
+        KeyframeGrowth::Tracking
+    );
+    assert!(!config.to_string().contains("keyframe growth"));
+    orb_mut(&mut config).mapping.keyframe_growth = KeyframeGrowth::Mapping;
+    assert!(
+        config
+            .to_string()
+            .contains("  local mapping: asynchronous\n  keyframe growth: Mapping\n")
+    );
+}
+
+#[test]
 fn the_mapping_acceptance_is_named_in_the_header_only_when_set() {
     use crate::tracking::MappingAcceptance;
     let mut config = SystemConfig::default();
@@ -1540,6 +1557,19 @@ mod ron_files {
 
     use super::*;
     use crate::loop_closure::OdometryRandomWalk;
+
+    #[test]
+    fn the_keyframe_growth_parses() {
+        use crate::mapping::KeyframeGrowth;
+        let config =
+            parse("(version: 1, pipeline: OrbSlam((mapping: (keyframe_growth: Mapping))))")
+                .unwrap();
+        assert_eq!(
+            orb(&config).mapping.keyframe_growth,
+            KeyframeGrowth::Mapping
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+    }
 
     #[test]
     fn the_mapping_acceptance_parses() {

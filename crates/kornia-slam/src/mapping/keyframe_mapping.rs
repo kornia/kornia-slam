@@ -141,7 +141,7 @@ pub(crate) fn keyframe_insertion(
 /// Not a queued, independently valid snapshot: it names keyframes by id and is
 /// consumed during the same publication interval that produced it.
 pub(crate) struct KeyframeGrowthPlan {
-    keyframe_idx: usize,
+    pub(crate) keyframe_idx: usize,
     /// Neighbours the keyframe triangulates new landmarks against.
     triangulation_neighbours: Vec<usize>,
     /// Neighbours its landmarks are fused into; equal to the above under
@@ -161,6 +161,19 @@ pub enum GrowthNeighbours {
     /// best 20, then temporal keyframes); `LocalMapping.cc:388-407, 714-763`.
     /// `covisible` is 10 (30 monocular).
     OrbSlam3 { covisible: usize },
+}
+
+/// The thread a new keyframe's growth and forward fusion run on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum KeyframeGrowth {
+    /// Inside the keyframe's insertion, on the tracking thread.
+    #[default]
+    Tracking,
+    /// Queued to the local-mapping thread, ahead of the keyframe's BA, without
+    /// the publication gate: ORB-SLAM3 runs `CreateNewMapPoints` and
+    /// `SearchInNeighbors` outside `mMutexMapUpdate` (`LocalMapping.cc:101-108`).
+    Mapping,
 }
 
 /// The velocity a new keyframe enters its first VI-BA with (card R).
@@ -826,5 +839,216 @@ mod tests {
             open.triangulation_neighbours
         );
         assert_eq!(unbounded.fusion_neighbours, open.fusion_neighbours);
+    }
+
+    mod queued {
+        //! `keyframe_growth: Mapping`: growth queued to the local-mapping thread.
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        use super::*;
+        use crate::mapping::local_mapping::{GrowthJob, GrowthOutcome};
+        use crate::mapping::{LocalMapping, LocalMappingMode};
+        use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
+
+        fn job(plan: KeyframeGrowthPlan) -> GrowthJob {
+            GrowthJob {
+                plan,
+                match_config: OrbMatchConfig::default(),
+                triangulation_config: TriangulationConfig::default(),
+                min_baseline_ratio: 0.0,
+            }
+        }
+
+        fn seeded_map() -> Map {
+            let mut map = Map::new();
+            for (idx, offset) in [(10, 0.0), (20, 1.0)] {
+                map.insert_keyframe(Keyframe::from_frame(observing_frame(idx, offset, &grid())))
+                    .unwrap();
+            }
+            map
+        }
+
+        /// Inserts keyframes `ids` one after another (plan, then publication,
+        /// as `insert_keyframe` does) and hands each plan to `grow`.
+        fn insert_and_grow(
+            map: &Mutex<Map>,
+            ids: &[usize],
+            mut grow: impl FnMut(KeyframeGrowthPlan),
+        ) {
+            for (i, &idx) in ids.iter().enumerate() {
+                let plan = {
+                    let mut map = map.lock().unwrap();
+                    let plan = prepare_keyframe_growth(&map, idx, GrowthNeighbours::RecentTen);
+                    let frame = observing_frame(idx, 2.0 + i as f64, &grid());
+                    map.insert_keyframe(Keyframe::from_frame(frame)).unwrap();
+                    plan
+                };
+                grow(plan);
+            }
+        }
+
+        fn drain_until(mapping: &LocalMapping, n: usize) -> Vec<GrowthOutcome> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut outcomes = Vec::new();
+            while outcomes.len() < n {
+                assert!(
+                    Instant::now() < deadline,
+                    "{} of {n} growth results",
+                    outcomes.len()
+                );
+                outcomes.extend(mapping.drain_growth());
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            outcomes
+        }
+
+        /// The worker blocks on the map lock the test holds while three jobs
+        /// queue; they come back in submission order and leave the same map as
+        /// growth inline on the inserting thread.
+        #[test]
+        fn queued_growth_runs_in_order_and_equals_inline_growth() {
+            let ids = [30, 40, 50];
+            let inline = Mutex::new(seeded_map());
+            insert_and_grow(&inline, &ids, |plan| {
+                grow(&inline, plan);
+            });
+
+            let map = Arc::new(Mutex::new(seeded_map()));
+            let mapping =
+                LocalMapping::new(LocalMappingMode::Asynchronous, Arc::clone(&map), camera());
+            let mut queued = Vec::new();
+            insert_and_grow(&map, &ids, |plan| queued.push(plan));
+            {
+                let _held = map.lock().unwrap();
+                for (n, plan) in queued.into_iter().enumerate() {
+                    assert_eq!(mapping.submit_growth(job(plan)), n + 1, "nothing ran yet");
+                }
+                assert!(mapping.load().busy);
+            }
+            let order: Vec<usize> = drain_until(&mapping, 3)
+                .iter()
+                .map(|outcome| outcome.keyframe_idx)
+                .collect();
+            assert_eq!(order, ids);
+            assert_eq!(
+                map.lock().unwrap().state_fingerprint_for_test(),
+                inline.lock().unwrap().state_fingerprint_for_test()
+            );
+
+            let synchronous = Arc::new(Mutex::new(seeded_map()));
+            let sync_mapping = LocalMapping::new(
+                LocalMappingMode::Synchronous,
+                Arc::clone(&synchronous),
+                camera(),
+            );
+            insert_and_grow(&synchronous, &ids, |plan| {
+                assert_eq!(sync_mapping.submit_growth(job(plan)), 0);
+            });
+            assert_eq!(sync_mapping.drain_growth().len(), 3);
+            assert_eq!(
+                synchronous.lock().unwrap().state_fingerprint_for_test(),
+                inline.lock().unwrap().state_fingerprint_for_test()
+            );
+        }
+
+        /// A neighbour removed while the plan waited is a skip, not a failure.
+        #[test]
+        fn a_plan_naming_an_evicted_neighbour_skips_it() {
+            let mut map = seeded_map();
+            let plan = prepare_keyframe_growth(&map, 30, GrowthNeighbours::RecentTen);
+            map.insert_keyframe(Keyframe::from_frame(observing_frame(30, 2.0, &grid())))
+                .unwrap();
+            map.remove_keyframe(20).unwrap();
+            let map = Mutex::new(map);
+            let result = grow(&map, plan);
+            assert_eq!(result.neighbor_count, 2);
+            assert!(result.pair_failures.is_empty());
+            assert!(result.fusion_failures.is_empty());
+            assert_eq!(
+                result.landmarks_added,
+                grid().len(),
+                "the pair with 10 still grows"
+            );
+        }
+
+        /// Local-map selection on another thread while the worker grows 50
+        /// keyframes: every read sees a consistent map.
+        #[test]
+        fn local_map_selection_runs_while_the_worker_grows() {
+            let map = Arc::new(Mutex::new(seeded_map()));
+            let mapping =
+                LocalMapping::new(LocalMappingMode::Asynchronous, Arc::clone(&map), camera());
+            let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader = {
+                let (map, done) = (Arc::clone(&map), Arc::clone(&done));
+                std::thread::spawn(move || {
+                    let mut reads = 0;
+                    while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                        let map = map.lock().unwrap();
+                        let newest = map.keyframes().last();
+                        let selection = select_local_map_points(
+                            &map,
+                            &[],
+                            newest,
+                            LocalMapSelectionConfig::default(),
+                        );
+                        assert!(selection.points.iter().all(|&p| p < map.map_points().len()));
+                        reads += 1;
+                    }
+                    reads
+                })
+            };
+            let ids: Vec<usize> = (0..50).map(|i| 30 + 10 * i).collect();
+            insert_and_grow(&map, &ids, |plan| {
+                mapping.submit_growth(job(plan));
+            });
+            let outcomes = drain_until(&mapping, ids.len());
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            assert!(reader.join().unwrap() > 0);
+            assert!(outcomes.iter().all(|o| o.result.fusion_failures.is_empty()));
+        }
+
+        /// Dropping local mapping with growth queued behind a held lock
+        /// returns once the lock is released; the queue is not drained.
+        #[test]
+        fn shutdown_with_queued_growth_returns() {
+            let map = Arc::new(Mutex::new(seeded_map()));
+            let mapping =
+                LocalMapping::new(LocalMappingMode::Asynchronous, Arc::clone(&map), camera());
+            let mut plans = Vec::new();
+            insert_and_grow(&map, &[30, 40, 50, 60], |plan| plans.push(plan));
+            let held = map.lock().unwrap();
+            for plan in plans {
+                mapping.submit_growth(job(plan));
+            }
+            let dropper = std::thread::spawn(move || drop(mapping));
+            std::thread::sleep(Duration::from_millis(20));
+            drop(held);
+            dropper.join().unwrap();
+        }
+
+        /// A reset drops the queue, and the result of the growth in progress.
+        #[test]
+        fn clearing_the_queue_discards_its_results() {
+            let map = Arc::new(Mutex::new(seeded_map()));
+            let mapping =
+                LocalMapping::new(LocalMappingMode::Asynchronous, Arc::clone(&map), camera());
+            let mut plans = Vec::new();
+            insert_and_grow(&map, &[30, 40], |plan| plans.push(plan));
+            {
+                let _held = map.lock().unwrap();
+                for plan in plans {
+                    mapping.submit_growth(job(plan));
+                }
+                mapping.clear_growth();
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while mapping.load().busy {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(mapping.drain_growth().is_empty());
+        }
     }
 }

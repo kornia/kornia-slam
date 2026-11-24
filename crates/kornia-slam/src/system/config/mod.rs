@@ -18,7 +18,7 @@ use crate::mapping::marginalization::BoundaryPrior;
 use crate::mapping::outlier_erase::OutlierErase;
 use crate::mapping::vi_ba_schur::ImuHuber;
 use crate::mapping::visual_information::{FisheyeWeight, VisualInformation};
-use crate::mapping::{GrowthNeighbours, KeyframeSeed, LocalMappingMode};
+use crate::mapping::{GrowthNeighbours, KeyframeGrowth, KeyframeSeed, LocalMappingMode};
 use crate::tracking::local_map::LocalMapRules;
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::{KeyframeObservations, MapProjectionConfig};
@@ -598,6 +598,8 @@ pub struct MappingConfig {
     pub growth_min_baseline_ratio: f64,
     /// The velocity a new keyframe is seeded with.
     pub keyframe_seed: KeyframeSeed,
+    /// The thread keyframe growth and forward fusion run on.
+    pub keyframe_growth: KeyframeGrowth,
 }
 
 /// The local BA / VI-BA window and its error model. The defaults are the
@@ -910,6 +912,9 @@ impl fmt::Display for SystemConfig {
         }
         if orb.mapping.keyframe_seed != KeyframeSeed::default() {
             writeln!(f, "  keyframe seed: {:?}", orb.mapping.keyframe_seed)?;
+        }
+        if orb.mapping.keyframe_growth != KeyframeGrowth::default() {
+            writeln!(f, "  keyframe growth: {:?}", orb.mapping.keyframe_growth)?;
         }
         if orb.tracking.frame_velocity != FrameVelocity::default() {
             writeln!(f, "  frame velocity: {:?}", orb.tracking.frame_velocity)?;

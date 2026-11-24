@@ -39,6 +39,7 @@ pub use validation::ConfigError;
 
 use crate::frontend::{FrontendObservation, OrbFrontend};
 use fan_out::TrackingFanOut;
+
 use state::{SystemMode, SystemState};
 
 use crate::tracking::{
@@ -58,8 +59,9 @@ use crate::tracking::pose_estimation::map_projection::MapProjectionRejectReason;
 use crate::tracking::pose_gate::{GateReference, GateVerdict};
 use crate::tracking::tracker::{FlowGuess, FrameInput, GateReading, Tracker};
 
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::Frame;
@@ -78,13 +80,15 @@ use crate::loop_closure::{
 };
 use crate::mapping::bundle_adjustment::LocalBaParams;
 use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
-use crate::mapping::local_mapping::MappingLoad;
+use crate::mapping::local_mapping::{GrowthJob, MappingLoad};
 use crate::mapping::map::{
     ImuFactor, InertialAlignmentError, Keyframe, Map, MapInsertion, MapMutationError, MapPoint,
     StateEnvelopeLimits,
 };
 use crate::mapping::session::{SessionKeyframe, SessionLandmark, snapshot_map};
-use crate::mapping::{GrowthNeighbours, KeyframeJob, KeyframeSeed, LocalMapping, SegmentId};
+use crate::mapping::{
+    GrowthNeighbours, KeyframeGrowth, KeyframeJob, KeyframeSeed, LocalMapping, SegmentId,
+};
 use crate::pose_conversion::{RIGID_TOLERANCE, apply_reference_pose_correction};
 use build::SystemSettings;
 use kornia_3d::pose::Pose3d;
@@ -178,6 +182,14 @@ enum FlowOnly {
     Tracked(Box<Frame>, Estimate),
 }
 
+/// Locks `map`, adding the wait to `wait`.
+fn lock_map<'a>(map: &'a Mutex<Map>, wait: &Cell<Duration>) -> MutexGuard<'a, Map> {
+    let started = Instant::now();
+    let guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    wait.set(wait.get() + started.elapsed());
+    guard
+}
+
 /// Top-level ORB-SLAM system: orchestrates tracking, mapping, and state transitions.
 pub struct SlamSystem {
     rig: SensorRig,
@@ -195,6 +207,11 @@ pub struct SlamSystem {
     growth_neighbours: GrowthNeighbours,
     growth_min_baseline_ratio: f64,
     keyframe_seed: KeyframeSeed,
+    keyframe_growth: KeyframeGrowth,
+    // The newest keyframe whose queued growth has come back (`KeyframeGrowth::Mapping`).
+    growth_done_through: Option<usize>,
+    // This frame's wait for the map lock; a `Cell` so `&self` paths can add to it.
+    map_wait: Cell<Duration>,
     sample_interpolation: SampleInterpolation,
     // Keyframes a map bound evicted, copied while a session is recorded.
     session_recording: bool,
@@ -357,6 +374,9 @@ impl SlamSystem {
             growth_neighbours: settings.growth_neighbours,
             growth_min_baseline_ratio: settings.growth_min_baseline_ratio,
             keyframe_seed: settings.keyframe_seed,
+            keyframe_growth: settings.keyframe_growth,
+            growth_done_through: None,
+            map_wait: Cell::new(Duration::ZERO),
             sample_interpolation: settings.inertial.sample_interpolation,
             session_recording: false,
             evicted_keyframes: Vec::new(),
@@ -444,7 +464,7 @@ impl SlamSystem {
                 .binary_search_by_key(&idx, |&(i, _)| i)
                 .map_or(f64::NAN, |slot| stamps[slot].1)
         };
-        let map = self.map.lock().unwrap();
+        let map = lock_map(&self.map, &self.map_wait);
         snapshot_map(
             &map,
             &self.rig,
@@ -466,7 +486,7 @@ impl SlamSystem {
             return;
         };
         let report = {
-            let mut map = self.map.lock().unwrap();
+            let mut map = lock_map(&self.map, &self.map_wait);
             // Only a map above the bound loses keyframes, so only then is a copy owed.
             let before = (self.session_recording && map.keyframes().len() > max_keyframes)
                 .then(|| map.keyframes().to_vec());
@@ -796,6 +816,7 @@ impl SlamSystem {
         self.tracking_timings = TrackingTimings::default();
         self.frame_trace = None;
         self.deferred_extraction = Duration::ZERO;
+        self.map_wait.set(Duration::ZERO);
         let tracking_start = Instant::now();
         self.last_skip = None;
         self.prepare_flow(images, self.next_frame_idx as u64 - 1);
@@ -803,6 +824,7 @@ impl SlamSystem {
         self.tracking_duration = tracking_start
             .elapsed()
             .saturating_sub(self.deferred_extraction);
+        self.tracking_timings.map_wait = self.map_wait.get();
         // An error leaves the frame uncounted, as before #184 made extraction fallible here.
         if let Ok(r) = &result {
             if r.status != TrackingStatus::Skipped {
@@ -913,7 +935,7 @@ impl SlamSystem {
     /// first matched over 10 s ago.
     fn report_landmark_age(&mut self, frame_idx: usize, matches: &[(usize, usize)], now_sec: f64) {
         const OLD_SEC: f64 = 10.0;
-        let map = self.map.lock().unwrap();
+        let map = lock_map(&self.map, &self.map_wait);
         let mut old = 0;
         for &(mp_idx, _) in matches {
             if map.map_points().get(mp_idx).is_none() {
@@ -1009,7 +1031,7 @@ impl SlamSystem {
     /// duration of the call. Avoids cloning the whole point list (descriptors
     /// included) for read-only consumers such as viz logging and summaries.
     pub fn with_map_points<R>(&self, f: impl FnOnce(&[MapPoint]) -> R) -> R {
-        f(self.map.lock().unwrap().map_points())
+        f(lock_map(&self.map, &self.map_wait).map_points())
     }
 
     /// Returns the index of the current reference keyframe, if tracking has one.
@@ -1034,7 +1056,7 @@ impl SlamSystem {
 
     /// Returns the number of active (non-culled) map points.
     pub fn num_active_map_points(&self) -> usize {
-        self.map.lock().unwrap().num_active_map_points()
+        lock_map(&self.map, &self.map_wait).num_active_map_points()
     }
 
     /// Drain any debug messages accumulated since the last call.
@@ -1053,6 +1075,7 @@ impl SlamSystem {
     }
 
     fn apply_local_mapping_results(&mut self) {
+        self.apply_growth_results();
         let Some(reference_idx) = self.state.current_keyframe_idx else {
             // Still drain results so a completed worker cannot build a result backlog.
             let _ = self.local_mapping.drain_results();
@@ -1113,13 +1136,24 @@ impl SlamSystem {
         }
     }
 
+    /// Reports the queued growth that has finished. Growth moves no landmark,
+    /// so the tracks' positions stay valid.
+    fn apply_growth_results(&mut self) {
+        for outcome in self.local_mapping.drain_growth() {
+            let lag = self.next_frame_idx.saturating_sub(outcome.keyframe_idx + 1) as u64;
+            self.counters.growth_lag_frames_max = self.counters.growth_lag_frames_max.max(lag);
+            self.growth_done_through = self.growth_done_through.max(Some(outcome.keyframe_idx));
+            self.report_growth(outcome.keyframe_idx, &outcome.result);
+        }
+    }
+
     /// Rewrites the tracks' stored map-point positions after a map change,
     /// under one map lock; only `WindowedU8` shards read them.
     fn refresh_track_positions(&mut self) {
         if self.rig_flow.is_none() {
             return;
         }
-        let map = self.map.lock().unwrap();
+        let map = lock_map(&self.map, &self.map_wait);
         self.counters.flow_position_refreshes += self.tracker.refresh_positions(&map);
     }
 
@@ -1136,12 +1170,18 @@ impl SlamSystem {
         if self.adopted_keyframe == Some(kf_idx) {
             return;
         }
+        // Its new landmarks exist only once its queued growth is back.
+        if self.keyframe_growth == KeyframeGrowth::Mapping
+            && self.growth_done_through < Some(kf_idx)
+        {
+            return;
+        }
         self.adopted_keyframe = Some(kf_idx);
         let previous_idx = self.next_frame_idx.checked_sub(2);
         let pose = self.state.pose_world_to_cam;
         let cameras = self.rig_flow.as_ref().map_or(1, RigFlow::cameras);
         let landmarks: Vec<([f32; 2], usize, usize, Vec3F64)> = {
-            let map = self.map.lock().unwrap();
+            let map = lock_map(&self.map, &self.map_wait);
             let Some(kf) = map.get_keyframe(kf_idx) else {
                 return;
             };
@@ -1383,7 +1423,7 @@ impl SlamSystem {
 
         // The keyframe and its seeds are published together; tracker state is
         // adopted below only once that succeeded.
-        let published = self.map.lock().unwrap().apply_insertion(insertion);
+        let published = lock_map(&self.map, &self.map_wait).apply_insertion(insertion);
         let added = match published {
             Ok(result) => result.landmark_ids.len(),
             Err(error) => {
@@ -1515,13 +1555,15 @@ impl SlamSystem {
 
         // The gate runs after initial BA, which can collapse a badly
         // conditioned pair.
-        let health = crate::initialization::initial_map_health(&self.map.lock().unwrap());
+        let health =
+            crate::initialization::initial_map_health(&lock_map(&self.map, &self.map_wait));
         if health.is_degenerate() {
             self.dbg(format!(
                 "[init_gate] reject: valid_in_both={} median_depth={:.3} (need >= {} and > 0)",
                 health.valid_in_both, health.median_depth_older_kf, MIN_VALID_POINTS,
             ));
-            self.map.lock().unwrap().clear_active();
+            lock_map(&self.map, &self.map_wait).clear_active();
+            self.local_mapping.clear_growth();
             if let Some(w) = self.wheel.as_mut() {
                 w.reset_map();
             }
@@ -1531,7 +1573,7 @@ impl SlamSystem {
 
         // Initial BA in publish_initial_map may have refined KF1's pose; sync state
         // and recompute velocity from the post-BA pose.
-        if let Some(kf) = self.map.lock().unwrap().get_keyframe(curr_idx) {
+        if let Some(kf) = lock_map(&self.map, &self.map_wait).get_keyframe(curr_idx) {
             self.state.pose_world_to_cam = kf.frame.pose_world_to_cam;
         }
         let pose = self.state.pose_world_to_cam;
@@ -1547,7 +1589,7 @@ impl SlamSystem {
             ) {
                 // Through the validated path: endpoints must exist, the edge
                 // must be new, and the interval finite and ordered.
-                let published = self.map.lock().unwrap().apply_insertion(MapInsertion {
+                let published = lock_map(&self.map, &self.map_wait).apply_insertion(MapInsertion {
                     imu_factors: vec![edge],
                     ..Default::default()
                 });
@@ -1586,9 +1628,9 @@ impl SlamSystem {
         insertion: MapInsertion,
         keyframes: [usize; 2],
     ) -> Result<(), MapMutationError> {
-        self.map.lock().unwrap().apply_insertion(insertion)?;
+        lock_map(&self.map, &self.map_wait).apply_insertion(insertion)?;
         let refined = crate::mapping::bundle_adjustment::run_initial_ba(
-            &mut self.map.lock().unwrap(),
+            &mut lock_map(&self.map, &self.map_wait),
             &self.rig.camera,
             self.local_ba.depth_sigma,
         );
@@ -1687,7 +1729,7 @@ impl SlamSystem {
 
         let due_for_retry = self.inertial.schedule.retry_due(timestamp_sec);
         let imu_init_ready = self.inertial.initializer.ready(
-            &self.map.lock().unwrap(),
+            &lock_map(&self.map, &self.map_wait),
             self.inertial.schedule.start_kf_idx(),
         );
 
@@ -1708,7 +1750,7 @@ impl SlamSystem {
             let prior_a0 = viba0_accel_bias_prior(is_mono);
             // Drop the solve's map lock before applying its result with a new lock.
             let init_result = self.inertial.initializer.try_initialize(
-                &self.map.lock().unwrap(),
+                &lock_map(&self.map, &self.map_wait),
                 self.rig.camera_to_body(),
                 self.inertial.bias,
                 start_idx,
@@ -1744,7 +1786,7 @@ impl SlamSystem {
         start_kf_idx: usize,
     ) -> Result<AppliedInitialization, InertialAlignmentError> {
         let applied = self.inertial.apply_initialization(
-            &mut self.map.lock().unwrap(),
+            &mut lock_map(&self.map, &self.map_wait),
             init,
             start_kf_idx,
         )?;
@@ -1797,7 +1839,7 @@ impl SlamSystem {
         let Some(kf_idx) = self.state.current_keyframe_idx else {
             return FrameVelocitySource::Carried;
         };
-        let map = self.map.lock().unwrap();
+        let map = lock_map(&self.map, &self.map_wait);
         let Some(kf) = map.get_keyframe(kf_idx) else {
             return FrameVelocitySource::Carried;
         };
@@ -1971,7 +2013,7 @@ impl SlamSystem {
             currently_lost_for,
         );
         if self.trace_enabled {
-            let map = self.map.lock().unwrap();
+            let map = lock_map(&self.map, &self.map_wait);
             self.frame_trace = Some(FrameTrace::begin(
                 source.idx(),
                 timestamp_sec,
@@ -2016,7 +2058,7 @@ impl SlamSystem {
                     FlowOnly::KeyframeDue(pose) => pose,
                     _ => candidate_pose,
                 };
-                let map = self.map.lock().unwrap();
+                let map = lock_map(&self.map, &self.map_wait);
                 let result = self.tracker.estimate(
                     FrameInput {
                         frame: &frame,
@@ -2138,7 +2180,7 @@ impl SlamSystem {
             // Release this non-reentrant lock before keyframe insertion locks the map.
             {
                 let local_map_config = self.tracker.local_map_config();
-                let mut map_guard = self.map.lock().unwrap();
+                let mut map_guard = lock_map(&self.map, &self.map_wait);
                 let current_kf = self
                     .state
                     .current_keyframe_idx
@@ -2208,8 +2250,8 @@ impl SlamSystem {
             self.settle_coast_trust(imu_confident);
             let policy = &self.tracking_loss_recovery;
             let grace_period_sec = policy.grace_period_sec(imu_confident);
-            let map_established =
-                self.map.lock().unwrap().keyframes().len() > policy.min_keyframes_for_grace;
+            let map_established = lock_map(&self.map, &self.map_wait).keyframes().len()
+                > policy.min_keyframes_for_grace;
 
             if !map_established && recently_lost_for < self.recovery.young_map_grace_sec {
                 self.dbg(format!(
@@ -2304,7 +2346,7 @@ impl SlamSystem {
             }
             return survivors;
         }
-        let map = self.map.lock().unwrap();
+        let map = lock_map(&self.map, &self.map_wait);
         let guess =
             self.klt_prediction
                 .filter(|_| trusted_prediction)
@@ -2419,7 +2461,7 @@ impl SlamSystem {
             }
             None => {
                 let waited = Instant::now();
-                let map = self.map.lock().unwrap();
+                let map = lock_map(&self.map, &self.map_wait);
                 self.tracking_timings.flow_map_wait += waited.elapsed();
                 let Some((mut frame, seeded)) =
                     self.tracker
@@ -2464,7 +2506,7 @@ impl SlamSystem {
                     Some(map) => map,
                     None => {
                         let waited = Instant::now();
-                        let map = self.map.lock().unwrap();
+                        let map = lock_map(&self.map, &self.map_wait);
                         self.tracking_timings.flow_map_wait += waited.elapsed();
                         map
                     }
@@ -2658,7 +2700,7 @@ impl SlamSystem {
         timestamp_sec: f64,
     ) -> (KeyframeEvidence, Duration) {
         let waited = Instant::now();
-        let map = self.map.lock().unwrap();
+        let map = lock_map(&self.map, &self.map_wait);
         let map_wait = waited.elapsed();
         let n_ref_map_points = self
             .state
@@ -2930,7 +2972,7 @@ impl SlamSystem {
             timestamp_sec,
         )?;
         let gap = bridge_gap(&edge.preintegrated.covariance);
-        let published = self.map.lock().unwrap().apply_insertion(MapInsertion {
+        let published = lock_map(&self.map, &self.map_wait).apply_insertion(MapInsertion {
             imu_factors: vec![edge],
             ..Default::default()
         });
@@ -2993,7 +3035,7 @@ impl SlamSystem {
         let segments = &self.segments;
         let mut refused = Vec::new();
         let found = {
-            let map = self.map.lock().unwrap();
+            let map = lock_map(&self.map, &self.map_wait);
             let candidates = loop_closer.relocalization_candidates(
                 &frame.features.descriptors,
                 &map,
@@ -3131,7 +3173,7 @@ impl SlamSystem {
     ) -> bool {
         // Guard: reference KF must exist before we can triangulate.
         if let Some(ki) = self.state.current_keyframe_idx {
-            let map = self.map.lock().unwrap();
+            let map = lock_map(&self.map, &self.map_wait);
             if map.get_keyframe(ki).is_none() {
                 return false;
             }
@@ -3165,7 +3207,7 @@ impl SlamSystem {
         // against itself and drop the oldest real neighbour. Selection policy
         // belongs to mapping.
         let growth_plan = {
-            let map = self.map.lock().unwrap();
+            let map = lock_map(&self.map, &self.map_wait);
             match self.seeded_window_start() {
                 Some(window_start_kf) => keyframe_mapping::prepare_seeded_window_growth(
                     &map,
@@ -3211,7 +3253,7 @@ impl SlamSystem {
             imu_edge,
         );
 
-        let published = self.map.lock().unwrap().apply_insertion(insertion);
+        let published = lock_map(&self.map, &self.map_wait).apply_insertion(insertion);
         if let Err(error) = published {
             // Nothing was written, so no tracker or IMU reference may advance to
             // a keyframe the map does not hold.
@@ -3257,15 +3299,32 @@ impl SlamSystem {
         // captured neighbours, then forward SearchInNeighbors / Fuse, before
         // local BA so BA sees the extra constraints. Mapping owns the sequence
         // and its lock boundaries; the messages stay here.
-        let growth = keyframe_mapping::grow_keyframe(
-            &self.map,
-            growth_plan,
-            &self.rig.camera,
-            self.two_view_init_config.match_config,
-            &self.two_view_init_config.triangulation_config,
-            self.growth_min_baseline_ratio,
-        );
-        self.report_growth(frame.idx, &growth);
+        let growth_start = Instant::now();
+        match self.keyframe_growth {
+            KeyframeGrowth::Tracking => {
+                let growth = keyframe_mapping::grow_keyframe(
+                    &self.map,
+                    growth_plan,
+                    &self.rig.camera,
+                    self.two_view_init_config.match_config,
+                    &self.two_view_init_config.triangulation_config,
+                    self.growth_min_baseline_ratio,
+                );
+                self.report_growth(frame.idx, &growth);
+            }
+            KeyframeGrowth::Mapping => {
+                let queued = self.local_mapping.submit_growth(GrowthJob {
+                    plan: growth_plan,
+                    match_config: self.two_view_init_config.match_config,
+                    triangulation_config: self.two_view_init_config.triangulation_config.clone(),
+                    min_baseline_ratio: self.growth_min_baseline_ratio,
+                });
+                self.counters.growth_queue_max = self.counters.growth_queue_max.max(queued as u64);
+                // Synchronous mapping has grown it already, in today's order.
+                self.apply_growth_results();
+            }
+        }
+        self.tracking_timings.keyframe_growth += growth_start.elapsed();
         if anchor {
             self.enforce_map_bound();
             self.refresh_track_positions();
@@ -3292,7 +3351,9 @@ impl SlamSystem {
         // asynchronous mode will deliver it at a later frame boundary.
         self.apply_local_mapping_results();
 
+        let recognition_start = Instant::now();
         self.register_place_recognition(frame.idx);
+        self.tracking_timings.loop_recognition += recognition_start.elapsed();
         self.enforce_map_bound();
         // Growth, fusion and an inertial refinement moved landmarks; an
         // asynchronous result refreshes only when it arrives (T3).
@@ -3339,7 +3400,7 @@ impl SlamSystem {
 
         // Drop the solve's map lock before applying its result with a new lock.
         let init_result = self.inertial.initializer.try_initialize(
-            &self.map.lock().unwrap(),
+            &lock_map(&self.map, &self.map_wait),
             self.rig.camera_to_body(),
             self.inertial.bias,
             start_idx,
@@ -3393,7 +3454,7 @@ impl SlamSystem {
         };
         let started = Instant::now();
         let outcome = {
-            let mut map = self.map.lock().unwrap();
+            let mut map = lock_map(&self.map, &self.map_wait);
             let outcome = loop_closer.on_keyframe(&mut map, &self.rig.camera, kf_idx, context);
             if self.rig_flow.is_some() && outcome.tracking_correction.is_some() {
                 self.counters.flow_position_refreshes += self.tracker.refresh_positions(&map);
@@ -3427,7 +3488,7 @@ impl SlamSystem {
             return;
         };
         let outcome = {
-            let mut map = self.map.lock().unwrap();
+            let mut map = lock_map(&self.map, &self.map_wait);
             let outcome = loop_closer.on_frame(&mut map, &self.rig.camera, context);
             if self.rig_flow.is_some() && outcome.tracking_correction.is_some() {
                 self.counters.flow_position_refreshes += self.tracker.refresh_positions(&map);
