@@ -2339,3 +2339,53 @@ checks alone; F4-F6 need the full-sequence LaMAria gate (answer 7).
 
 Ledger: G57 and G59 are tested by this ladder. The rig "overlap partners" row from `feat/euroc-rig` (G57 there) is
 renumbered **G60** at integration; no new id on this branch.
+
+### Results: F1, honest frame time and the RT re-baseline (2026-11-24)
+
+Code `feat/rt-a` 50d3f59 (F1 on b170b9c + card a767754). Binary `E/bin-rt-a-f1/kornia-slam-euroc`, md5
+`8fd23d696951b0e30db14c729a631a39` (`cargo build --release -p kornia-slam-app`, default features). Identity
+(`E/rt-a/ident.sh`, TAG f1): `IDENT_V102_OK`, `HEADER_OK`, `IDENT_R01_OK` (md5 `d4f77b567b912b5a4caa2af6085a35b1`).
+F1 adds output only, so trajectories are the base binary's.
+
+Runs: driver `E/rt-a/rt.sh` (then `rt2.sh`, which re-queues a run another pinned process overlapped; watcher
+`E/rt-a/pinwatch.py`), async, `--pace-timestamps`, `taskset -c 0,1`, start 0, golden header `E/expect/RT0E.header`
+(copied from `runs/RT0E_V1_02_medium_s0_r1` before the run) and `RT1PE.header`. Table `E/rt-a/f1table.py` →
+`E/rt-a/f1table.md`. Lane B ran its own real-time arms on cores 0,1 at the same time. Its `RT1E+B V1_02 r1` started
+12 s into `F1-RT1PE V2_01 r2`, so that run is discarded (`runs/F1-RT1PE_V2_01_easy_s0_r2.contaminated.1`, wall 222 s)
+and was rerun. The rerun's first try was flagged by a 2 s sampling overlap at its start and was rerun again; the table
+has the third. `F1-RT0E V1_02 r1` ran next to two unpinned lane-B identity runs (cores 0-11) for its first ~2 min,
+load 5.06 → 6.64.
+
+| run | wall s | loop wall s | Σtotal + Σsleep s (gap) | Σtotal ÷ frames ms | source p50/p90 | process p50/p90/p99 | total p50/p90/p99 | total KF p50/p90/p99 | latency p50/p90/p99 s | final latency s | late frames | causal ATE | load start |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| RT0E V1_02 r1 | 142 | 139.9 | 136.0 (2.8 %) | 78.9 | 33.5/48.5 | 15.5/122.1/188.6 | 53.1/157.9/230.4 | 141.9/207.0/601.2 | 25.5/49.6/54.2 | 54.4 | 1615 of 1710 | 0.082 | 5.06 |
+| RT1PE V2_01 r1 | 156 | 154.5 | 150.9 (2.3 %) | 65.8 | 28.7/44.4 | 16.9/96.4/164.6 | 52.8/124.1/196.3 | 124.1/179.8/234.5 | 16.6/38.3/41.4 | 40.6 | 2198 of 2280 | 0.052 | 5.41 |
+| RT1PE V2_01 r2 | 145 | 143.6 | 140.3 (2.3 %) | 61.0 | 25.7/38.0 | 16.0/91.6/155.3 | 48.2/116.8/178.2 | 113.5/158.4/264.8 | 12.4/27.7/30.3 | 29.6 | 2199 of 2280 | 0.046 | 5.45 |
+| RT1PE MH_04 r1 | 109 | 107.2 | 106.2 (0.9 %) | 50.2 | 24.3/37.4 | 5.8/78.0/130.7 | 38.4/100.7/160.0 | 102.9/143.4/206.8 | 4.1/6.8/7.5 | 5.6 | 1780 of 2032 | 0.229 | 5.81 |
+| RT1PE MH_04 r2 | 115 | 113.0 | 112.1 (0.8 %) | 53.9 | 25.0/45.3 | 5.8/81.0/156.5 | 40.8/108.0/187.0 | 105.4/165.7/258.0 | 10.1/13.2/13.7 | 11.4 | 1842 of 2032 | 0.339 | 5.35 |
+
+Per frame, `process_ms` equals `frame_ms + fe` within 0.1 ms on every run (sum of the difference 0.1 s per run), so
+ORB on the ready path and the deferred subtraction are both accounted for; the source work is the only stage
+`frame_ms` missed. The 0.8-2.8 % left between the loop's wall time and Σtotal + Σsleep is the app's own per-frame
+work (log lines, trajectory and session writes). Every run ends behind the sensor: 5.6-54.4 s, and 78-97 % of
+frames finish more than one frame period after their arrival. On the unpaced SYNC identity run (12 cores) `source_ms`
+p50 is 13.3 against 24-34 on 2 cores.
+
+| P/K | prediction | measured | verdict |
+|---|---|---|---|
+| P1 | RT0E V1_02 `source_ms` p50 28-36 | 33.5 | as predicted |
+| P2 | `total_ms_keyframe` p50 115-130 | 141.9 | missed |
+| P3 | Σ `total_ms` ÷ frames 63-75 ms | 78.9 | missed |
+| P4 | final `latency_ms` 30-40 s | 54.4 | missed |
+| K | Σ `total_ms` + Σ sleep differs from wall (minus vocabulary load) by > 5 % | 0.8-2.8 % (loop wall; the process wall adds 1.9-2.1 s of startup and vocabulary) | not fired |
+
+**Diagnosis of the misses (owner rule).** P2-P4 were derived from the profile run (wall 122 s, load 4.7, keyframe
+`frame_ms + fe` p50 90.3). This run's tracking work is slower: keyframe `frame_ms + fe` p50 108.6 (+20 %), with
+`source_ms` as predicted. 108.6 + 33.4 = 142 = P2's miss; P3 and P4 follow from the same per-frame excess (Σtotal 135 s
+against 108-128 predicted). The R11c RT0E V1_02 r1 run on the base binary had wall 137 s at load 5.6, so 122-142 s is
+the run-to-run band of this arm on this machine under load 5-7. The P2-P4 bands were one-sample ranges and are too
+narrow. Not an untimed stage (K not fired, and process = frame_ms + fe). One RT0E sample, next to lane-B work: provisional.
+
+Re-baseline for the next rungs (read on these fields): keyframe frames cost 102.9-141.9 ms p50 of wall on 2 cores,
+of which the source is 20-34 ms; flow frames are the p50 (38.4-53.1 ms total, of which source 24-34). F3 removes most
+of the source share. Next: F3.
