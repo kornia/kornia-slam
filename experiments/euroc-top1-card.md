@@ -1985,7 +1985,7 @@ Debug runs (`KORNIA_SLAM_DEBUG=1 --debug`, `E/debug/run_debug_r13.sh`, binary md
 - `E/debug/R13a-S0PEI-MH04-full1600` (start 0, 1600 frames): 1599 / 1600 tracked, `coast_inertial=1`. `traj.txt` is
   byte-identical to the batch run's first 1495 lines.
 
-The coasted frame is index 1494 (73.7 s after the first frame). Status lines are numbered from 1, so the log calls it
+The coasted frame is index 1494 (74.7 s after the first frame). Status lines are numbered from 1, so the log calls it
 `[ 1495]`.
 
 **Mechanism (measured).**
@@ -2036,3 +2036,60 @@ S0PE references:
 (Tracked frames, `coast_inertial`.) From the debug run, the restated K1 fires on MH_04 starts 0 and 1 by construction
 (byte-identical runs). The rerun scores P1-P5 on all 14 runs regardless and reports K1 per start. P4 also reads
 against S0PE's counts in place of "tracked = frames". The other predictions and K2 / K3 are unchanged.
+
+### Results: R13a rerun, S0PEI on all 14 runs, scored with K1 restated (2026-11-24)
+
+Binary md5 `e67615ad…`, driver `E/r13/drive.sh` (two lanes, at most 3 heavy jobs counting `cargo`), SYNC, unpaced.
+14 of 14 runs `rc=0`, headers identical to `E/expect/S0PEI.header`, `pose_inertial_solves` 1614-3637 on every run.
+MH_04 starts 0 and 1 and V1_02 start 0 are the runs of the first pass. SYNC output is deterministic (the debug run
+matches byte for byte), so they were not repeated. The 1-min load at start was 2.3-22.8; SYNC outputs do not depend on
+load (K0.2). Table `E/r13/report.py` → `E/r13/r13a_table.md`. SE(3) ATE RMSE, m, body centre, causal (`traj.txt`).
+
+| seq | start | S0PE | S0PEI | S0PEI smoothed | tracked (S0PE) | coast_inertial (S0PE) | K1 restated | step 63.3-66.7 s, m (S0PE) | cf floor | tilt 65-79 s (S0PE) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| MH_04 | 0 | 0.227 | 0.177 | 0.100 | 2031 (2032) | 1 (0) | fired | −0.22 (−0.54) | 0.133 | 1.80° (2.43°) |
+| MH_04 | 1 | 0.227 | 0.177 | 0.100 | 2031 (2032) | 1 (0) | fired | −0.22 (−0.54) | 0.133 | 1.80° (2.43°) |
+| MH_04 | 2 | 0.229 | 0.194 | 0.147 | 2023 (2031) | 8 (0) | fired | −0.29 (−0.53) | 0.129 | 1.88° (2.01°) |
+| MH_04 | 30 | 0.225 | 0.273 | 0.142 | 2002 (2003) | 1 (0) | fired | −0.28 (−0.54) | 0.242 | 2.04° (2.15°) |
+| MH_04 | 60 | 0.235 | 0.173 | 0.099 | 1969 (1973) | 4 (0) | fired | −0.26 (−0.50) | 0.117 | 1.83° (2.76°) |
+| **MH_04** | median | 0.227 | **0.177** (1.55x Basalt 0.114) | | | | | | | |
+| V1_02 | 0 / 1 / 2 | 0.036 | 0.035 / 0.035 / 0.035 (**0.035**, 0.78x Basalt 0.045) | 0.025 | 1687 (1687) | 1 (1) | no | - | - | - |
+| V2_01 | 0 / 1 / 2 | 0.049 / 0.056 / 0.066 (0.056) | 0.046 / 0.050 / 0.040 (**0.046**, 1.18x Basalt 0.039) | 0.035-0.041 | 2276 / 2266 / 2268 (2275 / 2277 / 2273) | 4 / 13 / 10 (5 / 2 / 5) | no / fired / fired | - | - | - |
+| MH_01 | 0 / 1 / 2 | 0.042 / 0.050 / 0.049 (0.049) | 0.050 / 0.049 / 0.041 (**0.049**, 0.73x Basalt 0.067) | 0.030-0.033 | = | 0 (0) | no | - | - | - |
+
+`give_ups=0` on every run. Coasted frames (status-line numbers):
+- MH_04: starts 0, 1 frame 1495; start 2 frames 1509-1515 and 1976; start 30 frame 1496; start 60 frames 1329-1330
+  and 1494-1495.
+- V2_01: frames 2171-2185, the stretch where S0PE coasts too (2172-2178).
+
+| P/K | prediction | measured | verdict |
+|---|---|---|---|
+| P1 | MH_04 step ≥ −0.25 m, every start | −0.22, −0.22, −0.29, −0.28, −0.26 (S0PE −0.50 to −0.54) | missed (2 of 5; the step is halved on all 5) |
+| P2 | MH_04 median 0.12-0.17, every start ≤ 0.19 | median 0.177; start 2 0.194, start 30 0.273 | missed |
+| P3 | MH_04 tilt 65-79 s ≤ 1.5° | 1.80-2.04° (S0PE 2.01-2.76°) | missed (lower than S0PE on every start) |
+| P4 (restated) | coasts and tracked no worse than S0PE, same start | worse on MH_04 ×5, V2_01 starts 1, 2 | missed |
+| P5 | guards ≤ 1.15x S0PE: V1_02 ≤ 0.041, V2_01 ≤ 0.064, MH_01 ≤ 0.056 | 0.035, 0.046, 0.049 | as predicted |
+| K1 (restated) | coast or tracked worse than S0PE, same start | 7 of 14 runs | **fired** |
+| K2 | P1 holds and median > 0.19 | P1 does not hold | not fired |
+| K3 | median ≤ 0.17 with step ≤ −0.40 | median 0.177, step ≥ −0.29 | not fired |
+
+**Diagnosis (owner rule; unverified parts marked).**
+- **The mechanism is right; the bound was too tight.** Pose-inertial tracking halves the dark-span step on every start
+  (−0.50 to −0.54 → −0.22 to −0.29 m) and lowers the 65-79 s tilt on every start. The MH_04 median moves 0.227 →
+  0.177 (−22 %). The remaining −0.22 to −0.29 m is what P1's −0.25 bound did not allow for. Not traced: whether the
+  rest is the anchor-keyframe bias (the R13a theory gave 0.024 m from b_a) or the map rigidity (G58 point 2).
+- **K1 is the count bar of the debug section, on every coast measured.** All MH_04 coasts fall in the two low-match
+  stretches (1329-1330, the dark span; 1494-1515, the drought the debug run measured). The V2_01 extra coasts extend
+  the end-of-run stretch where S0PE coasts too. Only the start-0 coast was traced in the debug log; the others are
+  inferred from their position (unverified).
+- **MH_04 start 30 (0.273, above S0PE) is not the step.** Its counterfactual floor is 0.242 against 0.110-0.134
+  elsewhere, so another error enters that run. It has a single coast (frame 1496). Not traced; a debug run of start 30
+  is needed before any credit.
+- **Guards gain or hold:** V2_01 0.056 → 0.046 and V1_02 0.036 → 0.035; MH_01 is unchanged at 0.049.
+
+**Verdict.** K1 (restated) fired on 7 of 14 runs. P1-P4 missed and P5 held. R13a is not credited and nothing is
+promoted. Next:
+1. The card H code fix proposed above: the pose-inertial path accepts at `min_inliers_with_prediction`, with its
+   predictions.
+2. Then this rerun again, plus a debug run of MH_04 start 30.
+3. If the step stays at about −0.25 m with K1 clean, R12 (the non-frozen window) is the map-rigidity lever.

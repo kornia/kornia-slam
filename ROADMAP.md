@@ -28,6 +28,11 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
   - One inertial coast at MH_04 frame 1495 (S0, S0E and S0PE have none on any start), so card H comes first.
   - On that run the dark-span step falls from −0.54 to −0.22 m and causal from 0.227 to 0.177. One start only; not
     credited. V1_02 0.035, same health counters as S0PE.
+  - Debug and rerun: the coast is a count reject. The pose-inertial gate keeps 29 of 31 PnP inliers, under the
+    visual bar of 30 (ORB-SLAM3 uses 15 after its inertial solve); no RON knob reaches it. With K1 restated
+    against S0PE, the 14-run rerun fires K1 on 7. The step is halved on every MH_04 start and the median goes 0.227 →
+    0.177. Guards hold (V1_02 0.035, V2_01 0.046, MH_01 0.049). Start 30 (0.273) is not traced. Next: the card H fix
+    (inlier bar 15), then rerun.
 - **RT3E (RT1PE + 7-iteration local BA, default rayon): accuracy holds, lag does not fall**
   (`experiments/euroc-top1-card.md` "Results: RT3E"; 12 real-time runs + 2 controls, on cores 2,3 beside other lanes).
   - Causal V2_01 0.047, V1_02 0.044 (0.98x Basalt), V1_03 0.122, V2_02 0.099, MH_04 0.214 (RT1PE 0.277), MH_01
