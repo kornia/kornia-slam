@@ -2358,23 +2358,26 @@ impl SlamSystem {
                     max_iter,
                     gyro_rotation: self.gyro_rotation,
                 });
-        if self.tracker.flows_rig() {
+        // The pyramidal LK forks per track; under `FanOut::Bounded` it forks
+        // on the bounded pool like the frame's ORB.
+        let (tracker, timings) = (&mut self.tracker, &mut self.tracking_timings);
+        if tracker.flows_rig() {
             let mut previous: Vec<&Image<u8, 1>> = Vec::with_capacity(images.len());
             previous.extend(previous_image);
             previous.extend(self.previous_secondary.iter());
             return self
-                .tracker
-                .flow_cameras(&previous, images, guess, &mut self.tracking_timings);
+                .fan_out
+                .run(|| tracker.flow_cameras(&previous, images, guess, timings));
         }
         if guess.is_none() {
             // Today's unpredicted flow reads no map.
             drop(map);
             return self
-                .tracker
-                .flow(previous_image, images[0], None, &mut self.tracking_timings);
+                .fan_out
+                .run(|| tracker.flow(previous_image, images[0], None, timings));
         }
-        self.tracker
-            .flow(previous_image, images[0], guess, &mut self.tracking_timings)
+        self.fan_out
+            .run(|| tracker.flow(previous_image, images[0], guess, timings))
     }
 
     /// What this frame's tracked pose is checked against: the inertial
