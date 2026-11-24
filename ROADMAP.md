@@ -23,6 +23,72 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 
 ### 2026-11-24
 
+- **EuRoC top-1 work integrated on one branch (`integ/euroc-top1`, from `feat/global-pose-graph` 1b5f8a7; not
+  pushed).** Cherry-picked, no merge commits: `feat/r11b-outlier-erase` (16), `feat/cardh-pi-bar` (2), `feat/rt-a`
+  (6), `feat/rt-b` (5; its copies of the F1 card and F1 code left out), `feat/euroc-rig` (8) and
+  `feat/pose-inertial-aj` (5). Every knob defaults to the old behaviour. Identity (knob off) on the integrated binary:
+  `.pr180-fix/euroc-top1/integ/ident.sh` with `bin-integ/kornia-slam-euroc` (md5 `7e48962980cb531e7eb14d863aa703cc`, built at bc544ef): `IDENT_V102_OK` (S0 V1_02 `traj.txt` and `traj_smoothed.txt` `cmp`-identical), `HEADER_OK`, `IDENT_R01_OK` (md5 `d4f77b567b912b5a4caa2af6085a35b1`). Evidence: master card `experiments/euroc-top1-card.md`, rig card `experiments/euroc-rig-plan.md`
+  and `experiments/euroc-rig-results.md`, card AJ `experiments/pr180-AJ-card.md`, ledger `experiments/gap-ledger.md`;
+  run dirs under `.pr180-fix/euroc-top1` (`E` in the card).
+  - **Harness and metric.** EuRoC is scored on the body (IMU) centre from `traj.txt` (G55: the camera centre had been
+    scored, 0.003-0.025 m off). R0 made SYNC (synchronous mapping, all threads, unpaced, 900 s cap) the A/B
+    instrument; it repeats `cmp`-identically. Owner decision 2026-11-23 (card "Owner decision: the score models real
+    time"): the score is the causal real-time pose, paced, asynchronous, on 2 cores (`taskset -c 0,1`). Smoothed and
+    offline-global trajectories are reported as benchmark-style (non-causal) only. M1 = below Basalt on all 11 on that
+    metric.
+  - **Gaps G53-G61** (ledger): G53 causal output (confirmed); G54 stale keyframes under async, fixed in real time by
+    `merge: PropagateToNewer` (R11c); G55 camera-centre scoring (fixed); G56 visual error-model tail (confirmed on V1_02
+    and the Vicon rooms, refuted on MH_04); G57 2-core budget lost to oversubscription and tracking-thread work
+    (profile); G58 MH_04 dark-span vertical step (diagnosed, halved by R13a); G59 PropagateToNewer copies a wrong
+    correction under lag (diagnosed); G60 a non-converging loop PGO drops the MH_04 loop at about 80 s (diagnosed by
+    correlation, card H); G61 a rig keyframe holds scale with half of Stereo's depth rows (was G57 on
+    `feat/euroc-rig`; fix F6 not built).
+  - **Accuracy rungs** (card sections "Results: …"). R0: S0 on all 11, smoothed below Basalt on MH_01/02/03/05 only.
+    R3 (full-weight bias rows): KD1 fired, G49 refuted as the EuRoC cause, knob off. R6 (offline global inertial BA,
+    non-causal): below Basalt on 10 of 11 (V1_01 equal), the ceiling of a global solve. R11b (`local_ba.outlier_erase`):
+    causal V2_01 0.200 → 0.055, V1_02 0.102 → 0.040, V1_03 0.188 → 0.072, V2_02 0.162 → 0.080; MH_04 unchanged.
+    R11c / R11d: PropagateToNewer fixes G54 in real time; a 7-iteration budget or PnpInliers removes the mapping lag;
+    K2 fired on MH_04 for the budget. R13a (`tracking.pose_inertial: OrbSlam3`): stopped by K1 (count reject),
+    MH_04 step −0.54 → −0.22 m. Card H (`tracking.pose_inertial_min_inliers`, default `Visual`): count reject gone,
+    K1 on 4 of 14, MH_04 median 0.178, spread from G60. Nothing promoted.
+  - **Real-time ladder F1-F5a** (card "Real-time fix ladder F1-F6"). F1 (honest frame time: source, process, total,
+    latency): done; runs end 5.6-54.4 s behind the sensor. F3 (`rectification: FixedPoint`, fixed-point table remap):
+    K2 cleared by rewrite 1, 0.39-0.59x OpenCV on a quiet core, byte-identical to `remap_u8` at Q10; **the 2-core F3
+    system run is pending**. F2 (`pipeline.fan_out: Bounded`): K3 fired (yield share 27-29 %, pre-F3), then widened to
+    the optical-flow step (f444fcf, not scored). F4 (`keyframes.mapping_acceptance: OrbSlam3`): **not promoted, K3
+    fired; knob off** (V2_01 0.056 at SYNC level, but Vicon keyframes fall to 0.75-0.80x and V1_03 coasts rise). F5a
+    (`mapping.keyframe_growth: Mapping`): lock audit done, code built, not scored.
+  - **Rig mode** (`cameras: Rig` on EuRoC, rig card, 68 SYNC runs): two-camera flow (rp48) against one-camera flow
+    (sp48) lowers mean ATE 0.171 → 0.128, inside 9-78 % start noise; K2 fired for the rig default (gain without flow).
+    The G52 fix (undistort pinhole rig keypoints before overlap matching) is in. Scale bias diagnosed as G61.
+  - **AJ** (`experiments/pr180-AJ-card.md`, PR #195 port, Astik-2002 author of the reprojection factor): the
+    reprojection residual with its pose Jacobian in `kornia-factors`, the pose-inertial solve refuses a step that moves
+    a row behind the camera, solver tests, and `pose_inertial_rejects` in the summary. Behind `tracking.pose_inertial`
+    (default `Off`); no run scored.
+  - **Best per sequence against Basalt, causal (the score), from the cards.** SYNC is the A/B instrument; RT = paced,
+    async, 2 cores. Rig arms are a different config (`cameras: Rig`), one start unless a range is given. R6 is
+    non-causal and listed for the ceiling only.
+
+    | seq | Basalt | best causal SYNC (arm) | best causal RT (arm) | best ÷ Basalt | R6 offline (non-causal) |
+    |---|---|---|---|---|---|
+    | MH_01 | 0.067 | 0.049 (S0PE / S0PEIH) | 0.039 (RT1PE) | 0.58 | 0.031 |
+    | MH_02 | 0.048 | 0.037 (rig sp48) | - | 0.77 | 0.020 |
+    | MH_03 | 0.062 | 0.045 (rig rp48, 0.042-0.046) | - | 0.73 | 0.027 |
+    | MH_04 | 0.114 | 0.178 (S0PEIH median) | 0.214 (RT3E) | 1.56 | 0.070 |
+    | MH_05 | 0.144 | 0.136 (rig rp48) | - | 0.94 | 0.081 |
+    | V1_01 | 0.043 | 0.057 (rig rdef) | - | 1.33 | 0.043 |
+    | V1_02 | 0.045 | 0.035 (S0PEIH) | 0.043 (RT2E), 0.044 (RT3E) | 0.78 | 0.024 |
+    | V1_03 | 0.053 | 0.072 (S0E) | 0.113 (RT1PE) | 1.36 | 0.049 |
+    | V2_01 | 0.039 | 0.046 (S0PEIH) | 0.047 (RT1PE / RT3E) | 1.18 | 0.035 |
+    | V2_02 | 0.049 | 0.080 (S0E) | 0.083 (RT2E) | 1.63 | 0.042 |
+    | V2_03 | 0.230 | 0.123 (rig rp48) | - | 0.53 | 0.120 |
+
+    Below Basalt: 6 of 11 across different arms (MH_01, MH_02, MH_03, MH_05, V1_02, V2_03), 2 of 11 in real time
+    (MH_01, V1_02). No single config is below Basalt on all 11; M1 is not met. Above: MH_04, V1_01, V1_03, V2_01, V2_02.
+  - **Pending:** the 2-core F3 system run; F2-widened and F5a scoring; F5b (D5b first); F4 follow-up (InterruptBA,
+    F5a first, or a solve-age refusal bound; owner to choose); F6 (G61 rig overlap partners) and rig rung R-a
+    (`active_keyframes: 10` on MH_02/MH_03); the G60 PGO trace, then R12; AJ's first scored runs; then the real-time
+    gate on all 11 (3 runs, load ≤ 6) and the full-sequence LaMAria guard before any knob is promoted.
 - **Card H fix: the pose-inertial solve's inlier bar becomes a knob; S0PEIH clears the count reject, K1 still fires**
   (`experiments/euroc-top1-card.md` "Results: card H fix"; `feat/cardh-pi-bar` c0342ac, 14 SYNC runs).
   - `tracking.pose_inertial_min_inliers: Visual | WithPrediction` (default `Visual` = 30, bit-identical when off:
@@ -501,7 +567,25 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
   - v0.1.0 release (#136);
   - IROS 2026 workshop paper (#137).
 
-## Now — egocentric accuracy on LaMAria
+## Now — EuRoC top-1, then LaMAria
+
+**EuRoC top-1 comes first (owner, 2026-11-23; master card `experiments/euroc-top1-card.md`).** LaMAria work waits
+behind it. Score: the causal real-time pose (paced, asynchronous, 2 cores), below Basalt on all 11 (M1), then below
+ORB-SLAM3 (M2). SYNC runs decide each A/B. In the card's order:
+- [ ] **G60:** trace the non-converging loop PGO on S0PEIH MH_04 start 60 (PGO iteration log) before any loop-path change.
+- [ ] **R12:** Basalt-style windowed marginalization in place of the frozen past (the MH_04 step stays at −0.22 to −0.29 m).
+- [ ] **Drought keyframes** (candidate only; theory and predictions first).
+- [ ] **Real-time ladder** (card "Real-time fix ladder F1-F6"): F1 done; F3 kernel done, **2-core system run pending**;
+  F2 widened to the flow step, not scored; F4 not promoted, K3 fired, knob off (follow-up: InterruptBA, F5a first, or a
+  solve-age refusal bound; owner to choose); F5a built, not scored; F5b after diagnosis D5b; F6 (G61 rig overlap
+  partners) in its own lane.
+- [ ] **Rig mode** (`experiments/euroc-rig-results.md`): K2 split (loops off), then rung R-a (`active_keyframes: 10` on
+  MH_02, MH_03), then F6.
+- [ ] **Card AJ** (`experiments/pr180-AJ-card.md`): code landed behind `tracking.pose_inertial`; arms D/DJ/D10/D10J not run.
+- [ ] **Real-time gate on all 11** after F5b (3 runs, load ≤ 6), then the full-sequence LaMAria guard before any knob
+  is promoted.
+
+### LaMAria (waits behind EuRoC top-1)
 
 **Experiments take at most 5 min (owner, 2026-11-23):** short unpaced windows or offline runs on saved sessions, at least 3 repeats. The gate below runs once per batch of stacked winners, not per card.
 
@@ -516,7 +600,7 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 We are working toward top results on the [LaMAria](https://github.com/cvg/lamaria) egocentric benchmark ([#78](https://github.com/kornia/kornia-slam/issues/78)), using the Aria rig and IMU and no GPS. The work is sequenced by where the benchmark score is lost: each change states its theory and predictions first, ships behind a config knob that defaults to the old behaviour, and is compared window by window against ORB-SLAM3 in the same harness.
 
 General purpose, not tuned per deployment (owner, 2026-11-21). A new rig or dataset should need its sensor model only: calibration, IMU noise and frame rate. Knobs are how a change lands and is measured; after each validation round a cleanup card makes the winners the code default and deletes the refuted or redundant knobs.
-- [ ] **Card AI: global stage (owner, 2026-11-23: main card; planning).** Every top entry scores from a global solve (SLAM Dunk: global BA about 69, then 82.4 with calibration over time and gyro intrinsics). Two parts:
+- [ ] **Card AI: global stage (owner, 2026-11-23: main LaMAria card; planning; waits behind EuRoC top-1).** Every top entry scores from a global solve (SLAM Dunk: global BA about 69, then 82.4 with calibration over time and gyro intrinsics). Two parts:
   - **(a)** a VIO that never resets: IMU coasting with honest covariance, then re-acquiring vision into the same state (Basalt, OKVIS2, OpenVINS). It replaces the give-up and re-seed path.
   - **(b)** a background global graph: IMU bridges and cross-segment matches join the segments, then a bounded global VI-BA runs. Corrections go through a map-to-odom transform. The same code runs as the end-of-sequence batch.
   - **Then the calibration ladder:** camera calibration over time, gyro intrinsics, accel, clock and thermal terms (the `offline_ba.calibration.*` knobs are built).

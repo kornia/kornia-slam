@@ -2188,7 +2188,7 @@ the per-start spread comes from a loop PGO that does not converge (new gap G60).
 Goal: paced, asynchronous, 2-core runs (`taskset -c 0,1`, `--pace-timestamps`) keep up with the 20 Hz sensor and
 score like SYNC on `traj.txt`. Six code rungs, each behind a knob that is bit-identical off. Base
 `feat/r11b-outlier-erase` @ b170b9c (card and ledger only since c1483be). Gap tested: G57 (2-core budget), G59 (mapping
-lag); F6 tests the rig overlap row (G60 at integration, see below). Owner approved 2026-11-24 with the recommended
+lag); F6 tests the rig overlap row (G61 after integration, see below). Owner approved 2026-11-24 with the recommended
 answer to every open question.
 
 Paths as at the top of this card, plus `O` = `B/src/ORB_SLAM3/src`, `KRS` =
@@ -2378,7 +2378,7 @@ solves per keyframe ≥ 0.97; `ba_keyframe_shifts` ≤ 10. PNG decode counts in 
 checks alone; F4-F6 need the full-sequence LaMAria gate (answer 7).
 
 Ledger: G57 and G59 are tested by this ladder. The rig "overlap partners" row from `feat/euroc-rig` (G57 there) is
-renumbered **G60** at integration; no new id on this branch.
+renumbered **G61** at integration (G60 went to card H's loop PGO row); no new id on this branch.
 
 ### Results: F1, honest frame time and the RT re-baseline (2026-11-24)
 
