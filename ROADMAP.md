@@ -53,8 +53,9 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
     K1 on 4 of 14, MH_04 median 0.178, spread from G60. Nothing promoted.
   - **Real-time ladder F1-F5a** (card "Real-time fix ladder F1-F6"). F1 (honest frame time: source, process, total,
     latency): done; runs end 5.6-54.4 s behind the sensor. F3 (`rectification: FixedPoint`, fixed-point table remap):
-    K2 cleared by rewrite 1, 0.39-0.59x OpenCV on a quiet core, byte-identical to `remap_u8` at Q10; **the 2-core F3
-    system run is pending**. F2 (`pipeline.fan_out: Bounded`): K3 fired (yield share 27-29 %, pre-F3), then widened to
+    K2 cleared by rewrite 1, 0.39-0.59x OpenCV on a quiet core, byte-identical to `remap_u8` at Q10; on 2 cores (same-time
+    knob-off controls, shared RT lock) it cuts `source_ms` p50 13.5-17.8 → 3.2-5.2, process CPU 7.5-22.3 ms per frame, and
+    V2_01 ends on time (final latency 0 s against 4.8-8.3 s); not yet a default. F2 (`pipeline.fan_out: Bounded`): K3 fired (yield share 27-29 %, pre-F3), then widened to
     the optical-flow step (f444fcf, not scored). F4 (`keyframes.mapping_acceptance: OrbSlam3`): **not promoted, K3
     fired; knob off** (V2_01 0.056 at SYNC level, but Vicon keyframes fall to 0.75-0.80x and V1_03 coasts rise). F5a
     (`mapping.keyframe_growth: Mapping`): lock audit done, code built, not scored.

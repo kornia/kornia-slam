@@ -2639,3 +2639,51 @@ F4 diagnosis (owner rule; unverified parts marked).
 - Next (proposals, owner to choose; nothing run): (a) `InterruptBA` (answer 10 allows it now that K3 fired), so that a
   held-back ratio keyframe preempts the solve instead of waiting; (b) F5a first, which shortens the mapping critical
   path seen by c1b; (c) a refusal bound on solve age instead of the pending count, which never moves under latest-wins.
+
+### Results: F3 system run on 2 cores, `rectification: FixedPoint` (2026-11-24 16:42-17:44, after the reboot)
+
+Binary `E/bin-rt-a-f3b/kornia-slam-euroc` (e788d14, md5 `0d931592fcc2d79c58cf698162232cfd`). Identity: knob off
+`IDENT_V102_OK`, `HEADER_OK`, `IDENT_R01_OK`; knob on SYNC S0E V1_02 `cmp`-identical to knob off. Driver `E/rt-a/rt4.sh`
+→ `rt_one.sh`, each pinned run under `flock /home/edgar/dev/split/.pr180-fix/rt.lock` (machine rule 2026-11-24).
+Each knob-on run is followed by a knob-off run of the same binary (F3off) as a same-time control. The laptop reboot
+removed the throttle that slowed every pre-reboot run: control walls are now 87-124 s against F1's 109-156 s. So the
+F1 table is not the base for these predictions; the controls are. No run overlapped another pinned process (watcher
+`E/rt-a/pinwatch.log`); 1-min load at start 2.1-5.8. The pre-reboot F3on V1_02 r1 (load_end 11) and an F3off r1 cut
+by the reboot are set aside (`runs/*.loaded-prereboot`, `*.interrupted-by-reboot`). Table: `E/rt-a/f3table.py` →
+`E/rt-a/f3table.md`. CPU is the whole process's user + sys time (`/usr/bin/time`) per frame.
+
+| run | wall s | source p50/p90/p99 | process p50/p90 | total p50/p90/p99 | total KF p50/p90/p99 | Σtotal ÷ frames ms | process CPU ms per frame | final latency s | latency p50/p90/p99 s | late frames | causal ATE | load start |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| F3off-RT0E_V1_02_medium_s0_r1 | 88 | 15.8/31.5/43.2 | 10.0/78.0 | 34.6/97.4/161.0 | 85.4/138.4/619.2 | 48.5 | 86.8 | 1.5 | 0.9/2.0/2.7 | 1607 of 1710 | 0.119 | 4.66 |
+| F3off-RT0E_V1_02_medium_s0_r2 | 87 | 13.5/28.6/40.4 | 10.1/65.3 | 31.8/83.7/143.8 | 72.3/116.3/245.3 | 43.0 | 79.3 | 0.0 | 0.1/0.8/1.8 | 1018 of 1710 | 0.224 | 2.12 |
+| F3off-RT1PE_MH_04_difficult_s0_r1 | 104 | 17.8/33.1/43.7 | 6.0/73.8 | 31.8/92.3/144.1 | 95.4/132.9/197.2 | 42.0 | 66.4 | 0.1 | 0.1/1.0/1.6 | 1198 of 2032 | 0.242 | 5.83 |
+| F3off-RT1PE_MH_04_difficult_s0_r2 | 103 | 17.0/30.0/38.1 | 5.0/74.1 | 29.1/90.1/141.9 | 92.2/127.8/245.9 | 40.4 | 64.1 | 0.0 | 0.1/0.8/1.4 | 1070 of 2032 | 0.224 | 5.49 |
+| F3off-RT1PE_V2_01_easy_s0_r1 | 124 | 17.0/33.5/44.4 | 14.1/84.6 | 39.0/102.9/164.1 | 102.9/152.1/208.0 | 50.3 | 82.9 | 8.3 | 0.9/8.2/9.9 | 2024 of 2280 | 0.048 | 5.17 |
+| F3off-RT1PE_V2_01_easy_s0_r2 | 120 | 15.6/30.3/48.2 | 12.7/74.3 | 35.0/89.7/179.4 | 88.4/145.6/223.4 | 46.0 | 76.4 | 4.8 | 0.6/6.1/6.7 | 1607 of 2280 | 0.061 | 3.24 |
+| F3on-RT0E_V1_02_medium_s0_r1 | 91 | 3.5/10.3/18.4 | 12.9/89.6 | 19.3/95.4/232.7 | 79.0/156.7/392.5 | 41.0 | 74.0 | 3.6 | 0.1/3.9/5.3 | 1085 of 1710 | 0.375 | 2.22 |
+| F3on-RT0E_V1_02_medium_s0_r2 | 87 | 3.4/10.0/18.0 | 13.6/83.4 | 19.4/88.4/178.1 | 75.0/137.7/285.4 | 37.8 | 71.8 | 0.0 | 0.1/0.3/0.6 | 950 of 1710 | 0.208 | 5.81 |
+| F3on-RT1PE_MH_04_difficult_s0_r1 | 103 | 4.7/11.1/16.2 | 6.5/79.5 | 13.9/87.0/150.9 | 90.0/139.9/216.9 | 30.9 | 47.2 | 0.1 | 0.0/0.1/0.7 | 721 of 2032 | 0.188 | 5.00 |
+| F3on-RT1PE_MH_04_difficult_s0_r2 | 104 | 4.4/11.7/13.9 | 7.8/71.7 | 16.0/78.4/127.2 | 81.1/115.4/176.4 | 29.9 | 47.7 | 0.0 | 0.0/0.1/0.2 | 545 of 2032 | 0.239 | 4.46 |
+| F3on-RT1PE_V2_01_easy_s0_r1 | 115 | 5.2/11.9/19.2 | 16.3/87.3 | 23.5/92.9/162.2 | 95.1/148.4/189.2 | 39.7 | 64.3 | 0.0 | 0.2/1.6/2.7 | 1476 of 2280 | 0.054 | 3.53 |
+| F3on-RT1PE_V2_01_easy_s0_r2 | 115 | 3.2/10.2/12.6 | 15.0/64.1 | 19.6/68.0/112.8 | 68.5/100.6/164.9 | 29.9 | 54.1 | 0.0 | 0.0/0.1/0.3 | 555 of 2280 | 0.047 | 2.49 |
+
+| P/K | prediction | measured (on against the same-time off) | verdict |
+|---|---|---|---|
+| system P1 | `source_ms` p50 32 → 8-11 | 3.2-5.2 against 13.5-17.8 (controls; 32 was the throttled pre-reboot base) | missed (below the range: the base moved; −10.1 to −13.4 ms per frame) |
+| system P2 | process CPU −17 to −20 ms per frame | V2_01 −18.6 / −22.3, MH_04 −19.2 / −16.4, V1_02 −12.8 / −7.5 | as predicted on V2_01 and MH_04 (3 of 4 inside or 0.6 ms off); missed on V1_02 |
+| system P3 | `remap_u8` share of worker samples 36 % → 0 | not profiled | not run |
+| K3 | `source_ms` p50 stays above 15 | 3.2-5.2 | not fired |
+
+Also measured: Σtotal ÷ frames falls 5-12 ms (V1_02 48.5 / 43.0 → 41.0 / 37.8, MH_04 42.0 / 40.4 → 30.9 / 29.9, V2_01
+50.3 / 46.0 → 39.7 / 29.9). Late frames fall to 31-65 % of off. V2_01 now ends on time (final latency 0.0 s on both
+runs, against 8.3 / 4.8 s off); MH_04 and V1_02 are on time either way (≤ 3.6 s). Keyframe frames still cost 68.5-95.1
+ms p50 of total: F3 takes the source off them, and the rest is tracking work (F2, F4, F5). Causal ATE: V2_01 0.054 /
+0.047 against 0.048 / 0.061, MH_04 0.188 / 0.239 against 0.242 / 0.224. RT0E V1_02 0.375 / 0.208 against 0.119 / 0.224
+is the RT0E arm's own spread, not the knob (SYNC output is identical). It runs `merge: SnapshotOnly`: 351-406 stale
+keyframes per run and 1-11 keyframe shifts, and the 0.375 run has the most shifts (11); G54.
+
+**Theory check.** Source work was the untimed stage F1 found, and the fixed-point table removes 75 % of it. What
+remains is about 3.5-5 ms p50: PNG decode plus the remap at 0.6 ms per image. The CPU saving tracks the source saving,
+except on V1_02, where the BA thread's share is largest (31 iterations per solve; profile) and run-to-run noise in it
+is larger than the 12 ms saving. Bench and system agree. Under answer 7, F3 may become the default after the identity
+checks alone. That is a default change, so it waits for the owner (stop point 8). Next in the ladder: F2.
