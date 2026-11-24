@@ -1766,3 +1766,75 @@ of its own solve, and PropagateToNewer has nothing to carry.
 
 Ledger: G58 (MH_04 dark-span step) and G59 (PropagateToNewer carries a wrong correction under lag) in
 `experiments/gap-ledger.md`.
+
+### Results: R11d, mapping lag under real time (RT2E, RT2E-r) and RT1PE (2026-11-23/24)
+
+Binary `E/bin-r11b/kornia-slam-euroc`, md5 `e67615adaf558b4aef7b7d1e35a2fb40` (unchanged). Predictions committed in
+203128b and 97482b3 (P2 bounds corrected to S0E start 0) before the runs. Driver `E/r11d/rt.sh`, 23:41-01:07, 36 runs,
+all `rc=0`, every header `diff`-identical to `E/expect/RT2E.header`, `RT2E-r.header`, `RT1PE.header`. One run at a time;
+1-min load at start 1.22-5.01; 35 of 36 runs started with no other `kornia-slam*` process, 1 with one. Scores
+`E/score.py` (`E/r11b/scores.jsonl`), table `E/r11d/rtreport.py` → `E/r11d/rt_table.md`. SE(3) ATE RMSE, m, body
+centre, causal (`traj.txt`). Lag = wall minus data span (frames / 20 Hz); `--pace-timestamps` processes a frame "no
+earlier than" its timestamp and drops nothing, so lag is how far tracking ended behind the sensor (includes about 3 s
+of vocabulary load).
+
+| seq | Basalt | S0E SYNC | RT1E | RT2E-r | RT2E | RT1PE | solves/kf RT1E → RT2E | BA ms RT1E → RT2E | keyframes RT2E (bound) | lag s RT1E / RT2E-r / RT2E / RT1PE |
+|---|---|---|---|---|---|---|---|---|---|---|
+| V2_01 | 0.039 | 0.055 | 0.122 / 0.128 (0.125) | 0.125 / 0.129 (0.127) | 0.060 / 0.054 (**0.057**) | 0.044 / 0.050 (**0.047**) | 0.86-0.87 → 1.01 | 173-206 → 43-56 | 359, 356 (389) | 27,14 / 1,33 / 2,22 / 2,13 |
+| V1_02 | 0.045 | 0.040 | 0.044 / 0.056 (0.050) | 0.050 / 0.056 (0.053) | 0.052 / 0.035 (**0.043**) | 0.042 / 0.050 (0.046) | 0.84-0.88 → 1.02 | 125-226 → 50-53 | 412, 418 (448) | 57,2 / 36,34 / 24,32 / 43,23 |
+| V1_03 | 0.053 | 0.072 | 0.153 / 0.124 (0.139) | 0.122 / 0.162 (0.142) | 0.092 / 0.137 (0.115) | 0.105 / 0.121 (0.113) | 0.87-0.90 → 1.00-1.01 | 119-133 → 50-56 | 511, 505 (546) | 3,1 / 44,31 / 50,30 / 21,19 |
+| V2_02 | 0.049 | 0.080 | 0.119 / 0.100 (0.109) | 0.098 / 0.101 (0.099) | 0.084 / 0.082 (0.083) | 0.096 / 0.121 (0.108) | 0.92-0.93 → 1.01 | 109-122 → 49-51 | 568, 564 (618) | 16,6 / 52,59 / 57,54 / 31,31 |
+| MH_04 | 0.114 | 0.311 | 0.332 / 0.299 (0.316) | 0.298 / 0.311 (0.305) | 0.341 / 0.521 (0.431) | 0.341 / 0.212 (0.277) | 1.01 → 1.01 | 53-59 → 31 | 365, 362 (395) | 1,1 / 10,10 / 17,13 / 1,1 |
+| MH_01 | 0.067 | 0.072 | 0.066 / 0.083 (0.075) | 0.066 / 0.066 (0.066) | 0.071 / 0.075 (0.073) | 0.039 / 0.040 (**0.039**) | 1.01 → 1.01 | 61-65 → 40-41 | 577, 576 (637) | 2,2 / 19,20 / 31,35 / 4,5 |
+
+Iterations per solve: RT1E 19-32, RT2E 6.5-7.0, RT1PE 14.7-17.7. `frame_ms` p90: RT1E 36.6-69.5, RT2E-r 41.4-69.7, RT2E
+35.4-66.3, RT1PE 43.5-70.4. Tracked within 3 frames of RT1E on every run; stale = propagated on every run; keyframe
+shifts 0-2 except V1_03 (RT2E 5-6, RT2E-r 7, RT1PE 3-6, RT1E 10-11). Below Basalt (causal mean): RT1E 0 of 6, RT2E-r 1
+(MH_01 0.066), RT2E 1 (V1_02 0.043), RT1PE 1 (MH_01 0.039, 0.59x); V1_02 RT1PE 0.046 is 1.01x.
+
+| P/K | prediction | measured | verdict |
+|---|---|---|---|
+| P1 | RT2E solves per keyframe ≥ 0.97, every sequence | 1.00-1.02 on all 12 runs (RT2E-r 0.85-0.91 on the Vicon rooms) | as predicted |
+| P2 | RT2E keyframes ≤ 1.10x S0E SYNC start 0 | 1.01-1.03x on every run (V2_01 359/356 against 354) | as predicted |
+| P3 | RT2E BA solve mean ≤ 80 ms, every run | 31-56 ms | as predicted |
+| P4 | RT2E `frame_ms` p90 ≤ 50 ms, every run | 35.4-66.3; 9 of 12 runs above 50 | missed |
+| P5 | RT2E V2_01 ≤ 0.066, V1_03 ≤ 0.086; elsewhere ≤ RT1E's worse run (V1_02 0.056, V2_02 0.119, MH_04 0.332, MH_01 0.083) | V2_01 0.057, V1_02 0.043, V2_02 0.083, MH_01 0.073 inside; V1_03 0.115 (> 0.086), MH_04 0.431 (> 0.332) | missed (4 of 6) |
+| P6 | RT1PE ≤ RT1E on MH_04 and MH_01 | 0.277 < 0.316, 0.039 < 0.075 | as predicted |
+| K1 | P1 holds and V2_01 ≥ 0.083 | V2_01 0.057 | not fired |
+| K2 | RT2E > 1.15x RT2E-r on MH_04 or MH_01 | MH_04 0.431 / 0.305 = 1.41x (r1 0.341 = 1.12x, r2 0.521); MH_01 1.11x | **fired (MH_04)** |
+| R13b | RT2E V2_01 r2: propagated ≤ 5 %, yaw 50-62 s within ±1.5°, tilt 62-110 s ≤ 1.5° | 0 propagated; yaw +0.2 to +0.9°; tilt 0.3-1.4° (`resid/rotdrift.py V2_01_easy 30 45 4 46 114`) | as predicted |
+| R13b | RT2E-r V2_01 r2: yaw ≥ +2.5° at 54-58 s, tilt ≥ 3° after 62.6 s | yaw +3.9 / +4.9°; tilt 4.2-5.2° (284 of 476 propagated) | as predicted |
+| K4 / K5 | signature absent in RT2E-r r2 / RT2E yaw step ≥ 3° | present / max +0.9° | not fired |
+
+**Diagnosis (owner rule; unverified parts marked).**
+- **Lag is the cause of the V2_01 real-time loss.** The budget alone moves solves per keyframe 0.86 → 1.01 and keyframes
+  to SYNC's count (RT2E-r, with the same rayon setting, stays at 0.85-0.91 and 459-476 keyframes). V2_01 then lands at
+  1.05x SYNC (0.057) with no propagation and no G59 yaw signature, and RT2E-r reproduces the signature. G57's lag and
+  G59's carried correction are confirmed by this pair.
+- **K2 fired on MH_04: the 7-iteration budget costs accuracy where mapping already kept up.** Both RT2E MH_04 runs have
+  higher RPE than RT2E-r (rpe1 0.145 / 0.160 against 0.139 / 0.130 m); r2 adds a yaw drift (rpe10 yaw 0.875° against
+  0.47-0.58°) and scores 0.521. MH_01 is 1.11x, inside the rule. The VI-BA in RT1E converges in about 20 iterations on MH
+  (19-21 per solve, cap 50) and 7 stops it early; Basalt affords 7 because its marginalization prior carries the past
+  solve forward, while our 3-keyframe window restarts against a frozen boundary (G49 / R12). Unverified: early stop as
+  the mechanism (no per-iteration cost trace); r2 alone exceeds the rule, so one more pair would set the band.
+- **`RAYON_NUM_THREADS=1` is not profile fix 1.** It removes the parallel ORB / remap / BA assembly, not just the spin:
+  BA mean rises on MH (RT2E-r 80-89 ms against RT1E 53-65), `frame_ms` p90 is not lower, and tracking ends 10-59 s behind
+  the sensor in at least one run of every sequence (RT1E: 1-57 s, mostly ≤ 16; RT1PE ≤ 43). RT2E carries the same lag (13-57 s). So
+  RT2E's scores come from runs that were not real time at the end; part of its mapping catch-up may come from slower
+  tracking (fewer keyframes per wall second), although RT2E-r shows that the slowdown alone does not fix lag.
+- **RT1PE removes the lag by another route.** PnpInliers lowers BA iterations to 15-18 per solve, solves per keyframe
+  reach 1.00-1.01 at default rayon, and RT1PE is the best real-time arm on V2_01 (0.047), MH_04 (0.277) and MH_01 (0.039)
+  with lag ≤ 5 s on V2_01 r1, MH_04, MH_01. V1_03 (0.113) and V2_02 (0.108) stay at 1.4-1.6x SYNC, as S0PE did in SYNC.
+- **V1_03 (P5 miss):** RT2E 0.092 / 0.137 still at 1.60x SYNC with 1.00 solves per keyframe and 5-6 keyframe shifts;
+  lag is removed there, so the remainder is not lag. Not traced.
+
+**Verdict.**
+- RT2E: mechanism confirmed (P1-P3, R13b); V2_01 fixed (0.125 → 0.057); beats RT1E on 5 of 6 (all but MH_04). K2 fired:
+  the 7-iteration budget is harmful on MH_04. Per the stop rule, the extension to MH_02, MH_03, MH_05, V1_01, V2_03 was
+  not run although its 4-of-6 condition held.
+- RT2E-r: no accuracy effect (all six inside RT1E's band or better), tracking falls behind the sensor. The env var is
+  dropped as a speed fix; fix 1 needs a pool without the spin (code, card T).
+- RT1PE: P6 met; best real-time arm on 3 of 6 and lag-free on MH.
+- Next (proposal, not run): RT3E = RT1PE + 7 iterations at default rayon, to test the budget without the rayon
+  confound and on top of PnpInliers; and the R13c keyframe-acceptance rung (its trigger holds: RT2E misses the 2-core
+  budget, P4 and lag). Nothing promoted.

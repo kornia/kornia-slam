@@ -21,6 +21,19 @@ Newest first, one entry per working day. "main" means a merged PR; "#180" means 
 `feat/global-pose-graph` branch (PR #180), which is not merged. Unless marked validated, branch work
 sits behind config knobs that default to the old behaviour, and nothing in it has been benchmarked yet.
 
+### 2026-11-24
+
+- **R11d: a 7-iteration local-BA budget removes the real-time mapping lag; PnpInliers removes it too**
+  (`experiments/euroc-top1-card.md` "Results: R11d"; config and env only, binary unchanged; 36 real-time runs).
+  - RT2E (RT1E + `max_iterations: 7`, `initial_lambda: 1e-4`, `RAYON_NUM_THREADS=1`): solves per keyframe 1.00-1.02,
+    SYNC keyframe counts, 31-56 ms per solve. Causal V2_01 0.057 (RT1E 0.125), V1_02 0.043 (below Basalt 0.045),
+    V2_02 0.083, MH_01 0.073; V1_03 0.115 and MH_04 0.431. Kill K2 fired on MH_04 (1.41x RT2E-r): the budget hurts
+    where mapping kept up. Extension to the other 5 sequences not run (stop on a fired kill).
+  - `RAYON_NUM_THREADS=1` alone (RT2E-r): no score change, and tracking ends 10-59 s behind the sensor. Dropped as a speed fix.
+  - RT1PE (RT1E + PnpInliers): V2_01 0.047, MH_04 0.277, MH_01 0.039 (0.59x Basalt); lag-free on MH.
+  - Below Basalt in real time: 1 of 6 per arm (RT2E V1_02, RT1PE MH_01). Next: RT3E (RT1PE + 7 iterations, default
+    rayon) and R13c (keyframe acceptance). Nothing promoted.
+
 ### 2026-11-23
 
 - **R11c: PropagateToNewer fixes G54 in real time; S0P + S0E stacked is the best SYNC arm on V1_02 and MH**
