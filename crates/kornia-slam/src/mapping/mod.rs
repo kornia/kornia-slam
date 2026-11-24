@@ -28,7 +28,7 @@ pub mod marginalization;
 pub(crate) mod online_calibration;
 pub mod outlier_erase;
 pub mod session;
-#[cfg(test)]
+#[cfg(any(test, feature = "bench_internals"))]
 pub(crate) mod synthetic_walk;
 pub mod vi_ba_schur;
 pub mod visual_information;
