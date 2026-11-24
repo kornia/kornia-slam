@@ -2298,6 +2298,46 @@ knob off.
     `growth_lag_frames_max`.
   - K3: solves per keyframe fall below pre-rung. Add ORB-SLAM3's skip-fusion-when-queued (`O/LocalMapping.cc:105`).
 
+#### F5a lock audit (stop point 5, 2026-11-24, before any F5a code)
+
+Lines are on `feat/rt-b` @ e210138 (`K` = `crates/kornia-slam/src`). With `keyframe_growth: Mapping`, keyframe k's
+growth and forward fusion (`grow_keyframe`, `K/mapping/keyframe_mapping.rs:330-397`) run on `kornia-local-mapping`, which
+takes only the map mutex: once per triangulation pair (prepare and `apply_insertion` under one lock) and once per fusion
+neighbour (proposals and `link_observation` under one lock). Its appends are: new landmarks (pushed, so every existing
+landmark index keeps its meaning), new links on k and on older keyframes, the landmark descriptor and normal refresh
+that each link does (`refresh_landmark`, `K/mapping/map/ops/mutation.rs:299-319`), and the covisibility those links imply.
+It never removes a keyframe or a landmark, never culls, never moves a pose. Rule that makes every append safe on the
+worker side: each proposal is resolved against the map under the same lock that applies it, and `link_observation`
+refuses an inactive landmark, a claimed feature and a second feature of one keyframe on one landmark (`:296-298`), so an
+interleaved tracking write can only turn a proposal into a skip or a counted failure.
+
+Tracking side: every place where the frame releases the map mutex and takes it again, and why an append in between is
+safe. The tracking thread holds the publication gate for the whole frame (`process_prepared`, `K/system/mod.rs:977-990`);
+growth must not take it (otherwise it would run only between frames), so all of these interleave with growth.
+
+| # | site | data carried across the release | why an append in between is safe |
+|---|---|---|---|
+| 1 | `tracking_step`: `tracker.estimate` under one lock (`:2019-2035`), then the visibility update (`:2141-2161`) | `matches` (feature, landmark index) | Landmark indices are append-only; growth culls nothing (culling is BA merge, same worker thread as growth, and under the gate). `select_local_map_points` re-reads covisibility under its own lock; a new link only changes which points are counted visible. |
+| 2 | estimate, then `timed_keyframe_evidence` (`:2653-2700`) | none (re-read) | Reads the reference keyframe's associated-point count under its own lock; growth of k-1 may have raised it. A policy input, read consistently; async runs are already timing-dependent. |
+| 3 | `insert_keyframe`: reference check (`:3134`), growth plan (`:3168-3182`), `apply_insertion` (`:3214`) | `matches`, the plan's neighbour ids | k is not in the map before `:3214`, so no growth can link its features before publication. `apply_insertion` validates every `Existing` link under its lock. The plan holds keyframe ids, not slots (slots shift on removal, `K/mapping/map/ops/removal.rs:160-165`); `pair_growth_request` returns `None` for a missing keyframe (`K/mapping/growth.rs:141-142`), so an evicted neighbour is a skip. |
+| 4 | `track_flow_only`: `flow_frame` (`:2422`) and, on fallback, a second lock for `estimate_flow_only` (`:2467`) | seeded (landmark index, feature) pairs, their positions | Append-only indices; positions read under the first lock are stale only if BA or a correction moved them, which growth does not. |
+| 5 | `adopt_landmarks` (`:1132-1170`) | none | Reads k's own new landmarks (`mp.keyframe_idx == k`); in `Mapping` mode they exist only after k's growth, so adoption must wait for that keyframe's growth result (plan step 4), or it adopts the stereo close points alone and never retries (`adopted_keyframe`). |
+| 6 | `refresh_track_positions` (`:1118-1124`) | none | Read-only pass under one lock. |
+| 7 | `register_place_recognition` (`:3389-3416`): BoW query, verification and, with `Synchronous` loop closing, loop fusion and correction under one lock | none | Covisibility read under the lock; k's growth links may land before or after, changing which covisible keyframes are excluded (async only). Loop fusion replaces landmarks under the lock; a later growth proposal against a replaced landmark is refused by `require_active_landmark`. A correction moves poses under the lock; each later growth pair triangulates at the corrected poses. |
+| 8 | `enforce_map_bound` (`:464-500`), `refine_inertial_init` (`:3331`), loop writeback (`apply_loop_closing_results`, `:3420`) | none | Removals, world rescales and corrections run under one lock and bump `world_epoch`; growth pairs before and after each see one consistent map. |
+| 9 | bootstrap reset `clear_active` (`:1524`) | queued growth plans | Clears keyframes and landmarks and bumps `world_epoch`; keyframe ids are frame indices and never reused, so a queued plan finds no keyframe and is skipped. F5a also clears the queue on reset, so no stale result is reported. |
+| 10 | BA snapshot and merge (worker, `K/mapping/local_mapping.rs:575-604`) | n/a | Same thread as growth; the worker drains all growth before it takes `latest`, so growth(k) precedes BA(k) as today. |
+
+Lock order: tracking takes gate then map; the worker takes gate then map for BA and map only for growth; no thread
+takes the gate while holding the map, so no deadlock. Cost to tracking: a frame that needs the map waits for at most
+one growth pair or one fusion neighbour (measured as `map_wait`, kill K1).
+
+What the audit cannot see (risk list, plan "fail silently"): an index assumption that only breaks under load. Behaviour
+changes that are not safety issues and appear in async runs only: frame k+1 tracks without k's new landmarks if growth
+is still queued (kill K2 reads `growth_lag_frames_max`); k+1's growth plan selects neighbours from covisibility that may
+lack k's links. In `Synchronous` mapping growth runs inline in `submit_growth` in today's order, so SYNC knob-on stays
+`cmp`-identical (predicted).
+
 ### Experiment F5b: loop verification and solve off the tracking thread
 - **Found.** Default `execution: Synchronous` solves and fuses inline even with asynchronous mapping; these are the
   0.17-1.2 s stalls. Verification is a 1000×1000 Hamming match plus PnP per candidate, under the map lock
@@ -2499,3 +2539,103 @@ idle), 1-min load 0.9-1.0. The governor is still `powersave` with EPP `balance_p
 
 On the quiet machine bench P1 (≤ 1.0 ms) holds: 0.57-0.74 ms. P2 (≥ 5x, 8.6x) and P3 (≤ 1.0x OpenCV, 0.39-0.59 against
 both OpenCV builds) hold too. All three are **as predicted**, and this sample supersedes the loaded one above.
+
+### Results: F2 bounded fan-out and F4 keyframe acceptance (lane B, 2026-11-24)
+
+Branch `feat/rt-b`: F2 beb6e0e, F4 a1ceb82, F1 cherry-picked as e210138 (from `feat/rt-a` 50d3f59), card e245c3d.
+Binaries `E/rt-b/bin-f2/kornia-slam-euroc` (F2 only, md5 `82c6242b6c1f0d4a2b8a3ec4d17f38f4`) and
+`E/rt-b/bin-f4/kornia-slam-euroc` (F1 + F2 + F4 at e210138, md5 `ea78b9838feca4ec367d9f42ad2fd26c`). F3 has not landed
+on `feat/rt-a`, so every F2 number here is on the **pre-F3 base** (the plan predicts F2 on the post-F3 base): the app
+still rectifies with `remap_u8` on the global rayon pool.
+
+**Identity** (`E/rt-b/ident.sh`, knob-off S0 V1_02, R_01, and knob-on SYNC S0E V1_02 against S0E with the same binary):
+
+| binary | IDENT_V102_OK | HEADER_OK | IDENT_R01_OK (md5 d4f77b56…) | knob-on SYNC `cmp` | knob-on header |
+|---|---|---|---|---|---|
+| bin-f2 | yes | yes | yes | S0E+F2: yes | `expect/S0E+F2.header`: yes |
+| bin-f4 | yes | yes | yes | S0E+F2+F4: yes | `expect/S0E+F2+F4.header`: yes |
+
+Tests: `cargo +1.100.0 test --release -j2 -p kornia-slam --features serde` 801 passed, 4 ignored (fixture-gated, as
+before); app tests (`--no-default-features`) 72 passed; clippy `-D warnings` clean on `kornia-slam --all-targets` and the
+app `--no-default-features --all-targets`.
+
+**Real-time runs.** Driver `E/rt-b/rt.sh` (from `E/r11d/rt.sh`): asynchronous, `--pace-timestamps`, `taskset -c 0,1`,
+start 0, one run at a time, started with no cargo build and at most 1 other `kornia-slam*` process at 1-min load ≤ 6;
+per-thread CPU from `prof/threadsamp.py`. Arms from `E/rt-b/mkcfg.sh`: `RT1E+B` = RT1E on the new binary, `RT1E+F2` =
+RT1E + `fan_out: Bounded(())`, `RT1E+F2+F4` = that + `keyframes: ( mapping_acceptance: OrbSlam3 )`. Golden headers
+`E/expect/RT1E+B.header` (= RT1E), `RT1E+F2.header`, `RT1E+F2+F4.header`, all `diff`-clean. Tables
+`E/rt-b/f2_table.md`, `E/rt-b/f4_table.md` (`rt-b/report.py`). Latency is F1's `latency_ms` (finish minus scheduled
+arrival); "final" is the last frame's.
+
+F2, V1_02 (`RT1E+B` r1 started with another `kornia-slam` run on the machine and is not a valid timing sample: wall 186 s,
+final latency 97 s; it is listed, not used):
+
+| run | causal | keyframes | solves/kf | process CPU s | main / 2 global workers / fan-out / mapping CPU s | `frontend_ms` p90 | `total_ms_keyframe` p50 | latency p90 ms | final latency s | wall s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| RT1E+B r1 (invalid) | 0.058 | 467 | 0.86 | 197 | – | 63.2 | 177.6 | 89348 | 97.1 | 186 |
+| RT1E+B r2 | 0.071 | 479 | 0.77 | 196 | 43.9 / 36.5 + 36.4 / – / 78.9 | 35.9 | 109.3 | 22789 | 24.5 | 112 |
+| RT1E+F2 r1 | 0.071 | 479 | 0.79 | 201 | 45.3 / 26.1 + 25.4 / 22.2 / 81.8 | 37.6 | 115.9 | 30023 | 32.6 | 121 |
+| RT1E+F2 r2 | 0.049 | 470 | 0.81 | 194 | 41.1 / 26.0 + 25.9 / 22.3 / 78.5 | 38.7 | 113.1 | 27355 | 28.8 | 116 |
+
+Stack samples (`E/rt-b/pmp.sh`, gdb at 1 Hz, `rt-b/yieldshare.py`, which reproduces the profile's 58 % on
+`prof/RT0E_V1_02_pmp_r1`): `RT1E+F2` global workers 27 % and 29 % of their busy samples in `sched_yield` (RT0E 57 %,
+58 %), the `kornia-fanout-0` thread 7 %. The global workers' remaining work is `remap_u8` (the app's rectification) and
+KLT `track_point` (the fixed-point flow forks on the global pool too); ORB, pyramids and stereo moved to the fan-out thread.
+
+| P/K | prediction (post-F3 base) | measured (pre-F3) | verdict |
+|---|---|---|---|
+| P | `sched_yield` share of worker samples 58 % → ≤ 10 % | 27 / 29 % (global workers), 7 % (fan-out) | missed (pre-F3) |
+| P | process CPU within 10 % of the R11d RT2E-r run | RT2E-r has no per-thread CPU record; against `RT1E+B` r2 on this binary: 194-201 against 196 s | not measurable as written; no CPU change |
+| P | core time per frame 121 → 70-80 ms with F3 | 113-118 ms (194-201 s / 1710 frames), F3 absent | not applicable (needs F3) |
+| P | `fe` p90 47 → ≤ 40; p50 29 → 26-38 | p90 37.6 / 38.7 (`RT1E+B` r2 35.9); p50 0.0 in every run (flow frames dominate the series) | p90 inside the base; p50 not measurable as written |
+| K1 | `fe` p50 above 40 ms | 0.0 | not fired |
+| K2 | CPU falls but `latency_ms` p90 does not | CPU did not fall | not applicable |
+| K3 | yield share stays above 20 % | 27-29 % | **fired** |
+
+F2 diagnosis: K3's stated cause holds. Fan-out outside `extract` remains on the global pool: the app's `remap_u8`
+(lane A, F3) and the tracking thread's fixed-point KLT (`tracking_step` → `flow`, library). Moving ORB alone shifted
+about 21 s of CPU from the global workers to the fan-out thread and saved none. The plan's remedy is to widen the wrap;
+it was not done (stop on a fired kill).
+
+F4, 2 runs each (RT1E and S0E SYNC start 0 from `E/r11b/scores.jsonl`; refusals = `keyframes_refused_busy`):
+
+| seq | causal r1 / r2 (mean) | RT1E (mean) | S0E SYNC | keyframes (÷ S0E) | RT1E keyframes | solves/kf | refused | coast r1 / r2 (RT1E) | tracked of frames (RT1E) | final latency s | wall s |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| V2_01 | 0.058 / 0.053 (**0.056**) | 0.125 | 0.055 | 325, 331 (0.92, 0.94) | 475, 483 | 1.00, 1.01 | 0 | 6 / 8 (6 / 5) | 2274, 2272 of 2280 (2274, 2275) | 2.4, 2.7 | 119, 120 |
+| V1_03 | 0.162 / 0.177 (0.170) | 0.139 | 0.072 | 393, 388 (0.79, 0.78) | 595, 593 | 1.01 | 0 | 11 / 5 (5 / 2) | 2138, 2144 of 2149 (2144, 2147) | 5.2, 1.5 | 115, 112 |
+| V2_02 | 0.144 / 0.090 (0.117) | 0.109 | 0.080 | 450, 445 (0.80, 0.79) | 657, 646 | 1.01 | 0 | 2 / 3 (0 / 0) | 2346, 2345 of 2348 (2348) | 8.3, 8.0 | 128, 129 |
+| V1_02 | 0.057 / 0.068 (0.063) | 0.050 | 0.040 | 306, 308 (0.75, 0.76) | 469, 466 | 1.01 | 0 | 2 / 1 (1 / 1) | 1686, 1687 of 1710 (1687) | 3.1, 1.6 | 91, 90 |
+| MH_04 | 0.334 / 0.286 (0.310) | 0.316 | 0.311 | 350, 349 (0.97) | 369, 371 | 1.01 | 0 | 0 / 0 | 2032 of 2032 | 0.1, 0.1 | 104, 103 |
+| MH_01 | 0.073 / 0.081 (0.077) | 0.075 | 0.072 | 561, 554 (0.97, 0.96) | 587, 584 | 1.01 | 0 | 0 / 0 | 3682 of 3682 | 3.9, 10.7 | 191, 197 |
+
+Load at start 3.0-4.8 on all 12 F4 runs, no other `kornia-slam*` process. BA mean 132-175 ms (Vicon), 77-103 ms (MH).
+
+| P/K | prediction | measured | verdict |
+|---|---|---|---|
+| P | solves per keyframe 0.83-0.92 → ≥ 0.97 | 1.00-1.01 on all 12 runs | as predicted |
+| P | keyframes async ÷ SYNC 1.16-1.34 → ≤ 1.10 | 0.75-0.97 | as predicted (bound met; undershoots SYNC by 20-25 % on V1_02, V1_03, V2_02) |
+| P | V2_01 0.125 → ≤ 0.083 | 0.058 / 0.053 | as predicted |
+| P | V1_03 0.139 → ≤ 0.108 | 0.162 / 0.177 | missed (worse than RT1E) |
+| P | MH_04, MH_01: refusals < 2 % of keyframes, ATE inside the r1/r2 range | 0 refusals; MH_04 0.334 / 0.286 (RT1E 0.299-0.332, r1 0.002 above), MH_01 0.073 / 0.081 (0.066-0.083) | as predicted, MH_04 r1 at the edge |
+| K1 | counters met, V2_01 > 0.110 and V1_03 > 0.144 | V2_01 0.056 | not fired |
+| K2 | ATE met with solves per keyframe < 0.92 | 1.00-1.01 | not fired |
+| K3 | tracked below frames − 3, any give-up, or more coast frames | no give-up; coast frames above RT1E on V1_03 r1 (11 against 5 / 2; frames 241, 794-797, 2089-2090 are new), V2_02 (2 / 3 against 0), V2_01 r2 (8 against 6 / 5); V1_03 r1 tracked 2138 of 2149 | **fired** |
+
+F4 diagnosis (owner rule; unverified parts marked).
+- The refusal rule never acted: `keyframes_refused_busy` = 0 on all 12 runs. With c1b holding the ratio trigger, only
+  the 8-frame bound (0.4 s) falls due while mapping is busy, so at most one keyframe arrives per 132-175 ms solve, and
+  the pending count (zeroed at each snapshot) never reached `active_keyframes` (3). Every effect is c1b, the busy gate
+  on the ratio trigger in `should_insert_with`.
+- c1b alone removes the lag: solves per keyframe 1.00-1.01, final latency 0.1-10.7 s (RT1E 1-57 s), and V2_01 lands at SYNC
+  (0.056 against 0.055). This confirms G59's precondition (lag) as the V2_01 cause, as RT2E did, without the BA budget.
+- It also starves the Vicon rooms of keyframes. A BA solve takes 132-175 ms there, so mapping is busy most of the time,
+  and the ratio trigger rarely fires. Keyframes then come from `max_frames_between` (8 frames): V1_03 r1 has 122 of 392
+  gaps at 8 frames, against 76 of 495 in S0E SYNC and 54 of 594 in RT1E. Keyframes fall to 0.75-0.80x SYNC on V1_02,
+  V1_03 and V2_02. On V1_03 r1, the run with the most new coast frames (11), causal is 0.162. ORB-SLAM3 tolerates c1b
+  because its keyframe rate is set by a much faster mapping thread and by `InterruptBA`, which this rung leaves out.
+- Unverified: that the new coast runs (794-797, 2089-2090) sit in V1_03's fast segments where a ratio keyframe was held
+  back. No per-frame trace of the held-back triggers was recorded. `max_frames_between: 8` as the c1a analogue is
+  0.4 s at 20 Hz, against ORB-SLAM3's `mMaxFrames` of 20 frames at 20 Hz, so c1a binds sooner here.
+- Next (proposals, owner to choose; nothing run): (a) `InterruptBA` (answer 10 allows it now that K3 fired), so that a
+  held-back ratio keyframe preempts the solve instead of waiting; (b) F5a first, which shortens the mapping critical
+  path seen by c1b; (c) a refusal bound on solve age instead of the pending count, which never moves under latest-wins.
