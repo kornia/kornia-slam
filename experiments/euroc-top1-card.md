@@ -3091,3 +3091,36 @@ the yaw and tilt held in the past (≤ 0.9° after 20 s in S0E), and scale (piec
 The rig alternative (rdef or rp48 plus the erase) also attacks cause 1. It costs ORB on both cameras every frame, about
 +45 % BA time (rdef 144.5 s against S0E 99.0 s of `ba_solve_ms` on V1_03), and the real-time budget (G57) has no room
 for that. It stays behind V-a.
+
+#### G11 extension: the V-a arms S0EIH and RT3EIH on all 11 (added 2026-11-24 after the G62 diagnosis, before their runs)
+
+Two arms without PnpInliers (G62: it drops 30-53 % of keyframe matches, which return as duplicate landmarks), run
+after the four G11 arms with the same binary and protocol. `E/mkcfg.sh` gains S0EIH and RT3EIH; the `run.ron` of
+RT3E, S0PEI, S0PEIH and S0E is byte-identical to the pre-edit script (`E/gate/mkcfg.sh.pre-g11b`).
+
+- **S0EIH (V-a, SYNC):** S0E + `tracking: ( pose_inertial: OrbSlam3, pose_inertial_min_inliers: WithPrediction )`.
+  All 11 × starts 0/1/2 (`E/gate/sync_{C,D}.txt`), run dirs `E/runs/G-S0EIH_*`. Scored against V-a P1-P5 and K1-K4 as
+  written above (V1_03 and V2_02 starts 0/1/2; guards V1_02, V2_01, MH_01), with `E/resid/v13v22/hf.py` for HF.
+  The other six sequences are reported, with no prediction beyond P-G5.
+- **RT3EIH (real time):** RT1E + `local_ba: ( max_iterations: 7, initial_lambda: 1e-4 )` + the same tracking. All 11 × 3
+  runs under the RT lock (`E/gate/rt_all2.sh`), run dirs `E/runs/G-RT3EIH_*`.
+- **Golden headers** (by construction, then checked by a 3-frame V1_02 probe in `E/gate/probe/`, both
+  `diff`-identical): `E/expect/S0EIH.header` = `S0E.header` + `pose-inertial min inliers: WithPrediction`;
+  `E/expect/RT3EIH.header` = `RT3E.header` without `keyframe observations: PnpInliers`, plus that line. The
+  `pose_inertial: OrbSlam3` knob does not print; a run counts only with `pose_inertial_solves` > 0.
+
+**RT3EIH predictions** (causal, median of 3). Base: RT2E (the same mapping, run with `RAYON_NUM_THREADS=1`) and the
+SYNC pose-inertial factor (0.78x on MH_04, about 1.0x elsewhere).
+
+| seq | RT2E | RT3E | RT3EIH predicted | reasoning |
+|---|---|---|---|---|
+| V2_02 | 0.082-0.084 | 0.097-0.101 | 0.075-0.090, below RT3E | G62: no duplicate seeds |
+| V1_03 | 0.092-0.137 | 0.100-0.145 | 0.08-0.13 | G62 plus V-a mechanism 1 (gyro on every frame) |
+| MH_01 | 0.071-0.075 | 0.038-0.048 | 0.055-0.080, above RT3E | PnpInliers helps the halls (S0E 0.072 against S0PE 0.049) |
+| MH_04 | 0.341-0.521 | 0.213-0.215 | 0.22-0.35 | S0E 0.311 × 0.78 ≈ 0.24; the 7-iteration budget hurt RT2E on MH_04 (R11d K2) |
+| V1_02 | 0.035-0.052 | 0.038-0.050 | 0.035-0.050 | |
+| V2_01 | 0.054-0.060 | 0.044-0.051 | 0.045-0.060 | |
+
+- **P-G6:** RT3EIH below RT3E on V1_03 and V2_02, above it on MH_01; below Basalt on 2-5 of 11.
+- **P-G7:** S0EIH below S0PEIH on V1_03 and V2_02, above it on MH_01, MH_02, MH_03 (the PnpInliers hall gain).
+- Stop rules as P-G5 (header, `rc`, `give_ups`), plus `pose_inertial_solves` > 0 on every run.
