@@ -2772,3 +2772,322 @@ SYNC S0PE value on the six measured sequences (MH_01 0.88, MH_04 0.94, V1_02 1.2
   (tens of frames); this is not a pass/fail prediction, only a check.
 - **Kill / stop rules:** a header mismatch, `rc≠0` or `give_ups>0` stops the batch for a diagnosis. Nothing is
   promoted from this rung: it is the measurement for the real-time gate and the full-sequence LaMAria guard comes first.
+
+## V1_03 / V2_02 diagnosis (2026-11-24)
+
+Read-only analysis of the existing runs, plus three short debug runs. Binary `E/bin-integ2/kornia-slam-euroc`, md5
+`e97329d4…`, `E/debug/run_debug_arm.sh`, load 2.8-5.3, one other `kornia-slam` process at most:
+- `E/debug/V13D-S0E-400` (S0E, V1_03, 400 frames);
+- `E/debug/V13D-S0P-400` (S0P, V1_03, 400 frames);
+- `E/debug/V22D-S0E-300` (S0E, V2_02, 300 frames).
+
+Each debug `traj.txt` is byte-identical to the first 399 / 299 lines of its batch run.
+
+Scripts are in `E/resid/v13v22/`:
+- `hf.py`: LF = the 1 s running median of the whole-run SE(3) error; HF = error − LF;
+- `hfsrc.py`: HF split by frame kind;
+- `pieces.py`: 10 s piece rms against GT and against Basalt;
+- `span.py`: ATE fitted on one span only;
+- `saw.py` / `jumps.py`: per-frame increments and spikes;
+- `roterr.py`, `ridge.py`: rotation error against position error;
+- `dstep.py`: tracker step against the GT step;
+- `kfobs.py`: keyframe matches, PnP outliers, grown and fused points by gyro rate;
+- `lever.py`: time-offset and lever-arm checks;
+- `rate.py`: LF drift rate by angular speed.
+
+Basalt is `B/results/basalt/<seq>/trajectory.txt`. SE(3) ATE RMSE, m, body centre, causal `traj.txt`, start 0 unless
+noted.
+
+### Verdict
+
+The two sequences lose to Basalt for different reasons. Neither cause is mapping lag or flow loss.
+
+1. **V1_03: tracking-frame jitter.** The S0E map is at Basalt's level: LF 0.052-0.057 over starts 0/1/2, against
+   Basalt 0.053. The excess is high-frequency error on non-keyframe frames: HF 0.041-0.054, against Basalt 0.004.
+   ATE² ≈ LF² + HF²: 0.057² + 0.041² gives 0.070, against the measured 0.072. The frames are visual-only PnP
+   (`tracking.pose_inertial: Off`, `system/config/mod.rs:519-524`; G13). Under fast rotation and blur they slide
+   along the rotation-translation ridge, rotation error and position error together, away from the gyro. The next
+   keyframe's VI-BA snaps them back.
+2. **V2_02: one early drift event, in the map.** After 28 s the S0E trajectory refitted alone scores 0.041 / 0.042 /
+   0.040 (starts 0/1/2), against Basalt 0.040. The first 28 s (23 % of the frames) hold 64-65 % of the whole-run
+   squared error. In those seconds the causal and smoothed outputs sit 0.11-0.15 m off the later map. The offset
+   leaves over 26-28.5 s: 1.2-1.5 m/s, gyro peak 1.0-1.2 rad/s, no yaw change, 1 s piece scale 1.02-1.05. HF is only
+   0.010. No loop reaches back before 35 s. Mechanism unverified (see V-d below).
+3. **PnpInliers hurts both sequences through the map.** It drops 30-53 % of each keyframe's matches, rising with gyro
+   rate. Those features are then seeded again as new stereo landmarks, so the map fragments. LF rises 0.057 → 0.100
+   (V1_03) and 0.079 → 0.098 (V2_02). HF does not move.
+4. **Flow availability is not the cause.**
+   - S0E has `flow_unavailable` on 4.4 % of V1_03 frames (94 / 2149) and 1.8 % of V2_02 frames (43 / 2348).
+   - The 43-45 % figure belongs to the rig preset rp48: 921 / 2149 frames, `klt_first: Enabled(min_tracks: 48)`.
+   - HF lives on frames where flow worked (V1_03 S0E): 56 % of HF² is on flow frames, 41 % on ORB tracking
+     frames, 3 % on keyframes.
+   - rdef has no flow frame at all, and its V1_03 HF is 0.020 against S0 0.047.
+
+### Q1: where the error accumulates
+
+**10 s pieces (piece-only SE(3) fit; "vs Basalt" fits ours to Basalt's trajectory).**
+
+V1_03:
+
+| piece, s | S0E vs GT | S0E vs Basalt | S0P vs GT | RT3E vs GT | Basalt vs GT |
+|---|---|---|---|---|---|
+| 0 | 0.017 | 0.019 | 0.017 | 0.015 | 0.007 |
+| 10 | **0.077** | 0.082 | 0.071 | **0.126** | 0.030 |
+| 20 | 0.039 | 0.034 | 0.037 | 0.047 | 0.023 |
+| 30-50 | 0.022-0.031 | 0.022-0.029 | 0.027-0.040 | 0.022-0.050 | 0.014-0.025 |
+| 60 | **0.055** | 0.044 | 0.079 | **0.099** | 0.026 |
+| 70-80 | 0.022-0.046 | 0.026-0.047 | 0.030-0.051 | 0.029-0.050 | 0.016-0.026 |
+| 90 | 0.055 | 0.058 | **0.106** | 0.089 | 0.029 |
+| 100 | **0.102** | 0.102 | 0.095 | 0.091 | 0.012 |
+
+V2_02: every S0E piece is 0.009-0.048 against GT (Basalt 0.007-0.057) and 0.011-0.051 against Basalt. The pieces are
+right; their placement is wrong. Whole-run bins put 0.14-0.16 m at 0-20 s (Basalt 0.06-0.09) and 0.08-0.10 at
+90-120 s (Basalt 0.03). That is the whole-run fit spreading the early offset.
+
+**Events against smooth drift.**
+
+| arm | ATE | LF | HF | rpe 1 frame, m | frames HF > 0.05 m | spikes > 0.08 m (ATE with them replaced) |
+|---|---|---|---|---|---|---|
+| V1_03 S0 | 0.181 | 0.172 | 0.047 | 0.056 | - | - |
+| V1_03 S0E | 0.072 | 0.057 | 0.041 | 0.049 | 175 | 25 (0.066) |
+| V1_03 S0P | 0.118 | 0.110 | 0.041 | 0.048 | - | 51 (0.116) |
+| V1_03 S0PE | 0.111 | 0.100 | 0.043 | 0.049 | - | 42 (0.109) |
+| V1_03 RT1PE / RT3E | 0.105 / 0.100 | 0.088 / 0.082 | 0.050 / 0.051 | 0.051 / 0.055 | - | - / 43 (0.099) |
+| V1_03 Basalt | 0.053 | 0.053 | 0.004 | 0.003 | - | 0 |
+| V2_02 S0E | 0.080 | 0.079 | 0.010 | 0.011 | 18 | 1 (0.080) |
+| V2_02 S0PE | 0.099 | 0.098 | 0.010 | 0.011 | - | 0 |
+| V2_02 RT1PE / RT3E | 0.096 / 0.097 | 0.094 / 0.095 | 0.015 / 0.013 | 0.013 / 0.012 | - | - / 5 |
+| V2_02 Basalt | 0.049 | 0.049 | 0.004 | 0.003 | - | 0 |
+
+Starts 1 and 2 agree: V1_03 S0E LF 0.052 / 0.054 and HF 0.054 / 0.041; V2_02 S0E LF 0.083 / 0.079 and HF 0.010 /
+0.010.
+
+The V1_03 error has two shapes:
+- **Saw-tooth.** At 11.2-11.6 s (1.5-1.8 m/s) the error grows 0.02 → 0.34 m over 7 tracking frames (224 → 231), then
+  keyframe 232 brings it back to 0.02 m.
+- **Single-frame spikes.** Examples: frame 237 at 0.24 m, frame 243 at 0.28 m, and frame 2089 at 104.45 s, 0.98 m
+  while moving at only 0.34 m/s. Replacing all 25 spikes by their neighbours' mean only lowers the ATE 0.072 → 0.066.
+  The saw-tooth is the larger part.
+
+Basalt has 20 frames with a per-frame error step above 1 cm; S0E has 824. The sum of |per-frame error step| is
+39.9 m against 4.5 m.
+
+**LF drift rate** (1 s bins by GT gyro peak, `rate.py`):
+- V1_03: S0E 0.017-0.028 m/s, Basalt 0.013-0.018. The drift is spread over all gyro bins, not concentrated at fast
+  rotation. Total |dLF| 2.25 m (smoothed output 1.99) against 1.41 m.
+- V2_02: S0E 0.011-0.013 m/s, Basalt 0.008-0.011. Total 1.34 m against 1.11 m.
+
+**V2_02 early event** (fit on 30-60 s, `anch.py`):
+- Over 0-24 s, S0E sits 0.14-0.17 m off horizontally. It falls to 0.01 m over 26-28.5 s, in the causal output and in
+  the smoothed output alike.
+- Basalt sits 0.11 m off over 0-12 s and drops to 0.04 m at 13-14 s (gyro peak 2.2 rad/s), then stays at 0.03-0.04.
+- rp48 shifts 0.09 → 0.02 m over the same 26-28.5 s.
+- After 60 s, S0E stays within 0.08 m of the 30-60 s fit (Basalt 0.09).
+
+**Tilt, yaw and scale** (`rotdrift.py`, world misalignment against a 20-40 s reference, 10 s bins):
+- **V1_03:**
+  - S0E: yaw −0.2 to +0.8°, tilt 0.1-0.8° after 20 s (Basalt yaw +0.1 to +0.7°, tilt 0.1-0.6°).
+  - S0P / S0PE: yaw −2.7 / −2.8° at 70 s, −1.6° at 80 s.
+- **V2_02:** S0E yaw −0.2 to +0.2°, tilt 0.3-1.1° (Basalt yaw −0.4 to +0.6°, tilt 0.2-0.9°).
+- **Absolute tilt** (`bins.py`): ours 1.1-2.3° against Basalt 0.1-1.5°. The 0-10 s bins read 16-21° because the
+  frames before the IMU init (V1_03 frame ≈147, 7.3 s; V2_02 ≈100) are written in the pre-gravity frame. They
+  cost little, because the camera barely moves then (V1_03 path 1.3 m, piece rms 0.017).
+- **Scale:** the 10 s piece Sim(3) scale over 10-100 s is 0.994-1.048 (V1_03) and 0.978-1.027 (V2_02). Basalt reads
+  0.997-1.033 and 0.996-1.033. Only the last V1_03 piece (0.853, 1.3 m of path) is off, and that is spike error.
+- **Not timing, not lever arm:** shifting our stamps by ±40 ms moves V1_03 ATE by 0.000-0.009, minimum at 0. A fitted
+  body lever arm is 0.040 m and removes 0.007 only. Basalt shows the same lever fit (0.028 m).
+
+### Q2: frontend under fast motion
+
+**The tracker leaves the gyro.**
+
+Saw-tooth at V1_03 frames 224-232 (`V13D-S0E-400`):
+
+| frame | kind | inliers / matches | `[predgap]` rot, ° | rotation error vs GT, ° | position error, m | tracker step / GT step, m |
+|---|---|---|---|---|---|---|
+| 224 | keyframe | 420 / 664 | 1.81 | 0.66 | 0.020 | - |
+| 225 | flow | 568 / 622 | 0.63 | 0.68 | 0.023 | 0.091 / 0.078 |
+| 227 | flow | 557 / 620 | 0.82 | 1.62 | 0.085 | 0.070 / 0.090 |
+| 229 | flow | 530 / 601 | 1.09 | 3.79 | 0.209 | 0.064 / 0.076 |
+| 231 | flow | 510 / 574 | 1.33 | 5.85 | 0.342 | 0.066 / 0.078 |
+| 232 | keyframe | 278 / 437 | 4.34 | 0.75 | 0.019 | - |
+
+- The tracked rotation moves 0.6-1.3° per frame away from the inertial prediction. The IMU-only spread is about
+  0.002° per frame (`tracking/pose_gate.rs:3-6`).
+- Position error and rotation error grow together: 0.34 m against 5.1° is 3.8 m/rad, at a median stereo depth of
+  2.5 m. That is the rotation-translation ridge of G58, here at short depth.
+- The tracker steps a near-constant 0.064-0.066 m in a direction 25-77° off the GT step.
+- Over the whole run (`ridge.py`, frames after 10 s): position HF and rotation HF correlate at 0.74 (V1_03 S0E) and
+  0.57 (V2_02). Frames with HF above 5 cm carry 0.70° (V1_03) and 0.93° (V2_02) of rotation HF; frames below 1 cm
+  carry 0.04-0.05°.
+- Nothing fuses the gyro into those frames: `pose_inertial: Off`, `pose_gate: Disabled` (`tracking/pose_gate.rs:21-28`,
+  `gate_rejects_*=0`), and `frame_velocity: KeyframeVelocity` (`system/config/mod.rs:551-556`). The `[vel]` line
+  holds v = (1.537, −0.233, −0.101) unchanged over frames 225-231.
+
+**`[predgap]` rotation, tracking frames after frame 150** (S0E debug logs; the R11b logs are other sequences, same
+config):
+
+| sequence | median, ° | p90, ° | median on frames with step_rot > 1° |
+|---|---|---|---|
+| V1_03 | 0.40 | 1.60 | 0.61 |
+| V2_02 | 0.12 | 0.54 | 0.17 |
+| V1_02 | 0.08 | 0.26 | 0.09 |
+| V2_01 | 0.05 | 0.17 | 0.07 |
+| MH_01 | 0.04 | 0.11 | 0.06 |
+
+The disagreement with the gyro ranks the sequences as their difficulty does: V1_03 5x V1_02, V2_02 1.5x.
+
+**Counters** (S0E start 0 batch summaries; RT3E in brackets):
+
+| | V1_03 | V2_02 |
+|---|---|---|
+| frames / tracked | 2149 / 2148 | 2348 / 2348 |
+| keyframes | 496 (568) | 562 (632) |
+| flow frames / `flow_unavailable` / `flow_refused` | 1359 / 94 / 5 (1206 / 157 / 0) | 1475 / 43 / 0 (1372 / 63 / 0) |
+| `coast_inertial` / `give_ups` | 1 / 0 (1 / 0) | 0 / 0 (0 / 0) |
+| erase: all rows / newest keyframe's rows | 6.3 % / 16.0 % (1.9 % / 1.9 %) | 7.5 % / 15.7 % (3.4 % / 4.1 %) |
+| final landmarks, obs per active landmark | 127 k, 4.55 (213 k, 4.07) | 134 k, 4.62 (207 k, 4.68) |
+
+**Debug windows** (frames 150-400 / 150-300):
+- **VISRES:** above Huber 2.2 % of all rows, 4.1 % of free rows (V1_03 S0E); 1.5 % and 3.6 % (V2_02 S0E); 0.4 % (V1_03
+  S0P).
+- **Erase per solve:** median 374 rows (7.5 % of tested), 16.9 % of the newest keyframe (p90 33.2 %) on V1_03. On
+  V2_02: 576 rows (8.2 %), 23.3 % (p90 32.6 %).
+- **Matches per keyframe:** 465-492 at a gyro rate below 1 rad/s and 316 above it (V1_03); 464-566 on V2_02.
+- **Tracking frames:** median 457 matches and 355 inliers on V1_03; 466 and 338 on V2_02.
+- **Worst span (V1_03 11.5-12.3 s, 1.6-1.8 m/s):** inliers fall 568 → 278 → 194 → 138 → 69 → 54 (frames 225, 232,
+  235, 238, 243, 244). The spike frames are the dips: 237 at 173 / 251, 243 at 69 / 136.
+- **Frames under 100 inliers:** 5 of 250 (V1_03), 3 of 150 (V2_02).
+
+**Is two-camera flow the cause?** No: flow availability is not the lever (verdict, point 4). Two-camera tracking
+does cut HF, though:
+
+| V1_03 | sdef (= S0) | rdef | sp48 | rp48 | S0E |
+|---|---|---|---|---|---|
+| ATE | 0.181 | 0.095 | 0.111 | 0.123 | 0.072 |
+| HF / LF | 0.047 / 0.172 | 0.020 / 0.091 | 0.060 / 0.087 | 0.015 / 0.121 | 0.041 / 0.057 |
+| frames HF > 0.05 m | - | 43 | - | - | 175 |
+
+rdef runs ORB on both cameras every frame and has no flow frame. It halves HF against S0, as rp48 does with flow. Which part does it, the second camera or ORB on every frame, is not separated. No rig arm has the erase, so their LF stays at 0.09-0.12.
+
+### Q3: why PnpInliers hurts here
+
+**What it removes** (`tracking/pose_estimation/map_projection/mod.rs:391-399`). At an accepted keyframe it keeps only
+the matches inside the final PnP gate at the tracker's pose. In `V13D-S0E-400` / `V22D-S0E-300` that gate rejects
+this share of the keyframe's matches (`[track]` at keyframe frames, `kfobs.py`):
+
+| gyro rate at the keyframe, rad/s | V1_03 outlier share (n) | V2_02 outlier share (n) |
+|---|---|---|
+| < 0.5 | 0.30 (56) | 0.31 (32) |
+| 0.5-1.0 | 0.42 (21) | 0.42 (12) |
+| 1.0-1.5 | 0.36 (2) | 0.40 (10) |
+| > 1.5 | - | 0.53 (6) |
+
+The IMU-aided VI-BA erase removes only 16.9 % (V1_03) and 23.3 % (V2_02) of the newest keyframe's rows. So
+PnpInliers drops about twice what the inertial solve rejects. It does so where the tracker pose is worst, on the
+ridge. It removes matches that disagree with a ridge-biased pose, not mismatches.
+
+**Where they go.** A dropped feature is unclaimed, so `growth::stereo_seeds` seeds it again as a new stereo landmark
+(`mapping/keyframe_mapping.rs:117-121`). This is a duplicate of the landmark it had matched. Over frames 0-400 of V1_03:
+- stereo seeds: 29 034 in 89 keyframes (S0P) against 17 330 in 80 (S0E), 326 against 217 per keyframe;
+- fused: 17 945 against 19 852.
+
+Final maps:
+- S0PE against S0E, V1_03: 210 k landmarks against 127 k, obs per active landmark 4.05 against 4.55, max_obs 46
+  against 62.
+- V2_02: 206 k against 134 k landmarks.
+- MH_04: +21 %.
+
+`flow_unavailable` rises too (S0P V1_03 173 against S0 76), because KLT tracks are seeded from the linked matches only.
+
+**Effect.**
+- LF on V1_03: S0 0.172 → S0P 0.110, but S0E 0.057 → S0PE 0.100.
+- LF on V2_02: 0.079 → 0.098.
+- The V1_03 yaw drifts −2.7° at 70 s in S0P / S0PE, against ≤ 0.9° in S0E.
+- HF does not change (0.041 / 0.043), so PnpInliers acts on the map, not the tracker.
+- On MH_04 the dropped rows are dark-span garbage (Q1 above) and it helps. On the fast Vicon rooms they are mostly
+  good rows.
+- RT1PE and RT3E are PnpInliers arms, which explains why they sit at 0.10-0.12 on V1_03 with the lag gone.
+
+### Q4: rig-mode runs on these two sequences
+
+| | sdef | rdef | sp48 | rp48 | S0E | Basalt |
+|---|---|---|---|---|---|---|
+| V1_03 ATE | 0.181 | 0.095 | 0.111 | 0.123 | 0.072 | 0.053 |
+| V2_02 ATE | 0.176 | 0.135 | 0.088 | **0.068** | 0.080 | 0.049 |
+| V2_02 refit after 28 s / E² share in 0-28 s | 0.159 / 0.32 | 0.125 / 0.28 | 0.057 / 0.59 | 0.061 / 0.32 | 0.041 / 0.64 | 0.040 / 0.47 |
+
+- rp48 is the best of any arm on V2_02. It puts half of S0E's share of error in 0-28 s; its 10-keyframe window and
+  `PropagateToNewer` are confounded with the second camera.
+- On V1_03 the rig arms cut HF (above), but they have no erase, so S0E still wins.
+- rp48 has `flow_unavailable` on 921 of 2149 V1_03 frames (43 %) and still the lowest HF (0.015). So the 43 % is not
+  harm.
+
+### Ranked causes
+
+| rank | cause | sequences | evidence | at stake (estimate) |
+|---|---|---|---|---|
+| 1 | Visual-only tracking frames drift along the rotation-translation ridge under fast rotation and blur, against the gyro (G13; new row G62) | V1_03 (HF 0.041-0.054); V2_02 small (HF 0.010) | saw-tooth 224-232; `[predgap]` 0.40° median / 1.60° p90 per frame; corr 0.74 | V1_03 0.072 → about 0.058-0.062 if HF reaches the rig level (0.015-0.020) at the same LF |
+| 2 | PnpInliers drops 30-53 % of keyframe matches, which then become duplicate stereo seeds | V1_03, V2_02 (and every RT*P* arm) | seeds 326 against 217 per keyframe; landmarks +65 %; LF +0.02 to +0.04 | not in S0E (the best arm does not use it); it is what keeps RT1PE / RT3E at 0.10-0.12 |
+| 3 | Early V2_02 drift event at 26-28.5 s, about 3 % over-scale at 1.2-1.5 m/s; mechanism unverified | V2_02 | span refit 0.041 against Basalt 0.040; 64 % of E² before 28 s | V2_02 0.080 → about 0.045-0.055 if removed |
+| 4 | Single-frame PnP spikes the IMU does not veto (pose gate disabled) | V1_03 | 25 spikes; 0.98 m at frame 2089 while moving at 0.34 m/s | V1_03 −0.006 (counterfactual) |
+
+Ruled out on these two: mapping lag (SYNC has the gap), flow availability (4.4 % / 1.8 %), time offset, lever arm,
+the yaw and tilt held in the past (≤ 0.9° after 20 s in S0E), and scale (piece scale 0.98-1.05, like Basalt).
+
+### Fix rungs (predictions and kill rules written 2026-11-24, before any run)
+
+**V-a (config only): S0EIH = S0E + `tracking: ( pose_inertial: OrbSlam3, pose_inertial_min_inliers: WithPrediction )`.**
+
+- **Theory:** the gyro and accelerometer constrain every tracking frame (ORB-SLAM3 `PoseInertialOptimizationLast*`).
+  The ridge direction then has the IMU's 0.002° per-frame rotation information in it, and the frame cannot slide
+  5° in 7 frames. The map is unchanged (S0E), so LF should hold.
+- **Protocol:** SYNC, unpaced, `E/bin-integ2`; V1_03 and V2_02 starts 0/1/2, then the guards V1_02, V2_01 and MH_01
+  start 0. One run is about 3 min wall, each within the 5-minute rule. Score with `hf.py` and `span.py` beside the
+  ATE.
+- **Not tested yet:** R13a / card H ran pose-inertial only on top of PnpInliers (S0PEI / S0PEIH), never on S0E, and
+  never on V1_03 or V2_02.
+
+| id | prediction |
+|---|---|
+| P1 (mechanism) | V1_03 HF ≤ 0.025 on every start (S0E 0.041-0.054); start 0 frames with HF > 0.05 m ≤ 60 (S0E 175) |
+| P2 | V1_03 causal median of 3 starts 0.055-0.065 (S0E 0.072); LF within 0.050-0.062 |
+| P3 | V2_02 median 0.072-0.082 (S0E 0.080). HF is already 0.010, so little to gain. A drop below 0.070 would mean the 26-28.5 s event is tracking-borne |
+| P4 | tracked and `coast_inertial` no worse than S0E on the same start (+2 frames); `give_ups=0` |
+| P5 (guards) | each ≤ 1.10x the S0E median: V1_02 ≤ 0.044, V2_01 ≤ 0.061, MH_01 ≤ 0.079 |
+
+| id | kill rule |
+|---|---|
+| K1 | V1_03 HF > 0.030 on 2 of 3 starts: the mechanism did not move. Stop; check that pose-inertial solves run on those frames (`pose_inertial_solves`), then the ridge in the map |
+| K2 | HF ≤ 0.025 but V1_03 median > 0.068: HF was not the score. Diagnose LF before any credit |
+| K3 | any start gains more than 3 coast frames or `give_ups > 0` against S0E, as R13a's K1 |
+| K4 | any guard above 1.15x S0E |
+
+**V-b (config only, after V-a): `tracking_loss: ( pose_gate: Innovation(( mode: Reject )) )` on the V-a arm.**
+- **When:** only if V-a leaves 10 or more spikes > 0.08 m on V1_03.
+- **Prediction:** at most −0.006 on V1_03, the spike counterfactual. Spikes > 0.08 m drop to ≤ 5.
+- **Kill:** any new coast > 3 frames, or a guard above 1.10x V-a.
+
+**V-c (code, after V-a): PnpInliers without duplicate seeds.**
+- **Change:** features dropped from the keyframe's links stay claimed, so `stereo_seeds` skips them
+  (`mapping/keyframe_mapping.rs:117-121`).
+- **Theory:** PnpInliers' MH_04 gain comes from keeping bad rows out of the first solve; its Vicon loss comes from
+  map fragmentation. This keeps the first and removes the second.
+- **Predictions:**
+  - S0PE V1_03 stereo seeds per keyframe 326 → ≤ 240 (S0E 217);
+  - final landmarks 210 k → ≤ 150 k;
+  - V1_03 LF 0.100 → ≤ 0.065 and causal ≤ 0.080;
+  - V2_02 ≤ 0.085;
+  - MH_04 stays ≤ 0.235 (S0PE 0.227).
+- **Kill:** MH_04 > 0.25, or V1_03 / V2_02 not below S0PE.
+
+**V-d (diagnosis before any fix): the V2_02 26-28.5 s event.**
+- **Run:** a debug run from `start_frame: 400` with `max_frames: 200`, which covers frames 480-580.
+- **Trace:** keyframe snaps, `[predgap]`, b_a and the window scale through the fast segment.
+- **Question:** whether the 3 % over-scale is born in tracking (V-a then fixes it) or in the window (G6, as rp48's
+  10-keyframe window suggests).
+- **Rule:** no rung for it before the trace.
+
+The rig alternative (rdef or rp48 plus the erase) also attacks cause 1. It costs ORB on both cameras every frame, about
++45 % BA time (rdef 144.5 s against S0E 99.0 s of `ba_solve_ms` on V1_03), and the real-time budget (G57) has no room
+for that. It stays behind V-a.
