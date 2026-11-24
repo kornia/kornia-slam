@@ -51,6 +51,15 @@ fn reads_a_run_file() {
 }
 
 #[test]
+fn rectification_defaults_to_the_f32_remap() {
+    let run = parse(r#"(source: Euroc((data: "d")))"#).unwrap();
+    assert_eq!(run.rectification, Rectification::RemapF32);
+    let run = parse(r#"(source: Euroc((data: "d")), rectification: FixedPoint)"#).unwrap();
+    assert_eq!(run.rectification, Rectification::FixedPoint);
+    parse_error(r#"(source: Euroc((data: "d")), rectification: Nearest)"#);
+}
+
+#[test]
 fn an_omitted_system_runs_the_default_pipeline() {
     let run = parse(r#"(source: Euroc((data: "d")))"#).unwrap();
     assert_eq!(

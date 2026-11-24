@@ -2389,3 +2389,59 @@ narrow. Not an untimed stage (K not fired, and process = frame_ms + fe). One RT0
 Re-baseline for the next rungs (read on these fields): keyframe frames cost 102.9-141.9 ms p50 of wall on 2 cores,
 of which the source is 20-34 ms; flow frames are the p50 (38.4-53.1 ms total, of which source 24-34). F3 removes most
 of the source share. Next: F3.
+
+### Results: F3 kernel, stopped at K2 (slower than OpenCV), 2026-11-24
+
+Code: `K/upstream/kornia_imgproc/remap_u8.rs` (`RemapTable`, `remap_u8_table`, `Q10Trunc` / `OpenCvQ5`), `K/rectify.rs`
+(`StereoRemap`), app knob `rectification: RemapF32 | FixedPoint` (default `RemapF32`; the `Stereo:` line gains
+` rectification=FixedPoint` only when set). The interior pixels gather their four taps per lane from the table's
+top-left offset and blend on `i32x8`; the zero pixels, the last source row and the last pixel of the row above it are
+fixed up in scalar after the lane pass.
+
+Tests (release): K1 is clean.
+- `q10_equals_remap_u8_on_the_euroc_maps`: byte-equal to kornia-rs `remap_u8` on both MH_01 rectification maps.
+- `q10_equals_remap_u8_on_the_edge_taps`: byte-equal on every pair of 23 special coordinates (NaN, ±inf, −1e-6, −0.5,
+  exact integers, the open `(w − 1, w)` band, w, h − 2, h − 1, ±1e9), at output widths 1, 7, 8, 11, 23.
+- `q10_rectifies_like_the_rectifier`: `StereoRemap` equals `StereoRectifier::rectify_left/right`.
+- `q5_matches_opencv_remap` (ignored without the fixture): max |diff| ≤ 1 against OpenCV 5.0.0 `convertMaps(CV_16SC2)` +
+  `remap` where all four taps are inside. Fixture from `benches/opencv_remap_fixture.py` on MH_01 cam0
+  `1403636579763555584.png`; the 3.6 MB `.bin` is not committed (as `frontend_opencv.bin`).
+- `tests/rectify_zero_alloc.rs`: a warm `StereoRemap::rectify` allocates nothing.
+
+Bench `benches/bench_upstream_remap_u8.rs` (criterion, 752×480 EuRoC cam0 map, `RAYON_NUM_THREADS=1`). OpenCV arm:
+OpenVINO 2021.4 OpenCV 4.5.3 (`/opt/intel/openvino_2021.4.752/opencv`, the only C++ OpenCV on the laptop), fixed maps
+built once outside the timed loop like our tables. The laptop ran at 0.8-2.0 GHz (`powersave`, i7-9750H) with lane B
+and another SLAM job on cores 0-3, so the absolute times are 3-5x a quiet machine's; the ratios are the measurement.
+
+| arm | core 8 (plan; HT sibling of busy core 2) | core 4 (sibling idle) | OpenCV 5.0.0 via Python, core 4 |
+|---|---|---|---|
+| kornia-rs `remap_u8` | 16.91 ms | 11.57 ms | |
+| ours `Q10Trunc` | 5.10 ms | 3.73 ms | |
+| ours `OpenCvQ5` | 4.88 ms | 3.56 ms | |
+| OpenCV `remap`, `CV_16SC2` maps | 4.30 ms | 2.85 ms | 2.83 ms (median of 15 × 50) |
+| OpenCV `remap`, `CV_32FC1` maps | | | 2.22 ms |
+
+| P/K | prediction | measured | verdict |
+|---|---|---|---|
+| bench P1 | ≤ 1.0 ms per image on one laptop core | 3.56-5.10 ms (at 0.8-2 GHz) | missed |
+| bench P2 | ≥ 5x faster than `remap_u8` at `RAYON_NUM_THREADS=1` | 3.1x (core 4), 3.3x (core 8) | missed |
+| bench P3 | time ÷ OpenCV ≤ 1.0 | Q10 1.31 (core 4), 1.19 (core 8); OpenCV 5.0 `CV_32FC1` is faster still | missed |
+| K1 | any byte differs from `remap_u8` | none | not fired |
+| K2 | slower than OpenCV | 1.19-1.31x OpenCV 4.5.3, 1.32x OpenCV 5.0 | **fired: stop and report (owner rule)** |
+| system P / K3 | `source_ms` p50 32 → 8-11; CPU −17 to −20 ms per frame | not run | not run (stopped at K2) |
+
+Identity of the committed code (binary `E/bin-rt-a-f3/kornia-slam-euroc`, md5 `bc099e5253ec9e4651340380da63bece`):
+knob off `IDENT_V102_OK`, `HEADER_OK`, `IDENT_R01_OK` (md5 `d4f77b567b912b5a4caa2af6085a35b1`); knob on, SYNC S0E V1_02
+with `rectification: FixedPoint` (`E/rt-a/ident_knob.sh`): `traj.txt` and `traj_smoothed.txt` `cmp`-identical to the
+same binary knob off. On that unpaced 12-core pair `source_ms` p50 is 12.5 (off, rayon) and 11.0 (on, one thread);
+this is not the 2-core F3 measurement, which was not run.
+
+**Diagnosis (unverified; no profile of the kernel was taken).** At 0.8 GHz OpenCV costs about 6 cycles per pixel and
+ours about 8. Our lane pass vectorises only the blend: per pixel it loads a u32 offset and two u16 weights, does one
+bounds-checked slice and four byte loads into scalar arrays, and stores eight bytes one by one; the blend is six i32
+multiplies per pixel. OpenCV's `RemapVec_8u`, from memory (no source on disk, not checked), reads each tap row as one 16-bit
+load and blends with 16-bit multiply-adds from a 1024-entry weight table indexed by the 5-bit fractions. The next
+version would: read the two taps of a row as one `u16`; blend in `i16x8` multiply-add (`Q5` weights fit in i16; `Q10`
+needs `(p01 − p00)·fx` style blends to stay in i16, or i32 for the vertical step only); drop the per-pixel slice check
+(the offsets are proven in range at build). Whether that reaches OpenCV is not known. Waiting for the owner before
+any more F3 work; the knob stays at `RemapF32`.

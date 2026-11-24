@@ -19,7 +19,7 @@ use kornia_slam::mapping::global_vi_ba::OfflineBaConfig;
 use kornia_slam::system::ConfigError;
 use serde::Deserialize;
 
-use crate::source::SourceConfig;
+use crate::source::{Rectification, SourceConfig};
 
 /// One run: where the data comes from and how it is processed.
 #[derive(Debug, Clone, Deserialize)]
@@ -37,6 +37,9 @@ pub struct RunConfig {
     /// Settings of the `offline-ba` subcommand; the online run never reads them.
     #[serde(default)]
     pub offline_ba: OfflineBaConfig,
+    /// How a raw stereo pair is rectified.
+    #[serde(default)]
+    pub rectification: Rectification,
 }
 
 /// A run file that cannot be read or does not describe a valid run.

@@ -63,3 +63,8 @@ required-features = ["bench_internals"]
 name = "bench_upstream_corner_subpix"
 harness = false
 required-features = ["bench_internals"]
+
+[[bench]]
+name = "bench_upstream_remap_u8"
+harness = false
+required-features = ["bench_internals"]

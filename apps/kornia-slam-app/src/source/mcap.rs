@@ -25,8 +25,8 @@ use kornia_slam::SensorSelection;
 use serde::Deserialize;
 
 use super::{
-    FrameItem, FrameSource, OpenedSource, SourceError, decode_jpeg_to_luma, no_imu, rectify_pair,
-    resolve, stereo_needs_calib,
+    FrameItem, FrameSource, OpenedSource, PairRectifier, Rectification, SourceError,
+    decode_jpeg_to_luma, no_imu, resolve, stereo_needs_calib,
 };
 use crate::datasets::StereoCalib;
 
@@ -70,7 +70,11 @@ impl McapConfig {
         }
     }
 
-    pub(super) fn open(&self, stereo: bool) -> Result<OpenedSource, SourceError> {
+    pub(super) fn open(
+        &self,
+        stereo: bool,
+        rectification: Rectification,
+    ) -> Result<OpenedSource, SourceError> {
         let source = match (&self.calib, stereo) {
             (Some(calib), true) => McapSource::open_stereo(
                 &self.path,
@@ -79,6 +83,7 @@ impl McapConfig {
                 calib,
                 self.start_frame,
                 self.max_frames,
+                rectification,
             )?,
             _ => McapSource::open(&self.path, &self.channel, self.start_frame, self.max_frames)?,
         };
@@ -183,10 +188,14 @@ impl McapSource {
         calib_path: &Path,
         start_frame: usize,
         max_frames: usize,
+        rectification: Rectification,
     ) -> Result<Self, SourceError> {
         let bytes = fs::read(path).map_err(SourceError::Io)?;
         let calib = StereoCalib::load(calib_path).map_err(SourceError::other)?;
-        let rectifier = calib.rectifier().map_err(SourceError::other)?;
+        let rectifier = PairRectifier::new(
+            calib.rectifier().map_err(SourceError::other)?,
+            rectification,
+        )?;
         let rect_cam = rectifier.rectified_camera();
 
         let left = read_channel(&bytes, left_suffix)?;
@@ -213,7 +222,7 @@ impl McapSource {
         let prepared: Vec<PreparedFrame> = sel
             .into_iter()
             .map(|(t, limg, rimg)| {
-                let (image, right_image) = rectify_pair(&rectifier, &limg, &rimg)?;
+                let (image, right_image) = rectifier.rectify(&limg, &rimg)?;
                 Ok(PreparedFrame {
                     timestamp_sec: t - t0,
                     image,

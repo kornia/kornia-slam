@@ -48,6 +48,7 @@ pub mod initialization;
 pub mod loop_closure;
 pub mod mapping;
 mod pose_conversion;
+pub mod rectify;
 pub mod rig;
 pub mod stereo;
 pub mod system;

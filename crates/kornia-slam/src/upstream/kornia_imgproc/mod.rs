@@ -7,3 +7,4 @@ pub mod lk_window;
 #[cfg(test)]
 mod opencv_fixture;
 pub mod pyrdown_u8;
+pub mod remap_u8;
