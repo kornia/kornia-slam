@@ -1876,3 +1876,50 @@ rayon threads, 900 s cap, plus a gate of at most 3 heavy jobs counting `cargo`).
   Basalt.
 
 Not in this rung: code, R13c (keyframe acceptance), promotion (full-sequence gate first).
+
+### Results: R13a, S0PEI (S0PE + per-frame pose-inertial tracking), stopped by K1 (2026-11-24)
+
+Binary `E/bin-r11b/kornia-slam-euroc`, md5 `e67615adaf558b4aef7b7d1e35a2fb40`. Driver `E/r13/drive.sh` (two lanes,
+lists `E/r13/r13a_{A,B}.full.txt`), SYNC, unpaced, 05:19-05:24. Three runs made, all `rc=0`, every header
+`diff`-identical to `E/expect/S0PEI.header` (= `S0PE.header`), `pose_inertial_solves` 1614-1961 > 0 on every run, so
+the knob was live. The first MH_04 run fired K1; the lists were emptied and no further run was started (11 of 14 not
+run). Table `E/r13/report.py`. SE(3) ATE RMSE, m, body centre, causal (`traj.txt`).
+
+| seq | start | S0PE causal | S0PEI causal | S0PEI smoothed | tracked / frames | coast_inertial (S0PE) | pose_inertial_solves / kf-anchored | keyframes (S0PE) | step 63.3-66.7 s, m (S0PE) | cf floor | tilt 65-79 s (S0PE) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| MH_04 | 0 | 0.227 | 0.177 | 0.100 | 2031 / 2032 | **1** (0) | 1961 / 367 | 375 (365) | −0.22 (−0.54) | 0.133 | 1.80° (2.43°) |
+| MH_04 | 1 | 0.227 | 0.177 | 0.100 | 2031 / 2032 | **1** (0) | 1961 / 367 | 375 | −0.22 (−0.54) | 0.133 | 1.80° (2.43°) |
+| V1_02 | 0 | 0.036 | 0.035 | 0.025 | 1687 / 1710 | 1 (1) | 1614 / 443 | 452 (450) | - | - | - |
+
+MH_04 start 1 is byte-identical to start 0 (`traj.txt` cmp), as it is for S0PE; the three runs are two independent
+points. Basalt: MH_04 0.114, V1_02 0.045.
+
+| P/K | prediction | measured | verdict |
+|---|---|---|---|
+| P1 | MH_04 step ≥ −0.25 m, every start | −0.22 (S0PE −0.54) | as predicted (1 independent start) |
+| P2 | MH_04 causal median 0.12-0.17, every start ≤ 0.19 | 0.177 | missed the median band (0.007 above), inside the 0.19 cap |
+| P3 | MH_04 tilt median 65-79 s ≤ 1.5° | 1.80° (S0PE 2.43°) | missed |
+| P4 | tracked = frames, `coast_inertial=0`, `give_ups=0`, `pose_inertial_solves` > 0 | MH_04 2031 / 2032, `coast_inertial=1`; V1_02 1687 / 1710, `coast_inertial=1` (22 bootstrap skips) | missed |
+| P5 | guards ≤ 1.15x S0PE | V1_02 0.035 (S0PE 0.036); V2_01, MH_01 not run | V1_02 inside |
+| K1 | any run below 100 % tracked or `coast_inertial` > 0 | MH_04 start 0, frame 1495 | **fired** |
+| K2, K3 | - | not reached (stop at K1) | - |
+
+**Diagnosis (owner rule; unverified parts marked).**
+- **K1 on MH_04 is a new defect of the pose-inertial path.** S0, S0E and S0PE track 100 % of every MH_04 start (0, 1,
+  2, 30, 60) with `coast_inertial=0`. S0PEI coasts on frame 1495 (74.75 s, after the dark span, inside the 65-79 s
+  tilt window). That is the frame where S0PE inserts keyframe 1494 (`KeyframeAccepted`); in S0PEI the frame reports
+  `Skipped`, counted by `record_frame` as `SkipKind::Coasting { inertial: true }` (`system/counters.rs:198`). The next
+  frames track normally (`give_ups=0`, `imu_trust_lost=0`, `pose_inertial_prior_dropped=0`). Unverified: why the
+  frame-level solve failed on a keyframe-due frame. The log has no per-frame reason line and no debug run was made.
+- **The K1 wording does not fit the guards.** S0PE itself fails "100 % tracked, `coast_inertial=0`" on V1_02 (22
+  bootstrap skips, 1 coast, on every start 0/1/2) and V2_01 (2-5 coasts); see `E/runs/S0PE_*/err.log`. On V1_02,
+  S0PEI matches S0PE (1687 tracked, 1 coast), so the guard shows no new defect. A restated K1 should read
+  "tracked or `coast_inertial` worse than the same start's S0PE"; MH_04 fires that version too (0 → 1).
+- **The mechanism moves as theorised.** On the one independent MH_04 start, the step drops from −0.54 to −0.22 m, the
+  65-79 s tilt from 2.43° to 1.80°, and the causal score from 0.227 to 0.177 (−22 %). The counterfactual floor (0.133)
+  is 0.015 above S0PE's (0.118): the rest of the run is slightly worse with the knob on. This is one start and is not
+  credited; the score needs a K1-clean run.
+
+**Verdict.** Stopped by K1 (the card H defect fires on EuRoC MH_04). Per the rule, card H (the per-frame pose-inertial
+path's failure on keyframe-due frames) comes first. Then rerun R13a with K1 restated against S0PE's own counts. Nothing
+promoted.
