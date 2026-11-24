@@ -23,6 +23,7 @@ use crate::mapping::map::StateEnvelope;
 use crate::mapping::marginalization::BoundaryPrior;
 use crate::mapping::outlier_erase::OutlierErase;
 use crate::mapping::{GrowthNeighbours, KeyframeSeed};
+use crate::odometry::{Odometry, OdometryImuNoise, OdometryMode};
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
 use crate::tracking::pose_gate::PoseGate;
@@ -111,6 +112,8 @@ pub enum ConfigError {
     PoseInertialWithLockFreeFlow,
     #[error("`{0}` needs loop closing's vocabulary: enable `pipeline.loop_closing`")]
     RelocalizationWithoutVocabulary(&'static str),
+    #[error("odometry SlidingWindow needs {needs}")]
+    OdometryNeeds { needs: &'static str },
     #[error("frontend.{knob} needs {needs}")]
     FrontendKnobNeeds {
         knob: &'static str,
@@ -201,6 +204,7 @@ impl OrbSlamPipeline {
                 AT_LEAST_ONE,
             )?;
         }
+        validate_odometry(&self.odometry, sensors)?;
         validate_lost_keyframes(
             self.mapping.local_ba.lost_keyframes,
             self.tracking_loss.keyframes_while_lost,
@@ -580,6 +584,36 @@ fn validate_flow(
     // `SlamSystem::build` has no tracking path for it yet (R-C6).
     if frontend.keyframe_orb == KeyframeOrb::Mapping {
         return needs("keyframe_orb", UNBUILT);
+    }
+    Ok(())
+}
+
+/// The sliding window runs on a rectified pair and the IMU; `Drive` has no
+/// tracking path yet (rung 2x-6).
+fn validate_odometry(odometry: &Odometry, sensors: &SensorSelection) -> Result<(), ConfigError> {
+    let Some(window) = odometry.sliding_window() else {
+        return Ok(());
+    };
+    if !sensors.imu {
+        return Err(ConfigError::InertialKnobWithoutImu("odometry"));
+    }
+    if sensors.cameras != CameraSelection::Stereo {
+        return Err(ConfigError::OdometryNeeds {
+            needs: "sensors.cameras: Stereo (a rectified pair)",
+        });
+    }
+    if window.mode == OdometryMode::Drive {
+        return Err(ConfigError::OdometryNeeds { needs: UNBUILT });
+    }
+    if let OdometryImuNoise::Explicit(noise) = window.imu_noise {
+        for (field, value) in [
+            ("gyro_noise", noise.gyro_noise),
+            ("accel_noise", noise.accel_noise),
+            ("gyro_bias_noise", noise.gyro_bias_noise),
+            ("accel_bias_noise", noise.accel_bias_noise),
+        ] {
+            check(format!("odometry.imu_noise.{field}"), value, POSITIVE)?;
+        }
     }
     Ok(())
 }

@@ -20,6 +20,9 @@ mod trace;
 mod validation;
 pub mod wheel;
 
+pub use crate::odometry::{
+    Odometry, OdometryImuNoise, OdometryMode, OdometryTuning, SlidingWindowConfig,
+};
 pub use build::BuildError;
 pub use config::{
     AnchorGuard, BoundedFanOut, CameraSelection, FanOut, FlowBookkeeping, FlowPose,

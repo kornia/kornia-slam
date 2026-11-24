@@ -10,6 +10,14 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**Sliding-window VI odometry (rung 2x-4), off by default.**
+- `pipeline.odometry`: `MapTracking` (default, today's tracking) or
+  `SlidingWindow(( mode: Observe, imu_noise: Rig ))`, a Basalt-style fixed-lag
+  visual-inertial smoother over the rectified stereo pair. It needs
+  `sensors.cameras: Stereo` and the IMU; `mode: Drive` parses and is refused
+  until it is built; `imu_noise: Explicit(( .. ))` sets the four noise
+  densities. When set, the header names it in one line.
+
 - EuRoC runs as `cameras: Rig`: raw cam0 and cam1, each with its own radtan
   intrinsics and `T_BS`, so flow can track both cameras
   (`configs/euroc-rig-imu-loop.ron`). A distorted pinhole rig now matches its

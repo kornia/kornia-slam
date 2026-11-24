@@ -20,6 +20,7 @@ use crate::mapping::outlier_erase::OutlierErase;
 use crate::mapping::vi_ba_schur::ImuHuber;
 use crate::mapping::visual_information::{FisheyeWeight, VisualInformation};
 use crate::mapping::{GrowthNeighbours, KeyframeGrowth, KeyframeSeed, LocalMappingMode};
+use crate::odometry::{Odometry, OdometryImuNoise, OdometryTuning};
 use crate::tracking::local_map::LocalMapRules;
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::{KeyframeObservations, MapProjectionConfig};
@@ -111,6 +112,8 @@ pub struct OrbSlamPipeline {
     pub tracking: TrackingConfig,
     pub inertial: InertialConfig,
     pub fan_out: FanOut,
+    /// Where each frame's pose comes from; `MapTracking` by default.
+    pub odometry: Odometry,
     /// Algorithm tuning, set from Rust only: configuration files always use the
     /// defaults.
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -812,6 +815,8 @@ pub struct OrbTuning {
     pub loss_recovery: TrackingLossRecoveryPolicy,
     /// Used when loop closing is enabled.
     pub loop_correction: LoopClosingConfig,
+    /// Used by `odometry: SlidingWindow`.
+    pub odometry: OdometryTuning,
 }
 
 /// One line per enabled stage with its resolved settings.
@@ -859,6 +864,21 @@ impl fmt::Display for SystemConfig {
             writeln!(f, "  IMU integration")?;
         }
         writeln!(f, "  tracking")?;
+        if let Some(window) = orb.odometry.sliding_window() {
+            write!(
+                f,
+                "  odometry: sliding window, {:?}, IMU noise ",
+                window.mode
+            )?;
+            match window.imu_noise {
+                OdometryImuNoise::Rig => writeln!(f, "Rig")?,
+                OdometryImuNoise::Explicit(n) => writeln!(
+                    f,
+                    "explicit (gyro {}, accel {}, gyro walk {}, accel walk {})",
+                    n.gyro_noise, n.accel_noise, n.gyro_bias_noise, n.accel_bias_noise
+                )?,
+            }
+        }
         if let FanOut::Bounded(bounded) = orb.fan_out {
             writeln!(
                 f,

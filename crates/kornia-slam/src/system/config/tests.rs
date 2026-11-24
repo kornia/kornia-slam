@@ -10,6 +10,7 @@ use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
 use crate::mapping::map::{StateEnvelope, StateEnvelopeLimits};
 use crate::mapping::marginalization::{BoundaryPrior, FrozenPoseSigma};
 use crate::mapping::visual_information::{FisheyeWeight, VisualInformation};
+use crate::odometry::{Odometry, OdometryImuNoise, OdometryMode, SlidingWindowConfig};
 use crate::system::ConfigError;
 #[cfg(feature = "serde")]
 use crate::system::LoadError;
@@ -1552,6 +1553,101 @@ fn the_mapping_acceptance_is_named_in_the_header_only_when_set() {
     );
 }
 
+fn sliding_window(mode: OdometryMode, imu_noise: OdometryImuNoise) -> Odometry {
+    Odometry::SlidingWindow(SlidingWindowConfig { mode, imu_noise })
+}
+
+fn with_odometry(odometry: Odometry, sensors: SensorSelection) -> SystemConfig {
+    let mut config = SystemConfig {
+        sensors,
+        ..SystemConfig::default()
+    };
+    orb_mut(&mut config).odometry = odometry;
+    config
+}
+
+/// T8: the sliding window needs the IMU and a rectified pair, `Drive` is
+/// not built, and explicit noise densities are finite and positive.
+#[test]
+fn the_odometry_knob_is_validated() {
+    let observe = sliding_window(OdometryMode::Observe, OdometryImuNoise::Rig);
+    let stereo_imu = sensors(CameraSelection::Stereo, true);
+    assert_eq!(with_odometry(observe, stereo_imu).validate(), Ok(()));
+    assert_eq!(
+        with_odometry(Odometry::MapTracking, sensors(CameraSelection::Mono, false)).validate(),
+        Ok(())
+    );
+    assert_eq!(
+        with_odometry(observe, sensors(CameraSelection::Stereo, false)).validate(),
+        Err(ConfigError::InertialKnobWithoutImu("odometry"))
+    );
+    for cameras in [CameraSelection::Mono, CameraSelection::Rig] {
+        assert!(matches!(
+            with_odometry(observe, sensors(cameras, true)).validate(),
+            Err(ConfigError::OdometryNeeds { needs }) if needs.contains("Stereo")
+        ));
+    }
+    let drive = sliding_window(OdometryMode::Drive, OdometryImuNoise::Rig);
+    assert_eq!(
+        with_odometry(drive, stereo_imu).validate(),
+        Err(ConfigError::OdometryNeeds {
+            needs: super::super::validation::UNBUILT
+        })
+    );
+    let basalt = kornia_sensors::imu::ImuCalib {
+        gyro_noise: 2.82e-4,
+        accel_noise: 1.6e-2,
+        gyro_bias_noise: 1.0e-4,
+        accel_bias_noise: 1.0e-3,
+    };
+    let explicit = |noise| sliding_window(OdometryMode::Observe, OdometryImuNoise::Explicit(noise));
+    assert_eq!(
+        with_odometry(explicit(basalt), stereo_imu).validate(),
+        Ok(())
+    );
+    for (field, bad) in [
+        ("gyro_noise", 0.0),
+        ("accel_noise", -1.0),
+        ("gyro_bias_noise", f64::NAN),
+        ("accel_bias_noise", f64::INFINITY),
+    ] {
+        let mut noise = basalt;
+        match field {
+            "gyro_noise" => noise.gyro_noise = bad,
+            "accel_noise" => noise.accel_noise = bad,
+            "gyro_bias_noise" => noise.gyro_bias_noise = bad,
+            _ => noise.accel_bias_noise = bad,
+        }
+        let config = with_odometry(explicit(noise), stereo_imu);
+        assert_eq!(
+            invalid_setting(&config).as_deref(),
+            Some(format!("odometry.imu_noise.{field}").as_str())
+        );
+    }
+}
+
+/// T8: one header line only when the knob is on, so the golden headers of
+/// every existing arm hold.
+#[test]
+fn the_odometry_knob_is_named_in_the_header_only_when_set() {
+    let stereo_imu = sensors(CameraSelection::Stereo, true);
+    let off = with_odometry(Odometry::MapTracking, stereo_imu).to_string();
+    assert!(!off.contains("odometry"), "{off}");
+    let on = with_odometry(
+        sliding_window(OdometryMode::Observe, OdometryImuNoise::Rig),
+        stereo_imu,
+    )
+    .to_string();
+    assert!(
+        on.contains("  tracking\n  odometry: sliding window, Observe, IMU noise Rig\n"),
+        "{on}"
+    );
+    assert_eq!(
+        on.replace("  odometry: sliding window, Observe, IMU noise Rig\n", ""),
+        off
+    );
+}
+
 #[cfg(feature = "serde")]
 mod ron_files {
     use std::path::Path;
@@ -1559,6 +1655,49 @@ mod ron_files {
     use super::*;
     use crate::loop_closure::OdometryRandomWalk;
     use crate::tracking::Stillness;
+
+    /// T8: the knob's RON shapes parse, round trip, and `Drive` parses but
+    /// is refused.
+    #[test]
+    fn the_odometry_knob_parses_and_round_trips() {
+        let at = |odometry: &str| {
+            parse(&format!(
+                "(version: 1, sensors: (cameras: Stereo, imu: true), pipeline: OrbSlam((odometry: {odometry})))"
+            ))
+        };
+        let default = parse("(version: 1)").unwrap();
+        assert_eq!(orb(&default).odometry, Odometry::MapTracking);
+        assert_eq!(
+            orb(&at("MapTracking").unwrap()).odometry,
+            Odometry::MapTracking
+        );
+        let observe = at("SlidingWindow(( mode: Observe ))").unwrap();
+        assert_eq!(
+            orb(&observe).odometry,
+            Odometry::SlidingWindow(SlidingWindowConfig::default())
+        );
+        assert_eq!(ron(&observe), ron(&parse(&ron(&observe)).unwrap()));
+        let explicit = at(
+            "SlidingWindow(( mode: Observe, imu_noise: Explicit(( gyro_noise: 2.82e-4, \
+             accel_noise: 1.6e-2, gyro_bias_noise: 1.0e-4, accel_bias_noise: 1.0e-3 )) ))",
+        )
+        .unwrap();
+        let Some(window) = orb(&explicit).odometry.sliding_window() else {
+            panic!("not a sliding window");
+        };
+        assert!(
+            matches!(window.imu_noise, OdometryImuNoise::Explicit(n) if n.accel_noise == 1.6e-2)
+        );
+        assert_eq!(ron(&explicit), ron(&parse(&ron(&explicit)).unwrap()));
+        assert!(matches!(
+            at("SlidingWindow(( mode: Drive ))"),
+            Err(LoadError::Invalid(ConfigError::OdometryNeeds { .. }))
+        ));
+        assert!(rejects_field(
+            "(version: 1, pipeline: OrbSlam((odometry: SlidingWindow(( window: 3 )))))",
+            "window"
+        ));
+    }
 
     #[test]
     fn the_keyframe_growth_parses() {
