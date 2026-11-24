@@ -1976,3 +1976,63 @@ CPU and beats Basalt on V1_02 and MH_01. Its stated purpose, less lag, missed (P
 tracking-thread work. RT3E becomes the real-time base arm; it is not promoted (full-sequence gate first). The lag
 lever is the tracking thread: R13c keyframe acceptance, or moving `keyframe_insert` work off the tracking thread
 (G57 fix list), not the BA budget.
+
+### R13a debug: why S0PEI coasts at MH_04 frame 1494 (card H), K1 restated (2026-11-24, before the rerun)
+
+Debug runs (`KORNIA_SLAM_DEBUG=1 --debug`, `E/debug/run_debug_r13.sh`, binary md5 `e67615ad…`):
+- `E/debug/R13a-S0PEI-MH04-s1400` (start 1400, 200 frames): 200 / 200 tracked, `coast_inertial=0`. A later start does
+  not reproduce the coast, because the map is a different one.
+- `E/debug/R13a-S0PEI-MH04-full1600` (start 0, 1600 frames): 1599 / 1600 tracked, `coast_inertial=1`. `traj.txt` is
+  byte-identical to the batch run's first 1495 lines.
+
+The coasted frame is index 1494 (73.7 s after the first frame). Status lines are numbered from 1, so the log calls it
+`[ 1495]`.
+
+**Mechanism (measured).**
+1. Frames 1490-1494 are a match drought: 30-36 map matches against a median of 150 per frame over the run. At frame
+   1494, visual PnP (map projection) accepts 31 inliers of 31 matches (`[predgap] inl=31 m=31`), at or above
+   `pnp.min_inliers` = 30.
+2. `refine_pose_inertial` (`K/system/estimator.rs:348-428`) then solves the frame. The anchor is the previous frame's
+   prior (`anchor=frame`, prior present), with gates `CHI2_FRAME_MONO` 5.991 on every round. It keeps 29: 2 rows exceed
+   the gate, also after the rescue below 30 inliers (χ² < 18, `pose_inertial.rs:139-145`). 29 < 30 is
+   `pose_inertial_rejects`, and the frame fails as `LowPnpInliers` (`K/system/mod.rs:2025-2030`).
+3. The solve itself is healthy. `imu_chi2=0.004`, and the previous frames have 0.005-0.006. The carried velocity
+   (−2.638, 0.296, 0.242) m/s matches the window's newest keyframe state (−2.645, 0.256, 0.206); `ba` = (−0.080, 0.061,
+   −0.132) m/s², `bg` = (−0.003, 0.020, 0.077) rad/s. Frame 1495 is anchored on the new keyframe and tracks 73 / 73.
+   So nothing diverged. The IMU and the 29 rows agree; the frame fails on a count.
+4. The keyframe that was due is inserted at the inertial prediction (`[lost] keyframe inserted at the inertial
+   prediction`), and tracking resumes at once. Cost: one pose not written (2031 of 2032); the score effect is at most
+   one frame's error.
+
+**Diagnosis.** The pose-inertial path rejects below 30 inliers, the visual-only bar (`PnpConfig::min_inliers`). ORB-SLAM3
+applies its inertial bar after the pose-inertial solve: `TrackLocalMap` fails an IMU-stereo frame below 15 inliers. The
+visual path here already has that bar (`MapProjectionConfig::min_inliers_with_prediction` = 15, with a trusted
+inertial prediction), but `refine_pose_inertial` does not use it. The solve removes the 1-2 rows that the IMU-consistent
+pose rejects. That is its job, and it is what pushes a 31-inlier frame under 30. S0PE never runs the solve, so it
+keeps the frame.
+
+**Config-level fix: none.** Both thresholds live in `OrbTuning` (`K/system/config/mod.rs:752-760`, "thresholds that
+configuration files do not expose"). `pose_inertial: LastKeyframe` would change the anchor and the gates (12 / 7.5 /
+5.991 / 5.991) on every frame, which is another arm, not a fix. The rerun therefore runs S0PEI unchanged.
+
+**Proposed code fix (card H, not in this rerun).** In `refine_pose_inertial`, accept at `min_inliers_with_prediction`
+(15) instead of `pnp.min_inliers` (30), as ORB-SLAM3 `TrackLocalMap` does for IMU stereo. Predictions:
+- MH_04 start 0: 2032 / 2032 tracked, `coast_inertial=0`; frame 1494 accepted with 29 inliers.
+- Causal within ±0.005 of S0PEI start 0 (0.177), since one frame changes.
+- No run gains a coast against S0PE on the same start.
+- Kill: any new coast or `give_ups` > 0 with the lower bar (a frame with 15-29 inliers that then diverges).
+
+**K1 restated (owner, 2026-11-24; replaces K1 of R13a for the rerun).** K1 fires on a run whose `coast_inertial` is
+above, or whose tracked count is below, S0PE's on the same sequence and start (`E/runs/S0PE_<seq>_s<start>_r1`).
+S0PE references:
+
+| seq | start 0 | start 1 | start 2 | start 30 | start 60 |
+|---|---|---|---|---|---|
+| MH_04 | 2032, 0 | 2032, 0 | 2031, 0 | 2003, 0 | 1973, 0 |
+| V1_02 | 1687, 1 | 1687, 1 | 1687, 1 | - | - |
+| V2_01 | 2275, 5 | 2277, 2 | 2273, 5 | - | - |
+| MH_01 | 3682, 0 | 3681, 0 | 3680, 0 | - | - |
+
+(Tracked frames, `coast_inertial`.) From the debug run, the restated K1 fires on MH_04 starts 0 and 1 by construction
+(byte-identical runs). The rerun scores P1-P5 on all 14 runs regardless and reports K1 per start. P4 also reads
+against S0PE's counts in place of "tracked = frames". The other predictions and K2 / K3 are unchanged.
