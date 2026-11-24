@@ -2687,3 +2687,88 @@ remains is about 3.5-5 ms p50: PNG decode plus the remap at 0.6 ms per image. Th
 except on V1_02, where the BA thread's share is largest (31 iterations per solve; profile) and run-to-run noise in it
 is larger than the 12 ms saving. Bench and system agree. Under answer 7, F3 may become the default after the identity
 checks alone. That is a default change, so it waits for the owner (stop point 8). Next in the ladder: F2.
+
+### Experiment G11: the current best stack on all 11, one binary, one config per arm (predictions written 2026-11-24 before the runs)
+
+Measurement only: no code, no build. Every number in this rung comes from one binary,
+`E/bin-integ2/kornia-slam-euroc` (md5 `e97329d40ad54bd38ad521376e78bf92`, the round-2 integration build; every knob
+present, all off by default). Its knob-off identity is recorded: `E/integ/ident.sh` with this `BIN`, run dirs
+`E/integ/ident-V1_02` and `E/integ/ident-r01` (19:30-19:33, after the binary's 19:30:12 copy): `IDENT_V102_OK`
+(S0 V1_02 `traj.txt` and `traj_smoothed.txt` `cmp`-identical to `E/runs/S0_V1_02_medium_s0_r1`), `HEADER_OK`,
+`IDENT_R01_OK` (md5 `d4f77b567b912b5a4caa2af6085a35b1`).
+
+Header probe (3 frames, V1_02, `max_frames: 3`, `E/gate/probe/`): the header of each arm on this binary is
+`diff`-identical to its golden header, which was written on older binaries: RT3E and RT3EF against
+`E/expect/RT3E.header`, S0PEI against `S0PEI.header`, S0PEIH against `S0PEIH.header`. RT3EF prints
+`rectification=FixedPoint` after the header; RT3E prints no rectification line.
+
+**Arms.**
+- **RT3E (real time, the claim):** RT1PE + `local_ba: ( max_iterations: 7, initial_lambda: 1e-4 )`, default rayon.
+  Async, `--pace-timestamps`, `taskset -c 0,1`, start 0, scored causal on `traj.txt`. Run dirs `E/runs/G-RT3E_*`.
+- **RT3EF:** RT3E + `rectification: FixedPoint` (F3). Output-identical under SYNC (F3 identity); under real time it
+  frees 10-13 ms of source work per frame. A separate arm, never pooled with RT3E. Run dirs `E/runs/GF-RT3E_*`.
+- **S0PEI (SYNC):** S0PE + `tracking: ( pose_inertial: OrbSlam3 )`. Unpaced, all threads, 900 s cap, starts 0/1/2.
+  Run dirs `E/runs/G-S0PEI_*`.
+- **S0PEIH (SYNC):** S0PEI + `pose_inertial_min_inliers: WithPrediction` (card H bar at 15). Same set. Its R13a median
+  matched S0PEI's, so both are reported. Run dirs `E/runs/G-S0PEIH_*`.
+
+**Protocol.** Real time: `E/gate/rt_all.sh` → `E/gate/rt_one.sh`, each run under `flock
+/home/edgar/dev/split/.pr180-fix/rt.lock` (shared with lane B), 11 sequences × 3 runs per arm, RT3E and RT3EF
+interleaved per sequence and run. Stricter than `rt-a/rt_one.sh`: a run starts only with no other `kornia-slam*`
+process, no `cargo`/`rustc`, 1-min load ≤ 6; any other `kornia-slam*` process alive during the run (watcher
+`E/gate/pinwatch.log`, every 2 s, any affinity) marks it contaminated and it is rerun. SYNC: `E/gate/drive.sh`, two
+lanes (`E/gate/sync_{A,B}.txt`), at most 2 `kornia-slam*` and 3 heavy jobs, and no start while the RT lock is held.
+Scoring: `E/score.py` (body centre, causal `traj.txt` and smoothed `traj_smoothed.txt`, also on ORB-SLAM3's span),
+F1 fields from `err.log`.
+
+**Baselines used for the predictions** (SYNC causal, median of starts 0/1/2, this card):
+
+| seq | S0 | S0P | S0E | S0PE | S0PE ÷ S0 | S0PEI(H) | RT3E (r1, r2) |
+|---|---|---|---|---|---|---|---|
+| MH_01 | 0.090 | 0.057 | 0.072 | 0.049 | 0.54 | 0.049 | 0.048, 0.038 |
+| MH_04 | 0.302 | 0.254 | 0.311 | 0.227 | 0.75 | 0.177 / 0.178 | 0.213, 0.215 |
+| V1_02 | 0.102 | 0.063 | 0.040 | 0.036 | 0.35 | 0.035 | 0.038, 0.050 |
+| V1_03 | 0.188 | 0.118 | 0.072 | 0.111 | 0.59 | - | 0.100, 0.145 |
+| V2_01 | 0.200 | 0.050 | 0.055 | 0.056 | 0.28 | 0.046 | 0.044, 0.051 |
+| V2_02 | 0.162 | 0.120 | 0.080 | 0.091 | 0.56 | - | 0.097, 0.101 |
+| MH_02 | 0.060 | - | - | - | - | - | - |
+| MH_03 | 0.071 | - | - | - | - | - | - |
+| MH_05 | 0.178 | - | - | - | - | - | - |
+| V1_01 | 0.079 | - | - | - | - | - | - |
+| V2_03 | 0.605 (89-94 coasts) | - | - | - | - | - | - |
+
+**Theory for the five new sequences.** S0 → S0PE removes two error sources: the visual outlier tail (G56, erase) and
+links to non-inlier observations (PnpInliers). Both are largest where S0's error is largest relative to its smoothed
+output. On the Machine Hall the stack took 0.54-0.75x of S0 (MH_01, MH_04); in the Vicon rooms 0.28-0.59x (V1_02,
+V1_03, V2_01, V2_02). The pose-inertial tracking (S0PEI) adds 0.78x where a dark span or a match drought sets the
+error (MH_04) and about 1.0x elsewhere (MH_01, V1_02); V2_01 0.82x. Real time on 2 cores has been 0.85-1.2x of the
+SYNC S0PE value on the six measured sequences (MH_01 0.88, MH_04 0.94, V1_02 1.22, V1_03 1.10, V2_01 0.84, V2_02 1.09).
+
+**Predictions (causal, median of 3).**
+
+| seq | Basalt | S0 | S0PEI / S0PEIH SYNC | RT3E / RT3EF real time | expected vs Basalt | reasoning |
+|---|---|---|---|---|---|---|
+| MH_02 | 0.048 | 0.060 | 0.030-0.048 | 0.030-0.055 | below SYNC; RT probably below | MH ratio 0.54-0.75 on an easy hall like MH_01 |
+| MH_03 | 0.062 | 0.071 | 0.036-0.055 | 0.035-0.065 | below SYNC; RT around | same MH ratio; S0 smoothed 0.041-0.052 is the floor the causal output approaches |
+| MH_05 | 0.144 | 0.178 | 0.085-0.135 | 0.085-0.160 | below SYNC; RT around | dark hall like MH_04: MH_04 ratio 0.75 then 0.78x pose-inertial; S0 smoothed 0.079-0.088 |
+| V1_01 | 0.043 | 0.079 | 0.035-0.060 | 0.035-0.070 | around; more likely above | Vicon ratio 0.28-0.59 gives 0.022-0.047, but S0 smoothed 0.064-0.088 says most of V1_01's error is not the outlier tail; rig rdef 0.057 |
+| V2_03 | 0.230 | 0.605 | 0.15-0.40 | 0.15-0.45 | around | Vicon ratio 0.28-0.59 on 0.605; 89-94 coasts in S0 (fast motion, motion blur) stay a source no rung has touched |
+| MH_01 | 0.067 | 0.090 | 0.041-0.050 | 0.035-0.050 | below | measured: S0PEI(H) 0.049, RT3E 0.043 |
+| MH_04 | 0.114 | 0.302 | 0.17-0.25 | 0.19-0.25 | above | measured: 0.177 / 0.178, RT3E 0.214; G58 and G60 open |
+| V1_02 | 0.045 | 0.102 | 0.034-0.036 | 0.036-0.050 | below | measured: 0.035, RT3E 0.044 |
+| V1_03 | 0.053 | 0.188 | 0.08-0.17 | 0.10-0.15 | above | S0PE 0.085-0.166; RT3E 0.122 |
+| V2_01 | 0.039 | 0.200 | 0.040-0.050 | 0.044-0.052 | above (1.0-1.3x) | measured: S0PEI(H) 0.046, RT3E 0.047 |
+| V2_02 | 0.049 | 0.162 | 0.085-0.100 | 0.09-0.11 | above | S0PE 0.091-0.099; RT3E 0.099 |
+
+- **P-G1 (real time, already shown):** RT3E below Basalt on MH_01 and V1_02.
+- **P-G2 (count):** RT3E below Basalt on 3-6 of 11 (MH_01, V1_02 certain on past runs; MH_02, MH_03 likely; MH_05,
+  V2_03 uncertain). S0PEI and S0PEIH below Basalt on 4-7 of 11. Above Basalt on both arms: MH_04, V1_03, V2_01, V2_02.
+  M1 (all 11) is not met by any arm.
+- **P-G3:** RT3EF within RT3E's per-sequence range ± 0.01 m (or ± 15 % of the RT3E median, whichever is larger); its
+  `source_ms` p50 3-6 ms against 13-18 for RT3E, and its final latency no higher than RT3E's on every sequence.
+- **P-G4:** S0PEIH within ± 0.005 of S0PEI on every sequence except MH_04 (start spread from G60) and where S0PEI
+  coasts (card H moves the coast/no-coast boundary).
+- **P-G5 (health):** every run `rc=0`, `give_ups=0`; header clean on every run. Coasts on V2_03 stay at S0's order
+  (tens of frames); this is not a pass/fail prediction, only a check.
+- **Kill / stop rules:** a header mismatch, `rc≠0` or `give_ups>0` stops the batch for a diagnosis. Nothing is
+  promoted from this rung: it is the measurement for the real-time gate and the full-sequence LaMAria guard comes first.
