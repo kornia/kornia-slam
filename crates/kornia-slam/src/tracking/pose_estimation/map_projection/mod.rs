@@ -22,7 +22,7 @@
 
 mod keypoint_grid;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::{Pose3d, RansacParams, ransac_fundamental_8point};
@@ -139,6 +139,10 @@ pub enum KeyframeObservations {
     /// ORB-SLAM3 nulls pose-optimization outliers in `TrackLocalMap`; a
     /// mismatch linked into a keyframe would stay in every later BA.
     PnpInliers,
+    /// `PnpInliers`, and the dropped matches' features stay claimed at the
+    /// keyframe, so stereo seeding does not make them duplicates of the
+    /// landmarks they matched (G62).
+    PnpInliersClaimed,
 }
 
 impl Default for MapProjectionConfig {
@@ -388,8 +392,9 @@ impl MapProjectionEstimator {
                     inliers = local.inliers;
                 }
             }
-            if self.config.keyframe_observations == KeyframeObservations::PnpInliers {
-                matches = self.inlier_matches(
+            let mut withheld = Vec::new();
+            if self.config.keyframe_observations != KeyframeObservations::AllMatches {
+                let kept = self.inlier_matches(
                     map.map_points(),
                     &matches,
                     &curr_keypoints_undist,
@@ -397,11 +402,16 @@ impl MapProjectionEstimator {
                     &grids,
                     &pose,
                 );
+                if self.config.keyframe_observations == KeyframeObservations::PnpInliersClaimed {
+                    withheld = dropped_matches(&matches, &kept);
+                }
+                matches = kept;
             }
             Ok(Estimate {
                 pose,
                 inliers,
                 matches,
+                withheld,
                 most_voted_keyframe,
             })
         };
@@ -522,6 +532,7 @@ impl MapProjectionEstimator {
             pose,
             inliers,
             matches,
+            withheld: Vec::new(),
             most_voted_keyframe: None,
         })
     }
@@ -658,6 +669,7 @@ impl MapProjectionEstimator {
             pose: new_pose,
             inliers,
             matches: global_matches,
+            withheld: Vec::new(),
             most_voted_keyframe: selection.most_voted_keyframe,
         })
     }
@@ -980,6 +992,16 @@ impl MapProjectionEstimator {
     }
 }
 
+/// The pairs of `matches` whose feature `kept` does not link.
+fn dropped_matches(matches: &[(usize, usize)], kept: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let kept: HashSet<usize> = kept.iter().map(|&(_, feature)| feature).collect();
+    matches
+        .iter()
+        .copied()
+        .filter(|(_, feature)| !kept.contains(feature))
+        .collect()
+}
+
 /// The frame's undistortion cache when filled (the pipeline fills it once
 /// per frame); only frames built outside the pipeline pay the per-keypoint
 /// undistortion here.
@@ -1097,6 +1119,19 @@ mod estimator_tests {
             config.search_scale_for(60.0, false),
             config.lost_search_scale
         );
+    }
+
+    /// The withheld pairs are the matches whose feature the inlier set does
+    /// not link, with the landmark each one matched.
+    #[test]
+    fn dropped_matches_are_the_pairs_outside_the_kept_set() {
+        let matches = [(10, 0), (11, 1), (12, 2), (13, 3)];
+        let kept = [(10, 0), (12, 2)];
+        assert_eq!(
+            super::dropped_matches(&matches, &kept),
+            vec![(11, 1), (13, 3)]
+        );
+        assert!(super::dropped_matches(&kept, &kept).is_empty());
     }
 
     #[test]

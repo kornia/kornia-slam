@@ -75,6 +75,14 @@ pub(crate) struct DeferredKeyframeContext {
     pub rig: Arc<RigGeometry>,
 }
 
+/// A tracked keyframe's `(landmark, feature)` matches: `linked` become
+/// observations; `withheld` only claim their feature, so stereo seeding skips it.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TrackedMatches<'a> {
+    pub linked: &'a [(usize, usize)],
+    pub withheld: &'a [(usize, usize)],
+}
+
 /// Builds the core insertion for `keyframe`, published as one validated batch.
 ///
 /// `tracked` holds `(landmark, feature)` matches from tracking. With
@@ -83,7 +91,7 @@ pub(crate) struct DeferredKeyframeContext {
 /// mirroring ORB-SLAM3's `CreateNewKeyFrame`.
 pub(crate) fn keyframe_insertion(
     keyframe: Keyframe,
-    tracked: &[(usize, usize)],
+    tracked: TrackedMatches<'_>,
     stereo_close_depth: Option<f64>,
     camera: &PinholeCamera,
     imu_edge: Option<ImuFactor>,
@@ -99,6 +107,7 @@ pub(crate) fn keyframe_insertion(
     // cannot be published must not win its landmark and suppress a valid
     // later claim on the same one.
     let tracked_claims: Vec<(usize, usize)> = tracked
+        .linked
         .iter()
         .copied()
         .filter(|&(_, feature_idx)| feature_idx < claimed.len())
@@ -113,6 +122,11 @@ pub(crate) fn keyframe_insertion(
             },
             landmark: LandmarkTarget::Existing(landmark_idx),
         });
+    }
+    for &(landmark_idx, feature_idx) in tracked.withheld {
+        if let Some(claim @ None) = claimed.get_mut(feature_idx) {
+            *claim = Some(landmark_idx);
+        }
     }
 
     if let Some(threshold) = stereo_close_depth
@@ -426,6 +440,13 @@ mod tests {
     use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbFeatures;
 
+    fn linked(matches: &[(usize, usize)]) -> TrackedMatches<'_> {
+        TrackedMatches {
+            linked: matches,
+            withheld: &[],
+        }
+    }
+
     fn stereo_keyframe(idx: usize, depths: Vec<f32>) -> Keyframe {
         let mut frame = empty_frame(idx);
         let n = depths.len();
@@ -448,7 +469,7 @@ mod tests {
         let KeyframeInsertion {
             insertion,
             close_points,
-        } = keyframe_insertion(keyframe, &tracked, Some(10.0), &camera(), None);
+        } = keyframe_insertion(keyframe, linked(&tracked), Some(10.0), &camera(), None);
 
         assert_eq!(insertion.observations.len(), 1);
         assert_eq!(insertion.observations[0].observation.feature_idx, 0);
@@ -467,11 +488,41 @@ mod tests {
         assert!(insertion.imu_factors.is_empty());
     }
 
+    /// A withheld match (a PnP outlier under `PnpInliersClaimed`) keeps its
+    /// feature from stereo seeding without linking it, so it does not become
+    /// a duplicate of the landmark it matched.
+    #[test]
+    fn keyframe_insertion_does_not_seed_withheld_features() {
+        let seeded = |withheld: &[(usize, usize)]| {
+            let keyframe = stereo_keyframe(9, vec![2.0, 2.0, 2.0]);
+            let KeyframeInsertion { insertion, .. } = keyframe_insertion(
+                keyframe,
+                TrackedMatches {
+                    linked: &[(5, 0)],
+                    withheld,
+                },
+                Some(10.0),
+                &camera(),
+                None,
+            );
+            assert_eq!(insertion.observations.len(), 1);
+            insertion
+                .landmarks
+                .iter()
+                .map(|seed| seed.reference.feature_idx)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(seeded(&[]), vec![1, 2]);
+        // Feature 0 is already linked and 99 is out of range.
+        assert_eq!(seeded(&[(6, 1), (7, 0), (8, 99)]), vec![2]);
+    }
+
     #[test]
     fn keyframe_insertion_skips_stereo_seeds_when_densification_is_off() {
         let keyframe = stereo_keyframe(9, vec![2.0, 2.0]);
         let KeyframeInsertion { close_points, .. } =
-            keyframe_insertion(keyframe, &[], None, &camera(), None);
+            keyframe_insertion(keyframe, TrackedMatches::default(), None, &camera(), None);
         assert_eq!(close_points, 0);
     }
 

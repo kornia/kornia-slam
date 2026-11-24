@@ -88,7 +88,9 @@ use crate::loop_closure::{
     LoopTiming,
 };
 use crate::mapping::bundle_adjustment::LocalBaParams;
-use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
+use crate::mapping::keyframe_mapping::{
+    self, KeyframeGrowthResult, KeyframeInsertion, TrackedMatches,
+};
 use crate::mapping::local_mapping::{GrowthJob, MappingLoad};
 use crate::mapping::map::{
     ImuFactor, InertialAlignmentError, Keyframe, Map, MapInsertion, MapMutationError, MapPoint,
@@ -2197,7 +2199,7 @@ impl SlamSystem {
         });
         // S0-C11: an accepted flow pose thrown away for a due keyframe.
         self.counters.flow_due_orb_rejected += u64::from(flow_due && result.is_err());
-        let (mut status, matches, tracked_inliers, reject_reason) = match result {
+        let (mut status, (matches, withheld), tracked_inliers, reject_reason) = match result {
             Ok(estimate) => {
                 self.note_tracked_step(&candidate_pose, &estimate.pose);
                 self.state.pose_world_to_cam = estimate.pose;
@@ -2220,7 +2222,7 @@ impl SlamSystem {
 
                 (
                     TrackingStatus::Tracked,
-                    estimate.matches,
+                    (estimate.matches, estimate.withheld),
                     estimate.inliers,
                     None,
                 )
@@ -2242,7 +2244,12 @@ impl SlamSystem {
                     inertial: predicted_velocity.is_some(),
                     trusted: false,
                 });
-                (TrackingStatus::Skipped, Vec::new(), 0, Some(reason))
+                (
+                    TrackingStatus::Skipped,
+                    (Vec::new(), Vec::new()),
+                    0,
+                    Some(reason),
+                )
             }
         };
         match reject_reason {
@@ -2314,8 +2321,15 @@ impl SlamSystem {
         // keyframe decision ran in `track_flow_only`.
         if status == TrackingStatus::Tracked && !(flow_tracked && self.flow_frames_lock_free()) {
             let insert_start = Instant::now();
-            let inserted =
-                self.try_insert_keyframe(&frame, timestamp_sec, tracked_inliers, &matches);
+            let inserted = self.try_insert_keyframe(
+                &frame,
+                timestamp_sec,
+                tracked_inliers,
+                TrackedMatches {
+                    linked: &matches,
+                    withheld: &withheld,
+                },
+            );
             self.tracking_timings.keyframe_insert += insert_start.elapsed();
             if inserted {
                 status = TrackingStatus::KeyframeAccepted;
@@ -3285,16 +3299,17 @@ impl SlamSystem {
         frame: &Frame,
         timestamp_sec: f64,
         tracked_inliers: usize,
-        matches: &[(usize, usize)],
+        tracked: TrackedMatches<'_>,
     ) -> bool {
+        let matches = tracked.linked;
         let evidence = self.keyframe_evidence(frame, tracked_inliers, matches, timestamp_sec);
         if !self.keyframe_due(&evidence, frame, matches, timestamp_sec) {
             return false;
         }
-        self.insert_keyframe(
+        self.insert_tracked_keyframe(
             frame,
             timestamp_sec,
-            matches,
+            tracked,
             tracked_inliers,
             KeyframeRole::Tracked,
         )
@@ -3308,6 +3323,23 @@ impl SlamSystem {
         frame: &Frame,
         timestamp_sec: f64,
         matches: &[(usize, usize)],
+        tracked_inliers: usize,
+        role: KeyframeRole,
+    ) -> bool {
+        let tracked = TrackedMatches {
+            linked: matches,
+            withheld: &[],
+        };
+        self.insert_tracked_keyframe(frame, timestamp_sec, tracked, tracked_inliers, role)
+    }
+
+    /// [`Self::insert_keyframe`], with withheld matches whose features the
+    /// keyframe claims without linking them.
+    fn insert_tracked_keyframe(
+        &mut self,
+        frame: &Frame,
+        timestamp_sec: f64,
+        tracked: TrackedMatches<'_>,
         tracked_inliers: usize,
         role: KeyframeRole,
     ) -> bool {
@@ -3387,7 +3419,7 @@ impl SlamSystem {
             close_points: n_close,
         } = keyframe_mapping::keyframe_insertion(
             curr_kf,
-            matches,
+            tracked,
             self.stereo_close_depth,
             &self.rig.camera,
             imu_edge,

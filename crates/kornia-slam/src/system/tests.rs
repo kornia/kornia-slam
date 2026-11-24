@@ -1250,6 +1250,7 @@ mod pose_inertial_guards {
             pose: Pose3d::IDENTITY,
             matches: (0..points.len()).map(|i| (i, i)).collect(),
             inliers: points.len(),
+            withheld: Vec::new(),
             most_voted_keyframe: None,
         };
         system.drain_debug_messages();

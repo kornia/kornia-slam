@@ -734,6 +734,7 @@ impl Tracker {
             pose,
             matches,
             inliers,
+            withheld: Vec::new(),
             most_voted_keyframe: None,
         };
         self.last_gap = None;
@@ -1196,6 +1197,7 @@ mod tests {
             pose,
             matches: (0..20).map(|i| (i, i)).collect(),
             inliers: 20,
+            withheld: Vec::new(),
             most_voted_keyframe: None,
         }
     }

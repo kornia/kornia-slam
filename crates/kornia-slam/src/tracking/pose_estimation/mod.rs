@@ -16,6 +16,10 @@ pub struct Estimate {
     pub pose: Pose3d,
     /// Matched pairs `(map_point_idx, keypoint_idx)`.
     pub matches: Vec<(usize, usize)>,
+    /// Pairs left out of `matches` by
+    /// [`KeyframeObservations::PnpInliersClaimed`](map_projection::KeyframeObservations): a
+    /// keyframe keeps their features claimed instead of seeding them as new landmarks.
+    pub withheld: Vec<(usize, usize)>,
     /// Number of inlier correspondences supporting the estimate.
     pub inliers: usize,
     /// The local map's most-voted keyframe; `None` without votes, or under

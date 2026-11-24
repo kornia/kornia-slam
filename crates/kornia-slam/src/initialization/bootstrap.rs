@@ -462,6 +462,7 @@ mod tests {
                 // Match 1 reuses reference feature 10; match 2 is out of range.
                 matches: vec![(10, 20), (10, 21), (11, 999), (12, 22)],
                 inliers: 4,
+                withheld: Vec::new(),
                 most_voted_keyframe: None,
             },
             points3d: vec![
