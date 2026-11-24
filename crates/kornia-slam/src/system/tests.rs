@@ -1011,7 +1011,8 @@ mod pose_inertial_guards {
     use super::*;
     use crate::tracking::KeyframeRules;
     use crate::tracking::parallax::tests::{
-        all_matches, frame_seeing_points, map_with_keyframe_at,
+        camera as parallax_camera, frame_seeing_points, map_with_keyframe_at,
+        map_with_keyframe_seeing,
     };
     use crate::tracking::pose_estimation::Estimate;
 
@@ -1046,22 +1047,28 @@ mod pose_inertial_guards {
 
     /// Whether frame `idx` at `t` ran the solve, and whether it was kept.
     fn refine(system: &mut SlamSystem, idx: usize, t: f64) -> (bool, bool) {
+        let (ran, kept, _) = refine_logged(system, idx, t);
+        (ran, kept)
+    }
+
+    /// [`refine`], plus the solve's debug line.
+    fn refine_logged(system: &mut SlamSystem, idx: usize, t: f64) -> (bool, bool, Option<String>) {
         let points: Vec<Vec3F64> =
             system.with_map_points(|mps| mps.iter().map(|mp| mp.position).collect());
         let frame = frame_seeing_points(idx, Pose3d::IDENTITY, &points);
         let mut estimate = Estimate {
             pose: Pose3d::IDENTITY,
-            matches: all_matches(),
+            matches: (0..points.len()).map(|i| (i, i)).collect(),
             inliers: points.len(),
             most_voted_keyframe: None,
         };
         system.drain_debug_messages();
         let kept = system.refine_pose_inertial(&frame, &mut estimate, t - 0.05, t);
-        let ran = system
+        let line = system
             .drain_debug_messages()
-            .iter()
-            .any(|m| m.starts_with("[pose_inertial]"));
-        (ran, kept)
+            .into_iter()
+            .find(|m| m.starts_with("[pose_inertial]"));
+        (line.is_some(), kept, line)
     }
 
     /// E5: a solve that keeps fewer than `min_inliers` (9 of 50 here) fails
@@ -1079,6 +1086,36 @@ mod pose_inertial_guards {
             (false, true),
             "no solve, kept"
         );
+    }
+
+    /// Card H: a 29-inlier solve fails the visual bar (30) and passes
+    /// ORB-SLAM3's inertial bar (15).
+    #[test]
+    fn the_with_prediction_bar_keeps_a_29_inlier_solve() {
+        let points: Vec<Vec3F64> = (0..29)
+            .map(|i| {
+                Vec3F64::new(
+                    (i % 6) as f64 * 0.3 - 0.75,
+                    (i / 6) as f64 * 0.25 - 0.5,
+                    4.0,
+                )
+            })
+            .collect();
+        let with = |bar: PoseInertialMinInliers| {
+            let mut system = system();
+            // The camera the frame's keypoints are projected with.
+            system.rig = SensorRig::new(parallax_camera()).with_imu(Pose3d::IDENTITY);
+            *system.map.lock().unwrap() =
+                map_with_keyframe_seeing(Pose3d::IDENTITY, points.clone());
+            // The IMU samples read zero: without gravity the frame is at rest.
+            system.inertial.gravity_world = Vec3F64::ZERO;
+            system.tracking_config.pose_inertial_min_inliers = bar;
+            let (ran, kept, line) = refine_logged(&mut system, 10, 0.5);
+            assert!(ran && line.is_some_and(|l| l.contains(" inliers=29 ")));
+            (kept, system.counters.pose_inertial_rejects)
+        };
+        assert_eq!(with(PoseInertialMinInliers::Visual), (false, 1));
+        assert_eq!(with(PoseInertialMinInliers::WithPrediction), (true, 0));
     }
 
     /// E4: ORB-SLAM3 stays visual for `mMaxFrames` frames after a

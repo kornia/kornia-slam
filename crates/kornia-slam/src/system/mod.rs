@@ -23,9 +23,9 @@ pub use config::{
     FrontendConfig, GyroGuess, InertialConfig, KeyframeOrb, KltFirst, KltPrediction, KltRetry,
     KltRig, LocalBaConfig, LoopClosingExecution, LoopClosingMode, LostRelocalization,
     MAX_FLOW_THREADS, MappingConfig, OnlineCalibrationConfig, OrbFrontendConfig, OrbSlamPipeline,
-    OrbTuning, PipelineDefinition, PoseInertial, SYSTEM_CONFIG_VERSION, SensorSelection,
-    SnapbackFix, StereoCloseDepth, StereoDepthSigma, StereoPyramid, SystemConfig, TrackRefill,
-    TrackingConfig, TrackingLossConfig,
+    OrbTuning, PipelineDefinition, PoseInertial, PoseInertialMinInliers, SYSTEM_CONFIG_VERSION,
+    SensorSelection, SnapbackFix, StereoCloseDepth, StereoDepthSigma, StereoPyramid, SystemConfig,
+    TrackRefill, TrackingConfig, TrackingLossConfig,
 };
 pub use counters::{RunCounters, SkipKind};
 #[cfg(feature = "serde")]

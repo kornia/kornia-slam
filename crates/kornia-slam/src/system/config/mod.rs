@@ -473,6 +473,8 @@ pub struct TrackingConfig {
     /// not raise the cost; `false` keeps the generic solver's rule.
     pub refine_monotone: bool,
     pub frame_velocity: FrameVelocity,
+    /// The inlier count a pose-inertial solve must keep for its frame to track.
+    pub pose_inertial_min_inliers: PoseInertialMinInliers,
 }
 
 /// A pose-inertial solve per frame (the idea of PR #195, credit Astik):
@@ -490,6 +492,20 @@ pub enum PoseInertial {
     /// 15×15 prior; `...LastKeyFrame` on the first frame after the map changed
     /// (`Tracking.cc:2970-2992`).
     OrbSlam3,
+}
+
+/// Inlier bar after the pose-inertial solve. Read only with a
+/// [`PoseInertial`] mode other than `Off`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum PoseInertialMinInliers {
+    /// The visual PnP bar, `pnp.min_inliers`.
+    #[default]
+    Visual,
+    /// The bar with a trusted inertial prediction, `min_inliers_with_prediction`:
+    /// ORB-SLAM3 `TrackLocalMap` fails an IMU-stereo frame below 15 after the
+    /// pose-inertial solve.
+    WithPrediction,
 }
 
 /// The velocity a frame's prediction starts from when the reference is the
@@ -854,6 +870,13 @@ impl fmt::Display for SystemConfig {
         }
         if orb.tracking.frame_velocity != FrameVelocity::default() {
             writeln!(f, "  frame velocity: {:?}", orb.tracking.frame_velocity)?;
+        }
+        if orb.tracking.pose_inertial_min_inliers != PoseInertialMinInliers::default() {
+            writeln!(
+                f,
+                "  pose-inertial min inliers: {:?}",
+                orb.tracking.pose_inertial_min_inliers
+            )?;
         }
         let ba = &orb.mapping.local_ba;
         if *ba != LocalBaConfig::default() {

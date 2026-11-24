@@ -140,7 +140,12 @@ pub(crate) mod tests {
     /// A map whose keyframe 0 sits at `kf_pose` and observes
     /// `points_before(kf_pose)` as landmarks `0..9`, feature `i` = landmark `i`.
     pub(crate) fn map_with_keyframe_at(kf_pose: Pose3d) -> Map {
-        let pts = points_before(&kf_pose);
+        map_with_keyframe_seeing(kf_pose, points_before(&kf_pose))
+    }
+
+    /// A map whose keyframe 0 sits at `kf_pose` and observes `pts` as
+    /// landmarks, feature `i` = landmark `i`.
+    pub(crate) fn map_with_keyframe_seeing(kf_pose: Pose3d, pts: Vec<Vec3F64>) -> Map {
         let mut map = Map::new();
         map.insert_keyframe(Keyframe::from_frame(frame_seeing_points(0, kf_pose, &pts)))
             .unwrap();

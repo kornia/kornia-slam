@@ -1634,6 +1634,36 @@ mod ron_files {
     }
 
     #[test]
+    fn the_pose_inertial_min_inliers_parses_round_trips_and_prints() {
+        let default = parse("(version: 1)").unwrap();
+        assert_eq!(
+            orb(&default).tracking.pose_inertial_min_inliers,
+            PoseInertialMinInliers::Visual
+        );
+        assert!(!default.to_string().contains("pose-inertial min inliers"));
+
+        let config = parse(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking: (pose_inertial: OrbSlam3, pose_inertial_min_inliers: WithPrediction))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).tracking.pose_inertial_min_inliers,
+            PoseInertialMinInliers::WithPrediction
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+        assert_eq!(config.validate(), Ok(()));
+        assert!(
+            config
+                .to_string()
+                .contains("  pose-inertial min inliers: WithPrediction\n")
+        );
+        assert!(matches!(
+            parse_error("(version: 1, pipeline: OrbSlam((tracking: (pose_inertial_min_inliers: Bogus))))"),
+            ron::Error::NoSuchEnumVariant { found, .. } if found == "Bogus"
+        ));
+    }
+
+    #[test]
     fn the_frame_velocity_parses_and_round_trips() {
         let default = parse("(version: 1)").unwrap();
         assert_eq!(
@@ -2266,6 +2296,28 @@ fn keyframe_orb_mapping_is_a_config_error() {
     let FrontendConfig::Orb(frontend) = &mut orb_mut(&mut built).frontend;
     frontend.keyframe_orb = KeyframeOrb::Mapping;
     assert_eq!(built.validate(), unbuilt);
+}
+
+/// Card H: the inertial bar is read only after a pose-inertial solve.
+#[test]
+fn the_pose_inertial_min_inliers_needs_a_pose_inertial_solve() {
+    let with = |pose_inertial: PoseInertial| {
+        let mut config = SystemConfig {
+            sensors: sensors(CameraSelection::Stereo, true),
+            ..SystemConfig::default()
+        };
+        let tracking = &mut orb_mut(&mut config).tracking;
+        tracking.pose_inertial_min_inliers = PoseInertialMinInliers::WithPrediction;
+        tracking.pose_inertial = pose_inertial;
+        config.validate()
+    };
+    assert_eq!(
+        with(PoseInertial::Off),
+        Err(ConfigError::PoseInertialMinInliersWithoutSolve)
+    );
+    for mode in [PoseInertial::LastKeyframe, PoseInertial::OrbSlam3] {
+        assert_eq!(with(mode), Ok(()), "{mode:?}");
+    }
 }
 
 /// R-C8: the frame velocity knob reads the IMU and is inert under the

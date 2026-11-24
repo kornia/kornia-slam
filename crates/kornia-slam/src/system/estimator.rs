@@ -26,7 +26,7 @@ use crate::tracking::pose_estimation::pose_inertial::{
 use crate::tracking::{KeyframeEvidence, KeyframeRules};
 use crate::upstream::kornia_3d::pose_ext::camera_centre;
 
-use super::{PoseInertial, SlamSystem, SnapbackFix};
+use super::{PoseInertial, PoseInertialMinInliers, SlamSystem, SnapbackFix};
 
 /// A BA write-back moving the newest keyframe further than this counts as a
 /// shift (G29).
@@ -342,9 +342,9 @@ impl SlamSystem {
 
     /// Under `tracking.pose_inertial`, refines a tracked `estimate` with the
     /// pose-inertial solve and takes the frame's velocity and bias from it.
-    /// Returns `false` when the solve keeps fewer than `min_inliers`: the
-    /// frame is rejected, as ORB-SLAM3 fails it (E5). Without a solve the
-    /// visual estimate stays.
+    /// Returns `false` when the solve keeps fewer inliers than the
+    /// `tracking.pose_inertial_min_inliers` bar: the frame is rejected, as
+    /// ORB-SLAM3 fails it (E5). Without a solve the visual estimate stays.
     pub(super) fn refine_pose_inertial(
         &mut self,
         frame: &Frame,
@@ -397,7 +397,7 @@ impl SlamSystem {
             &observations,
         );
         let inliers = solution.inliers.iter().filter(|&&inlier| inlier).count();
-        let min_inliers = self.tracker.map_projection_config().pnp.min_inliers;
+        let min_inliers = self.pose_inertial_min_inliers();
         self.dbg(format!(
             "[pose_inertial] frame={} anchor={} inliers={inliers} imu_chi2={:.3} prior_pd={}",
             frame.idx,
@@ -426,6 +426,15 @@ impl SlamSystem {
         self.estimator.frame_prior = solution.prior.map(|prior| (frame.idx, epoch, prior));
         self.estimator.map_changed = false;
         true
+    }
+
+    /// The inliers a pose-inertial solve must keep (card H).
+    fn pose_inertial_min_inliers(&self) -> usize {
+        let config = self.tracker.map_projection_config();
+        match self.tracking_config.pose_inertial_min_inliers {
+            PoseInertialMinInliers::Visual => config.pnp.min_inliers,
+            PoseInertialMinInliers::WithPrediction => config.min_inliers_with_prediction,
+        }
     }
 
     /// Whether the frame falls in the visual-only stretch after the last

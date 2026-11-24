@@ -5,8 +5,9 @@ use super::config::{
     AnchorGuard, CameraSelection, FlowPose, ForwardBackward, FrameVelocity, FrontendConfig,
     KeyframeOrb, KltFirst, KltRetry, KltRig, LocalBaConfig, LoopClosingMode, MAX_FLOW_THREADS,
     OnlineCalibrationConfig, OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition,
-    PoseInertial, SYSTEM_CONFIG_VERSION, SensorSelection, SnapbackFix, StereoCloseDepth,
-    StereoDepthSigma, SystemConfig, TrackRefill, TrackingConfig, TrackingLossConfig,
+    PoseInertial, PoseInertialMinInliers, SYSTEM_CONFIG_VERSION, SensorSelection, SnapbackFix,
+    StereoCloseDepth, StereoDepthSigma, SystemConfig, TrackRefill, TrackingConfig,
+    TrackingLossConfig,
 };
 use super::recovery::RecoveryConfig;
 use crate::inertial::MAX_BUFFERED_SEC;
@@ -88,6 +89,11 @@ pub enum ConfigError {
          the pose-inertial solve carries its own velocity; set one of them"
     )]
     FrameVelocityWithPoseInertial,
+    #[error(
+        "tracking.pose_inertial_min_inliers WithPrediction has no effect with tracking.pose_inertial \
+         Off: it is the bar after the pose-inertial solve"
+    )]
+    PoseInertialMinInliersWithoutSolve,
     #[error(
         "tracking.pose_inertial needs descriptors on every frame it can reject, but with \
          frontend.klt_first, klt_kernel WindowedU8 and flow_pose AnalyticGn a flow frame has \
@@ -294,6 +300,11 @@ fn validate_estimator(tracking: &TrackingConfig, imu: bool) -> Result<(), Config
         && tracking.pose_inertial != PoseInertial::Off
     {
         return Err(ConfigError::FrameVelocityWithPoseInertial);
+    }
+    if tracking.pose_inertial_min_inliers != PoseInertialMinInliers::Visual
+        && tracking.pose_inertial == PoseInertial::Off
+    {
+        return Err(ConfigError::PoseInertialMinInliersWithoutSolve);
     }
     Ok(())
 }
