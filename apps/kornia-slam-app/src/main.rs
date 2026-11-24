@@ -353,8 +353,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut trajectory: Vec<[f32; 3]> = Vec::new();
     let mut processed: usize = 0;
     let mut frame_times = summary::FrameTimes::default();
+    let loop_start = Instant::now();
 
-    while let Some(mut item) = source.next_frame()? {
+    loop {
+        let source_start = Instant::now();
+        let Some(mut item) = source.next_frame()? else {
+            break;
+        };
+        let source_time = source_start.elapsed();
         if let Some(blackout) = blackout.as_mut()
             && blackout.apply(&mut item)
             && !tui_active
@@ -364,13 +370,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let now = Instant::now();
         let elapsed = now.duration_since(last_frame_walltime);
 
+        // The pacer runs unpaced too, so latency is measured in every mode.
+        let pace_delay = timestamp_pacer.delay(item.timestamp_sec, now);
         if args.pace_timestamps {
-            std::thread::sleep(timestamp_pacer.delay(item.timestamp_sec, now));
+            std::thread::sleep(pace_delay);
         } else if !args.no_pace && elapsed < target_dt {
             std::thread::sleep(target_dt - elapsed);
         }
 
         last_frame_walltime = Instant::now();
+        frame_times.record_sleep(last_frame_walltime.duration_since(now));
 
         let FrameItem {
             idx,
@@ -389,6 +398,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(recorder) = session_recorder.as_mut() {
             recorder.record(image.size(), &imu_samples);
         }
+        let process_start = Instant::now();
         system.process_imu(&imu_samples);
         system.set_trace(trace_writer.is_some() && (args.trace_from..args.trace_to).contains(&idx));
         let result = match right_image.as_ref() {
@@ -400,6 +410,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             None => system.process_image(timestamp_sec, &image)?,
         };
+        let process_end = Instant::now();
+        let wall = summary::FrameWall {
+            timestamp_sec,
+            source: source_time,
+            process: process_end.duration_since(process_start),
+            latency: timestamp_pacer.lateness(timestamp_sec, process_end),
+            keyframe: result.status == kornia_slam::TrackingStatus::KeyframeAccepted,
+        };
         let frame_ms = system.tracking_duration().as_secs_f64() * 1000.0;
         let frontend_ms = system.frontend_observation().duration.as_secs_f64() * 1000.0;
         frame_times.record(frame_ms, frontend_ms);
@@ -410,6 +428,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 system.frontend_observation(),
                 system.tracking_timings(),
                 system.tracking_duration(),
+                &wall,
             )?;
             if let Some(trace) = system.frame_trace() {
                 writer.write_trace(idx, trace)?;
@@ -470,9 +489,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for line in &debug_msgs {
                 eprintln!("{line}");
             }
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
             let mut status_line = format!(
-                "[{idx:>5}] {:?}  kf={:<4} pts={:<5} {frame_ms:>6.1}ms fe={frontend_ms:.1}ms",
-                result.status, keyframe_idx, map_point_count,
+                "[{idx:>5}] {:?}  kf={:<4} pts={:<5} {frame_ms:>6.1}ms fe={frontend_ms:.1}ms \
+                 src={:.1} tot={:.1} lat={:.1}",
+                result.status,
+                keyframe_idx,
+                map_point_count,
+                ms(wall.source),
+                ms(wall.source + wall.process),
+                ms(wall.latency),
             );
             if args.debug {
                 status_line.push_str(&stage_times(
@@ -514,6 +540,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|kf| system.keyframe_pose(kf).map(|pose| (kf, pose)));
             smoothed.record_scored(timestamp_sec, &result.pose_world_to_cam, reference);
         }
+        frame_times.record_wall(wall);
         let traj_pt = trajectory_point_from_pose(&result.pose_world_to_cam);
         trajectory.push(traj_pt);
 
@@ -566,6 +593,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let loop_wall = loop_start.elapsed();
     // Restore terminal before printing the final summary.
     if let Some((mut term, _, _guard)) = tui_state.take() {
         tui::restore_terminal(&mut term)?;
@@ -594,6 +622,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
     );
     eprintln!("{}", summary::format(&system.run_counters(), &frame_times));
+    eprintln!("{}", summary::format_wall(&frame_times, loop_wall));
     if trajectory_out.is_some() {
         eprintln!("[summary] poses_written={poses_written}");
         eprintln!("[summary] poses_non_finite={poses_non_finite}");
@@ -703,6 +732,16 @@ impl TimestampPacer {
         let due = Duration::try_from_secs_f64(timestamp_sec - first_sec).unwrap_or(Duration::ZERO);
         due.saturating_sub(now.duration_since(first_wall))
     }
+
+    /// How far `now` lies behind the arrival time of the frame at
+    /// `timestamp_sec`; zero before the first frame or when early.
+    fn lateness(&self, timestamp_sec: f64, now: Instant) -> Duration {
+        let Some((first_sec, first_wall)) = self.start else {
+            return Duration::ZERO;
+        };
+        let due = Duration::try_from_secs_f64(timestamp_sec - first_sec).unwrap_or(Duration::ZERO);
+        now.duration_since(first_wall).saturating_sub(due)
+    }
 }
 
 /// Bootstrap skips hold the pose from before the loss and a visual coast has
@@ -779,6 +818,28 @@ mod cli_tests {
             parse(&["--config", "r.ron", "--pace-timestamps"])
                 .unwrap()
                 .pace_timestamps
+        );
+    }
+
+    /// F1: a frame finished after its arrival time is late by the
+    /// difference; one finished early, or before any frame, is not.
+    #[test]
+    fn lateness_is_the_finish_behind_the_arrival() {
+        let wall = Instant::now();
+        let mut pacer = TimestampPacer::default();
+        assert_eq!(pacer.lateness(1.0, wall), Duration::ZERO);
+        pacer.delay(1.0, wall);
+        assert_eq!(
+            pacer.lateness(1.0, wall + Duration::from_millis(40)),
+            Duration::from_millis(40)
+        );
+        assert_eq!(
+            pacer.lateness(1.5, wall + Duration::from_millis(620)),
+            Duration::from_millis(120)
+        );
+        assert_eq!(
+            pacer.lateness(1.5, wall + Duration::from_millis(300)),
+            Duration::ZERO
         );
     }
 

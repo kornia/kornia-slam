@@ -836,7 +836,9 @@ impl SlamSystem {
     }
 
     /// Time the latest successfully processed frame spent in tracking and
-    /// mapping, excluding feature extraction (see [`Self::frontend_observation`]).
+    /// mapping on the calling thread. It excludes feature extraction, whether
+    /// it ran before tracking or was deferred into it (see
+    /// [`Self::frontend_observation`]), and all work outside `process_*`.
     pub fn tracking_duration(&self) -> Duration {
         self.tracking_duration
     }

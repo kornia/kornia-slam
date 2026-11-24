@@ -1,6 +1,8 @@
 //! The `[summary]` lines printed at the end of a run: the system's run
 //! counters and per-frame timing percentiles.
 
+use std::time::Duration;
+
 use kornia_slam::RunCounters;
 
 /// Per-frame wall times in milliseconds, in frame order.
@@ -8,12 +10,34 @@ use kornia_slam::RunCounters;
 pub struct FrameTimes {
     frame_ms: Vec<f64>,
     frontend_ms: Vec<f64>,
+    wall: Vec<FrameWall>,
+    sleep: Duration,
+}
+
+/// One frame's wall time as the app sees it: reading the frame, the
+/// `process_*` calls, and how far their end lies behind the frame's paced
+/// arrival. `frame_ms` leaves out ORB and the source work (F1).
+pub struct FrameWall {
+    pub timestamp_sec: f64,
+    pub source: Duration,
+    pub process: Duration,
+    pub latency: Duration,
+    pub keyframe: bool,
 }
 
 impl FrameTimes {
     pub fn record(&mut self, frame_ms: f64, frontend_ms: f64) {
         self.frame_ms.push(frame_ms);
         self.frontend_ms.push(frontend_ms);
+    }
+
+    pub fn record_wall(&mut self, wall: FrameWall) {
+        self.wall.push(wall);
+    }
+
+    /// Time the loop slept for pacing.
+    pub fn record_sleep(&mut self, sleep: Duration) {
+        self.sleep += sleep;
     }
 }
 
@@ -134,6 +158,54 @@ fn format_estimator_recovery(c: &RunCounters) -> String {
         c.vi_ba_rejected_steps,
         c.vi_ba_solves_3plus_rejects,
     )
+}
+
+/// The app-side frame times (F1). `loop_wall` is the frame loop's wall time:
+/// with nothing untimed it equals `sum_total_s + sum_sleep_s`.
+pub fn format_wall(times: &FrameTimes, loop_wall: Duration) -> String {
+    let line = |f: fn(&FrameWall) -> Option<f64>| {
+        format_percentiles(&times.wall.iter().filter_map(f).collect::<Vec<_>>())
+    };
+    let period_ms = frame_period_ms(&times.wall);
+    let late = times
+        .wall
+        .iter()
+        .filter(|w| ms(w.latency) > period_ms)
+        .count();
+    let sum_total: Duration = times.wall.iter().map(|w| w.source + w.process).sum();
+    format!(
+        "[summary] source_ms {}\n\
+         [summary] process_ms {}\n\
+         [summary] total_ms {}\n\
+         [summary] total_ms_keyframe {}\n\
+         [summary] latency_ms {}\n\
+         [summary] late_frames={late} frame_period_ms={period_ms:.1} final_latency_ms={:.1} \
+         sum_total_s={:.3} sum_sleep_s={:.3} loop_wall_s={:.3}",
+        line(|w| Some(ms(w.source))),
+        line(|w| Some(ms(w.process))),
+        line(|w| Some(ms(w.source + w.process))),
+        line(|w| w.keyframe.then(|| ms(w.source + w.process))),
+        line(|w| Some(ms(w.latency))),
+        times.wall.last().map_or(0.0, |w| ms(w.latency)),
+        sum_total.as_secs_f64(),
+        times.sleep.as_secs_f64(),
+        loop_wall.as_secs_f64(),
+    )
+}
+
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
+
+/// Median spacing of the frame timestamps in ms; 0 with fewer than 2 frames.
+fn frame_period_ms(wall: &[FrameWall]) -> f64 {
+    let mut steps: Vec<f64> = wall
+        .windows(2)
+        .map(|pair| (pair[1].timestamp_sec - pair[0].timestamp_sec) * 1000.0)
+        .filter(|step| *step > 0.0)
+        .collect();
+    steps.sort_by(f64::total_cmp);
+    nearest_rank(&steps, 50.0)
 }
 
 fn format_percentiles(values: &[f64]) -> String {
@@ -271,6 +343,46 @@ mod tests {
             text.lines().last().unwrap(),
             "[summary] outlier_erase erase_tested=1 erase_unlinked=2 erase_tested_newest=3 \
              erase_unlinked_newest=4 erase_landmarks_retired=5 erase_stale_links=6"
+        );
+    }
+
+    #[test]
+    fn the_wall_lines_hold_source_process_total_and_latency() {
+        let ms = Duration::from_millis;
+        let mut times = FrameTimes::default();
+        for (i, (source, process, latency, keyframe)) in
+            [(30, 20, 0, false), (30, 90, 70, true), (20, 40, 60, false)]
+                .into_iter()
+                .enumerate()
+        {
+            times.record_wall(FrameWall {
+                timestamp_sec: 10.0 + 0.05 * i as f64,
+                source: ms(source),
+                process: ms(process),
+                latency: ms(latency),
+                keyframe,
+            });
+        }
+        times.record_sleep(ms(500));
+        times.record_sleep(ms(250));
+        assert_eq!(
+            format_wall(&times, ms(1000)),
+            "[summary] source_ms p50=30.0 p90=30.0 p99=30.0\n\
+             [summary] process_ms p50=40.0 p90=90.0 p99=90.0\n\
+             [summary] total_ms p50=60.0 p90=120.0 p99=120.0\n\
+             [summary] total_ms_keyframe p50=120.0 p90=120.0 p99=120.0\n\
+             [summary] latency_ms p50=60.0 p90=70.0 p99=70.0\n\
+             [summary] late_frames=2 frame_period_ms=50.0 final_latency_ms=60.0 \
+             sum_total_s=0.230 sum_sleep_s=0.750 loop_wall_s=1.000"
+        );
+        assert_eq!(
+            format_wall(&FrameTimes::default(), Duration::ZERO)
+                .lines()
+                .last(),
+            Some(
+                "[summary] late_frames=0 frame_period_ms=0.0 final_latency_ms=0.0 \
+                 sum_total_s=0.000 sum_sleep_s=0.000 loop_wall_s=0.000"
+            )
         );
     }
 }

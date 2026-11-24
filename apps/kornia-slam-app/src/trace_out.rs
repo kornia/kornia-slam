@@ -13,6 +13,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::Duration;
 
+use crate::summary::FrameWall;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
@@ -98,7 +99,7 @@ impl TraceWriter {
             timings,
             "frame_idx,status,orb_ms,overlap_ms,frontend_ms,klt_build_ms,klt_track_ms,\
              projection_search_ms,consistency_filter_ms,pnp_ms,local_refine_ms,\
-             keyframe_insert_ms,tracking_ms"
+             keyframe_insert_ms,tracking_ms,source_ms,process_ms,latency_ms"
         )?;
         let mut frames = open("frames.csv")?;
         writeln!(
@@ -129,6 +130,7 @@ impl TraceWriter {
         frontend: &FrontendObservation,
         timings: &TrackingTimings,
         tracking: Duration,
+        wall: &FrameWall,
     ) -> std::io::Result<()> {
         let orb: Vec<String> = frontend
             .orb_per_camera
@@ -137,7 +139,8 @@ impl TraceWriter {
             .collect();
         writeln!(
             self.timings,
-            "{frame_idx},{status:?},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+            "{frame_idx},{status:?},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},\
+             {:.3},{:.3},{:.3}",
             orb.join(";"),
             ms(frontend.overlap),
             ms(frontend.duration),
@@ -149,6 +152,9 @@ impl TraceWriter {
             ms(timings.local_refine),
             ms(timings.keyframe_insert),
             ms(tracking),
+            ms(wall.source),
+            ms(wall.process),
+            ms(wall.latency),
         )
     }
 
