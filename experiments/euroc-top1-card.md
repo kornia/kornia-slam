@@ -1923,3 +1923,56 @@ points. Basalt: MH_04 0.114, V1_02 0.045.
 **Verdict.** Stopped by K1 (the card H defect fires on EuRoC MH_04). Per the rule, card H (the per-frame pose-inertial
 path's failure on keyframe-due frames) comes first. Then rerun R13a with K1 restated against S0PE's own counts. Nothing
 promoted.
+
+### Results: RT3E (RT1PE + 7-iteration BA budget, default rayon) (2026-11-24)
+
+Binary `E/bin-r11b/kornia-slam-euroc`, md5 `e67615adaf558b4aef7b7d1e35a2fb40`. Predictions committed in 2fd69a7
+before the runs. Driver `E/r13/rt.sh`, 06:57-07:45, 12 runs, all `rc=0`, every header `diff`-identical to
+`E/expect/RT3E.header`. **Deviation from the written protocol:** for an hour the gate "no other `kornia-slam*` run"
+never opened, because other lanes ran paced runs back to back pinned to cores 0,1. RT3E was therefore pinned to cores 2,3
+(same i7-9750H physical cores, siblings 8,9) and started with at most 1 other run; 7 of 12 runs started beside one
+(`meta.txt` `others=`), and the 1-min load at start was 3.5-5.9 (RT1PE: 2.0-3.3). Control: RT1PE r3 on MH_01 and
+V2_02 under the RT3E conditions (cores 2,3, load 2.3-2.8 at start, `E/r13/rt_ctl.sh`). Table `E/r13/rtreport.py` →
+`E/r13/rt_table.md`. SE(3) ATE RMSE, m, body centre, causal (`traj.txt`); lag = wall − frames / 20 Hz.
+
+| seq | Basalt | RT1PE causal (mean) | RT3E causal (mean) | RT3E ÷ Basalt | solves/kf RT3E | BA ms RT1PE → RT3E | iters/solve RT1PE → RT3E | frame_ms p90 RT1PE / RT3E | lag s RT1PE / RT3E (mean) | RT1PE r3 control: causal, lag, p90 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| V2_01 | 0.039 | 0.044 / 0.050 (0.047) | 0.044 / 0.051 (**0.047**) | 1.21 | 1.01 / 1.01 | 76-115 → 58-68 | 17.5-17.7 → 6.5 | 43.5-54.9 / 64.0-67.5 | 2, 13 (7.5) / 17, 45 (31.0) | - |
+| V1_02 | 0.045 | 0.042 / 0.050 (0.046) | 0.038 / 0.050 (**0.044**) | **0.98** | 1.01 / 1.02 | 93-114 → 57-60 | 14.7-14.8 → 6.1 | 56.7-70.4 / 65.2-68.8 | 44, 24 (33.5) / 34, 36 (35.0) | - |
+| V1_03 | 0.053 | 0.105 / 0.121 (0.113) | 0.100 / 0.145 (0.122) | 2.30 | 1.01 / 1.00 | 97-98 → 50-53 | 16.5-17.2 → 6.5 | 53.8-54.1 / 56.3-62.1 | 22, 20 (20.5) / 31, 18 (24.0) | - |
+| V2_02 | 0.049 | 0.096 / 0.121 (0.108) | 0.097 / 0.101 (0.099) | 2.02 | 1.01 / 1.01 | 90-93 → 51 | 16.3-16.8 → 6.5 | 63.9-64.3 / 71.8-74.7 | 31, 31 (30.6) / 43, 51 (46.6) | 0.094, 41 s, 69.0 |
+| MH_04 | 0.114 | 0.341 / 0.212 (0.277) | 0.213 / 0.215 (**0.214**) | 1.88 | 1.01 / 1.01 | 61-62 → 34 | 16.7-17.0 → 6.4 | 47.2-48.6 / 56.1-57.4 | 1, 1 (1.4) / 4, 5 (4.9) | - |
+| MH_01 | 0.067 | 0.039 / 0.040 (0.039) | 0.048 / 0.038 (0.043) | **0.64** | 1.01 / 1.01 | 75-78 → 37-41 | 15.4-16.0 → 6.0 | 49.5-49.9 / 55.2-57.2 | 4, 5 (4.4) / 27, 5 (15.9) | 0.041, 4 s, 54.5 |
+
+Tracked within 8 frames of RT1PE on every run; stale = propagated on every run; keyframes 0.95-0.99x RT1PE; keyframe
+shifts 0-1 except V1_03 (6-7, RT1PE 3-6). Below Basalt (causal mean): RT3E 2 of 6 (V1_02 0.044, MH_01 0.043); RT1PE 1
+(MH_01; V1_02 1.02x).
+
+| P/K | prediction | measured | verdict |
+|---|---|---|---|
+| P1 | solves per keyframe ≥ 0.97, every run | 1.00-1.02 | as predicted (RT1PE was already 1.00-1.01, so this does not discriminate) |
+| P2 | MH_04 within RT1PE's band (0.212-0.341, mean 0.277) | 0.213 / 0.215, mean 0.214 (0.77x RT1PE) | as predicted |
+| P3 | V2_01 ≤ 0.050 | mean 0.047 (r2 0.051) | as predicted (mean) |
+| P4 | lag below RT1PE (Vicon per sequence; MH ≤ RT1PE + 2 s; sum < 97 s) | higher on all 6 (sum of means 157 s against 98) | **missed** |
+| K2 | MH_04 > 1.15x RT1PE (> 0.319) | 0.214 | not fired |
+
+**Diagnosis (owner rule; unverified parts marked).**
+- **P4 miss: the budget does not shorten lag because RT1PE's lag is not on the mapping thread.** RT1PE already solves
+  every keyframe as the newest (1.00-1.01). Halving the BA time (−40 to −50 % ms per solve) frees mapping CPU but does
+  not shorten the tracking thread's frames: `frame_ms` p90 is 56-75 ms for RT3E against 43-70 for RT1PE. The tail is
+  the keyframe frames, whose `keyframe_insert` (growth, fusion, place recognition) runs on the tracking thread (G57).
+- **Part of the excess is the machine, not the arm.** The control RT1PE r3 under the RT3E conditions has V2_02 lag 41
+  s and p90 69.0 (RT1PE r1/r2: 31 s, 64); MH_01 lag 4 s (unchanged). RT3E is still at or above the control (V2_02
+  43 / 51 s, p90 72-75; MH_01 27 / 5 s). So the lag comparison is not clean, but nothing shows the budget lowering
+  it. Unverified: why RT3E's p90 sits above the control. Candidates: more concurrent load in 7 of 12 runs, or more
+  frequent solve starts contending with tracking for the 2 cores. No profile was taken.
+- **On top of PnpInliers the 7-iteration budget does not hurt MH_04 (R11d K2 does not carry over).** RT2E (no
+  PnpInliers) was 0.341 / 0.521; RT3E is 0.213 / 0.215, at RT1PE's best run and with a tight pair. This fits the
+  theory that cleaner first-solve rows converge in fewer iterations, but no per-iteration cost trace was taken
+  (unverified). V1_03 (0.122) and V2_02 (0.099) stay at 1.2-1.7x S0E SYNC; the cause is not lag, as in R11d.
+
+**Verdict.** RT3E is accuracy-neutral or better than RT1PE on 5 of 6 (V1_03 r2 0.145 is the outlier). It halves BA
+CPU and beats Basalt on V1_02 and MH_01. Its stated purpose, less lag, missed (P4), and that is diagnosed as
+tracking-thread work. RT3E becomes the real-time base arm; it is not promoted (full-sequence gate first). The lag
+lever is the tracking thread: R13c keyframe acceptance, or moving `keyframe_insert` work off the tracking thread
+(G57 fix list), not the BA budget.

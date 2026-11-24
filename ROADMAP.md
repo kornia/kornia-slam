@@ -23,6 +23,17 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 
 ### 2026-11-24
 
+- **R13a: per-frame pose-inertial tracking (S0PEI) stopped by K1 on its first MH_04 run**
+  (`experiments/euroc-top1-card.md` "Results: R13a"; config only, 3 of 14 SYNC runs).
+  - One inertial coast at MH_04 frame 1495 (S0, S0E and S0PE have none on any start), so card H comes first.
+  - On that run the dark-span step falls from −0.54 to −0.22 m and causal from 0.227 to 0.177. One start only; not
+    credited. V1_02 0.035, same health counters as S0PE.
+- **RT3E (RT1PE + 7-iteration local BA, default rayon): accuracy holds, lag does not fall**
+  (`experiments/euroc-top1-card.md` "Results: RT3E"; 12 real-time runs + 2 controls, on cores 2,3 beside other lanes).
+  - Causal V2_01 0.047, V1_02 0.044 (0.98x Basalt), V1_03 0.122, V2_02 0.099, MH_04 0.214 (RT1PE 0.277), MH_01
+    0.043 (0.64x Basalt). K2 did not fire: on top of PnpInliers the budget does not hurt MH_04.
+  - Lag higher on all six (P4 missed). The lag sits in the tracking thread's keyframe work, not in BA. Next for
+    speed: R13c or moving `keyframe_insert` off the tracking thread. Nothing promoted.
 - **R11d: a 7-iteration local-BA budget removes the real-time mapping lag; PnpInliers removes it too**
   (`experiments/euroc-top1-card.md` "Results: R11d"; config and env only, binary unchanged; 36 real-time runs).
   - RT2E (RT1E + `max_iterations: 7`, `initial_lambda: 1e-4`, `RAYON_NUM_THREADS=1`): solves per keyframe 1.00-1.02,
