@@ -23,6 +23,9 @@ kornia-sensors.workspace = true
 # Sparse LLT for pose-graph optimization and dense Cholesky for the reduced
 # camera system in visual-inertial Schur-complement BA.
 faer = "0.22"
+# A private pool for the tracking fan-out and 1-thread pools that keep the
+# mapping and loop workers out of the global one (`pipeline.fan_out`).
+rayon = "1"
 thiserror = "1"
 ron = { version = "0.12", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }

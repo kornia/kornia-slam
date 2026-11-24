@@ -17,6 +17,8 @@ use crate::loop_closure::VerifiedLoopEdge;
 use crate::loop_closure::closer::{KeyframeGap, LoopGraphSettings, solve_in_graph};
 use crate::loop_closure::fusion_plan::{FusionOp, FusionSnapshot};
 use crate::loop_closure::{InertialPgoContext, PgoConfig, PgoError, PgoResult, PoseGraph};
+use crate::system::FanOut;
+use crate::system::fan_out::bind_worker_thread;
 
 /// What one solve reads, copied from the map and the closer when its loop was accepted.
 pub(crate) struct LoopSolveJob {
@@ -106,8 +108,8 @@ impl LoopSolver {
 
     /// # Errors
     /// The worker thread could not be spawned.
-    pub(crate) fn asynchronous() -> std::io::Result<Self> {
-        LoopWorker::spawn(LoopSolveJob::run).map(Self::Asynchronous)
+    pub(crate) fn asynchronous(fan_out: FanOut) -> std::io::Result<Self> {
+        LoopWorker::spawn(LoopSolveJob::run, fan_out).map(Self::Asynchronous)
     }
 
     pub(crate) fn is_synchronous(&self) -> bool {
@@ -166,12 +168,16 @@ pub(crate) struct LoopWorker {
 }
 
 impl LoopWorker {
-    fn spawn(solve: fn(LoopSolveJob) -> LoopSolveOutcome) -> std::io::Result<Self> {
+    fn spawn(
+        solve: fn(LoopSolveJob) -> LoopSolveOutcome,
+        fan_out: FanOut,
+    ) -> std::io::Result<Self> {
         let (jobs, job_queue) = mpsc::channel::<LoopSolveJob>();
         let (result_sender, results) = mpsc::channel();
         let join_handle = thread::Builder::new()
             .name("slam-loop-closing".into())
             .spawn(move || {
+                let _pool = bind_worker_thread(fan_out);
                 for job in job_queue {
                     if result_sender.send(solve(job)).is_err() {
                         break;
@@ -228,8 +234,11 @@ impl LoopSolver {
     /// An asynchronous solver whose worker panics on its first job.
     pub(crate) fn panicking_for_test() -> Self {
         Self::Asynchronous(
-            LoopWorker::spawn(|_| panic!("loop-closing worker panic for test"))
-                .expect("spawn test worker"),
+            LoopWorker::spawn(
+                |_| panic!("loop-closing worker panic for test"),
+                FanOut::Global,
+            )
+            .expect("spawn test worker"),
         )
     }
 }
@@ -238,7 +247,7 @@ impl LoopSolver {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{LoopSolveJob, LoopSolver, WorkerStopped};
+    use super::{FanOut, LoopSolveJob, LoopSolver, WorkerStopped};
     use crate::loop_closure::{LoopGraphSettings, PgoConfig, PgoError, PoseGraph};
 
     fn empty_job() -> LoopSolveJob {
@@ -283,7 +292,7 @@ mod tests {
 
     #[test]
     fn asynchronous_outcome_arrives_from_the_worker() {
-        let mut solver = LoopSolver::asynchronous().unwrap();
+        let mut solver = LoopSolver::asynchronous(FanOut::Global).unwrap();
         assert!(solver.submit(empty_job()).unwrap().is_none());
         assert!(solver.in_flight());
         let outcome = poll_until_done(&mut solver)
@@ -291,6 +300,24 @@ mod tests {
             .expect("solved within 2 s");
         assert_eq!(outcome.world_epoch, 7);
         assert!(!solver.in_flight());
+    }
+
+    #[test]
+    fn a_bounded_worker_forks_only_into_itself() {
+        use crate::system::BoundedFanOut;
+        fn solve_on_one_thread(job: LoopSolveJob) -> super::LoopSolveOutcome {
+            assert_eq!(rayon::current_num_threads(), 1);
+            job.run()
+        }
+        let mut solver = LoopSolver::Asynchronous(
+            super::LoopWorker::spawn(
+                solve_on_one_thread,
+                FanOut::Bounded(BoundedFanOut::default()),
+            )
+            .unwrap(),
+        );
+        solver.submit(empty_job()).unwrap();
+        assert!(poll_until_done(&mut solver).unwrap().is_some());
     }
 
     #[test]

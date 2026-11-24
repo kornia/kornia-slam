@@ -2,10 +2,11 @@ use kornia_imgproc::features::OrbDetector;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    AnchorGuard, CameraSelection, FlowBookkeeping, FlowPose, ForwardBackward, FrontendConfig,
-    GyroGuess, InertialConfig, KeyframeOrb, KltRetry, KltRig, LocalBaConfig, LoopClosingExecution,
-    LoopClosingMode, LostRelocalization, OrbFrontendConfig, OrbSlamPipeline, PipelineDefinition,
-    SensorSelection, StereoDepthSigma, StereoPyramid, SystemConfig, TrackRefill, TrackingConfig,
+    AnchorGuard, CameraSelection, FanOut, FlowBookkeeping, FlowPose, ForwardBackward,
+    FrontendConfig, GyroGuess, InertialConfig, KeyframeOrb, KltRetry, KltRig, LocalBaConfig,
+    LoopClosingExecution, LoopClosingMode, LostRelocalization, OrbFrontendConfig, OrbSlamPipeline,
+    PipelineDefinition, SensorSelection, StereoDepthSigma, StereoPyramid, SystemConfig,
+    TrackRefill, TrackingConfig,
 };
 use super::recovery::RecoveryConfig;
 use super::validation::ConfigError;
@@ -33,6 +34,8 @@ pub enum BuildError {
     LoopWorker(#[from] std::io::Error),
     #[error(transparent)]
     FlowPool(#[from] FlowPoolError),
+    #[error("could not start the fan-out pool: {0}")]
+    FanOut(#[from] rayon::ThreadPoolBuildError),
 }
 
 /// Settings a [`SlamSystem`](crate::SlamSystem) is assembled from, resolved
@@ -65,6 +68,7 @@ pub(crate) struct SystemSettings {
     pub growth_neighbours: GrowthNeighbours,
     pub growth_min_baseline_ratio: f64,
     pub keyframe_seed: KeyframeSeed,
+    pub fan_out: FanOut,
 }
 
 /// The 1 ms frontend knobs the tracking path reads.
@@ -233,6 +237,7 @@ impl SystemConfig {
             growth_neighbours: orb.mapping.growth_neighbours,
             growth_min_baseline_ratio: orb.mapping.growth_min_baseline_ratio,
             keyframe_seed: orb.mapping.keyframe_seed,
+            fan_out: orb.fan_out,
         }
     }
 
@@ -301,7 +306,7 @@ impl SystemConfig {
         };
         let solver = match execution.resolve(orb.mapping.execution) {
             LoopClosingExecution::Deferred { frames } => LoopSolver::deferred(frames),
-            LoopClosingExecution::Asynchronous => LoopSolver::asynchronous()?,
+            LoopClosingExecution::Asynchronous => LoopSolver::asynchronous(orb.fan_out)?,
             LoopClosingExecution::Synchronous | LoopClosingExecution::FollowMapping => {
                 LoopSolver::Synchronous
             }

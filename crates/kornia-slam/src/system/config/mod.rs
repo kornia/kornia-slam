@@ -106,10 +106,41 @@ pub struct OrbSlamPipeline {
     pub tracking_loss: TrackingLossConfig,
     pub tracking: TrackingConfig,
     pub inertial: InertialConfig,
+    pub fan_out: FanOut,
     /// Algorithm tuning, set from Rust only: configuration files always use the
     /// defaults.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub tuning: OrbTuning,
+}
+
+/// The rayon pools the tracking thread's ORB extraction and the mapping and
+/// loop-closing workers fork into.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum FanOut {
+    /// rayon's process-wide pool for all of them.
+    #[default]
+    Global,
+    /// Extraction on a private pool, and each worker forks only into itself:
+    /// rayon's idle workers yield 32 times before sleeping, which on 2 cores
+    /// takes time from the BA thread.
+    Bounded(BoundedFanOut),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct BoundedFanOut {
+    /// Threads of the extraction pool, at least 1.
+    pub tracking_threads: usize,
+}
+
+impl Default for BoundedFanOut {
+    fn default() -> Self {
+        Self {
+            tracking_threads: 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -822,6 +853,13 @@ impl fmt::Display for SystemConfig {
             writeln!(f, "  IMU integration")?;
         }
         writeln!(f, "  tracking")?;
+        if let FanOut::Bounded(bounded) = orb.fan_out {
+            writeln!(
+                f,
+                "  fan-out: bounded, {} extraction threads, workers fork inline",
+                bounded.tracking_threads
+            )?;
+        }
         if let PoseGate::Enabled(limits) = orb.tracking_loss.pose_gate {
             writeln!(
                 f,

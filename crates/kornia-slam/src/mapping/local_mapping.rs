@@ -21,6 +21,8 @@ use crate::mapping::map::{
 };
 use crate::mapping::online_calibration::OnlineCalibrationState;
 use crate::mapping::outlier_erase::{self, EraseReport};
+use crate::system::FanOut;
+use crate::system::fan_out::bind_worker_thread;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -346,6 +348,17 @@ fn merge_keeping_calibration(
 
 impl LocalMapping {
     pub fn new(mode: LocalMappingMode, map: Arc<Mutex<Map>>, camera: PinholeCamera) -> Self {
+        Self::with_fan_out(mode, map, camera, FanOut::Global)
+    }
+
+    /// As [`Self::new`], with the asynchronous worker's rayon pool set by
+    /// `fan_out`.
+    pub fn with_fan_out(
+        mode: LocalMappingMode,
+        map: Arc<Mutex<Map>>,
+        camera: PinholeCamera,
+        fan_out: FanOut,
+    ) -> Self {
         let counters = Arc::new(LocalMappingCounters::default());
         let backend = match mode {
             LocalMappingMode::Synchronous => LocalMappingBackend::Synchronous {
@@ -362,6 +375,7 @@ impl LocalMapping {
                     Arc::clone(&publication_gate),
                     camera,
                     Arc::clone(&counters),
+                    fan_out,
                 );
                 LocalMappingBackend::Asynchronous {
                     handle,
@@ -532,6 +546,7 @@ impl LocalMappingHandle {
         publication_gate: Arc<Mutex<()>>,
         camera: PinholeCamera,
         counters: Arc<LocalMappingCounters>,
+        fan_out: FanOut,
     ) -> Self {
         let pending = Arc::new(PendingJob::default());
         let worker_pending = Arc::clone(&pending);
@@ -540,6 +555,7 @@ impl LocalMappingHandle {
         let join_handle = thread::Builder::new()
             .name("kornia-local-mapping".into())
             .spawn(move || {
+                let _pool = bind_worker_thread(fan_out);
                 let _worker_exit = WorkerExit {
                     pending: Arc::clone(&worker_pending),
                 };

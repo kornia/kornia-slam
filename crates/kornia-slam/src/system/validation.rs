@@ -2,7 +2,7 @@ use kornia_imgproc::features::OrbMatchConfig;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    AnchorGuard, CameraSelection, FlowPose, ForwardBackward, FrameVelocity, FrontendConfig,
+    AnchorGuard, CameraSelection, FanOut, FlowPose, ForwardBackward, FrameVelocity, FrontendConfig,
     KeyframeOrb, KltFirst, KltRetry, KltRig, LocalBaConfig, LoopClosingMode, MAX_FLOW_THREADS,
     OnlineCalibrationConfig, OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition,
     PoseInertial, PoseInertialMinInliers, SYSTEM_CONFIG_VERSION, SensorSelection, SnapbackFix,
@@ -182,6 +182,13 @@ impl OrbSlamPipeline {
             check(
                 "mapping.growth_neighbours.covisible",
                 covisible as f64,
+                AT_LEAST_ONE,
+            )?;
+        }
+        if let FanOut::Bounded(bounded) = self.fan_out {
+            check(
+                "fan_out.tracking_threads",
+                bounded.tracking_threads as f64,
                 AT_LEAST_ONE,
             )?;
         }

@@ -176,6 +176,33 @@ fn stereo_preparation_matches_the_recorded_baseline() {
 }
 
 #[test]
+fn stereo_preparation_is_the_same_on_a_bounded_fan_out() {
+    use crate::system::fan_out::TrackingFanOut;
+    use crate::system::{BoundedFanOut, FanOut};
+    let (left, right) = synthetic_pair(376, 240, 8);
+    let prepare = |fan_out: FanOut| {
+        let mut frontend = stereo_frontend();
+        TrackingFanOut::new(fan_out)
+            .unwrap()
+            .run(|| frontend.prepare_stereo_pair(3, &left, &right))
+            .unwrap()
+    };
+    let global = prepare(FanOut::Global);
+    let bounded = prepare(FanOut::Bounded(BoundedFanOut::default()));
+    assert_eq!(global.features.keypoints_xy, bounded.features.keypoints_xy);
+    assert_eq!(global.features.descriptors, bounded.features.descriptors);
+    assert_eq!(global.features.octaves, bounded.features.octaves);
+    assert_eq!(
+        f32_bytes(&global.u_right).collect::<Vec<_>>(),
+        f32_bytes(&bounded.u_right).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        f32_bytes(&global.depth).collect::<Vec<_>>(),
+        f32_bytes(&bounded.depth).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn fisheye_mapping_matches_the_recorded_baseline() {
     let grid: Vec<[f32; 2]> = (0..40)
         .flat_map(|j| (0..40).map(move |i| [i as f32 * 1471.0 / 39.0, j as f32 * 1439.0 / 39.0]))

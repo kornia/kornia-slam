@@ -1491,12 +1491,56 @@ fn the_outlier_erase_is_named_in_the_header_and_range_checked() {
     );
 }
 
+#[test]
+fn the_fan_out_is_named_in_the_header_and_range_checked() {
+    let with = |fan_out| {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).fan_out = fan_out;
+        config
+    };
+    assert_eq!(OrbSlamPipeline::default().fan_out, FanOut::Global);
+    assert!(!with(FanOut::Global).to_string().contains("fan-out"));
+    let on = with(FanOut::Bounded(BoundedFanOut::default()));
+    assert_eq!(on.validate(), Ok(()));
+    assert!(
+        on.to_string().contains(
+            "  tracking\n  fan-out: bounded, 1 extraction threads, workers fork inline\n"
+        )
+    );
+    assert_eq!(
+        invalid_setting(&with(FanOut::Bounded(BoundedFanOut {
+            tracking_threads: 0
+        })))
+        .as_deref(),
+        Some("fan_out.tracking_threads")
+    );
+}
+
 #[cfg(feature = "serde")]
 mod ron_files {
     use std::path::Path;
 
     use super::*;
     use crate::loop_closure::OdometryRandomWalk;
+
+    #[test]
+    fn the_fan_out_parses() {
+        assert_eq!(orb(&parse("(version: 1)").unwrap()).fan_out, FanOut::Global);
+        let config =
+            parse("(version: 1, pipeline: OrbSlam((fan_out: Bounded((tracking_threads: 2)))))")
+                .unwrap();
+        assert_eq!(
+            orb(&config).fan_out,
+            FanOut::Bounded(BoundedFanOut {
+                tracking_threads: 2
+            })
+        );
+        assert_eq!(
+            orb(&parse("(version: 1, pipeline: OrbSlam((fan_out: Bounded(()))))").unwrap()).fan_out,
+            FanOut::Bounded(BoundedFanOut::default())
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+    }
 
     #[test]
     fn the_outlier_erase_parses_to_orb_slam3s_thresholds() {

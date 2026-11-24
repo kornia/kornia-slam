@@ -6192,6 +6192,7 @@ dependencies = [
  "kornia-imgproc",
  "kornia-sensors",
  "opencv",
+ "rayon",
  "ron 0.12.2",
  "serde",
  "thiserror 1.0.69",

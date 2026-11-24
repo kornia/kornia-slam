@@ -8,6 +8,7 @@ mod build;
 mod config;
 mod counters;
 mod estimator;
+pub(crate) mod fan_out;
 #[cfg(feature = "serde")]
 mod file;
 mod input;
@@ -19,13 +20,13 @@ pub mod wheel;
 
 pub use build::BuildError;
 pub use config::{
-    AnchorGuard, CameraSelection, FlowBookkeeping, FlowPose, ForwardBackward, FrameVelocity,
-    FrontendConfig, GyroGuess, InertialConfig, KeyframeOrb, KltFirst, KltPrediction, KltRetry,
-    KltRig, LocalBaConfig, LoopClosingExecution, LoopClosingMode, LostRelocalization,
-    MAX_FLOW_THREADS, MappingConfig, OnlineCalibrationConfig, OrbFrontendConfig, OrbSlamPipeline,
-    OrbTuning, PipelineDefinition, PoseInertial, PoseInertialMinInliers, SYSTEM_CONFIG_VERSION,
-    SensorSelection, SnapbackFix, StereoCloseDepth, StereoDepthSigma, StereoPyramid, SystemConfig,
-    TrackRefill, TrackingConfig, TrackingLossConfig,
+    AnchorGuard, BoundedFanOut, CameraSelection, FanOut, FlowBookkeeping, FlowPose,
+    ForwardBackward, FrameVelocity, FrontendConfig, GyroGuess, InertialConfig, KeyframeOrb,
+    KltFirst, KltPrediction, KltRetry, KltRig, LocalBaConfig, LoopClosingExecution,
+    LoopClosingMode, LostRelocalization, MAX_FLOW_THREADS, MappingConfig, OnlineCalibrationConfig,
+    OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition, PoseInertial,
+    PoseInertialMinInliers, SYSTEM_CONFIG_VERSION, SensorSelection, SnapbackFix, StereoCloseDepth,
+    StereoDepthSigma, StereoPyramid, SystemConfig, TrackRefill, TrackingConfig, TrackingLossConfig,
 };
 pub use counters::{RunCounters, SkipKind};
 #[cfg(feature = "serde")]
@@ -37,6 +38,7 @@ pub use trace::{FrameTrace, TraceMapPoint, TraceTrack};
 pub use validation::ConfigError;
 
 use crate::frontend::{FrontendObservation, OrbFrontend};
+use fan_out::TrackingFanOut;
 use state::{SystemMode, SystemState};
 
 use crate::tracking::{
@@ -225,6 +227,7 @@ pub struct SlamSystem {
     pending_graph_gap: Option<KeyframeGap>,
     state: SystemState,
     frontend: OrbFrontend,
+    fan_out: TrackingFanOut,
     // The last processed image, for optical-flow tracks into the next frame.
     previous_image: Option<Image<u8, 1>>,
     // Rig cameras 1 and up of the last processed capture, kept only when
@@ -285,6 +288,7 @@ impl SlamSystem {
             .with_stereo_pyramid(config.stereo_pyramid())
             .with_fisheye_weight(config.fisheye_weight(&rig));
         let loop_closer = config.loop_closer(&rig)?;
+        let fan_out = TrackingFanOut::new(settings.fan_out)?;
         let rig_flow = match settings.klt_kernel {
             LkKernel::WindowedU8 => Some(RigFlow::new(
                 rig_flow_settings(&settings),
@@ -298,6 +302,7 @@ impl SlamSystem {
             frontend,
             loop_closer,
             rig_flow,
+            fan_out,
         ))
     }
 
@@ -307,6 +312,7 @@ impl SlamSystem {
         frontend: OrbFrontend,
         loop_closer: Option<LoopCloser>,
         rig_flow: Option<RigFlow>,
+        fan_out: TrackingFanOut,
     ) -> Self {
         let camera = rig.camera.clone();
         let flow = settings.frontend_flow;
@@ -324,8 +330,12 @@ impl SlamSystem {
             tracker = tracker.with_rig_flow(Arc::clone(geometry), flow.threads);
         }
         let map = Arc::new(Mutex::new(Map::new()));
-        let local_mapping =
-            LocalMapping::new(settings.local_mapping, Arc::clone(&map), camera.clone());
+        let local_mapping = LocalMapping::with_fan_out(
+            settings.local_mapping,
+            Arc::clone(&map),
+            camera.clone(),
+            settings.fan_out,
+        );
         let map_publication_gate = local_mapping.publication_gate();
         Self {
             rig,
@@ -372,6 +382,7 @@ impl SlamSystem {
             loop_closure_events: Vec::new(),
             pending_graph_gap: None,
             frontend,
+            fan_out,
             previous_image: None,
             previous_secondary: Vec::new(),
             tracking_duration: Duration::ZERO,
@@ -731,14 +742,17 @@ impl SlamSystem {
 
     /// ORB features of a capture, undistorted, with the stereo report.
     fn extract(&mut self, pending: PendingFrame<'_>) -> Result<Frame, ProcessError> {
-        let mut frame = match pending.capture {
-            Capture::Mono(image) => self.frontend.prepare_image(pending.idx, image),
-            Capture::Stereo(left, right) => {
-                self.frontend.prepare_stereo_pair(pending.idx, left, right)
-            }
-            Capture::Rig(images) => self.frontend.prepare_rig(pending.idx, images),
-        }
-        .map_err(ProcessError::Frontend)?;
+        let frontend = &mut self.frontend;
+        let mut frame = self
+            .fan_out
+            .run(|| match pending.capture {
+                Capture::Mono(image) => frontend.prepare_image(pending.idx, image),
+                Capture::Stereo(left, right) => {
+                    frontend.prepare_stereo_pair(pending.idx, left, right)
+                }
+                Capture::Rig(images) => frontend.prepare_rig(pending.idx, images),
+            })
+            .map_err(ProcessError::Frontend)?;
         self.report_stereo(&frame);
         // Fill the per-frame undistortion cache once; tracking, BA gathering,
         // growth, and fuse all read from it.

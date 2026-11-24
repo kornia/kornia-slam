@@ -1674,7 +1674,8 @@ fn deferred_writeback_matches_the_synchronous_closure() {
 fn asynchronous_writeback_matches_the_synchronous_closure() {
     let (expected_map, _) = synchronous_closure();
     let (closer, mut map) = closing_fixture(background_config(), false);
-    let mut closer = closer.with_solver(LoopSolver::asynchronous().unwrap());
+    let mut closer =
+        closer.with_solver(LoopSolver::asynchronous(crate::system::FanOut::Global).unwrap());
     let context = closing_context(&map);
     let started = std::time::Instant::now();
 
