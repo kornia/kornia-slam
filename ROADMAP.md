@@ -23,6 +23,25 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 
 ### 2026-11-24
 
+- **Round 2 of the #180 integration (`integ/round2`, from `feat/global-pose-graph` 379bd1d; not pushed): the remaining
+  kornia-slam branches folded in.** Cherry-picked, original authors, no merge commits: `feat/loss-one-world` (21: cards
+  AC, AC-2b, quick-eval `worldrot.py`, `lossev.py`, `jumps.py`, `innov.py`), `feat/drift-budget` (5 beyond the 20 it
+  shares with loss-one-world: cards AG and AH stage 0/1, `revisits.py`, `driftbudget.py`, `budget.sh`, `biasevent.py`,
+  `winscore.sh`, the `clockscan.py` refactor), `feat/still-device` (17: cards AB and AB-1b, `still.py`, `imuquiet.py`)
+  and `feat/break-cases` (5: the break-case catalogue and BC-R1, and the session-slice / OpenCV
+  fixture v2 / `bc_extract.sh` WIP, now built and clippy-clean). `feat/rt-b` had nothing after f444fcf.
+  - Knobs, all off by default: `tracking_loss.reseed.seed` (`CoastedIfPlausible`; `Held`),
+    `tracking_loss.pose_gate: Innovation((mode: Observe | Reject))` (default `Disabled`), `keyframes.stillness` (`Off`;
+    `Observe`, `Gate`; `StationaryEdges` refused). New `[summary] loss` and `[summary] stillness` lines.
+  - The stillness bound/quality split is merged with F4: a busy mapping still gates the earned asks, and refuses a
+    due keyframe after the still gate.
+  - Ledger: G45-G48 added; the drift-budget G49 row is the same gap as the round-1 G49 (card AH) and is merged
+    into it, not renumbered.
+  - Identity (knobs off), `bin-integ2/kornia-slam-euroc` (md5 `e97329d40ad54bd38ad521376e78bf92`): `IDENT_V102_OK`,
+    `HEADER_OK`, `IDENT_R01_OK` (md5 `d4f77b567b912b5a4caa2af6085a35b1`).
+  - Left out (owner, 2026-11-24): the W1-W8 window-test commit. W2 (window solve depends on the world origin: 1.5-3.2 mm
+    at 1000 m) and W7 (chained windows drift: ATE 20-26 mm) are red-by-design gap tests and would turn CI red; the file
+    stays an uncommitted working copy. They remain open gaps (card Y window-local frame; W7 chain drift).
 - **EuRoC top-1 work integrated on one branch (`integ/euroc-top1`, from `feat/global-pose-graph` 1b5f8a7; not
   pushed).** Cherry-picked, no merge commits: `feat/r11b-outlier-erase` (16), `feat/cardh-pi-bar` (2), `feat/rt-a`
   (6), `feat/rt-b` (5; its copies of the F1 card and F1 code left out), `feat/euroc-rig` (8) and
