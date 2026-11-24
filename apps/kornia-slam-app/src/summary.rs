@@ -55,6 +55,7 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
          [summary] frontend_ms {}\n\
          {}\n\
          {}\n\
+         {}\n\
          {}",
         c.frames,
         c.tracked,
@@ -88,6 +89,15 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
         format_estimator_recovery(c),
         format_flow_coast(c),
         format_outlier_erase(c),
+        format_mapping_load(c),
+    )
+}
+
+/// How the tracking thread met local mapping's load (real-time fix ladder F4).
+fn format_mapping_load(c: &RunCounters) -> String {
+    format!(
+        "[summary] mapping_load keyframes_refused_busy={}",
+        c.keyframes_refused_busy
     )
 }
 
@@ -295,7 +305,7 @@ mod tests {
         counters.vi_ba_solves_3plus_rejects = 22;
         let text = format(&counters, &FrameTimes::default());
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 6);
+        assert_eq!(lines.len(), 7);
         assert_eq!(
             lines[3],
             "[summary] estimator_recovery ba_keyframe_shifts=1 ba_snapbacks=2 \
@@ -330,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn the_last_line_holds_the_outlier_erase_counters_in_order() {
+    fn the_sixth_line_holds_the_outlier_erase_counters_in_order() {
         let mut counters = RunCounters::default();
         counters.erase_tested = 1;
         counters.erase_unlinked = 2;
@@ -340,7 +350,7 @@ mod tests {
         counters.erase_stale_links = 6;
         let text = format(&counters, &FrameTimes::default());
         assert_eq!(
-            text.lines().last().unwrap(),
+            text.lines().nth(5).unwrap(),
             "[summary] outlier_erase erase_tested=1 erase_unlinked=2 erase_tested_newest=3 \
              erase_unlinked_newest=4 erase_landmarks_retired=5 erase_stale_links=6"
         );
@@ -383,6 +393,17 @@ mod tests {
                 "[summary] late_frames=0 frame_period_ms=0.0 final_latency_ms=0.0 \
                  sum_total_s=0.000 sum_sleep_s=0.000 loop_wall_s=0.000"
             )
+        );
+    }
+
+    #[test]
+    fn the_last_line_holds_the_mapping_load_counters() {
+        let mut counters = RunCounters::default();
+        counters.keyframes_refused_busy = 4;
+        let text = format(&counters, &FrameTimes::default());
+        assert_eq!(
+            text.lines().last().unwrap(),
+            "[summary] mapping_load keyframes_refused_busy=4"
         );
     }
 }

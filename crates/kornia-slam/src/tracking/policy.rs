@@ -36,6 +36,22 @@ pub struct KeyframePolicy {
     pub max_interval_sec: Option<f64>,
     /// The rule set the decision follows.
     pub rules: KeyframeRules,
+    /// Whether a busy local mapping holds keyframes back.
+    pub mapping_acceptance: MappingAcceptance,
+}
+
+/// How local mapping's load enters the keyframe decision.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum MappingAcceptance {
+    /// Mapping is taken as idle.
+    #[default]
+    Ignore,
+    /// ORB-SLAM3's `AcceptKeyFrames` (`Tracking.cc:3103, 3156-3158, 3190-3210`):
+    /// while mapping is busy only the frame-count bound (c1a) and the time and
+    /// weak-tracking rules insert, and `SlamSystem` refuses every keyframe
+    /// while `local_ba.active_keyframes` of them wait for the mapping thread.
+    OrbSlam3,
 }
 
 /// Which keyframe insertion rules apply.
@@ -60,6 +76,7 @@ impl Default for KeyframePolicy {
             min_parallax_px: None,
             max_interval_sec: None,
             rules: KeyframeRules::Kornia,
+            mapping_acceptance: MappingAcceptance::Ignore,
         }
     }
 }
@@ -94,6 +111,10 @@ pub struct KeyframeEvidence {
     pub mono_inertial: bool,
     pub secs_since_last_kf: Option<f64>,
     pub frames_since_reloc: Option<usize>,
+    /// Local mapping is solving or holds a job (ORB-SLAM3's `!AcceptKeyFrames()`).
+    pub mapping_busy: bool,
+    /// Keyframes submitted since the mapping thread's last snapshot.
+    pub mapping_pending: usize,
 }
 
 impl KeyframeEvidence {
@@ -154,10 +175,11 @@ impl KeyframePolicy {
     /// `min_frames_between`; always at `max_frames_between`; always when the
     /// reference keyframe holds no map points (tracking is weak); when the
     /// tracked ratio against the reference falls below `ref_ratio`; and, if
-    /// `min_parallax_px` is set, when the measured parallax reaches it.
+    /// `min_parallax_px` is set, when the measured parallax reaches it. The
+    /// last two need an idle mapping under [`MappingAcceptance::OrbSlam3`].
     pub fn should_insert_with(&self, evidence: &KeyframeEvidence) -> bool {
         if let KeyframeRules::OrbSlam3 { max_frames } = self.rules {
-            return orb_slam3_needs_keyframe(max_frames, evidence);
+            return orb_slam3_needs_keyframe(max_frames, self.mapping_idle(evidence), evidence);
         }
         let Some(last_kf_idx) = evidence.last_keyframe_idx else {
             return true;
@@ -173,6 +195,10 @@ impl KeyframePolicy {
 
         if evidence.n_ref_map_points == 0 {
             return true;
+        }
+        // c1b (`Tracking.cc:3158`): the earned triggers wait for an idle mapping.
+        if !self.mapping_idle(evidence) {
+            return false;
         }
 
         let weak_threshold = (evidence.n_ref_map_points as f64 * self.ref_ratio) as usize;
@@ -190,6 +216,10 @@ impl KeyframePolicy {
 }
 
 impl KeyframePolicy {
+    fn mapping_idle(&self, evidence: &KeyframeEvidence) -> bool {
+        self.mapping_acceptance == MappingAcceptance::Ignore || !evidence.mapping_busy
+    }
+
     /// Whether `max_interval_sec` forces a keyframe `secs_since_last_kf`
     /// seconds and `frames_since_last_kf` frames after the last one.
     pub(crate) fn interval_elapsed(
@@ -206,14 +236,18 @@ impl KeyframePolicy {
 }
 
 /// ORB-SLAM3's `Tracking::NeedNewKeyFrame`, inertial branches
-/// (`Tracking.cc:3064-3214`), with mapping synchronous: local mapping is
-/// always idle and `mMinFrames` is 0, so `c1b` always holds and `c1a` adds
-/// nothing. The rules that read the map's keyframe count (`nKFs <= 2`, `< 2`)
-/// are left out: they act only on the first two keyframes.
-fn orb_slam3_needs_keyframe(max_frames: usize, evidence: &KeyframeEvidence) -> bool {
-    if evidence.last_keyframe_idx.is_none() {
+/// (`Tracking.cc:3064-3214`). `mMinFrames` is 0, so `c1b` is `mapping_idle`;
+/// with mapping taken as idle `c1a` adds nothing. The rules that read the
+/// map's keyframe count (`nKFs <= 2`, `< 2`) are left out: they act only on
+/// the first two keyframes.
+fn orb_slam3_needs_keyframe(
+    max_frames: usize,
+    mapping_idle: bool,
+    evidence: &KeyframeEvidence,
+) -> bool {
+    let Some(last_kf_idx) = evidence.last_keyframe_idx else {
         return true;
-    }
+    };
     let secs_since_last_kf = evidence.secs_since_last_kf;
     if !evidence.imu_initialized {
         return secs_since_last_kf.is_some_and(|secs| secs >= 0.25);
@@ -230,10 +264,11 @@ fn orb_slam3_needs_keyframe(max_frames: usize, evidence: &KeyframeEvidence) -> b
     };
     let c2 = ((inliers as f64) < evidence.ref_points_min_obs as f64 * ref_ratio || need_close)
         && inliers > MIN_INLIERS_FOR_RATIO_INSERT;
+    let c1a = evidence.curr_idx.saturating_sub(last_kf_idx) >= max_frames;
     let c3 = secs_since_last_kf.is_some_and(|secs| secs >= 0.5);
     let c4 = evidence.mono_inertial
         && ((inliers < 75 && inliers > MIN_INLIERS_FOR_RATIO_INSERT) || evidence.recently_lost);
-    c2 || c3 || c4
+    ((c1a || mapping_idle) && c2) || c3 || c4
 }
 
 /// Recently-lost grace period policy (mirrors ORB-SLAM3's RECENTLY_LOST vs
@@ -401,6 +436,93 @@ mod tests {
             ..base
         }));
         assert!(!policy.interval_elapsed(1000, 1000.0));
+    }
+
+    /// `Ignore` and an idle mapping decide as before over a table of
+    /// evidence; a busy mapping keeps only the frame-count bound, the empty
+    /// reference and, under ORB-SLAM3's rules, c1a, c3 and c4.
+    #[test]
+    fn mapping_acceptance_holds_back_only_the_earned_triggers() {
+        let accepting = |policy: KeyframePolicy| KeyframePolicy {
+            mapping_acceptance: MappingAcceptance::OrbSlam3,
+            ..policy
+        };
+        let orb_slam3 = KeyframePolicy {
+            rules: KeyframeRules::OrbSlam3 { max_frames: 20 },
+            ..KeyframePolicy::default()
+        };
+        let busy = |e: KeyframeEvidence| KeyframeEvidence {
+            mapping_busy: true,
+            mapping_pending: 1,
+            ..e
+        };
+        let mut table = Vec::new();
+        for frames_since in [0, 2, 3, 5, 8, 20, 30] {
+            for (inliers, n_ref) in [(80, 100), (59, 100), (14, 30), (10, 0)] {
+                for px in [None, Some(4.0), Some(12.0)] {
+                    for secs in [Some(0.1), Some(0.5)] {
+                        table.push(KeyframeEvidence {
+                            median_parallax_px: px,
+                            imu_initialized: true,
+                            secs_since_last_kf: secs,
+                            ref_points_min_obs: n_ref,
+                            ..evidence(frames_since, inliers, n_ref)
+                        });
+                    }
+                }
+            }
+        }
+        for policy in [KeyframePolicy::default(), parallax_policy(), orb_slam3] {
+            for e in &table {
+                let today = policy.should_insert_with(e);
+                assert_eq!(accepting(policy).should_insert_with(e), today, "{e:?}");
+                let ignored = policy.should_insert_with(&busy(*e));
+                assert_eq!(ignored, today, "Ignore reads no load: {e:?}");
+            }
+        }
+
+        let kornia = accepting(KeyframePolicy::default());
+        assert!(kornia.should_insert_with(&evidence(3, 50, 100)));
+        assert!(
+            !kornia.should_insert_with(&busy(evidence(3, 50, 100))),
+            "ratio"
+        );
+        assert!(
+            kornia.should_insert_with(&busy(evidence(8, 80, 100))),
+            "max_frames_between"
+        );
+        assert!(
+            kornia.should_insert_with(&busy(evidence(3, 50, 0))),
+            "empty reference"
+        );
+        let parallax = accepting(parallax_policy());
+        assert!(parallax.should_insert_with(&with_parallax(evidence(3, 80, 100), 12.0)));
+        assert!(!parallax.should_insert_with(&busy(with_parallax(evidence(3, 80, 100), 12.0))));
+
+        let orb = accepting(orb_slam3);
+        let weak = KeyframeEvidence {
+            imu_initialized: true,
+            secs_since_last_kf: Some(0.1),
+            ref_points_min_obs: 200,
+            ..evidence(5, 140, 200)
+        };
+        assert!(orb.should_insert_with(&weak));
+        assert!(!orb.should_insert_with(&busy(weak)), "c2 needs c1b");
+        assert!(
+            orb.should_insert_with(&busy(KeyframeEvidence {
+                curr_idx: 120,
+                ..weak
+            })),
+            "c1a"
+        );
+        assert!(
+            orb.should_insert_with(&busy(KeyframeEvidence {
+                tracked_inliers: 190,
+                secs_since_last_kf: Some(0.5),
+                ..weak
+            })),
+            "c3"
+        );
     }
 
     #[test]

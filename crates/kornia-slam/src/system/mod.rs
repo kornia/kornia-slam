@@ -42,8 +42,8 @@ use fan_out::TrackingFanOut;
 use state::{SystemMode, SystemState};
 
 use crate::tracking::{
-    KeyframeEvidence, KeyframePolicy, KeyframesWhileLost, TrackingLossRecoveryPolicy,
-    median_parallax_px,
+    KeyframeEvidence, KeyframePolicy, KeyframesWhileLost, MappingAcceptance,
+    TrackingLossRecoveryPolicy, median_parallax_px,
 };
 
 use crate::tracking::TrackingTimings;
@@ -78,6 +78,7 @@ use crate::loop_closure::{
 };
 use crate::mapping::bundle_adjustment::LocalBaParams;
 use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
+use crate::mapping::local_mapping::MappingLoad;
 use crate::mapping::map::{
     ImuFactor, InertialAlignmentError, Keyframe, Map, MapInsertion, MapMutationError, MapPoint,
     StateEnvelopeLimits,
@@ -2681,12 +2682,19 @@ impl SlamSystem {
                 )
             });
         drop(map);
+        // Read only when it counts: the load takes the worker's queue lock.
+        let load = match self.keyframe_policy.mapping_acceptance {
+            MappingAcceptance::Ignore => MappingLoad::default(),
+            MappingAcceptance::OrbSlam3 => self.local_mapping.load(),
+        };
         let evidence = KeyframeEvidence {
             curr_idx: frame.idx,
             last_keyframe_idx: self.state.last_keyframe_idx,
             tracked_inliers,
             n_ref_map_points,
             median_parallax_px,
+            mapping_busy: load.busy,
+            mapping_pending: load.pending_keyframes,
             ..KeyframeEvidence::default()
         };
         let (evidence, orb_slam3_wait) =
@@ -2695,8 +2703,8 @@ impl SlamSystem {
     }
 
     /// The policy's decision, or `max_interval_sec` elapsed since the last
-    /// keyframe's timestamp.
-    fn keyframe_due(&self, evidence: &KeyframeEvidence, timestamp_sec: f64) -> bool {
+    /// keyframe's timestamp, unless the mapping refuses it.
+    fn keyframe_due(&mut self, evidence: &KeyframeEvidence, timestamp_sec: f64) -> bool {
         let interval_elapsed = evidence
             .last_keyframe_idx
             .zip(self.inertial.last_keyframe_timestamp_sec)
@@ -2706,7 +2714,22 @@ impl SlamSystem {
                     timestamp_sec - last_ts,
                 )
             });
-        interval_elapsed || self.keyframe_policy.should_insert_with(evidence)
+        let due = interval_elapsed || self.keyframe_policy.should_insert_with(evidence);
+        if due && self.mapping_refuses(evidence) {
+            self.counters.keyframes_refused_busy += 1;
+            return false;
+        }
+        due
+    }
+
+    /// ORB-SLAM3's busy branch (`Tracking.cc:3190-3210`): no keyframe while
+    /// the window's worth wait for the mapping thread, except while the IMU
+    /// initializes (`IsInitializing()`, `:3192`).
+    fn mapping_refuses(&self, evidence: &KeyframeEvidence) -> bool {
+        self.keyframe_policy.mapping_acceptance == MappingAcceptance::OrbSlam3
+            && evidence.mapping_busy
+            && evidence.mapping_pending >= self.local_ba.active_keyframes
+            && (self.rig.imu.is_none() || self.state.imu_initialized)
     }
 
     /// Whether the IMU prediction is trusted enough to coast on.

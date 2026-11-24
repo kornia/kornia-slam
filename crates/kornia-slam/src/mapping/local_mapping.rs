@@ -436,6 +436,14 @@ impl LocalMapping {
         }
     }
 
+    /// Always idle in synchronous mode, which solves inside `submit`.
+    pub(crate) fn load(&self) -> MappingLoad {
+        match &self.backend {
+            LocalMappingBackend::Synchronous { .. } => MappingLoad::default(),
+            LocalMappingBackend::Asynchronous { handle, .. } => handle.load(),
+        }
+    }
+
     /// Local-BA tallies so far. In asynchronous mode a job still on the
     /// worker is not counted yet.
     pub(crate) fn counts(&self) -> LocalMappingCounts {
@@ -501,9 +509,22 @@ impl LocalMapping {
     }
 }
 
+/// Local mapping's load as tracking sees it, for keyframe acceptance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MappingLoad {
+    /// A job is being solved or waits for the worker.
+    pub busy: bool,
+    /// Keyframes submitted since the worker's last snapshot, which the next
+    /// solve takes in at once.
+    pub pending_keyframes: usize,
+}
+
 #[derive(Default)]
 struct PendingState {
     latest: Option<KeyframeJob>,
+    /// The worker took a job and has not merged it yet.
+    in_flight: bool,
+    pending_keyframes: usize,
     /// Keyframes whose ORB runs here, in order; never replaced.
     deferred: VecDeque<DeferredKeyframe>,
     deferred_context: Option<Arc<DeferredKeyframeContext>>,
@@ -583,6 +604,7 @@ impl LocalMappingHandle {
                         let Some(job) = state.latest.take() else {
                             continue;
                         };
+                        state.in_flight = true;
                         job
                     };
 
@@ -592,10 +614,16 @@ impl LocalMappingHandle {
                         let _publication = publication_gate
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        capture_local_window(
+                        let snapshot = capture_local_window(
                             &map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
                             &job,
-                        )
+                        );
+                        worker_pending
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .pending_keyframes = 0;
+                        snapshot
                     };
 
                     let update = solve_counted(snapshot, &camera, &job, &counters, &calibration);
@@ -614,6 +642,11 @@ impl LocalMappingHandle {
                         counters.record_merge(&merged);
                         merged.is_ok_and(|result| result_sender.send(result).is_err())
                     };
+                    worker_pending
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .in_flight = false;
                     if should_stop {
                         break;
                     }
@@ -639,8 +672,21 @@ impl LocalMappingHandle {
             return false;
         }
         state.latest = Some(job);
+        state.pending_keyframes += 1;
         self.pending.ready.notify_one();
         true
+    }
+
+    fn load(&self) -> MappingLoad {
+        let state = self
+            .pending
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        MappingLoad {
+            busy: state.in_flight || state.latest.is_some(),
+            pending_keyframes: state.pending_keyframes,
+        }
     }
 
     fn drain_results(&self) -> Vec<LocalBaMergeResult> {
@@ -683,7 +729,7 @@ mod tests {
 
     use super::{
         BaUpdateError, KeyframeJob, LocalBaParams, LocalMapping, LocalMappingBackend,
-        LocalMappingMode,
+        LocalMappingMode, MappingLoad,
     };
     use crate::mapping::map::{InertialAlignment, KeyframeVelocity, Map};
     use kornia_algebra::SO3F64;
@@ -902,6 +948,40 @@ mod tests {
             None,
             "the keyframe side was cleaned up too"
         );
+    }
+
+    /// The worker blocked at its snapshot (the test holds the publication
+    /// gate): busy with every submission pending, then idle after the merge.
+    #[test]
+    fn the_load_follows_a_blocked_worker() {
+        let (map, _) = map_with_a_cullable_landmark();
+        let mapping = LocalMapping::new(
+            LocalMappingMode::Asynchronous,
+            Arc::clone(&map),
+            test_camera(),
+        );
+        assert_eq!(mapping.load(), MappingLoad::default());
+        let gate = mapping.publication_gate().unwrap();
+        let held = gate.lock().unwrap();
+        for submitted in 1..=3 {
+            assert!(mapping.submit(visual_job()));
+            assert_eq!(
+                mapping.load(),
+                MappingLoad {
+                    busy: true,
+                    pending_keyframes: submitted
+                }
+            );
+        }
+        drop(held);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while mapping.load() != MappingLoad::default() {
+            assert!(std::time::Instant::now() < deadline, "{:?}", mapping.load());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let synchronous = LocalMapping::new(LocalMappingMode::Synchronous, map, test_camera());
+        assert!(synchronous.submit(visual_job()));
+        assert_eq!(synchronous.load(), MappingLoad::default());
     }
 
     #[test]

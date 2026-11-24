@@ -726,6 +726,37 @@ mod anchors {
         assert_eq!(system.state.last_keyframe_idx, Some(8));
     }
 
+    /// F4: a due keyframe is refused while the window's worth waits for a
+    /// busy mapping, except before the IMU is initialized; `Ignore` and the
+    /// lost path are unchanged.
+    #[test]
+    fn a_busy_mapping_refuses_keyframes_once_the_window_waits() {
+        use crate::tracking::{KeyframeEvidence, MappingAcceptance};
+        let mut system = system();
+        system.keyframe_policy.mapping_acceptance = MappingAcceptance::OrbSlam3;
+        let waiting = KeyframeEvidence {
+            curr_idx: 8,
+            last_keyframe_idx: Some(0),
+            mapping_busy: true,
+            mapping_pending: 2,
+            ..KeyframeEvidence::default()
+        };
+        assert!(system.keyframe_due(&waiting, 0.4), "max_frames_between");
+        let full = KeyframeEvidence {
+            mapping_pending: 3,
+            ..waiting
+        };
+        assert!(!system.keyframe_due(&full, 0.4));
+        assert_eq!(system.counters.keyframes_refused_busy, 1);
+        system.state.imu_initialized = false;
+        assert!(system.keyframe_due(&full, 0.4), "IsInitializing");
+        system.state.imu_initialized = true;
+        system.keyframe_policy.mapping_acceptance = MappingAcceptance::Ignore;
+        assert!(system.keyframe_due(&full, 0.4));
+        assert_eq!(system.counters.keyframes_refused_busy, 1);
+        assert!(system.keyframe_due_while_lost(0.2));
+    }
+
     #[test]
     fn anchors_are_spaced_from_the_newest_anchor_and_tracking_clears_it() {
         let mut system = system();

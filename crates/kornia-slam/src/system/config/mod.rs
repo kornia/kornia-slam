@@ -24,7 +24,9 @@ use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::{KeyframeObservations, MapProjectionConfig};
 use crate::tracking::pose_gate::PoseGate;
 use crate::tracking::relocalization::RelocalizationSolver;
-use crate::tracking::{KeyframePolicy, KeyframesWhileLost, TrackingLossRecoveryPolicy};
+use crate::tracking::{
+    KeyframePolicy, KeyframesWhileLost, MappingAcceptance, TrackingLossRecoveryPolicy,
+};
 use kornia_sensors::imu::SampleInterpolation;
 
 use super::recovery::RecoveryConfig;
@@ -879,6 +881,9 @@ impl fmt::Display for SystemConfig {
         write!(f, " frames, ref ratio {}", k.ref_ratio)?;
         if let Some(px) = k.min_parallax_px {
             write!(f, ", parallax {px} px")?;
+        }
+        if k.mapping_acceptance != MappingAcceptance::default() {
+            write!(f, ", mapping acceptance {:?}", k.mapping_acceptance)?;
         }
         match k.max_interval_sec {
             Some(secs) => writeln!(f, ", at most {secs} s apart")?,
