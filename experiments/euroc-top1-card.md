@@ -3470,3 +3470,60 @@ sequence, except MH_04 (RT3E 0.270, RT3EF 0.248, RT3EIH 0.355); see `report_inte
 sequence reaches 0.5x Basalt, and no run passes the latency rule. Nothing is promoted. Still to run once the owner
 allows background work: the three set-aside real-time runs, then S0PEI, S0PEIH and S0EIH (99 SYNC runs,
 `E/gate/sync_{A..D}.txt`).
+
+## Lane B of the 2x plan: G60-b and V-c (rungs 2x-2, 2x-3; predictions written 2026-11-24, before the runs)
+
+Branch `feat/2x-loop-rt` (from `feat/global-pose-graph` 8ba53ba), worktree `kornia-slam-2x-b`. Both rungs are knobs whose
+default is today's behaviour. SYNC, unpaced, `E/drive.sh` protocol (header check, `rc`), no RT lock needed, never
+started while `P/rt.lock` is held by a pinned run. Basalt (SE(3) ATE, `B/results/euroc_systems.json`): MH_01 0.067,
+MH_04 0.114, MH_05 0.144, V1_02 0.045, V1_03 0.053, V2_01 0.039, V2_02 0.049.
+
+### G60-b: knob `loop_closing: Enabled(…, graph: ( accept_capped_solves: true ))`
+
+- **Change:** `unusable_reason` (`loop_closure/pose_graph.rs`) treats a solve stopped at `max_iterations` as
+  converged when its cost fell and the new loop's residual fell (strictly). The other checks stay: finite costs,
+  gravity within 1e-4 rad, cost fell, loop residual did not grow. A solve that stops short of the cap without
+  converging (λ above its maximum) stays unusable. Default `false`: every capped solve is dropped, as today. The
+  header prints `, capped solves accepted` inside the loop-closing line only when the knob is on.
+- **Not done from the G60 card text:** the `pgo_capped` counter. An applied capped loop is seen as the same
+  `[loop-closure] accepted kf=A ~ kf=B … applied=true` pair that the knob-off run logs `applied=false` with a
+  `[pgo] failed … not converged after 30 iterations` line.
+- **Arms:** S0PEIH (control, knob off, same binary) and S0PEIHC = S0PEIH + the knob. MH_04 starts 0/1/2/30/60, MH_01
+  0/1/2, MH_05 0/1/2, guards V1_02 and V2_01 start 0. S0PEIH has never run MH_05, so the control runs there are new.
+
+| id | prediction |
+|---|---|
+| Pb0 (control) | S0PEIH on this binary `cmp`-identical to the `bin-cardh` S0PEIH runs on MH_04 0/1/2/30/60, MH_01 0/1/2, V1_02 0, V2_01 0 (the integration kept S0's output; ident trio) |
+| Pb1 (mechanism) | S0PEIHC logs no `[pgo] failed … not converged` line on any run; each pair the control logs as failed is `applied=true` under the knob (MH_04 start 60: kf 1584 ~ 690) |
+| Pb2 | MH_04 start 60: 0.251 → 0.17-0.20 causal; MH_04 median of 5 ≤ 0.178 (S0PEIH 0.178) |
+| Pb3 | every run whose control has no `[pgo] failed` line is `cmp`-identical to its control (`traj.txt` and `traj_smoothed.txt`): MH_04 0/1/2/30, MH_01 0/1/2, V1_02 0, V2_01 0 |
+| Pb4 (MH_05, new) | where the MH_05 control fails a loop, that start improves by 0.00-0.04 causal; the others are identical |
+
+| id | kill rule |
+|---|---|
+| Kb1 | an applied capped loop raises the 10 s piece error after the loop by more than 0.05 m against the control, or a `gravity moved` reason appears: gate on the cost drop as well |
+| Kb2 | Pb3 fails: the knob touched converged solves |
+
+### V-c: `keyframe_observations: PnpInliersClaimed`
+
+- **Change:** a new `KeyframeObservations` variant. It links only the PnP inliers, as `PnpInliers`, and returns the
+  dropped features in the estimate. The keyframe insertion marks them claimed, so `growth::stereo_seeds` does not
+  seed them again as new stereo landmarks (`mapping/keyframe_mapping.rs:117-121`). Default `AllMatches`, and
+  `PnpInliers` is unchanged.
+- **Not covered:** pair growth can still triangulate a dropped feature against a neighbour later. That path is not
+  changed here. If the landmark count stays high, it is the next suspect.
+- **Arms:** S0PE (control, cached runs on `bin-r11b`/`bin-cardh` era, plus a knob-off control on this binary where
+  the cache is not identical) and S0PEC = S0PE with `PnpInliersClaimed`. V1_03, V2_02, MH_04 and MH_01, starts 0/1/2.
+
+| id | prediction |
+|---|---|
+| Pc1 (mechanism) | V1_03 start 0, frames 0-400 debug: stereo seeds per keyframe 326 → ≤ 240 (S0E 217); final landmarks 210 k → ≤ 150 k |
+| Pc2 | V1_03 median of 3 ≤ 0.080 (S0PE 0.111: 0.111 / 0.166 / 0.085; S0E 0.072), every start below its S0PE start |
+| Pc3 | V2_02 median ≤ 0.085 (S0PE 0.092: 0.099 / 0.091 / 0.092; S0E 0.080) |
+| Pc4 (keep the MH gain) | MH_04 median ≤ 0.235 (S0PE 0.227; S0E 0.311); MH_01 median ≤ 0.055 (S0PE 0.049; S0E 0.072) |
+
+| id | kill rule |
+|---|---|
+| Kc1 | MH_04 median > 0.25, or MH_01 median > 0.060: the duplicates were part of the hall gain |
+| Kc2 | V1_03 or V2_02 median not below S0PE: fragmentation was not the Vicon penalty |
+| Kc3 | Pc1 misses (seeds per keyframe > 240): the claims did not reach stereo seeding; check the plumbing before scoring |
