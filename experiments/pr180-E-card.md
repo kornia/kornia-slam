@@ -673,7 +673,7 @@ pub fn corner_sub_pix(image: &Image<u8, 1>, corners: &mut [[f32; 2]], half_win: 
 
 ## Sources
 
-- Plan: `/home/edgar/.claude/plans/pr180-frontend-1ms.md`, sections 2-6, 8, 10 (cost model, threading, budget, ordered changes, cuts, knobs, kill rules).
+- Plan: `pr180-frontend-1ms.md` (owner-local plan, not in the repo), sections 2-6, 8, 10 (cost model, threading, budget, ordered changes, cuts, knobs, kill rules).
 - Our evidence:
   - `$S/slam-viba/frontend-speedup.md:536`, `:579-581`, `:708-712`;
   - `$S/slam-viba/audit/klt-first-diagnosis.md:26-37`;

@@ -3,7 +3,7 @@
 Status: 2026-11-22. Stages 0-2 run (F1 binary, config only). Stage 1: mechanism confirmed (M1-M3 on R_01/R_03),
 score unchanged, K1 fired. Stage 2: the kernel layout is score-neutral on R_01/R_03, costs 0.01-0.03 m on R_11 (P8).
 Knobs stay at their defaults. Stage 3 (code) waits for the owner's verdict. Plan: planner (Fable), owner answers 2026-11-22
-(`~/.claude/plans/pr180-clock-card.md`). Card letter AA (Y is reserved for the window-local frame card).
+(owner-local plan `pr180-clock-card.md`, not in the repo). Card letter AA (Y is reserved for the window-local frame card).
 
 Paths: `P=/home/edgar/dev/split/.pr180-fix`, `AA=$P/cardAA`, `S` = the session scratchpad,
 `D=/home/edgar/dev/.flux-connect-scratch/bench/lamaria/data`, `B=/home/edgar/dev/.flux-connect-scratch/bench`.

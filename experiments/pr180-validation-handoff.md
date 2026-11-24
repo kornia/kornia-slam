@@ -2,7 +2,7 @@
 
 For the separate validation workflow. The 2026-11-17 round rebased `feat/global-pose-graph` on main and built cards A to D plus the review swaps. It compiled with `cargo check -j2` only. No test, clippy run, identity gate, benchmark or review has run on it, and this file makes no score claim.
 
-Plan: `/home/edgar/.claude/plans/show-me-the-previous-cosmic-meteor.md`. Cards: `experiments/pr180-{A,B,C,D}-card.md` and `experiments/pr180-review-swaps-plan.md`. Gap rows: `experiments/gap-ledger.md`. Background: `experiments/lamaria-handoff.md`.
+Plan: `show-me-the-previous-cosmic-meteor.md` (owner-local plan, not in the repo). Cards: `experiments/pr180-{A,B,C,D}-card.md` and `experiments/pr180-review-swaps-plan.md`. Gap rows: `experiments/gap-ledger.md`. Background: `experiments/lamaria-handoff.md`.
 
 ## Tags
 

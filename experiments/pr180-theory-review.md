@@ -1,6 +1,6 @@
 **PR #180 theory-review findings (kornia-slam, branch feat/global-pose-graph at 79c04bb)**
 
-Four read-only reviews (E estimator, D offline BA and calibration, G geometry and recovery, T frontend). Reports are verbatim; each finding gets an ID heading (E1-E14, D1-D14, G1-G13, T1-T11) in report order. Plan: `/home/edgar/.claude/plans/show-me-the-previous-cosmic-meteor.md`.
+Four read-only reviews (E estimator, D offline BA and calibration, G geometry and recovery, T frontend). Reports are verbatim; each finding gets an ID heading (E1-E14, D1-D14, G1-G13, T1-T11) in report order. Plan: `show-me-the-previous-cosmic-meteor.md` (owner-local plan, not in the repo).
 
 ## Owner decisions (2026-11-18)
 

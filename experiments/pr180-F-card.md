@@ -15,7 +15,7 @@ DEFERRED by the owner on 2026-11-17 to its own round. **Resumed 2026-11-20** (ro
 
 The base is now `feat/global-pose-graph` (df45adf or later), not the `pr180b/K` skeleton named below. The lane and skeleton wording below is from the 2026-11-17 plan; the new plan replaces it.
 
-Plan: `/home/edgar/.claude/plans/pr180-frontend-1ms.md`, Lane F (section 9), knobs from section 8, defaults from section 14. The roadmap and `lamaria-handoff.md:116,187` call this item "A9". Card A already uses A9 for `mapping.growth_neighbours` (`pr180-A-card.md:47,346`), so this card uses the id **F** and the gap id **G12**.
+Plan: `pr180-frontend-1ms.md` (owner-local plan, not in the repo), Lane F (section 9), knobs from section 8, defaults from section 14. The roadmap and `lamaria-handoff.md:116,187` call this item "A9". Card A already uses A9 for `mapping.growth_neighbours` (`pr180-A-card.md:47,346`), so this card uses the id **F** and the gap id **G12**.
 
 Today LaMAria runs on the pinhole ASL export: 758×572 per camera, f = 241.6 (`apps/kornia-slam-app/src/datasets/lamaria.rs:1-2,185-214`). That export crops each Aria SLAM camera from about 150° to about 115° horizontally. Lane F feeds the raw 640×480 fisheye images to the rig instead. Keypoints are mapped into a virtual pinhole, and the BA weights and search radius are scaled by the pinhole magnification. Nothing here has been measured, and the raw images are not on disk. Every number below is arithmetic on the R_11 Aria calibration (`$S/bench/lamaria/data/R_11_5cp/aria_calibrations/R_11_5cp.json`) or a prediction for the validation workflow.
 
@@ -74,7 +74,7 @@ Minor point, settled by the plan's struct: `Fisheye624Camera` has one `f`, and t
 
 ## Plan notes and corrected citations (2026-11-21)
 
-Plan: `/home/edgar/.claude/plans/pr180-card-F.md`. Read at b083ae0; card K (92acd29..60bfb1a) shifted some line numbers below by a few lines.
+Plan: `pr180-card-F.md` (owner-local plan, not in the repo). Read at b083ae0; card K (92acd29..60bfb1a) shifted some line numbers below by a few lines.
 
 - **JPEG images.** `vrs_to_asl_folder.py` writes `<out>/aria/{cam0,cam1}/data/<ts>.jpg`, with `data.csv` rows `ts,<ts>.jpg`. The loader read PNG only (`apps/kornia-slam-app/src/source/lamaria.rs:214-220`), so `read_gray` dispatches on the extension.
 - **KLT reads raw pixels as pinhole pixels** (`tracking/flow_tracker.rs:463-466,564`, `tracking/tracker.rs:1078-1090`). A raw rig with `klt_first: Enabled` is rejected at validation. RawFisheye runs only on ORB-every-frame configs such as `lamaria-rig-imu.ron`.
