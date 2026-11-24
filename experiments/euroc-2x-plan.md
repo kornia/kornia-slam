@@ -207,3 +207,47 @@ Rule for every rung: write the full slam-experiment block into `R/experiments/eu
 - **Faster (definition approved with the plan):** on every sequence our latency p50 and p99, and our CPU ms per
   frame, below Basalt's, with 0 frames dropped by us.
 - No P/K numbers are assumed before the first quiet Basalt sample (plan rung 2x-1).
+
+## 2x-5 experiment block (Observe), written 2026-11-24 before any estimator code
+
+Design: `experiments/euroc-2x-vio-design.md` (approved at S-B). This block is its section 10, unchanged; results go to `experiments/euroc-2x-results.md`.
+
+- **Gaps.** G13, G58, G62, G50 (`R/experiments/gap-ledger.md`).
+- **Mechanism.** Frames are visual-only PnP on a frozen map (`K/system/config/mod.rs:519-530`). The window is 3 keyframes clamped to a fixed past; flow is left-only in Stereo mode.
+- **Theory.** Every frame holds pose, velocity and bias under an IMU factor at full weight, with a dense first-estimate prior for the past. The gyro then constrains the rotation-translation ridge on every frame (V1_03 high-frequency error, MH_04 dark-span step), and right-camera rows keep the frame constrained when the left tracks thin out (V2_03).
+- **Knob.** `odometry: SlidingWindow(( mode: Observe ))` on S0E.
+- **Arms** (`E/mkcfg.sh`, outside the repo): `VO-ds` = S0E + the knob (rig, datasheet noise); `VO-bn` = the same with `imu_noise: Explicit((..))`, Basalt's values (section 1).
+- **Noise-arm rule, written before the runs (owner answer 5).** Screening: MH_01, V1_02, V1_03, MH_04, V2_03, start 0, both arms (10 runs). The primary arm is the one whose `imu_chi2_nav` is closer to 1 in `|log|` on at least 3 of 5; a tie goes to `VO-ds`. ATE does not enter the choice. The other arm is reported, not scored.
+- **Protocol.** SYNC, `--no-pace`, 900 s cap, at most 2 `kornia-slam*` processes, the command of the card's section 2 plus `--trajectory-vio $d/traj_vio.txt`. Primary arm on all 11 sequences × starts 0, 30, 60 (33 runs, about 4 min each). Each run is within the 5-minute rule.
+
+**Predictions (as in the plan), with the measurement.**
+
+| id | prediction | measured by |
+|---|---|---|
+| P1 (mechanism) | V1_03 HF ≤ 0.008 on every start (`hf.py`; ours 0.041-0.054, Basalt 0.004). Per-frame translation step p50 ≤ 1.5x Basalt on MH_01, V1_02, V2_01. | `E/resid/v13v22/hf.py V1_03_difficult - VO=traj_vio.txt`; new `E/twox/tsteps.py` (the earlier `tsteps.py` was never committed) |
+| P2 | MH_04 vertical increment over 63.3-66.7 s within ±0.10 m (`E/resid/cf.py`; S0PEIH −0.22..−0.29). | `E/resid/cf.py MH_04_difficult traj_vio.txt 81.5 63.3:66.7:v`, the `d=(..)` z value |
+| P3 | VIO-only ATE ÷ Basalt 0.8-1.3 on ≥ 9 of 11, none above 1.6. | new `E/twox/vio_score.py`: `B/eval.py --fmt tum --rpe 1,10` on `traj_vio.txt`, and on `B/results/basalt/<seq>/trajectory.txt` cropped to the same stamps (5 ms); `E/score.py` gains `traj_vio.txt` in `ALLOWED` |
+| P4 | V2_03 frames without a pose 0; ATE ≤ 0.30. | `[summary] vio frames=` against `poses=`; `resets=0` |
+| P5 | flow plus solve p50 ≤ 16 ms, p99 ≤ 35 ms on one core (criterion bench and a `[summary]` line). KLT kernel matches and beats OpenCV on the existing fixtures. | `[summary] vio_ms` from one run pinned with `taskset -c 8` under `flock P/rt.lock`; `bench_odometry_window`; T9 |
+
+**Kill rules (as in the plan).**
+
+| id | rule |
+|---|---|
+| K1 (mechanism, no score) | P1-P2 hold and P3 fails on ≥ 3. Diff against Basalt on MH_01, first 400 frames, before anything else. |
+| K2 (score, no mechanism) | P3 holds with a failed nullspace test or HF > 0.02. Not credited. |
+| K3 | P5 misses (p50 > 25 ms). Square-root f32 solve and `wide` SIMD before Drive. |
+| K4 | V-a's K1 fired and Observe HF > 0.02. The "IMU on every frame" theory is wrong; stop the estimator. |
+
+For K1's diff, the order of suspects is: open question 1 (FEJ form), the IMU noise arm, the bias start (Basalt's is calibrated), then track counts per frame.
+
+**Bit-identity.**
+1. Knob off: `BIN=E/bin-2x5-<tag>/kornia-slam-euroc E/integ/ident.sh` prints `IDENT_V102_OK`, `HEADER_OK`, `IDENT_R01_OK` (md5 `d4f77b567b912b5a4caa2af6085a35b1`).
+2. Knob `Observe`, SYNC S0E V1_02: `traj.txt` and `traj_smoothed.txt` `cmp`-identical to knob off on the same binary.
+3. Header: `E/expect/VO-ds.header` = `S0E.header` plus the odometry line, `diff`-clean.
+4. Determinism: VO-ds V1_02 and MH_04 twice; `cmp traj_vio.txt` prints nothing.
+
+**Noise.** `traj_vio.txt` is deterministic in SYNC, so the band is the start band: min..max over starts 0, 30, 60 per sequence (starts 0/1/2 are degenerate on MH_04, V2_03, V1_02). P3 is read on the median of the three, each start against Basalt cropped to its own stamps. Basalt is one run at load 24-27; the quiet rerun of rung 2x-1 is printed beside it and the targets do not change.
+
+**Stop S-C** after the verdict: go or no-go on Drive. A miss or a fired kill rule gets a written diagnosis first.
+

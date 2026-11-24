@@ -63,6 +63,10 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 
 ### 2026-11-24
 
+- **2x-4 design approved at S-B (lane A, branch `feat/2x-vio`, not pushed).** The design card is in the repo as
+  `experiments/euroc-2x-vio-design.md`; the 2x-5 Observe block (predictions P1-P5, kill rules K1-K4, the noise-arm rule)
+  is written into `experiments/euroc-2x-plan.md` before any estimator code. R12 is dropped from "Now": the new
+  estimator replaces it.
 - **Round 2 of the #180 integration (`integ/round2`, from `feat/global-pose-graph` 379bd1d; not pushed): the remaining
   kornia-slam branches folded in.** Cherry-picked, original authors, no merge commits: `feat/loss-one-world` (21: cards
   AC, AC-2b, quick-eval `worldrot.py`, `lossev.py`, `jumps.py`, `innov.py`), `feat/drift-budget` (5 beyond the 20 it
@@ -638,7 +642,8 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 behind it. Score: the causal real-time pose (paced, asynchronous, 2 cores), below Basalt on all 11 (M1), then below
 ORB-SLAM3 (M2). SYNC runs decide each A/B. In the card's order:
 - [ ] **G60:** trace the non-converging loop PGO on S0PEIH MH_04 start 60 (PGO iteration log) before any loop-path change.
-- [ ] **R12:** Basalt-style windowed marginalization in place of the frozen past (the MH_04 step stays at −0.22 to −0.29 m).
+- [ ] **2x-4 / 2x-5:** sliding-window VI odometry (`experiments/euroc-2x-vio-design.md`), Observe mode first; it
+  replaces R12 (dropped from this list 2026-11-24, plan section 2).
 - [ ] **Drought keyframes** (candidate only; theory and predictions first).
 - [ ] **Real-time ladder** (card "Real-time fix ladder F1-F6"): F1 done; F3 kernel done, **2-core system run pending**;
   F2 widened to the flow step, not scored; F4 not promoted, K3 fired, knob off (follow-up: InterruptBA, F5a first, or a
