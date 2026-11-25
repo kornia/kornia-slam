@@ -1865,13 +1865,14 @@ fn a_capped_solve_that_improved_is_applied_when_accepted() {
     let context = closing_context(&map);
     let inline = closer.on_keyframe(&mut map, &camera(), 10, context);
     assert!(applied(&inline.events), "{:?}", inline.events);
+    assert!(inline.pgo_capped);
 
     let (closer, mut map) = closing_fixture(config, false);
     let mut closer = closer.with_solver(LoopSolver::deferred(1));
     assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
     let background = closer.on_frame(&mut map, &camera(), context);
     assert!(applied(&background.events), "{:?}", background.events);
-    assert!(background.pgo_applied);
+    assert!(background.pgo_applied && background.pgo_capped);
 }
 
 /// The cap counts only for a capped solve that improved: a capped solve whose cost or loop

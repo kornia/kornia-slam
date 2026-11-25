@@ -51,6 +51,8 @@ pub struct PgoResult {
     pub usable: bool,
     /// Why the solve is not usable, set exactly when `usable` is false.
     pub unusable_reason: Option<String>,
+    /// Usable although it stopped at the iteration cap (`accept_capped_solves`).
+    pub capped: bool,
 }
 
 /// Why a finished solve must not be written back, or `None` when it may: it converged, its costs
@@ -196,6 +198,7 @@ pub fn optimize_pose_graph(
         optimized_poses,
         iterations: result.iterations,
         usable: unusable_reason.is_none(),
+        capped: !result.converged && unusable_reason.is_none(),
         unusable_reason,
     })
 }

@@ -59,6 +59,7 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
          {}\n\
          {}\n\
          {}\n\
+         {}\n\
          {}",
         c.frames,
         c.tracked,
@@ -95,8 +96,13 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
         format_flow_tracks(c),
         format_mapping_load(c),
         format_loss(c),
+        format_loop_closure(c),
         format_stillness(c),
     )
+}
+
+fn format_loop_closure(c: &RunCounters) -> String {
+    format!("[summary] loop_closure pgo_capped={}", c.pgo_capped)
 }
 
 /// How the tracking thread met local mapping's load (real-time fix ladder F4, F5a).
@@ -478,7 +484,7 @@ mod tests {
         counters.pose_inertial_rejects = 23;
         let text = format(&counters, &FrameTimes::default());
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 10);
+        assert_eq!(lines.len(), 11);
         assert_eq!(
             lines[3],
             "[summary] estimator_recovery ba_keyframe_shifts=1 ba_snapbacks=2 \
@@ -490,6 +496,17 @@ mod tests {
              seeded_window_frames=16 seeded_window_dropped_points=17 vi_ba_base_solves=18 \
              vi_ba_base_iterations=19 vi_ba_iterations_max=20 vi_ba_rejected_steps=21 \
              vi_ba_solves_3plus_rejects=22 pose_inertial_rejects=23"
+        );
+    }
+
+    #[test]
+    fn the_line_before_stillness_holds_the_loop_closure_counters() {
+        let mut counters = RunCounters::default();
+        counters.pgo_capped = 3;
+        let text = format(&counters, &FrameTimes::default());
+        assert_eq!(
+            text.lines().rev().nth(1),
+            Some("[summary] loop_closure pgo_capped=3")
         );
     }
 

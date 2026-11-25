@@ -3696,6 +3696,7 @@ impl SlamSystem {
             );
             self.state.velocity_world = corrected_velocity;
         }
+        self.counters.pgo_capped += u64::from(outcome.pgo_applied && outcome.pgo_capped);
         if outcome.pgo_applied {
             self.tracker.reset_tracks();
             if self.state.imu_initialized {

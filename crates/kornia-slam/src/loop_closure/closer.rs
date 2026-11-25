@@ -192,6 +192,8 @@ pub(crate) struct LoopClosingOutcome {
     /// was actually corrected.
     pub tracking_correction: Option<(Pose3d, Vec3F64)>,
     pub pgo_applied: bool,
+    /// The applied solve had stopped at its iteration cap (G60-b).
+    pub pgo_capped: bool,
     /// The accumulated map correction, set only when the map was corrected.
     pub correction: Option<Correction>,
     pub timing: LoopTiming,
@@ -773,6 +775,7 @@ impl LoopAcceptance {
                                 outcome.timing.fuse = fuse_started.elapsed();
                                 outcome.tracking_correction = Some((pose, velocity));
                                 outcome.pgo_applied = true;
+                                outcome.pgo_capped = result.capped;
                                 self.correction_epoch += 1;
                                 self.map_from_odometry = world.compose(&self.map_from_odometry);
                                 outcome.correction = Some(Correction {
@@ -988,6 +991,7 @@ impl LoopAcceptance {
         outcome.timing.geometry = written.geometry_refresh;
         outcome.timing.landmarks_refreshed = written.landmarks_refreshed;
         outcome.pgo_applied = true;
+        outcome.pgo_capped = result.capped;
         self.correction_epoch += 1;
         if let Some(change) = viewed_correction(
             &written.keyframes,
@@ -1223,6 +1227,7 @@ pub(super) fn solve_in_graph(
         optimized_poses,
         iterations: report.iterations,
         usable: unusable_reason.is_none(),
+        capped: !report.converged && unusable_reason.is_none(),
         unusable_reason,
     };
     Ok((result, new_world))

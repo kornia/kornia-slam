@@ -148,6 +148,8 @@ pub struct RunCounters {
     /// Of the keyframe-due frames, those whose ORB estimate was then
     /// rejected: the accepted flow pose was lost (S0-C11).
     pub flow_due_orb_rejected: u64,
+    /// Applied loop solves that had stopped at their iteration cap (G60-b).
+    pub pgo_capped: u64,
     /// Coasted frames the runaway check flagged, so not trusted (S0-C1b).
     pub coast_runaway_frames: u64,
     /// Lost keyframes inserted while the runaway check flagged the coast;
