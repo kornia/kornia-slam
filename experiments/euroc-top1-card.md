@@ -3527,3 +3527,38 @@ MH_04 0.114, MH_05 0.144, V1_02 0.045, V1_03 0.053, V2_01 0.039, V2_02 0.049.
 | Kc1 | MH_04 median > 0.25, or MH_01 median > 0.060: the duplicates were part of the hall gain |
 | Kc2 | V1_03 or V2_02 median not below S0PE: fragmentation was not the Vicon penalty |
 | Kc3 | Pc1 misses (seeds per keyframe > 240): the claims did not reach stereo seeding; check the plumbing before scoring |
+
+### Results so far: G60-b partial, V-c not run (stopped by the owner 2026-11-25 ~02:00)
+
+The owner stopped all background work; the lane B drivers were SIGSTOPped mid-list. Binaries:
+`E/bin-2xb-g60/kornia-slam-euroc` (md5 `a8386c21…`, df1cb30) and `E/bin-2xb-vc/kornia-slam-euroc` (md5 `1fcbc311…`,
+c4087e8). Identity trio on the G60-b binary: `IDENT_V102_OK`, `HEADER_OK`, `IDENT_R01_OK` (md5 `d4f77b56…`). The V-c
+binary's trio and every V-c run did not start. Runs: `E/lane2xb/runs/`, table `E/lane2xb/report.py g60`.
+
+| seq | start | S0PEIH `bin-cardh` | S0PEIH control (this binary) | S0PEIHC | knob = control | control `[pgo] failed` | knob `[pgo] failed` |
+|---|---|---|---|---|---|---|---|
+| MH_04 | 0 | 0.178 | 0.237 | 0.237 | yes (`cmp`) | 0 | 0 |
+| MH_04 | 1 | 0.178 | not run | 0.237 (= start 0) | - | - | 0 |
+| MH_04 | 30 | 0.173 | 0.171 | 0.171 | yes | 0 | 0 |
+| MH_04 | 60 | 0.251 | 0.166 | 0.166 | yes | 0 | 0 |
+| MH_05 | 0 | - | not run | 0.101 | - | - | 0 |
+| MH_05 | 1 | - | 0.077 | stopped | - | 1 (kf 2175 ~ 448) | - |
+| MH_05 | 2 | - | not run | 0.100 | - | - | 0 |
+
+Not run: MH_04 start 2, MH_01 0/1/2, V1_02, V2_01 (both arms), MH_05 0/2 controls. Basalt MH_04 0.114, MH_05 0.144.
+
+- **Pb0 missed.** The S0PEIH control on the `feat/global-pose-graph` tip is not `bin-cardh`'s output, though the
+  header is `diff`-identical. MH_04 start 0 moves 0.178 → 0.237; start 60 moves 0.251 → 0.166. The keyframe ids
+  differ before the first loop (start 60: kf 1576 ~ 697 here, 1584 ~ 690 there). So the code between `bin-cardh` and
+  the tip changes S0PEIH. The ident trio covers S0 only. Unverified which commit does it; the S0PEIH numbers on the
+  card are `bin-cardh` numbers, not tip numbers.
+- **The start 60 failure vanished on its own.** On the tip the loop after the drought converges and is applied in
+  the control too. That fits G60's "lottery near the cap": a small change in the graph moves the iteration count.
+- **Pb3 holds where measured.** The knob is `cmp`-identical to its control on MH_04 starts 0, 30, 60, none of which
+  fails. Kb2 has not fired.
+- **Pb1, Pb2, Pb4 untested.** The one control failure on the tip (MH_05 start 1, kf 2175 ~ 448) had its knob run in
+  progress when the drivers stopped. MH_05 starts 0 and 2 under the knob log no failure, but they have no control
+  run, and without a `pgo_capped` counter an applied capped solve cannot be told from a converged one.
+- **Verdict:** none yet. Next, when the owner restarts: the MH_05 start 1 knob run (the only live failure), then the
+  rest of `E/lane2xb/g60b.txt`. Also re-baseline S0PEIH on the tip before scoring any rung against the card's
+  `bin-cardh` S0PEIH numbers. V-c (`E/lane2xb/vc.txt`, `debug_vc.sh`) starts after that.
