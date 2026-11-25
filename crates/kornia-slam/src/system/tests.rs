@@ -2381,3 +2381,35 @@ mod adoption {
         assert!(tracks.iter().all(|track| track.map_point_idx().is_some()));
     }
 }
+
+/// T8: `odometry: SlidingWindow(( mode: Observe ))` leaves every
+/// `TrackingResult` of a 30-frame stereo-inertial run bit-identical to
+/// the knob off, and the estimator sees every frame.
+#[test]
+fn observe_odometry_leaves_every_tracking_result_unchanged() {
+    let run = |odometry: crate::odometry::Odometry| {
+        let mut config = config(CameraSelection::Stereo, true, LoopClosingMode::Disabled);
+        let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+        orb.odometry = odometry;
+        let mut system = SlamSystem::build(config, stereo_imu_rig()).unwrap();
+        let mut results = Vec::new();
+        for idx in 0..30 {
+            let samples: Vec<ImuMeasurement> = (0..10)
+                .map(|k| ImuMeasurement {
+                    timestamp: idx as f64 * 0.05 - 0.045 + k as f64 * 0.005,
+                    gyro: Vec3F64::new(0.0, 0.01, 0.0),
+                    accel: Vec3F64::new(0.0, -9.81, 0.0),
+                })
+                .collect();
+            system.process_imu(&samples);
+            let result = system.process_stereo(stamp(idx), &textured(idx), &textured(idx + 8));
+            results.push(format!("{result:?}"));
+        }
+        (results, system.odometry_counters().map(|c| c.frames))
+    };
+    let (off, none) = run(crate::odometry::Odometry::MapTracking);
+    let (on, frames) = run(crate::odometry::Odometry::SlidingWindow(Default::default()));
+    assert_eq!(none, None);
+    assert_eq!(frames, Some(30));
+    assert_eq!(off, on);
+}

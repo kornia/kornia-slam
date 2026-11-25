@@ -13,6 +13,7 @@ pub(crate) mod fan_out;
 mod file;
 mod innovation;
 mod input;
+mod odometry;
 mod recovery;
 mod state;
 mod stillness;
@@ -21,7 +22,8 @@ mod validation;
 pub mod wheel;
 
 pub use crate::odometry::{
-    Odometry, OdometryImuNoise, OdometryMode, OdometryTuning, SlidingWindowConfig,
+    Odometry, OdometryCounters, OdometryImuNoise, OdometryMode, OdometryOutput, OdometryTuning,
+    SlidingWindowConfig,
 };
 pub use build::BuildError;
 pub use config::{
@@ -299,6 +301,8 @@ pub struct SlamSystem {
     window_segment_start: Option<usize>,
     // The still run since the last keyframe (`keyframes.stillness`, card AB).
     stillness: stillness::StillnessState,
+    // `odometry: SlidingWindow` beside the pipeline (Observe).
+    odometry: Option<odometry::OdometryRunner>,
 }
 
 impl SlamSystem {
@@ -323,6 +327,9 @@ impl SlamSystem {
             .with_stereo_pyramid(config.stereo_pyramid())
             .with_fisheye_weight(config.fisheye_weight(&rig));
         let loop_closer = config.loop_closer(&rig)?;
+        let PipelineDefinition::OrbSlam(orb) = &config.pipeline;
+        let odometry =
+            odometry::OdometryRunner::build(orb, &rig, settings.inertial.sample_interpolation)?;
         let fan_out = TrackingFanOut::new(settings.fan_out)?;
         let rig_flow = match settings.klt_kernel {
             LkKernel::WindowedU8 => Some(RigFlow::new(
@@ -331,14 +338,9 @@ impl SlamSystem {
             )?),
             LkKernel::F32 | LkKernel::FixedPointU8 => None,
         };
-        Ok(Self::assemble(
-            rig,
-            settings,
-            frontend,
-            loop_closer,
-            rig_flow,
-            fan_out,
-        ))
+        let mut system = Self::assemble(rig, settings, frontend, loop_closer, rig_flow, fan_out);
+        system.odometry = odometry;
+        Ok(system)
     }
 
     fn assemble(
@@ -445,6 +447,7 @@ impl SlamSystem {
             window_segment_start: None,
             stillness: stillness::StillnessState::default(),
             adopted_keyframe: None,
+            odometry: None,
         }
     }
 
@@ -688,6 +691,20 @@ impl SlamSystem {
             return;
         }
         self.inertial.insert_buffer_samples(samples);
+        if let Some(odometry) = self.odometry.as_mut() {
+            odometry.push_imu(samples);
+        }
+    }
+
+    /// The sliding-window odometry's estimate of the last stereo pair, when
+    /// `pipeline.odometry` is `SlidingWindow` and that frame got one.
+    pub fn odometry_output(&self) -> Option<&OdometryOutput> {
+        self.odometry.as_ref().and_then(|o| o.output())
+    }
+
+    /// The sliding-window odometry's run totals, when it runs.
+    pub fn odometry_counters(&self) -> Option<&OdometryCounters> {
+        self.odometry.as_ref().map(|o| o.counters())
     }
 
     /// Extracts features from one image captured at `timestamp_sec` (on the
@@ -733,7 +750,13 @@ impl SlamSystem {
         if self.rig.stereo_baseline_m.is_none() {
             return Err(ProcessError::MonoPipeline);
         }
-        self.track_capture(Capture::Stereo(left, right), left, timestamp_sec)
+        let result = self.track_capture(Capture::Stereo(left, right), left, timestamp_sec);
+        // After the pipeline's frame, so `track_frame` and its timings are
+        // untouched; it reads only its own state and these borrows.
+        if let Some(odometry) = self.odometry.as_mut() {
+            odometry.observe(timestamp_sec, left, right);
+        }
+        result
     }
 
     /// Like [`Self::process_image`] for one capture of a multi-camera rig:

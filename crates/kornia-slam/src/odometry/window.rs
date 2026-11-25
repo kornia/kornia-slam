@@ -62,6 +62,10 @@ pub(crate) struct FrameReport {
     /// edge after the solve.
     pub imu_chi2_nav: Option<f64>,
     pub bias_walk_chi2: Option<f64>,
+    /// `r_navᵀ Ω r_nav / 9` of each IMU edge as it enters the prior, at the
+    /// values it is absorbed at: both its states have been through the
+    /// window's solves (the noise-arm statistic of 2x-5).
+    pub imu_chi2_marg: Vec<f64>,
     pub nullspace_time: std::time::Duration,
 }
 
@@ -169,6 +173,10 @@ impl Window {
         if let Some(ledger) = self.ledger.as_mut() {
             ledger.start(id, &self.prior);
         }
+    }
+
+    pub(crate) fn landmark_count(&self) -> usize {
+        self.landmarks.len()
     }
 
     pub(crate) fn newest(&self) -> Option<(FrameId, &StateWithLin)> {
@@ -491,6 +499,10 @@ impl Window {
                 continue;
             };
             factors.add_pair(Some((oi, &j_i)), Some((oj, &j_j)), &edge.omega, &residual);
+            let nav = residual.fixed_rows::<9>(0);
+            report
+                .imu_chi2_marg
+                .push(nav.dot(&(edge.omega.fixed_view::<9, 9>(0, 0) * nav)) / 9.0);
             #[cfg(test)]
             ledger.extend(self.ledger_imu(from, edge, &residual, &j_i, &j_j));
         }

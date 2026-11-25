@@ -177,3 +177,35 @@ Reading, before any diagnosis:
 - **First step:** the K1 diff against Basalt on MH_01, first 400 frames. The order of suspects is the FEJ form for visual rows, the IMU noise arm, the bias start, and then track counts per frame.
 - **V2_03 start 30 diverges.** It needs its own diagnosis. `vio_movement_rejects` (the 60 px cap, risk table in the design card) is the first suspect.
 - **MH_04 against the pipeline:** the VIO-only result (1.08x) is better than the pipeline's causal real-time result (RT3E 2.17x). On every other sequence the current pipeline (RT3E) is better.
+
+## 2x-4: sliding-window VI odometry, tests before any run (lane A, `feat/2x-vio`)
+
+Design: `experiments/euroc-2x-vio-design.md`. All tests run in release and are deterministic (no `rand`).
+
+| id | test | prediction | measured | verdict |
+|---|---|---|---|---|
+| T0 | anchored Jacobians vs central differences, host = −target, ρ = 0, chart round trip | 1e-6 relative | passes on 8 random geometries | pass |
+| T1 | 40-state linear chain with landmarks, sequential vs batch | 1e-9 | newest state and prior within 1e-9 | pass |
+| T1b | `schur_complement` vs `marginalize_frozen` | 1e-12 | within 1e-12 | pass |
+| T2 | sequential prior vs one-shot Schur of the ledger, 60 noisy frames | 1e-9 | H 6.5e-12, b 3.4e-12 (56 priors) | pass |
+| T3a | cost under a world translation and 0.7 rad yaw | 1e-9 | 2.7e-15; columns match to 1e-5 at ε = 1e-6 | pass |
+| T3b | twin prior x, y, z, yaw after 400 frames | ≤ 1e-9 | final ≤ 7.8e-15, worst over the run 1.5e-13 | pass |
+| T3c | roll, pitch ≥ 1e3 × yaw | ≥ 1e3 × | roll 1.6e-4, pitch 7.9e-6 against yaw 3.4e-15 | pass |
+| T4a | walk from rest, exact data | accel ≤ 0.01, gyro ≤ 1e-4, tilt ≤ 0.1° at 10 s; position ≤ 0.02 m at 20 s | 0.0041 m/s², 4.3e-5 rad/s, 0.027°; 4.2 mm; no reset | pass |
+| T4b | moving start at 5 s, 0.5 px, datasheet IMU noise | accel ≤ 0.03, gyro ≤ 3e-4, tilt ≤ 0.3°; `imu_chi2_nav` 0.5-2.0 | 0.0047, 1.0e-4, 0.020°; `imu_chi2_nav` **0.053** | bias and tilt pass; chi² **miss** |
+| T5 | M0-M10 plan rules, keyframe rule, per-frame bookkeeping | exact | pass (kf count ≤ max + 1 between conversions, as M5) | pass |
+| T6 | Huber at 2 px = 0.5, λ updates, ≤ 8 attempts, failed factor keeps the prediction | exact | pass; plus the system gradient equals the cost derivative to 1e-5 | pass |
+| T7 | stereo link at 12 px disparity, occluded patch, row gate, refill camera 0, determinism | 0.05 px, exact | pass | pass |
+| T8 | Observe leaves 30 frames of `TrackingResult` bit-identical; validation; header; RON | exact | pass | pass |
+
+### T4b chi² miss: diagnosis
+
+On the T4b walk the IMU nav chi² per DOF reads 0.053 for the newest edge after the solve (`imu_chi2_nav`), 0.100
+for each edge as it enters the marginal prior (`imu_chi2_marg`), and 0.973 for the same edges at the true states.
+The noise model and its injection are consistent; the two posterior statistics are biased low by construction. A
+50 ms preintegrated edge (σ_p about 1e-5 m, σ_R about 4e-5 rad) carries more information than one frame's vision
+(mm and about 1e-4 rad from 0.5 px over about 150 points), so consecutive poses and the free velocities follow the
+IMU and the edge's posterior residual stays far below its noise. The test now asserts the truth statistic; both
+posterior statistics are logged with no bound. Consequence for 2x-5 (coordinator decision, recorded in the card):
+the noise-arm rule cannot run on them, the primary arm is `VO-ds`, `VO-bn` is run on the screening five for the
+record. An innovation statistic is a later card.

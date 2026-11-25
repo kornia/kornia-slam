@@ -218,6 +218,18 @@ Design: `experiments/euroc-2x-vio-design.md` (approved at S-B). This block is it
 - **Knob.** `odometry: SlidingWindow(( mode: Observe ))` on S0E.
 - **Arms** (`E/mkcfg.sh`, outside the repo): `VO-ds` = S0E + the knob (rig, datasheet noise); `VO-bn` = the same with `imu_noise: Explicit((..))`, Basalt's values (section 1).
 - **Noise-arm rule, written before the runs (owner answer 5).** Screening: MH_01, V1_02, V1_03, MH_04, V2_03, start 0, both arms (10 runs). The primary arm is the one whose `imu_chi2_nav` is closer to 1 in `|log|` on at least 3 of 5; a tie goes to `VO-ds`. ATE does not enter the choice. The other arm is reported, not scored.
+- **Noise-arm rule changed before any run (2026-11-25, coordinator decision after test T4b).** On the T4b synthetic
+  walk (datasheet noise injected, 0.5 px pixels) the IMU nav chi² per DOF reads 0.053 for the newest edge after the
+  solve (`imu_chi2_nav`), 0.100 for each edge as it enters the marginal prior (`imu_chi2_marg`), and 0.973 for the same
+  edges at the true states. The model and its injection are consistent; both posterior statistics are biased low by
+  construction. Reason: a 50 ms preintegrated edge (σ_p about 1e-5 m, σ_R about 4e-5 rad) carries more information than
+  one frame's vision (mm and about 1e-4 rad from 0.5 px over about 150 points), so consecutive poses and the free
+  velocities follow the IMU and the edge's posterior residual stays far below its noise. Neither can pick a noise arm.
+  - **Change:** the primary arm is `VO-ds` (datasheet, the default) without screening. `VO-bn` runs on the 5 screening
+    sequences for the record only; it does not decide the arm. `imu_chi2_nav` and `imu_chi2_marg` are logged counters
+    with no bound. T4b asserts the truth statistic (0.5-2.0) instead.
+  - **Later:** an innovation statistic (vision-only pose change against the IMU prediction, both covariances), its own
+    small card; not built in 2x-5.
 - **Protocol.** SYNC, `--no-pace`, 900 s cap, at most 2 `kornia-slam*` processes, the command of the card's section 2 plus `--trajectory-vio $d/traj_vio.txt`. Primary arm on all 11 sequences × starts 0, 30, 60 (33 runs, about 4 min each). Each run is within the 5-minute rule.
 
 **Predictions (as in the plan), with the measurement.**

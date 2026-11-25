@@ -255,6 +255,7 @@ fn t4b_a_moving_noisy_start_converges() {
     let walk = StereoWalk::new(15.5, biased(), Some((datasheet(), 99)));
     let start = 100;
     let mut chi2 = Vec::new();
+    let mut chi2_marg = Vec::new();
     let mut at_10s = None;
     drive(
         &walk,
@@ -267,6 +268,7 @@ fn t4b_a_moving_noisy_start_converges() {
             if let Some(c) = report.imu_chi2_nav {
                 chi2.push(c);
             }
+            chi2_marg.extend_from_slice(&report.imu_chi2_marg);
             if k == start + 200 {
                 let state = window.newest().unwrap().1.value();
                 at_10s = Some((
@@ -280,9 +282,12 @@ fn t4b_a_moving_noisy_start_converges() {
     let (accel, gyro, tilt) = at_10s.unwrap();
     let newest_edge = chi2.iter().sum::<f64>() / chi2.len() as f64;
     let truth = chi2_at_truth(&walk, start + 1..start + 201);
+    let marg = chi2_marg.iter().sum::<f64>() / chi2_marg.len() as f64;
     eprintln!(
         "T4b: accel {accel:.4} m/s², gyro {gyro:.2e} rad/s, tilt {tilt:.3} deg; \
-         imu_chi2_nav {newest_edge:.3} (newest edge after the solve), {truth:.3} at the true states"
+         imu_chi2_nav {newest_edge:.3} (newest edge after the solve), imu_chi2_marg {marg:.3} \
+         ({} edges), {truth:.3} at the true states",
+        chi2_marg.len()
     );
     assert!(accel <= 0.03, "accel {accel}");
     assert!(gyro <= 3e-4, "gyro {gyro}");
@@ -290,11 +295,16 @@ fn t4b_a_moving_noisy_start_converges() {
     // The prediction was 0.5-2.0 for `imu_chi2_nav`; it reads 0.05 (miss,
     // results doc 2x-4): the newest state's free velocity and its weakly
     // seen pose absorb the newest edge's residual, so that statistic is not
-    // a noise-model test. The model itself is consistent at the truth.
+    // a noise-model test. The model and its injection are tested at the
+    // true states.
     assert!(
         (0.5..=2.0).contains(&truth),
         "chi2 at the true states {truth}"
     );
+    // `imu_chi2_marg` (each edge as it enters the prior) reads 0.10: a
+    // 50 ms edge carries more information than one frame's vision, so its
+    // posterior residual stays far below its noise wherever it is read. Both
+    // are logged only (results doc 2x-4).
 }
 
 /// Mean `r_navᵀ Ω r_nav / 9` of the edges between the true states of

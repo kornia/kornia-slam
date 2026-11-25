@@ -115,6 +115,7 @@ impl PoseWithLin {
         self.lin
     }
 
+    #[cfg(test)]
     pub(crate) fn is_linearized(&self) -> bool {
         self.linearized
     }

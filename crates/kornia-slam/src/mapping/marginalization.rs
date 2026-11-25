@@ -319,8 +319,6 @@ pub(super) fn marginalize_frozen(
 /// The prior `(H', b')` left when the variables at `marg` are eliminated
 /// from the quadratic `½ xᵀHx + bᵀx` over `keep ∪ marg`, `b` the gradient:
 /// `H' = H_kk − H_km H_mm⁻¹ H_mk`, `b' = b_k − H_km H_mm⁻¹ b_m`, symmetrized.
-// Test-only until the odometry window calls it from the system.
-#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct SchurComplement {
     pub h: Mat<f64>,
@@ -334,7 +332,6 @@ pub(crate) struct SchurComplement {
 /// not positive definite, its pseudo-inverse from a symmetric
 /// eigendecomposition is used, cut at `n · ε · λ_max` (Basalt always
 /// pseudo-inverts, `marg_helper.cpp:103-104`).
-#[cfg(test)]
 pub(crate) fn schur_complement(
     h: &Mat<f64>,
     b: &[f64],
@@ -387,7 +384,6 @@ pub(crate) fn schur_complement(
 
 /// Pseudo-inverse of the symmetric `a`, eigenvalues at or below
 /// `n · ε · λ_max` cut.
-#[cfg(test)]
 fn pseudo_inverse(a: &Mat<f64>) -> Result<Mat<f64>, MarginalizationError> {
     let n = a.nrows();
     let eigen = a

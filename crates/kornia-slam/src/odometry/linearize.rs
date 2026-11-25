@@ -206,6 +206,7 @@ impl LandmarkBlock {
         self.recorded.clear();
     }
 
+    #[cfg(test)]
     pub(crate) fn rows(&self) -> usize {
         self.rows
     }
