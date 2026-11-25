@@ -6104,6 +6104,7 @@ dependencies = [
 name = "kornia-slam"
 version = "0.2.0"
 dependencies = [
+ "bytemuck",
  "faer 0.22.6",
  "kornia-3d",
  "kornia-algebra",

@@ -1,3 +1,4 @@
+use crate::features::RBrief;
 use std::collections::HashSet;
 
 use kornia_3d::camera::PinholeCamera;
@@ -12,7 +13,7 @@ use crate::pose_conversion::{mat3_to_f32, mat3_to_f64, vec3_to_f32, vec3_to_f64}
 
 /// Acceptance thresholds for geometric loop verification.
 #[derive(Debug, Clone)]
-pub struct LoopVerificationConfig<D: Descriptor = [u8; 32]> {
+pub struct LoopVerificationConfig<D: Descriptor = RBrief> {
     pub descriptor_match: D::MatchConfig,
     pub min_correspondences: usize,
     pub min_inliers: usize,

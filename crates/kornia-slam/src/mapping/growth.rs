@@ -143,11 +143,11 @@ pub fn pair_growth_request<D: Descriptor>(
     let (curr_orientations, curr_descriptors) = subset(&curr_kf.frame.features, &curr_unassoc);
     let sub_matches = D::match_sets(
         DescriptorSet {
-            orientations: &prev_orientations,
+            orientations: prev_orientations.as_deref(),
             descriptors: &prev_descriptors,
         },
         DescriptorSet {
-            orientations: &curr_orientations,
+            orientations: curr_orientations.as_deref(),
             descriptors: &curr_descriptors,
         },
         match_config,
@@ -265,12 +265,11 @@ pub fn pair_growth_request<D: Descriptor>(
 }
 
 /// Orientations (when the detector has them) and descriptors of `indices`.
-fn subset<D: Descriptor>(features: &Features<D>, indices: &[usize]) -> (Vec<f32>, Vec<D>) {
-    let orientations = if features.orientations.is_empty() {
-        Vec::new()
-    } else {
-        indices.iter().map(|&i| features.orientations[i]).collect()
-    };
+fn subset<D: Descriptor>(features: &Features<D>, indices: &[usize]) -> (Option<Vec<f32>>, Vec<D>) {
+    let orientations = features
+        .orientations
+        .as_ref()
+        .map(|orientations| indices.iter().map(|&i| orientations[i]).collect());
     let descriptors = indices.iter().map(|&i| features.descriptors[i]).collect();
     (orientations, descriptors)
 }
@@ -407,7 +406,7 @@ pub fn accepted_pair_claims(candidates: &[(usize, usize)]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::Features;
+    use crate::features::{Features, RBrief};
     use crate::mapping::map::Keyframe;
     use kornia_3d::camera::CameraModel;
     use kornia_image::ImageSize;
@@ -431,8 +430,8 @@ mod tests {
             idx,
             features: Features {
                 keypoints_xy: (0..n).map(|i| [i as f32, i as f32]).collect(),
-                orientations: vec![0.0; n],
-                descriptors,
+                orientations: Some(vec![0.0; n]),
+                descriptors: descriptors.into_iter().map(RBrief).collect(),
                 octaves: vec![0; n],
             },
             pose_world_to_cam: Pose3d::IDENTITY,
@@ -653,7 +652,7 @@ mod tests {
                 idx,
                 features: Features {
                     keypoints_xy: vec![[320.0, 240.0]; n],
-                    orientations: Vec::new(),
+                    orientations: None,
                     descriptors,
                     octaves: vec![0; n],
                 },

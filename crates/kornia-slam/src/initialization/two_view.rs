@@ -12,6 +12,7 @@
 //    '-----------' '-----------'
 //      frame 1        frame 2
 
+use crate::features::RBrief;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 pub use kornia_3d::pose::TwoViewError;
@@ -37,7 +38,7 @@ pub struct TwoViewAcceptanceConfig {
 
 /// Configuration for two-view initialization.
 #[derive(Debug, Clone)]
-pub struct TwoViewInitConfig<D: Descriptor = [u8; 32]> {
+pub struct TwoViewInitConfig<D: Descriptor = RBrief> {
     /// Descriptor matcher settings.
     pub match_config: D::MatchConfig,
     /// Triangulation thresholds applied during two-view estimation.

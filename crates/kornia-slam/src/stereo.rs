@@ -468,7 +468,7 @@ mod tests {
             idx: 0,
             features: crate::features::Features {
                 keypoints_xy: vec![[100.0, 0.0], [0.0, 200.0], [50.0, 50.0]],
-                orientations: vec![0.0; 3],
+                orientations: Some(vec![0.0; 3]),
                 descriptors: vec![[0u8; 32]; 3],
                 octaves: vec![0; 3],
             },

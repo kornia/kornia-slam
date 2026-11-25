@@ -16,6 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::features::RBrief;
 use kornia_bow::metric::{DistanceMetric, Feature, L2};
 use kornia_bow::orb_slam3::{OrbVocabulary, pack_orb_descriptor};
 use kornia_bow::{BoW, Vocabulary as BowVocabulary};
@@ -67,9 +68,12 @@ pub trait BowEncoder<D>: Send + Sync {
 }
 
 /// ORB descriptors, packed into the vocabulary's `Feature<u64, 4>` layout.
-impl BowEncoder<[u8; 32]> for OrbVocabulary {
-    fn encode(&self, descriptors: &[[u8; 32]]) -> BoW {
-        let packed: Vec<_> = descriptors.iter().map(pack_orb_descriptor).collect();
+impl BowEncoder<RBrief> for OrbVocabulary {
+    fn encode(&self, descriptors: &[RBrief]) -> BoW {
+        let packed: Vec<_> = descriptors
+            .iter()
+            .map(|descriptor| pack_orb_descriptor(&descriptor.0))
+            .collect();
         transform_or_empty(self, &packed)
     }
 }

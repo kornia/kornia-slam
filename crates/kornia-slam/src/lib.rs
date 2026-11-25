@@ -53,7 +53,7 @@ pub mod stereo;
 pub mod system;
 pub mod tracking;
 
-pub use features::{Descriptor, DescriptorSet, Features, ScalePyramid};
+pub use features::{Descriptor, DescriptorSet, Features, RBrief, ScalePyramid};
 pub use frame::Frame;
 pub use frontend::FrontendObservation;
 pub use kornia_sensors::{ImuCalibration, SensorRig};

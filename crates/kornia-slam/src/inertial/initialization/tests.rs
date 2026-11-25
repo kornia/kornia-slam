@@ -55,7 +55,7 @@ fn synth_frame(idx: usize, pose_world_to_cam: Pose3d) -> Frame {
         idx,
         features: Features {
             keypoints_xy: vec![],
-            orientations: vec![],
+            orientations: Some(vec![]),
             descriptors: vec![],
             octaves: vec![],
         },

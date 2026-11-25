@@ -4,6 +4,7 @@
 //! affected landmark metadata. Batch insertion validates before its first write.
 
 use crate::features::Descriptor;
+use crate::features::RBrief;
 use crate::mapping::map::{ImuFactor, Keyframe, Map, MapPoint, ObservationKey};
 use kornia_algebra::Vec3F64;
 use std::collections::{HashMap, HashSet};
@@ -153,7 +154,7 @@ pub struct ObservationLink {
 /// One validated batch: keyframes, landmarks, observations and IMU factors
 /// that are accepted or rejected together.
 #[derive(Debug)]
-pub struct MapInsertion<D = [u8; 32]> {
+pub struct MapInsertion<D = RBrief> {
     pub keyframes: Vec<Keyframe<D>>,
     pub landmarks: Vec<LandmarkSeed>,
     pub observations: Vec<ObservationLink>,

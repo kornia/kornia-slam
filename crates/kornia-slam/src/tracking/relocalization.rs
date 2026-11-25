@@ -7,6 +7,7 @@
 //! local map. A pose is accepted only with as much support as normal tracking
 //! would need from a cold start.
 
+use crate::features::RBrief;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pnp::{PnPMethod, RansacParams, solve_pnp_ransac};
 use kornia_3d::pose::Pose3d;
@@ -22,7 +23,7 @@ use crate::tracking::pose_estimation::{Estimate, MapProjectionEstimator};
 
 /// Thresholds for relocalization (ORB-SLAM3's values).
 #[derive(Debug, Clone)]
-pub struct RelocalizationConfig<D: Descriptor = [u8; 32]> {
+pub struct RelocalizationConfig<D: Descriptor = RBrief> {
     /// Descriptor matcher against candidate keyframes.
     pub match_config: D::MatchConfig,
     /// Correspondences a candidate needs before PnP RANSAC is attempted.
@@ -242,8 +243,8 @@ mod tests {
             idx,
             features: Features {
                 keypoints_xy: pixels.clone(),
-                orientations: vec![0.0; LANDMARKS],
-                descriptors,
+                orientations: Some(vec![0.0; LANDMARKS]),
+                descriptors: descriptors.into_iter().map(RBrief).collect(),
                 octaves: vec![0; LANDMARKS],
             },
             pose_world_to_cam: pose,

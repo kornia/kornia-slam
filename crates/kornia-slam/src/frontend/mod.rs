@@ -184,14 +184,9 @@ impl FisheyeMapping {
     /// Remaps keypoints in place and drops those beyond the incidence cap,
     /// keeping orientations, descriptors and octaves aligned.
     fn map_keypoints(&self, features: &mut Features) {
-        let n = features.keypoints_xy.len();
-        let mut keypoints_xy = Vec::with_capacity(n);
-        let mut orientations = Vec::with_capacity(n);
-        let mut descriptors = Vec::with_capacity(n);
-        let mut octaves = Vec::with_capacity(n);
-
-        for i in 0..n {
-            let [u, v] = features.keypoints_xy[i];
+        let mut kept = Vec::with_capacity(features.len());
+        let mut keypoints_xy = Vec::with_capacity(features.len());
+        for (i, &[u, v]) in features.keypoints_xy.iter().enumerate() {
             let Some(bearing) = self
                 .fisheye
                 .unproject(&Vec2F64::new(u as f64, v as f64))
@@ -203,17 +198,17 @@ impl FisheyeMapping {
             let yn = bearing.y / bearing.z;
             let pu = self.camera.fx * xn + self.camera.cx;
             let pv = self.camera.fy * yn + self.camera.cy;
-
             keypoints_xy.push([pu as f32, pv as f32]);
-            orientations.push(features.orientations[i]);
-            descriptors.push(features.descriptors[i]);
-            octaves.push(features.octaves[i]);
+            kept.push(i);
         }
 
         features.keypoints_xy = keypoints_xy;
-        features.orientations = orientations;
-        features.descriptors = descriptors;
-        features.octaves = octaves;
+        features.orientations = features
+            .orientations
+            .as_ref()
+            .map(|orientations| kept.iter().map(|&i| orientations[i]).collect());
+        features.descriptors = kept.iter().map(|&i| features.descriptors[i]).collect();
+        features.octaves = kept.iter().map(|&i| features.octaves[i]).collect();
     }
 }
 

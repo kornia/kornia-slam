@@ -22,6 +22,7 @@
 
 mod keypoint_grid;
 
+use crate::features::RBrief;
 use std::collections::HashMap;
 
 use kornia_3d::camera::PinholeCamera;
@@ -67,7 +68,7 @@ impl Default for ProjectionMatchConfig {
 
 /// Map-projection tracking thresholds.
 #[derive(Debug, Clone)]
-pub struct MapProjectionConfig<D: Descriptor = [u8; 32]> {
+pub struct MapProjectionConfig<D: Descriptor = RBrief> {
     /// Descriptor matcher settings for tracking against reference observations.
     pub match_config: D::MatchConfig,
     /// PnP pose-estimation thresholds.
@@ -154,7 +155,7 @@ pub enum MapProjectionRejectReason {
 ///
 /// Estimates the camera pose by projecting map points into the current frame,
 /// matching their descriptors, and solving PnP.
-pub struct MapProjectionEstimator<D: Descriptor = [u8; 32]> {
+pub struct MapProjectionEstimator<D: Descriptor = RBrief> {
     config: MapProjectionConfig<D>,
 }
 
@@ -668,7 +669,7 @@ mod estimator_tests {
 #[cfg(test)]
 mod matching_tests {
     use super::*;
-    use crate::features::Features;
+    use crate::features::{Features, RBrief};
     use kornia_algebra::{Mat3F64, Vec3F64};
 
     fn make_test_estimator() -> MapProjectionEstimator {
@@ -694,8 +695,8 @@ mod matching_tests {
             idx: 0,
             features: Features {
                 keypoints_xy: keypoints.clone(),
-                orientations: vec![0.0; count],
-                descriptors: vec![[0; 32]; count],
+                orientations: Some(vec![0.0; count]),
+                descriptors: vec![RBrief([0; 32]); count],
                 octaves: vec![0; count],
             },
             pose_world_to_cam: Pose3d::IDENTITY,
@@ -812,7 +813,7 @@ mod matching_tests {
         let estimator = make_test_estimator();
         let camera = test_camera();
 
-        let desc_a = [0u8; 32];
+        let desc_a = RBrief([0u8; 32]);
         let map_points = vec![MapPoint::new(
             Vec3F64::new(0.0, 0.0, 5.0),
             desc_a,
@@ -822,7 +823,7 @@ mod matching_tests {
         )];
 
         let keypoints_xy = vec![[320.0f32, 240.0], [100.0, 100.0]];
-        let descriptors = vec![desc_a, [0xFF; 32]];
+        let descriptors = vec![desc_a, RBrief([0xFF; 32])];
         let octaves = vec![0u8, 0u8];
 
         let grid = KeypointGrid::new(&keypoints_xy, 640.0, 480.0, 64.0);
@@ -857,7 +858,7 @@ mod matching_tests {
     fn a_keypoint_without_an_undistorted_pixel_is_never_matched() {
         let estimator = make_test_estimator();
         let camera = test_camera();
-        let descriptor = [0u8; 32];
+        let descriptor = RBrief([0u8; 32]);
         // Projects to (10, 10), in the grid cell a NaN keypoint falls into.
         let map_points = vec![MapPoint::new(
             Vec3F64::new(-7.75, -5.75, 5.0),
@@ -900,14 +901,14 @@ mod matching_tests {
 
         let map_points = vec![MapPoint::new(
             Vec3F64::new(0.0, 0.0, -5.0),
-            [0u8; 32],
+            RBrief([0u8; 32]),
             0,
             [0; 3],
             0,
         )];
 
         let keypoints_xy = vec![[320.0f32, 240.0]];
-        let descriptors = vec![[0u8; 32]];
+        let descriptors = vec![RBrief([0u8; 32])];
         let octaves = vec![0u8];
         let grid = KeypointGrid::new(&keypoints_xy, 640.0, 480.0, 64.0);
 
@@ -942,14 +943,14 @@ mod matching_tests {
 
         let map_points = vec![MapPoint::new(
             Vec3F64::new(0.0, 0.0, 5.0),
-            [0u8; 32],
+            RBrief([0u8; 32]),
             0,
             [0; 3],
             0,
         )];
 
         let keypoints_xy = vec![[320.0f32, 240.0]];
-        let descriptors = vec![[0xFF; 32]];
+        let descriptors = vec![RBrief([0xFF; 32])];
         let octaves = vec![0u8];
         let grid = KeypointGrid::new(&keypoints_xy, 640.0, 480.0, 64.0);
 

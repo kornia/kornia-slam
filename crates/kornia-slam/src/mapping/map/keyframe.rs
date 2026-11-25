@@ -1,12 +1,13 @@
 //! Keyframes and their descriptor-to-map-point associations.
 
+use crate::features::RBrief;
 use crate::frame::Frame;
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::ImuBias;
 
 /// A frame promoted into the map, with descriptor-to-map-point associations.
 #[derive(Debug, Clone)]
-pub struct Keyframe<D = [u8; 32]> {
+pub struct Keyframe<D = RBrief> {
     pub frame: Frame<D>,
     /// For each descriptor index in `frame.features`, associated map-point index.
     pub map_point_by_desc_idx: Vec<Option<usize>>,

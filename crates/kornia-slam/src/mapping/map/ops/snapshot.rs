@@ -4,6 +4,7 @@
 //! map copies exactly those entities, and correction applies the numeric result.
 
 use crate::features::Descriptor;
+use crate::features::RBrief;
 use crate::mapping::map::{ImuFactor, Keyframe, Map, MapPoint};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
@@ -25,7 +26,7 @@ pub struct BaWindow {
 /// window rather than the map. Keyframes keep map insertion order; landmarks
 /// are sorted by id. IMU edges are those joining two captured keyframes.
 #[derive(Debug, Clone)]
-pub struct BaSnapshot<D = [u8; 32]> {
+pub struct BaSnapshot<D = RBrief> {
     pub(super) keyframes: Vec<Keyframe<D>>,
     pub(super) landmark_ids: Vec<usize>,
     pub(super) map_points: Vec<MapPoint<D>>,
@@ -47,7 +48,7 @@ pub(crate) struct KeyframeBaState {
 /// observations, landmark lifetimes and other live structure are never copied
 /// back. An unchanged update is still an accepted local-mapping completion.
 #[derive(Debug)]
-pub struct BaUpdate<D = [u8; 32]> {
+pub struct BaUpdate<D = RBrief> {
     pub(crate) keyframes: Vec<KeyframeBaState>,
     pub(crate) map_points: Vec<Vec3F64>,
     pub(crate) imu_preintegrations: Vec<PreintegratedImu>,

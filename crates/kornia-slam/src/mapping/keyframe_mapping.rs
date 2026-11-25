@@ -17,6 +17,7 @@
 //! shared mutex and keeps the existing boundaries. It never touches the
 //! publication gate — the caller already holds it.
 
+use crate::features::RBrief;
 use std::sync::Mutex;
 
 use kornia_3d::camera::PinholeCamera;
@@ -31,7 +32,7 @@ use crate::mapping::map::{
 
 /// The core request for an accepted keyframe, and how many of its landmarks
 /// are close stereo seeds.
-pub(crate) struct KeyframeInsertion<D = [u8; 32]> {
+pub(crate) struct KeyframeInsertion<D = RBrief> {
     pub insertion: MapInsertion<D>,
     pub close_points: usize,
 }
@@ -241,8 +242,8 @@ mod tests {
         let mut frame = empty_frame(idx);
         let n = depths.len();
         frame.features.keypoints_xy = vec![[320.0, 240.0]; n];
-        frame.features.orientations = vec![0.0; n];
-        frame.features.descriptors = vec![[0; 32]; n];
+        frame.features.orientations = Some(vec![0.0; n]);
+        frame.features.descriptors = vec![RBrief([0; 32]); n];
         frame.features.octaves = vec![0; n];
         frame.depth = depths;
         Keyframe::from_frame(frame)
@@ -312,7 +313,7 @@ mod tests {
             idx,
             features: Features {
                 keypoints_xy: Vec::new(),
-                orientations: Vec::new(),
+                orientations: None,
                 descriptors: Vec::new(),
                 octaves: Vec::new(),
             },
@@ -349,8 +350,8 @@ mod tests {
                         ]
                     })
                     .collect(),
-                orientations: vec![0.0; n],
-                descriptors: (0..n).map(|i| [i as u8; 32]).collect(),
+                orientations: Some(vec![0.0; n]),
+                descriptors: (0..n).map(|i| RBrief([i as u8; 32])).collect(),
                 octaves: vec![0; n],
             },
             pose_world_to_cam: pose,

@@ -258,7 +258,7 @@ impl ImuInitializer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::Features;
+    use crate::features::{Features, RBrief};
     use crate::frame::Frame;
     use crate::mapping::map::{ImuFactor, MapInsertion};
     use kornia_algebra::{Mat3F64, SO3F64};
@@ -326,8 +326,8 @@ mod tests {
             idx,
             features: Features {
                 keypoints_xy: vec![[10.0, 10.0]],
-                orientations: vec![0.0],
-                descriptors: vec![[0u8; 32]],
+                orientations: Some(vec![0.0]),
+                descriptors: vec![RBrief([0u8; 32])],
                 octaves: vec![0],
             },
             pose_world_to_cam,

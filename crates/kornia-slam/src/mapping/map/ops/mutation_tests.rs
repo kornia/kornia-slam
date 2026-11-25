@@ -1,7 +1,7 @@
 use super::{
     ImuFactor, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError, ObservationLink,
 };
-use crate::features::ScalePyramid;
+use crate::features::{RBrief, ScalePyramid};
 use crate::mapping::map::{
     Keyframe, Map, ObservationKey,
     tests::{assert_map_consistent, test_frame, test_frame_with_pose},
@@ -849,6 +849,7 @@ fn a_batch_finalizes_the_representative_descriptor() {
     let mut d12 = [0u8; 32];
     d12[0] = 0b1111_1111;
     d12[1] = 0b0000_1111;
+    let [d0, d4, d8, d12] = [d0, d4, d8, d12].map(RBrief);
 
     let mut map = Map::new();
     let mut request = MapInsertion::default();
@@ -892,6 +893,7 @@ fn a_single_link_finalizes_the_representative_descriptor() {
     let mut d12 = [0u8; 32];
     d12[0] = 0b1111_1111;
     d12[1] = 0b0000_1111;
+    let [d0, d8, d12] = [d0, d8, d12].map(RBrief);
 
     let mut map = Map::new();
     for (idx, descriptor) in [d0, d12, d8].into_iter().enumerate() {

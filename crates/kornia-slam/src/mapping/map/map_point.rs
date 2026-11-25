@@ -6,6 +6,7 @@
 //! the fields back here. Corrections decide which landmarks a moved camera
 //! made stale; nothing recomputes these fields from a `MapPoint` alone.
 
+use crate::features::RBrief;
 use kornia_algebra::Vec3F64;
 
 use crate::features::{Descriptor, ScalePyramid, most_distinctive};
@@ -20,13 +21,13 @@ pub struct ObservationKey {
 /// One landmark observation: where it was seen, and the descriptor that
 /// feature contributed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LandmarkObservation<D = [u8; 32]> {
+pub struct LandmarkObservation<D = RBrief> {
     pub key: ObservationKey,
     pub descriptor: D,
 }
 
 #[derive(Debug, Clone)]
-pub struct MapPoint<D = [u8; 32]> {
+pub struct MapPoint<D = RBrief> {
     /// World-frame position.
     pub position: Vec3F64,
     /// Representative descriptor for projection-guided matching, picked by
@@ -182,10 +183,10 @@ mod tests {
 
     #[test]
     fn map_point_new_sets_active_defaults() {
-        let mp = MapPoint::new(Vec3F64::new(1.0, 2.0, 3.0), [9u8; 32], 0, [0; 3], 5);
+        let mp = MapPoint::new(Vec3F64::new(1.0, 2.0, 3.0), RBrief([9u8; 32]), 0, [0; 3], 5);
 
         assert_eq!(mp.position, Vec3F64::new(1.0, 2.0, 3.0));
-        assert_eq!(mp.descriptor, [9u8; 32]);
+        assert_eq!(mp.descriptor, RBrief([9u8; 32]));
         assert_eq!(mp.keyframe_idx, 5);
         assert_eq!(mp.n_visible, 1);
         assert_eq!(mp.n_found, 1);
@@ -194,7 +195,7 @@ mod tests {
 
     #[test]
     fn map_point_tracking_helpers_work() {
-        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0, [0; 3], 0);
+        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), RBrief([0u8; 32]), 0, [0; 3], 0);
         mp.n_visible = 10;
         mp.n_found = 4;
 
@@ -207,7 +208,7 @@ mod tests {
     /// `nScale = clamp(ceil(log(maxDist/dist) / log(scaleFactor)), 0, nLevels-1)`.
     #[test]
     fn predict_scale_matches_orbslam3_closed_form() {
-        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0, [0; 3], 0);
+        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), RBrief([0u8; 32]), 0, [0; 3], 0);
         mp.max_distance = 10.0;
         let pyramid = ScalePyramid::ORB;
         let (sf, n) = (pyramid.factor, pyramid.n_levels);
@@ -227,7 +228,7 @@ mod tests {
 
         // Degenerate inputs return level 0.
         assert_eq!(mp.predict_scale(0.0, pyramid), 0);
-        let mut unset = MapPoint::new(Vec3F64::ZERO, [0u8; 32], 0, [0; 3], 0);
+        let mut unset = MapPoint::new(Vec3F64::ZERO, RBrief([0u8; 32]), 0, [0; 3], 0);
         unset.max_distance = 0.0;
         assert_eq!(unset.predict_scale(5.0, pyramid), 0);
     }
@@ -240,14 +241,14 @@ mod tests {
     }
 
     fn point() -> MapPoint {
-        MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0, [0; 3], 0)
+        MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), RBrief([0u8; 32]), 0, [0; 3], 0)
     }
 
     #[test]
     fn a_repeated_keyframe_is_refused_and_leaves_the_records_untouched() {
         let mut mp = point();
-        assert!(mp.add_observation(key(0, 0), [1u8; 32]));
-        assert!(!mp.add_observation(key(0, 7), [9u8; 32]));
+        assert!(mp.add_observation(key(0, 0), RBrief([1u8; 32])));
+        assert!(!mp.add_observation(key(0, 7), RBrief([9u8; 32])));
         mp.finalize_descriptor();
         assert_eq!(mp.observations().len(), 1);
         assert_eq!(mp.observations()[0].key, key(0, 0));
@@ -270,6 +271,7 @@ mod tests {
         let mut d12 = [0u8; 32];
         d12[0] = 0b1111_1111;
         d12[1] = 0b0000_1111;
+        let [d0, d4, d8, d12] = [d0, d4, d8, d12].map(RBrief);
 
         mp.add_observation(key(0, 0), d0);
         mp.add_observation(key(1, 0), d4);
@@ -291,7 +293,7 @@ mod tests {
     #[test]
     fn removing_an_absent_keyframe_is_none() {
         let mut mp = point();
-        mp.add_observation(key(0, 0), [1u8; 32]);
+        mp.add_observation(key(0, 0), RBrief([1u8; 32]));
         assert!(mp.remove_observation(42).is_none());
         assert_eq!(mp.observations().len(), 1);
     }
@@ -300,7 +302,7 @@ mod tests {
     fn observer_order_follows_insertion() {
         let mut mp = point();
         for kf in [5usize, 2, 9] {
-            mp.add_observation(key(kf, 0), [kf as u8; 32]);
+            mp.add_observation(key(kf, 0), RBrief([kf as u8; 32]));
         }
         assert_eq!(mp.observer_keyframes().collect::<Vec<_>>(), vec![5, 2, 9]);
     }

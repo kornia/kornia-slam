@@ -6,6 +6,7 @@
 //! to its own tracking state through [`LoopClosingOutcome`] rather than
 //! reaching into it.
 
+use crate::features::RBrief;
 use std::collections::HashSet;
 
 use kornia_3d::camera::PinholeCamera;
@@ -24,7 +25,7 @@ use crate::pose_conversion::apply_reference_pose_correction;
 
 /// Verification, episode consistency, fusion and pose-graph settings of loop correction.
 #[derive(Debug, Clone)]
-pub struct LoopClosingConfig<D: Descriptor = [u8; 32]> {
+pub struct LoopClosingConfig<D: Descriptor = RBrief> {
     pub episode: LoopEpisodeConfig,
     pub fusion: LoopFusionConfig<D::Distance>,
     pub verification: LoopVerificationConfig<D>,
@@ -83,7 +84,7 @@ pub(crate) struct LoopClosingOutcome {
 /// Keyframes are indexed even while correction is held back until inertial
 /// initialization, so the database is complete by the time a closure is
 /// allowed.
-pub(crate) struct LoopCloser<D: Descriptor = [u8; 32]> {
+pub(crate) struct LoopCloser<D: Descriptor = RBrief> {
     vocabulary: Box<dyn BowEncoder<D>>,
     kf_database: KeyFrameDatabase,
     acceptance: LoopAcceptance<D>,

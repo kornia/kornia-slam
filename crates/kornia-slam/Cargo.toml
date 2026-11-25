@@ -23,6 +23,8 @@ kornia-sensors.workspace = true
 # Sparse LLT for pose-graph optimization and dense Cholesky for the reduced
 # camera system in visual-inertial Schur-complement BA.
 faer = "0.22"
+# Zero-copy views of `RBrief` slices as the `[u8; 32]` kornia-imgproc matches.
+bytemuck = { version = "1", features = ["derive"] }
 thiserror = "1"
 ron = { version = "0.12", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }

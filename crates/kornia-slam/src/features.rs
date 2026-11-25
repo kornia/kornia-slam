@@ -5,6 +5,7 @@
 use std::cmp::Ordering;
 use std::fmt::Debug;
 
+use bytemuck::TransparentWrapper;
 use kornia_imgproc::features::{
     OrbFeatures, OrbMatchConfig, hamming_distance, match_orb_descriptors,
 };
@@ -33,15 +34,19 @@ pub trait Descriptor: Copy + Debug + PartialEq + Send + Sync + 'static {
     ) -> Vec<(usize, usize)>;
 }
 
-/// ORB's 256-bit rBRIEF descriptor, compared by Hamming distance.
-impl Descriptor for [u8; 32] {
+/// ORB's 256-bit rotated-BRIEF descriptor, compared by Hamming distance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TransparentWrapper)]
+#[repr(transparent)]
+pub struct RBrief(pub [u8; 32]);
+
+impl Descriptor for RBrief {
     type Distance = u32;
     type MatchConfig = OrbMatchConfig;
 
     const TH_LOW: u32 = 50;
 
     fn distance(&self, other: &Self) -> u32 {
-        hamming_distance(self, other)
+        hamming_distance(&self.0, &other.0)
     }
 
     fn match_sets(
@@ -49,45 +54,47 @@ impl Descriptor for [u8; 32] {
         candidates: DescriptorSet<'_, Self>,
         config: &OrbMatchConfig,
     ) -> Vec<(usize, usize)> {
-        if query.orientations.is_empty() || candidates.orientations.is_empty() {
-            return match_orb_descriptors(
-                &vec![0.0; query.descriptors.len()],
-                query.descriptors,
-                &vec![0.0; candidates.descriptors.len()],
-                candidates.descriptors,
+        let query_descriptors = RBrief::peel_slice(query.descriptors);
+        let candidate_descriptors = RBrief::peel_slice(candidates.descriptors);
+        match (query.orientations, candidates.orientations) {
+            (Some(query_orientations), Some(candidate_orientations)) => match_orb_descriptors(
+                query_orientations,
+                query_descriptors,
+                candidate_orientations,
+                candidate_descriptors,
+                *config,
+            ),
+            _ => match_orb_descriptors(
+                &vec![0.0; query_descriptors.len()],
+                query_descriptors,
+                &vec![0.0; candidate_descriptors.len()],
+                candidate_descriptors,
                 OrbMatchConfig {
                     check_orientation: false,
                     ..*config
                 },
-            );
+            ),
         }
-        match_orb_descriptors(
-            query.orientations,
-            query.descriptors,
-            candidates.orientations,
-            candidates.descriptors,
-            *config,
-        )
     }
 }
 
-/// Descriptors with their keypoint orientations, the input of
-/// [`Descriptor::match_sets`]. `orientations` is either parallel to
-/// `descriptors` or empty.
+/// Descriptors with their keypoint orientations, if the detector has them:
+/// the input of [`Descriptor::match_sets`].
 #[derive(Debug, Clone, Copy)]
 pub struct DescriptorSet<'a, D> {
-    pub orientations: &'a [f32],
+    /// Parallel to `descriptors` when present.
+    pub orientations: Option<&'a [f32]>,
     pub descriptors: &'a [D],
 }
 
 /// Per-keypoint parallel vectors for one image. Index `i` in every vector
 /// describes the same keypoint.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Features<D = [u8; 32]> {
+pub struct Features<D = RBrief> {
     /// Keypoints as `[col, row]` in full-resolution pixels.
     pub keypoints_xy: Vec<[f32; 2]>,
-    /// Keypoint orientations in radians; empty for detectors without them.
-    pub orientations: Vec<f32>,
+    /// Keypoint orientations in radians, for detectors that estimate one.
+    pub orientations: Option<Vec<f32>>,
     pub descriptors: Vec<D>,
     /// Pyramid level each keypoint was detected at (0 = full resolution);
     /// see [`ScalePyramid`].
@@ -98,7 +105,7 @@ impl<D> Default for Features<D> {
     fn default() -> Self {
         Self {
             keypoints_xy: Vec::new(),
-            orientations: Vec::new(),
+            orientations: None,
             descriptors: Vec::new(),
             octaves: Vec::new(),
         }
@@ -108,7 +115,7 @@ impl<D> Default for Features<D> {
 impl<D> Features<D> {
     pub fn descriptor_set(&self) -> DescriptorSet<'_, D> {
         DescriptorSet {
-            orientations: &self.orientations,
+            orientations: self.orientations.as_deref(),
             descriptors: &self.descriptors,
         }
     }
@@ -122,12 +129,12 @@ impl<D> Features<D> {
     }
 }
 
-impl From<OrbFeatures> for Features<[u8; 32]> {
+impl From<OrbFeatures> for Features<RBrief> {
     fn from(orb: OrbFeatures) -> Self {
         Self {
             keypoints_xy: orb.keypoints_xy,
-            orientations: orb.orientations,
-            descriptors: orb.descriptors,
+            orientations: Some(orb.orientations),
+            descriptors: orb.descriptors.into_iter().map(RBrief).collect(),
             octaves: orb.octaves,
         }
     }
@@ -223,12 +230,12 @@ pub(crate) mod scalar {
 mod tests {
     use super::*;
 
-    fn orb(bits_set: usize) -> [u8; 32] {
+    fn orb(bits_set: usize) -> RBrief {
         let mut d = [0u8; 32];
         for bit in 0..bits_set {
             d[bit / 8] |= 1 << (bit % 8);
         }
-        d
+        RBrief(d)
     }
 
     #[test]
@@ -238,7 +245,7 @@ mod tests {
         assert_eq!(most_distinctive(&set, |d| d), Some(1));
         // Equal medians resolve to the first descriptor.
         assert_eq!(most_distinctive(&[orb(4), orb(4)], |d| d), Some(0));
-        assert_eq!(most_distinctive::<[u8; 32], [u8; 32]>(&[], |d| d), None);
+        assert_eq!(most_distinctive::<RBrief, RBrief>(&[], |d| d), None);
     }
 
     #[test]
@@ -253,32 +260,29 @@ mod tests {
     fn orb_matching_accepts_sets_without_orientations() {
         let candidates = [orb(0), orb(40)];
         let query = DescriptorSet {
-            orientations: &[],
+            orientations: None,
             descriptors: &[orb(0)],
         };
         let candidates = DescriptorSet {
-            orientations: &[0.0, 1.0],
+            orientations: Some(&[0.0, 1.0]),
             descriptors: &candidates,
         };
         let config = OrbMatchConfig::default();
-        assert_eq!(
-            <[u8; 32]>::match_sets(query, candidates, &config),
-            vec![(0, 0)]
-        );
+        assert_eq!(RBrief::match_sets(query, candidates, &config), vec![(0, 0)]);
     }
 
     #[test]
     fn orb_features_convert_field_by_field() {
-        let orb = OrbFeatures {
+        let orb_features = OrbFeatures {
             keypoints_xy: vec![[1.0, 2.0]],
             orientations: vec![0.5],
-            descriptors: vec![orb(3)],
+            descriptors: vec![orb(3).0],
             octaves: vec![2],
         };
-        let features = Features::from(orb.clone());
-        assert_eq!(features.keypoints_xy, orb.keypoints_xy);
-        assert_eq!(features.orientations, orb.orientations);
-        assert_eq!(features.descriptors, orb.descriptors);
-        assert_eq!(features.octaves, orb.octaves);
+        let features = Features::from(orb_features.clone());
+        assert_eq!(features.keypoints_xy, orb_features.keypoints_xy);
+        assert_eq!(features.orientations, Some(orb_features.orientations));
+        assert_eq!(features.descriptors, [orb(3)]);
+        assert_eq!(features.octaves, orb_features.octaves);
     }
 }

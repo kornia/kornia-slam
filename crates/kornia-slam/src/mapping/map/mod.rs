@@ -58,6 +58,7 @@ mod keyframe;
 mod map_point;
 mod ops;
 
+use crate::features::RBrief;
 use crate::features::ScalePyramid;
 
 pub use imu_factor::ImuFactor;
@@ -76,7 +77,7 @@ pub use ops::{KeyframeRemoval, KeyframeRemovalError, StillNeighbour, StillSide};
 /// In-memory map storage for keyframes and persistent map points, over
 /// descriptor type `D` (ORB's by default).
 #[derive(Debug, Clone)]
-pub struct Map<D = [u8; 32]> {
+pub struct Map<D = RBrief> {
     keyframes: Vec<Keyframe<D>>,
     map_points: Vec<MapPoint<D>>,
     imu_factors: Vec<ImuFactor>,

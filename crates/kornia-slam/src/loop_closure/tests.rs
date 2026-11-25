@@ -1,6 +1,6 @@
 use super::*;
 use crate::Frame;
-use crate::features::Features;
+use crate::features::{Features, RBrief};
 use crate::loop_closure::sparse_pgo::{Se3Manifold, sparse_pose_graph_optimize};
 use crate::mapping::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
 use crate::pose_conversion::pose_to_se3;
@@ -29,8 +29,8 @@ fn frame(idx: usize, pose: Pose3d, points: &[[f32; 2]], descriptors: Vec<[u8; 32
         idx,
         features: Features {
             keypoints_xy: points.to_vec(),
-            orientations: vec![0.0; points.len()],
-            descriptors,
+            orientations: Some(vec![0.0; points.len()]),
+            descriptors: descriptors.into_iter().map(RBrief).collect(),
             octaves: vec![0; points.len()],
         },
         pose_world_to_cam: pose,
@@ -622,7 +622,7 @@ fn closing_fixture(config: LoopClosingConfig, require_imu_initialized: bool) -> 
         .features
         .descriptors
         .iter()
-        .map(kornia_bow::orb_slam3::pack_orb_descriptor)
+        .map(|d| kornia_bow::orb_slam3::pack_orb_descriptor(&d.0))
         .collect();
     let vocabulary =
         crate::loop_closure::place_recognition::Vocabulary::train(&descriptors, 1).unwrap();

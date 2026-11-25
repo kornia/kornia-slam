@@ -1,5 +1,6 @@
 //! Core frame-domain types shared across the crate.
 
+use crate::features::RBrief;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_image::ImageSize;
@@ -9,7 +10,7 @@ use crate::features::Features;
 /// A camera observation: features extracted at a known pose. `D` is the
 /// descriptor type; ORB's by default.
 #[derive(Debug, Clone)]
-pub struct Frame<D = [u8; 32]> {
+pub struct Frame<D = RBrief> {
     /// Frame index.
     pub idx: usize,
     /// Features extracted for this frame.
@@ -114,7 +115,7 @@ mod tests {
             idx: 0,
             features: Features {
                 keypoints_xy: Vec::new(),
-                orientations: Vec::new(),
+                orientations: None,
                 descriptors: Vec::new(),
                 octaves: Vec::new(),
             },

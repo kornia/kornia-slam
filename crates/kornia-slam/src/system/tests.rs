@@ -91,7 +91,7 @@ fn saved_vocabulary(name: &str) -> SavedVocabulary {
     let descriptors: Vec<_> = features
         .descriptors
         .iter()
-        .map(kornia_bow::orb_slam3::pack_orb_descriptor)
+        .map(|d| kornia_bow::orb_slam3::pack_orb_descriptor(&d.0))
         .collect();
     let path = std::env::temp_dir().join(format!(
         "kornia-slam-system-{}-{name}.bin",
