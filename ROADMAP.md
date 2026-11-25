@@ -65,6 +65,12 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
   - The Pb0 bisect finds dafaacb (the pose-inertial behind-camera refusal, from #195). It forks S0PEIH at rounding level, about 1e-8 at frame 70 (G63). It is a fix, not a regression.
   - S0PEIH re-baselined on the tip: MH_04 median 0.185, MH_01 0.048, MH_05 0.101, V1_02 0.041, V2_01 0.053.
   - The identity check now covers a knob-on arm (`E/integ/ident4.sh`). Next: V-c.
+- **V-c, lane B (in #180 95bc33c, off by default).**
+  - `keyframe_observations: PnpInliersClaimed` stops the features that PnpInliers drops from being seeded again: stereo seeds 326 → 222 per keyframe, landmarks −34 %.
+  - SYNC medians of 3: V1_03 0.111 → 0.094, V2_02 0.092 → 0.086, MH_04 0.227 → 0.218, MH_01 0.049 → 0.050.
+  - It keeps the hall gain but recovers only part of the Vicon penalty: S0E still scores 0.072 / 0.080 there. Pc2 missed; no kill rule fired.
+  - Remaining candidates (unverified): the dropped links, and fewer flow tracks.
+  - Not promoted: it goes into the next batch gate. Next: V-c2 (flow seeds from the claimed features).
 
 ### 2026-11-24
 

@@ -3625,3 +3625,56 @@ Basalt: MH_04 0.114, MH_01 0.067, MH_05 0.144, V1_02 0.045, V2_01 0.039.
 - G60-b does what it was written for: every capped failure on the tip is applied, converged solves are untouched, and no applied capped loop hurt a 10 s piece by more than 0.020 m.
 - The gain is small and on MH_05 only: start 2 causal −0.013 (smoothed −0.047); the median of 3 goes 0.101 → 0.100. MH_04 no longer exercises the knob on the tip.
 - Not promoted. It goes into the next batch gate with the other winners. G60-c (f64 PGO) stays the proper fix for the noise floor.
+
+### Results: V-c, `keyframe_observations: PnpInliersClaimed` (2026-11-25)
+
+Setup:
+- **Arm:** S0PEC = S0PE with `PnpInliersClaimed`.
+- **Binary:** `E/bin-fold` (#180 tip 95bc33c, md5 `aefd2aca…`). Runs in `E/lane2xb/runs/`; table from `E/lane2xb/report.py vc`.
+- **Header:** golden `E/lane2xb/expect/S0PEC.header` (S0PE's, plus `keyframe observations: PnpInliersClaimed`). Every header is `diff`-identical, and every run has `rc=0`.
+- **Controls:** S0PE V1_03 start 0 and MH_04 start 0 on `bin-fold` are `cmp`-identical to the cached `runs/S0PE_*`. S0PE has no pose-inertial, so dafaacb does not touch it.
+
+Causal SE(3) ATE, m, SYNC, taskset 2-5,8-11:
+
+| seq | starts 0 / 1 / 2, S0PE → S0PEC | median S0PE → S0PEC | Basalt |
+|---|---|---|---|
+| V1_03 | 0.111 → 0.094, 0.166 → 0.094, 0.085 → 0.107 | 0.111 → 0.094 (1.76x) | 0.053 |
+| V2_02 | 0.099 → 0.087, 0.091 → 0.079, 0.092 → 0.086 | 0.092 → 0.086 (1.74x) | 0.049 |
+| MH_04 | 0.227 → 0.218, 0.227 → 0.218, 0.229 → 0.211 | 0.227 → 0.218 (1.91x) | 0.114 |
+| MH_01 | 0.042 → 0.049, 0.050 → 0.053, 0.049 → 0.050 | 0.049 → 0.050 (0.74x) | 0.067 |
+
+Every S0PEC run has `give_ups=0`. Coasts are no worse than S0PE, except V2_02 start 0 (0 → 2) and start 1 (0 → 1).
+
+| P/K | measured | verdict |
+|---|---|---|
+| Pc1 | V1_03 start 0, frames 0-400, debug (`E/lane2xb/debug/`): stereo seeds per keyframe 326.1 (S0PE, this binary) → 222.4 (S0E 216.6). Final landmarks: V1_03 210.5 k → 138.3 k; V2_02 205.9 k → 146.5 k; MH_04 46.8 k → 42.3 k | as predicted |
+| Pc2 | V1_03 median 0.094 (≤ 0.080 predicted); start 2 rises 0.085 → 0.107 | missed |
+| Pc3 | V2_02 median 0.086 (≤ 0.085 predicted); every start below its S0PE start | missed by 0.001 |
+| Pc4 | MH_04 median 0.218 (≤ 0.235; better than S0PE); MH_01 0.050 (≤ 0.055) | as predicted |
+| Kc1 | MH_04 ≤ 0.25 and MH_01 ≤ 0.060 | not fired |
+| Kc2 | both Vicon medians below S0PE (0.111 → 0.094, 0.092 → 0.086) | not fired |
+| Kc3 | seeds per keyframe 222 ≤ 240 | not fired |
+
+**Diagnosis of the Pc2 miss (mechanism unverified).** The duplicates are gone, but S0PEC still sits above S0E on both Vicon rooms: V1_03 0.094 against S0E 0.072, V2_02 0.086 against 0.080. Duplicate seeding was only part of the PnpInliers penalty. Final map, start 0:
+
+| arm | landmarks V1_03 | obs per active landmark V1_03 / V2_02 | `flow_unavailable` V1_03 / V2_02 |
+|---|---|---|---|
+| S0E | 127 k | 4.55 / 4.62 | 94 / 43 |
+| S0PE | 210 k | 4.05 / 4.54 | 122 / 63 |
+| S0PEC | 138 k | 4.05 / 4.61 | 189 / 80 |
+
+Two candidates remain. Neither has been tested on its own.
+1. **The links PnpInliers drops.** A landmark loses the observation of a dropped match, so V1_03 stays at 4.05 observations per landmark against S0E's 4.55.
+2. **Fewer flow tracks.** KLT tracks are seeded only from linked matches. A dropped feature is now neither linked nor seeded, so `flow_unavailable` rises: V1_03 122 → 189, V2_02 63 → 80.
+
+V1_03's per-start spread is wide (S0PE 0.085-0.166), so its start-2 rise is within noise.
+
+**Verdict.**
+- V-c removes the duplicate seeds (Pc1) and keeps or improves the hall gain: MH_04 0.227 → 0.218, MH_01 0.049 → 0.050.
+- It recovers about 40 % of the V1_03 penalty (0.111 → 0.094, against S0E 0.072) and about half of V2_02's (0.092 → 0.086, against 0.080).
+- S0PEC is now the best SYNC PnpInliers arm on 3 of 4 sequences (not MH_01), but it still loses to S0E on the Vicon rooms.
+- Not promoted on its own. It goes into the next batch gate.
+
+**Next (theory first, no code yet).**
+1. V-c2: seed flow tracks from the claimed features too. Test whether `flow_unavailable` falls back to the S0PE level, and whether V1_03 follows.
+2. Only then the observation-density question: link the dropped match after the VI-BA erase, instead of dropping it at tracking.
