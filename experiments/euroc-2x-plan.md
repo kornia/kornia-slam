@@ -263,3 +263,52 @@ For K1's diff, the order of suspects is: open question 1 (FEJ form), the IMU noi
 
 **Stop S-C** after the verdict: go or no-go on Drive. A miss or a fired kill rule gets a written diagnosis first.
 
+
+## 2x-5 K1 diagnosis (written 2026-11-25 17:10, before any diagnostic run)
+
+K1 fired on the partial 2x-5 scores (`experiments/euroc-2x-results.md`): P1 and P2 hold, P3 fails on 7 of 11. The
+failing pattern: low-frequency error (V1_03 LF 0.100 against HF 0.004), Sim3 scale within 1 % on every sequence but
+V2_03, ratios highest where Basalt is best (MH_02 3.0, V1_02 1.76, V1_03 1.89, V2_01 1.8-2.1, V2_02 1.9-2.0), and
+10 s yaw RPE up to 2.2x Basalt's on MH_02 (0.46° against 0.21°).
+
+### K1-a: state diff against Basalt (measurement only, no estimator change)
+- **Instruments.** Ours: `--vio-states` (new app flag, no behaviour change) writes per frame the body pose, velocity,
+  both biases, landmark count, flow observations per camera, rows per camera and the keyframe flag. Basalt:
+  `bench-basalt2-states` (lane C's paced image plus a `vio.cpp` that writes every output state, `t p q v b_g b_a`, to
+  `states.txt`; unpaced). Sequences: MH_01 (the card's), MH_02 and V1_02 (the worst easy/medium), start 0, first
+  400 frames and whole run.
+- **Readings, each against Basalt and GT:** accel and gyro bias trajectories (Basalt starts from calibrated biases,
+  we from zero), velocity error, tilt (roll/pitch against GT), per-20 s drift growth of position and yaw,
+  landmarks and rows per frame.
+- **Predictions, written now so the diff is read against them:**
+  - Pd1 (FEJ form): if the strict visual FEJ is the cause, the error grows fastest where keyframe poses carry large
+    deltas; the diff shows our yaw drift rate ≥ 2x Basalt's on MH_02 and V1_02 while biases agree within 0.01 m/s²
+    and 2e-4 rad/s after 20 s.
+  - Pd2 (noise arm): if the datasheet noise is the cause, our accel bias wanders more than Basalt's (std over the run
+    ≥ 2x) and VO-bn (already queued) is within the band on ≥ 2 of MH_02, V1_02, V1_03 where VO-ds is not.
+  - Pd3 (bias start): if the uncalibrated start is the cause, our accel bias differs from Basalt's by ≥ 0.05 m/s² for
+    > 20 s after the start, and the error grows in that span, then stops.
+  - Pd4 (track counts): if track counts are the cause, our rows per frame are ≤ 0.5x Basalt's track count on the
+    Vicon rooms (Basalt keeps up to 144 + stereo per frame) and error growth correlates with low-row spans.
+- **Kill rule.** KD1: none of Pd1-Pd4 shows → the suspect list is incomplete; trace the first 20 s of V1_02 at the
+  linearization level before any A/B.
+
+### K1-b: cheap A/B per suspect, in the card's order, after K1-a
+Each knob default = today's; knob off must be bit-identical (T8 holds it). One SYNC run per sequence on V1_02,
+MH_02, V2_01 (the screen), then all 11 when one holds.
+- A/B 1, FEJ form: `odometry: SlidingWindow(( visual_jacobians: Current ))`: visual Jacobians at current poses
+  (Basalt's relative-pose value at the current state; visual rows keep their 6-DOF nullspace at any point).
+  Prediction if the cause: V1_02 1.76 → ≤ 1.3, MH_02 3.0 → ≤ 1.6; twin yaw log10 stays ≤ −9. If not: within ±5 %.
+- A/B 2, noise arm: VO-bn (no code), as queued.
+- A/B 3, bias start: Basalt's calibrated EuRoC biases as the first state's bias (bench only; the plan's answer 5
+  keeps zero biases in the product), to price the start.
+- A/B 4, track counts: decided after K1-a's rows-per-frame reading.
+
+### K1-c: V2_03 start-30 divergence (trace only)
+Find the frame where the error leaves 1 m; read rows per frame, `movement_rejects` and gyro rate before it, and the
+bias trajectory. Prediction: the divergence follows a span with rows_left < 20 for > 1 s during gyro rate > 2 rad/s
+(the 60 px movement cap, design risk table), with the accel bias leaving 0.5 m/s².
+
+### K1-d: MH_02 and MH_03 (2-3x Basalt with 72-82 landmarks)
+Read from K1-a's MH_02 diff. Prediction: not a track-count gap (rows ≥ Basalt's), so the cause is in the estimator
+(Pd1-Pd3); if rows are also short, the 60 px cap and the keyframe-only landmark creation are next.

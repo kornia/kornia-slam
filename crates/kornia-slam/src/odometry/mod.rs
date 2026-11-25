@@ -77,6 +77,12 @@ pub struct OdometryOutput {
     pub bias: ImuBias,
     pub keyframe: bool,
     pub optimized: bool,
+    /// Landmarks in the window after the frame.
+    pub landmarks: usize,
+    /// The frame's flow observations, left and right camera.
+    pub observations: [usize; 2],
+    /// Visual rows of the last accepted linearization, left and right.
+    pub rows: [usize; 2],
 }
 
 /// Run totals of the estimator; `*_ms` hold one value per frame.
@@ -400,6 +406,10 @@ impl SlidingWindowOdometry {
             bias: value.bias,
             keyframe: report.keyframe,
             optimized: report.optimized,
+            landmarks: self.window.landmark_count(),
+            observations: [0u8, 1]
+                .map(|c| self.observations.iter().filter(|o| o.camera == c).count()),
+            rows: report.solve.map_or([0; 2], |s| s.rows),
         })
     }
 }

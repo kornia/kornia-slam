@@ -45,6 +45,25 @@ impl TrajectoryWriter {
         Ok(true)
     }
 
+    /// As [`Self::write`], with `extra` appended to the line after a space.
+    pub fn write_with(
+        &mut self,
+        timestamp_sec: f64,
+        pose_world_to_cam: &Pose3d,
+        extra: &str,
+    ) -> std::io::Result<bool> {
+        if !is_finite_pose(pose_world_to_cam) {
+            return Ok(false);
+        }
+        let world_from_cam = pose_world_to_cam.inverse();
+        let pose = match &self.body_to_camera {
+            Some(t_cb) => world_from_cam.compose(t_cb),
+            None => world_from_cam,
+        };
+        writeln!(self.out, "{} {extra}", format_line(timestamp_sec, &pose))?;
+        Ok(true)
+    }
+
     pub fn finish(mut self) -> std::io::Result<()> {
         self.out.flush()
     }

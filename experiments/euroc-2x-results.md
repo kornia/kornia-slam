@@ -280,3 +280,45 @@ Observations for the diagnosis, none tested yet:
   count alone does not explain it.
 - V2_03 start 30 diverged to kilometres with `resets=0` and `errors=0`: the reset policy (owner answer 9) catches only
   non-finite states, so a finite runaway goes undetected. Its cause is not traced.
+
+## 2x-5 K1 diagnosis (card in `experiments/euroc-2x-plan.md`, section "2x-5 K1 diagnosis")
+
+### K1-a, MH_01 start 0 (found 2026-11-25 17:40)
+Instruments: ours `VO-ds_MH_01_easy_s0_r7` (`bin-2x5-k1`, md5 `720f91a1`, `--vio-states`; the run hit the 900 s cap
+at machine load 30-47, so the first 3479 of 3682 frames are read; its poses are identical to `VO-ds_MH_01_easy_s0_r1`
+from `bin-2x5-c11` over those frames). Basalt: `bench-basalt2-states`, unpaced, its biases plus its calibrated
+offsets (`euroc_ds_calib.json`). Script: `E/twox/k1/statediff.py`, per 10 s means against GT.
+
+- **Start transient (ours only):** in the first 10 s our accel bias y reads +0.38 m/s² against GT +0.14 (Basalt
+  +0.15), z +0.20 against +0.08, and the tilt error is 2.1° against Basalt's 0.5°. Both are gone by 20 s (tilt
+  0.12°, accel bias y +0.15). This is the uncalibrated zero-bias start (suspect Pd3; owner answer 5 keeps it).
+- **Steady state (20 s on):** gyro bias within 3e-4 rad/s of Basalt and of GT on every axis; accel bias within
+  ±0.04 m/s² of GT (Basalt ±0.03); tilt 0.1-0.3° (Basalt 0.1-0.2°); speed error within ±0.01 m/s (Basalt alike).
+- **Counts:** 50-114 landmarks and 290-780 left rows per frame.
+- MH_01 is our good sequence (0.75-0.83x Basalt), so it cannot show the failing mechanism; MH_02 and V1_02 decide.
+
+### K1-a, MH_02 and V1_02 start 0 (found 2026-11-25 18:00)
+Runs `VO-ds_MH_02_easy_s0_r7` (complete; poses identical to r1) and `VO-ds_V1_02_medium_s0_r7` (complete), Basalt
+`bench-basalt2-states`. Yaw and position growth from `growth.py` (SE3 fit on the first 10 s of overlap; change from
+10 s on), ours against Basalt:
+
+| seq | biases, tilt, speed against Basalt | yaw change from 10 s | vertical error at 70 s | landmarks / left rows / right rows per frame |
+|---|---|---|---|---|
+| MH_02 | gyro within 2-7e-4 rad/s, accel within 0.03 m/s², tilt 0.16-0.32° (Basalt 0.11-0.54°), speed within 0.02 m/s | +1.5° by 110 s against −0.0° | +0.23 m against +0.14 m | 39-122 / 259-755 / 4-546 (right rows 4 over 10-20 s) |
+| V1_02 | gyro within 3-9e-4, accel within 0.03 (our z 0.056-0.094 against GT 0.093, Basalt 0.075-0.087), tilt 0.15-0.59° (Basalt 0.20-0.45°), speed within 0.01 | −0.0° against +0.2° | +0.12 m against +0.03 m | 21-50 / 130-325 / 59-179 |
+| MH_01 (above) | same agreement | +0.5° to 90 s, then as Basalt | - | 50-114 / 290-780 |
+| V2_02 (trajectory only) | - | +1.2° by 90 s against −0.4° | - | - |
+| MH_03 (trajectory only) | - | −2.7° against −3.2° | - | - |
+
+Against the card's predictions:
+- **Pd1 (FEJ form):** biases agree within the predicted 0.01 m/s² / 2e-4 rad/s only roughly (accel within 0.03), and
+  the yaw drift is ≥ 2x Basalt's on MH_02 and V2_02 but not on V1_02, where the excess is vertical. **Partly shown.**
+- **Pd2 (noise arm):** our accel bias wanders ±0.04 against Basalt's ±0.03 (1.3x, not ≥ 2x). **Not shown**; the
+  VO-bn record runs are still queued.
+- **Pd3 (bias start):** the start transient (MH_01) is over by 20 s on every sequence, while MH_02's excess grows at
+  50-110 s. **Not shown** as the main cause.
+- **Pd4 (track counts):** Basalt's per-frame track count is not logged, so the 0.5x comparison is open. Our Vicon-room
+  left rows (130-325) are under half the Machine Hall ones (290-780), and MH_02 lost its right rows over 10-20 s.
+  **Open.**
+- **KD1 does not fire** (Pd1 partly shown). Next per the card: A/B 1, `visual_jacobians: Current`, once the fold is
+  done; the V1_02 vertical drift and the MH_02 right-row gap are recorded for A/B 4.

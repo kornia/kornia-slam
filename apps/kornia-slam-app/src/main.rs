@@ -82,6 +82,12 @@ struct Args {
     #[argh(option)]
     trajectory_vio: Option<String>,
 
+    /// like --trajectory-vio, each line followed by the state and its
+    /// counts: `vx vy vz bgx bgy bgz bax bay baz landmarks obs_left
+    /// obs_right rows_left rows_right keyframe`
+    #[argh(option)]
+    vio_states: Option<String>,
+
     /// black images from `<start_s>` after the first frame for `<duration_s>`,
     /// given as `<start_s>:<duration_s>`; frames and IMU are still processed
     #[argh(option)]
@@ -351,6 +357,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .transpose()?;
+    let mut vio_states = args
+        .vio_states
+        .as_deref()
+        .map(|path| {
+            trajectory::TrajectoryWriter::create(
+                std::path::Path::new(path),
+                system.rig().camera_to_body(),
+            )
+        })
+        .transpose()?;
     // The session dump carries the smoothed frames too.
     let mut smoothed = (args.trajectory_smoothed.is_some() || args.session_out.is_some())
         .then(trajectory::SmoothedTrajectory::default);
@@ -584,6 +600,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             writer.write(timestamp_sec, &vio.pose_world_to_cam)?;
         }
+        if let (Some(writer), Some(vio)) = (vio_states.as_mut(), system.odometry_output())
+            && vio.timestamp_sec == timestamp_sec
+        {
+            writer.write_with(
+                timestamp_sec,
+                &vio.pose_world_to_cam,
+                &vio_state_columns(vio),
+            )?;
+        }
         // Gated as --trajectory-out, so the session dump and offline-ba see
         // the same frames that are scored.
         if let Some(smoothed) = smoothed.as_mut()
@@ -690,6 +715,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         writer.finish()?;
     }
     if let Some(writer) = trajectory_vio {
+        writer.finish()?;
+    }
+    if let Some(writer) = vio_states {
         writer.finish()?;
     }
     if let Some(counters) = system.odometry_counters() {
@@ -857,14 +885,41 @@ fn writes_scored_pose(
             ))
 }
 
+/// The `--vio-states` columns after the pose.
+fn vio_state_columns(vio: &kornia_slam::OdometryOutput) -> String {
+    let (v, g, a) = (vio.velocity_world, vio.bias.gyro, vio.bias.accel);
+    format!(
+        "{:.6} {:.6} {:.6} {:.7} {:.7} {:.7} {:.6} {:.6} {:.6} {} {} {} {} {} {}",
+        v.x,
+        v.y,
+        v.z,
+        g.x,
+        g.y,
+        g.z,
+        a.x,
+        a.y,
+        a.z,
+        vio.landmarks,
+        vio.observations[0],
+        vio.observations[1],
+        vio.rows[0],
+        vio.rows[1],
+        u8::from(vio.keyframe)
+    )
+}
+
 /// `--trajectory-vio` writes the sliding-window odometry's poses, so it needs
 /// that estimator.
 fn check_trajectory_vio(
     args: &Args,
     orb: &kornia_slam::system::OrbSlamPipeline,
 ) -> Result<(), String> {
-    if args.trajectory_vio.is_some() && orb.odometry.sliding_window().is_none() {
-        return Err("--trajectory-vio needs pipeline.odometry: SlidingWindow".into());
+    if (args.trajectory_vio.is_some() || args.vio_states.is_some())
+        && orb.odometry.sliding_window().is_none()
+    {
+        return Err(
+            "--trajectory-vio and --vio-states need pipeline.odometry: SlidingWindow".into(),
+        );
     }
     Ok(())
 }
@@ -972,6 +1027,11 @@ mod cli_tests {
         assert!(check_trajectory_vio(&args, &orb).is_err());
         orb.odometry = kornia_slam::Odometry::SlidingWindow(Default::default());
         assert!(check_trajectory_vio(&args, &orb).is_ok());
+        let states = parse(&["--config", "r.ron", "--vio-states", "s.txt"]).unwrap();
+        assert!(
+            check_trajectory_vio(&states, &kornia_slam::system::OrbSlamPipeline::default())
+                .is_err()
+        );
         let without = parse(&["--config", "r.ron"]).unwrap();
         let default = kornia_slam::system::OrbSlamPipeline::default();
         assert!(check_trajectory_vio(&without, &default).is_ok());
