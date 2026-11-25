@@ -71,3 +71,8 @@ required-features = ["bench_internals"]
 name = "bench_upstream_remap_u8"
 harness = false
 required-features = ["bench_internals"]
+
+[[bench]]
+name = "bench_odometry_window"
+harness = false
+required-features = ["bench_internals"]

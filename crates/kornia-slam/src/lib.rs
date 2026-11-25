@@ -65,6 +65,9 @@ pub use frontend::FrontendObservation;
 pub use kornia_imgproc::features::OrbFeatures;
 pub use kornia_sensors::{ImuCalibration, SensorRig};
 pub use loop_closure::{LoopClosingConfig, LoopClosureEvent};
+#[cfg(feature = "bench_internals")]
+#[doc(hidden)]
+pub use odometry::bench as odometry_bench;
 pub use odometry::{
     Odometry, OdometryCounters, OdometryImuNoise, OdometryMode, OdometryOutput, OdometryTuning,
     SlidingWindowConfig,

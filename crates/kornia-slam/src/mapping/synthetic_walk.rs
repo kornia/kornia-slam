@@ -1,4 +1,5 @@
-//! Analytic walks with exact IMU streams, shared by the solver tests.
+//! Analytic walks with exact IMU streams, shared by the solver tests; the
+//! head walk and the Gaussian draws also feed the odometry bench.
 
 use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 use kornia_sensors::imu::ImuMeasurement;
@@ -8,11 +9,16 @@ use kornia_sensors::imu::ImuMeasurement;
 /// scale to the free accel bias: `b_a = (1 - s) A` fits a world scaled by `s`
 /// exactly. The varying part makes scale observable; roll, pitch and gravity
 /// need the body to turn too ([`Sampling::Rotating`]).
+#[cfg(test)]
 const VELOCITY: [f64; 3] = [0.5, 0.0, 0.0];
+#[cfg(test)]
 const ACCELERATION: [f64; 3] = [0.4, 0.0, 0.2];
+#[cfg(test)]
 const WOBBLE: [f64; 3] = [0.3, 0.2, -0.3];
+#[cfg(test)]
 const WOBBLE_RAD_S: f64 = 3.0;
 
+#[cfg(test)]
 pub(crate) fn body_position(t: f64) -> Vec3F64 {
     let w = WOBBLE_RAD_S;
     Vec3F64::from_array(VELOCITY) * t
@@ -20,6 +26,7 @@ pub(crate) fn body_position(t: f64) -> Vec3F64 {
         + Vec3F64::from_array(WOBBLE) * (t / w - (w * t).sin() / (w * w))
 }
 
+#[cfg(test)]
 pub(crate) fn body_velocity(t: f64) -> [f64; 3] {
     let w = WOBBLE_RAD_S;
     (Vec3F64::from_array(VELOCITY)
@@ -29,6 +36,7 @@ pub(crate) fn body_velocity(t: f64) -> [f64; 3] {
 }
 
 /// How the synthetic IMU samples the specific force.
+#[cfg(test)]
 #[derive(Clone, Copy)]
 pub(crate) enum Sampling {
     /// Each sample the mean over the interval before it: exact for `Hold`.
@@ -43,6 +51,7 @@ pub(crate) enum Sampling {
 
 /// `R_wb(t)` of the rotating walk: `Exp(α e_x) · Exp(0.7 α e_y)`,
 /// `α = 0.25 (1 − cos 2t)` rad; the identity otherwise.
+#[cfg(test)]
 pub(crate) fn body_rotation(t: f64, sampling: Sampling) -> Mat3F64 {
     match sampling {
         Sampling::Rotating => {
@@ -54,12 +63,14 @@ pub(crate) fn body_rotation(t: f64, sampling: Sampling) -> Mat3F64 {
     }
 }
 
+#[cfg(test)]
 fn body_acceleration(t: f64) -> Vec3F64 {
     Vec3F64::from_array(ACCELERATION) + Vec3F64::from_array(WOBBLE) * (WOBBLE_RAD_S * t).sin()
 }
 
 /// The IMU reading stamped `t` (gyro, accel), held over `(t - dt, t]`: the
 /// one the `Hold` preintegration reproduces exactly for `sampling`.
+#[cfg(test)]
 pub(crate) fn exact_reading(
     t: f64,
     dt: f64,

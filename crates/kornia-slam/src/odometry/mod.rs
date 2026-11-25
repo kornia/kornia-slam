@@ -14,7 +14,7 @@ mod linearize;
 mod marginalize;
 mod solve;
 mod state;
-#[cfg(test)]
+#[cfg(any(test, feature = "bench_internals"))]
 mod synthetic;
 #[cfg(test)]
 mod tests;
@@ -401,5 +401,98 @@ impl SlidingWindowOdometry {
             keyframe: report.keyframe,
             optimized: report.optimized,
         })
+    }
+}
+
+/// A steady window step for `benches/bench_odometry_window.rs`.
+#[cfg(feature = "bench_internals")]
+#[doc(hidden)]
+pub mod bench {
+    use kornia_sensors::imu::{ImuBias, ImuCalib, PreintegratedImu};
+
+    use super::config::OdometryTuning;
+    use super::synthetic::{StereoWalk, camera_to_body, gravity, stereo_views};
+    use super::window::{FrameInput, Observation, Window};
+
+    /// The frames of a 12 s noisy walk, precomputed, fed one per step; the
+    /// window restarts at the end.
+    pub struct WindowBench {
+        frames: Vec<(i64, Option<PreintegratedImu>, Vec<Observation>)>,
+        first_accel: kornia_algebra::Vec3F64,
+        window: Window,
+        next: usize,
+    }
+
+    const WARM_UP_FRAMES: usize = 40;
+
+    impl WindowBench {
+        pub fn new() -> Self {
+            let calib = ImuCalib {
+                gyro_noise: 1.6968e-4,
+                accel_noise: 2.0e-3,
+                gyro_bias_noise: 1.9393e-5,
+                accel_bias_noise: 3.0e-3,
+            };
+            let walk = StereoWalk::new(12.0, ImuBias::default(), Some((calib, 1)));
+            let mut gauss = crate::mapping::synthetic_walk::Gauss(3);
+            let frames = (0..walk.frames())
+                .map(|k| {
+                    let t = StereoWalk::time(k);
+                    let imu = (k > 0).then(|| {
+                        let t0 = StereoWalk::time(k - 1);
+                        PreintegratedImu::from_measurements(
+                            ImuBias::default(),
+                            calib,
+                            walk.samples(t0, t),
+                            t0,
+                            t,
+                        )
+                    });
+                    (
+                        StereoWalk::id(k),
+                        imu,
+                        walk.observations(k, Some((&mut gauss, 0.5))),
+                    )
+                })
+                .collect();
+            let mut bench = Self {
+                frames,
+                first_accel: walk.accel_at(0.0),
+                window: Window::new(
+                    &OdometryTuning::default(),
+                    stereo_views(),
+                    camera_to_body(),
+                    gravity(),
+                ),
+                next: 0,
+            };
+            for _ in 0..WARM_UP_FRAMES {
+                bench.step();
+            }
+            bench
+        }
+
+        /// One frame through the window.
+        pub fn step(&mut self) {
+            if self.next == self.frames.len() {
+                self.next = 0;
+            }
+            let (id, imu, observations) = &self.frames[self.next];
+            if self.next == 0 && self.window.initialize(*id, self.first_accel).is_err() {
+                return;
+            }
+            let _ = self.window.add_frame(FrameInput {
+                id: *id,
+                imu: imu.clone(),
+                observations,
+            });
+            self.next += 1;
+        }
+    }
+
+    impl Default for WindowBench {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 }
