@@ -53,7 +53,9 @@ use crate::tracking::{
 };
 
 use crate::tracking::TrackingTimings;
-use crate::tracking::flow_tracker::{FlowStepInput, RigFlow, RigFlowCamera, RigFlowSettings};
+use crate::tracking::flow_tracker::{
+    FlowStepInput, RefillCameras, RigFlow, RigFlowCamera, RigFlowSettings,
+};
 use crate::tracking::local_map::{LocalMapRules, select_local_map_points};
 use crate::tracking::motion::{
     InertialPrediction, body_to_world, predict_pose, propagate_keyframe_velocity,
@@ -3726,6 +3728,7 @@ fn rig_flow_settings(settings: &SystemSettings) -> RigFlowSettings {
         refill: flow.refill,
         anchor_guard: flow.anchor_guard,
         gyro_guess: flow.gyro_guess,
+        refill_cameras: RefillCameras::RoundRobin,
     }
 }
 

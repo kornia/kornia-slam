@@ -19,7 +19,8 @@ use crate::tracking::flow_tracker::ShardLayout;
 // zero-allocation test only.
 #[doc(hidden)]
 pub use crate::tracking::flow_tracker::{
-    FlowOutput, FlowStepCounts, FlowStepInput, RigFlow, RigFlowCamera, RigFlowSettings,
+    FlowOutput, FlowStepCounts, FlowStepInput, RefillCameras, RigFlow, RigFlowCamera,
+    RigFlowSettings,
 };
 use crate::tracking::timings::{TrackingTimings, timed};
 

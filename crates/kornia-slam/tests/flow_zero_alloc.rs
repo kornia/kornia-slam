@@ -11,7 +11,7 @@ use kornia_image::{Image, ImageSize};
 use kornia_slam::system::{AnchorGuard, ForwardBackward, GyroGuess, KltRetry, TrackRefill};
 use kornia_slam::tracking::TrackingTimings;
 use kornia_slam::tracking::optical_flow::{
-    FlowOutput, FlowStepInput, RigFlow, RigFlowCamera, RigFlowSettings, TrackSet,
+    FlowOutput, FlowStepInput, RefillCameras, RigFlow, RigFlowCamera, RigFlowSettings, TrackSet,
 };
 
 /// Counts allocations on every thread while `COUNTING` is set.
@@ -112,6 +112,7 @@ fn settings(threads: usize) -> RigFlowSettings {
         refill: TrackRefill::Off,
         anchor_guard: AnchorGuard::Off,
         gyro_guess: GyroGuess::Off,
+        refill_cameras: RefillCameras::RoundRobin,
     }
 }
 

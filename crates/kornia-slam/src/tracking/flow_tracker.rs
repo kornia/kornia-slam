@@ -578,6 +578,17 @@ pub struct RigFlowCamera {
     pub camera_from_primary: Option<Pose3d>,
 }
 
+/// Which camera a frame's refill detects in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RefillCameras {
+    /// One camera per frame, in turn.
+    #[default]
+    RoundRobin,
+    /// Camera 0 every frame: the other cameras get their tracks by
+    /// [`RigFlow::track_across`] (the sliding-window odometry's stereo link).
+    PrimaryOnly,
+}
+
 /// The frontend knobs a [`RigFlow`] step reads.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RigFlowSettings {
@@ -597,6 +608,7 @@ pub struct RigFlowSettings {
     pub refill: TrackRefill,
     pub anchor_guard: AnchorGuard,
     pub gyro_guess: GyroGuess,
+    pub refill_cameras: RefillCameras,
 }
 
 impl RigFlowSettings {
@@ -617,6 +629,7 @@ impl RigFlowSettings {
             refill: frontend.track_refill,
             anchor_guard: frontend.anchor_guard,
             gyro_guess: frontend.gyro_guess,
+            refill_cameras: RefillCameras::RoundRobin,
         }
     }
 }
@@ -685,6 +698,9 @@ pub struct RigFlow {
     keyframe: Vec<LkFrame>,
     /// Template a landmark is adopted with.
     adopted: LkTemplate,
+    /// Level-0 and coarse templates of [`Self::track_across`].
+    across: LkTemplate,
+    across_coarse: LkTemplate,
 }
 
 impl RigFlow {
@@ -727,6 +743,8 @@ impl RigFlow {
             output: FlowOutput::default(),
             keyframe: Vec::new(),
             adopted: LkTemplate::default(),
+            across: LkTemplate::default(),
+            across_coarse: LkTemplate::default(),
         })
     }
 
@@ -787,6 +805,81 @@ impl RigFlow {
             &SurvivorFilterConfig::default(),
         )
         .then_some(result.pixel)
+    }
+
+    /// New corners in `camera`'s current frame with no track to avoid, for
+    /// a track set that is empty: [`Self::step`] refills only after flow.
+    pub(crate) fn seed(&mut self, camera: usize) -> Result<&[(usize, [f32; 2])], FlowPoolError> {
+        let frames = self.frames.as_ref().ok_or(FlowPoolError::FrameShared)?;
+        let guess = &mut self.guess;
+        guess.refill_camera = Some(camera);
+        guess.refill_shard = 0;
+        guess.refill_occupied.clear();
+        let shard = &mut self.shards[0];
+        shard.spawned.clear();
+        shard.refill(&frames.current, guess, &mut ShardTimings::default());
+        guess.refill_camera = None;
+        Ok(&self.shards[0].spawned)
+    }
+
+    /// Where `pixel` of camera `from`'s current frame is in camera `to`'s
+    /// current frame: its template tracked coarse to fine from `start` (as
+    /// the forward solve), kept when it passes the survivor filter and its
+    /// round trip back lands within the forward-backward bound (as `keep`).
+    pub(crate) fn track_across(
+        &mut self,
+        from: usize,
+        to: usize,
+        pixel: [f32; 2],
+        start: [f32; 2],
+    ) -> Option<[f32; 2]> {
+        let (max_level, max_iter) = self.settings.unpredicted;
+        self.build_coarse(max_level).ok()?;
+        let frames = self.frames.as_ref()?;
+        let (source, target) = (frames.current.get(from)?, frames.current.get(to)?);
+        let window = self.settings.window;
+        let epsilon = self.settings.epsilon;
+        if !extract_template(source, pixel, 0, window, &mut self.across) {
+            return None;
+        }
+        let mut guess = start;
+        let levels = max_level.min(source.levels().min(target.levels()).saturating_sub(1));
+        for level in (1..=levels).rev() {
+            if !extract_template(source, pixel, level, window, &mut self.across_coarse) {
+                continue;
+            }
+            let coarse = track_template(&self.across_coarse, target, guess, max_iter, epsilon);
+            if coarse.status {
+                guess = coarse.pixel;
+            }
+        }
+        let result = track_template(&self.across, target, guess, max_iter, epsilon);
+        let size = target.plane().size();
+        if !KltTracker::accepts(
+            &Track::at(pixel),
+            u8::from(result.status),
+            result.error,
+            result.pixel,
+            [size.width as f32, size.height as f32],
+            &SurvivorFilterConfig::default(),
+        ) {
+            return None;
+        }
+        if let ForwardBackward::Enabled {
+            max_round_trip_px,
+            max_iter,
+            ..
+        } = self.settings.forward_backward
+        {
+            if !extract_template(target, result.pixel, 0, window, &mut self.across) {
+                return None;
+            }
+            let back = track_template(&self.across, source, pixel, max_iter, epsilon);
+            if !back.status || distance(back.pixel, pixel) > max_round_trip_px {
+                return None;
+            }
+        }
+        Some(result.pixel)
     }
 
     pub fn threads(&self) -> usize {
@@ -953,7 +1046,10 @@ impl RigFlow {
         else {
             return;
         };
-        let camera = (frame_idx % self.cameras().max(1) as u64) as usize;
+        let camera = match self.settings.refill_cameras {
+            RefillCameras::RoundRobin => (frame_idx % self.cameras().max(1) as u64) as usize,
+            RefillCameras::PrimaryOnly => 0,
+        };
         let Some(model) = self.guess.cameras.get(camera) else {
             return;
         };
@@ -1185,6 +1281,7 @@ mod tests {
             refill: refill(),
             anchor_guard: AnchorGuard::Off,
             gyro_guess,
+            refill_cameras: RefillCameras::RoundRobin,
         };
         let camera = RigFlowCamera {
             camera: pinhole(),
