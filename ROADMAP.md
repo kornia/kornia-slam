@@ -21,6 +21,46 @@ Newest first, one entry per working day. "main" means a merged PR; "#180" means 
 `feat/global-pose-graph` branch (PR #180), which is not merged. Unless marked validated, branch work
 sits behind config knobs that default to the old behaviour, and nothing in it has been benchmarked yet.
 
+### 2026-11-25
+
+- **Paused by the owner at 05:03.** Every lane was SIGSTOPped (G11 benchmark, 2x lanes A/B/C); nothing resumes without
+  the owner's go. Numbers below are partial. Details: `experiments/euroc-2x-results.md` ("Pause snapshot 2026-11-25").
+- **#180, G11 real-time arms (causal SE(3) ATE, `traj.txt`, paced, 2 cores, median of up to 3 runs).** No arm reaches
+  0.5x Basalt on any EuRoC sequence. RT3E is below Basalt on 5 of 11 (MH_01 0.80x, MH_02 0.64x, MH_03 0.92x, MH_05
+  0.57x, V1_02 0.91x); worst MH_04 2.17x, V1_03 2.75x, V2_02 1.88x, V2_03 2.11x. RT3EF (F3 remap) is inside RT3E's band
+  on all 11 and has lower latency, so it is `RTbase`. RT3EIH (no PnpInliers) fixes V1_03 (0.053, equal to Basalt) and
+  V2_02 (0.082) but is not real time (latency p50 3-34 s) and loses the halls. RT3E itself has latency p99 of 1-25 s:
+  part of that is other lanes' load during G11, not yet separated. The SYNC arms (S0PEI, S0PEIH, S0EIH) did not run.
+  No run meets the gate's real-time rule (latency p99 <= 100 ms); the closest is RT3EF on MH_04/MH_05 (p99 0.2-0.9 s).
+  So "faster than Basalt" is not met yet either. The ORB-SLAM3 reference column in the card is below Basalt on all 11 (e.g. MH_04
+  0.045, V2_03 0.027): it is the stronger target on the hard sequences. Interim card: `experiments/euroc-top1-card.md` (09f5043).
+- **#180, 2x-0 floor test.** The ground-truth term is 0.039 on V1_01 and 0.031-0.035 on V2_01 (three-system pairs; zero on
+  V2_02 and MH_02, so the method does not invent a floor). With "floor + 10 %", 0.5x Basalt is out of reach on V1_01 for
+  any system; the V1_01 target becomes about 0.043 and V2_01 about 0.036. Owner to confirm (stop S-A, question 1).
+- **#180, 2x-0 keyframe pieces.** Our keyframe-only 10 s pieces are within 1.3x of Basalt on 10 of 11 (only MH_04 is
+  1.40x): the gap is in the non-keyframe frames and in drift, not in keyframe precision.
+- **`feat/2x-vio`, 2x-4/2x-5 (sliding-window VI odometry, not merged into #180).** Commits 0-11 (to 6c7c18a) build a
+  Basalt-style fixed-lag smoother behind `pipeline.odometry`, default off and bit-identical (identity trio passes).
+  Tests: batch and ledger equivalence to 1e-9, 4-DOF nullspace held over 400 frames, synthetic walk 4.2 mm at 20 s, KLT
+  parity with OpenCV. The window step takes 18-20 ms against the predicted 8 ms; that sample is invalid (1.2 GHz core with
+  a busy sibling), so a rerun is needed. Observe (VIO-only `traj_vio.txt`, SYNC, datasheet IMU noise), 26 of 33 runs:
+  MH_01 0.75x, MH_04 1.08x, MH_05 1.09x Basalt, but MH_02 2.8x, MH_03 2.2x, V1_xx 1.2-1.9x, V2_01/V2_02 1.9-2.0x and V2_03
+  diverged (start 30: 4.0 km ATE). This first cut is worse than the current pipeline on most sequences. The mechanism
+  predictions hold: V1_03 high-frequency error is 0.004 on every start (Basalt 0.004; our pipeline 0.041-0.054), per-frame
+  steps are 1.02-1.34x Basalt, and the MH_04 dark-span vertical step is -0.03 m (pipeline -0.22..-0.29). So the error left
+  is low-frequency drift, not jitter. P3 and P4 fail and kill rule K1 fires. S-C verdict: no-go on Drive. Next: the K1 diff
+  against Basalt on MH_01 (first 400 frames; suspects in order: FEJ form, IMU noise arm, uncalibrated bias start, track
+  counts), then a trace of the V2_03 divergence. Code and the full results: branch `feat/2x-vio` (0273952), not pushed. The noise-arm
+  rule was changed before the runs: post-solve IMU chi2 is biased low by construction (T4b: 0.053 post-solve, 0.100 at
+  marginalization, 0.973 at the true states), so the datasheet arm is primary.
+- **`feat/2x-loop-rt`, lane B (not merged; 65a5157).** G60-b (`loop_closing.graph.accept_capped_solves`, default off)
+  and V-c (`keyframe_observations: PnpInliersClaimed`) are built and tested; identity holds on the G60-b binary. G60-b is
+  half run and byte-identical to its control on MH_04 starts 0/30/60; V-c has no runs. **Finding (Pb0 missed):** S0PEIH
+  on the current `feat/global-pose-graph` tip does not reproduce the `bin-cardh` binary, with an identical header (MH_04
+  start 0: 0.178 to 0.237; start 60: 0.251 to 0.166, its loop failure gone). The identity trio checks S0 only, so it cannot
+  catch this. Every S0PEIH number in the cards is a `bin-cardh` number, not a tip number. The commit that changes it is not
+  found yet: re-baseline S0PEIH on the tip before scoring against those cards, and extend the identity check to knob-on arms.
+
 ### 2026-11-24
 
 - **Round 2 of the #180 integration (`integ/round2`, from `feat/global-pose-graph` 379bd1d; not pushed): the remaining
