@@ -3562,3 +3562,66 @@ Not run: MH_04 start 2, MH_01 0/1/2, V1_02, V2_01 (both arms), MH_05 0/2 control
 - **Verdict:** none yet. Next, when the owner restarts: the MH_05 start 1 knob run (the only live failure), then the
   rest of `E/lane2xb/g60b.txt`. Also re-baseline S0PEIH on the tip before scoring any rung against the card's
   `bin-cardh` S0PEIH numbers. V-c (`E/lane2xb/vc.txt`, `debug_vc.sh`) starts after that.
+
+### Results: G60-b on the #180 tip, and the Pb0 bisect (2026-11-25)
+
+Binaries:
+- `E/bin-2xb-g60` (df1cb30) for the first runs.
+- `E/bin-2xb-cap` (71d5dfa, adds the `pgo_capped` counter, md5 `3fa3d573…`) for the rest. Knob-on runs rerun on it (`E/lane2xb/runs2/`) are `cmp`-identical to the `bin-2xb-g60` runs.
+- `E/bin-fold` (#180 tip 95bc33c, md5 `aefd2aca…`). S0PEIH V1_02 start 0 on it is `cmp`-identical to `bin-2xb-cap` (`traj.txt`, `traj_smoothed.txt`, header).
+
+All runs SYNC, taskset 2-5,8-11, at most 4 `kornia-slam` processes. Table: `E/lane2xb/report.py g60`.
+
+| seq | start | S0PEIH `bin-cardh` | S0PEIH tip (control) | S0PEIHC | knob = control | `[pgo] failed` control / knob | `pgo_capped` |
+|---|---|---|---|---|---|---|---|
+| MH_04 | 0 / 1 | 0.178 | 0.237 | 0.237 | yes | 0 / 0 | 0 |
+| MH_04 | 2 | 0.194 | 0.185 | 0.185 | yes | 0 / 0 | 0 |
+| MH_04 | 30 | 0.173 | 0.171 | 0.171 | yes | 0 / 0 | - |
+| MH_04 | 60 | 0.251 | 0.166 | 0.166 | yes | 0 / 0 | 0 |
+| MH_01 | 0 / 1 / 2 | 0.050 / 0.049 / 0.041 | 0.059 / 0.048 / 0.041 | same | yes (3 of 3) | 0 / 0 | 0 |
+| MH_05 | 0 | - | 0.101 | 0.101 | yes | 0 / 0 | 0 |
+| MH_05 | 1 | - | 0.0774 (smoothed 0.0549) | 0.0773 (0.0550) | no | 1 (kf 2175 ~ 448) / 0 | 1 |
+| MH_05 | 2 | - | 0.1125 (smoothed 0.0998) | 0.0995 (0.0531) | no | 2 (kf 1758 ~ 803, kf 2183 ~ 448) / 0 | 1 |
+| V1_02 | 0 | 0.035 | 0.041 | 0.041 | yes | 0 / 0 | 0 |
+| V2_01 | 0 | 0.046 | 0.053 | 0.053 | yes | 0 / 0 | 0 |
+
+Basalt: MH_04 0.114, MH_01 0.067, MH_05 0.144, V1_02 0.045, V2_01 0.039.
+
+| P/K | measured | verdict |
+|---|---|---|
+| Pb0 | the tip is not `bin-cardh` on S0PEIH: MH_04 start 0 0.178 → 0.237, start 60 0.251 → 0.166, headers identical | missed; explained below (dafaacb) |
+| Pb1 | 0 `[pgo] failed` in 13 knob runs. All 3 tip failures (MH_05 start 1: 2175 ~ 448; start 2: 1758 ~ 803 and 2183 ~ 448) are `applied=true`; `pgo_capped` = 1 on each of the two runs (in start 2 the second pair converged once the first was applied) | as predicted |
+| Pb2 | not testable: the MH_04 start 60 loop no longer fails on the tip (control 0.166). MH_04 median of 5: knob = control = 0.185 | n/a |
+| Pb3 | the 10 runs whose control has no failure are `cmp`-identical to it | as predicted |
+| Pb4 | MH_05 start 1 −0.0001, start 2 −0.013 causal (smoothed −0.047) | as predicted (0.00-0.04) |
+| Kb1 | 10 s pieces after the applied capped loops: start 1, 100-110 s 0.055 → 0.067, last piece 0.029 → 0.010; start 2, 80 s 0.069 → 0.084, 100 s 0.034 → 0.054. Largest rise +0.020 (limit 0.05). No gravity reason | not fired |
+| Kb2 | Pb3 holds | not fired |
+
+**Pb0 bisect.**
+- `git bisect` over 0a72a06..8ba53ba (31 code commits), probe S0PEIH MH_04 start 0, SYNC, `cmp` against `bin-cardh`'s `traj.txt`.
+- The good end is valid: 0a72a06 has the same code tree as `bin-cardh`'s c0342ac, and `bin-cardh` reruns byte-identical today (`E/lane2xb/repro-cardh-MH04s0`).
+- Steps: 20cb9b4 bad, aac6f66 good, 45290b4 good, dec2084 bad, dafaacb bad.
+- First bad: **dafaacb** "fix(tracking): pose-inertial solve refuses a step that moves a row behind the camera" (from #195). Its trajectory equals the tip control. It changes only `tracking/pose_estimation/pose_inertial.rs`:
+  1. An active row behind the camera now makes the cost infinite.
+  2. Rows behind the camera at the start begin as outliers.
+  3. The start and anchor poses go through `rigid()` at entry.
+  4. The Jacobian comes from `kornia_factors::reprojection::residual_and_pose_jacobian` instead of `pose_jacobian_2x6`.
+- Only `pose_inertial: OrbSlam3` arms reach this code, so S0 and the identity trio stay identical.
+- **Mechanism: a rounding-level fork, not a behaviour change.**
+  - The trajectories are identical up to frame 70, the first pose-inertial frame.
+  - At frame 70 they differ by about 1e-8 relative in the quaternion (−0.080288359 against −0.080288356). Position is identical.
+  - The gap grows to about 1e-6 m at frame 80, 1 cm at frame 170, and 2-3 cm through the run (0.90 m at most).
+  - `pose_inertial_solves` is equal (1962), and no solve was refused.
+  - Not verified: which of changes 3 and 4 makes the first difference (two more builds).
+- **It is a fix, not a regression.** It closes a real hole: before it, a step could drop a row's cost by moving the row behind the camera. Its score effect has mixed sign across starts (start 0 +0.059, start 30 −0.002, start 60 −0.085), as chaotic amplification would give.
+- **Consequence for the gate.** S0PEIH on MH_04 moves 0.06-0.09 per start under a 1e-8 perturbation. That is also why G60 behaves like a lottery near the iteration cap. An MH_04 arm difference below that size is noise unless it holds across starts.
+- **Baseline.** The S0PEIH numbers on this card before this section are `bin-cardh` numbers. The tip baseline is the control column above.
+
+**Identity check extended.**
+- `E/integ/ident4.sh` runs the identity trio plus S0PEIH V1_02 start 0 (knob-on), against `E/expect/golden-S0PEIH-V1_02/` (bin-fold, tip 95bc33c). Tokens: `IDENT_S0PEIH_V102_OK`, `HEADER_S0PEIH_OK`.
+- Drift of the dafaacb kind fails its first token: V1_02 S0PEIH moved 0.035 → 0.041 over the same range.
+
+**Verdict.**
+- G60-b does what it was written for: every capped failure on the tip is applied, converged solves are untouched, and no applied capped loop hurt a 10 s piece by more than 0.020 m.
+- The gain is small and on MH_05 only: start 2 causal −0.013 (smoothed −0.047); the median of 3 goes 0.101 → 0.100. MH_04 no longer exercises the knob on the tip.
+- Not promoted. It goes into the next batch gate with the other winners. G60-c (f64 PGO) stays the proper fix for the noise floor.

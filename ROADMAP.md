@@ -60,6 +60,11 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
   start 0: 0.178 to 0.237; start 60: 0.251 to 0.166, its loop failure gone). The identity trio checks S0 only, so it cannot
   catch this. Every S0PEIH number in the cards is a `bin-cardh` number, not a tip number. The commit that changes it is not
   found yet: re-baseline S0PEIH on the tip before scoring against those cards, and extend the identity check to knob-on arms.
+- **Lane B, now folded into #180 (95bc33c).**
+  - G60-b is scored on the tip. Every capped loop failure is applied; there are 3, all on MH_05. `pgo_capped` is visible, converged solves stay byte-identical, and Kb1 did not fire. MH_05 start 2 goes from 0.113 to 0.100 causal. Not promoted: G60-b joins the next batch gate, and G60-c (f64 PGO) stays the proper fix.
+  - The Pb0 bisect finds dafaacb (the pose-inertial behind-camera refusal, from #195). It forks S0PEIH at rounding level, about 1e-8 at frame 70 (G63). It is a fix, not a regression.
+  - S0PEIH re-baselined on the tip: MH_04 median 0.185, MH_01 0.048, MH_05 0.101, V1_02 0.041, V2_01 0.053.
+  - The identity check now covers a knob-on arm (`E/integ/ident4.sh`). Next: V-c.
 
 ### 2026-11-24
 
