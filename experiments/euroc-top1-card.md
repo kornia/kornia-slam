@@ -3376,3 +3376,97 @@ So ORB-SLAM3 has no path where a converged-in-fact solve is dropped.
   | id | kill rule |
   |---|---|
   | Kc1 | any solve over 15 iterations: the floor is not precision alone (look at the conditioning of the 300-node chain) |
+
+### Results: G11 interim, real-time arms RT3E, RT3EF, RT3EIH on all 11 (2026-11-24/25, stopped by the owner before the SYNC arms)
+
+**Status: interim.** The owner stopped all background work on 2026-11-25 at about 04:40. Every lane is SIGSTOPped
+(`E/gate/rt_all.sh` rerun, `rt_all2.sh` rerun chain, the SYNC lanes `E/gate/drive.sh` A-D, `E/gate/resume.sh`).
+No SYNC arm has run, so S0PEI, S0PEIH and S0EIH (V-a P1-P5, K1-K4, P-G4, P-G7) are **not scored**. The real-time
+arms have 96 valid runs: RT3E 32 of 33, RT3EF 32 of 33, RT3EIH 32 of 33. Missing: RT3E V2_03 r3 and RT3EF V2_03 r3
+(set aside as loaded, not yet rerun) and RT3EIH MH_01 r1 (set aside, rerun queued).
+
+Binary `E/bin-integ2/kornia-slam-euroc` (md5 `e97329d4…`, identity above). Every run: `rc=0`, `give_ups=0`, and a
+header `diff`-identical to its golden header. RT3EIH `pose_inertial_solves` > 0 on every run (for example MH_01 3638).
+Driver `E/gate/rt_all.sh` / `rt_all2.sh` → `E/gate/rt_one.sh`, under `rt.lock`, cores 0,1, paced, async, start 0, no
+other `kornia-slam*` process at any 2 s sample (`E/gate/pinwatch.log`; 4 contaminated runs rerun).
+
+**Load deviation, and the fix.** Another session's `cargo` builds started in the middle of runs, after the start gate
+had passed (23:25-01:35). From 23:34 a 10 s load sampler (`E/gate/load.log`) runs, and `E/gate/loaded.py` flags a run
+when, from 60 s after its start, the 1-min load is above 6 or a `cargo`/`rustc` process is seen. Runs before the
+sampler are flagged by `load_end` > 6. Before scoring, 15 flagged runs were moved to `runs/*.loaded.<ts>` (list
+`E/gate/loaded_setaside.log`). From 01:36 `rt_one.sh` applies the same check itself and reruns the run.
+Unexplained: RT3E V1_01 r3 (clean by this rule, load ≤ 5.2) ends 103 s behind the sensor, against 5 and 25 s for
+r1 and r2. Not traced; candidate: other CPU load that the 1-min load average does not show (a `flux-web` process
+ran at 100 % of one core at 02:36).
+
+Tables: `E/gate/report.py` → `E/gate/report_interim.md` (per sequence and per run). SE(3) ATE RMSE, m, body centre.
+Causal = `traj.txt` (the score); smoothed = `traj_smoothed.txt` (non-causal).
+
+| seq | Basalt | ORB-SLAM3 | RT3E causal median [range] (÷ Basalt) | sm | RT3EF causal | sm | RT3EIH causal | sm |
+|---|---|---|---|---|---|---|---|---|
+| MH_01 | 0.067 | 0.046 | **0.054** [0.048-0.055] (0.80) | 0.029 | **0.051** [0.044-0.065] (0.75) | 0.031 | 0.083 [0.075-0.091] (1.24), n=2 | 0.041 |
+| MH_02 | 0.048 | 0.034 | **0.031** [0.029-0.032] (0.64) | 0.017 | **0.033** [0.031-0.033] (0.69) | 0.020 | **0.040** [0.033-0.046] (0.82) | 0.024 |
+| MH_03 | 0.062 | 0.028 | **0.057** [0.054-0.058] (0.92) | 0.037 | **0.055** [0.043-0.057] (0.88) | 0.035 | **0.050** [0.049-0.057] (0.80) | 0.042 |
+| MH_04 | 0.114 | 0.045 | 0.247 [0.243-0.256] (2.17) | 0.173 | 0.227 [0.212-0.231] (1.99) | 0.150 | 0.330 [0.291-0.332] (2.89) | 0.168 |
+| MH_05 | 0.144 | 0.050 | **0.082** [0.079-0.102] (0.57) | 0.056 | **0.085** [0.076-0.103] (0.59) | 0.057 | **0.141** [0.126-0.143] (0.98) | 0.076 |
+| V1_01 | 0.043 | 0.039 | 0.045 [0.044-0.051] (1.05) | 0.044 | 0.047 [0.043-0.050] (1.10) | 0.045 | 0.048 [0.043-0.050] (1.11) | 0.046 |
+| V1_02 | 0.045 | 0.019 | **0.041** [0.036-0.041] (0.91) | 0.033 | **0.044** [0.040-0.045] (0.98) | 0.031 | **0.038** [0.035-0.040] (0.85) | 0.034 |
+| V1_03 | 0.053 | 0.026 | 0.146 [0.085-0.152] (2.75) | 0.105 | 0.097 [0.095-0.140] (1.83) | 0.072 | 0.053 [0.047-0.054] (1.00) | 0.043 |
+| V2_01 | 0.039 | 0.031 | 0.044 [0.044-0.055] (1.14) | 0.042 | 0.051 [0.045-0.051] (1.30) | 0.049 | 0.055 [0.053-0.064] (1.41) | 0.043 |
+| V2_02 | 0.049 | 0.037 | 0.092 [0.090-0.096] (1.88) | 0.088 | 0.104 [0.098-0.106] (2.12) | 0.099 | 0.082 [0.079-0.085] (1.66) | 0.079 |
+| V2_03 | 0.230 | 0.027 | 0.485 [0.483-0.488] (2.11), n=2 | 0.306 | 0.544 [0.508-0.579] (2.36), n=2 | 0.303 | 0.512 [0.495-1.151] (2.23) | 0.436 |
+
+The ORB-SLAM3 column is the README run on 80-96 % of frames. Ours on ORB-SLAM3's span is within ±0.003 of the full
+sequence, except MH_04 (RT3E 0.270, RT3EF 0.248, RT3EIH 0.355); see `report_interim.md`.
+
+**Counts (causal median below Basalt).**
+- RT3E: 5 of 11 (MH_01, MH_02, MH_03, MH_05, V1_02).
+- RT3EF: 5 of 11 (the same five).
+- RT3EIH: 4 of 11 (MH_02, MH_03, MH_05, V1_02).
+- Every run below Basalt: RT3E 5, RT3EF 4 (V1_02 r3 0.045), RT3EIH 4.
+- At or below the owner's 0.5x-Basalt goal: 0 of 11 on every arm. The closest are RT3E MH_05 0.57x and MH_02 0.64x.
+
+**Per run (F1 fields; medians per arm and sequence, full rows in `report_interim.md`).**
+- **Tracking:** 100 % tracked and 0 coasts on all five MH sequences and on V1_01 and V2_02, for RT3E and RT3EF.
+  V1_02 tracks 1686-1688 of 1710 (22 bootstrap skips) with 0-2 coasts, V1_03 has 1-4 coasts, and V2_01 has 2-10.
+- **V2_03:** 99-119 coasts (RT3E), 102-110 (RT3EF) and 136-173 (RT3EIH). Tracked is 1748-1822 of 1921.
+- **Keyframe shifts:** ≤ 8 on every run. RT3EIH has 0-1 on every sequence; V1_03 has 3-7 on RT3E / RT3EF.
+- **`source_ms` p50:** RT3E 16.4-20.5, RT3EF 3.6-5.1, RT3EIH 22.6-27.5.
+- **`frame_ms` p90:** RT3E 52-66, RT3EF 48-67, RT3EIH 57-85.
+- **Latency p99:** RT3E 0.3-31 s on 10 of 11 sequences, and 103 s on V1_01 r3 (above). RT3EF 0.2-17.4 s.
+  RT3EIH 1.0-86.5 s: MH_01 42-48, V2_02 44-74, V1_01 18-87 s.
+- **Real-time pass:** no run meets the gate's latency rule (p99 ≤ 100 ms). The closest is RT3EF on MH_04 / MH_05
+  (p99 0.2-0.9 s, final latency 0.0-0.1 s).
+
+| P/K | prediction | measured | verdict |
+|---|---|---|---|
+| P-G1 | RT3E below Basalt on MH_01 and V1_02 | 0.054 (0.80x), 0.041 (0.91x) | as predicted |
+| P-G2 | RT3E below Basalt on 3-6 of 11; above on MH_04, V1_03, V2_01, V2_02 | 5 of 11; above on those four, plus V1_01 (1.05x) and V2_03 | as predicted |
+| new sequences, RT3E | MH_02 0.030-0.055, MH_03 0.035-0.065, MH_05 0.085-0.160, V1_01 0.035-0.070, V2_03 0.15-0.45 | 0.031, 0.057, 0.082, 0.045, 0.485 | MH_02, MH_03, V1_01 inside; MH_05 0.003 below the band (better); **V2_03 missed** (above) |
+| P-G3 | RT3EF within RT3E's range ± max(0.01, 15 %); `source_ms` p50 3-6 against 13-18; final latency not higher on any sequence | accuracy within on 9 of 11. Outside: V1_03 0.097 against 0.146 (lower) and V2_03 0.544 against 0.485-0.488 (n=2). Source 3.6-5.1 against 16.4-20.5. Final latency higher on V1_02 (up to 17.5 s against 9.2) | accuracy and source as predicted, except V1_03 / V2_03; latency **missed** on V1_02 |
+| P-G5 | `rc=0`, `give_ups=0`, header clean | 96 of 96 | as predicted |
+| P-G6 | RT3EIH below RT3E on V1_03 and V2_02, above on MH_01; below Basalt on 2-5 | V1_03 0.053 against 0.146, V2_02 0.082 against 0.092, MH_01 0.083 against 0.054; 4 of 11 | as predicted |
+| RT3EIH table | V2_02 0.075-0.090, V1_03 0.08-0.13, MH_01 0.055-0.080, MH_04 0.22-0.35, V1_02 0.035-0.050, V2_01 0.045-0.060 | 0.082, 0.053, 0.083, 0.330, 0.038, 0.055 | V1_03 below the band (better); MH_01 0.003 above; the rest inside |
+
+**Diagnosis (owner rule; unverified parts marked).**
+- **G62 (b) holds in real time.** Without PnpInliers (RT3EIH), V1_03 falls 0.146 → 0.053 (Basalt level) and V2_02
+  0.092 → 0.082. The PnpInliers gain on the halls is lost: MH_01 0.054 → 0.083, MH_05 0.082 → 0.141, MH_04 0.247 →
+  0.330. No single real-time arm wins both groups. That argues for V-c (PnpInliers without duplicate seeds), not for
+  choosing one arm or the other.
+- **The two halves of the V1_03 gain are not separated.** RT3EIH adds pose-inertial tracking (G62 a) and drops
+  PnpInliers (G62 b) at the same time. Without the SYNC S0EIH runs, the split between the two is unmeasured.
+- **RT3EIH costs time.** Its `source_ms` p50 is 23-27 ms against 16-20 for RT3E (same rectification), and its lag is
+  11-87 s on 7 of 11 sequences. Two candidate causes: the per-frame pose-inertial solve and the larger map (G62 b:
+  more stereo seeds without the gate). Both are unverified, and no profile was taken.
+- **V2_03 (P-G2 band missed):** 2.1-2.4x Basalt on every arm, with 99-173 coasts per run against S0's 89-94. The
+  smoothed output is 0.30-0.44, so the error is not causal-only. The coasts sit in the fast-motion part (not
+  traced). No rung has targeted V2_03 yet.
+- **F3 (RT3EF):** the source time falls 4x on every sequence, as on the F3 system run. The mean of the final latency
+  falls on 8 of 11 sequences; V1_02 r2/r3 are the exceptions (not traced). Accuracy moves only inside the run spread,
+  except on V1_03 (0.097 against 0.146). V1_03 has 3-7 keyframe shifts on both arms, so this reads as the arm's
+  spread, not as an effect of F3 (unverified).
+
+**Verdict (interim).** Real time on bin-integ2: below Basalt on 5 of 11 (RT3E, RT3EF) and 4 of 11 (RT3EIH). No
+sequence reaches 0.5x Basalt, and no run passes the latency rule. Nothing is promoted. Still to run once the owner
+allows background work: the three set-aside real-time runs, then S0PEI, S0PEIH and S0EIH (99 SYNC runs,
+`E/gate/sync_{A..D}.txt`).
