@@ -326,6 +326,55 @@ fn frame_period_ms(wall: &[FrameWall]) -> f64 {
     nearest_rank(&steps, 50.0)
 }
 
+/// The sliding-window odometry's lines (`odometry: SlidingWindow`).
+pub fn format_vio(c: &kornia_slam::OdometryCounters) -> String {
+    let per_frame =
+        |v: &[f32]| format_percentiles(&v.iter().map(|x| f64::from(*x)).collect::<Vec<_>>());
+    let nullspace = if c.nullspace_yaw_log10_max.is_finite() {
+        c.nullspace_yaw_log10_max
+    } else {
+        0.0
+    };
+    format!(
+        "[summary] vio frames={} poses={} keyframes={} solves={} solve_failures={} resets={} \
+         errors={} iterations_mean={:.3} rejected_steps={} landmarks_mean={:.1} \
+         rows_left_mean={:.1} rows_right_mean={:.1} stereo_links={} fb_rejects={} \
+         row_gate_rejects={} movement_rejects={} landmarks_fixed={} marg_pinv={} \
+         imu_chi2_nav={:.4} imu_chi2_marg={:.4} bias_walk_chi2={:.4} visual_chi2={:.4} nullspace_yaw_log10_max={:.2}\n\
+         [summary] vio_ms {}\n\
+         [summary] vio_flow_ms {}\n\
+         [summary] vio_solve_ms {}\n\
+         [summary] vio_nullspace_ms {}",
+        c.frames,
+        c.poses,
+        c.keyframes,
+        c.solves,
+        c.solve_failures,
+        c.resets,
+        c.errors,
+        c.iterations_mean(),
+        c.rejected_steps,
+        c.landmarks_mean(),
+        c.rows_left_mean(),
+        c.rows_right_mean(),
+        c.stereo_links,
+        c.fb_rejects,
+        c.row_gate_rejects,
+        c.movement_rejects,
+        c.landmarks_fixed,
+        c.marg_pinv,
+        c.imu_chi2_nav(),
+        c.imu_chi2_marg(),
+        c.bias_walk_chi2(),
+        c.visual_chi2(),
+        nullspace,
+        per_frame(&c.total_ms),
+        per_frame(&c.flow_ms),
+        per_frame(&c.solve_ms),
+        per_frame(&c.nullspace_ms),
+    )
+}
+
 fn format_percentiles(values: &[f64]) -> String {
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
@@ -345,6 +394,21 @@ fn nearest_rank(sorted: &[f64], percent: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `E/score.py` reads `(\w+)=(-?[\d.]+)`: every vio field is plain
+    /// fixed-point, and an empty run prints zeros.
+    #[test]
+    fn the_vio_lines_are_fixed_point_fields() {
+        let text = format_vio(&kornia_slam::OdometryCounters::default());
+        assert!(text.starts_with("[summary] vio frames=0 poses=0"), "{text}");
+        assert!(text.contains("imu_chi2_marg=0.0000"), "{text}");
+        assert!(text.contains("nullspace_yaw_log10_max=0.00"), "{text}");
+        assert!(
+            text.contains("[summary] vio_ms p50=0.0 p90=0.0 p99=0.0"),
+            "{text}"
+        );
+        assert!(!text.contains("NaN") && !text.contains("inf"), "{text}");
+    }
 
     #[test]
     fn nearest_rank_percentiles() {

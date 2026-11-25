@@ -76,6 +76,12 @@ struct Args {
     #[argh(option)]
     trajectory_smoothed: Option<String>,
 
+    /// write the sliding-window odometry's pose of every frame it estimated
+    /// to this file, in the --trajectory-out layout (body pose); needs
+    /// `pipeline.odometry: SlidingWindow`
+    #[argh(option)]
+    trajectory_vio: Option<String>,
+
     /// black images from `<start_s>` after the first frame for `<duration_s>`,
     /// given as `<start_s>:<duration_s>`; frames and IMU are still processed
     #[argh(option)]
@@ -296,6 +302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let n_frames_hint = source.n_frames_hint();
     let PipelineDefinition::OrbSlam(orb) = &run.system.pipeline;
+    check_trajectory_vio(&args, orb)?;
     let vocabulary = orb
         .loop_closing
         .vocabulary()
@@ -326,6 +333,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut poses_non_finite: u64 = 0;
     let mut trajectory_coasted = args
         .trajectory_coasted
+        .as_deref()
+        .map(|path| {
+            trajectory::TrajectoryWriter::create(
+                std::path::Path::new(path),
+                system.rig().camera_to_body(),
+            )
+        })
+        .transpose()?;
+    let mut trajectory_vio = args
+        .trajectory_vio
         .as_deref()
         .map(|path| {
             trajectory::TrajectoryWriter::create(
@@ -562,6 +579,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             writer.write(timestamp_sec, &result.pose_world_to_cam)?;
         }
+        if let (Some(writer), Some(vio)) = (trajectory_vio.as_mut(), system.odometry_output())
+            && vio.timestamp_sec == timestamp_sec
+        {
+            writer.write(timestamp_sec, &vio.pose_world_to_cam)?;
+        }
         // Gated as --trajectory-out, so the session dump and offline-ba see
         // the same frames that are scored.
         if let Some(smoothed) = smoothed.as_mut()
@@ -666,6 +688,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(writer) = trajectory_coasted {
         writer.finish()?;
+    }
+    if let Some(writer) = trajectory_vio {
+        writer.finish()?;
+    }
+    if let Some(counters) = system.odometry_counters() {
+        eprintln!("{}", summary::format_vio(counters));
     }
     if let (Some(smoothed), Some(path)) = (smoothed.as_ref(), args.trajectory_smoothed.as_deref()) {
         let writer = trajectory::TrajectoryWriter::create(
@@ -829,6 +857,18 @@ fn writes_scored_pose(
             ))
 }
 
+/// `--trajectory-vio` writes the sliding-window odometry's poses, so it needs
+/// that estimator.
+fn check_trajectory_vio(
+    args: &Args,
+    orb: &kornia_slam::system::OrbSlamPipeline,
+) -> Result<(), String> {
+    if args.trajectory_vio.is_some() && orb.odometry.sliding_window().is_none() {
+        return Err("--trajectory-vio needs pipeline.odometry: SlidingWindow".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod cli_tests {
     use argh::FromArgs;
@@ -922,6 +962,19 @@ mod cli_tests {
         assert_eq!(offline.session, "s.cbor");
         assert_eq!(offline.trajectory_out, "t.txt");
         assert!(offline.report.is_none());
+    }
+
+    #[test]
+    fn the_vio_trajectory_needs_the_sliding_window() {
+        let args = parse(&["--config", "r.ron", "--trajectory-vio", "v.tum"]).unwrap();
+        assert_eq!(args.trajectory_vio.as_deref(), Some("v.tum"));
+        let mut orb = kornia_slam::system::OrbSlamPipeline::default();
+        assert!(check_trajectory_vio(&args, &orb).is_err());
+        orb.odometry = kornia_slam::Odometry::SlidingWindow(Default::default());
+        assert!(check_trajectory_vio(&args, &orb).is_ok());
+        let without = parse(&["--config", "r.ron"]).unwrap();
+        let default = kornia_slam::system::OrbSlamPipeline::default();
+        assert!(check_trajectory_vio(&without, &default).is_ok());
     }
 
     #[test]
