@@ -1,5 +1,6 @@
 //! The estimator's tests (design card section 9).
 
+mod frontend;
 mod linearize;
 mod marginalize;
 mod window;

@@ -4,6 +4,8 @@
 mod config;
 // Test-only until the Observe hook runs the window from the system.
 #[cfg(test)]
+mod frontend;
+#[cfg(test)]
 mod init;
 #[cfg(test)]
 mod keyframes;
@@ -40,6 +42,10 @@ pub(crate) enum OdometryError {
     PriorOutsideWindow,
     #[error("the marginal prior is not finite")]
     Marginalization,
+    #[error(transparent)]
+    Flow(#[from] crate::tracking::flow_pool::FlowPoolError),
+    #[error(transparent)]
+    Tracks(#[from] crate::tracking::optical_flow::TrackSetError),
 }
 
 pub use config::{Odometry, OdometryImuNoise, OdometryMode, OdometryTuning, SlidingWindowConfig};
