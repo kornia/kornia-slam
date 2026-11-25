@@ -209,3 +209,74 @@ IMU and the edge's posterior residual stays far below its noise. The test now as
 posterior statistics are logged with no bound. Consequence for 2x-5 (coordinator decision, recorded in the card):
 the noise-arm rule cannot run on them, the primary arm is `VO-ds`, `VO-bn` is run on the screening five for the
 record. An innovation statistic is a later card.
+
+### Step 12: binary, identity, T9, bench
+
+- Binaries: `bin-2x5-c7` (md5 `08cd9e65b9447f237d67a8640d4a2c0d`, commit 128443a) and `bin-2x5-c11` (md5
+  `22dadcc007288253a29f243920127d10`, commit 6c7c18a), under `.pr180-fix/euroc-top1`.
+- Identity trio, knob off, on `bin-2x5-c7`: `IDENT_V102_OK`, `HEADER_OK`, `IDENT_R01_OK` (md5
+  `d4f77b567b912b5a4caa2af6085a35b1`). The trio on `bin-2x5-c11` and the Observe identity items 2-4 have not run (see
+  below).
+- T9 parity: `frontend_opencv.bin` generated locally with OpenCV 5.0.0 (Python) on the kornia-rs `mh01_frame1/2.png`
+  (752×480, 200 corners, 197 tracked; md5 `823e6de5fad1f51c5569b1cf82507bf2`, not committed). The three ignored
+  parity tests pass (LK within 0.01 px with identical status, goodFeaturesToTrack, cornerSubPix).
+- `bench_odometry_window` (P5 window step, includes the nullspace twin): 18.0 / 19.2 / 20.5 ms against a predicted
+  p50 ≤ 8 ms. **Provisional, not a valid timing sample:** core 8 at 1.2 GHz, its sibling (core 2) busy, load 5.8.
+  To rerun on an idle core pair at load ≤ 3 with governor and frequency read first; if it still misses, profile
+  linearize, Schur, Cholesky, marginalization and the twin, and time the step without the twin.
+- `bench_upstream_lk_window` with `opencv_bench` (OpenVINO 2021.4 OpenCV 4.5.3, core 8 at 2.4 GHz, load 3.8, under
+  `rt.lock`), 48 tracks: our windowed forward solve 141 µs [135, 147], OpenCV prebuilt pyramid 154 µs [144, 163],
+  kornia-rs u8 151 µs. Point estimate below OpenCV, confidence intervals overlapping: the "beats OpenCV" half of T9
+  is marginal on this sample.
+- Identity trio on `bin-2x5-c11`: `IDENT_V102_OK`, `HEADER_OK`, `IDENT_R01_OK` (md5 `d4f77b567b912b5a4caa2af6085a35b1`).
+- Observe identity: S0E V1_02 start 0 knob off (r9) and VO-ds V1_02 start 0 on the same binary: `traj.txt` and
+  `traj_smoothed.txt` `cmp`-identical (also identical to the older binary's S0E r1). `expect/VO-ds.header` is
+  `S0E.header` plus `  odometry: sliding window, Observe, IMU noise Rig`. Determinism (VO-ds V1_02 and MH_04 twice)
+  not run.
+
+## 2x-5: Observe, VO-ds (PARTIAL, PAUSED 2026-11-25 05:03 by the owner)
+
+**Partial and paused.** 26 of the 33 primary runs finished (SYNC, unpaced, 900 s cap, `taskset -c 2-5,8-11`,
+`bin-2x5-c11`); the other 7, the determinism repeats, the `VO-bn` record runs and the pinned P5 timing run did not run.
+No verdict below is final. Scored by `E/twox/vio_score.py`: `B/eval.py --fmt tum --rpe 1,10` on `traj_vio.txt`,
+Basalt cropped to the same stamps (5 ms). SE3 ATE rmse, m.
+
+| seq | start 0: VIO / Basalt = ratio | start 30 | start 60 | resets | landmarks mean | vio_ms p50 / p99 (unpinned) |
+|---|---|---|---|---|---|---|
+| MH_01 | 0.056 / 0.067 = 0.83 | 0.051 = 0.75 | 0.050 = 0.74 | 0 | 84 | 20.3 / 53.0 |
+| MH_02 | 0.145 / 0.048 = 3.01 | not run | 0.122 = 2.53 | 0 | 82 | 19.7 / 49.8 |
+| MH_03 | 0.127 / 0.062 = 2.06 | not run | 0.140 = 2.27 | 0 | 72 | 18.8 / 48.2 |
+| MH_04 | 0.123 / 0.114 = 1.08 | not run | 0.123 = 1.08 | 0 | 58 | 16.1 / 45.9 |
+| MH_05 | 0.152 / 0.144 = 1.05 | not run | 0.163 = 1.13 | 0 | 65 | 16.3 / 45.9 |
+| V1_01 | 0.053 / 0.043 = 1.24 | not run | 0.053 = 1.21 | 0 | 56 | 15.2 / 42.2 |
+| V1_02 | 0.080 / 0.045 = 1.76 | 0.080 = 1.76 | 0.079 = 1.75 | 0 | 39 | 12.6 / 36.1 |
+| V1_03 | 0.101 / 0.053 = 1.89 | 0.102 = 1.91 | 0.101 = 1.89 | 0 | 24 | 10.1 / 32.1 |
+| V2_01 | 0.070 / 0.039 = 1.81 | 0.080 = 2.06 | not run | 0 | 59 | 14.7 / 38.9 |
+| V2_02 | 0.093 / 0.049 = 1.90 | 0.100 = 2.04 | not run | 0 | 43 | 13.0 / 35.5 |
+| V2_03 | 0.921 / 0.230 = 4.01 | **3996.6** (diverged) | not run | 0 | 20 | 8.3 / 25.1 |
+
+Every run: frames = poses (MH_05 start 0: 1 frame without a pose, `errors=1`), `solve_failures=0`, `resets=0`.
+Twin nullspace `nullspace_yaw_log10_max` −13.0 to −12.0 on every run. `imu_chi2_nav` 0.02-0.14, `imu_chi2_marg`
+0.04-0.21 (logged only; biased low, see 2x-4). `vio_flow_ms` p50 11.4 and `vio_solve_ms` p50 7.1 on MH_01 start 0.
+
+| id | prediction | measured (partial) | reading |
+|---|---|---|---|
+| P1 | V1_03 HF ≤ 0.008 every start; step p50 ≤ 1.5x Basalt on MH_01, V1_02, V2_01 | HF 0.004 on starts 0/30/60 (Basalt 0.004); step p50 0.95-0.99 / 1.39-1.46 / 0.87-0.90 mm against Basalt 0.80 / 1.36 / 0.67 (1.19-1.24x, 1.02-1.07x, 1.30-1.34x) | holds |
+| P2 | MH_04 vertical increment over 63.3-66.7 s within ±0.10 m | −0.03 m (start 0), −0.02 m (start 60) | holds |
+| P3 | ratio 0.8-1.3 on ≥ 9 of 11, none above 1.6 | in band on 4 (MH_04, MH_05, V1_01; MH_01 below band at 0.74-0.83, better than Basalt); above 1.6 on 7 (MH_02, MH_03, V1_02, V1_03, V2_01, V2_02, V2_03) | **fails** |
+| P4 | V2_03: 0 frames without a pose; ATE ≤ 0.30 | 0 frames without a pose, 0 resets; ATE 0.92 (start 0), 3997 m (start 30) | **fails** |
+| P5 | flow + solve p50 ≤ 16 ms, p99 ≤ 35 ms on one core | unpinned SYNC runs, load 4-10: p50 8.3-20.3, p99 25-53; the pinned run did not run; bench 19.2 ms invalid (see step 12) | not measured validly |
+
+Kill rules: **K1 fires** (P1 and P2 hold, P3 fails on 7 ≥ 3). Its card action: diff against Basalt on MH_01, first
+400 frames, before anything else; suspects in order: FEJ form for visual rows (open question 1), IMU noise arm, the
+uncalibrated bias start, track counts per frame. K2 does not apply (P3 fails; nullspace and HF pass). K3 is not
+decided (no valid P5 sample). K4 does not fire (HF 0.004).
+
+Observations for the diagnosis, none tested yet:
+- The error is low-frequency, not jitter: V1_03 LF 0.100 against HF 0.004 (Basalt LF 0.053, HF 0.004). The high
+  ratios sit where Basalt itself is best (MH_02, the Vicon rooms).
+- The worst sequences have the fewest landmarks per frame: 20-43 on V1_02, V1_03, V2_02, V2_03 against 72-84 on
+  MH_01-MH_03, with `movement_rejects` 9-14 k per run. MH_02 and MH_03 have many landmarks and still fail, so track
+  count alone does not explain it.
+- V2_03 start 30 diverged to kilometres with `resets=0` and `errors=0`: the reset policy (owner answer 9) catches only
+  non-finite states, so a finite runaway goes undetected. Its cause is not traced.
