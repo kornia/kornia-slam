@@ -70,7 +70,7 @@ pub use loop_closure::{LoopClosingConfig, LoopClosureEvent};
 pub use odometry::bench as odometry_bench;
 pub use odometry::{
     Odometry, OdometryCounters, OdometryImuNoise, OdometryMode, OdometryOutput, OdometryTuning,
-    SlidingWindowConfig,
+    SlidingWindowConfig, VisualJacobians,
 };
 #[cfg(feature = "serde")]
 pub use system::LoadError;

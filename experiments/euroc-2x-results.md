@@ -322,3 +322,15 @@ Against the card's predictions:
   **Open.**
 - **KD1 does not fire** (Pd1 partly shown). Next per the card: A/B 1, `visual_jacobians: Current`, once the fold is
   done; the V1_02 vertical drift and the MH_02 right-row gap are recorded for A/B 4.
+
+### 2x-5 update (2026-11-25 19:10; still partial)
+More runs finished after the resume at 17:01 (`bin-2x5-c11`): 31 of the 33 primary VO-ds runs; MH_02 start 30 and
+V1_01 start 30 hit the 900 s cap at machine load 30-47 and are in a rerun pass (paused again by the owner).
+- Determinism: VO-ds V1_02 and MH_04 start 0, r1 against r2: `traj_vio.txt` `cmp`-identical.
+- VO-ds medians over the starts run (ratio to Basalt cropped to each start's stamps): MH_01 0.75, MH_02 3.01 (2
+  starts), MH_03 2.27, MH_04 1.08, MH_05 1.13, V1_01 1.24 (2 starts), V1_02 1.76, V1_03 1.89, V2_01 1.97, V2_02 1.90,
+  V2_03 4.01 (start 60: 0.321 = 1.39; start 30 diverged). P3 still fails: in band on MH_04, MH_05, V1_01 (MH_01
+  better), above 1.6 on 7.
+- VO-bn (Basalt's noise values; record only, does not decide the arm), start 0: MH_01 0.043 (0.64), MH_04 0.152
+  (1.33), V1_02 0.074 (1.63), V1_03 0.105 (1.96), V2_03 **0.287 (1.25)** against VO-ds 0.921 (4.01). The noise arm
+  moves V2_03 by 3x and the others by up to ±20 %: Pd2 is not refuted for the fast sequence; it goes into K1-c.

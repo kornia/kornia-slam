@@ -30,6 +30,23 @@ impl Odometry {
 pub struct SlidingWindowConfig {
     pub mode: OdometryMode,
     pub imu_noise: OdometryImuNoise,
+    /// Where the visual rows' Jacobians are evaluated (2x-5 K1, A/B 1).
+    pub visual_jacobians: VisualJacobians,
+}
+
+/// The linearization point of the visual rows' Jacobians.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum VisualJacobians {
+    /// Every pose at its first estimate once it is in the prior (design card
+    /// section 3, open question 1).
+    #[default]
+    FirstEstimate,
+    /// Every pose at its current value. A visual row depends only on the
+    /// host-to-target relative pose, so its 6-DOF nullspace holds at any
+    /// point; Basalt evaluates that relative pose at the current state
+    /// (`linearization_abs_qr.cpp:206-221`).
+    Current,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -112,6 +129,8 @@ pub struct OdometryTuning {
     pub klt_iterations: usize,
     /// LK window side, odd: the window the OpenCV fixture validates.
     pub klt_window: usize,
+    /// Set from [`SlidingWindowConfig::visual_jacobians`].
+    pub visual_jacobians: VisualJacobians,
 }
 
 impl Default for OdometryTuning {
@@ -141,6 +160,7 @@ impl Default for OdometryTuning {
             klt_levels: 3,
             klt_iterations: 5,
             klt_window: 11,
+            visual_jacobians: VisualJacobians::FirstEstimate,
         }
     }
 }

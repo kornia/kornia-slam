@@ -9,6 +9,7 @@ use kornia_algebra::{Mat15F64, SMatF64, SVecF64, Vec15F64};
 use kornia_factors::inertial::preintegration::residual_and_jacobians;
 use kornia_factors::reprojection::{anchored_residual, anchored_residual_and_jacobians};
 
+use super::config::VisualJacobians;
 use super::landmarks::{Landmark, LandmarkId};
 use super::marginalize::MissingVariable;
 use super::state::{FrameId, POSE_DOF, STATE_DOF};
@@ -406,7 +407,15 @@ pub(crate) fn landmark_rows(
 ) -> Option<()> {
     let host_offset = order.pose_offset(lm.host)?;
     let host = window.frame_pose(lm.host)?;
-    let host_lin = window.frame_jacobian_pose(lm.host)?;
+    let current = window.tuning.visual_jacobians == VisualJacobians::Current;
+    let jacobian_pose = |id: FrameId| {
+        if current {
+            window.frame_pose(id)
+        } else {
+            window.frame_jacobian_pose(id)
+        }
+    };
+    let host_lin = jacobian_pose(lm.host)?;
     let allowed = |frame: FrameId| match rows {
         Rows::All => true,
         Rows::In(o) => o.find(frame).is_some(),
@@ -425,8 +434,7 @@ pub(crate) fn landmark_rows(
         let Some(view) = window.cameras.get(usize::from(camera)) else {
             continue;
         };
-        let (Some(target), Some(target_lin)) =
-            (window.frame_pose(frame), window.frame_jacobian_pose(frame))
+        let (Some(target), Some(target_lin)) = (window.frame_pose(frame), jacobian_pose(frame))
         else {
             continue;
         };

@@ -10,7 +10,9 @@ use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
 use crate::mapping::map::{StateEnvelope, StateEnvelopeLimits};
 use crate::mapping::marginalization::{BoundaryPrior, FrozenPoseSigma};
 use crate::mapping::visual_information::{FisheyeWeight, VisualInformation};
-use crate::odometry::{Odometry, OdometryImuNoise, OdometryMode, SlidingWindowConfig};
+use crate::odometry::{
+    Odometry, OdometryImuNoise, OdometryMode, SlidingWindowConfig, VisualJacobians,
+};
 use crate::system::ConfigError;
 #[cfg(feature = "serde")]
 use crate::system::LoadError;
@@ -1555,7 +1557,11 @@ fn the_mapping_acceptance_is_named_in_the_header_only_when_set() {
 }
 
 fn sliding_window(mode: OdometryMode, imu_noise: OdometryImuNoise) -> Odometry {
-    Odometry::SlidingWindow(SlidingWindowConfig { mode, imu_noise })
+    Odometry::SlidingWindow(SlidingWindowConfig {
+        mode,
+        imu_noise,
+        ..SlidingWindowConfig::default()
+    })
 }
 
 fn with_odometry(odometry: Odometry, sensors: SensorSelection) -> SystemConfig {
@@ -1647,6 +1653,20 @@ fn the_odometry_knob_is_named_in_the_header_only_when_set() {
         on.replace("  odometry: sliding window, Observe, IMU noise Rig\n", ""),
         off
     );
+    let current = with_odometry(
+        Odometry::SlidingWindow(SlidingWindowConfig {
+            visual_jacobians: VisualJacobians::Current,
+            ..SlidingWindowConfig::default()
+        }),
+        stereo_imu,
+    )
+    .to_string();
+    assert!(
+        current.contains(
+            "  odometry: sliding window, Observe, IMU noise Rig, visual Jacobians Current\n"
+        ),
+        "{current}"
+    );
 }
 
 #[cfg(feature = "serde")]
@@ -1690,6 +1710,15 @@ mod ron_files {
             matches!(window.imu_noise, OdometryImuNoise::Explicit(n) if n.accel_noise == 1.6e-2)
         );
         assert_eq!(ron(&explicit), ron(&parse(&ron(&explicit)).unwrap()));
+        let current = at("SlidingWindow(( mode: Observe, visual_jacobians: Current ))").unwrap();
+        assert_eq!(
+            orb(&current)
+                .odometry
+                .sliding_window()
+                .map(|w| w.visual_jacobians),
+            Some(VisualJacobians::Current)
+        );
+        assert_eq!(ron(&current), ron(&parse(&ron(&current)).unwrap()));
         assert!(matches!(
             at("SlidingWindow(( mode: Drive ))"),
             Err(LoadError::Invalid(ConfigError::OdometryNeeds { .. }))

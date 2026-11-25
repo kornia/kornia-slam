@@ -20,7 +20,7 @@ use crate::mapping::outlier_erase::OutlierErase;
 use crate::mapping::vi_ba_schur::ImuHuber;
 use crate::mapping::visual_information::{FisheyeWeight, VisualInformation};
 use crate::mapping::{GrowthNeighbours, KeyframeGrowth, KeyframeSeed, LocalMappingMode};
-use crate::odometry::{Odometry, OdometryImuNoise, OdometryTuning};
+use crate::odometry::{Odometry, OdometryImuNoise, OdometryTuning, VisualJacobians};
 use crate::tracking::local_map::LocalMapRules;
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::{KeyframeObservations, MapProjectionConfig};
@@ -871,13 +871,17 @@ impl fmt::Display for SystemConfig {
                 window.mode
             )?;
             match window.imu_noise {
-                OdometryImuNoise::Rig => writeln!(f, "Rig")?,
-                OdometryImuNoise::Explicit(n) => writeln!(
+                OdometryImuNoise::Rig => write!(f, "Rig")?,
+                OdometryImuNoise::Explicit(n) => write!(
                     f,
                     "explicit (gyro {}, accel {}, gyro walk {}, accel walk {})",
                     n.gyro_noise, n.accel_noise, n.gyro_bias_noise, n.accel_bias_noise
                 )?,
             }
+            if window.visual_jacobians != VisualJacobians::default() {
+                write!(f, ", visual Jacobians {:?}", window.visual_jacobians)?;
+            }
+            writeln!(f)?;
         }
         if let FanOut::Bounded(bounded) = orb.fan_out {
             writeln!(

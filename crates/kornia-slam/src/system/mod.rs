@@ -23,7 +23,7 @@ pub mod wheel;
 
 pub use crate::odometry::{
     Odometry, OdometryCounters, OdometryImuNoise, OdometryMode, OdometryOutput, OdometryTuning,
-    SlidingWindowConfig,
+    SlidingWindowConfig, VisualJacobians,
 };
 pub use build::BuildError;
 pub use config::{

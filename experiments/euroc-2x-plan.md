@@ -299,6 +299,14 @@ MH_02, V2_01 (the screen), then all 11 when one holds.
 - A/B 1, FEJ form: `odometry: SlidingWindow(( visual_jacobians: Current ))`: visual Jacobians at current poses
   (Basalt's relative-pose value at the current state; visual rows keep their 6-DOF nullspace at any point).
   Prediction if the cause: V1_02 1.76 → ≤ 1.3, MH_02 3.0 → ≤ 1.6; twin yaw log10 stays ≤ −9. If not: within ±5 %.
+  - Written before the A/B runs (2026-11-25 18:55, after K1-a): knob `visual_jacobians: Current` (RON, inside
+    `SlidingWindow`, default `FirstEstimate`). Arm `VO-dsJ` = VO-ds + the knob. Screen V1_02, MH_02, V2_01, start 0.
+    Mechanism counter: MH_02 yaw change from 10 s to 110 s (`growth.py`) +1.5° → ≤ +0.5° if the FEJ form drives the
+    yaw drift. Score: V1_02 1.76 → ≤ 1.3, MH_02 3.01 → ≤ 1.6, V2_01 1.81 → ≤ 1.3 (one run each, deterministic).
+    Guard: `nullspace_yaw_log10_max` ≤ −9 (the twin still holds the 4-DOF nullspace). Kill rules: KJ1, the yaw counter
+    moves to ≤ +0.5° but the ratios stay within ±10 %: yaw is not what costs the score; KJ2, the ratios fall by > 10 %
+    with the yaw counter unchanged (> +1.2°): another cause, not credited to the FEJ form. Knob off: T8 and the
+    identity trio hold; V1_02 knob-off `traj_vio.txt` is `cmp`-identical to `VO-ds_V1_02_medium_s0_r1`.
 - A/B 2, noise arm: VO-bn (no code), as queued.
 - A/B 3, bias start: Basalt's calibrated EuRoC biases as the first state's bias (bench only; the plan's answer 5
   keeps zero biases in the product), to price the start.

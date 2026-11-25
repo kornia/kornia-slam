@@ -9,7 +9,7 @@ use kornia_factors::inertial::preintegration::information;
 use kornia_factors::reprojection::AnchoredLandmark;
 use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 
-use crate::odometry::config::OdometryTuning;
+use crate::odometry::config::{OdometryTuning, VisualJacobians};
 use crate::odometry::landmarks::{Landmark, LandmarkStore, triangulate_from_host};
 use crate::odometry::linearize::{
     Cost, LandmarkBlock, Linearization, Order, Rows, VarKind, cost, huber, landmark_rows, linearize,
@@ -316,4 +316,47 @@ fn rows_outside_the_order_are_left_out() {
     window.order(&mut full);
     landmark_rows(&window, lm, &full, Rows::All, &mut all, &mut c).unwrap();
     assert_eq!(all.rows(), 4);
+}
+
+/// A/B 1 (2x-5 K1): under `VisualJacobians::Current` a pose in the prior with
+/// a delta gives the visual rows of the same pose linearized afresh at its
+/// value; under `FirstEstimate` it does not.
+#[test]
+fn current_visual_jacobians_read_the_current_pose() {
+    let blocks = |window: &Window| {
+        let mut order = Order::default();
+        window.order(&mut order);
+        let lm = window.landmarks.get(3).unwrap();
+        let (mut block, mut c) = (LandmarkBlock::default(), Cost::default());
+        landmark_rows(window, lm, &order, Rows::All, &mut block, &mut c).unwrap();
+        block.recorded.clone()
+    };
+    let step = SVecF64::<STATE_DOF>::from_fn(|r, _| if r < 6 { 2e-2 } else { 0.0 });
+    for (jacobians, same) in [
+        (VisualJacobians::Current, true),
+        (VisualJacobians::FirstEstimate, false),
+    ] {
+        // The host state 0 is in the prior: moved, it keeps its first estimate.
+        let mut moved = two_state_window();
+        moved.tuning.visual_jacobians = jacobians;
+        moved.states.get_mut(&0).unwrap().apply_increment(&step);
+        // The same value linearized afresh.
+        let mut fresh = two_state_window();
+        fresh.tuning.visual_jacobians = jacobians;
+        let value = moved.states[&0].value();
+        fresh.states.insert(0, StateWithLin::new(value));
+        fresh.states.get_mut(&0).unwrap().set_linearized();
+        let (a, b) = (blocks(&moved), blocks(&fresh));
+        assert_eq!(a.len(), b.len());
+        let max = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x.2 - y.2).abs().max().max((x.3 - y.3).abs().max()))
+            .fold(0.0, f64::max);
+        if same {
+            assert!(max < 1e-9, "{jacobians:?}: {max}");
+        } else {
+            assert!(max > 1e-3, "{jacobians:?}: {max}");
+        }
+    }
 }

@@ -31,7 +31,9 @@ use kornia_sensors::imu::{
     ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu, SampleInterpolation,
 };
 
-pub use config::{Odometry, OdometryImuNoise, OdometryMode, OdometryTuning, SlidingWindowConfig};
+pub use config::{
+    Odometry, OdometryImuNoise, OdometryMode, OdometryTuning, SlidingWindowConfig, VisualJacobians,
+};
 
 use crate::tracking::flow_pool::FlowPoolError;
 use crate::tracking::optical_flow::TrackSetError;
@@ -216,6 +218,10 @@ impl SlidingWindowOdometry {
         let noise = match config.imu_noise {
             OdometryImuNoise::Rig => rig.imu_noise(),
             OdometryImuNoise::Explicit(noise) => noise,
+        };
+        let tuning = &OdometryTuning {
+            visual_jacobians: config.visual_jacobians,
+            ..*tuning
         };
         Ok(Some(Self {
             noise,
