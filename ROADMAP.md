@@ -46,6 +46,10 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
   at V1_03 frame 390 (NH1): not promoted until prepare and apply are split. Faster than Basalt on 1 of 4 (MH_03, p50 27
   vs 41 ms, p99 158 vs 348 ms, CPU 47.9 vs 69.0 ms). Elsewhere, p50 is equal or below, but the p99 tail (keyframe-dense
   bursts) and Vicon-room CPU still lose. Next: G57-a on all 11 (NH3) for promotion, D5b, then the G57-b-2 and G57-c cards.
+- **#180, G57-a NH3 on the other 7 sequences (1 rep each).** ATE is inside or below the RT3EF band on all 11. V1_02 is
+  0.036 (0.80x) and V2_03 0.499. Loops are 26 against 29 (MH_05 and V1_02 lose one or two, with no ATE cost). Promotion
+  of `execution: Asynchronous` waits for D5b (running: SYNC, Synchronous / Deferred(1) / Asynchronous on MH_01, V1_02,
+  V1_03). The G57-b-2 card (prepare/apply split of growth) is with the planner.
 - **Next.** Lane A: A/B 1 screen, K1-c (V2_03), K1-d (MH_03), rerun pass. Lane B: V-c2 (theory first). G57 needs a card
   of its own before "faster than Basalt" can pass. Open owner questions: floor-adjusted targets (S-A), where to write
   the Staer split.

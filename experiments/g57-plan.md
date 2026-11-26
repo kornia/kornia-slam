@@ -279,3 +279,26 @@ In each window, keyframes are 26-35 % of frames and cost 82-161 ms. The mean fra
 2. D5b (SYNC): explain the background path's lost loops.
 3. G57-b-2 card (planner): prepare/apply split of the growth, with the frame-390 coast trace.
 4. G57-c card: loop recognition off the tracking thread (12-17 ms p50, 40 ms p90 per keyframe), aimed at the keyframe-burst tail.
+
+## Results: NH3 on the other 7 sequences (2026-11-26 10:45-11:00, `bin-fold`, RT4EF, 1 paced rep each, alone)
+
+Band: the RT3EF final-bench 3-rep range (`euroc-why-not-basalt.md`, final table), widened by max(0.01 m, 15 %). Loops and p99 for RT3EF come from the same final-bench runs (lower clock; p99 from reps 2-3).
+
+| seq | RT4EF ATE | RT3EF band | ratio to Basalt | NH3 | p50 / p99 ms | RT3EF p99 | loops RT4EF (RT3EF reps) | frames ≥ 300 ms | coasts (RT3EF reps) |
+|---|---|---|---|---|---|---|---|---|---|
+| MH_01 | 0.048 | 0.042-0.058 | 0.72 | inside | 24 / 175 | 2633-2674 | 4 (5, 6, 5) | 1 (325 ms, keyframe 3049, not a loop frame) | 0 (0, 0, 0) |
+| MH_02 | 0.035 | 0.033-0.040 | 0.73 | inside | 32 / 238 | 1221-1355 | 3 (4, 3, 3) | 0 | 0 (0, 0, 0) |
+| MH_04 | 0.212 | 0.210-0.356 | 1.86 | inside | 28 / 157 | 392-535 | 4 (4, 3, 2) | 0 | 0 (0, 0, 0) |
+| MH_05 | 0.095 | 0.089-0.103 | 0.66 | inside | 23 / 156 | 506-567 | 3 (4, 4, 3) | 0 | 0 (0, 0, 0) |
+| V1_02 | 0.036 | 0.043-0.057 | 0.80 | below the band (better) by 0.007 | 53 / 685 | 1912-3894 | 5 (8, 7, 5) | 0 | 0 (2, 1, 2) |
+| V2_01 | 0.051 | 0.049-0.111 | 1.31 | inside | 38 / 270 | 706-753 | 2 (2, 3, 2) | 0 | 5 (2, 2, 9) |
+| V2_03 | 0.499 | 0.521-0.577 | 2.17 | below the band (better) by 0.022 | 47 / 385 | 765-1450 | 5 (3, 4, 4) | 0 | 121 (99, 96, 115) |
+
+Every run: 0 give-ups, 0 dropped. V1_02's 22 untracked frames are bootstrap skips, the same as the RT3EF reps.
+
+**Reading.**
+- **NH3 holds on all 11 sequences** (4 from the full check, 7 here). Two are below the band, which is better.
+- **Loops:** 26 against 29 for the RT3EF medians (−10 %). On a single rep, MH_05 (3 against 4) and V1_02 (5 against 7) fall more than 20 %, the same signature as V1_03, with no ATE cost on either. D5b runs V1_02 and decides it.
+- **Latency:** p99 falls on every sequence, to 156-685 ms against 392-3894 ms. These are not same-clock pairs, so they are no speed claim.
+
+**Verdict.** On ATE, G57-a passes its promotion bar on all 11. It is held for D5b, since K2 (lost loops) is not yet explained. If D5b shows the loss is late application with no lost information, promote `execution: Asynchronous` into the single EuRoC config.
