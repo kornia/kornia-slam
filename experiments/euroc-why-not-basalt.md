@@ -10,6 +10,26 @@ Score: causal real-time SE(3) ATE (`traj.txt`, paced, asynchronous, `taskset -c 
 - **G57, oversubscription.** The real-time arms are behind the sensor even unthrottled: G11 RT3E has latency p99 of 1-25 s, and no run met p99 ≤ 100 ms. A pose computed late has drifted further.
 - **G63, numeric sensitivity.** MH_04 moves 0.06-0.09 m per start from a 1e-8 rounding change. A difference smaller than that is noise unless it holds across starts.
 
+## Final tip bench (95bc33c, RT3EF, real time, 3 reps, 2026-11-25/26)
+
+Binary `bin-fold` (95bc33c; a4a2f4b only adds an off-by-default knob). Rep 1 ran at 0.8-1.2 GHz (lag 47-207 s at the end of the run). Reps 2 and 3 ran at the normal clock (lag 0-16 s, except V2_02 at 9-10 s on every rep). The median is over the 3 reps.
+
+| seq | Basalt | 0.5x target | reps | median | ratio | smoothed | status |
+|---|---|---|---|---|---|---|---|
+| MH_01 | 0.067 | 0.034 | 0.043, 0.058, 0.042 | 0.043 | 0.64 | 0.028 | below Basalt |
+| MH_02 | 0.048 | 0.024 | 0.033 (r1 missing from the report) | 0.033 | 0.68 | 0.019 | below Basalt |
+| MH_03 | 0.062 | 0.031 | 0.050, 0.044, 0.054 | 0.050 | 0.81 | 0.033 | below Basalt |
+| MH_04 | 0.114 | 0.057 | 0.210, 0.228, 0.356 | 0.228 | 2.00 | 0.137 | G58 (row below); r3 0.356 is the G63 fork |
+| MH_05 | 0.144 | 0.072 | 0.103, 0.089, 0.094 | 0.094 | 0.65 | 0.054 | below Basalt |
+| V1_01 | 0.043 | 0.022 | 0.047, 0.049, 0.043 | 0.047 | 1.09 | 0.043 | GT floor (row below) |
+| V1_02 | 0.045 | 0.023 | 0.043, 0.057, 0.043 | 0.043 | 0.95 | 0.032 | below Basalt |
+| V1_03 | 0.053 | 0.027 | 0.145, 0.123, 0.127 | 0.127 | 2.38 | 0.101 | G62 + jitter (row below) |
+| V2_01 | 0.039 | 0.020 | 0.051, 0.111, 0.049 | 0.051 | 1.31 | 0.047 | G59 + floor; r2 0.111 is an outlier, cause not yet traced |
+| V2_02 | 0.049 | 0.025 | 0.094, 0.108, 0.106 | 0.106 | 2.15 | 0.101 | G62 + early under-scale; also 9-10 s lag on every rep (G57) |
+| V2_03 | 0.230 | 0.115 | 0.521, 0.577, 0.568 | 0.568 | 2.47 | 0.295 | unknown, 99-117 coasts per run; K1-c |
+
+Result: 6 of 11 are below Basalt (MH_01, MH_02, MH_03, MH_05, V1_02, and V1_01 within 0.004). None is at 0.5x. The best ratio is 0.64x on MH_01. The `bin-integ2` medians (G11, all at the normal clock) agree within 0.01 on every sequence, except V1_03 (0.097 there).
+
 ## Pipeline, real time (G11, RT3E / RT3EF, `bin-integ2`, median of 3)
 
 | seq | Basalt | ours (best RT arm) | ratio | why not below Basalt | evidence | status |
@@ -40,8 +60,14 @@ The predicted mechanisms hold: V1_03 high-frequency error is 0.004 (equal to Bas
 
 ## Speed against Basalt
 
-Not measured. The 2x-1 runs on the tip started at 800 MHz. The one invalid sample (MH_01 at 800 MHz) gives 109 ms of CPU per frame for ours, against 183-199 ms for Basalt. Neither kept up with real time. No verdict until the clock is normal.
+`twox/speed_all.sh` on 95bc33c, 3 paced reps per sequence, 2 cores (`taskset -c 0,1`). Rep 1 was throttled for both systems, so the medians use mostly reps 2-3.
+
+- **CPU per frame:** ours 48-57 ms on MH against Basalt's 74-80 ms (0.65-0.72x). On the Vicon rooms we are equal or slower: 62-71 ms against 58-74 ms.
+- **Latency:** we are faster only on MH_02 (p50 44 vs 49 ms, p99 1355 vs 1719 ms). On every other sequence our p99 is higher, at 535 ms to 11 s against Basalt's 105-1270 ms. V2_02 p50 is 1.1 s, a growing backlog.
+- **Verdict:** not faster than Basalt (1 of 11). The cause is G57. The per-frame mean cost is lower on MH, but mapping and loop work arrive in bursts. Tracking queues behind them on 2 cores, and the backlog never drains on the Vicon rooms. Fix path: bound the mapping work per keyframe, or move it off the tracking core; the estimator in Drive mode would also remove the PnP-on-map frames.
 
 ## Log
 
 - 2026-11-25: file created from the G11 interim results, the 2x-5 partial results, K1-a, V-c and the floor test. Tip (95bc33c) RT3EF at 800 MHz, first runs: MH_01 0.0435 (0.65x), MH_02 0.0404 (0.84x); both below Basalt, with 82-99 s of lag at the end of the run.
+- 2026-11-25: tip RT3EF rep 1 at 0.8-1.2 GHz, 8 of 11: MH_03 0.0500 (0.81x), MH_04 0.2101 (1.84x, G58 as logged), MH_05 0.1035 (0.72x), V1_01 0.0466 (1.08x, GT floor), V1_02 0.0432 (0.96x), V1_03 0.1449 (2.73x, G62 + jitter as logged). 0 give-ups; 2 coasts per Vicon-room run; 47-207 s of lag at the end of the run.
+- 2026-11-26: final tip bench done (3 reps RT3EF plus speed pairs). 6 of 11 below Basalt, none at 0.5x; speed is not faster (1 of 11, G57). Tables above.
