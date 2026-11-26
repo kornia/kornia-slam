@@ -334,3 +334,7 @@ V1_01 start 30 hit the 900 s cap at machine load 30-47 and are in a rerun pass (
 - VO-bn (Basalt's noise values; record only, does not decide the arm), start 0: MH_01 0.043 (0.64), MH_04 0.152
   (1.33), V1_02 0.074 (1.63), V1_03 0.105 (1.96), V2_03 **0.287 (1.25)** against VO-ds 0.921 (4.01). The noise arm
   moves V2_03 by 3x and the others by up to ±20 %: Pd2 is not refuted for the fast sequence; it goes into K1-c.
+
+## Pipeline reference, final tip bench (2026-11-26)
+
+The estimator results above compare against this pipeline baseline: `bin-fold` RT3EF, real time, median of 3 reps. 6 of 11 are below Basalt (best MH_01 0.64x); worst V2_03 2.47x, V1_03 2.38x, V2_02 2.15x, MH_04 2.00x. Speed is not faster than Basalt (G57). Full table: `experiments/euroc-why-not-basalt.md`.

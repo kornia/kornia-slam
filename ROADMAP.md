@@ -21,6 +21,27 @@ Newest first, one entry per working day. "main" means a merged PR; "#180" means 
 `feat/global-pose-graph` branch (PR #180), which is not merged. Unless marked validated, branch work
 sits behind config knobs that default to the old behaviour, and nothing in it has been benchmarked yet.
 
+### 2026-11-26
+
+- **#180, final EuRoC bench on the tip (95bc33c `bin-fold`, single variation RT3EF, causal SE(3) ATE on `traj.txt`,
+  paced, 2 cores, median of 3 reps).** 6 of 11 are below Basalt; none is at 0.5x. MH_01 0.043 (0.64x), MH_02 0.036
+  (0.75x), MH_03 0.050 (0.81x), MH_04 0.228 (2.00x), MH_05 0.094 (0.65x), V1_01 0.047 (1.09x, within 0.004 of Basalt,
+  GT floor), V1_02 0.043 (0.95x), V1_03 0.127 (2.38x), V2_01 0.051 (1.31x), V2_02 0.106 (2.15x), V2_03 0.568 (2.47x).
+  Rep 1 ran with the CPU throttled to 0.8-1.2 GHz; reps 2-3 at the normal clock agree with it, and the G11 `bin-integ2`
+  medians agree within 0.01 except V1_03 (0.097). 0 give-ups on every run. Cause per miss:
+  `experiments/euroc-why-not-basalt.md` (MH_04 G58 plus the G63 fork, r3 0.356; V1_03 and V2_02 G62 plus jitter or
+  under-scale; V2_01 G59 plus floor, r2 outlier 0.111 not yet traced; V2_03 unknown, K1-c).
+- **#180, speed against Basalt (`twox/speed_all.sh`, 3 paced reps, 2 cores).** Not faster: 1 of 11 (MH_02). CPU per
+  frame is lower on the halls (48-57 ms against 74-80 ms) and equal or higher in the Vicon rooms (62-71 against 58-74).
+  Latency p99 is 0.5-11 s against Basalt's 0.1-1.3 s, and V2_02 p50 is 1.1 s. Cause G57: mapping and loop work arrive
+  in bursts and tracking queues behind them on 2 cores. Fix path: bound the mapping work per keyframe or take it off the
+  tracking core; the estimator in Drive would remove the PnP-on-map frames.
+- **#180, A/B 1 pushed (a4a2f4b).** Knob `visual_jacobians: FirstEstimate | Current` for the estimator (default
+  unchanged); full gate green. Its screen runs are next in lane A. Full-pass review requested from Christie and Dmytro.
+- **Next.** Lane A: A/B 1 screen, K1-c (V2_03), K1-d (MH_03), rerun pass. Lane B: V-c2 (theory first). G57 needs a card
+  of its own before "faster than Basalt" can pass. Open owner questions: floor-adjusted targets (S-A), where to write
+  the Staer split.
+
 ### 2026-11-25
 
 - **Paused by the owner at 05:03.** Every lane was SIGSTOPped (G11 benchmark, 2x lanes A/B/C); nothing resumes without

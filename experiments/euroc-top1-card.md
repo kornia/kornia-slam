@@ -3678,3 +3678,7 @@ V1_03's per-start spread is wide (S0PE 0.085-0.166), so its start-2 rise is with
 **Next (theory first, no code yet).**
 1. V-c2: seed flow tracks from the claimed features too. Test whether `flow_unavailable` falls back to the S0PE level, and whether V1_03 follows.
 2. Only then the observation-density question: link the dropped match after the VI-BA erase, instead of dropping it at tracking.
+
+### Final tip bench (2026-11-26)
+
+`bin-fold` (95bc33c), RT3EF, real time, 3 reps (rep 1 throttled to 0.8-1.2 GHz). Median causal ATE (ratio to Basalt): MH_01 0.043 (0.64), MH_02 0.036 (0.75), MH_03 0.050 (0.81), MH_04 0.228 (2.00), MH_05 0.094 (0.65), V1_01 0.047 (1.09), V1_02 0.043 (0.95), V1_03 0.127 (2.38), V2_01 0.051 (1.31), V2_02 0.106 (2.15), V2_03 0.568 (2.47). 6 of 11 below Basalt, none at 0.5x. Speed: not faster (1 of 11; G57). Causes per sequence: `experiments/euroc-why-not-basalt.md`.
