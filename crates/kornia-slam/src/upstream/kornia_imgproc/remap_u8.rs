@@ -152,14 +152,6 @@ impl RemapTable {
         }
         Ok(table)
     }
-
-    pub fn src_size(&self) -> ImageSize {
-        self.src_size
-    }
-
-    pub fn dst_size(&self) -> ImageSize {
-        self.dst_size
-    }
 }
 
 /// Reinterprets each i32 lane `lo | hi << 16` as the i16 pair `[lo, hi]`.
