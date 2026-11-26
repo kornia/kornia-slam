@@ -18,7 +18,7 @@ use crate::loop_closure::{
     OdometryRandomWalk,
 };
 use crate::mapping::GrowthNeighbours;
-use crate::mapping::bundle_adjustment::{LargeWindow, LostKeyframes};
+use crate::mapping::bundle_adjustment::LargeWindow;
 use crate::mapping::global_vi_ba::OfflineBaConfig;
 use crate::mapping::marginalization::BoundaryPrior;
 use crate::mapping::outlier_erase::OutlierErase;
@@ -27,7 +27,7 @@ use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
 use crate::tracking::pose_gate::PoseGate;
 use crate::tracking::relocalization::RelocalizationSolver;
-use crate::tracking::{KeyframePolicy, KeyframeRules, KeyframesWhileLost};
+use crate::tracking::{KeyframePolicy, KeyframeRules};
 
 /// A system configuration that cannot be built or does not fit its source.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -67,12 +67,6 @@ pub enum ConfigError {
     FisheyeStereo,
     #[error("raw fisheye rig cameras need the `Rig` camera selection")]
     RawFisheyeOutsideRig,
-    #[error(
-        "mapping.local_ba.lost_keyframes FixedInertial has no effect with \
-         tracking_loss.keyframes_while_lost {0:?}: it acts only on lost keyframes inserted as \
-         full states (Enabled)"
-    )]
-    LostKeyframesWithoutEffect(KeyframesWhileLost),
     #[error(
         "mapping.local_ba.large_window active_keyframes ({large}) is below \
          mapping.local_ba.active_keyframes ({active})"
@@ -197,11 +191,6 @@ impl OrbSlamPipeline {
             )?;
         }
         validate_odometry(&self.odometry, sensors)?;
-        validate_lost_keyframes(
-            self.mapping.local_ba.lost_keyframes,
-            self.tracking_loss.keyframes_while_lost,
-            sensors.imu,
-        )?;
         validate_tuning(&self.tuning, self.loop_closing.is_enabled())
     }
 }
@@ -343,30 +332,6 @@ fn validate_lock_free_flow(
         return Err(ConfigError::PoseInertialWithLockFreeFlow);
     }
     Ok(())
-}
-
-/// `FixedInertial` acts only on keyframes inserted as full states while lost: anchors are
-/// already held fixed, `Disabled` inserts none, and without the IMU no lost keyframe
-/// is inserted at all (G12).
-fn validate_lost_keyframes(
-    lost_keyframes: LostKeyframes,
-    keyframes_while_lost: KeyframesWhileLost,
-    imu: bool,
-) -> Result<(), ConfigError> {
-    if lost_keyframes == LostKeyframes::FixedInertial && !imu {
-        return Err(ConfigError::InertialKnobWithoutImu(
-            "mapping.local_ba.lost_keyframes",
-        ));
-    }
-    match (lost_keyframes, keyframes_while_lost) {
-        (
-            LostKeyframes::FixedInertial,
-            KeyframesWhileLost::Anchor | KeyframesWhileLost::Disabled,
-        ) => Err(ConfigError::LostKeyframesWithoutEffect(
-            keyframes_while_lost,
-        )),
-        _ => Ok(()),
-    }
 }
 
 /// The gate checks against an inertial prediction (G12); the innovation

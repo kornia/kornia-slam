@@ -9,7 +9,7 @@ use crate::inertial::still::RUN_CHUNK_SEC;
 use crate::inertial::trust::ImuTrustMode;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{LoopClosingConfig, LoopGraphInformation, LoopGraphSettings};
-use crate::mapping::bundle_adjustment::{LargeWindow, LostKeyframes};
+use crate::mapping::bundle_adjustment::LargeWindow;
 use crate::mapping::dense_llt::DenseParallelism;
 use crate::mapping::global_vi_ba::{
     ClockOffsetPrior, FocalSlicePrior, GyroIntrinsicsPrior, RotationSlicePrior,
@@ -592,7 +592,6 @@ pub struct LocalBaConfig {
     pub visual_information: VisualInformation,
     /// Whether a merge also corrects the keyframes inserted during the solve.
     pub merge: LocalBaMerge,
-    pub lost_keyframes: LostKeyframes,
     pub large_window: LargeWindow,
     /// Calibration states VI-BA estimates online; needs the IMU.
     pub online_calibration: OnlineCalibrationConfig,
@@ -638,7 +637,6 @@ impl Default for LocalBaConfig {
             stereo_depth_sigma: StereoDepthSigma::default(),
             visual_information: VisualInformation::default(),
             merge: LocalBaMerge::SnapshotOnly,
-            lost_keyframes: LostKeyframes::Free,
             large_window: LargeWindow::Off,
             online_calibration: OnlineCalibrationConfig::default(),
             dense_parallelism: DenseParallelism::Global,
@@ -908,7 +906,7 @@ impl fmt::Display for SystemConfig {
                 "  local BA: {} active keyframes, {} iterations from lambda {}, \
                  boundary IMU scale {} (bias rows {}), \
                  boundary {:?}, IMU Huber AllEdges, depth sigma {:?}, visual information {:?}, \
-                 state envelope Off, lost keyframes {:?}, visual kernel L2",
+                 state envelope Off, lost keyframes Free, visual kernel L2",
                 ba.active_keyframes,
                 ba.max_iterations,
                 ba.initial_lambda,
@@ -921,7 +919,6 @@ impl fmt::Display for SystemConfig {
                 ba.boundary,
                 ba.stereo_depth_sigma,
                 ba.visual_information,
-                ba.lost_keyframes,
             )?;
         }
         if ba.merge != LocalBaMerge::default() {

@@ -62,7 +62,6 @@ pub struct LocalBaParams {
     /// Pixel-sigma scaling of raw fisheye views, VI-BA only as above.
     pub fisheye_weight: FisheyeWeight,
     pub merge: LocalBaMerge,
-    pub lost_keyframes: LostKeyframes,
     pub large_window: LargeWindow,
     /// Calibration states a VI-BA solve estimates; all off by default.
     pub online_calibration: OnlineCalibrationConfig,
@@ -98,18 +97,6 @@ pub enum LargeWindow {
     },
 }
 
-/// How VI-BA treats keyframes inserted while tracking was lost.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum LostKeyframes {
-    /// Full 15-DOF state, like any other keyframe.
-    #[default]
-    Free,
-    /// Velocity and bias held at the propagated values: with no match to the
-    /// map nothing observes them, and the solve would write back noise.
-    FixedInertial,
-}
-
 impl Default for LocalBaParams {
     fn default() -> Self {
         Self {
@@ -123,7 +110,6 @@ impl Default for LocalBaParams {
             visual_information: VisualInformation::Unit,
             fisheye_weight: FisheyeWeight::Uniform,
             merge: LocalBaMerge::SnapshotOnly,
-            lost_keyframes: LostKeyframes::Free,
             large_window: LargeWindow::Off,
             online_calibration: OnlineCalibrationConfig::default(),
             initial_lambda: 1.0,
@@ -669,8 +655,7 @@ fn run_local_inertial_ba_inner(
             velocity: kf.velocity_world,
             bias: kf.imu_bias,
             fixed: kf_idx < active_start || kf.anchor,
-            inertial_fixed: params.lost_keyframes == LostKeyframes::FixedInertial
-                && kf.inserted_while_lost,
+            inertial_fixed: false,
         })
         .collect();
 

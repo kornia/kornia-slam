@@ -344,38 +344,6 @@ fn pose_gate_limits_must_be_positive_and_finite() {
 }
 
 #[test]
-fn fixed_inertial_lost_keyframes_need_keyframes_inserted_as_full_states() {
-    use crate::mapping::bundle_adjustment::LostKeyframes;
-    use crate::tracking::KeyframesWhileLost;
-    let with = |lost_keyframes, keyframes_while_lost| {
-        let mut config = SystemConfig {
-            sensors: sensors(CameraSelection::Stereo, true),
-            ..SystemConfig::default()
-        };
-        orb_mut(&mut config).mapping.local_ba.lost_keyframes = lost_keyframes;
-        orb_mut(&mut config).tracking_loss.keyframes_while_lost = keyframes_while_lost;
-        config.validate()
-    };
-    for keyframes_while_lost in [
-        KeyframesWhileLost::Enabled,
-        KeyframesWhileLost::Anchor,
-        KeyframesWhileLost::Disabled,
-    ] {
-        assert_eq!(with(LostKeyframes::Free, keyframes_while_lost), Ok(()));
-    }
-    assert_eq!(
-        with(LostKeyframes::FixedInertial, KeyframesWhileLost::Enabled),
-        Ok(())
-    );
-    for inert in [KeyframesWhileLost::Anchor, KeyframesWhileLost::Disabled] {
-        assert_eq!(
-            with(LostKeyframes::FixedInertial, inert),
-            Err(ConfigError::LostKeyframesWithoutEffect(inert))
-        );
-    }
-}
-
-#[test]
 fn the_reseed_tilt_limit_must_be_positive() {
     let mut config = SystemConfig::default();
     orb_mut(&mut config).tracking_loss.reseed.max_tilt_deg = 0.0;
@@ -1968,22 +1936,6 @@ mod ron_files {
             parse_error("(version: 1, pipeline: OrbSlam((mapping: (local_ba: (boundary: Bogus)))))"),
             ron::Error::NoSuchEnumVariant { found, .. } if found == "Bogus"
         ));
-
-        let config = parse(
-            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((mapping: (local_ba: (lost_keyframes: FixedInertial)))))",
-        )
-        .unwrap();
-        assert_eq!(
-            orb(&config).mapping.local_ba.lost_keyframes,
-            LostKeyframes::FixedInertial
-        );
-        assert_eq!(
-            orb(&parse("(version: 1)").unwrap())
-                .mapping
-                .local_ba
-                .lost_keyframes,
-            LostKeyframes::Free
-        );
     }
 
     /// Tuning is not part of the file format, so a file cannot set it.
@@ -2476,11 +2428,10 @@ mod ron_files {
     }
 }
 
-/// G12: lost keyframes need a confident IMU, the pose gate an inertial
-/// prediction, and a kept inertial state an IMU; each is inert without one.
+/// G12: the pose gate needs an inertial prediction and a kept inertial state
+/// an IMU; each is inert without one.
 #[test]
 fn knobs_that_read_the_imu_are_refused_without_it() {
-    use crate::mapping::bundle_adjustment::LostKeyframes;
     use crate::tracking::pose_gate::{PoseGate, PoseGateLimits};
     let with = |imu: bool, set: &dyn Fn(&mut OrbSlamPipeline)| {
         let mut config = SystemConfig {
@@ -2491,10 +2442,7 @@ fn knobs_that_read_the_imu_are_refused_without_it() {
         config.validate()
     };
     type SetKnob<'a> = &'a dyn Fn(&mut OrbSlamPipeline);
-    let knobs: [(&str, SetKnob); 5] = [
-        ("mapping.local_ba.lost_keyframes", &|orb| {
-            orb.mapping.local_ba.lost_keyframes = LostKeyframes::FixedInertial
-        }),
+    let knobs: [(&str, SetKnob); 4] = [
         ("tracking_loss.pose_gate", &|orb| {
             orb.tracking_loss.pose_gate = PoseGate::Enabled(PoseGateLimits::default())
         }),

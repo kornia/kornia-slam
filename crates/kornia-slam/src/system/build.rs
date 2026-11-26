@@ -172,7 +172,6 @@ impl LocalBaConfig {
             // Resolved against the rig in `SystemConfig::settings`.
             fisheye_weight: FisheyeWeight::Uniform,
             merge: self.merge,
-            lost_keyframes: self.lost_keyframes,
             large_window: self.large_window,
             online_calibration: self.online_calibration,
             initial_lambda: self.initial_lambda,
