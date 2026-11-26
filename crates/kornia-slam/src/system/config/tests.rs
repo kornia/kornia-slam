@@ -2646,25 +2646,6 @@ fn the_frame_velocity_needs_the_imu_and_no_pose_inertial_solve() {
     }
 }
 
-/// R-C8: the IMU-propagated keyframe seed reads the IMU.
-#[test]
-fn the_imu_propagated_keyframe_seed_needs_the_imu() {
-    use crate::mapping::KeyframeSeed;
-    let with = |imu: bool| {
-        let mut config = SystemConfig {
-            sensors: sensors(CameraSelection::Stereo, imu),
-            ..SystemConfig::default()
-        };
-        orb_mut(&mut config).mapping.keyframe_seed = KeyframeSeed::ImuPropagated;
-        config.validate()
-    };
-    assert_eq!(with(true), Ok(()));
-    assert_eq!(
-        with(false),
-        Err(ConfigError::InertialKnobWithoutImu("mapping.keyframe_seed"))
-    );
-}
-
 /// R-C8: a bridge edge longer than the IMU buffer would be integrated from
 /// a truncated buffer.
 #[test]

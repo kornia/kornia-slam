@@ -93,13 +93,11 @@ use crate::mapping::keyframe_mapping::{
 };
 use crate::mapping::local_mapping::GrowthJob;
 use crate::mapping::map::{
-    ImuFactor, InertialAlignmentError, Keyframe, Map, MapInsertion, MapMutationError, MapPoint,
+    InertialAlignmentError, Keyframe, Map, MapInsertion, MapMutationError, MapPoint,
     StateEnvelopeLimits,
 };
 use crate::mapping::session::{SessionKeyframe, SessionLandmark, snapshot_map};
-use crate::mapping::{
-    GrowthNeighbours, KeyframeGrowth, KeyframeJob, KeyframeSeed, LocalMapping, SegmentId,
-};
+use crate::mapping::{GrowthNeighbours, KeyframeGrowth, KeyframeJob, LocalMapping, SegmentId};
 use crate::pose_conversion::{RIGID_TOLERANCE, angle_deg, apply_reference_pose_correction};
 use build::SystemSettings;
 use kornia_3d::pose::Pose3d;
@@ -225,7 +223,6 @@ pub struct SlamSystem {
     tracking_config: TrackingConfig,
     growth_neighbours: GrowthNeighbours,
     growth_min_baseline_ratio: f64,
-    keyframe_seed: KeyframeSeed,
     keyframe_growth: KeyframeGrowth,
     // The newest keyframe whose queued growth has come back (`KeyframeGrowth::Mapping`).
     growth_done_through: Option<usize>,
@@ -395,7 +392,6 @@ impl SlamSystem {
             tracking_config: settings.tracking,
             growth_neighbours: settings.growth_neighbours,
             growth_min_baseline_ratio: settings.growth_min_baseline_ratio,
-            keyframe_seed: settings.keyframe_seed,
             keyframe_growth: settings.keyframe_growth,
             growth_done_through: None,
             map_wait: Cell::new(Duration::ZERO),
@@ -2031,38 +2027,6 @@ impl SlamSystem {
         ));
     }
 
-    /// Under [`KeyframeSeed::ImuPropagated`], a tracked keyframe's velocity: the
-    /// last keyframe's propagated over the new keyframe's `edge`. `None` keeps
-    /// the tracker's velocity: no edge, or an anchor or lost keyframe at
-    /// either end.
-    fn propagated_keyframe_velocity(
-        &self,
-        edge: Option<&ImuFactor>,
-        role: KeyframeRole,
-    ) -> Option<Vec3F64> {
-        if self.keyframe_seed != KeyframeSeed::ImuPropagated
-            || role != KeyframeRole::Tracked
-            || !self.state.imu_initialized
-        {
-            return None;
-        }
-        let edge = edge?;
-        let map = self
-            .map
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let last = map
-            .get_keyframe(edge.prev_kf_idx)
-            .filter(|kf| !kf.anchor && !kf.inserted_while_lost)?;
-        Some(propagate_keyframe_velocity(
-            last.frame.pose_world_to_cam,
-            last.velocity_world,
-            self.inertial.gravity_world,
-            &edge.preintegrated,
-            self.rig.camera_to_body(),
-        ))
-    }
-
     /// Whether a knob lets the tracking reference differ from the last
     /// keyframe: A8's most-voted reference, or a relocalization while lost or
     /// after a give-up. The frame's velocity and bias then come from the last
@@ -3383,9 +3347,6 @@ impl SlamSystem {
         };
         if let Some(edge) = &imu_edge {
             self.note_tail_hold(&edge.raw_samples, timestamp_sec);
-        }
-        if let Some(velocity) = self.propagated_keyframe_velocity(imu_edge.as_ref(), role) {
-            curr_kf.velocity_world = velocity;
         }
         let KeyframeInsertion {
             insertion,

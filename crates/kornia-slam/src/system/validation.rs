@@ -17,12 +17,12 @@ use crate::loop_closure::{
     LoopClosingConfig, LoopGraphInformation, LoopOdometryGate, LoopTemporalConsistency,
     OdometryRandomWalk,
 };
+use crate::mapping::GrowthNeighbours;
 use crate::mapping::bundle_adjustment::{LargeWindow, LostKeyframes};
 use crate::mapping::global_vi_ba::OfflineBaConfig;
 use crate::mapping::map::StateEnvelope;
 use crate::mapping::marginalization::BoundaryPrior;
 use crate::mapping::outlier_erase::OutlierErase;
-use crate::mapping::{GrowthNeighbours, KeyframeSeed};
 use crate::odometry::{Odometry, OdometryImuNoise, OdometryMode};
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
@@ -172,9 +172,6 @@ impl OrbSlamPipeline {
         validate_estimator(&self.tracking, sensors.imu)?;
         match &self.frontend {
             FrontendConfig::Orb(orb) => validate_lock_free_flow(orb, &self.tracking)?,
-        }
-        if self.mapping.keyframe_seed != KeyframeSeed::default() && !sensors.imu {
-            return Err(ConfigError::InertialKnobWithoutImu("mapping.keyframe_seed"));
         }
         check(
             "inertial.viba_velocity_gate",
