@@ -151,3 +151,44 @@ Kill rules:
 2. Basalt paced drops 1-131 frames per run. Does "0 dropped" bind only us, and is Basalt's latency with drops still the bar?
 3. The full check is about 27 min of serial paced runs plus controls. Does it count as a batch gate, or must it fit the 5-minute rule (screen only)?
 4. May G57-b stack in this card after the screen, or does it need its own card after the verdict?
+
+## Results: screen (2026-11-26 08:35-08:47, `bin-fold`, paced, `taskset -c 0,1`, one run per arm, alone on the machine)
+
+**Clock.** The CPU now runs at about 3.6 GHz; the final bench's reps 2-3 ran lower. The RT3EF control at the same clock already reads V2_02 p50 351 ms and end lag 76 ms, against 1100 ms and 10 s in the baseline reps. So the predictions, which were written against the baseline reps, mix the fix with the clock. The clean comparison is against the control. Basalt must also be re-measured at this clock before any "faster than Basalt" claim (the full check does this).
+
+| run | ATE | p50 / p90 / p99 ms | end lag ms | loops accepted | frames ≥ 300 ms (sum) | keyframe tot p50 | keyframe_insert p50 | map_wait p90 | growth lag max | keyframes / tracked / coasts | CPU ms/frame |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| V2_02 RT3EF control r4 | 0.115 | 351 / 1526 / 1986 | 76 | 5 | 6 (7.0 s) | 87.3 | 46.1 | 0.0 | 0 | 657 / 2347 / 1 | 65.0 |
+| V2_02 RT4EF (G57-a) | 0.102 | 43 / 114 / 244 | 99 | 6 | 0 | 78.8 | 39.4 | 0.0 | 0 | 646 / 2348 / 0 | 58.4 |
+| V2_02 RT4EBF (G57-a+b) | 0.103 | 37 / 97 / 251 | 6 | 5 | 0 | 54.2 | 13.1 | 19.1 | 5 | 643 / 2347 / 1 | 58.1 |
+| V1_03 RT3EF control r4 | 0.129 | 38 / 129 / 2362 | 537 | 3 | 2 (3.3 s) | 67.6 | 26.4 | 0.0 | 0 | 572 / 2145 / 4 | 56.0 |
+| V1_03 RT4EF (G57-a) | 0.096 | 34 / 87 / 161 | 69 | 2 | 0 | 68.0 | 27.8 | 0.0 | 0 | 574 / 2147 / 2 | 55.3 |
+| V1_03 RT4EBF (G57-a+b) | 0.104 | 30 / 76 / 142 | 19 | 2 | 0 | 51.4 | 9.1 | 8.9 | 2 | 568 / 2146 / 3 | 55.5 |
+
+Basalt paced (final bench, measured at a lower clock): V2_02 p50 41.6, p99 132.9 ms, 63.5 ms/frame; V1_03 39.6, 113.7, 58.5.
+
+| P/K | prediction | baseline | measured | verdict |
+|---|---|---|---|---|
+| G57-a mechanism: frames ≥ 300 ms | ≤ 1 and ≤ 0.5 s; no loop frame > 250 ms | 6-7 / 10.3-10.5 s; 3 / 5.3-7.9 s | 0 and 0 (control 6 and 2) | as predicted |
+| G57-a P1 V2_02 p50 / p99 / end lag | 150-550 ms / 1.3-3.5 s / 0.1-2.3 s | 1100-1296 / 11.1-12.0 s / 10-11 s | 43 / 0.24 s / 0.099 s | better than the range (the clock adds to it) |
+| G57-a P1 V2_02 ATE | inside 0.093-0.108 | | 0.102 | as predicted |
+| G57-a P4 V1_03 p50 / p99 / end lag | 57-70 / 0.3-1.0 s / ≤ 0.1 s | 106-638 / 3.9-5.4 s / 1.7-4.2 s | 34 / 0.16 s / 0.069 s | better than the range (the clock adds to it) |
+| G57-a P4 V1_03 ATE | inside 0.101-0.165 | | 0.096 | below the band (better) |
+| G57-a P5 CPU per frame within ±3 ms of the control | | 65.0 / 56.0 | 58.4 / 55.3 | missed on V2_02 (−6.6 ms, lower) |
+| G57-a K2: loops accepted fall > 20 % | | V1_03 control 3 | 2 | fired on its wording (3 → 2, small count). V2_02 went 5 → 6. Decided on the full check's 3 reps |
+| G57-b P1 keyframe tot p50 | 55-75 ms | 78.8 / 68.0 (RT4EF) | 54.2 / 51.4 | as predicted (at the low edge) |
+| G57-b mechanism: keyframe_insert p50 falls 15-30 ms | | 39.4 / 27.8 | 13.1 / 9.1 (−26 / −19) | as predicted |
+| G57-b P3 p50 / end lag | V2_02 45-150 / ≤ 0.5 s; V1_03 45-65 / ≤ 0.1 s | | 37 / 0.006 s; 30 / 0.019 s | as predicted or better |
+| G57-b P4 map_wait p90 ≤ 5 ms; growth lag ≤ 3 | | 0.0 | 19.1 and 8.9 ms; 5 and 2 | **KB3 fired** (lock convoy); growth lag missed on V2_02 |
+| NH1 tracked −3, keyframes +10 %, coasts | no extra coast | 0 / 2 coasts (RT4EF) | tracked −1 / −1, keyframes −0.5 / −1 %, coasts 1 / 3 | fired on its wording (+1 coast each). The control had 1 / 4; decided on 3 reps |
+| NH2 BA solves per keyframe ≥ RT4EF | | 1.005 / 1.003 | 1.003 / 1.002 | inside noise (−0.002) |
+| NH3 ATE in band | | | 0.103 / 0.104 | holds |
+
+**Reading.**
+- **G57-a works as theorised.** The loop stalls disappear and the queue drains. ATE is equal or better.
+- **G57-b moves 19-26 ms per keyframe off the tracking thread**, as predicted. It brings p50 below Basalt's on both sequences. But tracking now waits up to 19 ms (p90) on the map lock: the lock convoy F5a's K1 foresaw.
+- **Both** are at or below Basalt's p50 and CPU per frame on these two sequences. They are not below Basalt's p99 (142-251 ms against 114-133). Basalt has not yet been re-measured at this clock.
+
+**Next.**
+1. Full check: 3 reps × {V2_02, V1_01, MH_03, V1_03} × {RT3EF control, RT4EF, RT4EBF}, plus Basalt paced at the same clock. This decides K2, NH1 and NH2 on 3 samples.
+2. G57-b before promotion: split prepare from apply (F5a K1), to remove the map_wait p90.
