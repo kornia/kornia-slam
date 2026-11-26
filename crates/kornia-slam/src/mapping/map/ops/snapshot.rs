@@ -3,7 +3,7 @@
 //! Capture has no window or solver policy: mapping chooses a [`BaWindow`], the
 //! map copies exactly those entities, and correction applies the numeric result.
 
-use super::correction::{LocalBaMerge, StateEnvelope};
+use super::correction::LocalBaMerge;
 use crate::mapping::map::{ImuFactor, Keyframe, Map, MapPoint};
 use crate::mapping::marginalization::MarginalPrior;
 use crate::mapping::online_calibration::OnlineCalibrationState;
@@ -62,8 +62,6 @@ pub struct BaUpdate {
     /// The boundary prior for the next window; stored only if this update
     /// is applied.
     pub(crate) next_prior: Option<MarginalPrior>,
-    /// Checked by [`Map::apply_ba_update`] before any write.
-    pub(crate) state_envelope: StateEnvelope,
     /// Whether [`Map::apply_ba_update`] carries the result to keyframes
     /// inserted after the snapshot.
     pub(crate) merge: LocalBaMerge,
@@ -211,7 +209,6 @@ impl BaSnapshot {
             snapshot: self,
             solve_stats: None,
             next_prior: None,
-            state_envelope: StateEnvelope::Off,
             merge: LocalBaMerge::SnapshotOnly,
             merge_inertial: None,
             outcome: BaOutcome::default(),

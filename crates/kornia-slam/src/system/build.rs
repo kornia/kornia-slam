@@ -13,8 +13,8 @@ use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabulary};
 use crate::loop_closure::{LoopCloser, LoopClosingConfig, LoopSolver};
 use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
-use crate::mapping::visual_information::FisheyeWeight;
 use crate::mapping::vi_ba_schur::ImuHuber;
+use crate::mapping::visual_information::FisheyeWeight;
 use crate::mapping::{GrowthNeighbours, KeyframeGrowth, LocalMappingMode};
 use crate::tracking::flow_pool::FlowPoolError;
 use crate::tracking::optical_flow::LkKernel;
@@ -171,7 +171,6 @@ impl LocalBaConfig {
             visual_information: self.visual_information,
             // Resolved against the rig in `SystemConfig::settings`.
             fisheye_weight: FisheyeWeight::Uniform,
-            state_envelope: self.state_envelope,
             merge: self.merge,
             lost_keyframes: self.lost_keyframes,
             visual_kernel: self.visual_kernel,

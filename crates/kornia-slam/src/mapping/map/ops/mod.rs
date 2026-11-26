@@ -10,7 +10,7 @@ mod snapshot;
 pub use correction::{
     BaUpdateError, GraphCorrectionResult, InertialAlignment, InertialAlignmentError,
     KeyframeBaCorrection, KeyframePoseChange, KeyframeVelocity, LocalBaMerge, LocalBaMergeResult,
-    PoseGraphCorrectionError, PoseGraphCorrectionResult, StateEnvelope, StateEnvelopeLimits,
+    PoseGraphCorrectionError, PoseGraphCorrectionResult, StateEnvelopeLimits,
 };
 pub use mutation::{
     InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError,

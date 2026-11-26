@@ -7,7 +7,7 @@ use crate::mapping::dense_llt::DenseParallelism;
 use crate::mapping::map::ObservationKey;
 use crate::mapping::map::{
     BaSnapshot, BaSolve, BaUpdate, BaUpdateError, BaWindow, ImuFactor as MapImuFactor, Keyframe,
-    LocalBaMerge, LocalBaStats, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR, StateEnvelope,
+    LocalBaMerge, LocalBaStats, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR,
 };
 use crate::mapping::marginalization::{
     BoundaryPrior, FrozenPoseSigma, MarginalPrior, marginalize_frozen,
@@ -61,8 +61,6 @@ pub struct LocalBaParams {
     pub visual_information: VisualInformation,
     /// Pixel-sigma scaling of raw fisheye views, VI-BA only as above.
     pub fisheye_weight: FisheyeWeight,
-    /// Bounds a VI-BA result must stay inside to be written back.
-    pub state_envelope: StateEnvelope,
     pub merge: LocalBaMerge,
     pub lost_keyframes: LostKeyframes,
     pub visual_kernel: VisualKernel,
@@ -137,7 +135,6 @@ impl Default for LocalBaParams {
             depth_sigma: DepthSigma::Relative(STEREO_DEPTH_REL_SIGMA),
             visual_information: VisualInformation::Unit,
             fisheye_weight: FisheyeWeight::Uniform,
-            state_envelope: StateEnvelope::Off,
             merge: LocalBaMerge::SnapshotOnly,
             lost_keyframes: LostKeyframes::Free,
             visual_kernel: VisualKernel::L2,
@@ -662,7 +659,6 @@ fn run_local_inertial_ba_inner(
     calibration: Option<(&OnlineCalibrationState, &OnlineCalibrationConfig)>,
 ) -> BaUpdate {
     let mut update = snapshot.into_update();
-    update.state_envelope = params.state_envelope;
     update.merge = params.merge;
     update.merge_inertial = Some((gravity_world, imu_t_bc));
     let snapshot = &update.snapshot;

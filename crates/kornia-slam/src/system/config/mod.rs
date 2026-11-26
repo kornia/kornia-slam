@@ -14,7 +14,7 @@ use crate::mapping::dense_llt::DenseParallelism;
 use crate::mapping::global_vi_ba::{
     ClockOffsetPrior, FocalSlicePrior, GyroIntrinsicsPrior, RotationSlicePrior,
 };
-use crate::mapping::map::{LocalBaMerge, StateEnvelope};
+use crate::mapping::map::LocalBaMerge;
 use crate::mapping::marginalization::BoundaryPrior;
 use crate::mapping::outlier_erase::OutlierErase;
 use crate::mapping::visual_information::{FisheyeWeight, VisualInformation};
@@ -590,8 +590,6 @@ pub struct LocalBaConfig {
     /// Reprojection weight by keypoint octave, in VI-BA and in the tracking
     /// PnP gates; with `Disparity` it also scales the stereo depth sigma.
     pub visual_information: VisualInformation,
-    /// Refuse a VI-BA result whose velocity or bias leaves these bounds.
-    pub state_envelope: StateEnvelope,
     /// Whether a merge also corrects the keyframes inserted during the solve.
     pub merge: LocalBaMerge,
     pub lost_keyframes: LostKeyframes,
@@ -641,7 +639,6 @@ impl Default for LocalBaConfig {
             boundary: BoundaryPrior::ScaledEdge,
             stereo_depth_sigma: StereoDepthSigma::default(),
             visual_information: VisualInformation::default(),
-            state_envelope: StateEnvelope::Off,
             merge: LocalBaMerge::SnapshotOnly,
             lost_keyframes: LostKeyframes::Free,
             visual_kernel: VisualKernel::L2,
@@ -914,7 +911,7 @@ impl fmt::Display for SystemConfig {
                 "  local BA: {} active keyframes, {} iterations from lambda {}, \
                  boundary IMU scale {} (bias rows {}), \
                  boundary {:?}, IMU Huber AllEdges, depth sigma {:?}, visual information {:?}, \
-                 state envelope {:?}, lost keyframes {:?}, visual kernel {:?}",
+                 state envelope Off, lost keyframes {:?}, visual kernel {:?}",
                 ba.active_keyframes,
                 ba.max_iterations,
                 ba.initial_lambda,
@@ -927,7 +924,6 @@ impl fmt::Display for SystemConfig {
                 ba.boundary,
                 ba.stereo_depth_sigma,
                 ba.visual_information,
-                ba.state_envelope,
                 ba.lost_keyframes,
                 ba.visual_kernel,
             )?;

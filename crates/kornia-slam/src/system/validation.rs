@@ -20,7 +20,6 @@ use crate::loop_closure::{
 use crate::mapping::GrowthNeighbours;
 use crate::mapping::bundle_adjustment::{LargeWindow, LostKeyframes};
 use crate::mapping::global_vi_ba::OfflineBaConfig;
-use crate::mapping::map::StateEnvelope;
 use crate::mapping::marginalization::BoundaryPrior;
 use crate::mapping::outlier_erase::OutlierErase;
 use crate::odometry::{Odometry, OdometryImuNoise, OdometryMode};
@@ -688,11 +687,6 @@ fn validate_local_ba(config: &LocalBaConfig) -> Result<(), ConfigError> {
             AT_LEAST_ONE,
         )?;
         check(at("large_window.initial_lambda"), initial_lambda, POSITIVE)?;
-    }
-    if let StateEnvelope::On(limits) = config.state_envelope {
-        check(at("state_envelope"), limits.max_speed_mps, POSITIVE)?;
-        check(at("state_envelope"), limits.max_accel_bias, POSITIVE)?;
-        check(at("state_envelope"), limits.max_gyro_bias, POSITIVE)?;
     }
     match config.stereo_depth_sigma {
         StereoDepthSigma::RelativeDepth(value) | StereoDepthSigma::Disparity { px: value } => {
