@@ -3,10 +3,7 @@
 //! measure the keyframe policy can key off.
 
 pub mod local_map;
-// Skeleton for the 1 ms frontend: lane T fills and calls these.
-#[allow(dead_code)]
 pub(crate) mod flow_pool;
-#[allow(dead_code)]
 pub(crate) mod flow_tracker;
 pub(crate) mod motion;
 pub mod optical_flow;

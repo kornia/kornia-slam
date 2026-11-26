@@ -73,7 +73,6 @@ pub(crate) struct SystemSettings {
 
 /// The 1 ms frontend knobs the tracking path reads.
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)] // skeleton: lane T reads the rest
 pub(crate) struct FlowSettings {
     pub threads: usize,
     pub rig: KltRig,

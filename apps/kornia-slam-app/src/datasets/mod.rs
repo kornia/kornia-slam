@@ -1,5 +1,4 @@
 pub mod euroc;
-#[allow(dead_code)]
 pub mod hilti;
 pub mod lamaria;
 pub mod stereo_calib;

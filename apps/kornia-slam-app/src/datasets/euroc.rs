@@ -27,7 +27,6 @@ pub enum DatasetError {
 #[derive(Debug, Clone)]
 pub struct DatasetSample {
     /// Timestamp in seconds.
-    #[allow(dead_code)]
     pub timestamp_sec: f64,
     /// Path to the image file.
     pub image_path: PathBuf,
@@ -37,7 +36,6 @@ pub struct DatasetSample {
 #[derive(Debug, Clone)]
 pub struct ImuSample {
     /// Timestamp in seconds.
-    #[allow(dead_code)]
     pub timestamp_sec: f64,
     /// Angular velocity in body frame (rad/s).
     pub gyro: [f64; 3],
@@ -49,16 +47,12 @@ pub struct ImuSample {
 #[derive(Debug, Clone, Copy)]
 pub struct GroundTruthPose {
     /// Timestamp in seconds.
-    #[allow(dead_code)]
     pub timestamp_sec: f64,
     /// Position x (meters).
-    #[allow(dead_code)]
     pub tx: f64,
     /// Position y (meters).
-    #[allow(dead_code)]
     pub ty: f64,
     /// Position z (meters).
-    #[allow(dead_code)]
     pub tz: f64,
 }
 
@@ -333,7 +327,6 @@ pub struct EurocDataset {
     /// Right-camera (`cam1`) calibration; `None` if the dataset is monocular.
     pub right_calibration: Option<EurocCameraCalibration>,
     /// Ground-truth poses (empty if GT file not present).
-    #[allow(dead_code)]
     pub ground_truth: Vec<GroundTruthPose>,
     /// IMU samples
     pub imu_samples: Vec<ImuSample>,
@@ -417,7 +410,6 @@ impl EurocDataset {
     }
 
     /// Returns parsed ground-truth poses (possibly empty).
-    #[allow(dead_code)]
     pub fn ground_truth(&self) -> &[GroundTruthPose] {
         &self.ground_truth
     }
