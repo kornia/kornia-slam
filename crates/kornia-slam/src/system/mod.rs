@@ -515,6 +515,7 @@ impl<D: Descriptor> SlamSystem<D> {
             .bootstrap_frame
             .take()
             .expect("an accepted bootstrap consumes the reference it matched against");
+        self.state.map_anchor_pose = Some(prev_bootstrap_frame.pose_world_to_cam);
 
         self.dbg(format!(
             "[bootstrap] frame={} accept: model={} triangulated={} inliers={}",
@@ -543,6 +544,7 @@ impl<D: Descriptor> SlamSystem<D> {
             self.dbg(format!(
                 "[bootstrap] frame={curr_idx} publication rejected: {error}"
             ));
+            self.restore_map_anchor();
             self.state.reset();
             return self.frame_result(TrackingStatus::Skipped);
         }
@@ -556,6 +558,7 @@ impl<D: Descriptor> SlamSystem<D> {
                 health.valid_in_both, health.median_depth_older_kf, MIN_VALID_POINTS,
             ));
             self.map.lock().unwrap().clear_active();
+            self.restore_map_anchor();
             self.state.reset();
             return self.frame_result(TrackingStatus::Skipped);
         }
@@ -632,6 +635,16 @@ impl<D: Descriptor> SlamSystem<D> {
     /// Leaves bootstrap with `kf_idx` as the reference keyframe. Inertial
     /// initialization follows when the camera-to-body extrinsic is known, since
     /// it relates IMU deltas to camera poses; otherwise tracking is visual-only.
+    /// Returns the pose to where an abandoned, never-established monocular
+    /// map was bootstrapped from: a map lost within frames of its bootstrap
+    /// is usually a bad pair, and handing its drift to the next bootstrap
+    /// compounds it (35 degrees over three such maps at the start of V1_02).
+    fn restore_map_anchor(&mut self) {
+        if let Some(anchor) = self.state.map_anchor_pose.take() {
+            self.state.pose_world_to_cam = anchor;
+        }
+    }
+
     fn finish_bootstrap(&mut self, kf_idx: usize, timestamp_sec: f64) {
         self.state.current_keyframe_idx = Some(kf_idx);
         self.state.last_keyframe_idx = Some(kf_idx);
@@ -966,6 +979,9 @@ impl<D: Descriptor> SlamSystem<D> {
                     frame.idx, recently_lost_for, map_established,
                 ));
                 self.tracker.reset_tracks();
+                if !map_established {
+                    self.restore_map_anchor();
+                }
                 self.state.reset();
                 return self.bootstrap_step(frame, timestamp_sec);
             }

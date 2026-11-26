@@ -404,6 +404,74 @@ fn precomputed_mono(path: &std::path::Path) -> SystemConfig {
     config
 }
 
+/// Noise-free CLIDD observations of a random non-planar scene, one frame at
+/// `stamp(i)` per camera centre (world-to-camera translation is `-centre`).
+fn scene_features(centres: &[Vec3F64]) -> Vec<feature_file_tests::StoredFrame> {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut uniform = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let cam = camera();
+    let project = |p: Vec3F64| [cam.fx * p.x / p.z + cam.cx, cam.fy * p.y / p.z + cam.cy];
+    let inside = |[u, v]: [f64; 2]| (5.0..371.0).contains(&u) && (5.0..235.0).contains(&v);
+    let mut points = Vec::new();
+    while points.len() < 300 {
+        let z = 4.0 + 4.0 * uniform();
+        let p = Vec3F64::new((uniform() - 0.5) * 0.7 * z, (uniform() - 0.5) * 0.45 * z, z);
+        if centres.iter().all(|&c| inside(project(p - c))) {
+            let mut d = [0.0f32; CLIDD_DIM];
+            d.iter_mut().for_each(|x| *x = uniform() as f32 - 0.5);
+            let norm = d.iter().map(|x| x * x).sum::<f32>().sqrt();
+            d.iter_mut().for_each(|x| *x /= norm);
+            points.push((p, Clidd(d)));
+        }
+    }
+    centres
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let keypoints = points
+                .iter()
+                .map(|&(p, _)| project(p - c).map(|x| x as f32))
+                .collect();
+            (
+                i as i64 * 50_000_000,
+                keypoints,
+                points.iter().map(|&(_, d)| d).collect(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_map_lost_before_it_is_established_hands_back_its_anchor_pose() {
+    let moved = Vec3F64::new(0.4, 0.0, 0.0);
+    let mut frames = scene_features(&[Vec3F64::ZERO, moved, moved]);
+    // Antipodal descriptors: the third frame matches nothing in the map.
+    for d in &mut frames[2].2 {
+        d.0.iter_mut().for_each(|x| *x = -*x);
+    }
+    let file = feature_file_tests::write(
+        "anchor",
+        &feature_file_tests::encode(CLIDD_DIM as u32, &frames),
+    );
+    let mut system =
+        SlamSystem::build_precomputed(precomputed_mono(&file.0), SensorRig::new(camera())).unwrap();
+
+    system.process_image(stamp(0), &textured(0)).unwrap();
+    let bootstrap = system.process_image(stamp(1), &textured(1)).unwrap();
+    assert_eq!(bootstrap.status, TrackingStatus::KeyframeAccepted);
+    assert!(bootstrap.pose_world_to_cam.translation.length() > 1e-3);
+
+    let lost = system.process_image(stamp(2), &textured(2)).unwrap();
+    assert_eq!(lost.status, TrackingStatus::Skipped);
+    assert_eq!(lost.pose_world_to_cam.translation, Vec3F64::ZERO);
+    assert_eq!(lost.pose_world_to_cam.rotation, Pose3d::IDENTITY.rotation);
+}
+
 #[test]
 fn precomputed_features_drive_their_own_system() {
     let frames = [(0, vec![[10.0, 10.0]], vec![Clidd([0.125; CLIDD_DIM])])];
