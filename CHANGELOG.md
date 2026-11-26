@@ -72,8 +72,6 @@ run unchanged. Built, not validated: no benchmark has run on them. Not built:
   keyframe creates.
 - `frontend.gyro_guess` (`Off`): `RotatedRay` starts a track without a trusted
   map-point prediction at its previous ray rotated by the gyro.
-- `frontend.anchor_guard` (`Off`): `Enabled(every_n_frames, max_drift_px)` drops
-  a track that drifts from its first-sighting template.
 - `frontend.flow_pose` (`RansacPnp`): `AnalyticGn(max_iter)` solves a flow
   frame's pose by Gauss-Newton from the IMU prediction, RANSAC PnP as fallback.
 - `frontend.flow_bookkeeping` (`EveryFrame`): `KeyframesOnly` counts landmark

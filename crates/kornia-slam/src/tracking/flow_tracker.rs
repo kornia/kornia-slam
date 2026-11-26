@@ -10,9 +10,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::Mat3F64;
 use kornia_image::Image;
 
-use crate::system::{
-    AnchorGuard, ForwardBackward, GyroGuess, KltRetry, OrbFrontendConfig, TrackRefill,
-};
+use crate::system::{ForwardBackward, GyroGuess, KltRetry, OrbFrontendConfig, TrackRefill};
 use crate::tracking::flow_pool::{FlowFrames, FlowPool, FlowPoolError};
 use crate::tracking::optical_flow::{
     FlowSurvivor, KltTracker, SurvivorFilterConfig, Track, TrackId, TrackSet,
@@ -113,7 +111,6 @@ pub(crate) struct ShardGuess {
     pub refill_shard: usize,
     /// Start-of-frame pixels of every track of `refill_camera`, all shards.
     pub refill_occupied: Vec<[f32; 2]>,
-    pub anchor_guard: AnchorGuard,
     /// Retry pass: only `retry` tracks, from `max_level`.
     pub retry: bool,
 }
@@ -140,7 +137,6 @@ impl Clone for ShardGuess {
         self.refill_camera = source.refill_camera;
         self.refill_shard = source.refill_shard;
         self.refill_occupied.clone_from(&source.refill_occupied);
-        self.anchor_guard = source.anchor_guard;
         self.retry = source.retry;
     }
 }
@@ -219,12 +215,9 @@ pub(crate) struct FlowShard {
     pub retry: Vec<TrackId>,
     pub spawned: Vec<(usize, [f32; 2])>,
     pub fb_rejects: u32,
-    pub anchor_drops: u32,
     pub template_rebuilds: u32,
     /// Each track's template, cut where it ended in the last frame.
     templates: TemplateCache,
-    /// Each track's first-sighting template (`AnchorGuard`).
-    anchors: TemplateCache,
     /// Coarse-level template of the track being solved.
     coarse: LkTemplate,
     features: GoodFeaturesScratch,
@@ -263,15 +256,10 @@ impl FlowShard {
         self.undistorted.clear();
         self.spawned.clear();
         self.fb_rejects = 0;
-        self.anchor_drops = 0;
         self.template_rebuilds = 0;
-        let anchored = !guess.retry && guess.anchor_guard != AnchorGuard::Off;
         if !guess.retry {
             self.retry.clear();
             self.templates.align(&self.tracks);
-            if anchored {
-                self.anchors.align(&self.tracks);
-            }
         }
         for i in 0..self.tracks.len() {
             let track = self.tracks[i];
@@ -296,19 +284,12 @@ impl FlowShard {
                 self.retry.push(track.id());
                 continue;
             };
-            if anchored && !self.anchor_holds(i, &track, result.pixel, previous, current, guess) {
-                self.anchor_drops += 1;
-                continue;
-            }
             self.keep(
                 slot, &track, result, previous, current, model, guess, timings,
             );
         }
         if !guess.retry {
             self.templates.sort();
-            if anchored {
-                self.anchors.sort();
-            }
             self.refill(current, guess, timings);
         }
     }
@@ -380,40 +361,6 @@ impl FlowShard {
         )
         .then_some(result)
     }
-
-    /// Whether `track`, now at `pixel`, is still where its first-sighting
-    /// template tracks to (`AnchorGuard`); cuts that template on the first
-    /// frame the shard sees the track. Its solve counts as forward time.
-    fn anchor_holds(
-        &mut self,
-        slot: usize,
-        track: &Track,
-        pixel: [f32; 2],
-        previous: &LkFrame,
-        current: &LkFrame,
-        guess: &ShardGuess,
-    ) -> bool {
-        let AnchorGuard::Enabled {
-            every_n_frames,
-            max_drift_px,
-        } = guess.anchor_guard
-        else {
-            return true;
-        };
-        let (_, frame_id, _, anchor) = &mut self.anchors.entries[slot];
-        if *frame_id == NO_TEMPLATE {
-            if extract_template(previous, track.pixel(), 0, guess.window, anchor) {
-                *frame_id = previous.frame_id();
-            }
-            return true;
-        }
-        if !due(guess.frame_idx, every_n_frames) {
-            return true;
-        }
-        let anchored = track_template(anchor, current, pixel, guess.max_iter, guess.epsilon);
-        anchored.status && distance(anchored.pixel, pixel) <= max_drift_px
-    }
-
     /// Records a forward result as a survivor, with its next template cut
     /// at the new pixel and its undistorted pixel; drops it instead when its
     /// round trip back into `previous` misses (`ForwardBackward`).
@@ -606,7 +553,6 @@ pub struct RigFlowSettings {
     pub retry: KltRetry,
     pub forward_backward: ForwardBackward,
     pub refill: TrackRefill,
-    pub anchor_guard: AnchorGuard,
     pub gyro_guess: GyroGuess,
     pub refill_cameras: RefillCameras,
 }
@@ -627,7 +573,6 @@ impl RigFlowSettings {
             retry: frontend.klt_retry,
             forward_backward: frontend.forward_backward,
             refill: frontend.track_refill,
-            anchor_guard: frontend.anchor_guard,
             gyro_guess: frontend.gyro_guess,
             refill_cameras: RefillCameras::RoundRobin,
         }
@@ -650,7 +595,6 @@ pub struct FlowStepCounts {
     pub tracks_tried: u64,
     pub fb_rejects: u64,
     pub retries: u64,
-    pub anchor_drops: u64,
     pub template_rebuilds: u64,
 }
 
@@ -730,7 +674,6 @@ impl RigFlow {
             epsilon: settings.epsilon,
             forward_backward: settings.forward_backward,
             refill: settings.refill,
-            anchor_guard: settings.anchor_guard,
             ..ShardGuess::default()
         };
         Ok(Self {
@@ -1117,7 +1060,6 @@ impl RigFlow {
         for shard in &self.shards {
             let counts = &mut self.output.counts;
             counts.fb_rejects += u64::from(shard.fb_rejects);
-            counts.anchor_drops += u64::from(shard.anchor_drops);
             counts.template_rebuilds += u64::from(shard.template_rebuilds);
             if self.guess.retry {
                 counts.retries += shard.tracks.len() as u64;
@@ -1279,7 +1221,6 @@ mod tests {
             retry: KltRetry::Off,
             forward_backward: ForwardBackward::Off,
             refill: refill(),
-            anchor_guard: AnchorGuard::Off,
             gyro_guess,
             refill_cameras: RefillCameras::RoundRobin,
         };

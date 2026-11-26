@@ -199,7 +199,6 @@ pub struct OrbFrontendConfig {
     /// Tracks start from the landmarks each new keyframe creates.
     pub adopt_landmarks: bool,
     pub gyro_guess: GyroGuess,
-    pub anchor_guard: AnchorGuard,
     /// How a frame tracked from flow alone gets its pose.
     pub flow_pose: FlowPose,
     pub flow_bookkeeping: FlowBookkeeping,
@@ -275,20 +274,6 @@ pub enum GyroGuess {
     Off,
     /// The previous ray rotated by the preintegrated gyro rotation.
     RotatedRay,
-}
-
-/// Drift check against each track's first-sighting template.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum AnchorGuard {
-    #[default]
-    Off,
-    /// Every `every_n_frames` frames, drop a track that drifted more than
-    /// `max_drift_px` from where its first template tracks to.
-    Enabled {
-        every_n_frames: usize,
-        max_drift_px: f32,
-    },
 }
 
 /// Pose of a frame tracked from flow alone.
@@ -419,7 +404,6 @@ impl Default for OrbFrontendConfig {
             track_refill: TrackRefill::default(),
             adopt_landmarks: false,
             gyro_guess: GyroGuess::default(),
-            anchor_guard: AnchorGuard::default(),
             flow_pose: FlowPose::default(),
             flow_bookkeeping: FlowBookkeeping::default(),
             keyframe_orb: KeyframeOrb::default(),
@@ -1075,9 +1059,6 @@ fn write_flow_knobs(f: &mut fmt::Formatter<'_>, frontend: &OrbFrontendConfig) ->
     }
     if frontend.gyro_guess != default.gyro_guess {
         writeln!(f, "  gyro guess: {:?}", frontend.gyro_guess)?;
-    }
-    if frontend.anchor_guard != default.anchor_guard {
-        writeln!(f, "  anchor guard: {:?}", frontend.anchor_guard)?;
     }
     if frontend.flow_pose != default.flow_pose {
         writeln!(f, "  flow pose: {:?}", frontend.flow_pose)?;

@@ -886,7 +886,6 @@ fn the_flow_knobs_default_to_todays_frontend() {
     assert_eq!(frontend.track_refill, TrackRefill::Off);
     assert!(!frontend.adopt_landmarks);
     assert_eq!(frontend.gyro_guess, GyroGuess::Off);
-    assert_eq!(frontend.anchor_guard, AnchorGuard::Off);
     assert_eq!(frontend.flow_pose, FlowPose::RansacPnp);
     assert_eq!(frontend.flow_bookkeeping, FlowBookkeeping::EveryFrame);
     assert_eq!(frontend.keyframe_orb, KeyframeOrb::Tracking);
@@ -1035,26 +1034,6 @@ fn flow_knob_ranges_are_checked() {
         ),
         (
             OrbFrontendConfig {
-                anchor_guard: AnchorGuard::Enabled {
-                    every_n_frames: 0,
-                    max_drift_px: 1.0,
-                },
-                ..windowed
-            },
-            "frontend.anchor_guard.every_n_frames",
-        ),
-        (
-            OrbFrontendConfig {
-                anchor_guard: AnchorGuard::Enabled {
-                    every_n_frames: 5,
-                    max_drift_px: 0.0,
-                },
-                ..windowed
-            },
-            "frontend.anchor_guard.max_drift_px",
-        ),
-        (
-            OrbFrontendConfig {
                 flow_pose: FlowPose::AnalyticGn { max_iter: 0 },
                 ..windowed
             },
@@ -1142,16 +1121,6 @@ fn flow_knobs_are_refused_without_the_knobs_they_need() {
                 ..fixed_point
             },
             "track_refill",
-        ),
-        (
-            OrbFrontendConfig {
-                anchor_guard: AnchorGuard::Enabled {
-                    every_n_frames: 5,
-                    max_drift_px: 1.0,
-                },
-                ..fixed_point
-            },
-            "anchor_guard",
         ),
         (
             OrbFrontendConfig {

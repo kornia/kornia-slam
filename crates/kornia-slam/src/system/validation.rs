@@ -2,8 +2,8 @@ use kornia_imgproc::features::OrbMatchConfig;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    AnchorGuard, CameraSelection, FanOut, FlowPose, ForwardBackward, FrameVelocity, FrontendConfig,
-    KeyframeOrb, KltFirst, KltRetry, KltRig, LocalBaConfig, LoopClosingMode, MAX_FLOW_THREADS,
+    CameraSelection, FanOut, FlowPose, ForwardBackward, FrameVelocity, FrontendConfig, KeyframeOrb,
+    KltFirst, KltRetry, KltRig, LocalBaConfig, LoopClosingMode, MAX_FLOW_THREADS,
     OnlineCalibrationConfig, OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition,
     PoseInertial, PoseInertialMinInliers, SYSTEM_CONFIG_VERSION, SensorSelection, SnapbackFix,
     StereoCloseDepth, StereoDepthSigma, SystemConfig, TrackRefill, TrackingConfig,
@@ -529,22 +529,6 @@ fn validate_flow(
             OPEN_UNIT_UPPER,
         )?;
     }
-    if let AnchorGuard::Enabled {
-        every_n_frames,
-        max_drift_px,
-    } = frontend.anchor_guard
-    {
-        check(
-            at("anchor_guard.every_n_frames"),
-            every_n_frames as f64,
-            AT_LEAST_ONE,
-        )?;
-        check(
-            at("anchor_guard.max_drift_px"),
-            max_drift_px.into(),
-            POSITIVE,
-        )?;
-    }
     if let FlowPose::AnalyticGn { max_iter } = frontend.flow_pose {
         check(at("flow_pose.max_iter"), max_iter as f64, AT_LEAST_ONE)?;
     }
@@ -570,7 +554,6 @@ fn validate_flow(
                 frontend.forward_backward != ForwardBackward::Off,
             ),
             ("track_refill", frontend.track_refill != TrackRefill::Off),
-            ("anchor_guard", frontend.anchor_guard != AnchorGuard::Off),
             ("flow_threads", threaded),
         ];
         if let Some((knob, _)) = windowed.into_iter().find(|&(_, on)| on) {

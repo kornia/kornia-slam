@@ -418,7 +418,6 @@ impl Tracker {
                 counts.tracks_tried += output.counts.tracks_tried;
                 counts.fb_rejects += output.counts.fb_rejects;
                 counts.retries += output.counts.retries;
-                counts.anchor_drops += output.counts.anchor_drops;
                 counts.template_rebuilds += output.counts.template_rebuilds;
                 self.pending_spawns.extend_from_slice(&output.spawned);
                 Some(output.survivors.clone())

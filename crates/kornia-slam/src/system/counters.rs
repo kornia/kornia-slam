@@ -169,8 +169,6 @@ pub struct RunCounters {
     pub flow_retries: u64,
     /// Tracks spawned by refill.
     pub flow_refill_spawns: u64,
-    /// Tracks dropped by the anchor guard.
-    pub flow_anchor_drops: u64,
     /// `AnalyticGn` flow frames that fell back to RANSAC PnP.
     pub flow_pose_fallbacks: u64,
     /// Templates cut again because the cached one came from another frame.

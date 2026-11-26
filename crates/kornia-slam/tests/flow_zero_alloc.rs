@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_image::{Image, ImageSize};
-use kornia_slam::system::{AnchorGuard, ForwardBackward, GyroGuess, KltRetry, TrackRefill};
+use kornia_slam::system::{ForwardBackward, GyroGuess, KltRetry, TrackRefill};
 use kornia_slam::tracking::TrackingTimings;
 use kornia_slam::tracking::optical_flow::{
     FlowOutput, FlowStepInput, RefillCameras, RigFlow, RigFlowCamera, RigFlowSettings, TrackSet,
@@ -110,7 +110,6 @@ fn settings(threads: usize) -> RigFlowSettings {
             every_n_frames: 1,
         },
         refill: TrackRefill::Off,
-        anchor_guard: AnchorGuard::Off,
         gyro_guess: GyroGuess::Off,
         refill_cameras: RefillCameras::RoundRobin,
     }

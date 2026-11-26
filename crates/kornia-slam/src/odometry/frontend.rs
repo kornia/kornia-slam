@@ -11,7 +11,7 @@ use kornia_image::Image;
 use super::OdometryError;
 use super::config::OdometryTuning;
 use super::window::{Observation, StereoView};
-use crate::system::{AnchorGuard, ForwardBackward, GyroGuess, KltRetry, TrackRefill};
+use crate::system::{ForwardBackward, GyroGuess, KltRetry, TrackRefill};
 use crate::tracking::TrackingTimings;
 use crate::tracking::flow_pool::FlowPoolError;
 use crate::tracking::flow_tracker::{
@@ -66,7 +66,6 @@ fn settings(tuning: &OdometryTuning) -> RigFlowSettings {
             refill_below: 1.0,
             border_px: 10,
         },
-        anchor_guard: AnchorGuard::Off,
         gyro_guess: GyroGuess::RotatedRay,
         refill_cameras: RefillCameras::PrimaryOnly,
     }

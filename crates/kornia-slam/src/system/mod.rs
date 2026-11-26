@@ -27,13 +27,13 @@ pub use crate::odometry::{
 };
 pub use build::BuildError;
 pub use config::{
-    AnchorGuard, BoundedFanOut, CameraSelection, FanOut, FlowBookkeeping, FlowPose,
-    ForwardBackward, FrameVelocity, FrontendConfig, GyroGuess, InertialConfig, KeyframeOrb,
-    KltFirst, KltPrediction, KltRetry, KltRig, LocalBaConfig, LoopClosingExecution,
-    LoopClosingMode, LostRelocalization, MAX_FLOW_THREADS, MappingConfig, OnlineCalibrationConfig,
-    OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition, PoseInertial,
-    PoseInertialMinInliers, SYSTEM_CONFIG_VERSION, SensorSelection, SnapbackFix, StereoCloseDepth,
-    StereoDepthSigma, StereoPyramid, SystemConfig, TrackRefill, TrackingConfig, TrackingLossConfig,
+    BoundedFanOut, CameraSelection, FanOut, FlowBookkeeping, FlowPose, ForwardBackward,
+    FrameVelocity, FrontendConfig, GyroGuess, InertialConfig, KeyframeOrb, KltFirst, KltPrediction,
+    KltRetry, KltRig, LocalBaConfig, LoopClosingExecution, LoopClosingMode, LostRelocalization,
+    MAX_FLOW_THREADS, MappingConfig, OnlineCalibrationConfig, OrbFrontendConfig, OrbSlamPipeline,
+    OrbTuning, PipelineDefinition, PoseInertial, PoseInertialMinInliers, SYSTEM_CONFIG_VERSION,
+    SensorSelection, SnapbackFix, StereoCloseDepth, StereoDepthSigma, StereoPyramid, SystemConfig,
+    TrackRefill, TrackingConfig, TrackingLossConfig,
 };
 pub use counters::{RunCounters, SkipKind, StillnessCounters};
 #[cfg(feature = "serde")]
@@ -630,7 +630,6 @@ impl SlamSystem {
             flow_tracks_tried: flow.tracks_tried,
             flow_fb_rejects: flow.fb_rejects,
             flow_retries: flow.retries,
-            flow_anchor_drops: flow.anchor_drops,
             flow_template_rebuilds: flow.template_rebuilds,
             flow_refill_spawns: refill_spawns,
             stillness: self.stillness.counters,
@@ -3781,7 +3780,6 @@ fn rig_flow_settings(settings: &SystemSettings) -> RigFlowSettings {
         retry: flow.retry,
         forward_backward: flow.forward_backward,
         refill: flow.refill,
-        anchor_guard: flow.anchor_guard,
         gyro_guess: flow.gyro_guess,
         refill_cameras: RefillCameras::RoundRobin,
     }

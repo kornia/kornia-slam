@@ -2,11 +2,10 @@ use kornia_imgproc::features::OrbDetector;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    AnchorGuard, CameraSelection, FanOut, FlowBookkeeping, FlowPose, ForwardBackward,
-    FrontendConfig, GyroGuess, InertialConfig, KeyframeOrb, KltRetry, KltRig, LocalBaConfig,
-    LoopClosingExecution, LoopClosingMode, LostRelocalization, OrbFrontendConfig, OrbSlamPipeline,
-    PipelineDefinition, SensorSelection, StereoDepthSigma, StereoPyramid, SystemConfig,
-    TrackRefill, TrackingConfig,
+    CameraSelection, FanOut, FlowBookkeeping, FlowPose, ForwardBackward, FrontendConfig, GyroGuess,
+    InertialConfig, KeyframeOrb, KltRetry, KltRig, LocalBaConfig, LoopClosingExecution,
+    LoopClosingMode, LostRelocalization, OrbFrontendConfig, OrbSlamPipeline, PipelineDefinition,
+    SensorSelection, StereoDepthSigma, StereoPyramid, SystemConfig, TrackRefill, TrackingConfig,
 };
 use super::recovery::RecoveryConfig;
 use super::validation::ConfigError;
@@ -85,7 +84,6 @@ pub(crate) struct FlowSettings {
     pub refill: TrackRefill,
     pub adopt_landmarks: bool,
     pub gyro_guess: GyroGuess,
-    pub anchor_guard: AnchorGuard,
     pub pose: FlowPose,
     pub bookkeeping: FlowBookkeeping,
     pub keyframe_orb: KeyframeOrb,
@@ -103,7 +101,6 @@ impl FlowSettings {
             refill: frontend.track_refill,
             adopt_landmarks: frontend.adopt_landmarks,
             gyro_guess: frontend.gyro_guess,
-            anchor_guard: frontend.anchor_guard,
             pose: frontend.flow_pose,
             bookkeeping: frontend.flow_bookkeeping,
             keyframe_orb: frontend.keyframe_orb,
