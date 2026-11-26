@@ -546,52 +546,65 @@ impl LoopAcceptance {
             if self.verified_loop_pairs.contains(&pair) {
                 continue;
             }
-            if let Ok(edge) = verify_loop_candidate(
+            let edge = match verify_loop_candidate(
                 map,
                 camera,
                 kf_idx,
                 candidate.kf_idx,
                 &self.config.verification,
             ) {
-                let query_order = map
-                    .keyframes()
-                    .iter()
-                    .position(|keyframe| keyframe.frame.idx == kf_idx)
-                    .expect("verified query keyframe must be in the map");
-                let candidate_order = map
-                    .keyframes()
-                    .iter()
-                    .position(|keyframe| keyframe.frame.idx == candidate.kf_idx)
-                    .expect("verified candidate keyframe must be in the map");
-                let gravity = context.imu_initialized.then_some(context.gravity_world);
-                let correction = loop_correction(map, query_order, candidate_order, &edge, gravity);
-                if let Some(correction) = correction {
-                    let proposal = LoopProposal {
-                        edge: &edge,
-                        correction,
-                        query_order,
-                        candidate_order,
-                    };
-                    let log = &mut outcome.gate_messages;
-                    if let GateDecision::Reject(_) = self.odometry_gate.decide(&proposal, log) {
-                        continue;
-                    }
-                    if self.temporal_gate.is_enabled()
-                        && !self.region_has_loop(map, candidate_order)
-                        && self.temporal_gate.decide(&proposal, log) == GateDecision::Hold
-                    {
-                        break;
-                    }
+                Ok(edge) => edge,
+                Err(reject) => {
+                    outcome.gate_messages.push(format!(
+                        "[loop-reject] kf={kf_idx} candidate={} stage=verify {reject:?}",
+                        candidate.kf_idx
+                    ));
+                    continue;
                 }
-                let decision =
-                    self.episode_tracker
-                        .observe(query_order, candidate_order, edge.clone());
-                return match decision {
-                    LoopEpisodeDecision::Pending { .. }
-                    | LoopEpisodeDecision::Suppressed { .. } => None,
-                    LoopEpisodeDecision::Ready { representative, .. } => Some(representative),
+            };
+            let query_order = map
+                .keyframes()
+                .iter()
+                .position(|keyframe| keyframe.frame.idx == kf_idx)
+                .expect("verified query keyframe must be in the map");
+            let candidate_order = map
+                .keyframes()
+                .iter()
+                .position(|keyframe| keyframe.frame.idx == candidate.kf_idx)
+                .expect("verified candidate keyframe must be in the map");
+            let gravity = context.imu_initialized.then_some(context.gravity_world);
+            let correction = loop_correction(map, query_order, candidate_order, &edge, gravity);
+            if let Some(correction) = correction {
+                let proposal = LoopProposal {
+                    edge: &edge,
+                    correction,
+                    query_order,
+                    candidate_order,
                 };
+                let log = &mut outcome.gate_messages;
+                if let GateDecision::Reject(_) = self.odometry_gate.decide(&proposal, log) {
+                    continue;
+                }
+                if self.temporal_gate.is_enabled()
+                    && !self.region_has_loop(map, candidate_order)
+                    && self.temporal_gate.decide(&proposal, log) == GateDecision::Hold
+                {
+                    break;
+                }
             }
+            let decision = self
+                .episode_tracker
+                .observe(query_order, candidate_order, edge.clone());
+            return match decision {
+                LoopEpisodeDecision::Ready { representative, .. } => Some(representative),
+                held => {
+                    outcome.gate_messages.push(format!(
+                        "[loop-reject] kf={kf_idx} candidate={} stage=episode {held:?}",
+                        candidate.kf_idx
+                    ));
+                    None
+                }
+            };
         }
         None
     }
