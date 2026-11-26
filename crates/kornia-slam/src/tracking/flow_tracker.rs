@@ -894,15 +894,6 @@ impl RigFlow {
             .map(|frame| frame.as_ref())
     }
 
-    /// The current frame of `camera`.
-    pub(crate) fn current_frame(&self, camera: usize) -> Option<&LkFrame> {
-        self.frames
-            .as_ref()?
-            .current
-            .get(camera)
-            .map(|frame| frame.as_ref())
-    }
-
     /// The output of the latest [`Self::step`].
     pub fn output(&self) -> &FlowOutput {
         &self.output
