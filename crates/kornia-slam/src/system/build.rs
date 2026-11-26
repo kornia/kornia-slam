@@ -5,7 +5,7 @@ use super::config::{
     CameraSelection, FanOut, FlowBookkeeping, FlowPose, ForwardBackward, FrontendConfig, GyroGuess,
     InertialConfig, KeyframeOrb, KltRetry, KltRig, LocalBaConfig, LoopClosingExecution,
     LoopClosingMode, LostRelocalization, OrbFrontendConfig, OrbSlamPipeline, PipelineDefinition,
-    SensorSelection, StereoDepthSigma, StereoPyramid, SystemConfig, TrackRefill, TrackingConfig,
+    SensorSelection, StereoDepthSigma, SystemConfig, TrackRefill, TrackingConfig,
 };
 use super::recovery::RecoveryConfig;
 use super::validation::ConfigError;
@@ -242,12 +242,6 @@ impl SystemConfig {
     pub(crate) fn fisheye_weight(&self, rig: &SensorRig) -> FisheyeWeight {
         let FrontendConfig::Orb(frontend) = self.orb().frontend;
         frontend.fisheye_weight.for_rig(rig)
-    }
-
-    /// The pyramid the stereo and overlap matching read.
-    pub(crate) fn stereo_pyramid(&self) -> StereoPyramid {
-        let FrontendConfig::Orb(frontend) = self.orb().frontend;
-        frontend.stereo_pyramid
     }
 
     /// Checks `frontend.flow_threads` against a rig returned by

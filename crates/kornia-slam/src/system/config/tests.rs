@@ -888,7 +888,6 @@ fn the_flow_knobs_default_to_todays_frontend() {
     assert_eq!(frontend.flow_pose, FlowPose::RansacPnp);
     assert_eq!(frontend.flow_bookkeeping, FlowBookkeeping::EveryFrame);
     assert_eq!(frontend.keyframe_orb, KeyframeOrb::Tracking);
-    assert_eq!(frontend.stereo_pyramid, StereoPyramid::Resized);
     assert_eq!(frontend.fisheye_weight, FisheyeWeight::Uniform);
     for threads in [2, 3] {
         let preset = orin_preset(threads, 48);

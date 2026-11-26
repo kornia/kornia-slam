@@ -196,7 +196,6 @@ pub struct OrbFrontendConfig {
     pub flow_pose: FlowPose,
     pub flow_bookkeeping: FlowBookkeeping,
     pub keyframe_orb: KeyframeOrb,
-    pub stereo_pyramid: StereoPyramid,
     /// Weights and search radius of raw fisheye rig views; `Uniform` on a
     /// rig without raw images whatever is set.
     pub fisheye_weight: FisheyeWeight,
@@ -300,17 +299,6 @@ pub enum KeyframeOrb {
     Mapping,
 }
 
-/// Pyramid the stereo and overlap matching read.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum StereoPyramid {
-    /// Built again from the image by resizing.
-    #[default]
-    Resized,
-    /// The ORB detector's own pyramid; changes output.
-    Shared,
-}
-
 /// Optical flow from a trusted inertial prediction: each track starts at
 /// its map point projected at the predicted pose, and LK searches pyramid
 /// levels `0..=max_level` with `max_iter` iterations each instead of the
@@ -398,7 +386,6 @@ impl Default for OrbFrontendConfig {
             flow_pose: FlowPose::default(),
             flow_bookkeeping: FlowBookkeeping::default(),
             keyframe_orb: KeyframeOrb::default(),
-            stereo_pyramid: StereoPyramid::default(),
             fisheye_weight: FisheyeWeight::default(),
         }
     }
@@ -1053,9 +1040,6 @@ fn write_flow_knobs(f: &mut fmt::Formatter<'_>, frontend: &OrbFrontendConfig) ->
     }
     if frontend.keyframe_orb != default.keyframe_orb {
         writeln!(f, "  keyframe ORB: {:?}", frontend.keyframe_orb)?;
-    }
-    if frontend.stereo_pyramid != default.stereo_pyramid {
-        writeln!(f, "  stereo pyramid: {:?}", frontend.stereo_pyramid)?;
     }
     if frontend.fisheye_weight != default.fisheye_weight {
         writeln!(f, "  fisheye weight: {:?}", frontend.fisheye_weight)?;

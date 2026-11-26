@@ -32,8 +32,8 @@ pub use config::{
     KltRetry, KltRig, LocalBaConfig, LoopClosingExecution, LoopClosingMode, LostRelocalization,
     MAX_FLOW_THREADS, MappingConfig, OnlineCalibrationConfig, OrbFrontendConfig, OrbSlamPipeline,
     OrbTuning, PipelineDefinition, PoseInertial, PoseInertialMinInliers, SYSTEM_CONFIG_VERSION,
-    SensorSelection, SnapbackFix, StereoCloseDepth, StereoDepthSigma, StereoPyramid, SystemConfig,
-    TrackRefill, TrackingConfig, TrackingLossConfig,
+    SensorSelection, SnapbackFix, StereoCloseDepth, StereoDepthSigma, SystemConfig, TrackRefill,
+    TrackingConfig, TrackingLossConfig,
 };
 pub use counters::{RunCounters, SkipKind, StillnessCounters};
 #[cfg(feature = "serde")]
@@ -325,7 +325,6 @@ impl SlamSystem {
             .into());
         }
         let frontend = OrbFrontend::new(config.orb_detector(), &rig)
-            .with_stereo_pyramid(config.stereo_pyramid())
             .with_fisheye_weight(config.fisheye_weight(&rig));
         let loop_closer = config.loop_closer(&rig)?;
         let PipelineDefinition::OrbSlam(orb) = &config.pipeline;

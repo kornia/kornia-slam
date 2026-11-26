@@ -76,8 +76,6 @@ run unchanged. Built, not validated: no benchmark has run on them. Not built:
   visibility only on frames that run ORB, as ORB-SLAM3.
 - `frontend.keyframe_orb` (`Tracking`): `Mapping` runs a flow keyframe's ORB,
   overlap match and insert on the mapping thread; needs `klt_first`.
-- `frontend.stereo_pyramid` (`Resized`): `Shared` matches stereo and rig overlap
-  on the ORB detector's own pyramid; changes output.
 - `frontend.fisheye_weight` (`Uniform`): `Magnification` scales the local VI-BA
   pixel sigma, the rig-overlap gates and the projection search radius of raw
   fisheye rig views by the raw-to-pinhole magnification; `Uniform` on a rig
