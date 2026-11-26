@@ -532,7 +532,7 @@ pub enum RefillCameras {
     #[default]
     RoundRobin,
     /// Camera 0 every frame: the other cameras get their tracks by
-    /// [`RigFlow::track_across`] (the sliding-window odometry's stereo link).
+    /// `RigFlow::track_across` (the sliding-window odometry's stereo link).
     PrimaryOnly,
 }
 
