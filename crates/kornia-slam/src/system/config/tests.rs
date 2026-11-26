@@ -6,10 +6,17 @@ use kornia_sensors::SensorRig;
 
 use super::*;
 use crate::mapping::LocalMappingMode;
+use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
+use crate::mapping::marginalization::{BoundaryPrior, FrozenPoseSigma};
+use crate::mapping::visual_information::{FisheyeWeight, VisualInformation};
+use crate::odometry::{
+    Odometry, OdometryImuNoise, OdometryMode, SlidingWindowConfig, VisualJacobians,
+};
 use crate::system::ConfigError;
 #[cfg(feature = "serde")]
 use crate::system::LoadError;
-use crate::tracking::KeyframePolicy;
+use crate::tracking::optical_flow::LkKernel;
+use crate::tracking::{KeyframePolicy, KeyframeRules};
 
 fn orb_mut(config: &mut SystemConfig) -> &mut OrbSlamPipeline {
     let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
@@ -28,6 +35,8 @@ fn with_loop_closing(mode: LoopClosingMode, sensors: SensorSelection) -> SystemC
 fn loop_closing() -> LoopClosingMode {
     LoopClosingMode::Enabled {
         vocabulary: PathBuf::from("ORBvoc.txt"),
+        execution: LoopClosingExecution::default(),
+        graph: Default::default(),
     }
 }
 
@@ -65,6 +74,9 @@ fn display_describes_the_pipeline() {
             SystemConfig::default(),
             "OrbSlam pipeline (config version 1)
   frontend: ORB, 1000 keypoints
+  klt kernel: fixed-point u8
+  klt-first: ORB only when a keyframe is due or fewer than 80 tracks survive
+  klt prediction: levels 0..=1, 10 iterations when trusted
   tracking
   keyframes: every 3..=8 frames, ref ratio 0.6
   local mapping: asynchronous
@@ -74,6 +86,9 @@ fn display_describes_the_pipeline() {
             stereo,
             "OrbSlam pipeline (config version 1)
   frontend: ORB, 1000 keypoints
+  klt kernel: fixed-point u8
+  klt-first: ORB only when a keyframe is due or fewer than 80 tracks survive
+  klt prediction: levels 0..=1, 10 iterations when trusted
   stereo depth: rectified pair, close within 35 baselines
   tracking
   keyframes: every 3..=8 frames, ref ratio 0.6
@@ -84,17 +99,23 @@ fn display_describes_the_pipeline() {
             inertial_loop,
             "OrbSlam pipeline (config version 1)
   frontend: ORB, 1000 keypoints
+  klt kernel: fixed-point u8
+  klt-first: ORB only when a keyframe is due or fewer than 80 tracks survive
+  klt prediction: levels 0..=1, 10 iterations when trusted
   IMU integration
   tracking
   keyframes: every 3..=8 frames, ref ratio 0.6
   local mapping: synchronous
-  loop closing: ORBvoc.txt
+  loop closing: ORBvoc.txt (pose graph: w*I, snapshot)
 ",
         ),
         (
             parallax,
             "OrbSlam pipeline (config version 1)
   frontend: ORB, 1000 keypoints
+  klt kernel: fixed-point u8
+  klt-first: ORB only when a keyframe is due or fewer than 80 tracks survive
+  klt prediction: levels 0..=1, 10 iterations when trusted
   tracking
   keyframes: every 3..=unbounded frames, ref ratio 0.6, parallax 10 px
   local mapping: asynchronous
@@ -103,6 +124,54 @@ fn display_describes_the_pipeline() {
     ] {
         assert_eq!(config.to_string(), expected);
     }
+}
+
+#[test]
+fn the_growth_baseline_ratio_defaults_off_and_is_range_checked() {
+    assert_eq!(MappingConfig::default().growth_min_baseline_ratio, 0.0);
+    let ratio = |growth_min_baseline_ratio| {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).mapping.growth_min_baseline_ratio = growth_min_baseline_ratio;
+        config.validate()
+    };
+    assert_eq!(ratio(0.0), Ok(()));
+    assert_eq!(ratio(0.0175), Ok(()));
+    for value in [-1.0, f64::NAN, f64::INFINITY] {
+        assert!(
+            matches!(
+                ratio(value),
+                Err(ConfigError::InvalidSetting { setting, .. })
+                    if setting == "mapping.growth_min_baseline_ratio"
+            ),
+            "ratio {value}"
+        );
+    }
+}
+
+#[test]
+fn display_names_the_growth_baseline_ratio_only_when_set() {
+    let mut config = SystemConfig::default();
+    orb_mut(&mut config).mapping.growth_min_baseline_ratio = 0.0175;
+    assert!(
+        config
+            .to_string()
+            .contains("  growth: pairs under baseline/depth 0.0175 skipped\n")
+    );
+}
+
+#[test]
+fn display_names_the_fisheye_weight_only_when_set() {
+    let mut config = SystemConfig::default();
+    assert!(!config.to_string().contains("fisheye weight"));
+    orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
+        fisheye_weight: FisheyeWeight::Magnification,
+        ..OrbFrontendConfig::default()
+    });
+    assert!(
+        config
+            .to_string()
+            .contains("  fisheye weight: Magnification\n")
+    );
 }
 
 #[test]
@@ -218,6 +287,61 @@ fn invalid_setting(config: &SystemConfig) -> Option<String> {
 }
 
 #[test]
+fn relocalization_knobs_are_off_by_default_and_need_loop_closing() {
+    use crate::tracking::relocalization::RelocalizationSolver;
+    let mut defaults = SystemConfig::default();
+    let tracking_loss = &orb_mut(&mut defaults).tracking_loss;
+    assert!(!tracking_loss.relocalization.while_lost);
+    assert_eq!(
+        tracking_loss.relocalization.solver,
+        RelocalizationSolver::PrimaryEpnp
+    );
+    assert_eq!(tracking_loss.relocalization.max_jump_m, 0.5);
+    assert!(!tracking_loss.reseed.relocalize_when_lost);
+    assert_eq!(tracking_loss.reseed.own_window_keyframes, 0);
+
+    type Knob = (&'static str, fn(&mut OrbSlamPipeline));
+    let knobs: [Knob; 3] = [
+        ("tracking_loss.relocalization.while_lost", |orb| {
+            orb.tracking_loss.relocalization.while_lost = true;
+        }),
+        ("tracking_loss.relocalization.solver", |orb| {
+            orb.tracking_loss.relocalization.solver = RelocalizationSolver::RigAp3p;
+        }),
+        ("tracking_loss.reseed.relocalize_when_lost", |orb| {
+            orb.tracking_loss.reseed.relocalize_when_lost = true;
+        }),
+    ];
+    let stereo = sensors(CameraSelection::Stereo, false);
+    for (knob, set) in knobs {
+        let mut without = with_loop_closing(LoopClosingMode::Disabled, stereo);
+        set(orb_mut(&mut without));
+        assert_eq!(
+            without.validate(),
+            Err(ConfigError::RelocalizationWithoutVocabulary(knob))
+        );
+        let mut with = with_loop_closing(loop_closing(), stereo);
+        set(orb_mut(&mut with));
+        assert_eq!(with.validate(), Ok(()), "{knob}");
+    }
+    for mode in [LoopClosingMode::Disabled, loop_closing()] {
+        assert_eq!(with_loop_closing(mode, stereo).validate(), Ok(()));
+    }
+}
+
+#[test]
+fn the_relocalization_jump_bound_must_be_positive() {
+    for bad in [0.0, -1.0, f64::INFINITY] {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).tracking_loss.relocalization.max_jump_m = bad;
+        assert_eq!(
+            invalid_setting(&config).as_deref(),
+            Some("tracking_loss.relocalization.max_jump_m")
+        );
+    }
+}
+
+#[test]
 fn settings_are_range_checked() {
     let mut config = SystemConfig::default();
     let orb = orb_mut(&mut config);
@@ -267,6 +391,109 @@ fn settings_are_range_checked() {
     );
     orb_mut(&mut config).loop_closing = LoopClosingMode::Disabled;
     assert_eq!(config.validate(), Ok(()));
+
+    for (local_ba, setting) in [
+        (
+            LocalBaConfig {
+                active_keyframes: 0,
+                ..LocalBaConfig::default()
+            },
+            "mapping.local_ba.active_keyframes",
+        ),
+        (
+            LocalBaConfig {
+                max_iterations: 0,
+                ..LocalBaConfig::default()
+            },
+            "mapping.local_ba.max_iterations",
+        ),
+        (
+            LocalBaConfig {
+                initial_lambda: 0.0,
+                ..LocalBaConfig::default()
+            },
+            "mapping.local_ba.initial_lambda",
+        ),
+        (
+            LocalBaConfig {
+                boundary: BoundaryPrior::Marginal(FrozenPoseSigma {
+                    frozen_pose_sigma_m: 0.0,
+                    ..FrozenPoseSigma::default()
+                }),
+                ..LocalBaConfig::default()
+            },
+            "mapping.local_ba.boundary",
+        ),
+        (
+            LocalBaConfig {
+                stereo_depth_sigma: StereoDepthSigma::Disparity { px: 0.0 },
+                ..LocalBaConfig::default()
+            },
+            "mapping.local_ba.stereo_depth_sigma",
+        ),
+    ] {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).mapping.local_ba = local_ba;
+        assert_eq!(invalid_setting(&config).as_deref(), Some(setting));
+    }
+}
+
+#[test]
+fn loop_graph_information_is_range_checked() {
+    use crate::loop_closure::OdometryRandomWalk;
+    let with = |information| {
+        with_loop_closing(
+            LoopClosingMode::Enabled {
+                vocabulary: PathBuf::from("ORBvoc.txt"),
+                graph: LoopGraphSettings {
+                    information,
+                    persistent: true,
+                    accept_capped_solves: false,
+                },
+                execution: LoopClosingExecution::default(),
+            },
+            sensors(CameraSelection::Stereo, false),
+        )
+    };
+    let drift = |edit: fn(&mut OdometryRandomWalk, &mut [f64; 3])| {
+        let LoopGraphInformation::Drift {
+            mut odometry,
+            loop_sigma_m,
+            loop_sigma_rad,
+            loop_cauchy_scale,
+        } = LoopGraphInformation::drift()
+        else {
+            unreachable!()
+        };
+        let mut loop_values = [loop_sigma_m, loop_sigma_rad, loop_cauchy_scale];
+        edit(&mut odometry, &mut loop_values);
+        let [loop_sigma_m, loop_sigma_rad, loop_cauchy_scale] = loop_values;
+        invalid_setting(&with(LoopGraphInformation::Drift {
+            odometry,
+            loop_sigma_m,
+            loop_sigma_rad,
+            loop_cauchy_scale,
+        }))
+    };
+    let at = |field: &str| Some(format!("pipeline.loop_closing.graph.information.{field}"));
+    assert_eq!(drift(|_, _| {}), None);
+    assert_eq!(with(LoopGraphInformation::ScalarWeights).validate(), Ok(()));
+    assert_eq!(
+        drift(|walk, _| walk.translation_m2_per_m = -1e-3),
+        at("odometry.translation_m2_per_m")
+    );
+    assert_eq!(
+        drift(|walk, _| walk.rotation_rad2_per_m = f64::NAN),
+        at("odometry.rotation_rad2_per_m")
+    );
+    assert_eq!(drift(|walk, _| walk.floor_m = 0.0), at("odometry.floor_m"));
+    assert_eq!(
+        drift(|walk, _| walk.floor_rad = f64::INFINITY),
+        at("odometry.floor_rad")
+    );
+    assert_eq!(drift(|_, values| values[0] = 0.0), at("loop_sigma_m"));
+    assert_eq!(drift(|_, values| values[1] = -1.0), at("loop_sigma_rad"));
+    assert_eq!(drift(|_, values| values[2] = 0.0), at("loop_cauchy_scale"));
 }
 
 #[test]
@@ -274,10 +501,52 @@ fn vocabulary_path_must_not_be_empty() {
     let config = with_loop_closing(
         LoopClosingMode::Enabled {
             vocabulary: PathBuf::new(),
+            execution: LoopClosingExecution::default(),
+            graph: Default::default(),
         },
         SensorSelection::default(),
     );
     assert_eq!(config.validate(), Err(ConfigError::EmptyVocabularyPath));
+}
+
+/// Loop closing solves inline unless a configuration asks for the worker, whatever the mapping
+/// execution.
+#[test]
+fn default_loop_closing_execution_is_synchronous() {
+    for mapping in [
+        LocalMappingMode::Synchronous,
+        LocalMappingMode::Asynchronous,
+    ] {
+        assert_eq!(
+            LoopClosingExecution::default().resolve(mapping),
+            LoopClosingExecution::Synchronous
+        );
+    }
+    assert_eq!(
+        LoopClosingExecution::default().resolve(LocalMappingMode::default()),
+        LoopClosingExecution::Synchronous
+    );
+}
+
+#[test]
+fn follow_mapping_resolves_to_the_mapping_execution() {
+    use LoopClosingExecution::*;
+    assert_eq!(
+        FollowMapping.resolve(LocalMappingMode::Synchronous),
+        Synchronous
+    );
+    assert_eq!(
+        FollowMapping.resolve(LocalMappingMode::Asynchronous),
+        Asynchronous
+    );
+    assert_eq!(
+        Deferred { frames: 2 }.resolve(LocalMappingMode::Asynchronous),
+        Deferred { frames: 2 }
+    );
+    assert_eq!(
+        Synchronous.resolve(LocalMappingMode::Asynchronous),
+        Synchronous
+    );
 }
 
 #[test]
@@ -337,8 +606,529 @@ fn stereo_rejects_raw_fisheye_images() {
     assert_eq!(SensorSelection::default().validate_rig(&rig), Ok(()));
 }
 
+fn raw_fisheye_rig() -> SensorRig {
+    let primary = rig().camera;
+    let view = |primary_from_camera| kornia_sensors::RigCamera {
+        camera: primary.clone(),
+        size: kornia_image::ImageSize {
+            width: 640,
+            height: 480,
+        },
+        primary_from_camera,
+        raw_model: Some(kornia_sensors::Fisheye624Camera {
+            f: primary.fx,
+            cx: primary.cx,
+            cy: primary.cy,
+            k: [-0.025, 0.096, -0.063, 0.0062, 0.0035, -0.00073],
+            p: [0.0009, 0.00036],
+            s: [-0.0014, -0.0001, -0.00046, -0.0001],
+        }),
+    };
+    rig().with_rig_cameras(vec![
+        view(Pose3d::IDENTITY),
+        view(Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            kornia_algebra::Vec3F64::new(0.1, 0.0, 0.0),
+        )),
+    ])
+}
+
+#[test]
+fn raw_fisheye_rig_cameras_need_the_rig_selection() {
+    let rig = raw_fisheye_rig();
+    for cameras in [CameraSelection::Mono, CameraSelection::Stereo] {
+        let rig = rig.clone().with_stereo_baseline(0.11);
+        assert_eq!(
+            sensors(cameras, false).validate_rig(&rig),
+            Err(ConfigError::RawFisheyeOutsideRig)
+        );
+    }
+    assert_eq!(
+        sensors(CameraSelection::Rig, false).validate_rig(&rig),
+        Ok(())
+    );
+}
+
+#[test]
+fn raw_fisheye_weight_reaches_local_ba_and_projection_on_raw_rigs_only() {
+    let mut config = SystemConfig::default();
+    orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
+        fisheye_weight: FisheyeWeight::Magnification,
+        ..OrbFrontendConfig::default()
+    });
+    let rig_selection = sensors(CameraSelection::Rig, false);
+    let raw = config.settings(&rig_selection.select_rig(raw_fisheye_rig()).unwrap());
+    assert_eq!(raw.local_ba.fisheye_weight, FisheyeWeight::Magnification);
+    assert_eq!(
+        raw.map_projection.fisheye_weight,
+        FisheyeWeight::Magnification
+    );
+    let pinhole = config.settings(&rig());
+    assert_eq!(pinhole.local_ba.fisheye_weight, FisheyeWeight::Uniform);
+    assert_eq!(
+        pinhole.map_projection.fisheye_weight,
+        FisheyeWeight::Uniform
+    );
+    let default =
+        SystemConfig::default().settings(&rig_selection.select_rig(raw_fisheye_rig()).unwrap());
+    assert_eq!(default.local_ba.fisheye_weight, FisheyeWeight::Uniform);
+}
+
+#[test]
+fn raw_fisheye_rig_rejects_klt_first() {
+    let selected = sensors(CameraSelection::Rig, false)
+        .select_rig(raw_fisheye_rig())
+        .unwrap();
+    let with_klt = |klt_first| {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
+            klt_first,
+            ..OrbFrontendConfig::default()
+        });
+        config
+    };
+    assert_eq!(
+        with_klt(KltFirst::default()).validate_raw_fisheye(&selected),
+        Err(ConfigError::FrontendKnobNeeds {
+            knob: "klt_first",
+            needs: "pinhole rig images",
+        })
+    );
+    assert_eq!(
+        with_klt(KltFirst::Disabled).validate_raw_fisheye(&selected),
+        Ok(())
+    );
+    assert_eq!(
+        with_klt(KltFirst::default()).validate_raw_fisheye(&rig()),
+        Ok(())
+    );
+}
+
+/// The Orin preset of card E: 2 threads with 48 tracks per camera, or 3
+/// with 64 (`configs/lamaria-rig-imu-orin{2,3}.ron`).
+fn orin_preset(threads: usize, per_camera: usize) -> SystemConfig {
+    let mut config = SystemConfig {
+        sensors: sensors(CameraSelection::Rig, true),
+        ..SystemConfig::default()
+    };
+    let orb = orb_mut(&mut config);
+    orb.mapping.execution = LocalMappingMode::Asynchronous;
+    orb.frontend = FrontendConfig::Orb(OrbFrontendConfig {
+        klt_kernel: LkKernel::WindowedU8,
+        flow_threads: threads,
+        klt_rig: KltRig::AllCameras,
+        klt_window: 11,
+        klt_prediction: KltPrediction::Enabled {
+            max_level: 0,
+            max_iter: 8,
+        },
+        klt_retry: KltRetry::CoarseLevel { max_level: 1 },
+        forward_backward: ForwardBackward::Enabled {
+            max_round_trip_px: 0.6,
+            max_iter: 4,
+            every_n_frames: 1,
+        },
+        track_refill: TrackRefill::Enabled {
+            per_camera,
+            min_spacing_px: 23.0,
+            refill_below: 0.8,
+            border_px: 9,
+        },
+        adopt_landmarks: true,
+        gyro_guess: GyroGuess::RotatedRay,
+        flow_pose: FlowPose::AnalyticGn { max_iter: 3 },
+        flow_bookkeeping: FlowBookkeeping::KeyframesOnly,
+        ..OrbFrontendConfig::default()
+    });
+    config
+}
+
+/// A config whose frontend is `frontend` on `cameras`, with the IMU.
+fn with_frontend(frontend: OrbFrontendConfig, cameras: CameraSelection) -> SystemConfig {
+    let mut config = SystemConfig {
+        sensors: sensors(cameras, true),
+        ..SystemConfig::default()
+    };
+    orb_mut(&mut config).frontend = FrontendConfig::Orb(frontend);
+    config
+}
+
+#[test]
+fn the_flow_knobs_default_to_todays_frontend() {
+    let frontend = OrbFrontendConfig::default();
+    assert_eq!(frontend.flow_threads, 1);
+    assert_eq!(frontend.klt_rig, KltRig::PrimaryOnly);
+    assert_eq!(frontend.klt_kernel, LkKernel::FixedPointU8);
+    assert_eq!(frontend.klt_window, 21);
+    assert_eq!(frontend.klt_prediction, KltPrediction::default());
+    assert_eq!(frontend.klt_retry, KltRetry::Off);
+    assert_eq!(frontend.forward_backward, ForwardBackward::Off);
+    assert_eq!(frontend.track_refill, TrackRefill::Off);
+    assert!(!frontend.adopt_landmarks);
+    assert_eq!(frontend.gyro_guess, GyroGuess::Off);
+    assert_eq!(frontend.flow_pose, FlowPose::RansacPnp);
+    assert_eq!(frontend.flow_bookkeeping, FlowBookkeeping::EveryFrame);
+    assert_eq!(frontend.fisheye_weight, FisheyeWeight::Uniform);
+    for threads in [2, 3] {
+        let preset = orin_preset(threads, 48);
+        assert_eq!(preset.validate(), Ok(()), "{threads} threads");
+        assert!(preset.to_string().contains("flow threads"));
+    }
+}
+
+#[test]
+fn flow_knob_ranges_are_checked() {
+    let windowed = OrbFrontendConfig {
+        klt_kernel: LkKernel::WindowedU8,
+        ..OrbFrontendConfig::default()
+    };
+    for (frontend, setting) in [
+        (
+            OrbFrontendConfig {
+                flow_threads: 0,
+                ..windowed
+            },
+            "frontend.flow_threads",
+        ),
+        (
+            OrbFrontendConfig {
+                flow_threads: MAX_FLOW_THREADS + 1,
+                ..windowed
+            },
+            "frontend.flow_threads",
+        ),
+        (
+            OrbFrontendConfig {
+                klt_window: 10,
+                ..windowed
+            },
+            "frontend.klt_window",
+        ),
+        (
+            OrbFrontendConfig {
+                klt_window: 1,
+                ..windowed
+            },
+            "frontend.klt_window",
+        ),
+        (
+            OrbFrontendConfig {
+                klt_retry: KltRetry::CoarseLevel { max_level: 0 },
+                ..windowed
+            },
+            "frontend.klt_retry.max_level",
+        ),
+        (
+            OrbFrontendConfig {
+                forward_backward: ForwardBackward::Enabled {
+                    max_round_trip_px: 0.0,
+                    max_iter: 4,
+                    every_n_frames: 1,
+                },
+                ..windowed
+            },
+            "frontend.forward_backward.max_round_trip_px",
+        ),
+        (
+            OrbFrontendConfig {
+                forward_backward: ForwardBackward::Enabled {
+                    max_round_trip_px: f32::NAN,
+                    max_iter: 4,
+                    every_n_frames: 1,
+                },
+                ..windowed
+            },
+            "frontend.forward_backward.max_round_trip_px",
+        ),
+        (
+            OrbFrontendConfig {
+                forward_backward: ForwardBackward::Enabled {
+                    max_round_trip_px: 0.6,
+                    max_iter: 0,
+                    every_n_frames: 1,
+                },
+                ..windowed
+            },
+            "frontend.forward_backward.max_iter",
+        ),
+        (
+            OrbFrontendConfig {
+                forward_backward: ForwardBackward::Enabled {
+                    max_round_trip_px: 0.6,
+                    max_iter: 4,
+                    every_n_frames: 0,
+                },
+                ..windowed
+            },
+            "frontend.forward_backward.every_n_frames",
+        ),
+        (
+            OrbFrontendConfig {
+                track_refill: TrackRefill::Enabled {
+                    per_camera: 0,
+                    min_spacing_px: 23.0,
+                    refill_below: 0.8,
+                    border_px: 9,
+                },
+                ..windowed
+            },
+            "frontend.track_refill.per_camera",
+        ),
+        (
+            OrbFrontendConfig {
+                track_refill: TrackRefill::Enabled {
+                    per_camera: 48,
+                    min_spacing_px: 0.0,
+                    refill_below: 0.8,
+                    border_px: 9,
+                },
+                ..windowed
+            },
+            "frontend.track_refill.min_spacing_px",
+        ),
+        (
+            OrbFrontendConfig {
+                track_refill: TrackRefill::Enabled {
+                    per_camera: 48,
+                    min_spacing_px: 23.0,
+                    refill_below: 0.0,
+                    border_px: 9,
+                },
+                ..windowed
+            },
+            "frontend.track_refill.refill_below",
+        ),
+        (
+            OrbFrontendConfig {
+                track_refill: TrackRefill::Enabled {
+                    per_camera: 48,
+                    min_spacing_px: 23.0,
+                    refill_below: 1.5,
+                    border_px: 9,
+                },
+                ..windowed
+            },
+            "frontend.track_refill.refill_below",
+        ),
+        (
+            OrbFrontendConfig {
+                flow_pose: FlowPose::AnalyticGn { max_iter: 0 },
+                ..windowed
+            },
+            "frontend.flow_pose.max_iter",
+        ),
+    ] {
+        let config = with_frontend(frontend, CameraSelection::Rig);
+        assert_eq!(invalid_setting(&config).as_deref(), Some(setting));
+    }
+}
+
+#[test]
+fn flow_knobs_are_refused_without_the_knobs_they_need() {
+    let needs = |knob: &'static str, needs: &'static str| -> Result<(), ConfigError> {
+        Err(ConfigError::FrontendKnobNeeds { knob, needs })
+    };
+    let windowed = OrbFrontendConfig {
+        klt_kernel: LkKernel::WindowedU8,
+        ..OrbFrontendConfig::default()
+    };
+    let threaded = OrbFrontendConfig {
+        flow_threads: 2,
+        klt_rig: KltRig::AllCameras,
+        ..windowed
+    };
+    let on_rig = |frontend| with_frontend(frontend, CameraSelection::Rig).validate();
+    assert_eq!(on_rig(threaded), Ok(()));
+    assert_eq!(
+        on_rig(OrbFrontendConfig {
+            klt_rig: KltRig::PrimaryOnly,
+            ..threaded
+        }),
+        needs("flow_threads", "klt_rig AllCameras on a rig")
+    );
+    assert_eq!(
+        with_frontend(threaded, CameraSelection::Mono).validate(),
+        needs("flow_threads", "klt_rig AllCameras on a rig")
+    );
+    assert_eq!(
+        on_rig(OrbFrontendConfig {
+            klt_window: 11,
+            klt_kernel: LkKernel::F32,
+            ..OrbFrontendConfig::default()
+        }),
+        needs(
+            "klt_window",
+            "klt_kernel FixedPointU8 or WindowedU8 unless it is 21"
+        )
+    );
+    assert_eq!(
+        on_rig(OrbFrontendConfig {
+            klt_window: 11,
+            ..OrbFrontendConfig::default()
+        }),
+        Ok(())
+    );
+    let fixed_point = OrbFrontendConfig::default();
+    for (frontend, knob) in [
+        (
+            OrbFrontendConfig {
+                klt_retry: KltRetry::CoarseLevel { max_level: 1 },
+                ..fixed_point
+            },
+            "klt_retry",
+        ),
+        (
+            OrbFrontendConfig {
+                forward_backward: ForwardBackward::Enabled {
+                    max_round_trip_px: 0.6,
+                    max_iter: 4,
+                    every_n_frames: 1,
+                },
+                ..fixed_point
+            },
+            "forward_backward",
+        ),
+        (
+            OrbFrontendConfig {
+                track_refill: TrackRefill::Enabled {
+                    per_camera: 48,
+                    min_spacing_px: 23.0,
+                    refill_below: 0.8,
+                    border_px: 9,
+                },
+                ..fixed_point
+            },
+            "track_refill",
+        ),
+        (
+            OrbFrontendConfig {
+                klt_kernel: LkKernel::FixedPointU8,
+                ..threaded
+            },
+            "flow_threads",
+        ),
+    ] {
+        assert_eq!(
+            on_rig(frontend),
+            needs(knob, "klt_kernel WindowedU8"),
+            "{knob}"
+        );
+    }
+}
+
+#[test]
+fn flow_threads_need_a_shard_layout_for_the_rig() {
+    for (threads, cameras, ok) in [
+        (1, 0, true),
+        (1, 2, true),
+        (2, 2, true),
+        (3, 2, true),
+        (4, 2, false),
+        (2, 0, false),
+    ] {
+        let frontend = OrbFrontendConfig {
+            flow_threads: threads,
+            ..OrbFrontendConfig::default()
+        };
+        let expected = if ok {
+            Ok(())
+        } else {
+            Err(ConfigError::FlowThreadsForRig { threads, cameras })
+        };
+        assert_eq!(
+            frontend.validate_flow_threads(cameras),
+            expected,
+            "{threads} threads, {cameras} cameras"
+        );
+    }
+}
+
+#[test]
+fn online_calibration_is_off_by_default_and_checked() {
+    use crate::mapping::global_vi_ba::{ClockOffsetPrior, RotationSlicePrior};
+    let default = LocalBaConfig::default().online_calibration;
+    assert_eq!(default, OnlineCalibrationConfig::default());
+    assert!(!default.is_enabled());
+    assert_eq!(default.camera_rotation, None);
+    assert_eq!(default.camera_focal, None);
+    assert_eq!(default.gyro_intrinsics, None);
+    assert_eq!(default.clock_offset, None);
+
+    let with = |online_calibration, imu| {
+        let mut config = SystemConfig {
+            sensors: sensors(CameraSelection::Mono, imu),
+            ..SystemConfig::default()
+        };
+        orb_mut(&mut config).mapping.local_ba.online_calibration = online_calibration;
+        config
+    };
+    let td = OnlineCalibrationConfig {
+        clock_offset: Some(ClockOffsetPrior { sigma_ms: 2.0 }),
+        ..OnlineCalibrationConfig::default()
+    };
+    assert!(td.is_enabled());
+    assert_eq!(with(td, true).validate(), Ok(()));
+    assert_eq!(
+        with(td, false).validate(),
+        Err(ConfigError::InertialKnobWithoutImu(
+            "mapping.local_ba.online_calibration"
+        ))
+    );
+    let zero = OnlineCalibrationConfig {
+        camera_rotation: Some(RotationSlicePrior {
+            step_sigma_deg: 0.0,
+            value_sigma_deg: 1.0,
+        }),
+        ..OnlineCalibrationConfig::default()
+    };
+    assert_eq!(
+        invalid_setting(&with(zero, true)).as_deref(),
+        Some("mapping.local_ba.online_calibration.camera_rotation.step_sigma_deg")
+    );
+}
+
 mod runtime_settings {
     use super::*;
+
+    /// `klt_rig: AllCameras` lets a rig defer ORB to flow frames; the default
+    /// keeps ORB on every rig frame.
+    #[test]
+    fn klt_first_reaches_a_rig_only_with_every_camera_tracked() {
+        let primary = rig().camera;
+        let view = |primary_from_camera| kornia_sensors::RigCamera {
+            camera: primary.clone(),
+            size: kornia_image::ImageSize {
+                width: 640,
+                height: 480,
+            },
+            primary_from_camera,
+            raw_model: None,
+        };
+        let two_cameras = rig().with_rig_cameras(vec![
+            view(Pose3d::IDENTITY),
+            view(Pose3d::new(
+                kornia_algebra::Mat3F64::IDENTITY,
+                kornia_algebra::Vec3F64::new(0.1, 0.0, 0.0),
+            )),
+        ]);
+        let selected = sensors(CameraSelection::Rig, false)
+            .select_rig(two_cameras)
+            .unwrap();
+        let klt_min_tracks = |klt_rig| {
+            let mut config = SystemConfig::default();
+            orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
+                klt_rig,
+                ..OrbFrontendConfig::default()
+            });
+            config.settings(&selected).klt_min_tracks
+        };
+        assert_eq!(klt_min_tracks(KltRig::PrimaryOnly), None);
+        assert_eq!(klt_min_tracks(KltRig::AllCameras), Some(80));
+        assert_eq!(
+            SystemConfig::default().settings(&rig()).klt_min_tracks,
+            Some(80)
+        );
+    }
 
     fn stereo_imu_rig() -> SensorRig {
         rig().with_stereo_baseline(0.11).with_imu(Pose3d::IDENTITY)
@@ -358,6 +1148,8 @@ mod runtime_settings {
             ref_ratio: 0.8,
             min_parallax_px: Some(12.0),
             max_interval_sec: Some(0.5),
+            rules: KeyframeRules::Kornia,
+            stillness: crate::tracking::Stillness::Gate,
         };
         orb.mapping.execution = LocalMappingMode::Synchronous;
         orb.tuning.initialization.acceptance_config.min_inliers = 40;
@@ -395,6 +1187,307 @@ mod runtime_settings {
         assert_eq!(close_depth(StereoCloseDepth::Metres(2.5)), Some(2.5));
         assert_eq!(close_depth(StereoCloseDepth::Disabled), None);
     }
+
+    /// The default knobs are the solver's constants, bit for bit; a disparity
+    /// sigma resolves against focal length times baseline.
+    #[test]
+    fn local_ba_settings_resolve_against_the_rig() {
+        let selected = sensors(CameraSelection::Stereo, false)
+            .select_rig(stereo_imu_rig())
+            .unwrap();
+        assert_eq!(
+            SystemConfig::default().settings(&selected).local_ba,
+            LocalBaParams::default()
+        );
+        assert_eq!(LocalBaParams::default().max_iterations, 50);
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).mapping.local_ba = LocalBaConfig {
+            active_keyframes: 10,
+            max_iterations: 10,
+            stereo_depth_sigma: StereoDepthSigma::Disparity { px: 1.0 },
+            visual_information: VisualInformation::OctaveScaled,
+            dense_parallelism: DenseParallelism::Sequential,
+            initial_lambda: 1e-4,
+            ..LocalBaConfig::default()
+        };
+        let settings = config.settings(&selected);
+        assert_eq!(
+            settings.map_projection.pnp.visual_information,
+            VisualInformation::OctaveScaled
+        );
+        let local_ba = settings.local_ba;
+        assert_eq!(local_ba.visual_information, VisualInformation::OctaveScaled);
+        assert_eq!(local_ba.active_keyframes, 10);
+        assert_eq!(local_ba.max_iterations, 10);
+        assert_eq!(local_ba.dense_parallelism, DenseParallelism::Sequential);
+        assert_eq!(local_ba.initial_lambda, 1e-4);
+        assert_eq!(LocalBaConfig::default().initial_lambda, 1.0);
+        assert_eq!(LocalBaParams::default().initial_lambda, 1.0);
+        let fb = selected.camera.fx * 0.11;
+        assert_eq!(
+            local_ba.depth_sigma,
+            DepthSigma::Disparity {
+                px_over_focal_baseline: (1.0 / fb) as f32
+            }
+        );
+    }
+
+    /// G11: off by default; when set it reaches the PnP refine.
+    #[test]
+    fn refine_monotone_reaches_the_pnp_refine() {
+        let selected = rig();
+        let monotone = |c: &SystemConfig| c.settings(&selected).map_projection.pnp.refine_monotone;
+        let mut config = SystemConfig::default();
+        assert!(!monotone(&config));
+        orb_mut(&mut config).tracking.refine_monotone = true;
+        assert!(monotone(&config));
+    }
+
+    #[test]
+    fn only_the_rig_selection_keeps_the_rig_cameras() {
+        let primary = rig().camera;
+        let view = |primary_from_camera| kornia_sensors::RigCamera {
+            camera: primary.clone(),
+            size: kornia_image::ImageSize {
+                width: 640,
+                height: 480,
+            },
+            primary_from_camera,
+            raw_model: None,
+        };
+        let two_cameras = rig().with_rig_cameras(vec![
+            view(Pose3d::IDENTITY),
+            view(Pose3d::new(
+                kornia_algebra::Mat3F64::IDENTITY,
+                kornia_algebra::Vec3F64::new(0.1, 0.0, 0.0),
+            )),
+        ]);
+        let selected = sensors(CameraSelection::Rig, false)
+            .select_rig(two_cameras.clone())
+            .unwrap();
+        assert_eq!(selected.cameras.len(), 2);
+        let mono = sensors(CameraSelection::Mono, false)
+            .select_rig(two_cameras)
+            .unwrap();
+        assert!(mono.cameras.is_empty());
+        assert!(matches!(
+            sensors(CameraSelection::Rig, false).select_rig(rig()),
+            Err(ConfigError::MissingSensor(_))
+        ));
+    }
+}
+
+/// R11b: the outlier erase prints its own header line, leaves the
+/// `local BA:` line's format alone, and is range checked.
+#[test]
+fn the_outlier_erase_is_named_in_the_header_and_range_checked() {
+    use crate::mapping::outlier_erase::{ChiSquareErase, OutlierErase};
+    let with = |outlier_erase| {
+        let mut config = SystemConfig {
+            sensors: sensors(CameraSelection::Stereo, true),
+            ..SystemConfig::default()
+        };
+        orb_mut(&mut config).mapping.local_ba.outlier_erase = outlier_erase;
+        config
+    };
+    assert!(
+        !with(OutlierErase::Off)
+            .to_string()
+            .contains("outlier erase")
+    );
+    let on = with(OutlierErase::ChiSquare(ChiSquareErase::default()));
+    assert_eq!(on.validate(), Ok(()));
+    assert!(on.to_string().contains(
+        "  local BA outlier erase: ChiSquare(ChiSquareErase { reprojection_chi2: 5.991, \
+         stereo_chi2: 7.815, close_factor: 1.5, close_range_m: 10.0 })\n"
+    ));
+    for rule in [
+        ChiSquareErase {
+            reprojection_chi2: 0.0,
+            ..ChiSquareErase::default()
+        },
+        ChiSquareErase {
+            stereo_chi2: f64::NAN,
+            ..ChiSquareErase::default()
+        },
+        ChiSquareErase {
+            close_factor: 0.5,
+            ..ChiSquareErase::default()
+        },
+        ChiSquareErase {
+            close_range_m: -1.0,
+            ..ChiSquareErase::default()
+        },
+    ] {
+        assert_eq!(
+            invalid_setting(&with(OutlierErase::ChiSquare(rule))).as_deref(),
+            Some("mapping.local_ba.outlier_erase"),
+            "{rule:?}"
+        );
+    }
+    let mut visual = on;
+    visual.sensors = sensors(CameraSelection::Stereo, false);
+    assert_eq!(
+        visual.validate(),
+        Err(ConfigError::InertialKnobWithoutImu(
+            "mapping.local_ba.outlier_erase"
+        ))
+    );
+}
+
+#[test]
+fn the_fan_out_is_named_in_the_header_and_range_checked() {
+    let with = |fan_out| {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).fan_out = fan_out;
+        config
+    };
+    assert_eq!(OrbSlamPipeline::default().fan_out, FanOut::Global);
+    assert!(!with(FanOut::Global).to_string().contains("fan-out"));
+    let on = with(FanOut::Bounded(BoundedFanOut::default()));
+    assert_eq!(on.validate(), Ok(()));
+    assert!(
+        on.to_string().contains(
+            "  tracking\n  fan-out: bounded, 1 extraction threads, workers fork inline\n"
+        )
+    );
+    assert_eq!(
+        invalid_setting(&with(FanOut::Bounded(BoundedFanOut {
+            tracking_threads: 0
+        })))
+        .as_deref(),
+        Some("fan_out.tracking_threads")
+    );
+}
+
+#[test]
+fn the_keyframe_growth_is_named_in_the_header_only_when_set() {
+    use crate::mapping::KeyframeGrowth;
+    let mut config = SystemConfig::default();
+    assert_eq!(
+        orb_mut(&mut config).mapping.keyframe_growth,
+        KeyframeGrowth::Tracking
+    );
+    assert!(!config.to_string().contains("keyframe growth"));
+    orb_mut(&mut config).mapping.keyframe_growth = KeyframeGrowth::Mapping;
+    assert!(
+        config
+            .to_string()
+            .contains("  local mapping: asynchronous\n  keyframe growth: Mapping\n")
+    );
+}
+
+fn sliding_window(mode: OdometryMode, imu_noise: OdometryImuNoise) -> Odometry {
+    Odometry::SlidingWindow(SlidingWindowConfig {
+        mode,
+        imu_noise,
+        ..SlidingWindowConfig::default()
+    })
+}
+
+fn with_odometry(odometry: Odometry, sensors: SensorSelection) -> SystemConfig {
+    let mut config = SystemConfig {
+        sensors,
+        ..SystemConfig::default()
+    };
+    orb_mut(&mut config).odometry = odometry;
+    config
+}
+
+/// T8: the sliding window needs the IMU and a rectified pair, `Drive` is
+/// not built, and explicit noise densities are finite and positive.
+#[test]
+fn the_odometry_knob_is_validated() {
+    let observe = sliding_window(OdometryMode::Observe, OdometryImuNoise::Rig);
+    let stereo_imu = sensors(CameraSelection::Stereo, true);
+    assert_eq!(with_odometry(observe, stereo_imu).validate(), Ok(()));
+    assert_eq!(
+        with_odometry(Odometry::MapTracking, sensors(CameraSelection::Mono, false)).validate(),
+        Ok(())
+    );
+    assert_eq!(
+        with_odometry(observe, sensors(CameraSelection::Stereo, false)).validate(),
+        Err(ConfigError::InertialKnobWithoutImu("odometry"))
+    );
+    for cameras in [CameraSelection::Mono, CameraSelection::Rig] {
+        assert!(matches!(
+            with_odometry(observe, sensors(cameras, true)).validate(),
+            Err(ConfigError::OdometryNeeds { needs }) if needs.contains("Stereo")
+        ));
+    }
+    let drive = sliding_window(OdometryMode::Drive, OdometryImuNoise::Rig);
+    assert_eq!(
+        with_odometry(drive, stereo_imu).validate(),
+        Err(ConfigError::OdometryNeeds {
+            needs: super::super::validation::UNBUILT
+        })
+    );
+    let basalt = kornia_sensors::imu::ImuCalib {
+        gyro_noise: 2.82e-4,
+        accel_noise: 1.6e-2,
+        gyro_bias_noise: 1.0e-4,
+        accel_bias_noise: 1.0e-3,
+    };
+    let explicit = |noise| sliding_window(OdometryMode::Observe, OdometryImuNoise::Explicit(noise));
+    assert_eq!(
+        with_odometry(explicit(basalt), stereo_imu).validate(),
+        Ok(())
+    );
+    for (field, bad) in [
+        ("gyro_noise", 0.0),
+        ("accel_noise", -1.0),
+        ("gyro_bias_noise", f64::NAN),
+        ("accel_bias_noise", f64::INFINITY),
+    ] {
+        let mut noise = basalt;
+        match field {
+            "gyro_noise" => noise.gyro_noise = bad,
+            "accel_noise" => noise.accel_noise = bad,
+            "gyro_bias_noise" => noise.gyro_bias_noise = bad,
+            _ => noise.accel_bias_noise = bad,
+        }
+        let config = with_odometry(explicit(noise), stereo_imu);
+        assert_eq!(
+            invalid_setting(&config).as_deref(),
+            Some(format!("odometry.imu_noise.{field}").as_str())
+        );
+    }
+}
+
+/// T8: one header line only when the knob is on, so the golden headers of
+/// every existing arm hold.
+#[test]
+fn the_odometry_knob_is_named_in_the_header_only_when_set() {
+    let stereo_imu = sensors(CameraSelection::Stereo, true);
+    let off = with_odometry(Odometry::MapTracking, stereo_imu).to_string();
+    assert!(!off.contains("odometry"), "{off}");
+    let on = with_odometry(
+        sliding_window(OdometryMode::Observe, OdometryImuNoise::Rig),
+        stereo_imu,
+    )
+    .to_string();
+    assert!(
+        on.contains("  tracking\n  odometry: sliding window, Observe, IMU noise Rig\n"),
+        "{on}"
+    );
+    assert_eq!(
+        on.replace("  odometry: sliding window, Observe, IMU noise Rig\n", ""),
+        off
+    );
+    let current = with_odometry(
+        Odometry::SlidingWindow(SlidingWindowConfig {
+            visual_jacobians: VisualJacobians::Current,
+            ..SlidingWindowConfig::default()
+        }),
+        stereo_imu,
+    )
+    .to_string();
+    assert!(
+        current.contains(
+            "  odometry: sliding window, Observe, IMU noise Rig, visual Jacobians Current\n"
+        ),
+        "{current}"
+    );
 }
 
 #[cfg(feature = "serde")]
@@ -402,6 +1495,122 @@ mod ron_files {
     use std::path::Path;
 
     use super::*;
+    use crate::loop_closure::OdometryRandomWalk;
+    use crate::tracking::Stillness;
+
+    /// T8: the knob's RON shapes parse, round trip, and `Drive` parses but
+    /// is refused.
+    #[test]
+    fn the_odometry_knob_parses_and_round_trips() {
+        let at = |odometry: &str| {
+            parse(&format!(
+                "(version: 1, sensors: (cameras: Stereo, imu: true), pipeline: OrbSlam((odometry: {odometry})))"
+            ))
+        };
+        let default = parse("(version: 1)").unwrap();
+        assert_eq!(orb(&default).odometry, Odometry::MapTracking);
+        assert_eq!(
+            orb(&at("MapTracking").unwrap()).odometry,
+            Odometry::MapTracking
+        );
+        let observe = at("SlidingWindow(( mode: Observe ))").unwrap();
+        assert_eq!(
+            orb(&observe).odometry,
+            Odometry::SlidingWindow(SlidingWindowConfig::default())
+        );
+        assert_eq!(ron(&observe), ron(&parse(&ron(&observe)).unwrap()));
+        let explicit = at(
+            "SlidingWindow(( mode: Observe, imu_noise: Explicit(( gyro_noise: 2.82e-4, \
+             accel_noise: 1.6e-2, gyro_bias_noise: 1.0e-4, accel_bias_noise: 1.0e-3 )) ))",
+        )
+        .unwrap();
+        let Some(window) = orb(&explicit).odometry.sliding_window() else {
+            panic!("not a sliding window");
+        };
+        assert!(
+            matches!(window.imu_noise, OdometryImuNoise::Explicit(n) if n.accel_noise == 1.6e-2)
+        );
+        assert_eq!(ron(&explicit), ron(&parse(&ron(&explicit)).unwrap()));
+        let current = at("SlidingWindow(( mode: Observe, visual_jacobians: Current ))").unwrap();
+        assert_eq!(
+            orb(&current)
+                .odometry
+                .sliding_window()
+                .map(|w| w.visual_jacobians),
+            Some(VisualJacobians::Current)
+        );
+        assert_eq!(ron(&current), ron(&parse(&ron(&current)).unwrap()));
+        assert!(matches!(
+            at("SlidingWindow(( mode: Drive ))"),
+            Err(LoadError::Invalid(ConfigError::OdometryNeeds { .. }))
+        ));
+        assert!(rejects_field(
+            "(version: 1, pipeline: OrbSlam((odometry: SlidingWindow(( window: 3 )))))",
+            "window"
+        ));
+    }
+
+    #[test]
+    fn the_keyframe_growth_parses() {
+        use crate::mapping::KeyframeGrowth;
+        let config =
+            parse("(version: 1, pipeline: OrbSlam((mapping: (keyframe_growth: Mapping))))")
+                .unwrap();
+        assert_eq!(
+            orb(&config).mapping.keyframe_growth,
+            KeyframeGrowth::Mapping
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+    }
+
+    #[test]
+    fn the_fan_out_parses() {
+        assert_eq!(orb(&parse("(version: 1)").unwrap()).fan_out, FanOut::Global);
+        let config =
+            parse("(version: 1, pipeline: OrbSlam((fan_out: Bounded((tracking_threads: 2)))))")
+                .unwrap();
+        assert_eq!(
+            orb(&config).fan_out,
+            FanOut::Bounded(BoundedFanOut {
+                tracking_threads: 2
+            })
+        );
+        assert_eq!(
+            orb(&parse("(version: 1, pipeline: OrbSlam((fan_out: Bounded(()))))").unwrap()).fan_out,
+            FanOut::Bounded(BoundedFanOut::default())
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+    }
+
+    #[test]
+    fn the_outlier_erase_parses_to_orb_slam3s_thresholds() {
+        use crate::mapping::outlier_erase::{ChiSquareErase, OutlierErase};
+        assert_eq!(
+            orb(&parse("(version: 1)").unwrap())
+                .mapping
+                .local_ba
+                .outlier_erase,
+            OutlierErase::Off
+        );
+        let config = parse(
+            "(version: 1, sensors: (cameras: Stereo, imu: true), pipeline: OrbSlam((mapping: (local_ba: (outlier_erase: ChiSquare(()))))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).mapping.local_ba.outlier_erase,
+            OutlierErase::ChiSquare(ChiSquareErase {
+                reprojection_chi2: 5.991,
+                stereo_chi2: 7.815,
+                close_factor: 1.5,
+                close_range_m: 10.0,
+            })
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+        assert!(rejects_field(
+            "(version: 1, sensors: (cameras: Stereo, imu: true), pipeline: OrbSlam((mapping: (local_ba: (outlier_erase: ChiSquare((chi2: 3.0)))))))",
+            "chi2"
+        ));
+    }
 
     const EXPLICIT_DEFAULTS: &str = r#"
         (
@@ -443,6 +1652,148 @@ mod ron_files {
     }
 
     #[test]
+    fn the_stillness_knob_parses_round_trips_and_refuses_stationary_edges() {
+        let config = parse(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((keyframes: (stillness: Gate))))",
+        )
+        .unwrap();
+        assert_eq!(orb(&config).keyframes.stillness, Stillness::Gate);
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+        assert_eq!(config.validate(), Ok(()));
+        assert!(config.to_string().contains("stillness: Gate"));
+
+        let default = parse("(version: 1)").unwrap();
+        assert_eq!(orb(&default).keyframes.stillness, Stillness::Off);
+        assert!(!default.to_string().contains("stillness"));
+    }
+
+    #[test]
+    fn the_inertial_config_defaults() {
+        let default = parse("(version: 1)").unwrap();
+        assert_eq!(orb(&default).inertial, InertialConfig::default());
+    }
+
+    #[test]
+    fn the_growth_baseline_ratio_parses_and_round_trips() {
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((mapping: (growth_min_baseline_ratio: 0.0175))))",
+        )
+        .unwrap();
+        assert_eq!(orb(&config).mapping.growth_min_baseline_ratio, 0.0175);
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+
+        let default = parse("(version: 1)").unwrap();
+        assert_eq!(orb(&default).mapping.growth_min_baseline_ratio, 0.0);
+    }
+
+    #[test]
+    fn the_initial_lambda_parses_and_round_trips() {
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((mapping: (local_ba: (max_iterations: 7, initial_lambda: 1e-4)))))",
+        )
+        .unwrap();
+        assert_eq!(orb(&config).mapping.local_ba.initial_lambda, 1e-4);
+        assert_eq!(orb(&config).mapping.local_ba.max_iterations, 7);
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+        assert_eq!(config.validate(), Ok(()));
+        let default = parse("(version: 1)").unwrap();
+        assert_eq!(orb(&default).mapping.local_ba.initial_lambda, 1.0);
+    }
+
+    #[test]
+    fn the_dense_parallelism_parses_and_round_trips() {
+        let default = parse("(version: 1)").unwrap();
+        assert_eq!(
+            orb(&default).mapping.local_ba.dense_parallelism,
+            DenseParallelism::Global
+        );
+
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((mapping: (local_ba: (dense_parallelism: Sequential)))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).mapping.local_ba.dense_parallelism,
+            DenseParallelism::Sequential
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+        assert_eq!(config.validate(), Ok(()));
+        assert!(matches!(
+            parse_error("(version: 1, pipeline: OrbSlam((mapping: (local_ba: (dense_parallelism: Bogus)))))"),
+            ron::Error::NoSuchEnumVariant { found, .. } if found == "Bogus"
+        ));
+    }
+
+    #[test]
+    fn the_pose_inertial_min_inliers_parses_round_trips_and_prints() {
+        let default = parse("(version: 1)").unwrap();
+        assert_eq!(
+            orb(&default).tracking.pose_inertial_min_inliers,
+            PoseInertialMinInliers::Visual
+        );
+        assert!(!default.to_string().contains("pose-inertial min inliers"));
+
+        let config = parse(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking: (pose_inertial: OrbSlam3, pose_inertial_min_inliers: WithPrediction))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).tracking.pose_inertial_min_inliers,
+            PoseInertialMinInliers::WithPrediction
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+        assert_eq!(config.validate(), Ok(()));
+        assert!(
+            config
+                .to_string()
+                .contains("  pose-inertial min inliers: WithPrediction\n")
+        );
+        assert!(matches!(
+            parse_error("(version: 1, pipeline: OrbSlam((tracking: (pose_inertial_min_inliers: Bogus))))"),
+            ron::Error::NoSuchEnumVariant { found, .. } if found == "Bogus"
+        ));
+    }
+
+    #[test]
+    fn the_frame_velocity_parses_and_round_trips() {
+        let default = parse("(version: 1)").unwrap();
+        assert_eq!(
+            orb(&default).tracking.frame_velocity,
+            FrameVelocity::KeyframeVelocity
+        );
+
+        let config = parse(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking: (frame_velocity: PropagatedFromKeyframe))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).tracking.frame_velocity,
+            FrameVelocity::PropagatedFromKeyframe
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+        assert_eq!(config.validate(), Ok(()));
+        assert!(matches!(
+            parse_error("(version: 1, pipeline: OrbSlam((tracking: (frame_velocity: Bogus))))"),
+            ron::Error::NoSuchEnumVariant { found, .. } if found == "Bogus"
+        ));
+    }
+
+    #[test]
+    fn the_fisheye_weight_parses_and_round_trips() {
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((frontend: Orb((fisheye_weight: Magnification)))))",
+        )
+        .unwrap();
+        let FrontendConfig::Orb(frontend) = orb(&config).frontend;
+        assert_eq!(frontend.fisheye_weight, FisheyeWeight::Magnification);
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+
+        let default = parse("(version: 1)").unwrap();
+        let FrontendConfig::Orb(frontend) = orb(&default).frontend;
+        assert_eq!(frontend.fisheye_weight, FisheyeWeight::Uniform);
+    }
+
+    #[test]
     fn omitted_settings_take_their_defaults() {
         let default = ron(&SystemConfig::default());
         assert_eq!(ron(&parse(EXPLICIT_DEFAULTS).unwrap()), default);
@@ -464,6 +1815,40 @@ mod ron_files {
         assert_eq!(orb(&config).keyframes.max_frames_between, usize::MAX);
         assert_eq!(orb(&config).keyframes.min_parallax_px, Some(10.0));
         assert_eq!(orb(&config).keyframes.max_interval_sec, Some(0.5));
+
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((mapping: (local_ba: (active_keyframes: 10, stereo_depth_sigma: Disparity(px: 1.0))))))",
+        )
+        .unwrap();
+        let local_ba = orb(&config).mapping.local_ba;
+        assert_eq!(local_ba.active_keyframes, 10);
+        assert_eq!(
+            local_ba.stereo_depth_sigma,
+            StereoDepthSigma::Disparity { px: 1.0 }
+        );
+        assert!(local_ba.boundary_scales_bias_rows);
+        assert_eq!(local_ba.boundary, BoundaryPrior::ScaledEdge);
+        assert_eq!(local_ba.max_iterations, 50);
+
+        let config =
+            parse("(version: 1, pipeline: OrbSlam((mapping: (local_ba: (max_iterations: 10)))))")
+                .unwrap();
+        assert_eq!(orb(&config).mapping.local_ba.max_iterations, 10);
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((mapping: (local_ba: (boundary: Marginal((frozen_pose_sigma_m: 0.002, frozen_pose_sigma_rad: 0.001)))))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).mapping.local_ba.boundary,
+            BoundaryPrior::Marginal(FrozenPoseSigma::default())
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+        assert!(matches!(
+            parse_error("(version: 1, pipeline: OrbSlam((mapping: (local_ba: (boundary: Bogus)))))"),
+            ron::Error::NoSuchEnumVariant { found, .. } if found == "Bogus"
+        ));
     }
 
     /// Tuning is not part of the file format, so a file cannot set it.
@@ -521,6 +1906,10 @@ mod ron_files {
                 "window",
             ),
             (
+                "(version: 1, pipeline: OrbSlam((mapping: (local_ba: (window: 3)))))",
+                "window",
+            ),
+            (
                 "(version: 1, pipeline: OrbSlam((loop_closing: Enabled(vocabulary: \"v.txt\", pgo: true))))",
                 "pgo",
             ),
@@ -560,6 +1949,43 @@ mod ron_files {
     }
 
     #[test]
+    fn loop_graph_defaults_to_the_snapshot_and_drift_is_opt_in() {
+        let base = Path::new("/configs");
+        let text = |graph: &str| {
+            format!(
+                "(version: 1, sensors: (cameras: Stereo), pipeline: OrbSlam((loop_closing: Enabled(vocabulary: \"v.txt\"{graph}))))"
+            )
+        };
+        let default = SystemConfig::from_ron_str(&text(""), base).unwrap();
+        assert_eq!(
+            orb(&default).loop_closing.graph(),
+            Some(LoopGraphSettings {
+                information: LoopGraphInformation::ScalarWeights,
+                persistent: false,
+                accept_capped_solves: false,
+            })
+        );
+        let drift = SystemConfig::from_ron_str(
+            &text(", graph: (information: Drift(loop_cauchy_scale: 2.0), persistent: true)"),
+            base,
+        )
+        .unwrap();
+        let LoopGraphInformation::Drift {
+            odometry,
+            loop_sigma_m,
+            loop_cauchy_scale,
+            ..
+        } = orb(&drift).loop_closing.graph().unwrap().information
+        else {
+            panic!("Drift expected");
+        };
+        assert_eq!(odometry, OdometryRandomWalk::default());
+        assert_eq!(loop_sigma_m, 0.10);
+        assert_eq!(loop_cauchy_scale, 2.0);
+        assert!(orb(&drift).loop_closing.graph().unwrap().persistent);
+    }
+
+    #[test]
     fn file_paths_resolve_against_the_file_directory() {
         let dir = std::env::temp_dir().join(format!("kornia-slam-system-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -580,6 +2006,35 @@ mod ron_files {
     }
 
     #[test]
+    fn loop_closing_execution_is_optional_and_parses() {
+        let text = |execution: &str| {
+            format!(
+                "(version: 1, sensors: (cameras: Stereo), pipeline: OrbSlam((loop_closing: Enabled(vocabulary: \"v.txt\"{execution}))))"
+            )
+        };
+        let execution = |config: &SystemConfig| match &orb(config).loop_closing {
+            LoopClosingMode::Enabled { execution, .. } => *execution,
+            LoopClosingMode::Disabled => panic!("loop closing is enabled"),
+        };
+        assert_eq!(
+            execution(&parse(&text("")).unwrap()),
+            LoopClosingExecution::Synchronous
+        );
+        assert_eq!(
+            execution(&parse(&text(", execution: FollowMapping")).unwrap()),
+            LoopClosingExecution::FollowMapping
+        );
+        assert_eq!(
+            execution(&parse(&text(", execution: Deferred(frames: 4)")).unwrap()),
+            LoopClosingExecution::Deferred { frames: 4 }
+        );
+        assert_eq!(
+            execution(&parse(&text(", execution: Asynchronous")).unwrap()),
+            LoopClosingExecution::Asynchronous
+        );
+    }
+
+    #[test]
     fn missing_file_is_an_io_error() {
         let err = SystemConfig::from_ron_file("/nonexistent/orb.ron").unwrap_err();
         assert!(matches!(err, LoadError::Io { .. }));
@@ -590,6 +2045,8 @@ mod ron_files {
         let mut config = with_loop_closing(
             LoopClosingMode::Enabled {
                 vocabulary: PathBuf::from("/weights/ORBvoc.bin"),
+                execution: LoopClosingExecution::default(),
+                graph: Default::default(),
             },
             sensors(CameraSelection::Stereo, true),
         );
@@ -597,6 +2054,10 @@ mod ron_files {
         settings.frontend = FrontendConfig::Orb(OrbFrontendConfig {
             n_keypoints: 2000,
             stereo_close_depth: StereoCloseDepth::Metres(4.0),
+            klt_first: KltFirst::Enabled { min_tracks: 120 },
+            klt_prediction: KltPrediction::Disabled,
+            klt_kernel: LkKernel::F32,
+            ..OrbFrontendConfig::default()
         });
         settings.keyframes.ref_ratio = 0.75;
         settings.mapping.execution = LocalMappingMode::Synchronous;
@@ -610,7 +2071,360 @@ mod ron_files {
             FrontendConfig::Orb(OrbFrontendConfig {
                 n_keypoints: 2000,
                 stereo_close_depth: StereoCloseDepth::Metres(4.0),
+                klt_first: KltFirst::Enabled { min_tracks: 120 },
+                klt_prediction: KltPrediction::Disabled,
+                klt_kernel: LkKernel::F32,
+                ..OrbFrontendConfig::default()
             })
         );
     }
+
+    #[test]
+    fn tracking_loss_selects_anchors_and_defaults_to_lost_keyframes() {
+        use crate::tracking::KeyframesWhileLost;
+        assert_eq!(
+            orb(&parse("(version: 1)").unwrap())
+                .tracking_loss
+                .keyframes_while_lost,
+            KeyframesWhileLost::Enabled
+        );
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((tracking_loss: (keyframes_while_lost: Anchor))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).tracking_loss.keyframes_while_lost,
+            KeyframesWhileLost::Anchor
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+
+        let config = parse(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (keyframes_while_lost: Anchor, reseed: (keep_inertial: true, min_seed_points: 10)))))",
+        )
+        .unwrap();
+        let reseed = orb(&config).tracking_loss.reseed;
+        assert!(reseed.keep_inertial);
+        assert_eq!(reseed.min_seed_points, 10);
+        assert!(
+            !orb(&parse("(version: 1)").unwrap())
+                .tracking_loss
+                .reseed
+                .keep_inertial
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+    }
+
+    #[test]
+    fn the_pose_gate_defaults_off() {
+        use crate::tracking::pose_gate::PoseGate;
+        let old = parse(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (reseed: (keep_inertial: true)))))",
+        )
+        .unwrap();
+        assert_eq!(orb(&old).tracking_loss.pose_gate, PoseGate::Disabled);
+        assert!(!config_display_mentions_gate(&old));
+    }
+
+    #[test]
+    fn the_innovation_gate_parses_observe_by_default_and_round_trips() {
+        use crate::tracking::pose_gate::{InnovationGate, InnovationMode, PoseGate};
+        let config = parse(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (pose_gate: Innovation(())))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).tracking_loss.pose_gate,
+            PoseGate::Innovation(InnovationGate {
+                mode: InnovationMode::Observe
+            })
+        );
+        assert!(config_display_mentions_gate(&config));
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+
+        let config = parse(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (pose_gate: Innovation((mode: Reject))))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).tracking_loss.pose_gate,
+            PoseGate::Innovation(InnovationGate {
+                mode: InnovationMode::Reject
+            })
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+        assert!(parse(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (pose_gate: Innovation((confidence: 0.99))))))",
+        )
+        .is_err());
+    }
+
+    fn config_display_mentions_gate(config: &SystemConfig) -> bool {
+        config.to_string().contains("pose gate")
+    }
+
+    #[test]
+    fn the_reseed_defaults_are_todays_behaviour_and_round_trip() {
+        let defaults = crate::system::RecoveryConfig::default();
+        assert!(!defaults.keep_inertial);
+        assert_eq!(defaults.min_seed_points, 50);
+        assert_eq!(
+            defaults.seed,
+            crate::system::SeedPlacement::CoastedIfPlausible
+        );
+
+        let config = parse(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (reseed: (keep_inertial: true, min_seed_points: 10)))))",
+        )
+        .unwrap();
+        let reseed = orb(&config).tracking_loss.reseed;
+        assert_eq!(reseed.min_seed_points, 10);
+        assert_eq!(
+            orb(&parse(&ron(&config)).unwrap()).tracking_loss.reseed,
+            reseed
+        );
+
+        let held = parse(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (reseed: (keep_inertial: true, seed: Held)))))",
+        )
+        .unwrap();
+        let reseed = orb(&held).tracking_loss.reseed;
+        assert_eq!(reseed.seed, crate::system::SeedPlacement::Held);
+        assert_eq!(
+            orb(&parse(&ron(&held)).unwrap()).tracking_loss.reseed,
+            reseed
+        );
+        assert_eq!(held.validate(), Ok(()));
+    }
+
+    /// Card AC: a held seed only places a re-seed that keeps the inertial state.
+    #[test]
+    fn a_held_seed_needs_the_kept_inertial_state() {
+        assert!(matches!(
+            parse(
+                "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (reseed: (seed: Held)))))"
+            ),
+            Err(LoadError::Invalid(
+                ConfigError::HeldSeedWithoutKeptInertialState
+            ))
+        ));
+    }
+
+    /// Card E's Orin 2-core preset, as `configs/lamaria-rig-imu-orin2.ron` sets it.
+    const ORIN2_PRESET: &str = r#"
+        (
+            version: 1,
+            sensors: ( cameras: Rig, imu: true ),
+            pipeline: OrbSlam((
+                frontend: Orb((
+                    klt_kernel: WindowedU8,
+                    flow_threads: 2,
+                    klt_rig: AllCameras,
+                    klt_window: 11,
+                    klt_prediction: Enabled(max_level: 0, max_iter: 8),
+                    klt_retry: CoarseLevel(max_level: 1),
+                    forward_backward: Enabled(max_round_trip_px: 0.6, max_iter: 4, every_n_frames: 1),
+                    track_refill: Enabled(per_camera: 48, min_spacing_px: 23.0, refill_below: 0.8, border_px: 9),
+                    adopt_landmarks: true,
+                    gyro_guess: RotatedRay,
+                    flow_pose: AnalyticGn(max_iter: 3),
+                    flow_bookkeeping: KeyframesOnly,
+                )),
+                mapping: ( execution: Asynchronous ),
+            )),
+        )
+    "#;
+
+    #[test]
+    fn the_orin_presets_round_trip() {
+        let parsed = parse(ORIN2_PRESET).unwrap();
+        assert_eq!(orb(&parsed).frontend, orb(&orin_preset(2, 48)).frontend);
+        for preset in [orin_preset(2, 48), orin_preset(3, 64)] {
+            let text = ron(&preset);
+            let reparsed = parse(&text).unwrap();
+            assert_eq!(ron(&reparsed), text);
+            assert_eq!(orb(&reparsed).frontend, orb(&preset).frontend);
+        }
+        assert_eq!(
+            orb(&parse("(version: 1)").unwrap()).frontend,
+            FrontendConfig::default()
+        );
+    }
+
+    #[test]
+    fn each_online_calibration_state_parses() {
+        use crate::mapping::global_vi_ba::{
+            ClockOffsetPrior, FocalSlicePrior, GyroIntrinsicsPrior, RotationSlicePrior,
+        };
+        let online = |states: &str| {
+            parse(&format!(
+                "(version: 1, sensors: (imu: true), pipeline: OrbSlam((mapping: (local_ba: (online_calibration: ({states}))))))"
+            ))
+            .map(|config| orb(&config).mapping.local_ba.online_calibration)
+        };
+        assert_eq!(online("").unwrap(), OnlineCalibrationConfig::default());
+        assert_eq!(
+            online("clock_offset: Some((sigma_ms: 2.0))")
+                .unwrap()
+                .clock_offset,
+            Some(ClockOffsetPrior { sigma_ms: 2.0 })
+        );
+        assert_eq!(
+            online("camera_rotation: Some((step_sigma_deg: 0.05, value_sigma_deg: 1.0))")
+                .unwrap()
+                .camera_rotation,
+            Some(RotationSlicePrior {
+                step_sigma_deg: 0.05,
+                value_sigma_deg: 1.0
+            })
+        );
+        assert_eq!(
+            online("camera_focal: Some((step_sigma: 5e-4, value_sigma: 0.01))")
+                .unwrap()
+                .camera_focal,
+            Some(FocalSlicePrior {
+                step_sigma: 5e-4,
+                value_sigma: 0.01
+            })
+        );
+        assert_eq!(
+            online("gyro_intrinsics: Some((sigma: 0.005))")
+                .unwrap()
+                .gyro_intrinsics,
+            Some(GyroIntrinsicsPrior { sigma: 0.005 })
+        );
+        assert!(rejects_field(
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((mapping: (local_ba: (online_calibration: (time_slices: 8))))))",
+            "time_slices"
+        ));
+        assert!(matches!(
+            online("clock_offset: Some((sigma_ms: 0.0))"),
+            Err(LoadError::Invalid(ConfigError::InvalidSetting { .. }))
+        ));
+        assert!(matches!(
+            parse(
+                "(version: 1, pipeline: OrbSlam((mapping: (local_ba: (online_calibration: (clock_offset: Some((sigma_ms: 2.0))))))))"
+            ),
+            Err(LoadError::Invalid(ConfigError::InertialKnobWithoutImu(_)))
+        ));
+    }
+}
+
+/// G12: the pose gate needs an inertial prediction and a kept inertial state
+/// an IMU; each is inert without one.
+#[test]
+fn knobs_that_read_the_imu_are_refused_without_it() {
+    use crate::tracking::pose_gate::PoseGate;
+    let with = |imu: bool, set: &dyn Fn(&mut OrbSlamPipeline)| {
+        let mut config = SystemConfig {
+            sensors: sensors(CameraSelection::Stereo, imu),
+            ..SystemConfig::default()
+        };
+        set(orb_mut(&mut config));
+        config.validate()
+    };
+    type SetKnob<'a> = &'a dyn Fn(&mut OrbSlamPipeline);
+    let knobs: [(&str, SetKnob); 3] = [
+        ("tracking_loss.pose_gate", &|orb| {
+            orb.tracking_loss.pose_gate = PoseGate::Innovation(Default::default())
+        }),
+        ("tracking_loss.reseed.keep_inertial", &|orb| {
+            orb.tracking_loss.reseed.keep_inertial = true
+        }),
+        ("tracking_loss.reseed.seed", &|orb| {
+            orb.tracking_loss.reseed.keep_inertial = true;
+            orb.tracking_loss.reseed.seed = crate::system::SeedPlacement::Held;
+        }),
+    ];
+    for (knob, set) in knobs {
+        assert_eq!(with(true, set), Ok(()), "{knob}");
+        assert_eq!(
+            with(false, set),
+            Err(ConfigError::InertialKnobWithoutImu(knob)),
+            "{knob}"
+        );
+    }
+    assert_eq!(with(false, &|_| {}), Ok(()), "the defaults need no IMU");
+}
+
+/// Card H: the inertial bar is read only after a pose-inertial solve.
+#[test]
+fn the_pose_inertial_min_inliers_needs_a_pose_inertial_solve() {
+    let with = |pose_inertial: PoseInertial| {
+        let mut config = SystemConfig {
+            sensors: sensors(CameraSelection::Stereo, true),
+            ..SystemConfig::default()
+        };
+        let tracking = &mut orb_mut(&mut config).tracking;
+        tracking.pose_inertial_min_inliers = PoseInertialMinInliers::WithPrediction;
+        tracking.pose_inertial = pose_inertial;
+        config.validate()
+    };
+    assert_eq!(
+        with(PoseInertial::Off),
+        Err(ConfigError::PoseInertialMinInliersWithoutSolve)
+    );
+    for mode in [PoseInertial::LastKeyframe, PoseInertial::OrbSlam3] {
+        assert_eq!(with(mode), Ok(()), "{mode:?}");
+    }
+}
+
+/// R-C8: the frame velocity knob reads the IMU and is inert under the
+/// pose-inertial solve.
+#[test]
+fn the_frame_velocity_needs_the_imu_and_no_pose_inertial_solve() {
+    let with = |imu: bool, pose_inertial: PoseInertial| {
+        let mut config = SystemConfig {
+            sensors: sensors(CameraSelection::Stereo, imu),
+            ..SystemConfig::default()
+        };
+        let tracking = &mut orb_mut(&mut config).tracking;
+        tracking.frame_velocity = FrameVelocity::PropagatedFromKeyframe;
+        tracking.pose_inertial = pose_inertial;
+        config.validate()
+    };
+    assert_eq!(with(true, PoseInertial::Off), Ok(()));
+    assert_eq!(
+        with(false, PoseInertial::Off),
+        Err(ConfigError::InertialKnobWithoutImu(
+            "tracking.frame_velocity"
+        ))
+    );
+    for mode in [PoseInertial::LastKeyframe, PoseInertial::OrbSlam3] {
+        assert_eq!(
+            with(true, mode),
+            Err(ConfigError::FrameVelocityWithPoseInertial),
+            "{mode:?}"
+        );
+    }
+}
+
+/// R-D3: a lock-free flow frame has no descriptors, and a late pose-inertial
+/// reject would send it to relocalization and lost keyframes.
+#[test]
+fn pose_inertial_with_windowed_flow_is_refused() {
+    let with = |flow_pose: FlowPose, klt_first: KltFirst, pose_inertial: PoseInertial| {
+        let mut config = orin_preset(2, 48);
+        let orb = orb_mut(&mut config);
+        let FrontendConfig::Orb(frontend) = &mut orb.frontend;
+        frontend.flow_pose = flow_pose;
+        frontend.klt_first = klt_first;
+        orb.tracking.pose_inertial = pose_inertial;
+        config.validate()
+    };
+    let analytic = FlowPose::AnalyticGn { max_iter: 3 };
+    let klt_first = KltFirst::default();
+    assert_ne!(klt_first, KltFirst::Disabled);
+    assert_eq!(
+        with(analytic, klt_first, PoseInertial::LastKeyframe),
+        Err(ConfigError::PoseInertialWithLockFreeFlow)
+    );
+    assert_eq!(with(analytic, klt_first, PoseInertial::Off), Ok(()));
+    assert_eq!(
+        with(FlowPose::RansacPnp, klt_first, PoseInertial::LastKeyframe),
+        Ok(())
+    );
+    assert_eq!(
+        with(analytic, KltFirst::Disabled, PoseInertial::LastKeyframe),
+        Ok(())
+    );
 }

@@ -47,20 +47,36 @@ pub mod inertial;
 pub mod initialization;
 pub mod loop_closure;
 pub mod mapping;
+mod odometry;
 mod pose_conversion;
+pub mod rectify;
+pub mod rig;
 pub mod stereo;
 pub mod system;
 pub mod tracking;
+#[cfg(feature = "bench_internals")]
+#[doc(hidden)]
+pub mod upstream;
+#[cfg(not(feature = "bench_internals"))]
+pub(crate) mod upstream;
 
 pub use frame::Frame;
 pub use frontend::FrontendObservation;
 pub use kornia_imgproc::features::OrbFeatures;
 pub use kornia_sensors::{ImuCalibration, SensorRig};
 pub use loop_closure::{LoopClosingConfig, LoopClosureEvent};
+#[cfg(feature = "bench_internals")]
+#[doc(hidden)]
+pub use odometry::bench as odometry_bench;
+pub use odometry::{
+    Odometry, OdometryCounters, OdometryImuNoise, OdometryMode, OdometryOutput, OdometryTuning,
+    SlidingWindowConfig, VisualJacobians,
+};
 #[cfg(feature = "serde")]
 pub use system::LoadError;
 pub use system::{
-    BuildError, CameraSelection, ConfigError, LoopClosingMode, ProcessError, SensorSelection,
-    SlamSystem, SystemConfig, TrackingResult, TrackingStatus,
+    BuildError, CameraSelection, ConfigError, FrameTrace, LoopClosingExecution, LoopClosingMode,
+    ProcessError, RunCounters, SensorSelection, SkipKind, SlamSystem, StillnessCounters,
+    SystemConfig, TrackingResult, TrackingStatus,
 };
-pub use tracking::{KeyframePolicy, MapProjectionEstimator};
+pub use tracking::{KeyframePolicy, MapProjectionEstimator, TrackingTimings};

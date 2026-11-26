@@ -176,6 +176,33 @@ fn stereo_preparation_matches_the_recorded_baseline() {
 }
 
 #[test]
+fn stereo_preparation_is_the_same_on_a_bounded_fan_out() {
+    use crate::system::fan_out::TrackingFanOut;
+    use crate::system::{BoundedFanOut, FanOut};
+    let (left, right) = synthetic_pair(376, 240, 8);
+    let prepare = |fan_out: FanOut| {
+        let mut frontend = stereo_frontend();
+        TrackingFanOut::new(fan_out)
+            .unwrap()
+            .run(|| frontend.prepare_stereo_pair(3, &left, &right))
+            .unwrap()
+    };
+    let global = prepare(FanOut::Global);
+    let bounded = prepare(FanOut::Bounded(BoundedFanOut::default()));
+    assert_eq!(global.features.keypoints_xy, bounded.features.keypoints_xy);
+    assert_eq!(global.features.descriptors, bounded.features.descriptors);
+    assert_eq!(global.features.octaves, bounded.features.octaves);
+    assert_eq!(
+        f32_bytes(&global.u_right).collect::<Vec<_>>(),
+        f32_bytes(&bounded.u_right).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        f32_bytes(&global.depth).collect::<Vec<_>>(),
+        f32_bytes(&bounded.depth).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn fisheye_mapping_matches_the_recorded_baseline() {
     let grid: Vec<[f32; 2]> = (0..40)
         .flat_map(|j| (0..40).map(move |i| [i as f32 * 1471.0 / 39.0, j as f32 * 1439.0 / 39.0]))
@@ -268,4 +295,95 @@ fn fisheye_observation_keeps_raw_image_keypoints() {
     let observed = &frontend.observation().keypoints_xy;
     assert!(observed.len() > frame.features.keypoints_xy.len());
     assert!(frontend.observation().stereo_matched.is_none());
+}
+
+#[test]
+fn a_rig_frame_splits_features_per_camera_and_keeps_depth_empty() {
+    let camera = pinhole(240.0, 240.0, 188.0, 120.0);
+    let size = ImageSize {
+        width: 376,
+        height: 240,
+    };
+    let view = |primary_from_camera| kornia_sensors::RigCamera {
+        camera: camera.clone(),
+        size,
+        primary_from_camera,
+        raw_model: None,
+    };
+    // A pure 11 cm sideways baseline: the synthetic pair's 8 px shift.
+    let rig = SensorRig::new(camera.clone()).with_rig_cameras(vec![
+        view(Pose3d::IDENTITY),
+        view(Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            kornia_algebra::Vec3F64::new(0.11, 0.0, 0.0),
+        )),
+    ]);
+    let mut frontend = OrbFrontend::new(OrbDetector::default(), &rig);
+    let (left, right) = synthetic_pair(376, 240, 8);
+    let frame = frontend.prepare_rig(1, &[&left, &right]).unwrap();
+
+    assert!(frame.is_rig());
+    assert!(frame.depth.is_empty() && frame.u_right.is_empty());
+    // A zero-distortion pinhole rig (LaMAria pinhole) reads raw keypoints.
+    assert!(frame.keypoints_undist.is_empty());
+    let ranges = &frame.rig.camera_ranges;
+    assert_eq!(ranges.len(), 2);
+    assert_eq!(ranges[0].start, 0);
+    assert_eq!(ranges[1].end, frame.features.keypoints_xy.len());
+    assert_eq!(frame.rig.stereo_points.len(), ranges[0].len());
+    assert_eq!(frame.camera_of(ranges[1].start), 1);
+    let matched = frame.rig.stereo_points.iter().flatten().count();
+    assert!(matched > 20, "only {matched} overlap points");
+    let mut depths = Vec::new();
+    for (i, point) in frame.rig.stereo_points.iter().enumerate() {
+        let (Some(point), Some(j)) = (point, frame.rig.left_to_right[i]) else {
+            continue;
+        };
+        assert!(ranges[1].contains(&j));
+        depths.push(point.z);
+    }
+    // bf / d = 240 * 0.11 / 8; coarse-octave keypoints are a pixel or two off.
+    depths.sort_by(f64::total_cmp);
+    let median = depths[depths.len() / 2];
+    assert!((median - 3.3).abs() < 0.2, "median depth {median}");
+    let close = depths.iter().filter(|z| (**z - 3.3).abs() < 0.66).count();
+    assert!(
+        close * 10 >= depths.len() * 8,
+        "{close} of {} near 3.3 m",
+        depths.len()
+    );
+}
+
+#[test]
+fn a_distorted_pinhole_rig_frame_undistorts_every_keypoint() {
+    let camera = PinholeCamera {
+        k1: -0.28,
+        ..pinhole(240.0, 240.0, 188.0, 120.0)
+    };
+    let size = ImageSize {
+        width: 376,
+        height: 240,
+    };
+    let view = |primary_from_camera| kornia_sensors::RigCamera {
+        camera: camera.clone(),
+        size,
+        primary_from_camera,
+        raw_model: None,
+    };
+    let rig = SensorRig::new(camera.clone()).with_rig_cameras(vec![
+        view(Pose3d::IDENTITY),
+        view(Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            kornia_algebra::Vec3F64::new(0.11, 0.0, 0.0),
+        )),
+    ]);
+    let mut frontend = OrbFrontend::new(OrbDetector::default(), &rig);
+    let (left, right) = synthetic_pair(376, 240, 8);
+    let frame = frontend.prepare_rig(1, &[&left, &right]).unwrap();
+
+    assert!(!frame.features.keypoints_xy.is_empty());
+    assert_eq!(
+        frame.keypoints_undist.len(),
+        frame.features.keypoints_xy.len()
+    );
 }

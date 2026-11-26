@@ -10,15 +10,27 @@
 //! keeps admission, core publication and the tracker/IMU lifecycle.
 //!
 //! [`vi_ba_schur`] is the visual-inertial solver behind [`bundle_adjustment`];
-//! its IMU, wheel-odometry and parked-robot factors come from `kornia_factors`.
+//! its IMU, wheel-odometry and parked-robot factors come from `kornia_factors`,
+//! and [`marginalization`] is its boundary prior.
 
 pub mod bundle_adjustment;
+mod calibration_states;
 pub mod culling;
+pub mod dense_llt;
+pub mod global_vi_ba;
 pub mod growth;
 pub(crate) mod keyframe_mapping;
 pub mod local_mapping;
 pub mod map;
+pub mod marginalization;
+pub(crate) mod online_calibration;
+pub mod outlier_erase;
+pub mod session;
+#[cfg(any(test, feature = "bench_internals"))]
+pub(crate) mod synthetic_walk;
 pub mod vi_ba_schur;
+pub mod visual_information;
 
+pub use keyframe_mapping::{GrowthNeighbours, KeyframeGrowth};
 pub use local_mapping::{KeyframeJob, LocalMapping, LocalMappingMode};
-pub use map::{Keyframe, Map, MapPoint};
+pub use map::{Keyframe, Map, MapPoint, SegmentId};

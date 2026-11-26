@@ -40,8 +40,8 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuMeasurement};
 
-use super::{ImuInitResult, ImuInitializer, window_is_mono};
-use crate::mapping::map::{Keyframe, Map};
+use super::{ImuInitResult, ImuInitializer, in_window, window_is_mono};
+use crate::mapping::map::{Keyframe, KeyframeVelocity, Map};
 
 /// Mean and spread of a window of raw IMU samples, in the IMU (body) frame.
 ///
@@ -204,7 +204,7 @@ impl ImuInitializer {
         let mut keyframes: Vec<&Keyframe> = map
             .keyframes()
             .iter()
-            .filter(|kf| kf.frame.idx >= start_idx)
+            .filter(|kf| in_window(kf, start_idx))
             .collect();
         keyframes.sort_by_key(|kf| kf.frame.idx);
         let Some(newest) = keyframes.last() else {
@@ -246,11 +246,18 @@ impl ImuInitializer {
         Ok(ImuInitResult {
             scale: 1.0,
             gravity_world,
-            velocities_world: vec![Vec3F64::ZERO; keyframes.len()],
+            keyframe_velocities: keyframes
+                .iter()
+                .map(|kf| KeyframeVelocity {
+                    keyframe_idx: kf.frame.idx,
+                    velocity_world: Vec3F64::ZERO,
+                })
+                .collect(),
             bias: ImuBias {
                 gyro: stats.mean_gyro,
                 accel: accel_bias,
             },
+            gated_edges: Vec::new(),
         })
     }
 }
@@ -263,6 +270,7 @@ mod tests {
     use kornia_algebra::{Mat3F64, SO3F64};
     use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbFeatures;
+    use kornia_sensors::imu::SampleInterpolation;
     use kornia_sensors::imu::{ImuCalib, PreintegratedImu};
 
     const RATE_HZ: f64 = 200.0;
@@ -339,6 +347,7 @@ mod tests {
             u_right: vec![5.0],
             depth: vec![2.0], // => is_stereo()
             keypoints_undist: vec![],
+            rig: Default::default(),
         }
     }
 
@@ -347,6 +356,8 @@ mod tests {
             min_keyframes: 10,
             min_time_sec: 1.0,
             min_motion: 0.05,
+            viba_window: super::super::VibaWindow::All,
+            viba_velocity_gate: 0.0,
         })
     }
 
@@ -390,6 +401,7 @@ mod tests {
                         t0,
                         t1,
                         bias_walk_extra_s: 0.0,
+                        interpolation: SampleInterpolation::Hold,
                     }],
                     ..Default::default()
                 })
@@ -493,13 +505,21 @@ mod tests {
         // |f - prior| is g exactly here, so the along-gravity correction is nil.
         assert!((init.bias.accel - prior.accel).length() < 1e-9);
         assert_eq!(init.scale, 1.0);
-        assert_eq!(init.velocities_world, vec![Vec3F64::ZERO; 4]);
+        assert_eq!(
+            init.keyframe_velocities,
+            (0..4)
+                .map(|keyframe_idx| KeyframeVelocity {
+                    keyframe_idx,
+                    velocity_world: Vec3F64::ZERO,
+                })
+                .collect::<Vec<_>>()
+        );
 
         // Windowed: only keyframes from `start_idx` get a velocity.
         let init = initializer()
             .initialize_stationary(&map, extrinsic(), prior, 2, &stats, 0.3)
             .unwrap();
-        assert_eq!(init.velocities_world.len(), 2);
+        assert_eq!(init.keyframe_velocities.len(), 2);
     }
 
     /// The gravity-magnitude sanity check, a monocular window and an empty one
@@ -636,7 +656,8 @@ mod tests {
             stationary.gravity_world
         );
         assert!((motion.bias.gyro - stationary.bias.gyro).length() < 1e-3);
-        for v in &motion.velocities_world {
+        for kv in &motion.keyframe_velocities {
+            let v = kv.velocity_world;
             assert!(v.length() < 0.02, "motion velocity {v:?}");
         }
 

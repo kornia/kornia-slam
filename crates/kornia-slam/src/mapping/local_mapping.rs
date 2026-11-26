@@ -1,12 +1,28 @@
+use std::collections::VecDeque;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
+use kornia_3d::pose::TriangulationConfig;
 use kornia_algebra::Vec3F64;
+use kornia_imgproc::features::OrbMatchConfig;
 
-use crate::mapping::map::{BaSnapshot, BaUpdate, BaUpdateError, LocalBaMergeResult, Map};
+use crate::mapping::bundle_adjustment::{
+    LocalBaParams, local_window_of, run_local_ba_with, run_local_inertial_ba_calibrated,
+    run_local_inertial_ba_with,
+};
+use crate::mapping::keyframe_mapping::{KeyframeGrowthPlan, KeyframeGrowthResult, grow_keyframe};
+use crate::mapping::map::{
+    BaOutcome, BaSnapshot, BaSolve, BaUpdate, BaUpdateError, LocalBaMergeResult, LocalBaStats, Map,
+};
+use crate::mapping::online_calibration::OnlineCalibrationState;
+use crate::mapping::outlier_erase::{self, EraseReport};
+use crate::system::FanOut;
+use crate::system::fan_out::bind_worker_thread;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -36,29 +52,241 @@ pub struct KeyframeJob {
     pub imu_initialized: bool,
     pub imu_t_bc: Option<Pose3d>,
     pub gravity_world: Vec3F64,
+    pub local_ba: LocalBaParams,
+    /// Wheel-odometry edges between keyframes; empty without a wheel feed.
+    pub wheel_factors: Vec<kornia_factors::wheel_odometry::WheelOdomFactor>,
+    /// PnP inliers the keyframe was tracked with; selects
+    /// [`LargeWindow`](crate::mapping::bundle_adjustment::LargeWindow).
+    pub tracked_inliers: usize,
 }
 
-fn capture_local_window(map: &Map) -> BaSnapshot {
-    map.ba_snapshot(&super::bundle_adjustment::local_window(map))
+impl KeyframeJob {
+    /// Whether this job solves in the large window; VI-BA only, as
+    /// ORB-SLAM3's `LocalInertialBA`.
+    fn large_window(&self) -> bool {
+        self.imu_initialized && self.local_ba.large_window_applies(self.tracked_inliers)
+    }
+
+    /// The local-BA settings this job solves with.
+    fn ba_params(&self) -> LocalBaParams {
+        if self.large_window() {
+            self.local_ba.large()
+        } else {
+            self.local_ba
+        }
+    }
 }
 
-fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJob) -> BaUpdate {
-    if job.imu_initialized {
-        super::bundle_adjustment::run_local_inertial_ba(
+fn capture_local_window(map: &Map, job: &KeyframeJob) -> BaSnapshot {
+    map.ba_snapshot(&local_window_of(map, job.ba_params().active_keyframes, []))
+}
+
+fn solve_snapshot(
+    snapshot: BaSnapshot,
+    camera: &PinholeCamera,
+    job: &KeyframeJob,
+    calibration: &OnlineCalibrationState,
+) -> BaUpdate {
+    let params = job.ba_params();
+    if job.imu_initialized && params.online_calibration.is_enabled() {
+        run_local_inertial_ba_calibrated(
             snapshot,
             camera,
             job.imu_t_bc,
             job.gravity_world,
+            &job.wheel_factors,
             &[],
+            &params,
+            calibration,
+        )
+    } else if job.imu_initialized {
+        run_local_inertial_ba_with(
+            snapshot,
+            camera,
+            job.imu_t_bc,
+            job.gravity_world,
+            &job.wheel_factors,
             &[],
+            &params,
         )
     } else {
-        super::bundle_adjustment::run_local_ba(snapshot, camera)
+        run_local_ba_with(snapshot, camera, &params)
     }
+}
+
+/// Local-BA tallies since the worker started; see `RunCounters` for the meaning.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LocalMappingCounts {
+    pub ba_failed: u64,
+    pub vi_ba_failed: u64,
+    pub prior_fallbacks: u64,
+    pub ba_updates_rejected: u64,
+    pub ba_solves: u64,
+    pub ba_solve_ns: u64,
+    pub large_window_solves: u64,
+    pub vi_ba_base_solves: u64,
+    pub vi_ba_base_iterations: u64,
+    pub vi_ba_iterations_max: u64,
+    pub vi_ba_rejected_steps: u64,
+    pub vi_ba_solves_3plus_rejects: u64,
+    pub ba_stale_keyframes: u64,
+    pub ba_propagated_keyframes: u64,
+    pub ba_propagations_stopped_at_bridge: u64,
+    pub erase_tested: u64,
+    pub erase_unlinked: u64,
+    pub erase_tested_newest: u64,
+    pub erase_unlinked_newest: u64,
+    pub erase_landmarks_retired: u64,
+    pub erase_stale_links: u64,
+}
+
+// Atomics because the asynchronous worker writes them while tracking reads.
+#[derive(Default)]
+struct LocalMappingCounters {
+    ba_failed: AtomicU64,
+    vi_ba_failed: AtomicU64,
+    prior_fallbacks: AtomicU64,
+    ba_updates_rejected: AtomicU64,
+    ba_solves: AtomicU64,
+    ba_solve_ns: AtomicU64,
+    large_window_solves: AtomicU64,
+    vi_ba_base_solves: AtomicU64,
+    vi_ba_base_iterations: AtomicU64,
+    vi_ba_iterations_max: AtomicU64,
+    vi_ba_rejected_steps: AtomicU64,
+    vi_ba_solves_3plus_rejects: AtomicU64,
+    ba_stale_keyframes: AtomicU64,
+    ba_propagated_keyframes: AtomicU64,
+    ba_propagations_stopped_at_bridge: AtomicU64,
+    erase_tested: AtomicU64,
+    erase_unlinked: AtomicU64,
+    erase_tested_newest: AtomicU64,
+    erase_unlinked_newest: AtomicU64,
+    erase_landmarks_retired: AtomicU64,
+    erase_stale_links: AtomicU64,
+}
+
+impl LocalMappingCounters {
+    /// `stats` is what the solver reported when it ran (VI-BA only).
+    fn record_solve(
+        &self,
+        job: &KeyframeJob,
+        outcome: BaOutcome,
+        stats: Option<&LocalBaStats>,
+        started: Instant,
+    ) {
+        let add = |counter: &AtomicU64, n: u64| counter.fetch_add(n, Ordering::Relaxed);
+        if outcome.prior_fallback {
+            add(&self.prior_fallbacks, 1);
+        }
+        if outcome.solve == BaSolve::NotRun {
+            return;
+        }
+        add(&self.ba_solves, 1);
+        if job.large_window() {
+            add(&self.large_window_solves, 1);
+        }
+        if job.imu_initialized
+            && let Some(stats) = stats
+        {
+            let iterations = u64::try_from(stats.iterations).unwrap_or(u64::MAX);
+            let rejected = u64::try_from(stats.rejected_steps).unwrap_or(u64::MAX);
+            add(&self.vi_ba_rejected_steps, rejected);
+            if rejected >= 3 {
+                add(&self.vi_ba_solves_3plus_rejects, 1);
+            }
+            self.vi_ba_iterations_max
+                .fetch_max(iterations, Ordering::Relaxed);
+            if !job.large_window() {
+                add(&self.vi_ba_base_solves, 1);
+                add(&self.vi_ba_base_iterations, iterations);
+            }
+        }
+        let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        add(&self.ba_solve_ns, elapsed_ns);
+        if outcome.solve == BaSolve::Failed {
+            add(
+                if job.imu_initialized {
+                    &self.vi_ba_failed
+                } else {
+                    &self.ba_failed
+                },
+                1,
+            );
+        }
+    }
+
+    fn record_merge(&self, merged: &Result<LocalBaMergeResult, BaUpdateError>) {
+        let add = |counter: &AtomicU64, n: usize| {
+            counter.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed)
+        };
+        match merged {
+            Ok(result) => {
+                add(&self.ba_stale_keyframes, result.newer_keyframes);
+                add(&self.ba_propagated_keyframes, result.propagated_keyframes);
+                add(
+                    &self.ba_propagations_stopped_at_bridge,
+                    usize::from(result.stopped_at_bridge),
+                );
+                let erase = &result.erase;
+                add(&self.erase_tested, erase.tested);
+                add(&self.erase_unlinked, erase.unlinked);
+                add(&self.erase_tested_newest, erase.tested_newest);
+                add(&self.erase_unlinked_newest, erase.unlinked_newest);
+                add(&self.erase_landmarks_retired, erase.landmarks_retired);
+                add(&self.erase_stale_links, erase.stale_links);
+            }
+            Err(_) => {
+                add(&self.ba_updates_rejected, 1);
+            }
+        }
+    }
+
+    fn counts(&self) -> LocalMappingCounts {
+        let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        LocalMappingCounts {
+            ba_failed: read(&self.ba_failed),
+            vi_ba_failed: read(&self.vi_ba_failed),
+            prior_fallbacks: read(&self.prior_fallbacks),
+            ba_updates_rejected: read(&self.ba_updates_rejected),
+            ba_solves: read(&self.ba_solves),
+            ba_solve_ns: read(&self.ba_solve_ns),
+            large_window_solves: read(&self.large_window_solves),
+            vi_ba_base_solves: read(&self.vi_ba_base_solves),
+            vi_ba_base_iterations: read(&self.vi_ba_base_iterations),
+            vi_ba_iterations_max: read(&self.vi_ba_iterations_max),
+            vi_ba_rejected_steps: read(&self.vi_ba_rejected_steps),
+            vi_ba_solves_3plus_rejects: read(&self.vi_ba_solves_3plus_rejects),
+            ba_stale_keyframes: read(&self.ba_stale_keyframes),
+            ba_propagated_keyframes: read(&self.ba_propagated_keyframes),
+            ba_propagations_stopped_at_bridge: read(&self.ba_propagations_stopped_at_bridge),
+            erase_tested: read(&self.erase_tested),
+            erase_unlinked: read(&self.erase_unlinked),
+            erase_tested_newest: read(&self.erase_tested_newest),
+            erase_unlinked_newest: read(&self.erase_unlinked_newest),
+            erase_landmarks_retired: read(&self.erase_landmarks_retired),
+            erase_stale_links: read(&self.erase_stale_links),
+        }
+    }
+}
+
+/// Solves `job`'s window and records what the solve did.
+fn solve_counted(
+    snapshot: BaSnapshot,
+    camera: &PinholeCamera,
+    job: &KeyframeJob,
+    counters: &LocalMappingCounters,
+    calibration: &OnlineCalibrationState,
+) -> BaUpdate {
+    let started = Instant::now();
+    let update = solve_snapshot(snapshot, camera, job, calibration);
+    counters.record_solve(job, update.outcome, update.solve_stats(), started);
+    update
 }
 
 pub struct LocalMapping {
     backend: LocalMappingBackend,
+    counters: Arc<LocalMappingCounters>,
 }
 
 enum LocalMappingBackend {
@@ -66,6 +294,10 @@ enum LocalMappingBackend {
         map: Arc<Mutex<Map>>,
         camera: PinholeCamera,
         results: Mutex<Vec<LocalBaMergeResult>>,
+        growth_results: Mutex<Vec<GrowthOutcome>>,
+        /// The online calibration the next solve starts from; boxed, as it
+        /// dwarfs the asynchronous variant.
+        calibration: Box<Mutex<OnlineCalibrationState>>,
     },
     Asynchronous {
         handle: LocalMappingHandle,
@@ -78,31 +310,139 @@ enum LocalMappingBackend {
 /// Culling runs under the caller's map lock, immediately after an accepted
 /// merge and before the result is published, so a completed result is never
 /// observable ahead of its cleanup. A refused snapshot — one whose world epoch
-/// no longer matches — publishes nothing and must therefore cull nothing.
-fn merge_and_cull(map: &mut Map, update: BaUpdate) -> Result<LocalBaMergeResult, BaUpdateError> {
-    let merged = map.apply_ba_update(update)?;
+/// no longer matches — publishes nothing and must therefore cull nothing; nor
+/// does it erase the outliers its solve found.
+fn merge_and_cull(
+    map: &mut Map,
+    mut update: BaUpdate,
+) -> Result<LocalBaMergeResult, BaUpdateError> {
+    let links = std::mem::take(&mut update.outlier_links);
+    let tested = update.erase_tested;
+    let mut merged = map.apply_ba_update(update)?;
+    merged.erase = EraseReport {
+        tested: tested.tested,
+        tested_newest: tested.tested_newest,
+        ..outlier_erase::erase(map, &links)
+    };
     crate::mapping::culling::cull_landmarks(map);
     Ok(merged)
 }
 
+/// [`merge_and_cull`], keeping the calibration state `update` carries only if
+/// the merge is accepted, as the boundary prior is.
+fn merge_keeping_calibration(
+    map: &mut Map,
+    mut update: BaUpdate,
+    calibration: &mut OnlineCalibrationState,
+) -> Result<LocalBaMergeResult, BaUpdateError> {
+    let next = update.online_calibration.take();
+    let merged = merge_and_cull(map, update);
+    if merged.is_ok()
+        && let Some(next) = next
+    {
+        *calibration = next;
+    }
+    merged
+}
+
 impl LocalMapping {
     pub fn new(mode: LocalMappingMode, map: Arc<Mutex<Map>>, camera: PinholeCamera) -> Self {
+        Self::with_fan_out(mode, map, camera, FanOut::Global)
+    }
+
+    /// As [`Self::new`], with the asynchronous worker's rayon pool set by
+    /// `fan_out`.
+    pub fn with_fan_out(
+        mode: LocalMappingMode,
+        map: Arc<Mutex<Map>>,
+        camera: PinholeCamera,
+        fan_out: FanOut,
+    ) -> Self {
+        let counters = Arc::new(LocalMappingCounters::default());
         let backend = match mode {
             LocalMappingMode::Synchronous => LocalMappingBackend::Synchronous {
                 map,
                 camera,
                 results: Mutex::new(Vec::new()),
+                growth_results: Mutex::new(Vec::new()),
+                calibration: Box::new(Mutex::new(OnlineCalibrationState::default())),
             },
             LocalMappingMode::Asynchronous => {
                 let publication_gate = Arc::new(Mutex::new(()));
-                let handle = LocalMappingHandle::spawn(map, Arc::clone(&publication_gate), camera);
+                let handle = LocalMappingHandle::spawn(
+                    map,
+                    Arc::clone(&publication_gate),
+                    camera,
+                    Arc::clone(&counters),
+                    fan_out,
+                );
                 LocalMappingBackend::Asynchronous {
                     handle,
                     publication_gate,
                 }
             }
         };
-        Self { backend }
+        Self { backend, counters }
+    }
+
+    /// Grows `job`'s keyframe: inline in synchronous mode, else queued to the
+    /// worker. Returns the growth queue's length after the submission.
+    pub(crate) fn submit_growth(&self, job: GrowthJob) -> usize {
+        match &self.backend {
+            LocalMappingBackend::Synchronous {
+                map,
+                camera,
+                growth_results,
+                ..
+            } => {
+                let outcome = job.run(map, camera);
+                growth_results
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(outcome);
+                0
+            }
+            LocalMappingBackend::Asynchronous { handle, .. } => handle.submit_growth(job),
+        }
+    }
+
+    /// The growth finished since the last call, in submission order.
+    pub(crate) fn drain_growth(&self) -> Vec<GrowthOutcome> {
+        match &self.backend {
+            LocalMappingBackend::Synchronous { growth_results, .. } => std::mem::take(
+                &mut *growth_results
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            ),
+            LocalMappingBackend::Asynchronous { handle, .. } => handle.drain_growth(),
+        }
+    }
+
+    /// Drops the queued growth and any result not yet drained, for a map that
+    /// was cleared: their keyframes are gone.
+    pub(crate) fn clear_growth(&self) {
+        match &self.backend {
+            LocalMappingBackend::Synchronous { growth_results, .. } => growth_results
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear(),
+            LocalMappingBackend::Asynchronous { handle, .. } => handle.clear_growth(),
+        }
+    }
+
+    /// Always idle in synchronous mode, which solves inside `submit`.
+    #[cfg(test)]
+    pub(crate) fn load(&self) -> MappingLoad {
+        match &self.backend {
+            LocalMappingBackend::Synchronous { .. } => MappingLoad::default(),
+            LocalMappingBackend::Asynchronous { handle, .. } => handle.load(),
+        }
+    }
+
+    /// Local-BA tallies so far. In asynchronous mode a job still on the
+    /// worker is not counted yet.
+    pub(crate) fn counts(&self) -> LocalMappingCounts {
+        self.counters.counts()
     }
 
     pub fn publication_gate(&self) -> Option<Arc<Mutex<()>>> {
@@ -120,18 +460,26 @@ impl LocalMapping {
                 map,
                 camera,
                 results,
+                calibration,
+                ..
             } => {
                 let snapshot = capture_local_window(
                     &map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    &job,
                 );
-                let update = solve_snapshot(snapshot, camera, &job);
+                let mut calibration = calibration
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let update = solve_counted(snapshot, camera, &job, &self.counters, &calibration);
                 // Cull under the same lock as the merge, so a completed result
                 // is never observable before cleanup. A rejected snapshot culls
                 // nothing.
-                let merged = merge_and_cull(
+                let merged = merge_keeping_calibration(
                     &mut map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
                     update,
+                    &mut calibration,
                 );
+                self.counters.record_merge(&merged);
                 if let Ok(result) = merged {
                     results
                         .lock()
@@ -156,9 +504,62 @@ impl LocalMapping {
     }
 }
 
+/// One keyframe's growth and forward fusion, queued by `keyframe_growth: Mapping`.
+pub(crate) struct GrowthJob {
+    pub plan: KeyframeGrowthPlan,
+    pub match_config: OrbMatchConfig,
+    pub triangulation_config: TriangulationConfig,
+    pub min_baseline_ratio: f64,
+}
+
+impl GrowthJob {
+    fn run(self, map: &Mutex<Map>, camera: &PinholeCamera) -> GrowthOutcome {
+        let keyframe_idx = self.plan.keyframe_idx;
+        let result = grow_keyframe(
+            map,
+            self.plan,
+            camera,
+            self.match_config,
+            &self.triangulation_config,
+            self.min_baseline_ratio,
+        );
+        GrowthOutcome {
+            keyframe_idx,
+            result,
+            generation: 0,
+        }
+    }
+}
+
+/// A finished [`GrowthJob`].
+pub(crate) struct GrowthOutcome {
+    pub keyframe_idx: usize,
+    pub result: KeyframeGrowthResult,
+    /// The queue generation it was submitted in; a reset discards the older ones.
+    generation: u64,
+}
+
+/// Local mapping's load; the growth tests wait on it.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MappingLoad {
+    /// A job is being solved or grown, or waits for the worker.
+    pub busy: bool,
+    /// Keyframes submitted since the worker's last snapshot, which the next
+    /// solve takes in at once.
+    pub pending_keyframes: usize,
+}
+
 #[derive(Default)]
 struct PendingState {
     latest: Option<KeyframeJob>,
+    /// The worker took a job and has not merged it yet.
+    in_flight: bool,
+    pending_keyframes: usize,
+    /// FIFO, drained before `latest`, so a keyframe grows before its BA.
+    growth: VecDeque<GrowthJob>,
+    growing: bool,
+    growth_generation: u64,
     shutdown: bool,
 }
 
@@ -181,6 +582,7 @@ impl Drop for WorkerExit {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.shutdown = true;
         state.latest = None;
+        state.growth.clear();
         self.pending.ready.notify_all();
     }
 }
@@ -188,6 +590,7 @@ impl Drop for WorkerExit {
 struct LocalMappingHandle {
     pending: Arc<PendingJob>,
     results: mpsc::Receiver<LocalBaMergeResult>,
+    growth_results: mpsc::Receiver<GrowthOutcome>,
     join_handle: Option<JoinHandle<()>>,
 }
 
@@ -196,24 +599,30 @@ impl LocalMappingHandle {
         map: Arc<Mutex<Map>>,
         publication_gate: Arc<Mutex<()>>,
         camera: PinholeCamera,
+        counters: Arc<LocalMappingCounters>,
+        fan_out: FanOut,
     ) -> Self {
         let pending = Arc::new(PendingJob::default());
         let worker_pending = Arc::clone(&pending);
         let (result_sender, results) = mpsc::channel();
+        let (growth_sender, growth_results) = mpsc::channel();
 
         let join_handle = thread::Builder::new()
             .name("kornia-local-mapping".into())
             .spawn(move || {
+                let _pool = bind_worker_thread(fan_out);
                 let _worker_exit = WorkerExit {
                     pending: Arc::clone(&worker_pending),
                 };
+                // The online calibration the next solve starts from.
+                let mut calibration = OnlineCalibrationState::default();
                 loop {
                     let job = {
                         let mut state = worker_pending
                             .state
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        while state.latest.is_none() && !state.shutdown {
+                        while state.latest.is_none() && state.growth.is_empty() && !state.shutdown {
                             state = worker_pending
                                 .ready
                                 .wait(state)
@@ -222,7 +631,36 @@ impl LocalMappingHandle {
                         if state.shutdown {
                             break;
                         }
-                        state.latest.take().expect("pending job disappeared")
+                        if let Some(growth) = state.growth.pop_front() {
+                            state.growing = true;
+                            Err((growth, state.growth_generation))
+                        } else {
+                            let Some(job) = state.latest.take() else {
+                                continue;
+                            };
+                            state.in_flight = true;
+                            Ok(job)
+                        }
+                    };
+                    let job = match job {
+                        Ok(job) => job,
+                        Err((growth, generation)) => {
+                            // Map lock only, never the publication gate: the
+                            // tracking thread holds the gate for a whole frame.
+                            let outcome = GrowthOutcome {
+                                generation,
+                                ..growth.run(&map, &camera)
+                            };
+                            worker_pending
+                                .state
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .growing = false;
+                            if growth_sender.send(outcome).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
                     };
 
                     // The gate makes compound keyframe publication atomic to local
@@ -231,12 +669,19 @@ impl LocalMappingHandle {
                         let _publication = publication_gate
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        capture_local_window(
+                        let snapshot = capture_local_window(
                             &map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
-                        )
+                            &job,
+                        );
+                        worker_pending
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .pending_keyframes = 0;
+                        snapshot
                     };
 
-                    let update = solve_snapshot(snapshot, &camera, &job);
+                    let update = solve_counted(snapshot, &camera, &job, &counters, &calibration);
 
                     // Merge is short and cannot interleave with keyframe publication
                     // or a world-frame transformation. Epoch mismatch rejects stale BA.
@@ -244,12 +689,19 @@ impl LocalMappingHandle {
                         let _publication = publication_gate
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let merged = merge_and_cull(
+                        let merged = merge_keeping_calibration(
                             &mut map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
                             update,
+                            &mut calibration,
                         );
+                        counters.record_merge(&merged);
                         merged.is_ok_and(|result| result_sender.send(result).is_err())
                     };
+                    worker_pending
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .in_flight = false;
                     if should_stop {
                         break;
                     }
@@ -260,8 +712,46 @@ impl LocalMappingHandle {
         Self {
             pending,
             results,
+            growth_results,
             join_handle: Some(join_handle),
         }
+    }
+
+    fn submit_growth(&self, job: GrowthJob) -> usize {
+        let mut state = self
+            .pending
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.shutdown {
+            return 0;
+        }
+        state.growth.push_back(job);
+        self.pending.ready.notify_one();
+        state.growth.len()
+    }
+
+    fn drain_growth(&self) -> Vec<GrowthOutcome> {
+        let generation = self
+            .pending
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .growth_generation;
+        self.growth_results
+            .try_iter()
+            .filter(|outcome| outcome.generation == generation)
+            .collect()
+    }
+
+    fn clear_growth(&self) {
+        let mut state = self
+            .pending
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.growth.clear();
+        state.growth_generation += 1;
     }
 
     /// Replaces any not-yet-started BA with the newest request.
@@ -275,8 +765,25 @@ impl LocalMappingHandle {
             return false;
         }
         state.latest = Some(job);
+        state.pending_keyframes += 1;
         self.pending.ready.notify_one();
         true
+    }
+
+    #[cfg(test)]
+    fn load(&self) -> MappingLoad {
+        let state = self
+            .pending
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        MappingLoad {
+            busy: state.in_flight
+                || state.latest.is_some()
+                || state.growing
+                || !state.growth.is_empty(),
+            pending_keyframes: state.pending_keyframes,
+        }
     }
 
     fn drain_results(&self) -> Vec<LocalBaMergeResult> {
@@ -294,6 +801,7 @@ impl Drop for LocalMappingHandle {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.shutdown = true;
             state.latest = None;
+            state.growth.clear();
         }
         self.pending.ready.notify_one();
 
@@ -316,7 +824,10 @@ mod tests {
     use kornia_3d::camera::PinholeCamera;
     use kornia_algebra::Vec3F64;
 
-    use super::{BaUpdateError, KeyframeJob, LocalMapping, LocalMappingBackend, LocalMappingMode};
+    use super::{
+        BaUpdateError, KeyframeJob, LocalBaParams, LocalMapping, LocalMappingBackend,
+        LocalMappingMode, MappingLoad,
+    };
     use crate::mapping::map::{InertialAlignment, KeyframeVelocity, Map};
     use kornia_algebra::SO3F64;
     use kornia_sensors::imu::ImuBias;
@@ -339,7 +850,72 @@ mod tests {
             imu_initialized: false,
             imu_t_bc: None,
             gravity_world: Vec3F64::ZERO,
+            local_ba: LocalBaParams::default(),
+            wheel_factors: Vec::new(),
+            tracked_inliers: 0,
         }
+    }
+
+    /// Card V (E-1): a 0-inlier VI job never takes the large window, so it
+    /// solves with the base settings, and the counters book it as a base solve.
+    #[test]
+    fn a_zero_inlier_vi_job_solves_with_the_base_budget_and_is_counted() {
+        use super::{BaOutcome, BaSolve, LocalBaStats, LocalMappingCounters};
+        use crate::mapping::bundle_adjustment::LargeWindow;
+        use std::time::Instant;
+
+        let local_ba = LocalBaParams {
+            active_keyframes: 10,
+            max_iterations: 7,
+            initial_lambda: 1e-4,
+            large_window: LargeWindow::Enabled {
+                min_tracked_inliers: 0,
+                active_keyframes: 10,
+                max_iterations: 4,
+                initial_lambda: 1e-2,
+            },
+            ..LocalBaParams::default()
+        };
+        let job = |tracked_inliers| KeyframeJob {
+            imu_initialized: true,
+            local_ba,
+            tracked_inliers,
+            ..visual_job()
+        };
+        let base = job(0).ba_params();
+        assert_eq!(
+            (
+                base.active_keyframes,
+                base.max_iterations,
+                base.initial_lambda
+            ),
+            (10, 7, 1e-4)
+        );
+        assert_eq!(job(1).ba_params().max_iterations, 4, "the large window");
+
+        let counters = LocalMappingCounters::default();
+        let solved = BaOutcome {
+            solve: BaSolve::Solved,
+            prior_fallback: false,
+        };
+        let stats = |iterations, rejected_steps| LocalBaStats {
+            iterations,
+            rejected_steps,
+            ..LocalBaStats::default()
+        };
+        counters.record_solve(&job(0), solved, Some(&stats(5, 0)), Instant::now());
+        counters.record_solve(&job(0), solved, Some(&stats(7, 3)), Instant::now());
+        counters.record_solve(&job(1), solved, Some(&stats(4, 2)), Instant::now());
+        counters.record_solve(&visual_job(), solved, None, Instant::now());
+        let counts = counters.counts();
+        assert_eq!(counts.vi_ba_base_solves, 2);
+        assert_eq!(counts.vi_ba_base_iterations, 12);
+        assert_eq!(counts.vi_ba_iterations_max, 7);
+        assert_eq!(counts.large_window_solves, 1);
+        assert_eq!(counts.ba_solves, 4);
+        // S0-A4: rejected steps from every VI solve, base and large window.
+        assert_eq!(counts.vi_ba_rejected_steps, 5);
+        assert_eq!(counts.vi_ba_solves_3plus_rejects, 1);
     }
 
     #[test]
@@ -428,6 +1004,7 @@ mod tests {
             u_right: Vec::new(),
             depth: Vec::new(),
             keypoints_undist: Vec::new(),
+            rig: Default::default(),
         }))
         .unwrap();
         let doomed = map
@@ -468,6 +1045,40 @@ mod tests {
             None,
             "the keyframe side was cleaned up too"
         );
+    }
+
+    /// The worker blocked at its snapshot (the test holds the publication
+    /// gate): busy with every submission pending, then idle after the merge.
+    #[test]
+    fn the_load_follows_a_blocked_worker() {
+        let (map, _) = map_with_a_cullable_landmark();
+        let mapping = LocalMapping::new(
+            LocalMappingMode::Asynchronous,
+            Arc::clone(&map),
+            test_camera(),
+        );
+        assert_eq!(mapping.load(), MappingLoad::default());
+        let gate = mapping.publication_gate().unwrap();
+        let held = gate.lock().unwrap();
+        for submitted in 1..=3 {
+            assert!(mapping.submit(visual_job()));
+            assert_eq!(
+                mapping.load(),
+                MappingLoad {
+                    busy: true,
+                    pending_keyframes: submitted
+                }
+            );
+        }
+        drop(held);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while mapping.load() != MappingLoad::default() {
+            assert!(std::time::Instant::now() < deadline, "{:?}", mapping.load());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let synchronous = LocalMapping::new(LocalMappingMode::Synchronous, map, test_camera());
+        assert!(synchronous.submit(visual_job()));
+        assert_eq!(synchronous.load(), MappingLoad::default());
     }
 
     #[test]
@@ -527,6 +1138,43 @@ mod tests {
         let map = map.lock().unwrap();
         assert!(!map.map_points()[doomed].culled, "no cull after a refusal");
         assert_eq!(map.get_keyframe(0).unwrap().map_point(0), Some(doomed));
+    }
+
+    /// R11b: the outliers a refused update found are not erased either.
+    #[test]
+    fn the_coordinator_does_not_erase_after_a_refused_merge() {
+        use crate::mapping::map::ObservationKey;
+        use crate::mapping::outlier_erase::OutlierLink;
+
+        let (map, doomed) = map_with_a_cullable_landmark();
+        let mut update = map.lock().unwrap().full_ba_snapshot().into_update();
+        update.outlier_links = vec![OutlierLink {
+            key: ObservationKey {
+                keyframe_idx: 0,
+                feature_idx: 0,
+            },
+            landmark: doomed,
+            newest: true,
+        }];
+        map.lock()
+            .unwrap()
+            .apply_inertial_alignment(InertialAlignment {
+                scale: 2.0,
+                rotation: SO3F64::IDENTITY,
+                keyframe_velocities: vec![KeyframeVelocity {
+                    keyframe_idx: 0,
+                    velocity_world: Vec3F64::ZERO,
+                }],
+                bias: ImuBias::default(),
+            })
+            .expect("a valid alignment advances the world epoch");
+
+        let merged = super::merge_and_cull(&mut map.lock().unwrap(), update);
+
+        assert!(matches!(merged, Err(BaUpdateError::ObsoleteWorldFrame)));
+        let map = map.lock().unwrap();
+        assert_eq!(map.get_keyframe(0).unwrap().map_point(0), Some(doomed));
+        assert!(map.map_points()[doomed].is_observed_by(0));
     }
 
     /// A malformed result is refused at the same seam, and a refusal must not

@@ -7,6 +7,7 @@
 
 pub mod inertial;
 pub mod relative_pose;
+pub mod reprojection;
 pub mod wheel_odometry;
 
 #[cfg(test)]

@@ -186,6 +186,8 @@ pub fn try_initialize_two_view(
             pose,
             matches,
             inliers,
+            withheld: Vec::new(),
+            most_voted_keyframe: None,
         },
         points3d: result.points3d,
         inlier_indices: result.inlier_indices,

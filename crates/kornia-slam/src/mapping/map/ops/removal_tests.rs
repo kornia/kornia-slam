@@ -4,7 +4,9 @@ use crate::mapping::map::{
     ImuFactor, Keyframe, LandmarkSeed, Map, MapInsertion, ObservationKey, ops::BaWindow,
 };
 use kornia_algebra::Vec3F64;
-use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
+use kornia_sensors::imu::{
+    ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu, SampleInterpolation,
+};
 
 fn calib() -> ImuCalib {
     ImuCalib {
@@ -47,6 +49,7 @@ fn edge(prev: usize, curr: usize, t0: f64, t1: f64) -> ImuFactor {
         t0,
         t1,
         bias_walk_extra_s: 0.0,
+        interpolation: SampleInterpolation::Hold,
     }
 }
 

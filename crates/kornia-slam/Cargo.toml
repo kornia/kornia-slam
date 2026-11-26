@@ -23,13 +23,53 @@ kornia-sensors.workspace = true
 # Sparse LLT for pose-graph optimization and dense Cholesky for the reduced
 # camera system in visual-inertial Schur-complement BA.
 faer = "0.22"
+# A private pool for the tracking fan-out and 1-thread pools that keep the
+# mapping and loop workers out of the global one (`pipeline.fan_out`).
+rayon = "1"
 thiserror = "1"
 ron = { version = "0.12", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
+# Portable SIMD (SSE/AVX and NEON) for the upstream/ frontend kernels; the
+# version kornia-rs pins.
+wide = "1.4"
+opencv = { version = "0.100", optional = true }
+
+[dev-dependencies]
+criterion = "0.8"
 
 [features]
 # Serialization of the system configuration and its RON file loading.
 serde = ["dep:serde", "dep:ron", "kornia-sensors/serde"]
+# Makes `upstream` public (doc-hidden) so the kernel benches can call it.
+bench_internals = []
+# OpenCV arms of the kernel benches.
+opencv_bench = ["dep:opencv"]
 
 [package.metadata.docs.rs]
 features = ["serde"]
+
+# Kernel benches (plan step K5); `upstream` is public only under bench_internals.
+[[bench]]
+name = "bench_upstream_lk_window"
+harness = false
+required-features = ["bench_internals"]
+
+[[bench]]
+name = "bench_upstream_good_features"
+harness = false
+required-features = ["bench_internals"]
+
+[[bench]]
+name = "bench_upstream_corner_subpix"
+harness = false
+required-features = ["bench_internals"]
+
+[[bench]]
+name = "bench_upstream_remap_u8"
+harness = false
+required-features = ["bench_internals"]
+
+[[bench]]
+name = "bench_odometry_window"
+harness = false
+required-features = ["bench_internals"]

@@ -6,10 +6,12 @@
 
 pub mod initialization;
 mod schedule;
+pub(crate) mod still;
+pub mod trust;
 
 pub use initialization::{
     AlignedTrackingState, ImuInitConfig, ImuInitResult, ImuInitializer, ImuWindowStats,
-    StationaryInitError,
+    StationaryInitError, VibaWindow,
 };
 pub(crate) use schedule::{InertialInitSchedule, viba0_accel_bias_prior};
 
@@ -18,12 +20,14 @@ use std::collections::VecDeque;
 use crate::mapping::Map;
 use crate::mapping::map::{ImuFactor, InertialAlignmentError};
 use kornia_algebra::Vec3F64;
-use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
+use kornia_sensors::imu::{
+    GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu, SampleInterpolation,
+};
 
 /// Longest span of IMU samples kept while no keyframe prunes them, well beyond
 /// the gap between keyframes. Also how far ahead of the latest image a sample
 /// may be before it is taken for a clock glitch.
-const MAX_BUFFERED_SEC: f64 = 30.0;
+pub(crate) const MAX_BUFFERED_SEC: f64 = 30.0;
 
 pub(crate) struct InertialState {
     pub(crate) bias: ImuBias,
@@ -37,6 +41,7 @@ pub(crate) struct InertialState {
     pub(crate) initializer: ImuInitializer,
     pub(crate) schedule: InertialInitSchedule,
     pending_samples: VecDeque<ImuMeasurement>,
+    sample_interpolation: SampleInterpolation,
 }
 
 impl InertialState {
@@ -54,9 +59,20 @@ impl InertialState {
                 min_keyframes: 10,
                 min_time_sec: 1.0,
                 min_motion: 0.05,
+                viba_window: VibaWindow::All,
+                viba_velocity_gate: 0.0,
             }),
             schedule: InertialInitSchedule::default(),
             pending_samples: VecDeque::new(),
+            sample_interpolation: SampleInterpolation::Hold,
+        }
+    }
+
+    /// [`Self::new`] integrating its windows with `interpolation`.
+    pub(crate) fn with_sample_interpolation(interpolation: SampleInterpolation) -> Self {
+        Self {
+            sample_interpolation: interpolation,
+            ..Self::new()
         }
     }
 
@@ -106,14 +122,57 @@ impl InertialState {
         t0: f64,
         t1: f64,
     ) -> (PreintegratedImu, Vec<ImuMeasurement>) {
-        let samples: Vec<ImuMeasurement> = self
-            .pending_samples
-            .iter()
-            .filter(|m| m.timestamp >= t0 && m.timestamp <= t1)
-            .copied()
-            .collect();
-        let pre = PreintegratedImu::from_measurements(self.bias, noise, &samples, t0, t1);
+        let samples: Vec<ImuMeasurement> = match self.sample_interpolation {
+            SampleInterpolation::Hold => self
+                .pending_samples
+                .iter()
+                .filter(|m| m.timestamp >= t0 && m.timestamp <= t1)
+                .copied()
+                .collect(),
+            // The samples bracketing the window interpolate its ends.
+            SampleInterpolation::Midpoint => {
+                let start = self
+                    .pending_samples
+                    .partition_point(|m| m.timestamp < t0)
+                    .saturating_sub(1);
+                let end = (self.pending_samples.partition_point(|m| m.timestamp <= t1) + 1)
+                    .min(self.pending_samples.len());
+                self.pending_samples
+                    .range(start..end.max(start))
+                    .copied()
+                    .collect()
+            }
+        };
+        let pre = PreintegratedImu::from_measurements_with(
+            self.bias,
+            noise,
+            &samples,
+            t0,
+            t1,
+            self.sample_interpolation,
+        );
         (pre, samples)
+    }
+
+    /// Stamp of the newest buffered sample.
+    pub(crate) fn newest_sample_sec(&self) -> Option<f64> {
+        self.pending_samples.back().map(|m| m.timestamp)
+    }
+
+    /// The buffered samples from `t0` on, in time order.
+    pub(crate) fn samples_from(&self, t0: f64) -> Vec<ImuMeasurement> {
+        let start = self.pending_samples.partition_point(|m| m.timestamp < t0);
+        self.pending_samples.range(start..).copied().collect()
+    }
+
+    /// Mean and spread of the buffered samples in the inclusive window
+    /// `[t0, t1]`, or `None` for fewer than two.
+    pub(crate) fn window_stats(&self, t0: f64, t1: f64) -> Option<ImuWindowStats> {
+        ImuWindowStats::from_samples(
+            self.pending_samples
+                .iter()
+                .filter(|m| m.timestamp >= t0 && m.timestamp <= t1),
+        )
     }
 
     /// The IMU edge between two keyframes, carrying its raw samples for later
@@ -135,13 +194,25 @@ impl InertialState {
             t0,
             t1,
             bias_walk_extra_s: 0.0,
+            interpolation: self.sample_interpolation,
         })
     }
 
     /// Drops buffered samples strictly older than `timestamp` (typically the
     /// last keyframe: the next edge and all per-frame windows start there).
+    /// Under `Midpoint` the newest of them stays: it interpolates the start
+    /// of those windows.
     pub(crate) fn prune_before(&mut self, timestamp: f64) {
-        self.pending_samples.retain(|m| m.timestamp >= timestamp);
+        let keep_from = match self.sample_interpolation {
+            SampleInterpolation::Hold => timestamp,
+            SampleInterpolation::Midpoint => self
+                .pending_samples
+                .iter()
+                .rev()
+                .find(|m| m.timestamp < timestamp)
+                .map_or(timestamp, |m| m.timestamp),
+        };
+        self.pending_samples.retain(|m| m.timestamp >= keep_from);
     }
 
     /// Applies an initialization to the map, taking the new bias and gravity
@@ -185,7 +256,9 @@ pub(crate) struct AppliedInitialization {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImuInitResult, InertialAlignmentError, InertialState, MAX_BUFFERED_SEC, Map};
+    use super::{
+        ImuInitResult, InertialAlignmentError, InertialState, MAX_BUFFERED_SEC, Map, VibaWindow,
+    };
     use kornia_algebra::Vec3F64;
     use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement};
 
@@ -319,6 +392,16 @@ mod tests {
         assert_eq!(edge.raw_samples.len(), 3);
     }
 
+    #[test]
+    fn the_viba_knobs_default_off() {
+        let config = &InertialState::new().initializer.config;
+        assert_eq!(config.min_keyframes, 10);
+        assert_eq!(config.min_time_sec, 1.0);
+        assert_eq!(config.min_motion, 0.05);
+        assert_eq!(config.viba_window, VibaWindow::All);
+        assert_eq!(config.viba_velocity_gate, 0.0);
+    }
+
     /// A refused alignment must not be reported as applied, nor change the
     /// bias and gravity estimates.
     #[test]
@@ -328,11 +411,12 @@ mod tests {
         let init = ImuInitResult {
             scale: 0.0,
             gravity_world: Vec3F64::new(0.0, 0.0, -9.81),
-            velocities_world: Vec::new(),
+            keyframe_velocities: Vec::new(),
             bias: ImuBias {
                 gyro: Vec3F64::new(0.01, 0.02, 0.03),
                 accel: Vec3F64::new(0.1, 0.2, 0.3),
             },
+            gated_edges: Vec::new(),
         };
 
         let result = inertial.apply_initialization(&mut Map::new(), init, 0);

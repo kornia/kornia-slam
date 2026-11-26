@@ -96,6 +96,20 @@ impl InertialInitFactor {
     }
 }
 
+/// The velocity block `ev` of the [`InertialInitFactor`] residual, body frame.
+pub(super) fn velocity_residual(
+    r_bw_i: Mat3F64,
+    v_i: Vec3F64,
+    v_j: Vec3F64,
+    scale: f64,
+    g: Vec3F64,
+    dt: f64,
+    d_vel: Vec3F64,
+) -> Vec3F64 {
+    let dv_world = scale * (v_j - v_i) - g * dt;
+    r_bw_i * dv_world - d_vel
+}
+
 impl Factor for InertialInitFactor {
     fn linearize(
         &self,
@@ -153,8 +167,7 @@ impl Factor for InertialInitFactor {
         let e_r_mat = d_rot.transpose() * r_bw_i * r_wb_j;
         let er = SO3F64::from_matrix(&e_r_mat).log();
 
-        let dv_world = scale * (v_j - v_i) - g * dt;
-        let ev = r_bw_i * dv_world - d_vel;
+        let ev = velocity_residual(r_bw_i, v_i, v_j, scale, g, dt, d_vel);
 
         let dp_world = scale * (self.kf_j.t_wb - self.kf_i.t_wb - v_i * dt) - g * (0.5 * dt * dt);
         let ep = r_bw_i * dp_world - d_pos;

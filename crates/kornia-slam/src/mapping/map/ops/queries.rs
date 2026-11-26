@@ -5,6 +5,7 @@
 //! any neighbour limit.
 
 use crate::mapping::map::Map;
+use kornia_3d::pose::Pose3d;
 use std::collections::HashMap;
 
 impl Map {
@@ -65,6 +66,52 @@ impl Map {
         }
         kept
     }
+
+    /// Median depth, in metres, of `kf_idx`'s live landmarks in its camera-0
+    /// frame. `None` for an unknown keyframe or when no landmark has a valid
+    /// depth.
+    pub fn scene_median_depth(&self, kf_idx: usize) -> Option<f64> {
+        let kf = self.get_keyframe(kf_idx)?;
+        median_positive_depth(
+            kf.map_point_by_desc_idx
+                .iter()
+                .flatten()
+                .filter_map(|&mp_idx| self.map_points().get(mp_idx))
+                .filter(|mp| !mp.culled)
+                .map(|mp| kf.frame.pose_world_to_cam.transform_point(&mp.position).z),
+        )
+    }
+
+    /// Median depth, in metres, of the live landmarks rig camera `camera` of
+    /// `kf_idx` observes, in that camera's frame (`pose_cw`, world to that
+    /// camera). `None` as [`Map::scene_median_depth`].
+    pub fn camera_median_depth(
+        &self,
+        kf_idx: usize,
+        camera: usize,
+        pose_cw: &Pose3d,
+    ) -> Option<f64> {
+        let kf = self.get_keyframe(kf_idx)?;
+        median_positive_depth(
+            kf.frame
+                .camera_range(camera)
+                .filter_map(|feature| kf.map_point(feature))
+                .filter_map(|mp_idx| self.map_points().get(mp_idx))
+                .filter(|mp| !mp.culled)
+                .map(|mp| pose_cw.transform_point(&mp.position).z),
+        )
+    }
+}
+
+/// Upper median of the finite positive depths; `None` without one.
+fn median_positive_depth(depths: impl Iterator<Item = f64>) -> Option<f64> {
+    let mut depths: Vec<f64> = depths.filter(|z| z.is_finite() && *z > 0.0).collect();
+    if depths.is_empty() {
+        return None;
+    }
+    let mid = depths.len() / 2;
+    let (_, median, _) = depths.select_nth_unstable_by(mid, f64::total_cmp);
+    Some(*median)
 }
 
 #[cfg(test)]
@@ -129,5 +176,31 @@ mod tests {
         let map = covis_map();
         assert_eq!(map.covisible_keyframes_min_weight(0, 15), vec![(1, 2)]);
         assert!(map.covisible_keyframes_min_weight(99, 15).is_empty());
+    }
+
+    #[test]
+    fn scene_median_depth_is_the_median_camera_depth_of_live_landmarks() {
+        let mut map = Map::new();
+        for idx in 0..2 {
+            map.insert_keyframe(Keyframe::from_frame(test_frame(
+                idx,
+                vec![[idx as u8; 32]; 3],
+            )))
+            .unwrap();
+        }
+        for (slot, depth) in [(0usize, 1.0), (1, 2.0), (2, 9.0)] {
+            map.insert_landmark(LandmarkSeed {
+                position: Vec3F64::new(0.0, 0.0, depth),
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx: slot,
+                },
+            })
+            .unwrap();
+        }
+        assert_eq!(map.scene_median_depth(0), Some(2.0));
+        assert_eq!(map.scene_median_depth(1), None);
+        assert_eq!(map.scene_median_depth(99), None);
     }
 }

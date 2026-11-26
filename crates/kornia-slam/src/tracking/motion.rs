@@ -10,6 +10,9 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::PreintegratedImu;
 
+use crate::pose_conversion::rigid;
+use crate::upstream::kornia_3d::pose_ext::camera_centre;
+
 /// Preintegration prepared by the system, which owns bias and sample buffering.
 pub(crate) struct InertialPrediction<'a> {
     pub preintegrated: &'a PreintegratedImu,
@@ -47,9 +50,11 @@ pub(crate) fn predict_pose(
 
 /// Applies the last inter-frame motion again.
 fn predict_pose_visual(pose_before: Pose3d, visual_velocity: Option<Pose3d>) -> Pose3d {
-    visual_velocity
-        .map(|v| v.compose(&pose_before))
-        .unwrap_or(pose_before)
+    rigid(
+        visual_velocity
+            .map(|v| v.compose(&pose_before))
+            .unwrap_or(pose_before),
+    )
 }
 
 /// Propagates the camera pose and body velocity through one preintegrated IMU
@@ -74,10 +79,30 @@ fn predict_pose_imu(
         Some(t_bc) => pred_body_to_world.compose(t_bc),
         None => pred_body_to_world,
     };
-    (pred_cam_to_world.inverse(), v_j)
+    (rigid(pred_cam_to_world.inverse()), v_j)
 }
 
-fn body_to_world(pose_w2c: &Pose3d, camera_to_body: Option<Pose3d>) -> Pose3d {
+/// World velocity of a new keyframe: the last keyframe's state propagated over
+/// the keyframe edge `edge` (ORB-SLAM3 `Tracking.cc:1746-1762`), so the edge
+/// starts the next VI-BA with no velocity residual.
+pub(crate) fn propagate_keyframe_velocity(
+    last_pose_w2c: Pose3d,
+    last_velocity_world: Vec3F64,
+    gravity_world: Vec3F64,
+    edge: &PreintegratedImu,
+    camera_to_body: Option<Pose3d>,
+) -> Vec3F64 {
+    predict_pose_imu(
+        last_pose_w2c,
+        last_velocity_world,
+        gravity_world,
+        edge,
+        camera_to_body,
+    )
+    .1
+}
+
+pub(crate) fn body_to_world(pose_w2c: &Pose3d, camera_to_body: Option<Pose3d>) -> Pose3d {
     let cam_to_world = pose_w2c.inverse();
     match &camera_to_body {
         Some(t_bc) => cam_to_world.compose(&t_bc.inverse()),
@@ -85,11 +110,31 @@ fn body_to_world(pose_w2c: &Pose3d, camera_to_body: Option<Pose3d>) -> Pose3d {
     }
 }
 
+/// Whether moving the camera centre from `before` to `after` in `gap_sec`
+/// stays under `max_speed_mps` on average. A non-finite pose never does.
+pub(crate) fn coast_is_plausible(
+    before: &Pose3d,
+    after: &Pose3d,
+    gap_sec: f64,
+    max_speed_mps: f64,
+) -> bool {
+    let travelled = (camera_centre(after) - camera_centre(before)).length();
+    if !travelled.is_finite() {
+        return false;
+    }
+    gap_sec <= 0.0 || travelled / gap_sec <= max_speed_mps
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{InertialPrediction, predict_pose};
+    use super::{
+        InertialPrediction, coast_is_plausible, predict_pose, propagate_keyframe_velocity,
+    };
+    use crate::mapping::synthetic_walk::{BodyState, HEAD_WALK_IMU_DT, HeadWalk};
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::{SO3F64, Vec3F64};
+    use kornia_factors::inertial::NavState;
+    use kornia_factors::inertial::preintegration;
     use kornia_sensors::imu::{ImuBias, ImuCalib, PreintegratedImu};
 
     fn preintegration(dt: f64) -> PreintegratedImu {
@@ -227,5 +272,115 @@ mod tests {
 
         assert_pose_close(pose, pose_before);
         assert_eq!(velocity, Some(Vec3F64::ZERO));
+    }
+
+    /// World-to-camera pose of a camera centred at `(x, 0, 0)`.
+    fn centred_at(x: f64) -> Pose3d {
+        let mut pose = Pose3d::IDENTITY;
+        pose.translation = Vec3F64::new(-x, 0.0, 0.0);
+        pose
+    }
+
+    #[test]
+    fn a_walking_coast_is_plausible_and_a_runaway_is_not() {
+        let before = centred_at(0.0);
+        assert!(coast_is_plausible(&before, &centred_at(7.0), 5.0, 4.0));
+        assert!(coast_is_plausible(&before, &centred_at(20.0), 5.0, 4.0));
+        assert!(!coast_is_plausible(&before, &centred_at(20.5), 5.0, 4.0));
+        assert!(!coast_is_plausible(&before, &centred_at(-8.1e57), 5.0, 4.0));
+        assert!(!coast_is_plausible(
+            &before,
+            &centred_at(f64::NAN),
+            5.0,
+            4.0
+        ));
+    }
+
+    /// Both models return a rotation even from a scaled `pose_before`.
+    #[test]
+    fn predictions_from_a_scaled_pose_are_rigid() {
+        let pose_before = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.1, -0.2, 0.3)).matrix() * 1.001,
+            Vec3F64::new(0.4, 0.3, -0.2),
+        );
+        let velocity = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.0, 0.01, 0.0)).matrix(),
+            Vec3F64::new(0.02, 0.0, 0.0),
+        );
+        let preintegrated = preintegration(0.05);
+        let inertial = InertialPrediction {
+            preintegrated: &preintegrated,
+            camera_to_body: None,
+            gravity_world: Vec3F64::new(0.0, 0.0, -9.81),
+        };
+        let (visual, _) = predict_pose(pose_before, Some(velocity), Vec3F64::ZERO, None);
+        let (imu, _) = predict_pose(pose_before, None, Vec3F64::ZERO, Some(inertial));
+        for pose in [visual, imu] {
+            assert!(pose.rotation_defect() < 1e-12);
+        }
+    }
+
+    /// Red on the old code (2026-11-21): the tracker's velocity, the
+    /// reference keyframe's plus one frame of IMU, left the crossing edge at
+    /// r_v 0.204 m/s p50 on Q0a and 1.37-1.65 m/s on async 10-active runs.
+    #[test]
+    fn a_propagated_keyframe_seed_leaves_no_velocity_residual_on_its_edge() {
+        let gravity = Vec3F64::new(0.0, 9.81, 0.0);
+        let bias = ImuBias {
+            gyro: Vec3F64::new(2e-3, -1e-3, 5e-4),
+            accel: Vec3F64::new(0.05, -0.02, 0.03),
+        };
+        let walk = HeadWalk {
+            origin: Vec3F64::new(1.0, -0.5, 2.0),
+            accel_bias: bias.accel,
+            gyro_bias: bias.gyro,
+        };
+        let t_bc = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.1, -0.2, 0.05)).matrix(),
+            Vec3F64::new(0.03, -0.01, 0.02),
+        );
+        let pose_cw = |s: &BodyState| {
+            t_bc.inverse()
+                .compose(&Pose3d::new(s.r_wb, s.position).inverse())
+        };
+        // Keyframes 0.45 s apart, as an async 10-active solve absorbs them.
+        let (last, next) = (1000, 1450);
+        let (states, readings) = walk.simulate(next + 1, gravity);
+        let calib = ImuCalib {
+            gyro_noise: 1.7e-4,
+            accel_noise: 7.8e-4,
+            gyro_bias_noise: 1.9e-5,
+            accel_bias_noise: 3.0e-3,
+        };
+        let edge = PreintegratedImu::from_measurements(
+            bias,
+            calib,
+            &readings[last..next],
+            last as f64 * HEAD_WALK_IMU_DT,
+            next as f64 * HEAD_WALK_IMU_DT,
+        );
+        let (pose_i, pose_j) = (pose_cw(&states[last]), pose_cw(&states[next]));
+
+        let seed =
+            propagate_keyframe_velocity(pose_i, states[last].velocity, gravity, &edge, Some(t_bc));
+
+        let (res, _, _) = preintegration::residual_and_jacobians(
+            NavState {
+                pose_cw: &pose_i,
+                velocity: states[last].velocity,
+                bias,
+            },
+            NavState {
+                pose_cw: &pose_j,
+                velocity: seed,
+                bias,
+            },
+            &edge,
+            &gravity,
+            Some(&t_bc),
+        );
+        let r_v = res.fixed_rows::<3>(3).norm();
+        assert!(r_v < 1e-6, "crossing r_v {r_v:.3e} m/s");
+        assert!((seed - states[next].velocity).length() < 1e-6);
     }
 }

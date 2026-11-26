@@ -51,6 +51,15 @@ fn reads_a_run_file() {
 }
 
 #[test]
+fn rectification_defaults_to_the_f32_remap() {
+    let run = parse(r#"(source: Euroc((data: "d")))"#).unwrap();
+    assert_eq!(run.rectification, Rectification::RemapF32);
+    let run = parse(r#"(source: Euroc((data: "d")), rectification: FixedPoint)"#).unwrap();
+    assert_eq!(run.rectification, Rectification::FixedPoint);
+    parse_error(r#"(source: Euroc((data: "d")), rectification: Nearest)"#);
+}
+
+#[test]
 fn an_omitted_system_runs_the_default_pipeline() {
     let run = parse(r#"(source: Euroc((data: "d")))"#).unwrap();
     assert_eq!(
@@ -228,6 +237,60 @@ fn relative_paths_resolve_against_the_run_file() {
         Some(configs.join("c.yaml").as_path())
     );
     assert_eq!(vocabulary(&run), Some(Path::new("/weights/ORBvoc.txt")));
+}
+
+#[test]
+fn a_rig_calibration_file_resolves_and_must_match_the_source() {
+    use kornia_3d::camera::PinholeCamera;
+    use kornia_3d::pose::Pose3d;
+
+    let (temp, path) = TempRun::new(
+        "rig-calibration",
+        r#"(source: Mcap((path: "r.mcap", calib: "c.yaml")), rig_calibration: "rig.ron")"#,
+    );
+    let run = RunConfig::from_ron_file(&path).unwrap();
+    let file = temp.dir.join("configs").join("rig.ron");
+    assert_eq!(run.rig_calibration.as_deref(), Some(file.as_path()));
+
+    let camera = PinholeCamera {
+        fx: 240.0,
+        fy: 240.0,
+        cx: 320.0,
+        cy: 240.0,
+        k1: 0.0,
+        k2: 0.0,
+        p1: 0.0,
+        p2: 0.0,
+    };
+    let mono = SensorRig::new(camera.clone()).with_imu(Pose3d::IDENTITY);
+    let mut written = mono.clone();
+    written.camera.fx = 250.0;
+    let calibration = RigCalibration::from_sensor_rig(&written);
+    let text = ron::ser::to_string_pretty(&calibration, ron::ser::PrettyConfig::default()).unwrap();
+    std::fs::write(&file, text).unwrap();
+    assert_eq!(run.apply_rig_calibration(mono).unwrap().camera.fx, 250.0);
+
+    let rig = SensorRig::new(camera.clone()).with_rig_cameras(
+        [Pose3d::IDENTITY, Pose3d::IDENTITY]
+            .map(|primary_from_camera| kornia_sensors::RigCamera {
+                camera: camera.clone(),
+                size: kornia_image::ImageSize {
+                    width: 640,
+                    height: 480,
+                },
+                primary_from_camera,
+                raw_model: None,
+            })
+            .to_vec(),
+    );
+    assert!(matches!(
+        run.apply_rig_calibration(rig),
+        Err(RigCalibrationFileError::CameraCount {
+            in_file: 1,
+            in_source: 2,
+            ..
+        })
+    ));
 }
 
 #[test]

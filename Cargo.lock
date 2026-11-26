@@ -202,6 +202,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloca"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5a7d05ea6aea7e9e64d25b9156ba2fee3fdd659e34e41063cd2fc7cd020d7f4"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -240,6 +249,12 @@ checksum = "819e7219dbd41043ac279b19830f2efc897156490d7fd6ea916720117ee66311"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "anes"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b46cbb362ab8752921c97e041f5e366ee6297bd428a31275b9fcf1e380f7299"
 
 [[package]]
 name = "anstream"
@@ -1625,6 +1640,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df8670b8c7b9dae1793364eafadf7239c40d669904660c5960d74cfd80b46a53"
 
 [[package]]
+name = "cast"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1791,6 +1812,16 @@ checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common",
  "inout",
+]
+
+[[package]]
+name = "clang"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2ed30b30e1e17966b55ddd0b9dd2758fd824f0a6da6875c8abb17e6aba47c28"
+dependencies = [
+ "clang-sys",
+ "libc",
 ]
 
 [[package]]
@@ -2251,6 +2282,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if 1.0.4",
+]
+
+[[package]]
+name = "criterion"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "950046b2aa2492f9a536f5f4f9a3de7b9e2476e575e05bd6c333371add4d98f3"
+dependencies = [
+ "alloca",
+ "anes",
+ "cast",
+ "ciborium",
+ "clap",
+ "criterion-plot",
+ "itertools 0.13.0",
+ "num-traits",
+ "oorandom",
+ "page_size",
+ "plotters",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_json",
+ "tinytemplate",
+ "walkdir",
+]
+
+[[package]]
+name = "criterion-plot"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8d80a2f4f5b554395e47b5d8305bc3d27813bacb73493eb1001e8f76dae29ea"
+dependencies = [
+ "cast",
+ "itertools 0.13.0",
 ]
 
 [[package]]
@@ -5996,7 +6062,7 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 [[package]]
 name = "kornia-3d"
 version = "0.2.0"
-source = "git+https://github.com/kornia/kornia-rs?rev=11b4951719d3b702b6ede25d082874fdd23d05c3#11b4951719d3b702b6ede25d082874fdd23d05c3"
+source = "git+https://github.com/kornia/kornia-rs?rev=4ada5a7554ffe4d373b39c611e55ddc47bcd3294#4ada5a7554ffe4d373b39c611e55ddc47bcd3294"
 dependencies = [
  "bincode 2.0.1",
  "faer 0.24.4",
@@ -6015,7 +6081,7 @@ dependencies = [
 [[package]]
 name = "kornia-algebra"
 version = "0.2.0"
-source = "git+https://github.com/kornia/kornia-rs?rev=11b4951719d3b702b6ede25d082874fdd23d05c3#11b4951719d3b702b6ede25d082874fdd23d05c3"
+source = "git+https://github.com/kornia/kornia-rs?rev=4ada5a7554ffe4d373b39c611e55ddc47bcd3294#4ada5a7554ffe4d373b39c611e55ddc47bcd3294"
 dependencies = [
  "glam 0.33.2",
  "nalgebra 0.35.0",
@@ -6026,7 +6092,7 @@ dependencies = [
 [[package]]
 name = "kornia-bow"
 version = "0.2.0"
-source = "git+https://github.com/kornia/kornia-rs?rev=11b4951719d3b702b6ede25d082874fdd23d05c3#11b4951719d3b702b6ede25d082874fdd23d05c3"
+source = "git+https://github.com/kornia/kornia-rs?rev=4ada5a7554ffe4d373b39c611e55ddc47bcd3294#4ada5a7554ffe4d373b39c611e55ddc47bcd3294"
 dependencies = [
  "bincode 2.0.1",
  "rand 0.10.2",
@@ -6048,7 +6114,7 @@ dependencies = [
 [[package]]
 name = "kornia-image"
 version = "0.2.0"
-source = "git+https://github.com/kornia/kornia-rs?rev=11b4951719d3b702b6ede25d082874fdd23d05c3#11b4951719d3b702b6ede25d082874fdd23d05c3"
+source = "git+https://github.com/kornia/kornia-rs?rev=4ada5a7554ffe4d373b39c611e55ddc47bcd3294#4ada5a7554ffe4d373b39c611e55ddc47bcd3294"
 dependencies = [
  "kornia-tensor",
  "num-traits",
@@ -6059,7 +6125,7 @@ dependencies = [
 [[package]]
 name = "kornia-imgproc"
 version = "0.2.0"
-source = "git+https://github.com/kornia/kornia-rs?rev=11b4951719d3b702b6ede25d082874fdd23d05c3#11b4951719d3b702b6ede25d082874fdd23d05c3"
+source = "git+https://github.com/kornia/kornia-rs?rev=4ada5a7554ffe4d373b39c611e55ddc47bcd3294#4ada5a7554ffe4d373b39c611e55ddc47bcd3294"
 dependencies = [
  "kornia-algebra",
  "kornia-image",
@@ -6073,7 +6139,7 @@ dependencies = [
 [[package]]
 name = "kornia-io"
 version = "0.2.0"
-source = "git+https://github.com/kornia/kornia-rs?rev=11b4951719d3b702b6ede25d082874fdd23d05c3#11b4951719d3b702b6ede25d082874fdd23d05c3"
+source = "git+https://github.com/kornia/kornia-rs?rev=4ada5a7554ffe4d373b39c611e55ddc47bcd3294#4ada5a7554ffe4d373b39c611e55ddc47bcd3294"
 dependencies = [
  "image-webp",
  "jpeg-encoder",
@@ -6104,6 +6170,7 @@ dependencies = [
 name = "kornia-slam"
 version = "0.2.0"
 dependencies = [
+ "criterion",
  "faer 0.22.6",
  "kornia-3d",
  "kornia-algebra",
@@ -6112,9 +6179,12 @@ dependencies = [
  "kornia-image",
  "kornia-imgproc",
  "kornia-sensors",
+ "opencv",
+ "rayon",
  "ron 0.12.2",
  "serde",
  "thiserror 1.0.69",
+ "wide 1.5.0",
 ]
 
 [[package]]
@@ -6140,6 +6210,7 @@ dependencies = [
  "rerun",
  "ron 0.12.2",
  "serde",
+ "serde_json",
  "serde_yaml",
  "thiserror 2.0.19",
 ]
@@ -6147,7 +6218,7 @@ dependencies = [
 [[package]]
 name = "kornia-tensor"
 version = "0.2.0"
-source = "git+https://github.com/kornia/kornia-rs?rev=11b4951719d3b702b6ede25d082874fdd23d05c3#11b4951719d3b702b6ede25d082874fdd23d05c3"
+source = "git+https://github.com/kornia/kornia-rs?rev=4ada5a7554ffe4d373b39c611e55ddc47bcd3294#4ada5a7554ffe4d373b39c611e55ddc47bcd3294"
 dependencies = [
  "num-traits",
  "rayon",
@@ -7847,6 +7918,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "oorandom"
+version = "11.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
+
+[[package]]
+name = "opencv"
+version = "0.100.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08cb1e12c6c3f533f6b1f2c573c73ea42e07e75c4891af6cea9679508fd61e1f"
+dependencies = [
+ "cc",
+ "dunce",
+ "jobserver",
+ "libc",
+ "num-traits",
+ "opencv-binding-generator",
+ "pkg-config",
+ "semver",
+ "shlex 2.0.1",
+ "vcpkg",
+ "windows 0.62.2",
+ "winsplit",
+]
+
+[[package]]
+name = "opencv-binding-generator"
+version = "0.105.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "619e1ab8e9b95beb1eb7919ab34710027894db29428634f6680dfde15eb004f0"
+dependencies = [
+ "clang",
+ "clang-sys",
+ "dunce",
+ "percent-encoding",
+ "regex",
+ "semver",
+ "shlex 2.0.1",
+]
+
+[[package]]
 name = "openssl"
 version = "0.10.81"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8036,6 +8148,16 @@ name = "owo-colors"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1b04fb49957986fdce4d6ee7a65027d55d4b6d2265e5848bbb507b58ccfdb6f"
+
+[[package]]
+name = "page_size"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30d5b2194ed13191c1999ae0704b7839fb18384fa22e49b57eeaa97d79ce40da"
+dependencies = [
+ "libc",
+ "winapi",
+]
 
 [[package]]
 name = "parking"
@@ -8331,6 +8453,34 @@ name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
+
+[[package]]
+name = "plotters"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5aeb6f403d7a4911efb1e33402027fc44f29b5bf6def3effcc22d7bb75f2b747"
+dependencies = [
+ "num-traits",
+ "plotters-backend",
+ "plotters-svg",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
+name = "plotters-backend"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df42e13c12958a16b3f7f4386b9ab1f3e7933914ecea48da7139435263a4172a"
+
+[[package]]
+name = "plotters-svg"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51bae2ac328883f7acdfea3d66a7c35751187f870bc81f94563733a154d7a670"
+dependencies = [
+ "plotters-backend",
+]
 
 [[package]]
 name = "ply-rs-bw"
@@ -12660,6 +12810,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinytemplate"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be4d6b5f19ff7664e8c98d03e2139cb510db9b0a60b55f8e8709b689d939b6bc"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tinyvec"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14450,6 +14610,12 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "winsplit"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ab703352da6a72f35c39a533526393725640575bb211f61987a2748323ad956"
 
 [[package]]
 name = "wit-bindgen"

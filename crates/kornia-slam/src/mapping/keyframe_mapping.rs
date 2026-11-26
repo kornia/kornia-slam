@@ -36,6 +36,14 @@ pub(crate) struct KeyframeInsertion {
     pub close_points: usize,
 }
 
+/// A tracked keyframe's `(landmark, feature)` matches: `linked` become
+/// observations; `withheld` only claim their feature, so stereo seeding skips it.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TrackedMatches<'a> {
+    pub linked: &'a [(usize, usize)],
+    pub withheld: &'a [(usize, usize)],
+}
+
 /// Builds the core insertion for `keyframe`, published as one validated batch.
 ///
 /// `tracked` holds `(landmark, feature)` matches from tracking. With
@@ -44,7 +52,7 @@ pub(crate) struct KeyframeInsertion {
 /// mirroring ORB-SLAM3's `CreateNewKeyFrame`.
 pub(crate) fn keyframe_insertion(
     keyframe: Keyframe,
-    tracked: &[(usize, usize)],
+    tracked: TrackedMatches<'_>,
     stereo_close_depth: Option<f64>,
     camera: &PinholeCamera,
     imu_edge: Option<ImuFactor>,
@@ -60,6 +68,7 @@ pub(crate) fn keyframe_insertion(
     // cannot be published must not win its landmark and suppress a valid
     // later claim on the same one.
     let tracked_claims: Vec<(usize, usize)> = tracked
+        .linked
         .iter()
         .copied()
         .filter(|&(_, feature_idx)| feature_idx < claimed.len())
@@ -75,11 +84,22 @@ pub(crate) fn keyframe_insertion(
             landmark: LandmarkTarget::Existing(landmark_idx),
         });
     }
+    for &(landmark_idx, feature_idx) in tracked.withheld {
+        if let Some(claim @ None) = claimed.get_mut(feature_idx) {
+            *claim = Some(landmark_idx);
+        }
+    }
 
     if let Some(threshold) = stereo_close_depth
         && keyframe.frame.is_stereo()
     {
         insertion.landmarks = growth::stereo_seeds(&keyframe.frame, camera, threshold, &claimed);
+    } else if let Some(threshold) = stereo_close_depth
+        && keyframe.frame.is_rig()
+    {
+        let (seeds, links) = growth::rig_seeds(&keyframe.frame, threshold, &claimed);
+        insertion.landmarks = seeds;
+        insertion.observations.extend(links);
     }
     let close_points = insertion.landmarks.len();
     insertion.keyframes.push(keyframe);
@@ -96,8 +116,39 @@ pub(crate) fn keyframe_insertion(
 /// Not a queued, independently valid snapshot: it names keyframes by id and is
 /// consumed during the same publication interval that produced it.
 pub(crate) struct KeyframeGrowthPlan {
-    keyframe_idx: usize,
-    neighbor_keyframe_indices: Vec<usize>,
+    pub(crate) keyframe_idx: usize,
+    /// Neighbours the keyframe triangulates new landmarks against.
+    triangulation_neighbours: Vec<usize>,
+    /// Neighbours its landmarks are fused into; equal to the above under
+    /// [`GrowthNeighbours::RecentTen`].
+    fusion_neighbours: Vec<usize>,
+}
+
+/// Which keyframes a new keyframe grows and fuses against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum GrowthNeighbours {
+    /// The 10 most recent keyframes, for triangulation and fusion alike.
+    #[default]
+    RecentTen,
+    /// ORB-SLAM3's lists: `CreateNewMapPoints` (best covisible, then the
+    /// previous-keyframe chain) and `SearchInNeighbors` (best covisible, their
+    /// best 20, then temporal keyframes); `LocalMapping.cc:388-407, 714-763`.
+    /// `covisible` is 10 (30 monocular).
+    OrbSlam3 { covisible: usize },
+}
+
+/// The thread a new keyframe's growth and forward fusion run on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum KeyframeGrowth {
+    /// Inside the keyframe's insertion, on the tracking thread.
+    #[default]
+    Tracking,
+    /// Queued to the local-mapping thread, ahead of the keyframe's BA, without
+    /// the publication gate: ORB-SLAM3 runs `CreateNewMapPoints` and
+    /// `SearchInNeighbors` outside `mMutexMapUpdate` (`LocalMapping.cc:101-108`).
+    Mapping,
 }
 
 /// A pair whose growth batch was refused, with the neighbour it was against.
@@ -133,19 +184,118 @@ const MAX_COVIS_KFS: usize = 10;
 /// list that already contained it would triangulate it against itself and drop
 /// the oldest real neighbour. The id is filtered anyway, so the policy states
 /// that intent rather than relying on call order alone.
-pub(crate) fn prepare_keyframe_growth(map: &Map, keyframe_idx: usize) -> KeyframeGrowthPlan {
-    let neighbor_keyframe_indices = map
+pub(crate) fn prepare_keyframe_growth(
+    map: &Map,
+    keyframe_idx: usize,
+    rule: GrowthNeighbours,
+) -> KeyframeGrowthPlan {
+    match rule {
+        GrowthNeighbours::RecentTen => {
+            let neighbours: Vec<usize> = map
+                .keyframes()
+                .iter()
+                .rev()
+                .map(|kf| kf.frame.idx)
+                .filter(|&idx| idx != keyframe_idx)
+                .take(MAX_COVIS_KFS)
+                .collect();
+            KeyframeGrowthPlan {
+                keyframe_idx,
+                fusion_neighbours: neighbours.clone(),
+                triangulation_neighbours: neighbours,
+            }
+        }
+        GrowthNeighbours::OrbSlam3 { covisible } => orb_slam3_growth(map, keyframe_idx, covisible),
+    }
+}
+
+/// ORB-SLAM3 links keyframes sharing at least 15 landmarks
+/// (`KeyFrame::UpdateConnections`).
+const MIN_COVISIBILITY_WEIGHT: usize = 15;
+/// Second-order fusion neighbours per target, and the size the temporal
+/// keyframes fill the fusion list to (`LocalMapping.cc:741-763`).
+const FUSION_TARGETS: usize = 20;
+
+/// ORB-SLAM3's lists, triangulation from `CreateNewMapPoints`
+/// (`LocalMapping.cc:388-407`) and fusion from `SearchInNeighbors`
+/// (`:714-763`). The new keyframe is not in the map yet, so its covisibility
+/// stands in as the previous keyframe's: that keyframe, then its best
+/// covisible neighbours.
+fn orb_slam3_growth(map: &Map, keyframe_idx: usize, covisible: usize) -> KeyframeGrowthPlan {
+    // Newest first: ORB-SLAM3's `mPrevKF` chain.
+    let recent: Vec<usize> = map
         .keyframes()
         .iter()
         .rev()
         .map(|kf| kf.frame.idx)
         .filter(|&idx| idx != keyframe_idx)
-        .take(MAX_COVIS_KFS)
         .collect();
+    let best_covisible = |kf_idx: usize, n: usize| -> Vec<usize> {
+        map.covisible_keyframes_min_weight(kf_idx, MIN_COVISIBILITY_WEIGHT)
+            .into_iter()
+            .map(|(idx, _)| idx)
+            .filter(|&idx| idx != keyframe_idx)
+            .take(n)
+            .collect()
+    };
+    let mut nearest = Vec::new();
+    if let Some(&previous) = recent.first() {
+        nearest.push(previous);
+        extend_unique(&mut nearest, best_covisible(previous, covisible));
+        nearest.truncate(covisible);
+    }
+
+    let mut triangulation_neighbours = nearest.clone();
+    for &idx in recent.iter().take(covisible) {
+        if triangulation_neighbours.len() > covisible {
+            break;
+        }
+        extend_unique(&mut triangulation_neighbours, [idx]);
+    }
+
+    let mut fusion_neighbours = nearest.clone();
+    for &target in &nearest {
+        extend_unique(
+            &mut fusion_neighbours,
+            best_covisible(target, FUSION_TARGETS),
+        );
+    }
+    for &idx in &recent {
+        if fusion_neighbours.len() >= FUSION_TARGETS {
+            break;
+        }
+        extend_unique(&mut fusion_neighbours, [idx]);
+    }
+
     KeyframeGrowthPlan {
         keyframe_idx,
-        neighbor_keyframe_indices,
+        triangulation_neighbours,
+        fusion_neighbours,
     }
+}
+
+/// Appends each of `ids` not in `list` yet, in order.
+fn extend_unique(list: &mut Vec<usize>, ids: impl IntoIterator<Item = usize>) {
+    for id in ids {
+        if !list.contains(&id) {
+            list.push(id);
+        }
+    }
+}
+
+/// [`prepare_keyframe_growth`] for a re-seeded segment still inside its own
+/// window: both lists keep only keyframes at or after `window_start_kf`.
+pub(crate) fn prepare_seeded_window_growth(
+    map: &Map,
+    keyframe_idx: usize,
+    rule: GrowthNeighbours,
+    window_start_kf: usize,
+) -> KeyframeGrowthPlan {
+    let mut plan = prepare_keyframe_growth(map, keyframe_idx, rule);
+    plan.triangulation_neighbours
+        .retain(|&idx| idx >= window_start_kf);
+    plan.fusion_neighbours.retain(|&idx| idx >= window_start_kf);
+    plan
 }
 
 /// Grows the accepted keyframe against its captured neighbours, then fuses its
@@ -161,13 +311,14 @@ pub(crate) fn grow_keyframe(
     camera: &PinholeCamera,
     match_config: OrbMatchConfig,
     triangulation_config: &TriangulationConfig,
+    min_baseline_ratio: f64,
 ) -> KeyframeGrowthResult {
     let mut result = KeyframeGrowthResult {
-        neighbor_count: plan.neighbor_keyframe_indices.len(),
+        neighbor_count: plan.triangulation_neighbours.len(),
         ..Default::default()
     };
 
-    for &neighbor_keyframe_idx in &plan.neighbor_keyframe_indices {
+    for &neighbor_keyframe_idx in &plan.triangulation_neighbours {
         let mut guard = map.lock().unwrap();
         let Some(request) = growth::pair_growth_request(
             &guard,
@@ -176,6 +327,7 @@ pub(crate) fn grow_keyframe(
             match_config,
             triangulation_config,
             camera,
+            min_baseline_ratio,
         ) else {
             continue;
         };
@@ -197,7 +349,7 @@ pub(crate) fn grow_keyframe(
     // descriptor, and the next neighbour's search must match against that,
     // not against the descriptor it had before fusion began.
     let mut guard = map.lock().unwrap();
-    for &neighbor_keyframe_idx in &plan.neighbor_keyframe_indices {
+    for &neighbor_keyframe_idx in &plan.fusion_neighbours {
         let links = growth::neighbor_fusion_links(
             &guard,
             plan.keyframe_idx,
@@ -231,11 +383,18 @@ pub(crate) fn grow_keyframe(
 mod tests {
     use super::*;
     use crate::frame::Frame;
-    use crate::mapping::map::Keyframe;
+    use crate::mapping::map::{Keyframe, LandmarkSeed};
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::Vec3F64;
     use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbFeatures;
+
+    fn linked(matches: &[(usize, usize)]) -> TrackedMatches<'_> {
+        TrackedMatches {
+            linked: matches,
+            withheld: &[],
+        }
+    }
 
     fn stereo_keyframe(idx: usize, depths: Vec<f32>) -> Keyframe {
         let mut frame = empty_frame(idx);
@@ -259,7 +418,7 @@ mod tests {
         let KeyframeInsertion {
             insertion,
             close_points,
-        } = keyframe_insertion(keyframe, &tracked, Some(10.0), &camera(), None);
+        } = keyframe_insertion(keyframe, linked(&tracked), Some(10.0), &camera(), None);
 
         assert_eq!(insertion.observations.len(), 1);
         assert_eq!(insertion.observations[0].observation.feature_idx, 0);
@@ -278,11 +437,41 @@ mod tests {
         assert!(insertion.imu_factors.is_empty());
     }
 
+    /// A withheld match (a PnP outlier under `PnpInliersClaimed`) keeps its
+    /// feature from stereo seeding without linking it, so it does not become
+    /// a duplicate of the landmark it matched.
+    #[test]
+    fn keyframe_insertion_does_not_seed_withheld_features() {
+        let seeded = |withheld: &[(usize, usize)]| {
+            let keyframe = stereo_keyframe(9, vec![2.0, 2.0, 2.0]);
+            let KeyframeInsertion { insertion, .. } = keyframe_insertion(
+                keyframe,
+                TrackedMatches {
+                    linked: &[(5, 0)],
+                    withheld,
+                },
+                Some(10.0),
+                &camera(),
+                None,
+            );
+            assert_eq!(insertion.observations.len(), 1);
+            insertion
+                .landmarks
+                .iter()
+                .map(|seed| seed.reference.feature_idx)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(seeded(&[]), vec![1, 2]);
+        // Feature 0 is already linked and 99 is out of range.
+        assert_eq!(seeded(&[(6, 1), (7, 0), (8, 99)]), vec![2]);
+    }
+
     #[test]
     fn keyframe_insertion_skips_stereo_seeds_when_densification_is_off() {
         let keyframe = stereo_keyframe(9, vec![2.0, 2.0]);
         let KeyframeInsertion { close_points, .. } =
-            keyframe_insertion(keyframe, &[], None, &camera(), None);
+            keyframe_insertion(keyframe, TrackedMatches::default(), None, &camera(), None);
         assert_eq!(close_points, 0);
     }
 
@@ -325,6 +514,7 @@ mod tests {
             u_right: Vec::new(),
             depth: Vec::new(),
             keypoints_undist: Vec::new(),
+            rig: Default::default(),
         }
     }
 
@@ -362,6 +552,7 @@ mod tests {
             u_right: Vec::new(),
             depth: Vec::new(),
             keypoints_undist: Vec::new(),
+            rig: Default::default(),
         }
     }
 
@@ -372,6 +563,7 @@ mod tests {
             &camera(),
             OrbMatchConfig::default(),
             &TriangulationConfig::default(),
+            0.0,
         )
     }
 
@@ -386,10 +578,10 @@ mod tests {
                 .unwrap();
         }
 
-        let plan = prepare_keyframe_growth(&map, 999);
+        let plan = prepare_keyframe_growth(&map, 999, GrowthNeighbours::RecentTen);
 
         assert_eq!(
-            plan.neighbor_keyframe_indices,
+            plan.triangulation_neighbours,
             vec![31, 88, 2, 55, 7, 64, 12, 900, 5, 41],
             "the ten most recently inserted, newest first"
         );
@@ -406,9 +598,26 @@ mod tests {
                 .unwrap();
         }
 
-        let plan = prepare_keyframe_growth(&map, 9);
+        let plan = prepare_keyframe_growth(&map, 9, GrowthNeighbours::RecentTen);
 
-        assert_eq!(plan.neighbor_keyframe_indices, vec![4]);
+        assert_eq!(plan.triangulation_neighbours, vec![4]);
+    }
+
+    /// Without covisibility the ORB-SLAM3 lists are the previous keyframe,
+    /// then the temporal chain: `covisible + 1` at most for triangulation,
+    /// up to 20 for fusion; never the grown keyframe.
+    #[test]
+    fn orb_slam3_neighbours_fall_back_to_the_temporal_chain() {
+        let mut map = Map::new();
+        for idx in 1..=6 {
+            map.insert_keyframe(Keyframe::from_frame(empty_frame(idx)))
+                .unwrap();
+        }
+
+        let plan = prepare_keyframe_growth(&map, 6, GrowthNeighbours::OrbSlam3 { covisible: 2 });
+
+        assert_eq!(plan.triangulation_neighbours, vec![5, 4]);
+        assert_eq!(plan.fusion_neighbours, vec![5, 4, 3, 2, 1]);
     }
 
     /// Each pair is published before the next is prepared, so the second
@@ -422,10 +631,10 @@ mod tests {
             map.insert_keyframe(Keyframe::from_frame(observing_frame(idx, offset, &points)))
                 .unwrap();
         }
-        let plan = prepare_keyframe_growth(&map, 30);
+        let plan = prepare_keyframe_growth(&map, 30, GrowthNeighbours::RecentTen);
         map.insert_keyframe(Keyframe::from_frame(observing_frame(30, 2.0, &points)))
             .unwrap();
-        assert_eq!(plan.neighbor_keyframe_indices, vec![20, 10]);
+        assert_eq!(plan.triangulation_neighbours, vec![20, 10]);
         let map = Mutex::new(map);
 
         let result = grow(&map, plan);
@@ -461,11 +670,11 @@ mod tests {
         // Shares no features: the pair has nothing to propose.
         map.insert_keyframe(Keyframe::from_frame(empty_frame(10)))
             .unwrap();
-        let plan = prepare_keyframe_growth(&map, 30);
+        let plan = prepare_keyframe_growth(&map, 30, GrowthNeighbours::RecentTen);
         map.insert_keyframe(Keyframe::from_frame(observing_frame(30, 2.0, &points)))
             .unwrap();
         assert_eq!(
-            plan.neighbor_keyframe_indices,
+            plan.triangulation_neighbours,
             vec![10, 20],
             "the skipped neighbour must be visited before the useful one"
         );
@@ -487,6 +696,46 @@ mod tests {
         assert!(map.lock().unwrap().get_keyframe(30).is_some());
     }
 
+    /// Keyframe 30 is 1 m from keyframe 10 and holds one landmark 5 m deep, so
+    /// its pair's baseline/depth is 0.2: a 0.25 ratio skips it, 0.15 grows it.
+    #[test]
+    fn the_baseline_ratio_reaches_each_pair() {
+        let added = |ratio: f64| {
+            let mut points = grid();
+            let mut map = Map::new();
+            map.insert_keyframe(Keyframe::from_frame(observing_frame(10, 0.0, &points)))
+                .unwrap();
+            points.push(Vec3F64::new(1.0, 0.0, 5.0));
+            map.insert_keyframe(Keyframe::from_frame(observing_frame(30, 1.0, &points)))
+                .unwrap();
+            map.insert_landmark(LandmarkSeed {
+                position: points[20],
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 30,
+                    feature_idx: 20,
+                },
+            })
+            .unwrap();
+            let plan = KeyframeGrowthPlan {
+                keyframe_idx: 30,
+                triangulation_neighbours: vec![10],
+                fusion_neighbours: vec![],
+            };
+            grow_keyframe(
+                &Mutex::new(map),
+                plan,
+                &camera(),
+                OrbMatchConfig::default(),
+                &TriangulationConfig::default(),
+                ratio,
+            )
+            .landmarks_added
+        };
+        assert_eq!(added(0.25), 0);
+        assert_eq!(added(0.15), 20);
+    }
+
     /// Fusion runs after growth and over the same neighbour list, so it sees
     /// the landmarks growth just created and can extend them into a neighbour
     /// that does not observe them yet.
@@ -499,7 +748,7 @@ mod tests {
             .unwrap();
         map.insert_keyframe(Keyframe::from_frame(observing_frame(20, 1.0, &points)))
             .unwrap();
-        let plan = prepare_keyframe_growth(&map, 30);
+        let plan = prepare_keyframe_growth(&map, 30, GrowthNeighbours::RecentTen);
         map.insert_keyframe(Keyframe::from_frame(observing_frame(30, 2.0, &points)))
             .unwrap();
         let map = Mutex::new(map);
@@ -541,14 +790,15 @@ mod tests {
             map.insert_keyframe(Keyframe::from_frame(observing_frame(idx, offset, &points)))
                 .unwrap();
         }
-        let first_plan = prepare_keyframe_growth(&map, 30);
+        let first_plan = prepare_keyframe_growth(&map, 30, GrowthNeighbours::RecentTen);
         map.insert_keyframe(Keyframe::from_frame(observing_frame(30, 2.0, &points)))
             .unwrap();
         let map = Mutex::new(map);
         let first = grow(&map, first_plan);
         assert!(first.landmarks_added > 0);
 
-        let second_plan = prepare_keyframe_growth(&map.lock().unwrap(), 30);
+        let second_plan =
+            prepare_keyframe_growth(&map.lock().unwrap(), 30, GrowthNeighbours::RecentTen);
         let before = map.lock().unwrap().state_fingerprint_for_test();
 
         let result = grow(&map, second_plan);
@@ -562,5 +812,243 @@ mod tests {
             before,
             "a pass with nothing to do changed the map"
         );
+    }
+
+    #[test]
+    fn a_seeded_window_grows_against_its_own_keyframes_only() {
+        let mut map = Map::new();
+        for idx in 0..13 {
+            map.insert_keyframe(Keyframe::from_frame(empty_frame(idx)))
+                .unwrap();
+        }
+        let open = prepare_keyframe_growth(&map, 13, GrowthNeighbours::RecentTen);
+        assert_eq!(
+            open.triangulation_neighbours,
+            (3..13).rev().collect::<Vec<_>>()
+        );
+
+        let plan = prepare_seeded_window_growth(&map, 13, GrowthNeighbours::RecentTen, 8);
+        let window: Vec<usize> = (8..13).rev().collect();
+        assert_eq!(plan.keyframe_idx, 13);
+        assert_eq!(plan.triangulation_neighbours, window);
+        assert_eq!(plan.fusion_neighbours, window);
+
+        let unbounded = prepare_seeded_window_growth(&map, 13, GrowthNeighbours::RecentTen, 0);
+        assert_eq!(
+            unbounded.triangulation_neighbours,
+            open.triangulation_neighbours
+        );
+        assert_eq!(unbounded.fusion_neighbours, open.fusion_neighbours);
+    }
+
+    mod queued {
+        //! `keyframe_growth: Mapping`: growth queued to the local-mapping thread.
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        use super::*;
+        use crate::mapping::local_mapping::{GrowthJob, GrowthOutcome};
+        use crate::mapping::{LocalMapping, LocalMappingMode};
+        use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
+
+        fn job(plan: KeyframeGrowthPlan) -> GrowthJob {
+            GrowthJob {
+                plan,
+                match_config: OrbMatchConfig::default(),
+                triangulation_config: TriangulationConfig::default(),
+                min_baseline_ratio: 0.0,
+            }
+        }
+
+        fn seeded_map() -> Map {
+            let mut map = Map::new();
+            for (idx, offset) in [(10, 0.0), (20, 1.0)] {
+                map.insert_keyframe(Keyframe::from_frame(observing_frame(idx, offset, &grid())))
+                    .unwrap();
+            }
+            map
+        }
+
+        /// Inserts keyframes `ids` one after another (plan, then publication,
+        /// as `insert_keyframe` does) and hands each plan to `grow`.
+        fn insert_and_grow(
+            map: &Mutex<Map>,
+            ids: &[usize],
+            mut grow: impl FnMut(KeyframeGrowthPlan),
+        ) {
+            for (i, &idx) in ids.iter().enumerate() {
+                let plan = {
+                    let mut map = map.lock().unwrap();
+                    let plan = prepare_keyframe_growth(&map, idx, GrowthNeighbours::RecentTen);
+                    let frame = observing_frame(idx, 2.0 + i as f64, &grid());
+                    map.insert_keyframe(Keyframe::from_frame(frame)).unwrap();
+                    plan
+                };
+                grow(plan);
+            }
+        }
+
+        fn drain_until(mapping: &LocalMapping, n: usize) -> Vec<GrowthOutcome> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut outcomes = Vec::new();
+            while outcomes.len() < n {
+                assert!(
+                    Instant::now() < deadline,
+                    "{} of {n} growth results",
+                    outcomes.len()
+                );
+                outcomes.extend(mapping.drain_growth());
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            outcomes
+        }
+
+        /// The worker blocks on the map lock the test holds while three jobs
+        /// queue; they come back in submission order and leave the same map as
+        /// growth inline on the inserting thread.
+        #[test]
+        fn queued_growth_runs_in_order_and_equals_inline_growth() {
+            let ids = [30, 40, 50];
+            let inline = Mutex::new(seeded_map());
+            insert_and_grow(&inline, &ids, |plan| {
+                grow(&inline, plan);
+            });
+
+            let map = Arc::new(Mutex::new(seeded_map()));
+            let mapping =
+                LocalMapping::new(LocalMappingMode::Asynchronous, Arc::clone(&map), camera());
+            let mut queued = Vec::new();
+            insert_and_grow(&map, &ids, |plan| queued.push(plan));
+            {
+                let _held = map.lock().unwrap();
+                for (n, plan) in queued.into_iter().enumerate() {
+                    assert_eq!(mapping.submit_growth(job(plan)), n + 1, "nothing ran yet");
+                }
+                assert!(mapping.load().busy);
+            }
+            let order: Vec<usize> = drain_until(&mapping, 3)
+                .iter()
+                .map(|outcome| outcome.keyframe_idx)
+                .collect();
+            assert_eq!(order, ids);
+            assert_eq!(
+                map.lock().unwrap().state_fingerprint_for_test(),
+                inline.lock().unwrap().state_fingerprint_for_test()
+            );
+
+            let synchronous = Arc::new(Mutex::new(seeded_map()));
+            let sync_mapping = LocalMapping::new(
+                LocalMappingMode::Synchronous,
+                Arc::clone(&synchronous),
+                camera(),
+            );
+            insert_and_grow(&synchronous, &ids, |plan| {
+                assert_eq!(sync_mapping.submit_growth(job(plan)), 0);
+            });
+            assert_eq!(sync_mapping.drain_growth().len(), 3);
+            assert_eq!(
+                synchronous.lock().unwrap().state_fingerprint_for_test(),
+                inline.lock().unwrap().state_fingerprint_for_test()
+            );
+        }
+
+        /// A neighbour removed while the plan waited is a skip, not a failure.
+        #[test]
+        fn a_plan_naming_an_evicted_neighbour_skips_it() {
+            let mut map = seeded_map();
+            let plan = prepare_keyframe_growth(&map, 30, GrowthNeighbours::RecentTen);
+            map.insert_keyframe(Keyframe::from_frame(observing_frame(30, 2.0, &grid())))
+                .unwrap();
+            map.remove_keyframe(20).unwrap();
+            let map = Mutex::new(map);
+            let result = grow(&map, plan);
+            assert_eq!(result.neighbor_count, 2);
+            assert!(result.pair_failures.is_empty());
+            assert!(result.fusion_failures.is_empty());
+            assert_eq!(
+                result.landmarks_added,
+                grid().len(),
+                "the pair with 10 still grows"
+            );
+        }
+
+        /// Local-map selection on another thread while the worker grows 50
+        /// keyframes: every read sees a consistent map.
+        #[test]
+        fn local_map_selection_runs_while_the_worker_grows() {
+            let map = Arc::new(Mutex::new(seeded_map()));
+            let mapping =
+                LocalMapping::new(LocalMappingMode::Asynchronous, Arc::clone(&map), camera());
+            let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader = {
+                let (map, done) = (Arc::clone(&map), Arc::clone(&done));
+                std::thread::spawn(move || {
+                    let mut reads = 0;
+                    while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                        let map = map.lock().unwrap();
+                        let newest = map.keyframes().last();
+                        let selection = select_local_map_points(
+                            &map,
+                            &[],
+                            newest,
+                            LocalMapSelectionConfig::default(),
+                        );
+                        assert!(selection.points.iter().all(|&p| p < map.map_points().len()));
+                        reads += 1;
+                    }
+                    reads
+                })
+            };
+            let ids: Vec<usize> = (0..50).map(|i| 30 + 10 * i).collect();
+            insert_and_grow(&map, &ids, |plan| {
+                mapping.submit_growth(job(plan));
+            });
+            let outcomes = drain_until(&mapping, ids.len());
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            assert!(reader.join().unwrap() > 0);
+            assert!(outcomes.iter().all(|o| o.result.fusion_failures.is_empty()));
+        }
+
+        /// Dropping local mapping with growth queued behind a held lock
+        /// returns once the lock is released; the queue is not drained.
+        #[test]
+        fn shutdown_with_queued_growth_returns() {
+            let map = Arc::new(Mutex::new(seeded_map()));
+            let mapping =
+                LocalMapping::new(LocalMappingMode::Asynchronous, Arc::clone(&map), camera());
+            let mut plans = Vec::new();
+            insert_and_grow(&map, &[30, 40, 50, 60], |plan| plans.push(plan));
+            let held = map.lock().unwrap();
+            for plan in plans {
+                mapping.submit_growth(job(plan));
+            }
+            let dropper = std::thread::spawn(move || drop(mapping));
+            std::thread::sleep(Duration::from_millis(20));
+            drop(held);
+            dropper.join().unwrap();
+        }
+
+        /// A reset drops the queue, and the result of the growth in progress.
+        #[test]
+        fn clearing_the_queue_discards_its_results() {
+            let map = Arc::new(Mutex::new(seeded_map()));
+            let mapping =
+                LocalMapping::new(LocalMappingMode::Asynchronous, Arc::clone(&map), camera());
+            let mut plans = Vec::new();
+            insert_and_grow(&map, &[30, 40], |plan| plans.push(plan));
+            {
+                let _held = map.lock().unwrap();
+                for plan in plans {
+                    mapping.submit_growth(job(plan));
+                }
+                mapping.clear_growth();
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while mapping.load().busy {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(mapping.drain_growth().is_empty());
+        }
     }
 }

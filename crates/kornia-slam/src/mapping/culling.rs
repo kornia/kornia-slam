@@ -246,6 +246,44 @@ pub fn cull_redundant_keyframes(
     report
 }
 
+/// What [`bound_keyframes`] removed: the redundant keyframes it culled first, then the oldest it
+/// evicted to reach the bound.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KeyframeBoundReport {
+    pub culled: Vec<usize>,
+    pub evicted: Vec<usize>,
+}
+
+impl KeyframeBoundReport {
+    /// Every keyframe removed, culled then evicted.
+    pub fn removed(&self) -> impl Iterator<Item = usize> + '_ {
+        self.culled.iter().chain(&self.evicted).copied()
+    }
+}
+
+/// Holds the map to `max_keyframes`: redundant keyframes go first
+/// ([`cull_redundant_keyframes`]), and only if that is not enough the oldest
+/// ([`evict_oldest_keyframes`]). A map at or under the bound is left alone.
+/// Wheel edges touching a removed keyframe are composed or dropped with it.
+pub fn bound_keyframes(
+    map: &mut Map,
+    max_keyframes: usize,
+    culling: &KeyframeCullingConfig,
+    mut wheel_factors: Option<&mut Vec<WheelOdomFactor>>,
+) -> KeyframeBoundReport {
+    let mut report = KeyframeBoundReport::default();
+    if map.keyframes().len() <= max_keyframes {
+        return report;
+    }
+    report.culled =
+        cull_redundant_keyframes(map, culling, wheel_factors.as_deref_mut(), None).removed;
+    if map.keyframes().len() > max_keyframes {
+        report.evicted = evict_oldest_keyframes(map, max_keyframes, wheel_factors, None).evicted;
+    }
+    report
+}
+
 /// What [`evict_oldest_keyframes`] did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -446,7 +484,9 @@ fn is_redundant(map: &Map, kf_idx: usize, config: &KeyframeCullingConfig) -> boo
         live += 1;
         let coarsest =
             feature_octave(keyframe, feature).saturating_add(config.scale_level_tolerance);
-        let seen_by = mp
+        // Distinct keyframes: both cameras of a rig keyframe are one observer.
+        let mut observers: Vec<usize> = Vec::with_capacity(config.min_other_observers);
+        for o in mp
             .observations()
             .iter()
             .filter(|o| o.key.keyframe_idx != kf_idx)
@@ -454,8 +494,15 @@ fn is_redundant(map: &Map, kf_idx: usize, config: &KeyframeCullingConfig) -> boo
                 octave_in(o.key.keyframe_idx, o.key.feature_idx)
                     .is_some_and(|octave| octave <= coarsest)
             })
-            .take(config.min_other_observers)
-            .count();
+        {
+            if observers.len() >= config.min_other_observers {
+                break;
+            }
+            if !observers.contains(&o.key.keyframe_idx) {
+                observers.push(o.key.keyframe_idx);
+            }
+        }
+        let seen_by = observers.len();
         if seen_by >= config.min_other_observers {
             redundant += 1;
         }
@@ -630,6 +677,7 @@ mod tests {
             u_right: Vec::new(),
             depth: Vec::new(),
             keypoints_undist: Vec::new(),
+            rig: Default::default(),
         }
     }
 

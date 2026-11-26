@@ -1,9 +1,10 @@
-//! Frame sources: offline datasets (EuRoC, Hilti, TUM-VI, MCAP recordings) and live
+//! Frame sources: offline datasets (EuRoC, Hilti, LaMAria, TUM-VI, MCAP recordings) and live
 //! cameras (OAK-D, UVC) behind one [`FrameSource`] trait. Each source module
 //! also owns the run-file settings it is opened from.
 
 pub mod euroc;
 pub mod hilti;
+pub mod lamaria;
 pub mod mcap;
 pub mod oakd;
 pub mod tumvi;
@@ -12,16 +13,20 @@ pub mod uvc;
 use std::path::{Path, PathBuf};
 
 use kornia_image::Image;
+use kornia_imgproc::color::gray_from_rgb_u8;
+use kornia_io::jpeg::{decode_image_jpeg_layout, decode_image_jpeg_mono8, decode_image_jpeg_rgb8};
 use kornia_sensors::SensorRig;
 use kornia_sensors::imu::ImuMeasurement;
 use serde::Deserialize;
 
 use crate::datasets::StereoRectifier;
 use crate::datasets::euroc::GroundTruthPose;
+use kornia_slam::rectify::{RemapQuantisation, StereoRemap};
 use kornia_slam::{CameraSelection, SensorSelection};
 
 use euroc::EurocConfig;
 use hilti::HiltiConfig;
+use lamaria::LamariaConfig;
 use mcap::McapConfig;
 use oakd::OakdConfig;
 use tumvi::TumViConfig;
@@ -37,6 +42,9 @@ pub struct FrameItem {
     pub image: Image<u8, 1>,
     /// Rectified right view, when the source provides a stereo pair.
     pub right_image: Option<Image<u8, 1>>,
+    /// Images of the other rig cameras, in rig order after `image` (the
+    /// primary), when the source yields a multi-camera rig.
+    pub rig_images: Vec<Image<u8, 1>>,
     /// IMU samples between the previous yielded camera frame and this one.
     pub imu_samples: Vec<ImuMeasurement>,
 }
@@ -99,6 +107,7 @@ pub struct OpenedSource {
 pub enum SourceConfig {
     Euroc(EurocConfig),
     Hilti(HiltiConfig),
+    Lamaria(LamariaConfig),
     Mcap(McapConfig),
     Oakd(OakdConfig),
     TumVi(TumViConfig),
@@ -113,6 +122,7 @@ impl SourceConfig {
         match self {
             Self::Euroc(_) => Ok(()),
             Self::Hilti(hilti) => hilti.validate(sensors),
+            Self::Lamaria(lamaria) => lamaria.validate(sensors),
             Self::Mcap(mcap) => mcap.validate(sensors),
             Self::Oakd(oakd) => oakd.validate(sensors),
             Self::TumVi(tumvi) => tumvi.validate(sensors),
@@ -125,6 +135,7 @@ impl SourceConfig {
         match self {
             Self::Euroc(euroc) => euroc.resolve_paths(base_dir),
             Self::Hilti(hilti) => hilti.resolve_paths(base_dir),
+            Self::Lamaria(lamaria) => lamaria.resolve_paths(base_dir),
             Self::Mcap(mcap) => mcap.resolve_paths(base_dir),
             Self::Oakd(oakd) => oakd.resolve_paths(base_dir),
             Self::TumVi(tumvi) => tumvi.resolve_paths(base_dir),
@@ -132,14 +143,20 @@ impl SourceConfig {
         }
     }
 
-    /// Opens the source in the mode the selected sensors need.
-    pub fn open(&self, sensors: SensorSelection) -> Result<OpenedSource, SourceError> {
+    /// Opens the source in the mode the selected sensors need; stereo pairs
+    /// from raw cameras are rectified as `rectification` says.
+    pub fn open(
+        &self,
+        sensors: SensorSelection,
+        rectification: Rectification,
+    ) -> Result<OpenedSource, SourceError> {
         let stereo = sensors.cameras == CameraSelection::Stereo;
         match self {
-            Self::Euroc(euroc) => euroc.open(stereo),
+            Self::Euroc(euroc) => euroc.open(sensors.cameras, rectification),
             Self::Hilti(hilti) => hilti.open(sensors.imu),
-            Self::Mcap(mcap) => mcap.open(stereo),
-            Self::Oakd(oakd) => oakd.open(stereo),
+            Self::Lamaria(lamaria) => lamaria.open(sensors),
+            Self::Mcap(mcap) => mcap.open(stereo, rectification),
+            Self::Oakd(oakd) => oakd.open(stereo, rectification),
             Self::TumVi(tumvi) => tumvi.open(sensors.imu),
             Self::Uvc(uvc) => uvc.open(),
         }
@@ -207,19 +224,88 @@ fn non_empty(poses: Vec<GroundTruthPose>) -> Option<Vec<GroundTruthPose>> {
     (!poses.is_empty()).then_some(poses)
 }
 
-/// Rectify a raw stereo pair into freshly allocated `(left, right)` images.
-fn rectify_pair(
-    rectifier: &StereoRectifier,
-    left: &Image<u8, 1>,
-    right: &Image<u8, 1>,
-) -> Result<(Image<u8, 1>, Image<u8, 1>), SourceError> {
-    let mut left_rect = Image::from_size_val(left.size(), 0).map_err(SourceError::other)?;
-    let mut right_rect = Image::from_size_val(right.size(), 0).map_err(SourceError::other)?;
-    rectifier
-        .rectify_left(left, &mut left_rect)
-        .map_err(SourceError::other)?;
-    rectifier
-        .rectify_right(right, &mut right_rect)
-        .map_err(SourceError::other)?;
-    Ok((left_rect, right_rect))
+/// Decode a JPEG payload to a luma8 image. Mono JPEGs are decoded directly;
+/// RGB JPEGs (used by the `compressed` channel) are decoded then converted.
+fn decode_jpeg_to_luma(
+    jpeg_bytes: &[u8],
+) -> Result<Image<u8, 1>, Box<dyn std::error::Error + Send + Sync>> {
+    let layout = decode_image_jpeg_layout(jpeg_bytes)?;
+    let size = layout.image_size;
+    match layout.channels {
+        1 => {
+            let mut dst = Image::<u8, 1>::from_size_val(size, 0)?;
+            decode_image_jpeg_mono8(jpeg_bytes, &mut dst)?;
+            Ok(dst)
+        }
+        3 => {
+            let mut rgb = Image::<u8, 3>::from_size_val(size, 0)?;
+            decode_image_jpeg_rgb8(jpeg_bytes, &mut rgb)?;
+            let mut gray = Image::<u8, 1>::from_size_val(size, 0)?;
+            gray_from_rgb_u8(&rgb, &mut gray)?;
+            Ok(gray)
+        }
+        n => Err(format!("unsupported JPEG channel count: {n} (want 1 or 3)").into()),
+    }
+}
+
+/// How a raw stereo pair is rectified (`RunConfig.rectification`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum Rectification {
+    /// kornia-rs `remap_u8` on the f32 maps, on rayon rows.
+    #[default]
+    RemapF32,
+    /// Precomputed fixed-point tables on SIMD lanes, on the source thread.
+    /// The same bytes as `RemapF32`.
+    FixedPoint,
+}
+
+/// A [`StereoRectifier`] and, for [`Rectification::FixedPoint`], its tables.
+pub struct PairRectifier {
+    rectifier: StereoRectifier,
+    tables: Option<StereoRemap>,
+}
+
+impl PairRectifier {
+    pub fn new(rectifier: StereoRectifier, mode: Rectification) -> Result<Self, SourceError> {
+        let tables = match mode {
+            Rectification::RemapF32 => None,
+            Rectification::FixedPoint => Some(
+                StereoRemap::new(&rectifier, RemapQuantisation::Q10Trunc)
+                    .map_err(SourceError::other)?,
+            ),
+        };
+        Ok(Self { rectifier, tables })
+    }
+
+    /// Rectify a raw stereo pair into freshly allocated `(left, right)` images.
+    fn rectify(
+        &self,
+        left: &Image<u8, 1>,
+        right: &Image<u8, 1>,
+    ) -> Result<(Image<u8, 1>, Image<u8, 1>), SourceError> {
+        let mut left_rect = Image::from_size_val(left.size(), 0).map_err(SourceError::other)?;
+        let mut right_rect = Image::from_size_val(right.size(), 0).map_err(SourceError::other)?;
+        match &self.tables {
+            Some(tables) => tables
+                .rectify(left, right, &mut left_rect, &mut right_rect)
+                .map_err(SourceError::other)?,
+            None => {
+                self.rectifier
+                    .rectify_left(left, &mut left_rect)
+                    .map_err(SourceError::other)?;
+                self.rectifier
+                    .rectify_right(right, &mut right_rect)
+                    .map_err(SourceError::other)?;
+            }
+        }
+        Ok((left_rect, right_rect))
+    }
+}
+
+impl std::ops::Deref for PairRectifier {
+    type Target = StereoRectifier;
+
+    fn deref(&self) -> &StereoRectifier {
+        &self.rectifier
+    }
 }

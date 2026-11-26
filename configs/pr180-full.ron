@@ -1,0 +1,69 @@
+// PR #180 round 2: pr180-frontend-1ms.ron plus the cards A-D estimator bundle
+// (card A, "Experiment A0") and the card B recovery
+// knobs. UNTESTED: it has never run, and no accuracy or speed figure is
+// claimed. Raw fisheye is deferred.
+//
+// Run from the repository root, pinned to two cores:
+//   taskset -c 0,1 cargo run --release -p kornia-slam-app -- --config configs/pr180-full.ron
+// Needs the DBoW2 ORB vocabulary at weights/ORBvoc.txt in the repository root
+// (relocalization and the card B knobs need loop closing). `max_frames` below
+// is the card's "camera rate"; 10 is the assumed LaMAria SLAM camera rate,
+// check it for your recording. The rig values are the stereo ones (100, 10).
+(
+    source: Lamaria((
+        data: "../data/lamaria/sequence_1_19",
+        calib: "../data/lamaria/sequence_1_19/pinhole_calibrations/sequence_1_19.json",
+        factory_calib: "../data/lamaria/sequence_1_19/factory_calib.json",
+    )),
+    system: (
+        version: 1,
+        sensors: ( cameras: Rig, imu: true ),
+        pipeline: OrbSlam((
+            frontend: Orb((
+                // Half the 2 x 48 tracks `track_refill` caps a rig at; the
+                // default 80 would send most frames back to ORB.
+                klt_first: Enabled(min_tracks: 48),
+                flow_threads: 2,
+                klt_rig: AllCameras,
+                klt_kernel: WindowedU8,
+                klt_window: 11,
+                klt_prediction: Enabled(max_level: 0, max_iter: 8),
+                klt_retry: CoarseLevel(max_level: 1),
+                forward_backward: Enabled(max_round_trip_px: 0.6, max_iter: 4, every_n_frames: 1),
+                track_refill: Enabled(per_camera: 48, min_spacing_px: 23.0, refill_below: 0.8, border_px: 9),
+                adopt_landmarks: true,
+                gyro_guess: RotatedRay,
+                flow_pose: AnalyticGn(max_iter: 3),
+                flow_bookkeeping: KeyframesOnly,
+            )),
+            // Card A, bundle A0.
+            mapping: (
+                execution: Asynchronous,
+                local_ba: (
+                    active_keyframes: 10,
+                    max_iterations: 50,
+                    large_window: Enabled(min_tracked_inliers: 100, active_keyframes: 25, max_iterations: 50, initial_lambda: 1e-2),
+                    boundary_scales_bias_rows: false,
+                ),
+                growth_neighbours: OrbSlam3(covisible: 10),
+            ),
+            inertial: ( sample_interpolation: Midpoint ),
+            // G11: `refine_monotone` makes the analytic refine never adopt an uphill step.
+            // `pose_inertial` stays Off: with OrbSlam3 this bundle lost scale on
+            // LaMAria R_01 (0.08-0.82 over 4 runs; card H).
+            tracking: ( pose_inertial: Off, local_map: OrbSlam3, refine_monotone: true ),
+            keyframes: ( rules: OrbSlam3(max_frames: 10) ),
+            loop_closing: Enabled(vocabulary: "../weights/ORBvoc.txt"),
+            // Card B recovery knobs. `keep_inertial` is required by the
+            // re-seed knobs; the card scores `own_window_keyframes` at 10.
+            tracking_loss: (
+                relocalization: ( while_lost: true, solver: RigAp3p ),
+                reseed: (
+                    keep_inertial: true,
+                    relocalize_when_lost: true,
+                    own_window_keyframes: 10,
+                ),
+            ),
+        )),
+    ),
+)

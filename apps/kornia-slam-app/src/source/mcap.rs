@@ -18,8 +18,6 @@ use std::path::{Path, PathBuf};
 use ciborium::value::Value as CborValue;
 use kornia_3d::camera::PinholeCamera;
 use kornia_image::Image;
-use kornia_imgproc::color::gray_from_rgb_u8;
-use kornia_io::jpeg::{decode_image_jpeg_layout, decode_image_jpeg_mono8, decode_image_jpeg_rgb8};
 use mcap::McapError;
 
 use kornia_sensors::SensorRig;
@@ -27,8 +25,8 @@ use kornia_slam::SensorSelection;
 use serde::Deserialize;
 
 use super::{
-    FrameItem, FrameSource, OpenedSource, SourceError, no_imu, rectify_pair, resolve,
-    stereo_needs_calib,
+    FrameItem, FrameSource, OpenedSource, PairRectifier, Rectification, SourceError,
+    decode_jpeg_to_luma, no_imu, resolve, stereo_needs_calib,
 };
 use crate::datasets::StereoCalib;
 
@@ -72,7 +70,11 @@ impl McapConfig {
         }
     }
 
-    pub(super) fn open(&self, stereo: bool) -> Result<OpenedSource, SourceError> {
+    pub(super) fn open(
+        &self,
+        stereo: bool,
+        rectification: Rectification,
+    ) -> Result<OpenedSource, SourceError> {
         let source = match (&self.calib, stereo) {
             (Some(calib), true) => McapSource::open_stereo(
                 &self.path,
@@ -81,6 +83,7 @@ impl McapConfig {
                 calib,
                 self.start_frame,
                 self.max_frames,
+                rectification,
             )?,
             _ => McapSource::open(&self.path, &self.channel, self.start_frame, self.max_frames)?,
         };
@@ -185,10 +188,14 @@ impl McapSource {
         calib_path: &Path,
         start_frame: usize,
         max_frames: usize,
+        rectification: Rectification,
     ) -> Result<Self, SourceError> {
         let bytes = fs::read(path).map_err(SourceError::Io)?;
         let calib = StereoCalib::load(calib_path).map_err(SourceError::other)?;
-        let rectifier = calib.rectifier().map_err(SourceError::other)?;
+        let rectifier = PairRectifier::new(
+            calib.rectifier().map_err(SourceError::other)?,
+            rectification,
+        )?;
         let rect_cam = rectifier.rectified_camera();
 
         let left = read_channel(&bytes, left_suffix)?;
@@ -215,7 +222,7 @@ impl McapSource {
         let prepared: Vec<PreparedFrame> = sel
             .into_iter()
             .map(|(t, limg, rimg)| {
-                let (image, right_image) = rectify_pair(&rectifier, &limg, &rimg)?;
+                let (image, right_image) = rectifier.rectify(&limg, &rimg)?;
                 Ok(PreparedFrame {
                     timestamp_sec: t - t0,
                     image,
@@ -267,6 +274,7 @@ impl FrameSource for McapSource {
             timestamp_sec: prepared.timestamp_sec,
             image: prepared.image,
             right_image: prepared.right_image,
+            rig_images: Vec::new(),
             imu_samples: Vec::new(),
         }))
     }
@@ -341,30 +349,6 @@ fn nearest_index(ts: &[f64], t: f64) -> usize {
         .min_by(|(_, a), (_, b)| (*a - t).abs().total_cmp(&(*b - t).abs()))
         .map(|(i, _)| i)
         .unwrap_or(0)
-}
-
-/// Decode a JPEG payload to a luma8 image. Mono JPEGs are decoded directly;
-/// RGB JPEGs (used by the `compressed` channel) are decoded then converted.
-fn decode_jpeg_to_luma(
-    jpeg_bytes: &[u8],
-) -> Result<Image<u8, 1>, Box<dyn std::error::Error + Send + Sync>> {
-    let layout = decode_image_jpeg_layout(jpeg_bytes)?;
-    let size = layout.image_size;
-    match layout.channels {
-        1 => {
-            let mut dst = Image::<u8, 1>::from_size_val(size, 0)?;
-            decode_image_jpeg_mono8(jpeg_bytes, &mut dst)?;
-            Ok(dst)
-        }
-        3 => {
-            let mut rgb = Image::<u8, 3>::from_size_val(size, 0)?;
-            decode_image_jpeg_rgb8(jpeg_bytes, &mut rgb)?;
-            let mut gray = Image::<u8, 1>::from_size_val(size, 0)?;
-            gray_from_rgb_u8(&rgb, &mut gray)?;
-            Ok(gray)
-        }
-        n => Err(format!("unsupported JPEG channel count: {n} (want 1 or 3)").into()),
-    }
 }
 
 /// `{header, body}` envelope → body. Returns None if the value isn't a map
