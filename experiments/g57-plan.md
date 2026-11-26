@@ -276,6 +276,6 @@ In each window, keyframes are 26-35 % of frames and cost 82-161 ms. The mean fra
 
 **Next.**
 1. G57-a on all 11 sequences, 1 rep each, RT4EF against the RT3EF band (NH3), paced. If it holds, promote `execution: Asynchronous` into the single config.
-2. D5b (SYNC, about 10 min): explain the background path's lost loops.
+2. D5b (SYNC): explain the background path's lost loops.
 3. G57-b-2 card (planner): prepare/apply split of the growth, with the frame-390 coast trace.
 4. G57-c card: loop recognition off the tracking thread (12-17 ms p50, 40 ms p90 per keyframe), aimed at the keyframe-burst tail.

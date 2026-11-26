@@ -64,10 +64,17 @@ The predicted mechanisms hold: V1_03 high-frequency error is 0.004 (equal to Bas
 
 - **CPU per frame:** ours 48-57 ms on MH against Basalt's 74-80 ms (0.65-0.72x). On the Vicon rooms we are equal or slower: 62-71 ms against 58-74 ms.
 - **Latency:** we are faster only on MH_02 (p50 44 vs 49 ms, p99 1355 vs 1719 ms). On every other sequence our p99 is higher, at 535 ms to 11 s against Basalt's 105-1270 ms. V2_02 p50 is 1.1 s, a growing backlog.
-- **Verdict:** not faster than Basalt (1 of 11). The cause is G57. The per-frame mean cost is lower on MH, but mapping and loop work arrive in bursts. Tracking queues behind them on 2 cores, and the backlog never drains on the Vicon rooms. Fix path: bound the mapping work per keyframe, or move it off the tracking core; the estimator in Drive mode would also remove the PnP-on-map frames.
+- **G57 full check (2026-11-26, same clock, Basalt re-measured, 3 reps, `experiments/g57-plan.md`).** With loop closing in the background (G57-a, RT4EF), every loop stall is gone (0 frames ≥ 300 ms on 12 runs, against 2-14 per control run). Faster than Basalt on 1 of 4 (MH_03: p50 27 vs 41 ms, p99 158 vs 348 ms, CPU 47.9 vs 69.0 ms). Why not on the other three:
+  - **V2_02:** p50 43 vs 38 ms (RT4EBF 37.8 vs 37.6), p99 616 vs 539 (RT4EBF). CPU 58.7-58.8 vs 58.7 ms.
+  - **V1_03:** CPU 55.4-55.7 vs 53.3 ms. RT4EF also loses on p99 (244 vs 174 ms); RT4EBF is below on p50 (30) and p99 (159).
+  - **V1_01:** p99 910 (RT4EF) or 355 (RT4EBF) vs 278 ms. p50 and CPU are below Basalt.
+  - **Cause of the p99 tail:** keyframe-dense bursts. In the peak windows, keyframes are 26-35 % of frames and cost 82-161 ms, so the mean frame cost is 51-77 ms against the 50 ms period. What remains per keyframe on the tracking thread: loop recognition (12 ms p50, 40 ms p90; G57-c), ORB extraction, the BA wait and, under G57-b, the map lock wait (7-20 ms p90; KB3).
+  - **Cause of the Vicon-room CPU:** not yet split per stage at this clock; the final-bench profile (G57 ledger row) still applies.
+- **Verdict (final bench, 95bc33c):** not faster than Basalt (1 of 11). The cause is G57. The per-frame mean cost is lower on MH, but mapping and loop work arrive in bursts. Tracking queues behind them on 2 cores, and the backlog never drains on the Vicon rooms. Fix path: bound the mapping work per keyframe, or move it off the tracking core; the estimator in Drive mode would also remove the PnP-on-map frames.
 
 ## Log
 
 - 2026-11-25: file created from the G11 interim results, the 2x-5 partial results, K1-a, V-c and the floor test. Tip (95bc33c) RT3EF at 800 MHz, first runs: MH_01 0.0435 (0.65x), MH_02 0.0404 (0.84x); both below Basalt, with 82-99 s of lag at the end of the run.
 - 2026-11-25: tip RT3EF rep 1 at 0.8-1.2 GHz, 8 of 11: MH_03 0.0500 (0.81x), MH_04 0.2101 (1.84x, G58 as logged), MH_05 0.1035 (0.72x), V1_01 0.0466 (1.08x, GT floor), V1_02 0.0432 (0.96x), V1_03 0.1449 (2.73x, G62 + jitter as logged). 0 give-ups; 2 coasts per Vicon-room run; 47-207 s of lag at the end of the run.
 - 2026-11-26: final tip bench done (3 reps RT3EF plus speed pairs). 6 of 11 below Basalt, none at 0.5x; speed is not faster (1 of 11, G57). Tables above.
+- 2026-11-26: G57 full check (3 reps × 4 sequences, Basalt re-measured at the same clock). G57-a removes every loop stall; ATE equal or better on 3 of 4 (V2_02 0.102 vs control 0.095, inside the band). Faster than Basalt on 1 of 4 (MH_03); the p99 tail (keyframe bursts) and Vicon-room CPU still lose. G57-b is blocked by the map lock wait (KB3) and a coast at V1_03 frame 390 (NH1).

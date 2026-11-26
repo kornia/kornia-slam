@@ -38,6 +38,14 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
   tracking core; the estimator in Drive would remove the PnP-on-map frames.
 - **#180, A/B 1 pushed (a4a2f4b).** Knob `visual_jacobians: FirstEstimate | Current` for the estimator (default
   unchanged); full gate green. Its screen runs are next in lane A. Full-pass review requested from Christie and Dmytro.
+- **#180, G57 full check (`experiments/g57-plan.md`, 3 paced reps × V2_02, V1_03, V1_01, MH_03, Basalt re-measured at
+  the same clock).** G57-a (`loop_closing … execution: Asynchronous`, no code change) removes every loop stall: 0 frames
+  ≥ 300 ms on 12 runs against 2-14 per control run; p99 falls from 1.25-6.2 s to 0.16-0.91 s; ATE is equal or better on
+  3 of 4. K2 fired on V1_03 (a late marginal loop is lost, 3 → 2, no ATE cost); D5b is named to explain it. G57-b
+  (`keyframe_growth: Mapping`) takes 18-28 ms off each keyframe but adds a map lock wait (p90 7-20 ms, KB3) and a coast
+  at V1_03 frame 390 (NH1): not promoted until prepare and apply are split. Faster than Basalt on 1 of 4 (MH_03, p50 27
+  vs 41 ms, p99 158 vs 348 ms, CPU 47.9 vs 69.0 ms). Elsewhere, p50 is equal or below, but the p99 tail (keyframe-dense
+  bursts) and Vicon-room CPU still lose. Next: G57-a on all 11 (NH3) for promotion, D5b, then the G57-b-2 and G57-c cards.
 - **Next.** Lane A: A/B 1 screen, K1-c (V2_03), K1-d (MH_03), rerun pass. Lane B: V-c2 (theory first). G57 needs a card
   of its own before "faster than Basalt" can pass. Open owner questions: floor-adjusted targets (S-A), where to write
   the Staer split.
