@@ -46,7 +46,6 @@
                     max_iterations: 50,
                     large_window: Enabled(min_tracked_inliers: 100, active_keyframes: 25, max_iterations: 50, initial_lambda: 1e-2),
                     boundary_scales_bias_rows: false,
-                    imu_huber: BoundaryOrRecentInit,
                 ),
                 growth_neighbours: OrbSlam3(covisible: 10),
             ),
