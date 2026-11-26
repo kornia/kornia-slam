@@ -21,7 +21,7 @@ use serde::Deserialize;
 use std::{
     fs::File,
     io::{BufRead, BufReader},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use kornia_3d::camera::{FisheyeCamera, PinholeCamera};
@@ -47,10 +47,6 @@ pub struct KannalaBrandtCalibration {
     pub k3: f64,
     /// Fourth KB distortion coefficient.
     pub k4: f64,
-    /// Image width in pixels.
-    pub width: u32,
-    /// Image height in pixels.
-    pub height: u32,
 }
 
 impl KannalaBrandtCalibration {
@@ -92,23 +88,21 @@ impl KannalaBrandtCalibration {
 /// Reader for the Hilti-Trimble SLAM Challenge 2026 dataset.
 #[derive(Debug, Clone)]
 pub struct HiltiDataset {
-    /// Base directory of the extracted sequence.
-    #[allow(dead_code)]
-    pub root: PathBuf,
     /// Ordered `cam0` image samples.
     pub cam0_samples: Vec<DatasetSample>,
-    /// Ordered `cam1` image samples. Empty if `cam1` is absent.
-    pub cam1_samples: Vec<DatasetSample>,
+    /// Ordered `cam1` image samples. Empty if `cam1` is absent. Parsed for
+    /// the format, unused.
+    pub _cam1_samples: Vec<DatasetSample>,
     /// Ordered IMU samples. Empty if `imu0` is absent.
     pub imu_samples: Vec<ImuMeasurement>,
     /// `cam0` Kannala-Brandt calibration.
     pub cam0_calibration: KannalaBrandtCalibration,
-    /// `cam1` Kannala-Brandt calibration.
-    pub cam1_calibration: KannalaBrandtCalibration,
+    /// `cam1` Kannala-Brandt calibration; parsed for the format, unused.
+    pub _cam1_calibration: KannalaBrandtCalibration,
     /// Transform from IMU to `cam0`.
     pub t_cam0_imu: [[f64; 4]; 4],
-    /// Transform from IMU to `cam1`.
-    pub t_cam1_imu: [[f64; 4]; 4],
+    /// Transform from IMU to `cam1`; parsed for the format, unused.
+    pub _t_cam1_imu: [[f64; 4]; 4],
     /// Ground-truth poses from `state_groundtruth_estimate0/data.csv`. Empty
     /// when the extraction ran without a `--gt-topic`.
     pub ground_truth: Vec<GroundTruthPose>,
@@ -152,14 +146,13 @@ impl HiltiDataset {
         let ground_truth = read_optional_ground_truth(&root)?;
 
         Ok(Self {
-            root,
             cam0_samples,
-            cam1_samples,
+            _cam1_samples: cam1_samples,
             imu_samples,
             cam0_calibration,
-            cam1_calibration,
+            _cam1_calibration: cam1_calibration,
             t_cam0_imu,
-            t_cam1_imu,
+            _t_cam1_imu: t_cam1_imu,
             ground_truth,
         })
     }
@@ -172,11 +165,6 @@ impl HiltiDataset {
     /// Returns the ground-truth poses (empty when none were extracted).
     pub fn ground_truth(&self) -> &[GroundTruthPose] {
         &self.ground_truth
-    }
-
-    /// True when a usable `cam1` stream is present.
-    pub fn is_stereo(&self) -> bool {
-        !self.cam1_samples.is_empty()
     }
 }
 
@@ -211,7 +199,7 @@ impl KalibrCamera {
                 "expected 4 {camera_name} distortion_coeffs in {path_display}"
             )));
         };
-        let [width, height] = self.resolution.as_slice() else {
+        let [_, _] = self.resolution.as_slice() else {
             return Err(DatasetError::Parse(format!(
                 "expected 2 {camera_name} resolution values in {path_display}"
             )));
@@ -226,8 +214,6 @@ impl KalibrCamera {
             k2: *k2,
             k3: *k3,
             k4: *k4,
-            width: *width,
-            height: *height,
         })
     }
 
@@ -448,15 +434,16 @@ fn read_optional_ground_truth(root: &Path) -> Result<Vec<GroundTruthPose>, Datas
             ))
         })?;
 
+        let (tx, ty, tz) = (parse(1)?, parse(2)?, parse(3)?);
+        // The quaternion columns must parse; they are unused.
+        for idx in 4..8 {
+            parse(idx)?;
+        }
         poses.push(GroundTruthPose {
             timestamp_sec: ts_ns as f64 * 1e-9,
-            tx: parse(1)?,
-            ty: parse(2)?,
-            tz: parse(3)?,
-            qw: parse(4)?,
-            qx: parse(5)?,
-            qy: parse(6)?,
-            qz: parse(7)?,
+            tx,
+            ty,
+            tz,
         });
     }
 
@@ -562,7 +549,7 @@ cam1:
         assert_eq!(dataset.cam0_samples.len(), 2);
         assert_eq!(dataset.cam0_samples[0].timestamp_sec, 1.0);
         assert_eq!(dataset.cam0_samples[1].timestamp_sec, 2.0);
-        assert!(dataset.cam1_samples.is_empty());
+        assert!(dataset._cam1_samples.is_empty());
         assert!(dataset.imu_samples.is_empty());
     }
 
@@ -589,8 +576,8 @@ cam1:
 
         let dataset = HiltiDataset::open(dir.path(), calibration).unwrap();
 
-        assert_eq!(dataset.cam1_samples.len(), 1);
-        assert_eq!(dataset.cam1_samples[0].timestamp_sec, 2.0);
+        assert_eq!(dataset._cam1_samples.len(), 1);
+        assert_eq!(dataset._cam1_samples[0].timestamp_sec, 2.0);
         assert_eq!(dataset.imu_samples.len(), 2);
         assert_eq!(dataset.imu_samples[0].timestamp, 1.0);
         assert_eq!(dataset.imu_samples[0].gyro, Vec3F64::new(0.1, 0.2, 0.3));
@@ -617,11 +604,9 @@ cam1:
         assert_eq!(dataset.cam0_calibration.k2, -0.0216);
         assert_eq!(dataset.cam0_calibration.k3, 0.0031);
         assert_eq!(dataset.cam0_calibration.k4, -0.0005);
-        assert_eq!(dataset.cam0_calibration.width, 1472);
-        assert_eq!(dataset.cam0_calibration.height, 1440);
-        assert_eq!(dataset.cam1_calibration.fx, 462.0);
+        assert_eq!(dataset._cam1_calibration.fx, 462.0);
         assert_eq!(dataset.t_cam0_imu[0][3], 0.01);
-        assert_eq!(dataset.t_cam1_imu[0][3], -0.10);
+        assert_eq!(dataset._t_cam1_imu[0][3], -0.10);
     }
 
     #[test]

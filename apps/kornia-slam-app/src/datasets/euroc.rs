@@ -60,18 +60,6 @@ pub struct GroundTruthPose {
     /// Position z (meters).
     #[allow(dead_code)]
     pub tz: f64,
-    /// Quaternion scalar part.
-    #[allow(dead_code)]
-    pub qw: f64,
-    /// Quaternion x.
-    #[allow(dead_code)]
-    pub qx: f64,
-    /// Quaternion y.
-    #[allow(dead_code)]
-    pub qy: f64,
-    /// Quaternion z.
-    #[allow(dead_code)]
-    pub qz: f64,
 }
 
 /// EuRoC camera calibration loaded from a cam's `sensor.yaml`.
@@ -332,9 +320,6 @@ pub fn read_camera_csv(csv: &Path, data_dir: &Path) -> Result<Vec<DatasetSample>
 /// PNG images in `<root>/mav0/cam0/data/`.
 #[derive(Debug, Clone)]
 pub struct EurocDataset {
-    /// Base directory of the extracted dataset.
-    #[allow(dead_code)]
-    pub root: std::path::PathBuf,
     /// Ordered left-camera (`cam0`) samples.
     pub left_samples: Vec<DatasetSample>,
     /// Left-camera (`cam0`) calibration.
@@ -379,7 +364,6 @@ impl EurocDataset {
             match_by_timestamp(&left_samples, &right_samples, STEREO_SYNC_TOLERANCE_SEC);
 
         Ok(Self {
-            root,
             left_samples,
             left_calibration,
             right_samples,
@@ -461,7 +445,8 @@ impl EurocDataset {
             if line.starts_with('#') || line.trim().is_empty() {
                 continue;
             }
-            // Columns: timestamp_ns, px, py, pz, qw, qx, qy, qz, ...
+            // Columns: timestamp_ns, px, py, pz, qw, qx, qy, qz, ...; the
+            // quaternion must parse for the row to count, but is unused.
             let cols: Vec<&str> = line.split(',').collect();
             if cols.len() < 8 {
                 continue;
@@ -470,7 +455,7 @@ impl EurocDataset {
                 continue;
             };
             let f = |i: usize| cols[i].trim().parse::<f64>();
-            let (Ok(px), Ok(py), Ok(pz), Ok(qw), Ok(qx), Ok(qy), Ok(qz)) =
+            let (Ok(px), Ok(py), Ok(pz), Ok(_), Ok(_), Ok(_), Ok(_)) =
                 (f(1), f(2), f(3), f(4), f(5), f(6), f(7))
             else {
                 continue;
@@ -481,10 +466,6 @@ impl EurocDataset {
                 tx: px,
                 ty: py,
                 tz: pz,
-                qw,
-                qx,
-                qy,
-                qz,
             });
         }
         poses
@@ -804,7 +785,6 @@ mod tests {
         let left_samples = samples_at(&[0.0, 50.0, 100.0]);
         let right_samples = samples_at(right_ms);
         EurocDataset {
-            root: PathBuf::new(),
             right_for_left: match_by_timestamp(
                 &left_samples,
                 &right_samples,
