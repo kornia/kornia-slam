@@ -6,6 +6,7 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 
+use crate::features::{Descriptor, RBrief};
 use crate::mapping::map::{BaSnapshot, BaUpdate, BaUpdateError, LocalBaMergeResult, Map};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -38,11 +39,15 @@ pub struct KeyframeJob {
     pub gravity_world: Vec3F64,
 }
 
-fn capture_local_window(map: &Map) -> BaSnapshot {
+fn capture_local_window<D: Descriptor>(map: &Map<D>) -> BaSnapshot<D> {
     map.ba_snapshot(&super::bundle_adjustment::local_window(map))
 }
 
-fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJob) -> BaUpdate {
+fn solve_snapshot<D: Descriptor>(
+    snapshot: BaSnapshot<D>,
+    camera: &PinholeCamera,
+    job: &KeyframeJob,
+) -> BaUpdate<D> {
     if job.imu_initialized {
         super::bundle_adjustment::run_local_inertial_ba(
             snapshot,
@@ -57,13 +62,13 @@ fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJo
     }
 }
 
-pub struct LocalMapping {
-    backend: LocalMappingBackend,
+pub struct LocalMapping<D = RBrief> {
+    backend: LocalMappingBackend<D>,
 }
 
-enum LocalMappingBackend {
+enum LocalMappingBackend<D> {
     Synchronous {
-        map: Arc<Mutex<Map>>,
+        map: Arc<Mutex<Map<D>>>,
         camera: PinholeCamera,
         results: Mutex<Vec<LocalBaMergeResult>>,
     },
@@ -79,14 +84,17 @@ enum LocalMappingBackend {
 /// merge and before the result is published, so a completed result is never
 /// observable ahead of its cleanup. A refused snapshot — one whose world epoch
 /// no longer matches — publishes nothing and must therefore cull nothing.
-fn merge_and_cull(map: &mut Map, update: BaUpdate) -> Result<LocalBaMergeResult, BaUpdateError> {
+fn merge_and_cull<D: Descriptor>(
+    map: &mut Map<D>,
+    update: BaUpdate<D>,
+) -> Result<LocalBaMergeResult, BaUpdateError> {
     let merged = map.apply_ba_update(update)?;
     crate::mapping::culling::cull_landmarks(map);
     Ok(merged)
 }
 
-impl LocalMapping {
-    pub fn new(mode: LocalMappingMode, map: Arc<Mutex<Map>>, camera: PinholeCamera) -> Self {
+impl<D: Descriptor> LocalMapping<D> {
+    pub fn new(mode: LocalMappingMode, map: Arc<Mutex<Map<D>>>, camera: PinholeCamera) -> Self {
         let backend = match mode {
             LocalMappingMode::Synchronous => LocalMappingBackend::Synchronous {
                 map,
@@ -192,8 +200,8 @@ struct LocalMappingHandle {
 }
 
 impl LocalMappingHandle {
-    fn spawn(
-        map: Arc<Mutex<Map>>,
+    fn spawn<D: Descriptor>(
+        map: Arc<Mutex<Map<D>>>,
         publication_gate: Arc<Mutex<()>>,
         camera: PinholeCamera,
     ) -> Self {

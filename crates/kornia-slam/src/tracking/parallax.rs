@@ -1,6 +1,7 @@
 //! Rotation-compensated parallax between a keyframe and the current frame,
 //! the motion measure behind [`super::KeyframePolicy::min_parallax_px`].
 
+use crate::features::Descriptor;
 use crate::frame::Frame;
 use crate::mapping::map::Map;
 use kornia_3d::camera::PinholeCamera;
@@ -15,10 +16,10 @@ use kornia_algebra::{Mat3F64, Vec3F64};
 /// keyframe is skipped. The relative rotation comes from the keyframe's
 /// world-to-camera pose and `current_pose_world_to_cam`, the tracked pose of
 /// `current`. `None` when the keyframe is unknown or no match survives.
-pub fn median_parallax_px(
-    map: &Map,
+pub fn median_parallax_px<D: Descriptor>(
+    map: &Map<D>,
     keyframe_idx: usize,
-    current: &Frame,
+    current: &Frame<D>,
     current_pose_world_to_cam: &Pose3d,
     matches: &[(usize, usize)],
     camera: &PinholeCamera,

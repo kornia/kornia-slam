@@ -55,7 +55,7 @@ pub mod tracking;
 
 pub use features::{Clidd, Descriptor, DescriptorSet, Features, RBrief, ScalePyramid};
 pub use frame::Frame;
-pub use frontend::FrontendObservation;
+pub use frontend::{FrontendError, FrontendObservation};
 pub use kornia_sensors::{ImuCalibration, SensorRig};
 pub use loop_closure::{LoopClosingConfig, LoopClosureEvent};
 #[cfg(feature = "serde")]
