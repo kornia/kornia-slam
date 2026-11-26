@@ -101,7 +101,7 @@ Field of view and speed:
 - [ ] Optical flow on every rig camera, forward-backward check, refill, gyro guess and flow-only pose (built, knobs `klt_rig`, `forward_backward`, `track_refill`, `gyro_guess` and `flow_pose`, not yet validated)
 - [ ] Window-only fixed-point LK at an 11x11 window (built, knobs `klt_kernel: WindowedU8` and `klt_window`, not yet validated)
 - [ ] Flow workers across 2-3 cores (built, knob `flow_threads`, not yet validated)
-- [ ] Keyframe ORB on the mapping thread (`keyframe_orb: Mapping`): deferred, its design is open (lane T step 12)
+- [ ] Keyframe ORB on the mapping thread: deferred, its design is open (the unbuilt `keyframe_orb` knob was removed 2026-11-26)
 
 ## Next — complete the SLAM stack
 
