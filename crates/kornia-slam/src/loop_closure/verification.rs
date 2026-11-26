@@ -1,18 +1,20 @@
+use crate::features::RBrief;
 use std::collections::HashSet;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pnp::{PnPMethod, RansacParams, solve_pnp_ransac};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Vec2F32, Vec3AF32};
-use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
+use kornia_imgproc::features::OrbMatchConfig;
 
+use crate::features::Descriptor;
 use crate::mapping::map::Map;
 use crate::pose_conversion::{mat3_to_f32, mat3_to_f64, vec3_to_f32, vec3_to_f64};
 
 /// Acceptance thresholds for geometric loop verification.
 #[derive(Debug, Clone)]
-pub struct LoopVerificationConfig {
-    pub orb_match: OrbMatchConfig,
+pub struct LoopVerificationConfig<D: Descriptor = RBrief> {
+    pub descriptor_match: D::MatchConfig,
     pub min_correspondences: usize,
     pub min_inliers: usize,
     pub min_inlier_ratio: f32,
@@ -26,7 +28,7 @@ pub struct LoopVerificationConfig {
 impl Default for LoopVerificationConfig {
     fn default() -> Self {
         Self {
-            orb_match: OrbMatchConfig::default(),
+            descriptor_match: OrbMatchConfig::default(),
             min_correspondences: 30,
             min_inliers: 30,
             min_inlier_ratio: 0.4,
@@ -80,12 +82,12 @@ pub(super) struct VerificationInput {
     pub(super) image_points: Vec<Vec2F32>,
 }
 
-pub(super) fn verification_input(
-    map: &Map,
+pub(super) fn verification_input<D: Descriptor>(
+    map: &Map<D>,
     camera: &PinholeCamera,
     query_kf_idx: usize,
     candidate_kf_idx: usize,
-    config: &LoopVerificationConfig,
+    config: &LoopVerificationConfig<D>,
 ) -> Result<VerificationInput, LoopVerificationReject> {
     let query = map
         .get_keyframe(query_kf_idx)
@@ -93,12 +95,10 @@ pub(super) fn verification_input(
     let candidate = map
         .get_keyframe(candidate_kf_idx)
         .ok_or(LoopVerificationReject::MissingCandidateKeyframe)?;
-    let matches = match_orb_descriptors(
-        &candidate.frame.features.orientations,
-        &candidate.frame.features.descriptors,
-        &query.frame.features.orientations,
-        &query.frame.features.descriptors,
-        config.orb_match,
+    let matches = D::match_sets(
+        candidate.frame.features.descriptor_set(),
+        query.frame.features.descriptor_set(),
+        &config.descriptor_match,
     );
 
     let mut world_points = Vec::with_capacity(matches.len());
@@ -133,12 +133,12 @@ pub(super) fn verification_input(
 }
 
 /// Verify a BoW loop candidate using candidate landmarks and query pixels.
-pub fn verify_loop_candidate(
-    map: &Map,
+pub fn verify_loop_candidate<D: Descriptor>(
+    map: &Map<D>,
     camera: &PinholeCamera,
     query_kf_idx: usize,
     candidate_kf_idx: usize,
-    config: &LoopVerificationConfig,
+    config: &LoopVerificationConfig<D>,
 ) -> Result<VerifiedLoopEdge, LoopVerificationReject> {
     let input = verification_input(map, camera, query_kf_idx, candidate_kf_idx, config)?;
     let intrinsics = mat3_to_f32(camera.intrinsic_matrix());

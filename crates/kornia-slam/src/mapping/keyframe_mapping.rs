@@ -17,12 +17,13 @@
 //! shared mutex and keeps the existing boundaries. It never touches the
 //! publication gate — the caller already holds it.
 
+use crate::features::RBrief;
 use std::sync::Mutex;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::TriangulationConfig;
-use kornia_imgproc::features::OrbMatchConfig;
 
+use crate::features::Descriptor;
 use crate::mapping::growth;
 use crate::mapping::map::{
     ImuFactor, Keyframe, LandmarkTarget, Map, MapInsertion, MapMutationError, ObservationKey,
@@ -31,8 +32,8 @@ use crate::mapping::map::{
 
 /// The core request for an accepted keyframe, and how many of its landmarks
 /// are close stereo seeds.
-pub(crate) struct KeyframeInsertion {
-    pub insertion: MapInsertion,
+pub(crate) struct KeyframeInsertion<D = RBrief> {
+    pub insertion: MapInsertion<D>,
     pub close_points: usize,
 }
 
@@ -42,13 +43,13 @@ pub(crate) struct KeyframeInsertion {
 /// `stereo_close_depth` set, close stereo keypoints (`z <= threshold`, metres)
 /// become metric landmarks directly; far ones are left to pair growth,
 /// mirroring ORB-SLAM3's `CreateNewKeyFrame`.
-pub(crate) fn keyframe_insertion(
-    keyframe: Keyframe,
+pub(crate) fn keyframe_insertion<D>(
+    keyframe: Keyframe<D>,
     tracked: &[(usize, usize)],
     stereo_close_depth: Option<f64>,
     camera: &PinholeCamera,
     imu_edge: Option<ImuFactor>,
-) -> KeyframeInsertion {
+) -> KeyframeInsertion<D> {
     let keyframe_idx = keyframe.frame.idx;
     // Tracked links are recorded as claims first, so stereo seeding cannot
     // take a feature tracking already owns.
@@ -133,7 +134,7 @@ const MAX_COVIS_KFS: usize = 10;
 /// list that already contained it would triangulate it against itself and drop
 /// the oldest real neighbour. The id is filtered anyway, so the policy states
 /// that intent rather than relying on call order alone.
-pub(crate) fn prepare_keyframe_growth(map: &Map, keyframe_idx: usize) -> KeyframeGrowthPlan {
+pub(crate) fn prepare_keyframe_growth<D>(map: &Map<D>, keyframe_idx: usize) -> KeyframeGrowthPlan {
     let neighbor_keyframe_indices = map
         .keyframes()
         .iter()
@@ -155,11 +156,11 @@ pub(crate) fn prepare_keyframe_growth(map: &Map, keyframe_idx: usize) -> Keyfram
 /// the feature claims an earlier one took. Every pair is optional: a proposal
 /// that does not materialize is a skip, and a refused batch is reported without
 /// disturbing the accepted keyframe or any earlier successful pair.
-pub(crate) fn grow_keyframe(
-    map: &Mutex<Map>,
+pub(crate) fn grow_keyframe<D: Descriptor>(
+    map: &Mutex<Map<D>>,
     plan: KeyframeGrowthPlan,
     camera: &PinholeCamera,
-    match_config: OrbMatchConfig,
+    match_config: &D::MatchConfig,
     triangulation_config: &TriangulationConfig,
 ) -> KeyframeGrowthResult {
     let mut result = KeyframeGrowthResult {
@@ -230,19 +231,19 @@ pub(crate) fn grow_keyframe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::Features;
     use crate::frame::Frame;
     use crate::mapping::map::Keyframe;
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::Vec3F64;
     use kornia_image::ImageSize;
-    use kornia_imgproc::features::OrbFeatures;
 
     fn stereo_keyframe(idx: usize, depths: Vec<f32>) -> Keyframe {
         let mut frame = empty_frame(idx);
         let n = depths.len();
         frame.features.keypoints_xy = vec![[320.0, 240.0]; n];
-        frame.features.orientations = vec![0.0; n];
-        frame.features.descriptors = vec![[0; 32]; n];
+        frame.features.orientations = Some(vec![0.0; n]);
+        frame.features.descriptors = vec![RBrief([0; 32]); n];
         frame.features.octaves = vec![0; n];
         frame.depth = depths;
         Keyframe::from_frame(frame)
@@ -310,9 +311,9 @@ mod tests {
     fn empty_frame(idx: usize) -> Frame {
         Frame {
             idx,
-            features: OrbFeatures {
+            features: Features {
                 keypoints_xy: Vec::new(),
-                orientations: Vec::new(),
+                orientations: None,
                 descriptors: Vec::new(),
                 octaves: Vec::new(),
             },
@@ -338,7 +339,7 @@ mod tests {
         );
         Frame {
             idx,
-            features: OrbFeatures {
+            features: Features {
                 keypoints_xy: points
                     .iter()
                     .map(|p| {
@@ -349,8 +350,8 @@ mod tests {
                         ]
                     })
                     .collect(),
-                orientations: vec![0.0; n],
-                descriptors: (0..n).map(|i| [i as u8; 32]).collect(),
+                orientations: Some(vec![0.0; n]),
+                descriptors: (0..n).map(|i| RBrief([i as u8; 32])).collect(),
                 octaves: vec![0; n],
             },
             pose_world_to_cam: pose,
@@ -370,7 +371,7 @@ mod tests {
             map,
             plan,
             &camera(),
-            OrbMatchConfig::default(),
+            &kornia_imgproc::features::OrbMatchConfig::default(),
             &TriangulationConfig::default(),
         )
     }

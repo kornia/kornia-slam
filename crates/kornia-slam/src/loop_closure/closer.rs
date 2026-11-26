@@ -6,15 +6,15 @@
 //! to its own tracking state through [`LoopClosingOutcome`] rather than
 //! reaching into it.
 
+use crate::features::RBrief;
 use std::collections::HashSet;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 
-use crate::loop_closure::place_recognition::{
-    Candidate, KeyFrameDatabase, Vocabulary, compute_bow,
-};
+use crate::features::Descriptor;
+use crate::loop_closure::place_recognition::{BowEncoder, Candidate, KeyFrameDatabase};
 use crate::loop_closure::{
     InertialPgoContext, LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker,
     LoopFusionConfig, LoopVerificationConfig, PgoConfig, VerifiedLoopEdge, fuse_verified_loop,
@@ -24,12 +24,23 @@ use crate::mapping::Map;
 use crate::pose_conversion::apply_reference_pose_correction;
 
 /// Verification, episode consistency, fusion and pose-graph settings of loop correction.
-#[derive(Debug, Clone, Default)]
-pub struct LoopClosingConfig {
+#[derive(Debug, Clone)]
+pub struct LoopClosingConfig<D: Descriptor = RBrief> {
     pub episode: LoopEpisodeConfig,
-    pub fusion: LoopFusionConfig,
-    pub verification: LoopVerificationConfig,
+    pub fusion: LoopFusionConfig<D::Distance>,
+    pub verification: LoopVerificationConfig<D>,
     pub optimizer: PgoConfig,
+}
+
+impl Default for LoopClosingConfig {
+    fn default() -> Self {
+        Self {
+            episode: LoopEpisodeConfig::default(),
+            fusion: LoopFusionConfig::default(),
+            verification: LoopVerificationConfig::default(),
+            optimizer: PgoConfig::default(),
+        }
+    }
 }
 
 /// Concise externally visible result of a loop-closure attempt.
@@ -73,22 +84,22 @@ pub(crate) struct LoopClosingOutcome {
 /// Keyframes are indexed even while correction is held back until inertial
 /// initialization, so the database is complete by the time a closure is
 /// allowed.
-pub(crate) struct LoopCloser {
-    vocabulary: Vocabulary,
+pub(crate) struct LoopCloser<D: Descriptor = RBrief> {
+    vocabulary: Box<dyn BowEncoder<D>>,
     kf_database: KeyFrameDatabase,
-    acceptance: LoopAcceptance,
+    acceptance: LoopAcceptance<D>,
 }
 
-impl LoopCloser {
+impl<D: Descriptor> LoopCloser<D> {
     /// `require_imu_initialized` holds correction back until inertial
     /// initialization.
     pub(crate) fn new(
-        vocabulary: Vocabulary,
-        config: LoopClosingConfig,
+        vocabulary: impl BowEncoder<D> + 'static,
+        config: LoopClosingConfig<D>,
         require_imu_initialized: bool,
     ) -> Self {
         Self {
-            vocabulary,
+            vocabulary: Box::new(vocabulary),
             kf_database: KeyFrameDatabase::new(),
             acceptance: LoopAcceptance::new(config, require_imu_initialized),
         }
@@ -99,11 +110,11 @@ impl LoopCloser {
     /// keyframes no longer in the map are skipped.
     pub(crate) fn relocalization_candidates(
         &self,
-        descriptors: &[[u8; 32]],
-        map: &Map,
+        descriptors: &[D],
+        map: &Map<D>,
         max_candidates: usize,
     ) -> Vec<usize> {
-        let query = compute_bow(&self.vocabulary, descriptors);
+        let query = self.vocabulary.encode(descriptors);
         self.kf_database
             .detect_candidates(&query, &HashSet::new(), 0.0)
             .into_iter()
@@ -123,7 +134,7 @@ impl LoopCloser {
     /// this keyframe is added, so it never matches itself.
     pub(crate) fn on_keyframe(
         &mut self,
-        map: &mut Map,
+        map: &mut Map<D>,
         camera: &PinholeCamera,
         kf_idx: usize,
         context: LoopClosingContext,
@@ -132,7 +143,7 @@ impl LoopCloser {
         let Some(kf) = map.get_keyframe(kf_idx) else {
             return LoopClosingOutcome::default();
         };
-        let bow = compute_bow(&self.vocabulary, &kf.frame.features.descriptors);
+        let bow = self.vocabulary.encode(&kf.frame.features.descriptors);
         if bow.0.is_empty() {
             return LoopClosingOutcome::default();
         }
@@ -170,7 +181,7 @@ impl LoopCloser {
 }
 
 #[cfg(test)]
-impl LoopCloser {
+impl<D: Descriptor> LoopCloser<D> {
     pub(crate) fn correction_requires_imu(&self) -> bool {
         self.acceptance.require_imu_initialized
     }
@@ -192,16 +203,16 @@ impl LoopCloser {
 
 /// Verifies loop candidates and applies accepted closures to the map, keeping
 /// the history that makes acceptance consistent across keyframes.
-struct LoopAcceptance {
-    config: LoopClosingConfig,
+struct LoopAcceptance<D: Descriptor> {
+    config: LoopClosingConfig<D>,
     require_imu_initialized: bool,
     episode_tracker: LoopEpisodeTracker,
     verified_loops: Vec<VerifiedLoopEdge>,
     verified_loop_pairs: HashSet<(usize, usize)>,
 }
 
-impl LoopAcceptance {
-    fn new(config: LoopClosingConfig, require_imu_initialized: bool) -> Self {
+impl<D: Descriptor> LoopAcceptance<D> {
+    fn new(config: LoopClosingConfig<D>, require_imu_initialized: bool) -> Self {
         let episode_tracker = LoopEpisodeTracker::new(config.episode);
         Self {
             config,
@@ -216,7 +227,7 @@ impl LoopAcceptance {
     /// optimizes the pose graph, corrects the map and fuses the loop.
     fn close(
         &mut self,
-        map: &mut Map,
+        map: &mut Map<D>,
         camera: &PinholeCamera,
         kf_idx: usize,
         candidates: &[Candidate],

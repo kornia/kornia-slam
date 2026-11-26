@@ -6,8 +6,10 @@
 //! the fields back here. Corrections decide which landmarks a moved camera
 //! made stale; nothing recomputes these fields from a `MapPoint` alone.
 
+use crate::features::RBrief;
 use kornia_algebra::Vec3F64;
-use kornia_imgproc::features::hamming_distance;
+
+use crate::features::{Descriptor, ScalePyramid, most_distinctive};
 
 /// Identifies one feature slot in one keyframe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -19,21 +21,21 @@ pub struct ObservationKey {
 /// One landmark observation: where it was seen, and the descriptor that
 /// feature contributed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LandmarkObservation {
+pub struct LandmarkObservation<D = RBrief> {
     pub key: ObservationKey,
-    pub descriptor: [u8; 32],
+    pub descriptor: D,
 }
 
 #[derive(Debug, Clone)]
-pub struct MapPoint {
+pub struct MapPoint<D = RBrief> {
     /// World-frame position.
     pub position: Vec3F64,
     /// Representative descriptor for projection-guided matching, picked by
     /// `recompute_representative_descriptor`.
-    pub descriptor: [u8; 32],
+    pub descriptor: D,
     /// Where this landmark has been seen, in insertion order. One record per
     /// link; a keyframe appears at most once.
-    observations: Vec<LandmarkObservation>,
+    observations: Vec<LandmarkObservation<D>>,
     /// Octave in the reference keyframe; drives the distance bounds below.
     pub reference_octave: u8,
     /// ORB-SLAM3's `mNormalVector`. Zero until computed.
@@ -53,10 +55,10 @@ pub struct MapPoint {
     pub culled: bool,
 }
 
-impl MapPoint {
+impl<D: Descriptor> MapPoint<D> {
     pub fn new(
         position: Vec3F64,
-        descriptor: [u8; 32],
+        descriptor: D,
         octave: u8,
         color: [u8; 3],
         keyframe_idx: usize,
@@ -94,7 +96,7 @@ impl MapPoint {
     /// Does not finalize: the representative descriptor is stale until
     /// [`MapPoint::finalize_descriptor`] runs. A batch or a merge changing
     /// several links pays for one O(n^2) selection rather than one per link.
-    pub(crate) fn add_observation(&mut self, key: ObservationKey, descriptor: [u8; 32]) -> bool {
+    pub(crate) fn add_observation(&mut self, key: ObservationKey, descriptor: D) -> bool {
         if self.is_observed_by(key.keyframe_idx) {
             return false;
         }
@@ -108,7 +110,7 @@ impl MapPoint {
     pub(crate) fn remove_observation(
         &mut self,
         keyframe_idx: usize,
-    ) -> Option<LandmarkObservation> {
+    ) -> Option<LandmarkObservation<D>> {
         let at = self
             .observations
             .iter()
@@ -121,7 +123,7 @@ impl MapPoint {
         self.recompute_representative_descriptor();
     }
 
-    pub fn observations(&self) -> &[LandmarkObservation] {
+    pub fn observations(&self) -> &[LandmarkObservation<D>] {
         &self.observations
     }
 
@@ -136,39 +138,24 @@ impl MapPoint {
         self.observations.iter().map(|o| o.key.keyframe_idx)
     }
 
-    /// Picks the descriptor with minimum median Hamming distance to all others
-    /// (ORB-SLAM3's `ComputeDistinctiveDescriptors`). Trivial below 3
-    /// observations; an O(n^2) pairwise scan above.
+    /// Picks the observation descriptor with the minimum median distance to
+    /// the others; trivial below 3 observations.
     fn recompute_representative_descriptor(&mut self) {
-        let n = self.observations.len();
-        match n {
-            0 => {}
-            1 | 2 => self.descriptor = self.observations[0].descriptor,
-            _ => {
-                let mut dist_buf = vec![0u32; n];
-                let mut best_idx = 0usize;
-                let mut best_median = u32::MAX;
-                for i in 0..n {
-                    let candidate = &self.observations[i].descriptor;
-                    for (slot, other) in dist_buf.iter_mut().zip(self.observations.iter()) {
-                        *slot = hamming_distance(candidate, &other.descriptor);
-                    }
-                    let mid = n / 2;
-                    dist_buf.select_nth_unstable(mid);
-                    let median = dist_buf[mid];
-                    if median < best_median {
-                        best_median = median;
-                        best_idx = i;
-                    }
-                }
-                self.descriptor = self.observations[best_idx].descriptor;
-            }
-        }
+        let best = match self.observations.len() {
+            0 => return,
+            1 | 2 => 0,
+            _ => most_distinctive(&self.observations, |o| &o.descriptor).unwrap_or(0),
+        };
+        self.descriptor = self.observations[best].descriptor;
     }
 
     /// Pyramid level the point should be observable at from `distance`
     /// (ORB-SLAM3's `PredictScale`). Returns 0 when the geometry is unset.
-    pub fn predict_scale(&self, distance: f64, scale_factor: f64, n_levels: usize) -> usize {
+    pub fn predict_scale(&self, distance: f64, pyramid: ScalePyramid) -> usize {
+        let ScalePyramid {
+            factor: scale_factor,
+            n_levels,
+        } = pyramid;
         if distance <= 0.0 || self.max_distance <= 0.0 || n_levels == 0 {
             return 0;
         }
@@ -192,15 +179,14 @@ impl MapPoint {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{ORB_N_LEVELS, ORB_SCALE_FACTOR};
     use super::*;
 
     #[test]
     fn map_point_new_sets_active_defaults() {
-        let mp = MapPoint::new(Vec3F64::new(1.0, 2.0, 3.0), [9u8; 32], 0, [0; 3], 5);
+        let mp = MapPoint::new(Vec3F64::new(1.0, 2.0, 3.0), RBrief([9u8; 32]), 0, [0; 3], 5);
 
         assert_eq!(mp.position, Vec3F64::new(1.0, 2.0, 3.0));
-        assert_eq!(mp.descriptor, [9u8; 32]);
+        assert_eq!(mp.descriptor, RBrief([9u8; 32]));
         assert_eq!(mp.keyframe_idx, 5);
         assert_eq!(mp.n_visible, 1);
         assert_eq!(mp.n_found, 1);
@@ -209,7 +195,7 @@ mod tests {
 
     #[test]
     fn map_point_tracking_helpers_work() {
-        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0, [0; 3], 0);
+        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), RBrief([0u8; 32]), 0, [0; 3], 0);
         mp.n_visible = 10;
         mp.n_found = 4;
 
@@ -222,10 +208,10 @@ mod tests {
     /// `nScale = clamp(ceil(log(maxDist/dist) / log(scaleFactor)), 0, nLevels-1)`.
     #[test]
     fn predict_scale_matches_orbslam3_closed_form() {
-        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0, [0; 3], 0);
+        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), RBrief([0u8; 32]), 0, [0; 3], 0);
         mp.max_distance = 10.0;
-        let sf = ORB_SCALE_FACTOR;
-        let n = ORB_N_LEVELS;
+        let pyramid = ScalePyramid::ORB;
+        let (sf, n) = (pyramid.factor, pyramid.n_levels);
 
         for &dist in &[40.0_f64, 12.0, 10.0, 8.0, 3.7, 0.9, 0.01] {
             let want = {
@@ -237,14 +223,14 @@ mod tests {
                     (lvl as usize).min(n - 1)
                 }
             };
-            assert_eq!(mp.predict_scale(dist, sf, n), want, "dist={dist}");
+            assert_eq!(mp.predict_scale(dist, pyramid), want, "dist={dist}");
         }
 
         // Degenerate inputs return level 0.
-        assert_eq!(mp.predict_scale(0.0, sf, n), 0);
-        let mut unset = MapPoint::new(Vec3F64::ZERO, [0u8; 32], 0, [0; 3], 0);
+        assert_eq!(mp.predict_scale(0.0, pyramid), 0);
+        let mut unset = MapPoint::new(Vec3F64::ZERO, RBrief([0u8; 32]), 0, [0; 3], 0);
         unset.max_distance = 0.0;
-        assert_eq!(unset.predict_scale(5.0, sf, n), 0);
+        assert_eq!(unset.predict_scale(5.0, pyramid), 0);
     }
 
     fn key(kf: usize, feature: usize) -> ObservationKey {
@@ -255,14 +241,14 @@ mod tests {
     }
 
     fn point() -> MapPoint {
-        MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0, [0; 3], 0)
+        MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), RBrief([0u8; 32]), 0, [0; 3], 0)
     }
 
     #[test]
     fn a_repeated_keyframe_is_refused_and_leaves_the_records_untouched() {
         let mut mp = point();
-        assert!(mp.add_observation(key(0, 0), [1u8; 32]));
-        assert!(!mp.add_observation(key(0, 7), [9u8; 32]));
+        assert!(mp.add_observation(key(0, 0), RBrief([1u8; 32])));
+        assert!(!mp.add_observation(key(0, 7), RBrief([9u8; 32])));
         mp.finalize_descriptor();
         assert_eq!(mp.observations().len(), 1);
         assert_eq!(mp.observations()[0].key, key(0, 0));
@@ -285,6 +271,7 @@ mod tests {
         let mut d12 = [0u8; 32];
         d12[0] = 0b1111_1111;
         d12[1] = 0b0000_1111;
+        let [d0, d4, d8, d12] = [d0, d4, d8, d12].map(RBrief);
 
         mp.add_observation(key(0, 0), d0);
         mp.add_observation(key(1, 0), d4);
@@ -306,7 +293,7 @@ mod tests {
     #[test]
     fn removing_an_absent_keyframe_is_none() {
         let mut mp = point();
-        mp.add_observation(key(0, 0), [1u8; 32]);
+        mp.add_observation(key(0, 0), RBrief([1u8; 32]));
         assert!(mp.remove_observation(42).is_none());
         assert_eq!(mp.observations().len(), 1);
     }
@@ -315,7 +302,7 @@ mod tests {
     fn observer_order_follows_insertion() {
         let mut mp = point();
         for kf in [5usize, 2, 9] {
-            mp.add_observation(key(kf, 0), [kf as u8; 32]);
+            mp.add_observation(key(kf, 0), RBrief([kf as u8; 32]));
         }
         assert_eq!(mp.observer_keyframes().collect::<Vec<_>>(), vec![5, 2, 9]);
     }

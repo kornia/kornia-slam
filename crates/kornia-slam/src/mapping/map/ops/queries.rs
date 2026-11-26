@@ -4,10 +4,11 @@
 //! it. Search policy does not live here: callers choose the minimum weight and
 //! any neighbour limit.
 
+use crate::features::Descriptor;
 use crate::mapping::map::Map;
 use std::collections::HashMap;
 
-impl Map {
+impl<D: Descriptor> Map<D> {
     /// Covisibility neighbours of `kf_idx` as `(frame_idx, weight)`, where
     /// weight counts the active map points both keyframes observe.
     ///

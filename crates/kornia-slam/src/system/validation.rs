@@ -269,7 +269,11 @@ fn validate_correction(config: &LoopClosingConfig) -> Result<(), ConfigError> {
     let section = "tuning.loop_correction";
     let at = |field| format!("{section}.{field}");
     let v = &config.verification;
-    validate_orb_match(section, "verification.orb_match", &v.orb_match)?;
+    validate_orb_match(
+        section,
+        "verification.descriptor_match",
+        &v.descriptor_match,
+    )?;
     check(
         at("verification.min_inlier_ratio"),
         v.min_inlier_ratio.into(),

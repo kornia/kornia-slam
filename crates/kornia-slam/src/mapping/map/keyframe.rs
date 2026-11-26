@@ -1,13 +1,14 @@
 //! Keyframes and their descriptor-to-map-point associations.
 
+use crate::features::RBrief;
 use crate::frame::Frame;
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::ImuBias;
 
 /// A frame promoted into the map, with descriptor-to-map-point associations.
 #[derive(Debug, Clone)]
-pub struct Keyframe {
-    pub frame: Frame,
+pub struct Keyframe<D = RBrief> {
+    pub frame: Frame<D>,
     /// For each descriptor index in `frame.features`, associated map-point index.
     pub map_point_by_desc_idx: Vec<Option<usize>>,
     /// Metric linear velocity in world frame, initialized by visual-inertial bootstrap.
@@ -16,9 +17,9 @@ pub struct Keyframe {
     pub imu_bias: ImuBias,
 }
 
-impl Keyframe {
+impl<D> Keyframe<D> {
     /// Creates a keyframe from a frame, with empty map-point associations.
-    pub fn from_frame(frame: Frame) -> Self {
+    pub fn from_frame(frame: Frame<D>) -> Self {
         let map_point_by_desc_idx = vec![None; frame.features.descriptors.len()];
         Self {
             frame,

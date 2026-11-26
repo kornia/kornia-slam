@@ -41,6 +41,7 @@ pub(crate) fn debug_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KORNIA_SLAM_DEBUG").is_some())
 }
 
+pub mod features;
 pub mod frame;
 pub(crate) mod frontend;
 pub mod inertial;
@@ -52,9 +53,9 @@ pub mod stereo;
 pub mod system;
 pub mod tracking;
 
+pub use features::{Descriptor, DescriptorSet, Features, RBrief, ScalePyramid};
 pub use frame::Frame;
 pub use frontend::FrontendObservation;
-pub use kornia_imgproc::features::OrbFeatures;
 pub use kornia_sensors::{ImuCalibration, SensorRig};
 pub use loop_closure::{LoopClosingConfig, LoopClosureEvent};
 #[cfg(feature = "serde")]

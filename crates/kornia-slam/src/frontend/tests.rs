@@ -1,6 +1,8 @@
 use std::f32::consts::{PI, TAU};
 
 use super::*;
+use crate::features::RBrief;
+use bytemuck::TransparentWrapper;
 
 const FRONTEND_FIXTURE: &str = include_str!("../../tests/fixtures/frontend/frontend.txt");
 const HILTI_FIXTURE: &str = include_str!("../../tests/fixtures/frontend/hilti.txt");
@@ -107,16 +109,16 @@ fn hilti_mapping() -> FisheyeMapping {
 }
 
 /// Features whose orientation, descriptor and octave all encode their index.
-fn indexed_features(keypoints_xy: Vec<[f32; 2]>) -> OrbFeatures {
+fn indexed_features(keypoints_xy: Vec<[f32; 2]>) -> Features {
     let n = keypoints_xy.len();
-    OrbFeatures {
+    Features {
         keypoints_xy,
-        orientations: (0..n).map(|i| i as f32 * 0.01).collect(),
+        orientations: Some((0..n).map(|i| i as f32 * 0.01).collect()),
         descriptors: (0..n)
             .map(|i| {
                 let mut d = [0u8; 32];
                 d[..8].copy_from_slice(&(i as u64).to_le_bytes());
-                d
+                RBrief(d)
             })
             .collect(),
         octaves: (0..n).map(|i| (i % 8) as u8).collect(),
@@ -144,7 +146,10 @@ fn stereo_preparation_matches_the_recorded_baseline() {
             "keypoints_xy",
             fnv(f32_bytes(&f.keypoints_xy.concat()).collect::<Vec<_>>()),
         ),
-        ("descriptors", fnv(f.descriptors.concat())),
+        (
+            "descriptors",
+            fnv(RBrief::peel_slice(&f.descriptors).concat()),
+        ),
         ("octaves", fnv(f.octaves.iter().copied())),
         (
             "u_right",
@@ -164,7 +169,7 @@ fn stereo_preparation_matches_the_recorded_baseline() {
             "{key}"
         );
     }
-    assert_orientations_match(&f.orientations, ORIENTATIONS_FIXTURE);
+    assert_orientations_match(f.orientations.as_deref().unwrap(), ORIENTATIONS_FIXTURE);
     let matched = frontend.observation().stereo_matched.unwrap();
     assert_eq!(
         matched.to_string(),
@@ -184,8 +189,8 @@ fn fisheye_mapping_matches_the_recorded_baseline() {
     hilti_mapping().map_keypoints(&mut features);
 
     let hash = fnv(f32_bytes(&features.keypoints_xy.concat())
-        .chain(f32_bytes(&features.orientations))
-        .chain(features.descriptors.concat())
+        .chain(f32_bytes(features.orientations.as_deref().unwrap()))
+        .chain(RBrief::peel_slice(&features.descriptors).concat())
         .chain(features.octaves.iter().copied())
         .collect::<Vec<_>>());
     assert_eq!(
@@ -217,10 +222,10 @@ fn dropped_fisheye_keypoints_take_their_attributes_with_them() {
     let kept_indices: Vec<u64> = features
         .descriptors
         .iter()
-        .map(|d| u64::from_le_bytes(d[..8].try_into().unwrap()))
+        .map(|d| u64::from_le_bytes(d.0[..8].try_into().unwrap()))
         .collect();
     assert_eq!(kept_indices, [1, 3]);
-    assert_eq!(features.orientations, [0.01, 0.03]);
+    assert_eq!(features.orientations, Some(vec![0.01, 0.03]));
     assert_eq!(features.octaves, [1, 3]);
     assert_eq!(features.keypoints_xy.len(), 2);
 }

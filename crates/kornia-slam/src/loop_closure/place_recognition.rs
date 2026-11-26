@@ -3,10 +3,11 @@
 //!
 //! Port of ORB-SLAM3's `KeyFrameDatabase` (`extra/ORB_SLAM3/src/KeyFrameDatabase.cc`)
 //! on top of the [`kornia_bow`] vocabulary. Each keyframe is summarized by a
-//! sparse [`BoW`] vector (word id → TF-IDF weight) computed from its ORB
-//! descriptors against a shared [`OrbVocabulary`]. An inverted index (word →
-//! keyframes) makes "which past keyframes share words with this one" cheap, and
-//! candidates are scored by [`BoW::l1_similarity`] exactly as DBoW2 does.
+//! sparse [`BoW`] vector (word id → TF-IDF weight) computed from its
+//! descriptors by a [`BowEncoder`], such as an [`OrbVocabulary`] for ORB. An
+//! inverted index (word → keyframes) makes "which past keyframes share words
+//! with this one" cheap, and candidates are scored by [`BoW::l1_similarity`]
+//! exactly as DBoW2 does.
 //!
 //! Covisibility-group score accumulation (ORB-SLAM3's second pass over each
 //! candidate's neighbours) is left to the loop-closing layer; this database
@@ -15,8 +16,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use kornia_bow::BoW;
+use crate::features::RBrief;
+use kornia_bow::metric::{DistanceMetric, Feature, L2};
 use kornia_bow::orb_slam3::{OrbVocabulary, pack_orb_descriptor};
+use kornia_bow::{BoW, Vocabulary as BowVocabulary};
 
 // Re-export so downstream crates can load and hold a vocabulary through
 // `kornia_slam::loop_closure::place_recognition` without depending on `kornia-bow` directly.
@@ -57,17 +60,40 @@ pub fn load_vocabulary(path: &Path) -> Result<Vocabulary, VocabularyLoadError> {
     })
 }
 
-/// Computes the bag-of-words vector for a set of ORB descriptors.
-///
-/// Descriptors are packed into the vocabulary's `Feature<u64, 4>` layout and
-/// transformed into a sparse, L1-normalized [`BoW`]. Returns an empty `BoW`
-/// when there are no descriptors (an unusable keyframe for place recognition).
-pub fn compute_bow(vocab: &OrbVocabulary, descriptors: &[[u8; 32]]) -> BoW {
-    if descriptors.is_empty() {
+/// Summarizes one image's descriptors as the sparse, L1-normalized [`BoW`]
+/// vector the [`KeyFrameDatabase`] indexes. An empty `BoW` marks an image
+/// that cannot take part in place recognition.
+pub trait BowEncoder<D>: Send + Sync {
+    fn encode(&self, descriptors: &[D]) -> BoW;
+}
+
+/// ORB descriptors, packed into the vocabulary's `Feature<u64, 4>` layout.
+impl BowEncoder<RBrief> for OrbVocabulary {
+    fn encode(&self, descriptors: &[RBrief]) -> BoW {
+        let packed: Vec<_> = descriptors
+            .iter()
+            .map(|descriptor| pack_orb_descriptor(&descriptor.0))
+            .collect();
+        transform_or_empty(self, &packed)
+    }
+}
+
+/// Float descriptors, compared by squared L2 distance.
+impl<const B: usize, const N: usize> BowEncoder<[f32; N]> for BowVocabulary<B, L2<N>> {
+    fn encode(&self, descriptors: &[[f32; N]]) -> BoW {
+        let features: Vec<_> = descriptors.iter().copied().map(Feature).collect();
+        transform_or_empty(self, &features)
+    }
+}
+
+fn transform_or_empty<const B: usize, M: DistanceMetric>(
+    vocabulary: &BowVocabulary<B, M>,
+    features: &[M::Data],
+) -> BoW {
+    if features.is_empty() {
         return BoW(Vec::new());
     }
-    let packed: Vec<_> = descriptors.iter().map(pack_orb_descriptor).collect();
-    vocab.transform(&packed).unwrap_or(BoW(Vec::new()))
+    vocabulary.transform(features).unwrap_or(BoW(Vec::new()))
 }
 
 /// Inverted-index bag-of-words database over keyframes.
@@ -233,6 +259,21 @@ mod tests {
             assert_eq!(err.path, Path::new(path));
             assert!(matches!(err.source, kornia_bow::BowError::Io(_)));
         }
+    }
+
+    #[test]
+    fn a_float_vocabulary_encodes_float_descriptors() {
+        let near = |x: f32| Feature([x, 0.0]);
+        let far = |x: f32| Feature([50.0 + x, 50.0]);
+        let training = [near(0.0), near(0.1), far(0.0), far(0.1)];
+        let vocabulary = BowVocabulary::<2, L2<2>>::train(&training, 1).unwrap();
+
+        let a = vocabulary.encode(&[[0.05, 0.0]]);
+        let b = vocabulary.encode(&[[0.0, 0.0]]);
+        let c = vocabulary.encode(&[[50.0, 50.0]]);
+        assert!((a.l1_similarity(&b) - 1.0).abs() < 1e-6);
+        assert_eq!(a.l1_similarity(&c), 0.0);
+        assert!(vocabulary.encode(&[]).0.is_empty());
     }
 
     #[test]

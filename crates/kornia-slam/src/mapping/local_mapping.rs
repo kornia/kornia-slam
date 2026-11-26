@@ -404,19 +404,19 @@ mod tests {
     /// A map holding one landmark that fails the culling policy, with a live
     /// association, so cleanup is observable.
     fn map_with_a_cullable_landmark() -> (Arc<Mutex<Map>>, usize) {
+        use crate::features::{Features, RBrief};
         use crate::frame::Frame;
         use crate::mapping::map::{Keyframe, LandmarkSeed, ObservationKey};
         use kornia_3d::pose::Pose3d;
         use kornia_image::ImageSize;
-        use kornia_imgproc::features::OrbFeatures;
 
         let mut map = Map::new();
         map.insert_keyframe(Keyframe::from_frame(Frame {
             idx: 0,
-            features: OrbFeatures {
+            features: Features {
                 keypoints_xy: vec![[10.0, 10.0]],
-                orientations: vec![0.0],
-                descriptors: vec![[0u8; 32]],
+                orientations: Some(vec![0.0]),
+                descriptors: vec![RBrief([0u8; 32])],
                 octaves: vec![0],
             },
             pose_world_to_cam: Pose3d::IDENTITY,

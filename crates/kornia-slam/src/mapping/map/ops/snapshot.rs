@@ -3,6 +3,8 @@
 //! Capture has no window or solver policy: mapping chooses a [`BaWindow`], the
 //! map copies exactly those entities, and correction applies the numeric result.
 
+use crate::features::Descriptor;
+use crate::features::RBrief;
 use crate::mapping::map::{ImuFactor, Keyframe, Map, MapPoint};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
@@ -24,10 +26,10 @@ pub struct BaWindow {
 /// window rather than the map. Keyframes keep map insertion order; landmarks
 /// are sorted by id. IMU edges are those joining two captured keyframes.
 #[derive(Debug, Clone)]
-pub struct BaSnapshot {
-    pub(super) keyframes: Vec<Keyframe>,
+pub struct BaSnapshot<D = RBrief> {
+    pub(super) keyframes: Vec<Keyframe<D>>,
     pub(super) landmark_ids: Vec<usize>,
-    pub(super) map_points: Vec<MapPoint>,
+    pub(super) map_points: Vec<MapPoint<D>>,
     pub(super) imu_factors: Vec<ImuFactor>,
     pub(super) world_epoch: u64,
 }
@@ -46,11 +48,11 @@ pub(crate) struct KeyframeBaState {
 /// observations, landmark lifetimes and other live structure are never copied
 /// back. An unchanged update is still an accepted local-mapping completion.
 #[derive(Debug)]
-pub struct BaUpdate {
+pub struct BaUpdate<D = RBrief> {
     pub(crate) keyframes: Vec<KeyframeBaState>,
     pub(crate) map_points: Vec<Vec3F64>,
     pub(crate) imu_preintegrations: Vec<PreintegratedImu>,
-    pub(crate) snapshot: BaSnapshot,
+    pub(crate) snapshot: BaSnapshot<D>,
     pub(crate) solve_stats: Option<LocalBaStats>,
 }
 
@@ -83,7 +85,7 @@ pub struct LocalBaStats {
     pub points_rejected: usize,
 }
 
-impl BaUpdate {
+impl<D> BaUpdate<D> {
     /// What the solve that produced this update did, if one ran and reports
     /// it (see [`LocalBaStats`]).
     pub fn solve_stats(&self) -> Option<&LocalBaStats> {
@@ -102,13 +104,13 @@ impl BaUpdate {
     }
 }
 
-impl BaSnapshot {
-    pub fn keyframes(&self) -> &[Keyframe] {
+impl<D> BaSnapshot<D> {
+    pub fn keyframes(&self) -> &[Keyframe<D>] {
         &self.keyframes
     }
 
     /// Captured landmarks, parallel to [`BaSnapshot::landmark_ids`].
-    pub fn map_points(&self) -> &[MapPoint] {
+    pub fn map_points(&self) -> &[MapPoint<D>] {
         &self.map_points
     }
 
@@ -128,7 +130,7 @@ impl BaSnapshot {
 
     /// Starts an unchanged numeric result, including the original IMU edges.
     /// Solvers replace estimates in this result without changing their inputs.
-    pub(crate) fn into_update(self) -> BaUpdate {
+    pub(crate) fn into_update(self) -> BaUpdate<D> {
         BaUpdate {
             keyframes: self
                 .keyframes
@@ -151,14 +153,14 @@ impl BaSnapshot {
     }
 }
 
-impl Map {
+impl<D: Descriptor> Map<D> {
     /// Captures owned copies of the window's entities without selecting or
     /// solving a problem. Out-of-range slots and ids are skipped.
-    pub fn ba_snapshot(&self, window: &BaWindow) -> BaSnapshot {
+    pub fn ba_snapshot(&self, window: &BaWindow) -> BaSnapshot<D> {
         let mut keyframe_slots = window.keyframe_slots.clone();
         keyframe_slots.sort_unstable();
         keyframe_slots.dedup();
-        let keyframes: Vec<Keyframe> = keyframe_slots
+        let keyframes: Vec<Keyframe<D>> = keyframe_slots
             .iter()
             .filter_map(|&slot| self.keyframes.get(slot).cloned())
             .collect();
@@ -191,7 +193,7 @@ impl Map {
 
     /// Captures every entity; for tests that index updates by map slot.
     #[cfg(test)]
-    pub(crate) fn full_ba_snapshot(&self) -> BaSnapshot {
+    pub(crate) fn full_ba_snapshot(&self) -> BaSnapshot<D> {
         self.ba_snapshot(&BaWindow {
             keyframe_slots: (0..self.keyframes.len()).collect(),
             landmark_ids: (0..self.map_points.len()).collect(),

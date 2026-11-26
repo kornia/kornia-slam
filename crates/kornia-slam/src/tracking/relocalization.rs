@@ -7,23 +7,25 @@
 //! local map. A pose is accepted only with as much support as normal tracking
 //! would need from a cold start.
 
+use crate::features::RBrief;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pnp::{PnPMethod, RansacParams, solve_pnp_ransac};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Vec2F32, Vec3AF32};
-use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
+use kornia_imgproc::features::OrbMatchConfig;
 
 use crate::Frame;
+use crate::features::Descriptor;
 use crate::frame::is_finite_xy;
 use crate::mapping::{Keyframe, Map};
 use crate::pose_conversion::{mat3_to_f32, mat3_to_f64, vec3_to_f32, vec3_to_f64};
 use crate::tracking::pose_estimation::{Estimate, MapProjectionEstimator};
 
 /// Thresholds for relocalization (ORB-SLAM3's values).
-#[derive(Debug, Clone, Copy)]
-pub struct RelocalizationConfig {
+#[derive(Debug, Clone)]
+pub struct RelocalizationConfig<D: Descriptor = RBrief> {
     /// Descriptor matcher against candidate keyframes.
-    pub match_config: OrbMatchConfig,
+    pub match_config: D::MatchConfig,
     /// Correspondences a candidate needs before PnP RANSAC is attempted.
     pub min_correspondences: usize,
     /// RANSAC inliers a candidate pose needs before refinement.
@@ -63,13 +65,13 @@ pub struct Relocalization {
 
 /// Tries each candidate keyframe in order and returns the first pose with
 /// enough support that `accept` also takes.
-pub fn relocalize(
-    frame: &Frame,
+pub fn relocalize<D: Descriptor>(
+    frame: &Frame<D>,
     candidates: &[usize],
-    map: &Map,
+    map: &Map<D>,
     camera: &PinholeCamera,
-    estimator: &MapProjectionEstimator,
-    config: &RelocalizationConfig,
+    estimator: &MapProjectionEstimator<D>,
+    config: &RelocalizationConfig<D>,
     mut accept: impl FnMut(&Relocalization) -> bool,
 ) -> Option<Relocalization> {
     candidates.iter().find_map(|&keyframe_idx| {
@@ -101,23 +103,19 @@ pub fn relocalize(
 }
 
 // TODO: adapt for global descriptors (e.g. NetVLAD/DINO) — retrieve candidate
-// keyframes by global embedding instead of ORB/BoW, and make local matching
-// descriptor-agnostic.
+// keyframes by global embedding instead of BoW.
 /// `(map_point_idx, keypoint_idx)` pairs from descriptor matches against the
 /// keyframe's associated landmarks.
-fn keyframe_correspondences(
-    frame: &Frame,
-    keyframe: &Keyframe,
-    map: &Map,
-    config: &RelocalizationConfig,
+fn keyframe_correspondences<D: Descriptor>(
+    frame: &Frame<D>,
+    keyframe: &Keyframe<D>,
+    map: &Map<D>,
+    config: &RelocalizationConfig<D>,
 ) -> Vec<(usize, usize)> {
-    let features = &keyframe.frame.features;
-    match_orb_descriptors(
-        &features.orientations,
-        &features.descriptors,
-        &frame.features.orientations,
-        &frame.features.descriptors,
-        config.match_config,
+    D::match_sets(
+        keyframe.frame.features.descriptor_set(),
+        frame.features.descriptor_set(),
+        &config.match_config,
     )
     .into_iter()
     .filter_map(|(keyframe_desc, keypoint)| {
@@ -135,13 +133,13 @@ fn keyframe_correspondences(
 /// PnP RANSAC over the correspondences, returning the pose and its inlier
 /// correspondences. Points are expressed relative to the keyframe's camera
 /// centre and scaled to unit median depth for the f32 solver.
-fn ransac_pose(
-    frame: &Frame,
-    keyframe: &Keyframe,
-    map: &Map,
+fn ransac_pose<D: Descriptor>(
+    frame: &Frame<D>,
+    keyframe: &Keyframe<D>,
+    map: &Map<D>,
     camera: &PinholeCamera,
     correspondences: &[(usize, usize)],
-    config: &RelocalizationConfig,
+    config: &RelocalizationConfig<D>,
 ) -> Option<(Pose3d, Vec<(usize, usize)>)> {
     let keyframe_pose = keyframe.frame.pose_world_to_cam;
     let center = keyframe_pose.inverse().translation;
@@ -197,11 +195,11 @@ fn ransac_pose(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::Features;
     use crate::mapping::map::{LandmarkSeed, ObservationKey};
     use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
     use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
     use kornia_image::ImageSize;
-    use kornia_imgproc::features::OrbFeatures;
 
     const LANDMARKS: usize = 80;
 
@@ -243,10 +241,10 @@ mod tests {
             .collect();
         Frame {
             idx,
-            features: OrbFeatures {
+            features: Features {
                 keypoints_xy: pixels.clone(),
-                orientations: vec![0.0; LANDMARKS],
-                descriptors,
+                orientations: Some(vec![0.0; LANDMARKS]),
+                descriptors: descriptors.into_iter().map(RBrief).collect(),
                 octaves: vec![0; LANDMARKS],
             },
             pose_world_to_cam: pose,

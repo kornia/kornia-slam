@@ -11,11 +11,12 @@
 //! depends on a camera centre that solve moved, even though its own position
 //! must never be written back from that stale capture.
 
-use crate::mapping::map::{Map, ORB_N_LEVELS, ORB_SCALE_FACTOR};
+use crate::features::Descriptor;
+use crate::mapping::map::Map;
 use kornia_algebra::Vec3F64;
 use std::collections::HashSet;
 
-impl Map {
+impl<D: Descriptor> Map<D> {
     /// Recomputes the mean viewing direction and scale-invariance distance
     /// bounds for one map point from its observing keyframes (ORB-SLAM3's
     /// `MapPoint::UpdateNormalAndDepth`). No-op if the point is culled or its
@@ -23,12 +24,9 @@ impl Map {
     ///
     /// Private to `map` and its descendants: callers reach it through the
     /// corrections and mutations that know which landmarks became stale.
-    pub(in crate::mapping::map) fn update_map_point_geometry(
-        &mut self,
-        mp_idx: usize,
-        scale_factor: f64,
-        n_levels: usize,
-    ) {
+    pub(in crate::mapping::map) fn update_map_point_geometry(&mut self, mp_idx: usize) {
+        let scale_factor = self.scale_pyramid.factor;
+        let n_levels = self.scale_pyramid.n_levels;
         let (position, kf_indices, ref_kf_idx, ref_octave) = {
             let Some(mp) = self.map_points.get(mp_idx) else {
                 return;
@@ -125,7 +123,7 @@ impl Map {
         ids.sort_unstable();
         ids.dedup();
         for idx in ids {
-            self.update_map_point_geometry(idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+            self.update_map_point_geometry(idx);
         }
     }
 }

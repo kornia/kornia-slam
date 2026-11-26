@@ -1197,7 +1197,7 @@ impl SlamSystem {
             &self.map,
             growth_plan,
             &self.rig.camera,
-            self.two_view_init_config.match_config,
+            &self.two_view_init_config.match_config,
             &self.two_view_init_config.triangulation_config,
         );
         self.report_growth(frame.idx, &growth);

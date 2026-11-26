@@ -3,9 +3,9 @@
 //! Canonical mutations maintain both sides of observation links and finalize
 //! affected landmark metadata. Batch insertion validates before its first write.
 
-use crate::mapping::map::{
-    ImuFactor, Keyframe, Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR, ObservationKey,
-};
+use crate::features::Descriptor;
+use crate::features::RBrief;
+use crate::mapping::map::{ImuFactor, Keyframe, Map, MapPoint, ObservationKey};
 use kornia_algebra::Vec3F64;
 use std::collections::{HashMap, HashSet};
 
@@ -17,7 +17,7 @@ pub struct MapPointMergeResult {
     pub redirected_associations: usize,
 }
 
-impl Map {
+impl<D: Descriptor> Map<D> {
     /// Wipes all keyframes and map points. Used to discard a failed bootstrap.
     pub fn clear_active(&mut self) {
         self.world_epoch = self.world_epoch.wrapping_add(1);
@@ -60,7 +60,7 @@ impl Map {
 
         // Records already carry at most one entry per keyframe, so support is
         // simply the number of links.
-        let support = |point: &MapPoint| point.observations().len();
+        let support = |point: &MapPoint<D>| point.observations().len();
         let first_support = support(first_point);
         let second_support = support(second_point);
         let second_is_stronger = second_support > first_support
@@ -153,12 +153,23 @@ pub struct ObservationLink {
 
 /// One validated batch: keyframes, landmarks, observations and IMU factors
 /// that are accepted or rejected together.
-#[derive(Debug, Default)]
-pub struct MapInsertion {
-    pub keyframes: Vec<Keyframe>,
+#[derive(Debug)]
+pub struct MapInsertion<D = RBrief> {
+    pub keyframes: Vec<Keyframe<D>>,
     pub landmarks: Vec<LandmarkSeed>,
     pub observations: Vec<ObservationLink>,
     pub imu_factors: Vec<ImuFactor>,
+}
+
+impl<D> Default for MapInsertion<D> {
+    fn default() -> Self {
+        Self {
+            keyframes: Vec::new(),
+            landmarks: Vec::new(),
+            observations: Vec::new(),
+            imu_factors: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -215,10 +226,10 @@ pub enum MapMutationError {
     },
 }
 
-impl Map {
+impl<D: Descriptor> Map<D> {
     /// Adds a detached keyframe. Rejects a duplicate id rather than replacing a
     /// stored entity, and requires empty associations sized to its descriptors.
-    pub fn insert_keyframe(&mut self, keyframe: Keyframe) -> Result<usize, MapMutationError> {
+    pub fn insert_keyframe(&mut self, keyframe: Keyframe<D>) -> Result<usize, MapMutationError> {
         let idx = keyframe.frame.idx;
         if self.get_keyframe(idx).is_some() {
             return Err(MapMutationError::DuplicateKeyframe(idx));
@@ -228,7 +239,7 @@ impl Map {
         Ok(idx)
     }
 
-    fn check_detached(keyframe: &Keyframe) -> Result<(), MapMutationError> {
+    fn check_detached(keyframe: &Keyframe<D>) -> Result<(), MapMutationError> {
         let n = keyframe.frame.features.descriptors.len();
         if keyframe.map_point_by_desc_idx.len() != n
             || keyframe.map_point_by_desc_idx.iter().any(|s| s.is_some())
@@ -360,7 +371,7 @@ impl Map {
     /// validation-before-write, not rollback: it does not survive a panic.
     pub fn apply_insertion(
         &mut self,
-        insertion: MapInsertion,
+        insertion: MapInsertion<D>,
     ) -> Result<InsertionResult, MapMutationError> {
         let MapInsertion {
             keyframes,
@@ -545,7 +556,7 @@ impl Map {
 
     // ── shared primitives ────────────────────────────────────────────────
 
-    fn feature_data(&self, key: ObservationKey) -> Result<([u8; 32], u8), MapMutationError> {
+    fn feature_data(&self, key: ObservationKey) -> Result<(D, u8), MapMutationError> {
         let Some(kf) = self.get_keyframe(key.keyframe_idx) else {
             return Err(MapMutationError::UnknownKeyframe(key.keyframe_idx));
         };
@@ -625,7 +636,7 @@ impl Map {
         Ok(LinkVerdict::New)
     }
 
-    fn link_unchecked(&mut self, key: ObservationKey, landmark_idx: usize, descriptor: [u8; 32]) {
+    fn link_unchecked(&mut self, key: ObservationKey, landmark_idx: usize, descriptor: D) {
         if let Some(kf) = self.get_keyframe_mut(key.keyframe_idx) {
             kf.associate_map_point(key.feature_idx, landmark_idx);
         }
@@ -681,7 +692,7 @@ impl Map {
         if let Some(mp) = self.map_points.get_mut(landmark_idx) {
             mp.finalize_descriptor();
         }
-        self.update_map_point_geometry(landmark_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+        self.update_map_point_geometry(landmark_idx);
     }
 }
 

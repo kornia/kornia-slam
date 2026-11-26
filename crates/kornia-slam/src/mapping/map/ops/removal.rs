@@ -10,6 +10,7 @@
 //! merged that way is refused before anything is written.
 
 use super::correction::valid_preintegration;
+use crate::features::Descriptor;
 use crate::mapping::map::{ImuFactor, Map};
 use kornia_sensors::imu::ImuMeasurement;
 
@@ -147,7 +148,7 @@ impl ImuRepair {
     }
 }
 
-impl Map {
+impl<D: Descriptor> Map<D> {
     /// Removes keyframe `keyframe_idx` and every reference to it.
     ///
     /// Each landmark it observed loses that record: one left with no observer

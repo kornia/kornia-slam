@@ -58,6 +58,9 @@ mod keyframe;
 mod map_point;
 mod ops;
 
+use crate::features::RBrief;
+use crate::features::ScalePyramid;
+
 pub use imu_factor::ImuFactor;
 pub use keyframe::Keyframe;
 pub use map_point::{LandmarkObservation, MapPoint, ObservationKey};
@@ -71,31 +74,53 @@ pub use ops::{
 };
 pub use ops::{KeyframeRemoval, KeyframeRemovalError, StillNeighbour, StillSide};
 
-/// ORB pyramid scale factor between adjacent levels (matches the kornia-imgproc
-/// ORB extractor default `downscale = 1.2`, which equals ORB-SLAM3's default).
-pub const ORB_SCALE_FACTOR: f64 = 1.2;
-/// Number of ORB pyramid levels (matches `OrbDetector` default `n_scales = 8`).
-pub const ORB_N_LEVELS: usize = 8;
-
-/// In-memory map storage for keyframes and persistent map points.
-#[derive(Debug, Clone, Default)]
-pub struct Map {
-    keyframes: Vec<Keyframe>,
-    map_points: Vec<MapPoint>,
+/// In-memory map storage for keyframes and persistent map points, over
+/// descriptor type `D` (ORB's by default).
+#[derive(Debug, Clone)]
+pub struct Map<D = RBrief> {
+    keyframes: Vec<Keyframe<D>>,
+    map_points: Vec<MapPoint<D>>,
     imu_factors: Vec<ImuFactor>,
     // Incremented whenever the map's world coordinate frame changes. Local BA
     // snapshots from an older epoch must never be merged into the new frame.
     world_epoch: u64,
+    scale_pyramid: ScalePyramid,
+}
+
+impl Default for Map {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<D> Map<D> {
+    /// Creates an empty map whose keyframe octaves index `scale_pyramid`.
+    pub fn with_scale_pyramid(scale_pyramid: ScalePyramid) -> Self {
+        Self {
+            keyframes: Vec::new(),
+            map_points: Vec::new(),
+            imu_factors: Vec::new(),
+            world_epoch: 0,
+            scale_pyramid,
+        }
+    }
+
+    /// The pyramid keyframe octaves and landmark scale predictions refer to.
+    pub fn scale_pyramid(&self) -> ScalePyramid {
+        self.scale_pyramid
+    }
 }
 
 impl Map {
-    /// Creates an empty map.
+    /// Creates an empty map for ORB features.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_scale_pyramid(ScalePyramid::ORB)
     }
+}
 
+impl<D> Map<D> {
     /// Returns all keyframes.
-    pub fn keyframes(&self) -> &[Keyframe] {
+    pub fn keyframes(&self) -> &[Keyframe<D>] {
         &self.keyframes
     }
 
@@ -105,23 +130,23 @@ impl Map {
     /// Private to this module tree — `map` and its descendants. Everything
     /// outside changes structure only through the canonical operations, which
     /// keep both sides of every link in step.
-    fn keyframes_mut(&mut self) -> &mut [Keyframe] {
+    fn keyframes_mut(&mut self) -> &mut [Keyframe<D>] {
         &mut self.keyframes
     }
 
     /// Returns the keyframe with frame index `idx`, if present.
-    pub fn get_keyframe(&self, idx: usize) -> Option<&Keyframe> {
+    pub fn get_keyframe(&self, idx: usize) -> Option<&Keyframe<D>> {
         self.keyframes.iter().find(|kf| kf.frame.idx == idx)
     }
 
     /// Mutable access to one stored keyframe, for numeric writeback. Private
     /// for the same reason as [`Map::keyframes_mut`].
-    fn get_keyframe_mut(&mut self, idx: usize) -> Option<&mut Keyframe> {
+    fn get_keyframe_mut(&mut self, idx: usize) -> Option<&mut Keyframe<D>> {
         self.keyframes.iter_mut().find(|kf| kf.frame.idx == idx)
     }
 
     /// Returns all map points.
-    pub fn map_points(&self) -> &[MapPoint] {
+    pub fn map_points(&self) -> &[MapPoint<D>] {
         &self.map_points
     }
 
@@ -132,7 +157,7 @@ impl Map {
     /// `swap` and `sort` would still reassign landmark identities without
     /// repairing the associations that index them, so this stays inside the
     /// module tree where every caller is auditable.
-    fn map_points_mut(&mut self) -> &mut [MapPoint] {
+    fn map_points_mut(&mut self) -> &mut [MapPoint<D>] {
         &mut self.map_points
     }
 

@@ -12,12 +12,15 @@
 //    '-----------' '-----------'
 //      frame 1        frame 2
 
+use crate::features::RBrief;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 pub use kornia_3d::pose::TwoViewError;
 use kornia_3d::pose::{TriangulationConfig, TwoViewEstimator, TwoViewModel, TwoViewResult};
 use kornia_algebra::{Vec2F64, Vec3F64};
-use kornia_imgproc::features::{OrbFeatures, OrbMatchConfig, match_orb_descriptors};
+use kornia_imgproc::features::OrbMatchConfig;
+
+use crate::features::{Descriptor, Features};
 
 use crate::frame::undistorted_camera;
 use crate::tracking::pose_estimation::Estimate;
@@ -35,9 +38,9 @@ pub struct TwoViewAcceptanceConfig {
 
 /// Configuration for two-view initialization.
 #[derive(Debug, Clone)]
-pub struct TwoViewInitConfig {
-    /// ORB descriptor matcher settings.
-    pub match_config: OrbMatchConfig,
+pub struct TwoViewInitConfig<D: Descriptor = RBrief> {
+    /// Descriptor matcher settings.
+    pub match_config: D::MatchConfig,
     /// Triangulation thresholds applied during two-view estimation.
     pub triangulation_config: TriangulationConfig,
     /// Acceptance thresholds applied on top of the estimator result.
@@ -110,21 +113,19 @@ pub struct TwoViewEstimate {
 }
 
 /// Attempt two-view initialization between a reference frame and the current frame.
-pub fn try_initialize_two_view(
-    ref_features: &OrbFeatures,
+pub fn try_initialize_two_view<D: Descriptor>(
+    ref_features: &Features<D>,
     ref_pose: &Pose3d,
-    curr_features: &OrbFeatures,
+    curr_features: &Features<D>,
     camera: &PinholeCamera,
-    config: &TwoViewInitConfig,
+    config: &TwoViewInitConfig<D>,
 ) -> Result<TwoViewEstimate, TwoViewRejectReason> {
     let acceptance = &config.acceptance_config;
 
-    let mut matches = match_orb_descriptors(
-        &ref_features.orientations,
-        &ref_features.descriptors,
-        &curr_features.orientations,
-        &curr_features.descriptors,
-        config.match_config,
+    let mut matches = D::match_sets(
+        ref_features.descriptor_set(),
+        curr_features.descriptor_set(),
+        &config.match_config,
     );
     if matches.len() < acceptance.min_matches {
         return Err(TwoViewRejectReason::LowMatches);
