@@ -244,14 +244,6 @@ impl SystemConfig {
         frontend.fisheye_weight.for_rig(rig)
     }
 
-    /// Keypoints for every image but the primary.
-    pub(crate) fn secondary_n_keypoints(&self) -> usize {
-        let FrontendConfig::Orb(frontend) = self.orb().frontend;
-        frontend
-            .secondary_n_keypoints
-            .unwrap_or(frontend.n_keypoints)
-    }
-
     /// The pyramid the stereo and overlap matching read.
     pub(crate) fn stereo_pyramid(&self) -> StereoPyramid {
         let FrontendConfig::Orb(frontend) = self.orb().frontend;

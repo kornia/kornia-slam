@@ -2289,7 +2289,6 @@ mod ron_files {
             stereo_close_depth: StereoCloseDepth::Metres(4.0),
             klt_first: KltFirst::Enabled { min_tracks: 120 },
             klt_prediction: KltPrediction::Disabled,
-            secondary_n_keypoints: Some(500),
             klt_kernel: LkKernel::F32,
             ..OrbFrontendConfig::default()
         });
@@ -2307,7 +2306,6 @@ mod ron_files {
                 stereo_close_depth: StereoCloseDepth::Metres(4.0),
                 klt_first: KltFirst::Enabled { min_tracks: 120 },
                 klt_prediction: KltPrediction::Disabled,
-                secondary_n_keypoints: Some(500),
                 klt_kernel: LkKernel::F32,
                 ..OrbFrontendConfig::default()
             })

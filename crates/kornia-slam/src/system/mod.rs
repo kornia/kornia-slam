@@ -325,7 +325,6 @@ impl SlamSystem {
             .into());
         }
         let frontend = OrbFrontend::new(config.orb_detector(), &rig)
-            .with_secondary_keypoints(config.secondary_n_keypoints())
             .with_stereo_pyramid(config.stereo_pyramid())
             .with_fisheye_weight(config.fisheye_weight(&rig));
         let loop_closer = config.loop_closer(&rig)?;

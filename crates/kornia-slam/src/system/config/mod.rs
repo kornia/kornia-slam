@@ -176,10 +176,6 @@ pub struct OrbFrontendConfig {
     pub klt_first: KltFirst,
     /// Optical-flow search when the inertial prediction is trusted.
     pub klt_prediction: KltPrediction,
-    /// Keypoints per image for the stereo right image and non-primary rig
-    /// cameras, within [`OrbFrontendConfig::N_KEYPOINTS_RANGE`]; `None` uses
-    /// `n_keypoints`.
-    pub secondary_n_keypoints: Option<usize>,
     /// The pyramidal LK implementation optical flow runs on.
     pub klt_kernel: LkKernel,
     /// Threads the flow step runs on, the tracking thread included: 1, the
@@ -390,7 +386,6 @@ impl Default for OrbFrontendConfig {
             stereo_close_depth: StereoCloseDepth::default(),
             klt_first: KltFirst::default(),
             klt_prediction: KltPrediction::default(),
-            secondary_n_keypoints: None,
             klt_kernel: LkKernel::FixedPointU8,
             flow_threads: 1,
             klt_rig: KltRig::default(),
@@ -808,9 +803,6 @@ impl fmt::Display for SystemConfig {
         writeln!(f, "  frontend: ORB, {} keypoints", frontend.n_keypoints)?;
         if frontend.klt_kernel == LkKernel::FixedPointU8 {
             writeln!(f, "  klt kernel: fixed-point u8")?;
-        }
-        if let Some(n) = frontend.secondary_n_keypoints {
-            writeln!(f, "  secondary cameras: {n} keypoints")?;
         }
         if let Some(min_tracks) = frontend.klt_first.min_tracks() {
             writeln!(
