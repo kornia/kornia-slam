@@ -17,7 +17,7 @@ Binary `bin-fold` (95bc33c; a4a2f4b only adds an off-by-default knob). Rep 1 ran
 | seq | Basalt | 0.5x target | reps | median | ratio | smoothed | status |
 |---|---|---|---|---|---|---|---|
 | MH_01 | 0.067 | 0.034 | 0.043, 0.058, 0.042 | 0.043 | 0.64 | 0.028 | below Basalt |
-| MH_02 | 0.048 | 0.024 | 0.033 (r1 missing from the report) | 0.033 | 0.68 | 0.019 | below Basalt |
+| MH_02 | 0.048 | 0.024 | 0.040, 0.036, 0.033 | 0.036 | 0.75 | 0.021 | below Basalt |
 | MH_03 | 0.062 | 0.031 | 0.050, 0.044, 0.054 | 0.050 | 0.81 | 0.033 | below Basalt |
 | MH_04 | 0.114 | 0.057 | 0.210, 0.228, 0.356 | 0.228 | 2.00 | 0.137 | G58 (row below); r3 0.356 is the G63 fork |
 | MH_05 | 0.144 | 0.072 | 0.103, 0.089, 0.094 | 0.094 | 0.65 | 0.054 | below Basalt |
