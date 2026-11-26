@@ -79,3 +79,8 @@ The predicted mechanisms hold: V1_03 high-frequency error is 0.004 (equal to Bas
 - 2026-11-26: final tip bench done (3 reps RT3EF plus speed pairs). 6 of 11 below Basalt, none at 0.5x; speed is not faster (1 of 11, G57). Tables above.
 - 2026-11-26: G57 full check (3 reps × 4 sequences, Basalt re-measured at the same clock). G57-a removes every loop stall; ATE equal or better on 3 of 4 (V2_02 0.102 vs control 0.095, inside the band). Faster than Basalt on 1 of 4 (MH_03); the p99 tail (keyframe bursts) and Vicon-room CPU still lose. G57-b is blocked by the map lock wait (KB3) and a coast at V1_03 frame 390 (NH1).
 - 2026-11-26: G57-a (RT4EF) on the other 7 sequences, 1 rep each: ATE inside or below the RT3EF band on all (MH_01 0.048, MH_02 0.035, MH_04 0.212, MH_05 0.095, V1_02 0.036, V2_01 0.051, V2_03 0.499). Misses against Basalt are unchanged in cause (MH_04 G58, V2_01 G59 + floor, V2_03 unknown/K1-c). Loops 26 against 29; promotion waits for D5b.
+- 2026-11-26 (checkpoint A3/A8, `euroc-checkpoint-2026-11-26.md` section 7): corrections.
+  - **V2_03.** The coasts start after cam0's 100 ms frame gaps: 34 of 35 coast runs, base rate 22 %. Matching gets too few inputs (LowPnpInliers, LowReferenceMatches). The earlier note "K1-c is tracing it" was wrong: K1-c traces the estimator.
+  - **V2_01 r2 (0.111).** A 3 m excursion over 5 coast frames at 108.6 s, after a 1.30° loop correction. Reps 1 and 3 coast on the same frames with no excursion.
+  - **MH_04 r3 (0.356).** G60 (`[pgo] failed`, not converged after 30 iterations), not the G63 fork.
+  - **Count.** 4 of 11 are robustly below Basalt, not 6.

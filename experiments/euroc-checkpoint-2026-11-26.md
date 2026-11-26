@@ -160,3 +160,64 @@ Every item is config only or small code unless marked. Each code item goes plann
 6. **Flow-gate fix (A4).** May the keyframe count change, or must it stay within ±5 %?
 7. **Batch gate (A7).** May G57-a and G60-b go through one batch gate together?
 8. **Verdict gate.** Is 5 pairs × 11 sequences (about 4 h) acceptable as the speed verdict gate?
+
+## 7. Results: A3 and A8 (2026-11-26, no code)
+
+Harness scripts (outside the repo): `twox/a8/sim3_table.py`, `twox/a8/seg_err.py`, `twox/a8/a3_coasts.py`. Debug run: `debug/A3-S0PE-V203` (`bin-fold`, S0PE, SYNC, `--debug`, full length).
+
+### A3: V2_03 coasts
+
+- **The frame gaps are confirmed.** cam0 has 1922 images and cam1 2336. 414 of 1919 frame intervals are 100 ms (22 %).
+- **Almost every coast run starts after one.** The run has 115 coast frames in 35 coast runs. **34 of the 35 start on the frame right after a 100 ms gap**, against the 22 % base rate. This confirms the review.
+- **Why tracking rejects the frame:**
+
+  | | LowPnpInliers | LowReferenceMatches | PnpFailed | LowReferenceCorrespondences |
+  |---|---|---|---|---|
+  | at the start of a coast run | 21 | 10 | 3 | 1 |
+  | over all 115 coast frames | 57 | 42 | 6 | 10 |
+
+  Rejects happen only on coast frames.
+- **Motion over a gap.** On the frames tracked after a gap, the predicted motion is 4-5 times that of a normal 50 ms step: rotation median 0.86° (p90 2.47°) against 0.18° (p90 0.70°), and translation median 0.041 m against 0.010 m. These come from the `[predgap]` lines, which are printed only on tracked frames.
+- **The failing PnPs have too few inputs.** They get 4-12 matches. Two of them also exceed their gate (reference stage, median residual 61-82 px against `gate_px=25`).
+- **Reading.** The doubled frame interval on V2_03, at fast rotation, leaves the projection and reference matching too few matches. That is the coast trigger. The 60 px flow cap is not the lead: the review measured gyro-only motion above it at 3 of 35 starts.
+- **Next card.** A match search that scales with the predicted motion (or with `dt`) on gap frames. Prediction: coasts 99-117 → ≤ 20, ATE 0.53 → 0.15-0.25 (review, rig-arm basis). Kill: coasts fall but ATE stays above 0.40.
+  - Owner question 5 (should coast frames count?) also applies here: our V2_03 output has 1806 poses against Basalt's 1890.
+
+### A8, part 1: Sim(3) scale table
+
+Ours is the RT3EF final bench (`FD-RT3E` r1-3, median, causal). Basalt is its blocking reference. ORB-SLAM3 is the stereo-inertial `f_run.txt` (final, not causal). Each cell is SE(3) ATE / Sim(3) ATE / Sim(3) scale. "1 % scale" is 0.01 × the RMS radius of the ground-truth path: what a 1 % scale error costs in SE(3) ATE.
+
+| seq | ours | Basalt | ORB-SLAM3 | 1 % scale |
+|---|---|---|---|---|
+| MH_01 | 0.043 / 0.033 / 1.0067 | 0.067 / 0.024 / 1.0148 | 0.046 / 0.020 / 1.0097 | 0.043 |
+| MH_02 | 0.036 / 0.036 / 0.9986 | 0.048 / 0.030 / 1.0081 | 0.034 / 0.034 / 0.9991 | 0.046 |
+| MH_03 | 0.050 / 0.049 / 1.0024 | 0.062 / 0.052 / 1.0095 | 0.028 / 0.027 / 1.0014 | 0.036 |
+| MH_04 | 0.228 / 0.226 / 1.0046 | 0.114 / 0.087 / 1.0110 | 0.045 / 0.044 / 1.0016 | 0.068 |
+| MH_05 | 0.094 / 0.091 / 1.0030 | 0.144 / 0.141 / 1.0043 | 0.050 / 0.050 / 0.9996 | 0.069 |
+| V1_01 | 0.047 / 0.044 / 1.0086 | 0.043 / 0.033 / 1.0155 | 0.039 / 0.035 / 1.0090 | 0.019 |
+| V1_02 | 0.043 / 0.042 / 1.0046 | 0.045 / 0.036 / 1.0157 | 0.019 / 0.011 / 1.0091 | 0.018 |
+| V1_03 | 0.127 / 0.127 / 1.0084 | 0.053 / 0.051 / 1.0105 | 0.026 / 0.021 / 1.0104 | 0.016 |
+| V2_01 | 0.051 / 0.037 / 1.0148 | 0.039 / 0.028 / 1.0119 | 0.031 / 0.020 / 1.0103 | 0.023 |
+| V2_02 | 0.106 / 0.106 / 1.0011 | 0.049 / 0.047 / 1.0063 | 0.037 / 0.031 / 0.9904 | 0.021 |
+| V2_03 | 0.568 / 0.560 / 1.0638 | 0.230 / 0.229 / 0.9881 | 0.027 / 0.027 / 0.9995 | 0.021 |
+
+**What the table says.**
+- **The common Vicon-room scale is real on four sequences.** V1_01, V1_02, V1_03 and V2_01 read 1.009-1.016 on both references, and 1.005-1.015 on ours. It is not there on V2_02 or V2_03, where ORB-SLAM3 reads 0.990 and 0.9995.
+- **The review's floor claim is too strong on V1_02 and V1_03.** ORB-SLAM3 reaches 0.019 and 0.026 there, at or below the 0.5x targets (0.023, 0.027), despite its 1 % scale. On V1_01 (0.039) and V2_01 (0.031) it stays above 0.5x (0.022, 0.020).
+- **Non-causal ORB-SLAM3 is at or below 0.5x Basalt on 6 sequences:** MH_03, MH_04, MH_05, V1_02, V1_03 and V2_03. So on those six, 0.5x is not unreachable in principle. It is out of reach for a causal system this week.
+- **Basalt's MH_01 reference is mostly scale** (SE(3) 0.067, Sim(3) 0.024), as the review said. Ours there is better in scale and worse in shape.
+- **Our V2_03 scale is 1.064, but scale is not the error.** Sim(3) (0.560) barely improves on SE(3) (0.568), so the error is in shape: the coasts.
+
+### A8, part 2: the V2_01 rep-2 outlier (0.111)
+
+- **Where it is.** Per-10 s error after one SE(3) alignment: rep 2 matches reps 1 and 3 in every bin except 100-110 s, which reads 0.337 against 0.052-0.069.
+- **What it is.** A 3 m excursion over 5 frames (t = 108.55-108.8 s, frames 2171-2176). Step excess against ground truth is 1.1-3.0 m per frame. Error is 0.02-0.09 m on either side.
+- **Same coast, no excursion elsewhere.** Those frames are inertial coasts (`Skipped` at 2173, 2174, 2177, 2178). Reps 1 and 3 coast on the same frames (2173-2178 and 2172-2178) with no excursion, so the coast itself is in the sequence. Only rep 2's coast poses run away.
+- **The one difference before the coast is the late loop.** Rep 2's loop at kf 2094 ~ 287 applies a 1.30° rotation (`[map-correction] … rot_deg=1.30`). Reps 1 and 3 close at kf 2105 and 2108 with 0.22° and 0.55°.
+  - A 1.3° turn of the velocity cannot make 3 m in 0.25 s; that needs a velocity off by about 12 m/s.
+  - So the candidate is the coast's propagation state (velocity or reference keyframe) after that writeback. It is not verified, because this is a paced, non-repeatable run.
+- **Coverage gap.** No counter flags it: `coast_runaway_frames=0`, `coast_m_at_give_up_max=0`.
+- **Next.**
+  1. A coast-excursion counter: coast step against the IMU-predicted step bound.
+  2. A SYNC search for the same excursion on V2_01 (S0E, starts 0/30/60) to get a repeatable case.
+- **Gap ledger:** this is a G59-class tail (a correction landing on the propagation), not lag.
