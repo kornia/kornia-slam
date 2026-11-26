@@ -10,6 +10,12 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**`SlamSystem` is generic over its descriptor.** `SlamSystem<D>` defaults to
+ORB's `RBrief`, so existing code builds unchanged; the map, tracking, mapping
+and inertial initialization it drives are generic over `D`, and frames come
+from a frontend behind one interface. `ProcessError::Frontend` now carries a
+`FrontendError` instead of an `ImageError`.
+
 **A `Clidd` descriptor joins ORB's `RBrief`.** `kornia_slam::Clidd` is
 CLIDD's L2-normalised 64-D float descriptor (Yao et al., 2026), compared by
 squared L2 distance, with default matching settings for two-view

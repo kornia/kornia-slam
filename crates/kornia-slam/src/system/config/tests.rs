@@ -364,11 +364,14 @@ mod runtime_settings {
         orb.tuning.map_projection.pnp.min_inliers = 12;
         orb.tuning.loss_recovery.timeout_imu_sec = 2.0;
 
-        let slam = config.settings(&rig());
+        let slam = config.settings(&rig(), config.orb_matching());
         assert_eq!(slam.keyframe_policy, orb_keyframes(&config));
         assert_eq!(slam.local_mapping, LocalMappingMode::Synchronous);
-        assert_eq!(slam.two_view_init.acceptance_config.min_inliers, 40);
-        assert_eq!(slam.map_projection.pnp.min_inliers, 12);
+        assert_eq!(
+            slam.matching.two_view_init.acceptance_config.min_inliers,
+            40
+        );
+        assert_eq!(slam.matching.map_projection.pnp.min_inliers, 12);
         assert_eq!(slam.tracking_loss_recovery.timeout_imu_sec, 2.0);
         assert_eq!(config.orb_detector().n_keypoints, 3000);
     }
@@ -389,7 +392,9 @@ mod runtime_settings {
                 stereo_close_depth: depth,
                 ..OrbFrontendConfig::default()
             });
-            config.settings(&selected).stereo_close_depth_m
+            config
+                .settings(&selected, config.orb_matching())
+                .stereo_close_depth_m
         };
         assert_eq!(close_depth(StereoCloseDepth::default()), Some(0.11 * 35.0));
         assert_eq!(close_depth(StereoCloseDepth::Metres(2.5)), Some(2.5));

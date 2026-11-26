@@ -27,11 +27,11 @@ fn vec3_from_var(values: &[f32]) -> Vec3F64 {
 impl ImuInitializer {
     // ── main entry point ──────────────────────────────────────────────────────
     #[allow(clippy::too_many_arguments)]
-    pub fn inertial_optimizer(
+    pub fn inertial_optimizer<D>(
         &self,
-        map: &Map,
+        map: &Map<D>,
         frame_to_local: &HashMap<usize, usize>,
-        keyframes: Vec<&Keyframe>,
+        keyframes: Vec<&Keyframe<D>>,
         rwg: Mat3F64,
         seed_velocities: &[Vec3F64],
         scale_init: f64,
@@ -187,9 +187,9 @@ impl ImuInitializer {
     /// as identity and velocities seed from each keyframe's current
     /// IMU-propagated estimate instead of being re-derived visually.
     #[allow(clippy::too_many_arguments)]
-    pub fn try_initialize(
+    pub fn try_initialize<D>(
         &self,
-        map: &Map,
+        map: &Map<D>,
         imu_t_bc: Option<Pose3d>,
         imu_bias: ImuBias,
         start_idx: usize,
@@ -199,7 +199,7 @@ impl ImuInitializer {
     ) -> Option<ImuInitResult> {
         let imu_t_bc = imu_t_bc?;
 
-        let mut keyframes: Vec<&Keyframe> = map
+        let mut keyframes: Vec<&Keyframe<D>> = map
             .keyframes()
             .iter()
             .filter(|kf| kf.frame.idx >= start_idx)

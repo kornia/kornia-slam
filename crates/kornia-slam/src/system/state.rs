@@ -2,6 +2,7 @@
 
 use kornia_3d::pose::Pose3d;
 
+use crate::features::RBrief;
 use crate::frame::Frame;
 use crate::inertial::AlignedTrackingState;
 use crate::initialization::two_view::TwoViewRejectReason;
@@ -29,7 +30,7 @@ pub struct TrackingResult {
 
 /// Mutable pipeline state carried across frames.
 #[derive(Debug, Clone)]
-pub(crate) struct SystemState {
+pub(crate) struct SystemState<D = RBrief> {
     pub pose_world_to_cam: Pose3d,
     pub velocity: Option<Pose3d>,
     /// Metric body velocity in the world frame (m/s); valid once `imu_initialized`.
@@ -57,7 +58,7 @@ pub(crate) struct SystemState {
     /// Consecutive descriptor-starved two-view attempts against the stored
     /// bootstrap reference.
     pub bootstrap_low_match_rejections: usize,
-    pub bootstrap_frame: Option<Frame>,
+    pub bootstrap_frame: Option<Frame<D>>,
     pub mode: SystemMode,
 }
 
@@ -72,7 +73,7 @@ pub(crate) enum SystemMode {
     Tracking,
 }
 
-impl SystemState {
+impl<D> SystemState<D> {
     pub fn new() -> Self {
         Self {
             pose_world_to_cam: Pose3d::IDENTITY,
@@ -132,7 +133,7 @@ impl SystemState {
     }
 }
 
-impl Default for SystemState {
+impl<D> Default for SystemState<D> {
     fn default() -> Self {
         Self::new()
     }
@@ -148,7 +149,7 @@ mod tests {
 
     #[test]
     fn adopting_an_initialization_resumes_from_the_aligned_keyframe() {
-        let mut state = SystemState::new();
+        let mut state: SystemState = SystemState::new();
         state.velocity = Some(Pose3d::IDENTITY);
         let mut pose = Pose3d::IDENTITY;
         pose.translation = Vec3F64::new(1.0, 2.0, 3.0);
@@ -169,7 +170,7 @@ mod tests {
 
     #[test]
     fn only_consecutive_low_match_rejections_lose_the_bootstrap_reference() {
-        let mut state = SystemState::new();
+        let mut state: SystemState = SystemState::new();
         for _ in 0..3 {
             assert!(!state.bootstrap_reference_lost(&TwoViewRejectReason::LowMatches, 3));
         }

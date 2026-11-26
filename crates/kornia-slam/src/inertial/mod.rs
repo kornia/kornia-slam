@@ -15,6 +15,7 @@ pub(crate) use schedule::{InertialInitSchedule, viba0_accel_bias_prior};
 
 use std::collections::VecDeque;
 
+use crate::features::Descriptor;
 use crate::mapping::Map;
 use crate::mapping::map::{ImuFactor, InertialAlignmentError};
 use kornia_algebra::Vec3F64;
@@ -150,9 +151,9 @@ impl InertialState {
     /// A refused alignment leaves the map and this state untouched. The caller
     /// still owns adopting the aligned tracking state, the mode transition and
     /// the mapping-worker handoff.
-    pub(crate) fn apply_initialization(
+    pub(crate) fn apply_initialization<D: Descriptor>(
         &mut self,
-        map: &mut Map,
+        map: &mut Map<D>,
         init: ImuInitResult,
         start_kf_idx: usize,
     ) -> Result<AppliedInitialization, InertialAlignmentError> {

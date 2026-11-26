@@ -11,6 +11,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
 
 use crate::Frame;
+use crate::features::{Descriptor, RBrief};
 use crate::mapping::Map;
 use crate::tracking::optical_flow::{
     KltTracker, MapKeypointMatch, TrackSet, carry_klt_survivors, snap_unique,
@@ -22,8 +23,8 @@ use crate::tracking::pose_estimation::{Estimate, MapProjectionEstimator};
 use crate::tracking::relocalization::{Relocalization, RelocalizationConfig, relocalize};
 
 /// Everything the tracker needs about the current frame that it does not own.
-pub(crate) struct FrameInput<'a> {
-    pub frame: &'a Frame,
+pub(crate) struct FrameInput<'a, D = RBrief> {
+    pub frame: &'a Frame<D>,
     pub previous_image: Option<&'a Image<u8, 1>>,
     pub current_image: &'a Image<u8, 1>,
     /// Pose predicted by the motion model, used to seed the projection search.
@@ -38,16 +39,21 @@ pub(crate) struct FrameInput<'a> {
     pub trusted_prediction: bool,
 }
 
-pub(crate) struct Tracker {
-    estimator: MapProjectionEstimator,
+pub(crate) struct Tracker<D: Descriptor = RBrief> {
+    estimator: MapProjectionEstimator<D>,
+    relocalization: RelocalizationConfig<D>,
     klt_tracker: KltTracker,
     track_set: TrackSet,
 }
 
-impl Tracker {
-    pub(crate) fn new(config: MapProjectionConfig) -> Self {
+impl<D: Descriptor> Tracker<D> {
+    pub(crate) fn new(
+        config: MapProjectionConfig<D>,
+        relocalization: RelocalizationConfig<D>,
+    ) -> Self {
         Self {
             estimator: MapProjectionEstimator::new(config),
+            relocalization,
             klt_tracker: KltTracker::default(),
             track_set: TrackSet::new(),
         }
@@ -58,9 +64,9 @@ impl Tracker {
     /// which belonged to the lost pose, dropped.
     pub(crate) fn relocalize(
         &mut self,
-        frame: &Frame,
+        frame: &Frame<D>,
         candidates: &[usize],
-        map: &Map,
+        map: &Map<D>,
         camera: &PinholeCamera,
         accept: impl FnMut(&Relocalization) -> bool,
     ) -> Option<Relocalization> {
@@ -70,7 +76,7 @@ impl Tracker {
             map,
             camera,
             &self.estimator,
-            &RelocalizationConfig::default(),
+            &self.relocalization,
             accept,
         );
         if found.is_some() {
@@ -93,8 +99,8 @@ impl Tracker {
     /// rejection, and cleared when neither can be applied.
     pub(crate) fn estimate(
         &mut self,
-        input: FrameInput<'_>,
-        map: &Map,
+        input: FrameInput<'_, D>,
+        map: &Map<D>,
         camera: &PinholeCamera,
     ) -> Result<Estimate, MapProjectionRejectReason> {
         let search_scale = self

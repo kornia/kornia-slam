@@ -12,7 +12,7 @@ use kornia_imgproc::resize::resize_fast_mono;
 use kornia_sensors::SensorRig;
 
 use crate::Frame;
-use crate::features::Features;
+use crate::features::{Features, RBrief, ScalePyramid};
 use crate::stereo::{StereoMatchConfig, StereoMatches, compute_stereo_matches};
 
 /// Fisheye keypoints beyond this incidence angle are dropped: a pinhole cannot
@@ -29,6 +29,41 @@ pub struct FrontendObservation {
     pub stereo_matched: Option<usize>,
     /// Feature extraction and stereo matching time.
     pub duration: Duration,
+}
+
+/// Why a frontend could not prepare a frame.
+#[derive(Debug, thiserror::Error)]
+pub enum FrontendError {
+    #[error(transparent)]
+    Image(#[from] ImageError),
+}
+
+/// Turns one validated image, or rectified stereo pair, into the frame
+/// tracking consumes, with features described by `D`.
+pub(crate) trait FeatureFrontend<D>: Send {
+    /// The pyramid this frontend's keypoint octaves index.
+    fn scale_pyramid(&self) -> ScalePyramid;
+
+    /// Prepares the image captured at `timestamp_sec`, numbering the frame
+    /// `idx`. The observation is updated only when preparation succeeds.
+    fn prepare_image(
+        &mut self,
+        idx: usize,
+        timestamp_sec: f64,
+        image: &Image<u8, 1>,
+    ) -> Result<Frame<D>, FrontendError>;
+
+    /// Like [`Self::prepare_image`], adding stereo depth where the frontend
+    /// supports it; otherwise the right image is ignored.
+    fn prepare_stereo_pair(
+        &mut self,
+        idx: usize,
+        timestamp_sec: f64,
+        left: &Image<u8, 1>,
+        right: &Image<u8, 1>,
+    ) -> Result<Frame<D>, FrontendError>;
+
+    fn observation(&self) -> &FrontendObservation;
 }
 
 /// ORB extraction plus the rig-specific preparation tracking expects.
@@ -51,15 +86,10 @@ impl OrbFrontend {
                 detector.n_scales,
             )
         });
-        let fisheye = rig.fisheye.clone().map(|fisheye| FisheyeMapping {
-            fisheye,
-            camera: rig.camera.clone(),
-            min_bearing_z: MAX_INCIDENCE_DEG.to_radians().cos(),
-        });
         Self {
             detector,
             stereo,
-            fisheye,
+            fisheye: FisheyeMapping::for_rig(rig),
             observation: FrontendObservation::default(),
         }
     }
@@ -116,33 +146,15 @@ impl OrbFrontend {
         stereo: Option<StereoMatches>,
         start: Instant,
     ) -> Frame {
-        let mut features = Features::from(features);
-        let stereo_matched = stereo.as_ref().map(StereoMatches::num_matched);
-        let StereoMatches { u_right, depth } = stereo.unwrap_or_default();
-
-        self.observation.keypoints_xy.clear();
-        self.observation
-            .keypoints_xy
-            .extend_from_slice(&features.keypoints_xy);
-        // Every per-feature array, stereo included, must stay aligned, so the
-        // mapping runs before colors are sampled. A fisheye rig is never stereo.
-        if let Some(fisheye) = &self.fisheye {
-            fisheye.map_keypoints(&mut features);
-        }
-        let keypoint_colors = sample_colors(image, &features.keypoints_xy);
-
-        self.observation.stereo_matched = stereo_matched;
-        self.observation.duration = start.elapsed();
-        Frame {
+        assemble_frame(
             idx,
-            features,
-            pose_world_to_cam: Pose3d::IDENTITY,
-            image_size: image.size(),
-            keypoint_colors,
-            u_right,
-            depth,
-            keypoints_undist: Vec::new(),
-        }
+            image,
+            Features::from(features),
+            stereo,
+            self.fisheye.as_ref(),
+            &mut self.observation,
+            start,
+        )
     }
 
     /// Builds an ORB-consistent pyramid: level `o` is the full image
@@ -170,6 +182,74 @@ impl OrbFrontend {
     }
 }
 
+impl FeatureFrontend<RBrief> for OrbFrontend {
+    fn scale_pyramid(&self) -> ScalePyramid {
+        ScalePyramid::ORB
+    }
+
+    fn prepare_image(
+        &mut self,
+        idx: usize,
+        _timestamp_sec: f64,
+        image: &Image<u8, 1>,
+    ) -> Result<Frame, FrontendError> {
+        Ok(OrbFrontend::prepare_image(self, idx, image)?)
+    }
+
+    fn prepare_stereo_pair(
+        &mut self,
+        idx: usize,
+        _timestamp_sec: f64,
+        left: &Image<u8, 1>,
+        right: &Image<u8, 1>,
+    ) -> Result<Frame, FrontendError> {
+        Ok(OrbFrontend::prepare_stereo_pair(self, idx, left, right)?)
+    }
+
+    fn observation(&self) -> &FrontendObservation {
+        OrbFrontend::observation(self)
+    }
+}
+
+/// The frame `features` of `image` make, mapped into the geometry camera for a
+/// fisheye rig, with `observation` updated to match.
+fn assemble_frame<D: Copy>(
+    idx: usize,
+    image: &Image<u8, 1>,
+    mut features: Features<D>,
+    stereo: Option<StereoMatches>,
+    fisheye: Option<&FisheyeMapping>,
+    observation: &mut FrontendObservation,
+    start: Instant,
+) -> Frame<D> {
+    let stereo_matched = stereo.as_ref().map(StereoMatches::num_matched);
+    let StereoMatches { u_right, depth } = stereo.unwrap_or_default();
+
+    observation.keypoints_xy.clear();
+    observation
+        .keypoints_xy
+        .extend_from_slice(&features.keypoints_xy);
+    // Every per-feature array, stereo included, must stay aligned, so the
+    // mapping runs before colors are sampled. A fisheye rig is never stereo.
+    if let Some(fisheye) = fisheye {
+        fisheye.map_keypoints(&mut features);
+    }
+    let keypoint_colors = sample_colors(image, &features.keypoints_xy);
+
+    observation.stereo_matched = stereo_matched;
+    observation.duration = start.elapsed();
+    Frame {
+        idx,
+        features,
+        pose_world_to_cam: Pose3d::IDENTITY,
+        image_size: image.size(),
+        keypoint_colors,
+        u_right,
+        depth,
+        keypoints_undist: Vec::new(),
+    }
+}
+
 /// Maps raw fisheye keypoints into a virtual pinhole by unprojecting each to a
 /// bearing through the Kannala-Brandt model, as ORB-SLAM3 does for fisheye
 /// cameras, instead of resampling the whole image.
@@ -181,9 +261,18 @@ struct FisheyeMapping {
 }
 
 impl FisheyeMapping {
+    /// The mapping a rig with a fisheye model needs; `None` otherwise.
+    fn for_rig(rig: &SensorRig) -> Option<Self> {
+        rig.fisheye.clone().map(|fisheye| Self {
+            fisheye,
+            camera: rig.camera.clone(),
+            min_bearing_z: MAX_INCIDENCE_DEG.to_radians().cos(),
+        })
+    }
+
     /// Remaps keypoints in place and drops those beyond the incidence cap,
     /// keeping orientations, descriptors and octaves aligned.
-    fn map_keypoints(&self, features: &mut Features) {
+    fn map_keypoints<D: Copy>(&self, features: &mut Features<D>) {
         let mut kept = Vec::with_capacity(features.len());
         let mut keypoints_xy = Vec::with_capacity(features.len());
         for (i, &[u, v]) in features.keypoints_xy.iter().enumerate() {

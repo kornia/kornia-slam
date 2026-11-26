@@ -192,16 +192,16 @@ impl ImuInitializer {
     ///
     /// See [`StationaryInitError`]. Nothing is written either way; this only
     /// computes.
-    pub fn initialize_stationary(
+    pub fn initialize_stationary<D>(
         &self,
-        map: &Map,
+        map: &Map<D>,
         imu_t_bc: Pose3d,
         prior_bias: ImuBias,
         start_idx: usize,
         stats: &ImuWindowStats,
         max_gravity_norm_error: f64,
     ) -> Result<ImuInitResult, StationaryInitError> {
-        let mut keyframes: Vec<&Keyframe> = map
+        let mut keyframes: Vec<&Keyframe<D>> = map
             .keyframes()
             .iter()
             .filter(|kf| kf.frame.idx >= start_idx)

@@ -5,6 +5,7 @@
 //! the map's canonical operation, so this selects ids and delegates — there is
 //! no second cleanup loop, and the map never calls back into mapping.
 
+use crate::features::Descriptor;
 use crate::mapping::map::{Keyframe, Map, StillNeighbour, StillSide};
 use kornia_factors::inertial::stationary::StationaryFactor;
 use kornia_factors::wheel_odometry::WheelOdomFactor;
@@ -27,7 +28,7 @@ const MAX_LANDMARK_DISTANCE_M: f64 = 1e4;
 /// any landmark sitting behind a keyframe that observes it, and any farther
 /// than [`MAX_LANDMARK_DISTANCE_M`] from every keyframe observing it (the map
 /// holds only finite positions).
-fn select_for_culling(map: &Map) -> Vec<usize> {
+fn select_for_culling<D: Descriptor>(map: &Map<D>) -> Vec<usize> {
     let mut selected: HashSet<usize> = HashSet::new();
 
     for (idx, mp) in map.map_points().iter().enumerate() {
@@ -72,7 +73,7 @@ fn select_for_culling(map: &Map) -> Vec<usize> {
 /// Culls landmarks that fail the policy. Returns how many were retired.
 ///
 /// Held under exclusive access so selection and removal see one state.
-pub fn cull_landmarks(map: &mut Map) -> usize {
+pub fn cull_landmarks<D: Descriptor>(map: &mut Map<D>) -> usize {
     let mut retired = 0usize;
     for idx in select_for_culling(map) {
         if map.remove_landmark(idx).unwrap_or(false) {
@@ -193,8 +194,8 @@ pub struct KeyframeCullReport {
 /// after every other candidate, each at most once per call. A bare chain end
 /// (a stationary factor and nothing on the other side) is kept. `None` culls
 /// exactly as before.
-pub fn cull_redundant_keyframes(
-    map: &mut Map,
+pub fn cull_redundant_keyframes<D: Descriptor>(
+    map: &mut Map<D>,
     config: &KeyframeCullingConfig,
     mut wheel_factors: Option<&mut Vec<WheelOdomFactor>>,
     mut stationary_factors: Option<&mut Vec<StationaryFactor>>,
@@ -267,8 +268,8 @@ pub struct KeyframeEvictReport {
 /// keyframe takes its IMU edge ([`Map::evict_keyframe`]) and every wheel and
 /// stationary factor touching it, so the new oldest keyframe is the start of
 /// every chain. Stops early at the first keyframe the map refuses.
-pub fn evict_oldest_keyframes(
-    map: &mut Map,
+pub fn evict_oldest_keyframes<D: Descriptor>(
+    map: &mut Map<D>,
     keep: usize,
     mut wheel_factors: Option<&mut Vec<WheelOdomFactor>>,
     mut stationary_factors: Option<&mut Vec<StationaryFactor>>,
@@ -318,8 +319,8 @@ enum Step {
 /// Judges and, if allowed, removes one candidate, repairing the factor chains and the report.
 /// A stationary boundary is removed only when `boundaries` is set.
 #[allow(clippy::too_many_arguments)]
-fn cull_one(
-    map: &mut Map,
+fn cull_one<D: Descriptor>(
+    map: &mut Map<D>,
     config: &KeyframeCullingConfig,
     kf_idx: usize,
     boundaries: bool,
@@ -400,7 +401,11 @@ fn cull_one(
 }
 
 /// ORB-SLAM's redundancy test for keyframe `kf_idx` against the live map.
-fn is_redundant(map: &Map, kf_idx: usize, config: &KeyframeCullingConfig) -> bool {
+fn is_redundant<D: Descriptor>(
+    map: &Map<D>,
+    kf_idx: usize,
+    config: &KeyframeCullingConfig,
+) -> bool {
     let slot_of: HashMap<usize, usize> = map
         .keyframes()
         .iter()
@@ -463,7 +468,7 @@ fn is_redundant(map: &Map, kf_idx: usize, config: &KeyframeCullingConfig) -> boo
     live > 0 && redundant as f64 >= config.redundant_ratio * live as f64
 }
 
-fn feature_octave(keyframe: &Keyframe, feature: usize) -> u8 {
+fn feature_octave<D>(keyframe: &Keyframe<D>, feature: usize) -> u8 {
     keyframe
         .frame
         .features
@@ -475,7 +480,7 @@ fn feature_octave(keyframe: &Keyframe, feature: usize) -> u8 {
 
 /// Whether the IMU edges through `kf_idx` may be merged under `config`. That
 /// they *can* be is [`Map::remove_keyframe`]'s to decide.
-fn imu_allows_removal(map: &Map, kf_idx: usize, config: &KeyframeCullingConfig) -> bool {
+fn imu_allows_removal<D>(map: &Map<D>, kf_idx: usize, config: &KeyframeCullingConfig) -> bool {
     let touching = map
         .imu_factors()
         .iter()
@@ -489,7 +494,7 @@ fn imu_allows_removal(map: &Map, kf_idx: usize, config: &KeyframeCullingConfig) 
     config.merge_imu_edges && end - start <= config.max_merged_imu_span_sec
 }
 
-fn touches_imu_edge(map: &Map, kf_idx: usize) -> bool {
+fn touches_imu_edge<D>(map: &Map<D>, kf_idx: usize) -> bool {
     map.imu_factors()
         .iter()
         .any(|f| f.prev_kf_idx == kf_idx || f.curr_kf_idx == kf_idx)

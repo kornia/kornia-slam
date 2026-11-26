@@ -6,11 +6,13 @@ use super::config::{
     SystemConfig,
 };
 use super::validation::ConfigError;
+use crate::features::{Descriptor, RBrief};
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopCloser;
 use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabulary};
 use crate::mapping::LocalMappingMode;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
+use crate::tracking::relocalization::RelocalizationConfig;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
 /// A [`SlamSystem`](crate::SlamSystem) that cannot be built from its
@@ -25,9 +27,8 @@ pub enum BuildError {
 
 /// Settings a [`SlamSystem`](crate::SlamSystem) is assembled from, resolved
 /// from a system configuration against the selected rig.
-pub(crate) struct SystemSettings {
-    pub two_view_init: TwoViewInitConfig,
-    pub map_projection: MapProjectionConfig,
+pub(crate) struct SystemSettings<D: Descriptor> {
+    pub matching: MatchingSettings<D>,
     pub keyframe_policy: KeyframePolicy,
     pub tracking_loss_recovery: TrackingLossRecoveryPolicy,
     pub local_mapping: LocalMappingMode,
@@ -35,6 +36,13 @@ pub(crate) struct SystemSettings {
     /// keyframe back-projects its unassociated "close" (`z < threshold`) stereo
     /// keypoints directly into metric map points.
     pub stereo_close_depth_m: Option<f64>,
+}
+
+/// The descriptor-dependent settings of bootstrap, tracking and relocalization.
+pub(crate) struct MatchingSettings<D: Descriptor> {
+    pub two_view_init: TwoViewInitConfig<D>,
+    pub map_projection: MapProjectionConfig<D>,
+    pub relocalization: RelocalizationConfig<D>,
 }
 
 impl SensorSelection {
@@ -55,19 +63,31 @@ impl SystemConfig {
     /// System settings for a rig returned by [`SensorSelection::select_rig`].
     ///
     /// Stereo close depth is resolved against the rig's baseline.
-    pub(crate) fn settings(&self, rig: &SensorRig) -> SystemSettings {
+    pub(crate) fn settings<D: Descriptor>(
+        &self,
+        rig: &SensorRig,
+        matching: MatchingSettings<D>,
+    ) -> SystemSettings<D> {
         let orb = self.orb();
         let FrontendConfig::Orb(frontend) = orb.frontend;
-        let tuning = &orb.tuning;
         SystemSettings {
-            two_view_init: tuning.initialization.clone(),
-            map_projection: tuning.map_projection.clone(),
+            matching,
             keyframe_policy: orb.keyframes,
-            tracking_loss_recovery: tuning.loss_recovery,
+            tracking_loss_recovery: orb.tuning.loss_recovery,
             local_mapping: orb.mapping.execution,
             stereo_close_depth_m: rig
                 .stereo_baseline_m
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
+        }
+    }
+
+    /// The ORB pipeline's matching settings, from its tuning.
+    pub(crate) fn orb_matching(&self) -> MatchingSettings<RBrief> {
+        let tuning = &self.orb().tuning;
+        MatchingSettings {
+            two_view_init: tuning.initialization.clone(),
+            map_projection: tuning.map_projection.clone(),
+            relocalization: RelocalizationConfig::default(),
         }
     }
 

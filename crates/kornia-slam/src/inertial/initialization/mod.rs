@@ -14,6 +14,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::{QuatF64, SO3F64, Vec3F64};
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias};
 
+use crate::features::Descriptor;
 use crate::mapping::map::{
     InertialAlignment, InertialAlignmentError, Keyframe, KeyframeVelocity, Map,
 };
@@ -50,7 +51,7 @@ fn rotation_from_to(from: Vec3F64, to: Vec3F64) -> SO3F64 {
 }
 
 /// A keyframe window is monocular unless its first keyframe carries stereo data.
-fn window_is_mono(kfs: &[&Keyframe]) -> bool {
+fn window_is_mono<D>(kfs: &[&Keyframe<D>]) -> bool {
     !kfs.first().map(|kf| kf.frame.is_stereo()).unwrap_or(false)
 }
 
@@ -88,12 +89,12 @@ impl ImuInitializer {
 
     // ── readiness gate ────────────────────────────────────────────────────────
 
-    pub fn ready(&self, map: &Map, start_idx: Option<usize>) -> bool {
+    pub fn ready<D>(&self, map: &Map<D>, start_idx: Option<usize>) -> bool {
         let Some(start_idx) = start_idx else {
             return false;
         };
 
-        let kfs: Vec<&Keyframe> = map
+        let kfs: Vec<&Keyframe<D>> = map
             .keyframes()
             .iter()
             .filter(|kf| kf.frame.idx >= start_idx)
@@ -155,9 +156,9 @@ impl ImuInitializer {
     /// Returns where tracking resumes, or `None` if the window has no
     /// keyframe; a refused alignment leaves the map, bias and gravity as they
     /// were.
-    pub fn apply_initialization(
+    pub fn apply_initialization<D: Descriptor>(
         &self,
-        map: &mut Map,
+        map: &mut Map<D>,
         imu_bias: &mut ImuBias,
         gravity_world: &mut Vec3F64,
         init: ImuInitResult,

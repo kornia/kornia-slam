@@ -3,6 +3,7 @@
 //! Solvers consume immutable map snapshots and return numerical updates. The
 //! map owns capture and writeback; the local-mapping worker owns scheduling.
 
+use crate::features::Descriptor;
 use crate::mapping::map::{
     BaSnapshot, BaUpdate, BaUpdateError, BaWindow, Keyframe, LocalBaStats, Map,
 };
@@ -44,7 +45,7 @@ const WRITE_BACK_FAR_M: f64 = 50.0;
 /// Mirrors ORB-SLAM3's `LocalBundleAdjustment` selection. Fixed keyframes
 /// always precede the active ones in slot order, because the active keyframes
 /// are the newest.
-pub fn local_window(map: &Map) -> BaWindow {
+pub fn local_window<D: Descriptor>(map: &Map<D>) -> BaWindow {
     local_window_with_neighbors(map, [])
 }
 
@@ -55,8 +56,8 @@ pub fn local_window(map: &Map) -> BaWindow {
 /// Without it a keyframe linked to the active window only by a caller-held
 /// factor, and observing none of its landmarks, would be left out, and the
 /// factor dropped with it.
-pub fn local_window_with_neighbors(
-    map: &Map,
+pub fn local_window_with_neighbors<D: Descriptor>(
+    map: &Map<D>,
     neighbors: impl IntoIterator<Item = (usize, usize)>,
 ) -> BaWindow {
     let keyframes = map.keyframes();
@@ -93,7 +94,7 @@ pub fn local_window_with_neighbors(
 }
 
 /// The bootstrap pair (the two newest keyframes) and the live landmarks they observe.
-fn initial_window(map: &Map) -> BaWindow {
+fn initial_window<D: Descriptor>(map: &Map<D>) -> BaWindow {
     let keyframes = map.keyframes();
     let start = keyframes.len().saturating_sub(2);
     BaWindow {
@@ -103,7 +104,7 @@ fn initial_window(map: &Map) -> BaWindow {
 }
 
 /// Live landmark ids observed by `keyframes`, ascending.
-fn live_landmarks_of(map: &Map, keyframes: &[Keyframe]) -> Vec<usize> {
+fn live_landmarks_of<D: Descriptor>(map: &Map<D>, keyframes: &[Keyframe<D>]) -> Vec<usize> {
     let mut ids: Vec<usize> = keyframes
         .iter()
         .flat_map(|kf| kf.map_point_by_desc_idx.iter().flatten().copied())
@@ -140,8 +141,8 @@ pub enum InitialBaError {
 /// `CreateInitialMapMonocular`.
 ///
 /// The map is left untouched unless the outcome is [`InitialBaOutcome::Refined`].
-pub fn run_initial_ba(
-    map: &mut Map,
+pub fn run_initial_ba<D: Descriptor>(
+    map: &mut Map<D>,
     camera: &PinholeCamera,
 ) -> Result<InitialBaOutcome, InitialBaError> {
     let mut update = map.ba_snapshot(&initial_window(map)).into_update();
@@ -244,7 +245,7 @@ pub fn run_initial_ba(
 /// Collects the last N active keyframes, gathers observations (undistorting keypoints
 /// via camera), calls the Schur solver, and returns optimized poses and points.
 /// An early exit returns an unchanged update for the worker to publish normally.
-pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
+pub fn run_local_ba<D: Descriptor>(snapshot: BaSnapshot<D>, camera: &PinholeCamera) -> BaUpdate<D> {
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
     const MIN_OBSERVATIONS: usize = 8;
@@ -319,14 +320,14 @@ pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
 /// beyond 50 m), keeps its old position: such a landmark had no depth the
 /// window could observe, and written back it would poison the next window.
 /// [`BaUpdate::solve_stats`] reports how many, with the solver's own counts.
-pub fn run_local_inertial_ba(
-    snapshot: BaSnapshot,
+pub fn run_local_inertial_ba<D: Descriptor>(
+    snapshot: BaSnapshot<D>,
     camera: &PinholeCamera,
     imu_t_bc: Option<Pose3d>,
     gravity_world: Vec3F64,
     wheel_factors: &[WheelOdomFactor],
     stationary_factors: &[StationaryFactor],
-) -> BaUpdate {
+) -> BaUpdate<D> {
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
     use crate::mapping::vi_ba_schur::{ViBaParams, visual_inertial_bundle_adjust};
@@ -595,9 +596,9 @@ struct WindowPoints {
 }
 
 impl WindowPoints {
-    fn collect<'a>(
-        snapshot: &BaSnapshot,
-        keyframes: impl IntoIterator<Item = &'a Keyframe>,
+    fn collect<'a, D: Descriptor>(
+        snapshot: &BaSnapshot<D>,
+        keyframes: impl IntoIterator<Item = &'a Keyframe<D>>,
     ) -> Self {
         let mut unique: HashSet<usize> = HashSet::new();
         for kf in keyframes {
@@ -638,9 +639,9 @@ impl WindowPoints {
 
     /// Reprojection (and stereo depth) observations of the window's landmarks
     /// from each `(pose_idx, keyframe, fixed)` in order.
-    fn observations<'a>(
+    fn observations<'a, D: Descriptor>(
         &self,
-        poses: impl IntoIterator<Item = (usize, &'a Keyframe, bool)>,
+        poses: impl IntoIterator<Item = (usize, &'a Keyframe<D>, bool)>,
         camera: &PinholeCamera,
     ) -> Vec<BaObservation> {
         let mut observations = Vec::new();
@@ -691,7 +692,11 @@ impl WindowPoints {
 /// `observation` with the stereo depth of `kf`'s keypoint `desc_idx` attached when
 /// it has one, anchoring the BA's metric scale; otherwise a pure reprojection
 /// observation.
-fn with_stereo_depth(observation: BaObservation, kf: &Keyframe, desc_idx: usize) -> BaObservation {
+fn with_stereo_depth<D>(
+    observation: BaObservation,
+    kf: &Keyframe<D>,
+    desc_idx: usize,
+) -> BaObservation {
     match kf.frame.stereo_depth(desc_idx) {
         Some(z) => {
             observation.with_depth(z, (STEREO_DEPTH_REL_SIGMA * z).max(STEREO_DEPTH_MIN_SIGMA))

@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use kornia_3d::camera::PinholeCamera;
 
 use crate::Frame;
+use crate::features::Descriptor;
 use crate::initialization::two_view::{
     TwoViewEstimate, TwoViewInitConfig, TwoViewRejectReason, try_initialize_two_view,
 };
@@ -61,11 +62,11 @@ pub(crate) enum BootstrapDecision {
 /// `reference` is the frame previously stored by [`BootstrapDecision::StoreAsReference`],
 /// if any. Passing it by reference is deliberate: whether it survives is the
 /// caller's decision, driven by which variant comes back.
-pub(crate) fn evaluate_bootstrap(
-    reference: Option<&Frame>,
-    current: &Frame,
+pub(crate) fn evaluate_bootstrap<D: Descriptor>(
+    reference: Option<&Frame<D>>,
+    current: &Frame<D>,
     camera: &PinholeCamera,
-    config: &TwoViewInitConfig,
+    config: &TwoViewInitConfig<D>,
 ) -> BootstrapDecision {
     let keypoints = current.features.keypoints_xy.len();
     if keypoints <= MIN_KEYPOINTS_FOR_BOOTSTRAP {
@@ -101,10 +102,10 @@ pub(crate) struct TooFewStereoPoints {
 /// depth becomes a metric landmark (ORB-SLAM3's `StereoInitialization`).
 ///
 /// `camera` must be the rectified camera the depths were computed against.
-pub(crate) fn stereo_initial_map(
-    keyframe: Keyframe,
+pub(crate) fn stereo_initial_map<D>(
+    keyframe: Keyframe<D>,
     camera: &PinholeCamera,
-) -> Result<MapInsertion, TooFewStereoPoints> {
+) -> Result<MapInsertion<D>, TooFewStereoPoints> {
     let landmarks = stereo_seeds(&keyframe.frame, camera, f64::INFINITY, &[]);
     if landmarks.len() < MIN_STEREO_POINTS {
         return Err(TooFewStereoPoints {
@@ -123,11 +124,11 @@ pub(crate) fn stereo_initial_map(
 ///
 /// Points are rescaled so the median depth is one, and landmarks are
 /// referenced to the newer keyframe, as ORB-SLAM3 creates them.
-pub(crate) fn two_view_initial_map(
-    reference: Keyframe,
-    current: Keyframe,
+pub(crate) fn two_view_initial_map<D>(
+    reference: Keyframe<D>,
+    current: Keyframe<D>,
     estimate: &TwoViewEstimate,
-) -> MapInsertion {
+) -> MapInsertion<D> {
     let depth_scale = estimate.median_depth.filter(|&d| d > 1e-6).unwrap_or(1.0);
     let reference_pose_inv = reference.frame.pose_world_to_cam.inverse();
     let reference_kf_idx = reference.frame.idx;
@@ -227,7 +228,7 @@ impl InitialMapHealth {
 /// plus the median depth in the older KF's frame. Used to decide whether
 /// a freshly-bootstrapped map is safe to commit. The gate is a bootstrap
 /// policy, so it reads the map rather than living on it.
-pub fn initial_map_health(map: &Map) -> InitialMapHealth {
+pub fn initial_map_health<D>(map: &Map<D>) -> InitialMapHealth {
     let keyframes = map.keyframes();
     let n = keyframes.len();
     if n < 2 {
