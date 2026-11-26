@@ -832,18 +832,8 @@ impl fmt::Display for SystemConfig {
                 bounded.tracking_threads
             )?;
         }
-        match orb.tracking_loss.pose_gate {
-            PoseGate::Enabled(limits) => writeln!(
-                f,
-                "  pose gate: {} deg, {} m/s from the prediction, {} m/s while lost",
-                limits.max_rotation_gap_deg,
-                limits.max_translation_gap_mps,
-                limits.max_recover_speed_mps
-            )?,
-            PoseGate::Innovation(gate) => {
-                writeln!(f, "  pose gate: innovation at 99.9 %, {:?}", gate.mode)?
-            }
-            PoseGate::Disabled => {}
+        if let PoseGate::Innovation(gate) = orb.tracking_loss.pose_gate {
+            writeln!(f, "  pose gate: innovation at 99.9 %, {:?}", gate.mode)?;
         }
         let k = &orb.keyframes;
         write!(f, "  keyframes: every {}..=", k.min_frames_between)?;

@@ -65,7 +65,7 @@ use crate::tracking::motion::{
 use crate::tracking::optical_flow::{FlowSurvivor, LkKernel};
 use crate::tracking::pose_estimation::Estimate;
 use crate::tracking::pose_estimation::map_projection::MapProjectionRejectReason;
-use crate::tracking::pose_gate::{GateReference, GateVerdict};
+use crate::tracking::pose_gate::GateReference;
 use crate::tracking::tracker::{FlowGuess, FrameInput, GateReading, Tracker};
 
 use std::cell::Cell;
@@ -2471,8 +2471,7 @@ impl SlamSystem {
         lost_for_sec: f64,
     ) -> Option<GateReference> {
         let gate = self.tracker.pose_gate();
-        let reads_prediction = gate.is_enabled() || gate.innovation().is_some();
-        (velocity.is_some() && (self.debug || reads_prediction)).then(|| GateReference {
+        (velocity.is_some() && (self.debug || gate.innovation().is_some())).then(|| GateReference {
             prediction,
             dt_sec,
             lost: self
@@ -2489,21 +2488,14 @@ impl SlamSystem {
             gap,
             inliers,
             matches,
-            verdict,
         } = reading;
-        let verdict = match verdict {
-            None => "off",
-            Some(GateVerdict::Accepted) => "ok",
-            Some(GateVerdict::RotationGap) => "rot",
-            Some(GateVerdict::TranslationGap) => "trans",
-        };
         let lost = match gap.recover_mps {
             Some(speed) => format!("1 recover_mps={speed:.3}"),
             None => "0".into(),
         };
         self.dbg(format!(
             "[predgap] frame={idx} dt={:.4} rot={:.3} trans={:.4} step={:.4} step_rot={:.3} \
-             inl={inliers} m={matches} lost={lost} trusted=1 verdict={verdict}",
+             inl={inliers} m={matches} lost={lost} trusted=1",
             gate.dt_sec, gap.rot_deg, gap.trans_m, gap.step_m, gap.step_rot_deg,
         ));
     }

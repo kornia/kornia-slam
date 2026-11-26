@@ -33,7 +33,7 @@ use crate::tracking::pose_estimation::map_projection::{
 };
 use crate::tracking::pose_estimation::rig_pnp::{RigObservation, solve_rig_pnp};
 use crate::tracking::pose_estimation::{Estimate, MapProjectionEstimator};
-use crate::tracking::pose_gate::{GateReference, GateVerdict, PoseGap, PoseGate};
+use crate::tracking::pose_gate::{GateReference, PoseGap, PoseGate};
 use crate::tracking::relocalization::{
     Relocalization, RelocalizationConfig, RelocalizationSolver, relocalize,
 };
@@ -71,8 +71,6 @@ pub(crate) struct GateReading {
     pub gap: PoseGap,
     pub inliers: usize,
     pub matches: usize,
-    /// `None` when the gate is disabled.
-    pub verdict: Option<GateVerdict>,
 }
 
 /// A predicted pose to start optical flow from, and the shallower search a
@@ -788,26 +786,11 @@ impl Tracker {
             return Err(MapProjectionRejectReason::LowPnpInliers);
         }
         if let Some(reference) = &input.gate {
-            let gap = PoseGap::measure(reference, &input.pose_before, &estimate.pose);
-            let verdict = self
-                .pose_gate
-                .is_enabled()
-                .then(|| self.pose_gate.judge(reference, &gap, &estimate.pose));
             self.last_gap = Some(GateReading {
-                gap,
+                gap: PoseGap::measure(reference, &input.pose_before, &estimate.pose),
                 inliers: estimate.inliers,
                 matches: estimate.matches.len(),
-                verdict,
             });
-            match verdict {
-                Some(GateVerdict::RotationGap) => {
-                    return Err(MapProjectionRejectReason::RotationGap);
-                }
-                Some(GateVerdict::TranslationGap) => {
-                    return Err(MapProjectionRejectReason::TranslationGap);
-                }
-                Some(GateVerdict::Accepted) | None => {}
-            }
         }
         Ok(estimate)
     }
@@ -1177,12 +1160,6 @@ mod tests {
         assert!(!frame.is_rig() && !frame.is_stereo());
     }
 
-    fn gated(tracker: Tracker) -> Tracker {
-        tracker.with_pose_gate(PoseGate::Enabled(
-            crate::tracking::pose_gate::PoseGateLimits::default(),
-        ))
-    }
-
     /// A camera centred at `(x, 0, 0)`.
     fn centred_at(x: f64) -> Pose3d {
         Pose3d::new(
@@ -1218,55 +1195,6 @@ mod tests {
     }
 
     #[test]
-    fn a_gate_reject_carries_the_flow_survivors() {
-        let (tracker, _map) = tracked_map(5);
-        let mut tracker = gated(tracker);
-        let frame = test_frame(1, vec![[0; 32]; 5]);
-        let survivors = survivors_of(&tracker);
-        let before: Vec<[f32; 2]> = tracker.tracks().iter().map(|t| t.pixel()).collect();
-
-        let result = tracker.accept(
-            &input_at(&frame, Pose3d::IDENTITY),
-            estimate_at(centred_at(1095.0)),
-        );
-        assert_eq!(
-            result.as_ref().err(),
-            Some(&MapProjectionRejectReason::TranslationGap)
-        );
-        let reading = tracker.last_gap().unwrap();
-        assert_eq!(reading.verdict, Some(GateVerdict::TranslationGap));
-        assert!((reading.gap.trans_m - 1095.0).abs() < 1e-9);
-
-        assert!(tracker.settle(result, Some(survivors), &frame).is_err());
-        let after: Vec<[f32; 2]> = tracker.tracks().iter().map(|t| t.pixel()).collect();
-        assert_eq!(after.len(), before.len());
-        for (a, b) in after.iter().zip(&before) {
-            assert_eq!(*a, [b[0] + 1.0, b[1]]);
-        }
-    }
-
-    #[test]
-    fn the_gate_measures_against_the_reference_not_the_search_seed() {
-        // A KeyframeDue flow pose seeds the full search; the reference stays
-        // the inertial prediction, so a pose at the seed is still rejected.
-        let (tracker, _map) = tracked_map(5);
-        let mut tracker = gated(tracker);
-        let frame = test_frame(1, vec![[0; 32]; 5]);
-        let seed = centred_at(3.0);
-        let result = tracker.accept(&input_at(&frame, seed), estimate_at(seed));
-        assert_eq!(
-            result.err(),
-            Some(MapProjectionRejectReason::TranslationGap)
-        );
-        let ok = tracker.accept(&input_at(&frame, seed), estimate_at(centred_at(0.1)));
-        assert!(ok.is_ok());
-        assert_eq!(
-            tracker.last_gap().unwrap().verdict,
-            Some(GateVerdict::Accepted)
-        );
-    }
-
-    #[test]
     fn a_disabled_gate_measures_and_accepts() {
         let (mut tracker, _map) = tracked_map(5);
         let frame = test_frame(1, vec![[0; 32]; 5]);
@@ -1276,7 +1204,7 @@ mod tests {
                 .accept(&input_at(&frame, Pose3d::IDENTITY), far)
                 .is_ok()
         );
-        assert_eq!(tracker.last_gap().unwrap().verdict, None);
+        assert!(tracker.last_gap().is_some());
         let mut input = input_at(&frame, Pose3d::IDENTITY);
         input.gate = None;
         tracker.last_gap = None;
