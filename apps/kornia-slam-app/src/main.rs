@@ -15,11 +15,13 @@ mod source;
 mod tui;
 mod utils;
 use config::RunConfig;
+use datasets::euroc::GroundTruthPose;
 use evaluation::associate_gt;
 use kornia_algebra::Vec3F64;
-use kornia_slam::system::PipelineDefinition;
-use kornia_slam::{LoopClosureEvent, SlamSystem};
-use source::{FrameItem, OpenedSource};
+use kornia_slam::system::{FrontendConfig, PipelineDefinition};
+use kornia_slam::{Descriptor, LoopClosureEvent, SlamSystem};
+use source::{FrameItem, FrameSource, OpenedSource};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use utils::trajectory_point_from_pose;
 
@@ -74,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let OpenedSource {
-        mut source,
+        source,
         ground_truth,
         summary,
     } = run.source.open(run.system.sensors)?;
@@ -84,16 +86,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !tui_active && let Some(summary) = summary {
         eprintln!("{summary}");
     }
-    let target_dt = Duration::from_secs_f64(1.0 / 30.0);
-    let mut last_frame_walltime = Instant::now();
-
-    let n_frames_hint = source.n_frames_hint();
     let PipelineDefinition::OrbSlam(orb) = &run.system.pipeline;
     let vocabulary = orb
         .loop_closing
         .vocabulary()
         .map(std::path::Path::to_path_buf);
-    let mut system = SlamSystem::build(run.system, source.rig()).map_err(|e| e.to_string())?;
+    let precomputed = matches!(orb.frontend, FrontendConfig::Precomputed(_));
+    let rig = source.rig();
+    let session = Session {
+        args: &args,
+        tui_active,
+        source,
+        ground_truth,
+        vocabulary,
+    };
+    if precomputed {
+        let system = SlamSystem::build_precomputed(run.system, rig).map_err(|e| e.to_string())?;
+        run_system(system, session)
+    } else {
+        let system = SlamSystem::build(run.system, rig).map_err(|e| e.to_string())?;
+        run_system(system, session)
+    }
+}
+
+/// What a run needs besides the system: the options, the opened source and
+/// its ground truth.
+struct Session<'a> {
+    args: &'a Args,
+    tui_active: bool,
+    source: Box<dyn FrameSource>,
+    ground_truth: Option<Vec<GroundTruthPose>>,
+    vocabulary: Option<PathBuf>,
+}
+
+/// Feeds every frame of the session's source to `system`, then reports.
+fn run_system<D: Descriptor>(
+    mut system: SlamSystem<D>,
+    session: Session<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Session {
+        args,
+        tui_active,
+        mut source,
+        ground_truth,
+        vocabulary,
+    } = session;
+    let target_dt = Duration::from_secs_f64(1.0 / 30.0);
+    let mut last_frame_walltime = Instant::now();
+    let n_frames_hint = source.n_frames_hint();
     system.set_debug(args.debug);
     let camera = system.rig().camera.clone();
     if let Some(path) = vocabulary {

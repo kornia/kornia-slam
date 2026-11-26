@@ -5,8 +5,9 @@ use kornia_algebra::Vec3F64;
 use kornia_image::ImageSize;
 
 use super::*;
-use crate::frontend::OrbFrontend;
+use crate::features::CLIDD_DIM;
 use crate::frontend::tests::synthetic_pair;
+use crate::frontend::{FrontendError, OrbFrontend, feature_file_tests};
 use crate::loop_closure::place_recognition::{Vocabulary, VocabularyLoadError};
 use crate::mapping::LocalMappingMode;
 
@@ -84,7 +85,7 @@ impl Drop for SavedVocabulary {
 /// A vocabulary trained on the texture's descriptors, saved where a
 /// configuration can name it.
 fn saved_vocabulary(name: &str) -> SavedVocabulary {
-    let features = OrbFrontend::new(mono().orb_detector(), &SensorRig::new(camera()))
+    let features = OrbFrontend::new(mono().orb_detector().unwrap(), &SensorRig::new(camera()))
         .prepare_image(0, &textured(0))
         .unwrap()
         .features;
@@ -392,4 +393,43 @@ mod keyframe_evidence {
         system.keyframe_policy.max_interval_sec = None;
         assert!(!system.keyframe_due(&parked, 1e6), "no bound unless set");
     }
+}
+
+fn precomputed_mono(path: &std::path::Path) -> SystemConfig {
+    let mut config = mono();
+    let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+    orb.frontend = FrontendConfig::Precomputed(PrecomputedFrontendConfig {
+        path: path.to_path_buf(),
+    });
+    config
+}
+
+#[test]
+fn precomputed_features_drive_their_own_system() {
+    let frames = [(0, vec![[10.0, 10.0]], vec![Clidd([0.125; CLIDD_DIM])])];
+    let file = feature_file_tests::write(
+        "system",
+        &feature_file_tests::encode(CLIDD_DIM as u32, &frames),
+    );
+    let config = precomputed_mono(&file.0);
+
+    assert!(matches!(
+        SlamSystem::build(config.clone(), SensorRig::new(camera())),
+        Err(BuildError::Config(ConfigError::FrontendMismatch { .. }))
+    ));
+    assert!(matches!(
+        SlamSystem::build_precomputed(mono(), SensorRig::new(camera())),
+        Err(BuildError::Config(ConfigError::FrontendMismatch { .. }))
+    ));
+
+    let mut system = SlamSystem::build_precomputed(config, SensorRig::new(camera())).unwrap();
+    let result = system.process_image(stamp(0), &textured(0)).unwrap();
+    assert_eq!(result.status, TrackingStatus::Skipped);
+    assert_eq!(system.frontend_observation().keypoints_xy, [[10.0, 10.0]]);
+    assert!(matches!(
+        system.process_image(stamp(1), &textured(1)),
+        Err(ProcessError::Frontend(
+            FrontendError::MissingFeatures { .. }
+        ))
+    ));
 }

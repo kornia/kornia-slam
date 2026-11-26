@@ -337,6 +337,61 @@ fn stereo_rejects_raw_fisheye_images() {
     assert_eq!(SensorSelection::default().validate_rig(&rig), Ok(()));
 }
 
+fn precomputed(path: &str, sensors: SensorSelection) -> SystemConfig {
+    let mut config = SystemConfig {
+        sensors,
+        ..SystemConfig::default()
+    };
+    orb_mut(&mut config).frontend = FrontendConfig::Precomputed(PrecomputedFrontendConfig {
+        path: PathBuf::from(path),
+    });
+    config
+}
+
+#[test]
+fn precomputed_features_are_monocular_without_loop_closing() {
+    let mono = sensors(CameraSelection::Mono, true);
+    assert_eq!(precomputed("mh01.kfeat", mono).validate(), Ok(()));
+    assert_eq!(
+        precomputed("", mono).validate(),
+        Err(ConfigError::EmptyFeaturePath)
+    );
+    assert_eq!(
+        precomputed("mh01.kfeat", sensors(CameraSelection::Stereo, true)).validate(),
+        Err(ConfigError::PrecomputedStereo)
+    );
+    let mut looping = precomputed("mh01.kfeat", mono);
+    orb_mut(&mut looping).loop_closing = loop_closing();
+    assert_eq!(looping.validate(), Err(ConfigError::PrecomputedLoopClosing));
+}
+
+#[test]
+fn each_frontend_has_its_own_builder() {
+    let config = precomputed("mh01.kfeat", SensorSelection::default());
+    assert!(matches!(
+        config.orb_detector(),
+        Err(ConfigError::FrontendMismatch { .. })
+    ));
+    assert_eq!(
+        config.precomputed_features().unwrap(),
+        std::path::Path::new("mh01.kfeat")
+    );
+    assert!(matches!(
+        SystemConfig::default().precomputed_features(),
+        Err(ConfigError::FrontendMismatch { .. })
+    ));
+}
+
+#[test]
+fn precomputed_feature_paths_resolve_against_the_file() {
+    let mut config = precomputed("features/mh01.kfeat", SensorSelection::default());
+    config.resolve_paths(std::path::Path::new("/runs"));
+    assert_eq!(
+        config.precomputed_features().unwrap(),
+        std::path::Path::new("/runs/features/mh01.kfeat")
+    );
+}
+
 mod runtime_settings {
     use super::*;
 
@@ -373,7 +428,7 @@ mod runtime_settings {
         );
         assert_eq!(slam.matching.map_projection.pnp.min_inliers, 12);
         assert_eq!(slam.tracking_loss_recovery.timeout_imu_sec, 2.0);
-        assert_eq!(config.orb_detector().n_keypoints, 3000);
+        assert_eq!(config.orb_detector().unwrap().n_keypoints, 3000);
     }
 
     fn orb_keyframes(config: &SystemConfig) -> KeyframePolicy {
@@ -485,6 +540,22 @@ mod ron_files {
             orb(&reloaded).tuning.loss_recovery.timeout_imu_sec,
             OrbTuning::default().loss_recovery.timeout_imu_sec
         );
+    }
+
+    #[test]
+    fn files_select_precomputed_features() {
+        let config = SystemConfig::from_ron_str(
+            r#"(version: 1, pipeline: OrbSlam((frontend: Precomputed((path: "mh01.kfeat")))))"#,
+            Path::new("/runs"),
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).frontend,
+            FrontendConfig::Precomputed(PrecomputedFrontendConfig {
+                path: PathBuf::from("/runs/mh01.kfeat"),
+            })
+        );
+        assert_eq!(ron(&parse(&ron(&config)).unwrap()), ron(&config));
     }
 
     #[test]

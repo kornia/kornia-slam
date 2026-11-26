@@ -10,6 +10,14 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**Monocular runs can use CLIDD features exported offline instead of ORB.**
+A run file's `frontend: Precomputed((path: "…"))` reads the per-image CLIDD
+L64 keypoints and descriptors `scripts/export_clidd_features.py` writes, matched
+to frames by timestamp, and `SlamSystem::build_precomputed` builds a
+`SlamSystem<Clidd>` from it; ORB runs are unchanged. Loop closing, which needs
+an ORB vocabulary, and stereo are rejected with precomputed features.
+`configs/euroc-clidd-mono.ron` runs EuRoC MH_01 this way.
+
 **`SlamSystem` is generic over its descriptor.** `SlamSystem<D>` defaults to
 ORB's `RBrief`, so existing code builds unchanged; the map, tracking, mapping
 and inertial initialization it drives are generic over `D`, and frames come

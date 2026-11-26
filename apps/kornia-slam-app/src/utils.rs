@@ -80,7 +80,7 @@ pub fn log_camera_to_rerun(
 
 /// Log active map points as a 3D point cloud.
 #[cfg(feature = "viz")]
-pub fn log_map_points_to_rerun(rec: &rerun::RecordingStream, map_points: &[MapPoint]) {
+pub fn log_map_points_to_rerun<D>(rec: &rerun::RecordingStream, map_points: &[MapPoint<D>]) {
     let (positions, colors): (Vec<_>, Vec<_>) = map_points
         .iter()
         .filter(|mp| !mp.culled)
