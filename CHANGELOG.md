@@ -10,6 +10,12 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**A monocular map lost before it is established no longer passes on its drift.**
+When tracking gives up on a map that never grew past the grace keyframe count,
+or its bootstrap publication or initial-map gate is rejected, the pose returns
+to the reference the map was bootstrapped from, so the next bootstrap starts
+there instead of from the failed map's pose. Established maps are unaffected.
+
 **Monocular runs can use CLIDD features exported offline instead of ORB.**
 A run file's `frontend: Precomputed((path: "…"))` reads the per-image CLIDD
 L64 keypoints and descriptors `scripts/export_clidd_features.py` writes, matched

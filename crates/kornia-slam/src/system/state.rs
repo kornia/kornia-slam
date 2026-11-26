@@ -59,6 +59,9 @@ pub(crate) struct SystemState<D = RBrief> {
     /// bootstrap reference.
     pub bootstrap_low_match_rejections: usize,
     pub bootstrap_frame: Option<Frame<D>>,
+    /// Reference pose the current monocular map was bootstrapped from, kept
+    /// until the next reset.
+    pub map_anchor_pose: Option<Pose3d>,
     pub mode: SystemMode,
 }
 
@@ -84,6 +87,7 @@ impl<D> SystemState<D> {
             lost_since_sec: None,
             bootstrap_low_match_rejections: 0,
             bootstrap_frame: None,
+            map_anchor_pose: None,
             imu_initialized: false,
             imu_init_timestamp_sec: None,
             last_frame_timestamp_sec: 0.0,
@@ -99,6 +103,7 @@ impl<D> SystemState<D> {
         self.lost_since_sec = None;
         self.bootstrap_low_match_rejections = 0;
         self.bootstrap_frame = None;
+        self.map_anchor_pose = None;
         // The new map starts at an unknown monocular scale, so the metric
         // IMU state no longer applies until inertial init runs again.
         self.imu_initialized = false;
