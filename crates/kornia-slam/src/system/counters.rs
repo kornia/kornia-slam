@@ -181,9 +181,6 @@ pub struct RunCounters {
     pub deferred_keyframe_lag_frames: u64,
     /// Longest the deferred keyframe queue has been.
     pub deferred_keyframe_queue_max: u64,
-    /// Due keyframes refused because `local_ba.active_keyframes` of them
-    /// already waited for a busy mapping (`keyframes.mapping_acceptance`).
-    pub keyframes_refused_busy: u64,
     /// Longest the growth queue has been (`mapping.keyframe_growth: Mapping`).
     pub growth_queue_max: u64,
     /// Most frames between a keyframe and the frame that saw its growth done.

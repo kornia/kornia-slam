@@ -487,6 +487,7 @@ impl LocalMapping {
     }
 
     /// Always idle in synchronous mode, which solves inside `submit`.
+    #[cfg(test)]
     pub(crate) fn load(&self) -> MappingLoad {
         match &self.backend {
             LocalMappingBackend::Synchronous { .. } => MappingLoad::default(),
@@ -594,7 +595,8 @@ pub(crate) struct GrowthOutcome {
     generation: u64,
 }
 
-/// Local mapping's load as tracking sees it, for keyframe acceptance.
+/// Local mapping's load; the growth tests wait on it.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct MappingLoad {
     /// A job is being solved or grown, or waits for the worker.
@@ -835,6 +837,7 @@ impl LocalMappingHandle {
         true
     }
 
+    #[cfg(test)]
     fn load(&self) -> MappingLoad {
         let state = self
             .pending

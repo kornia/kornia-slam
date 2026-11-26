@@ -1277,7 +1277,6 @@ mod runtime_settings {
             min_parallax_px: Some(12.0),
             max_interval_sec: Some(0.5),
             rules: KeyframeRules::Kornia,
-            mapping_acceptance: crate::tracking::MappingAcceptance::Ignore,
             stillness: crate::tracking::Stillness::Gate,
         };
         orb.mapping.execution = LocalMappingMode::Synchronous;
@@ -1506,23 +1505,6 @@ fn the_keyframe_growth_is_named_in_the_header_only_when_set() {
     );
 }
 
-#[test]
-fn the_mapping_acceptance_is_named_in_the_header_only_when_set() {
-    use crate::tracking::MappingAcceptance;
-    let mut config = SystemConfig::default();
-    assert_eq!(
-        orb_mut(&mut config).keyframes.mapping_acceptance,
-        MappingAcceptance::Ignore
-    );
-    assert!(!config.to_string().contains("mapping acceptance"));
-    orb_mut(&mut config).keyframes.mapping_acceptance = MappingAcceptance::OrbSlam3;
-    assert!(
-        config.to_string().contains(
-            "  keyframes: every 3..=8 frames, ref ratio 0.6, mapping acceptance OrbSlam3\n"
-        )
-    );
-}
-
 fn sliding_window(mode: OdometryMode, imu_noise: OdometryImuNoise) -> Odometry {
     Odometry::SlidingWindow(SlidingWindowConfig {
         mode,
@@ -1705,19 +1687,6 @@ mod ron_files {
         assert_eq!(
             orb(&config).mapping.keyframe_growth,
             KeyframeGrowth::Mapping
-        );
-        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
-    }
-
-    #[test]
-    fn the_mapping_acceptance_parses() {
-        use crate::tracking::MappingAcceptance;
-        let config =
-            parse("(version: 1, pipeline: OrbSlam((keyframes: (mapping_acceptance: OrbSlam3))))")
-                .unwrap();
-        assert_eq!(
-            orb(&config).keyframes.mapping_acceptance,
-            MappingAcceptance::OrbSlam3
         );
         assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
     }

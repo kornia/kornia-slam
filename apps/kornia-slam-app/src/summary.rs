@@ -108,9 +108,8 @@ fn format_loop_closure(c: &RunCounters) -> String {
 /// How the tracking thread met local mapping's load (real-time fix ladder F4, F5a).
 fn format_mapping_load(c: &RunCounters) -> String {
     format!(
-        "[summary] mapping_load keyframes_refused_busy={} growth_queue_max={} \
-         growth_lag_frames_max={}",
-        c.keyframes_refused_busy, c.growth_queue_max, c.growth_lag_frames_max
+        "[summary] mapping_load growth_queue_max={} growth_lag_frames_max={}",
+        c.growth_queue_max, c.growth_lag_frames_max
     )
 }
 
@@ -594,12 +593,11 @@ mod tests {
     #[test]
     fn the_eighth_line_holds_the_mapping_load_counters() {
         let mut counters = RunCounters::default();
-        counters.keyframes_refused_busy = 4;
+        counters.growth_queue_max = 4;
         let text = format(&counters, &FrameTimes::default());
         assert_eq!(
             text.lines().nth(7).unwrap(),
-            "[summary] mapping_load keyframes_refused_busy=4 growth_queue_max=0 \
-             growth_lag_frames_max=0"
+            "[summary] mapping_load growth_queue_max=4 growth_lag_frames_max=0"
         );
     }
 
