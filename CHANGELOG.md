@@ -255,8 +255,8 @@ a configuration file, e.g. `graph: (information: Drift(), persistent: true)`:
   the gate lets through can do, but does not remove it.
 
 `SlamSystem::map_correction()` reports the composed map-from-odometry
-correction. `PoseGraph<P>`, its `LoopVerifier` and the `LoopGate` trait are
-public for other front ends.
+correction. `PoseGraph<P>` and the `LoopGate` trait are public for other
+front ends.
 
 **Stereo-inertial tracking rides through fast motion instead of resetting.**
 Once the IMU has settled, a tracking failure now coasts on the inertial

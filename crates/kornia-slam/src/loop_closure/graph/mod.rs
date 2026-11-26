@@ -6,7 +6,6 @@
 //! node, so the graph grows with the area covered rather than with time.
 
 mod gate;
-mod verify;
 
 #[cfg(test)]
 mod tests;
@@ -29,7 +28,6 @@ use crate::upstream::kornia_3d::pose_ext::camera_centre;
 pub use gate::{
     GateDecision, LoopGate, LoopProposal, OdometryConsistencyGate, TemporalConsistencyGate,
 };
-pub use verify::{LoopCandidate, LoopMeasurement, LoopQuery, LoopVerifier, RejectAll};
 
 /// A node's index, in creation order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -45,36 +43,23 @@ pub enum GraphManifold {
     Gravity(Vec3F64),
 }
 
-/// When a keyframe is close enough to an existing node to make none.
+/// A verified loop and its noise.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct NodeSpacing {
-    /// Within this of a node, both in distance and in yaw, a keyframe makes no node.
-    pub min_distance_m: f64,
-    pub min_yaw_rad: f64,
-    /// Only nodes this close are compared for the two thresholds above.
-    pub neighbour_radius_m: f64,
-    /// A node is made anyway after this long without making one or re-anchoring onto one, so an
-    /// odometry edge never spans more.
-    pub max_interval_s: f64,
+pub struct LoopMeasurement {
+    /// `T_query * T_candidate^-1` for world-to-camera `T`, as in [`VerifiedLoopEdge`].
+    ///
+    /// [`VerifiedLoopEdge`]: crate::loop_closure::VerifiedLoopEdge
+    pub candidate_to_query: Pose3d,
+    /// One standard deviation of each translation component (m).
+    pub sigma_m: f64,
+    /// One standard deviation of each rotation component (rad).
+    pub sigma_rad: f64,
 }
 
-impl Default for NodeSpacing {
-    fn default() -> Self {
-        Self {
-            min_distance_m: 0.3,
-            min_yaw_rad: 15f64.to_radians(),
-            neighbour_radius_m: 1.0,
-            max_interval_s: 30.0,
-        }
-    }
-}
-
-/// Node, drift, candidate and solver settings.
+/// Node, drift and solver settings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PoseGraphConfig {
     pub manifold: GraphManifold,
-    /// `None` makes every keyframe a node.
-    pub node_spacing: Option<NodeSpacing>,
     /// Odometry drift, linear in path: translation sigma per metre travelled, rotation sigma per
     /// radian turned and per metre travelled.
     pub drift_m_per_m: f64,
@@ -88,13 +73,6 @@ pub struct PoseGraphConfig {
     /// Floors on an odometry edge's sigmas, so a zero-length edge is not infinitely certain.
     pub min_sigma_m: f64,
     pub min_sigma_rad: f64,
-    /// A loop candidate lies within this many drift sigmas of the current estimate.
-    pub loop_gate_sigmas: f64,
-    pub loop_max_yaw_rad: f64,
-    /// A node visited less than this much path ago is the same pass, not a loop.
-    pub loop_min_path_m: f64,
-    /// At most this many candidates go to the verifier per keyframe, nearest first.
-    pub loop_max_candidates: usize,
     /// Cauchy scale on loop edges, in whitened (sigma) units; `None` is least squares.
     pub loop_cauchy_scale: Option<f64>,
     pub max_iterations: usize,
@@ -107,7 +85,6 @@ impl Default for PoseGraphConfig {
     fn default() -> Self {
         Self {
             manifold: GraphManifold::Se3,
-            node_spacing: Some(NodeSpacing::default()),
             drift_m_per_m: 0.02,
             drift_rad_per_rad: 0.03,
             drift_rad_per_m: 0.005,
@@ -115,10 +92,6 @@ impl Default for PoseGraphConfig {
             walk_rad2_per_m: 0.0,
             min_sigma_m: 0.01,
             min_sigma_rad: 0.002,
-            loop_gate_sigmas: 3.0,
-            loop_max_yaw_rad: 40f64.to_radians(),
-            loop_min_path_m: 2.0,
-            loop_max_candidates: 3,
             loop_cauchy_scale: Some(3.0),
             max_iterations: 50,
             cost_tolerance: 1e-7,
@@ -159,8 +132,6 @@ pub struct Node<P> {
     /// In the map world.
     pub pose: Pose3d,
     pub payload: P,
-    /// Path length at the last visit, created or re-anchored to.
-    visited_at_path_m: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -213,16 +184,6 @@ pub enum KeyframeLink {
     },
 }
 
-/// What one keyframe did to the graph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyframeOutcome {
-    /// Inside an existing node's footprint and no loop: no node.
-    Skipped,
-    NewNode(NodeId),
-    /// A loop was accepted and the graph solved.
-    LoopClosed,
-}
-
 /// How a solve ended. Costs are `0.5 * sum rho(|S r|^2)`; the loop residual is the whitened norm
 /// of the last loop edge added.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -235,7 +196,7 @@ pub struct SolveReport {
     pub loop_residual_after: f64,
 }
 
-/// See the module doc. `P` is whatever the verifier needs to match two places.
+/// See the module doc. `P` is a payload each node carries.
 #[derive(Debug, Clone)]
 pub struct PoseGraph<P> {
     config: PoseGraphConfig,
@@ -249,7 +210,6 @@ pub struct PoseGraph<P> {
     last_odometry: Option<Pose3d>,
     path_m: f64,
     loops_accepted: u64,
-    loops_rejected: u64,
 }
 
 impl<P> PoseGraph<P> {
@@ -264,7 +224,6 @@ impl<P> PoseGraph<P> {
             last_odometry: None,
             path_m: 0.0,
             loops_accepted: 0,
-            loops_rejected: 0,
         }
     }
 
@@ -289,10 +248,6 @@ impl<P> PoseGraph<P> {
         self.loops_accepted
     }
 
-    pub fn loops_rejected(&self) -> u64 {
-        self.loops_rejected
-    }
-
     pub fn node_of_keyframe(&self, keyframe: usize) -> Option<NodeId> {
         self.by_keyframe.get(&keyframe).copied()
     }
@@ -311,30 +266,6 @@ impl<P> PoseGraph<P> {
                 .compose(&self.nodes[anchor.node.0].pose),
             None => *odometry,
         }
-    }
-
-    /// The correction now, yaw and translation only on a gravity manifold; identity before the
-    /// first keyframe.
-    pub fn correction(&self) -> Correction {
-        let Some(anchor) = &self.anchor else {
-            return Correction {
-                map_from_odometry: Pose3d::IDENTITY,
-            };
-        };
-        let full = self.nodes[anchor.node.0]
-            .pose
-            .inverse()
-            .compose(&anchor.offset.inverse())
-            .compose(&anchor.odometry_ref);
-        let map_from_odometry = match self.config.manifold {
-            GraphManifold::Se3 => full,
-            GraphManifold::Gravity(gravity) => {
-                let axis = gravity.normalize();
-                let yaw = twist_about(&full.rotation, axis);
-                Pose3d::new(SO3F64::exp(axis * yaw).matrix(), full.translation)
-            }
-        };
-        Correction { map_from_odometry }
     }
 
     /// Live keyframes in node order with their odometry and map-world poses: the
@@ -405,85 +336,30 @@ impl<P> PoseGraph<P> {
         self.last_odometry = Some(odometry);
     }
 
-    /// Feed one odometry keyframe, `odometry` world-to-camera in the odometry world.
+    /// Feed one odometry keyframe, `odometry` world-to-camera in the odometry world: a node
+    /// joined to the anchor by a drift odometry edge.
     ///
     /// # Errors
-    /// The keyframe already has a node, or the loop solve failed; then the graph is left as it was
-    /// before this keyframe's loop.
+    /// The keyframe already has a node.
     pub fn add_keyframe(
         &mut self,
         keyframe: usize,
         t_s: f64,
         odometry: Pose3d,
         payload: P,
-        verifier: &mut dyn LoopVerifier<P>,
-    ) -> Result<KeyframeOutcome, PoseGraphError> {
+    ) -> Result<NodeId, PoseGraphError> {
         if self.by_keyframe.contains_key(&keyframe) {
             return Err(PoseGraphError::DuplicateKeyframe(keyframe));
         }
-        let Some(anchor) = self.anchor else {
+        if self.anchor.is_none() {
             let node = self.push_node(keyframe, t_s, odometry, odometry, payload);
             self.anchor = Some(self.anchor_at_node(node, t_s));
             self.last_odometry = Some(odometry);
-            return Ok(KeyframeOutcome::NewNode(node));
-        };
+            return Ok(node);
+        }
         self.advance_path(&odometry);
         let estimate = self.estimate(&odometry);
-        let candidates = self.loop_candidates(&estimate);
-
-        let reuse = self.config.node_spacing.is_some_and(|spacing| {
-            t_s - anchor.t_s < spacing.max_interval_s
-                && self.is_near_existing_node(&estimate, &spacing)
-        });
-        if reuse {
-            // A revisit inside an existing node's footprint: a verified loop re-anchors onto it
-            // without a new node, which is what keeps the node count tied to area.
-            // The anchor itself is skipped: the loop edge needs two distinct nodes.
-            let query = LoopQuery {
-                keyframe,
-                t_s,
-                odometry,
-                estimate,
-                payload: &payload,
-            };
-            for &candidate in candidates.iter().filter(|&&node| node != anchor.node) {
-                if let Some(measurement) = self.consult(verifier, &query, candidate) {
-                    self.close_by_reanchor(t_s, &odometry, candidate, &measurement)?;
-                    return Ok(KeyframeOutcome::LoopClosed);
-                }
-            }
-            return Ok(KeyframeOutcome::Skipped);
-        }
-
-        let new_node = self.push_node_with_odometry(keyframe, t_s, odometry, estimate, payload);
-        for &candidate in &candidates {
-            let node = &self.nodes[new_node.0];
-            let query = LoopQuery {
-                keyframe,
-                t_s,
-                odometry,
-                estimate,
-                payload: &node.payload,
-            };
-            let measurement = verifier.verify(&query, &self.candidate(candidate));
-            match measurement {
-                Some(measurement) => {
-                    let edge = Edge {
-                        from: candidate,
-                        to: new_node,
-                        measurement: measurement.candidate_to_query,
-                        sigma_m: measurement.sigma_m,
-                        sigma_rad: measurement.sigma_rad,
-                        kind: EdgeKind::Loop,
-                    };
-                    self.commit_loops(vec![edge], |_| {})?;
-                    self.nodes[candidate.0].visited_at_path_m = self.path_m;
-                    return Ok(KeyframeOutcome::LoopClosed);
-                }
-                None => self.loops_rejected += 1,
-            }
-        }
-        Ok(KeyframeOutcome::NewNode(new_node))
+        Ok(self.push_node_with_odometry(keyframe, t_s, odometry, estimate, payload))
     }
 
     /// A node for `keyframe`, joined by `link` instead of the drift odometry edge, without a loop
@@ -578,12 +454,7 @@ impl<P> PoseGraph<P> {
                 kind: EdgeKind::Loop,
             });
         }
-        let visited: Vec<_> = edges.iter().map(|edge| edge.from).collect();
-        let report = self.commit_loops(edges, |_| {})?;
-        for node in visited {
-            self.nodes[node.0].visited_at_path_m = self.path_m;
-        }
-        Ok(report)
+        self.commit_loops(edges, |_| {})
     }
 
     /// [`Self::add_loop_edges`] for one loop.
@@ -614,7 +485,6 @@ impl<P> PoseGraph<P> {
             odometry,
             pose,
             payload,
-            visited_at_path_m: self.path_m,
         });
         self.by_keyframe.insert(keyframe, id);
         id
@@ -640,72 +510,6 @@ impl<P> PoseGraph<P> {
             anchor.turn_rad += turn;
         }
         self.last_odometry = Some(*odometry);
-    }
-
-    fn is_near_existing_node(&self, estimate: &Pose3d, spacing: &NodeSpacing) -> bool {
-        let manifold = &self.config.manifold;
-        self.nodes.iter().any(|node| {
-            let distance = distance_between(manifold, &node.pose, estimate);
-            distance <= spacing.neighbour_radius_m
-                && distance <= spacing.min_distance_m
-                && turn_between(manifold, &node.pose, estimate) <= spacing.min_yaw_rad
-        })
-    }
-
-    /// Nodes from an earlier pass whose distance to `estimate` is inside the drift gate, nearest
-    /// first.
-    fn loop_candidates(&self, estimate: &Pose3d) -> Vec<NodeId> {
-        if self.config.loop_max_candidates == 0 {
-            return Vec::new();
-        }
-        let manifold = &self.config.manifold;
-        let mut gated: Vec<(f64, NodeId)> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| {
-                let path_since = self.path_m - node.visited_at_path_m;
-                if path_since < self.config.loop_min_path_m {
-                    return None;
-                }
-                let sigma = self.config.min_sigma_m + self.config.drift_m_per_m * path_since;
-                let distance = distance_between(manifold, &node.pose, estimate);
-                let inside = distance <= self.config.loop_gate_sigmas * sigma
-                    && turn_between(manifold, &node.pose, estimate) < self.config.loop_max_yaw_rad;
-                inside.then_some((distance, NodeId(index)))
-            })
-            .collect();
-        gated.sort_by(|a, b| a.0.total_cmp(&b.0));
-        gated
-            .into_iter()
-            .take(self.config.loop_max_candidates)
-            .map(|(_, node)| node)
-            .collect()
-    }
-
-    fn candidate(&self, node: NodeId) -> LoopCandidate<'_, P> {
-        let candidate = &self.nodes[node.0];
-        LoopCandidate {
-            node,
-            keyframe: candidate.keyframe,
-            t_s: candidate.t_s,
-            odometry: candidate.odometry,
-            pose: candidate.pose,
-            payload: &candidate.payload,
-        }
-    }
-
-    fn consult(
-        &mut self,
-        verifier: &mut dyn LoopVerifier<P>,
-        query: &LoopQuery<'_, P>,
-        node: NodeId,
-    ) -> Option<LoopMeasurement> {
-        let measurement = verifier.verify(query, &self.candidate(node));
-        if measurement.is_none() {
-            self.loops_rejected += 1;
-        }
-        measurement
     }
 
     /// The odometry since the anchor as `T_now * T_anchor_node^-1`, with its drift sigmas.
@@ -751,46 +555,6 @@ impl<P> PoseGraph<P> {
         });
         self.anchor = Some(self.anchor_at_node(to, t_s));
         to
-    }
-
-    /// Chain the odometry since the anchor with the verified measurement into one loop edge from
-    /// the anchor node to the candidate, then hang the head from the candidate.
-    fn close_by_reanchor(
-        &mut self,
-        t_s: f64,
-        odometry: &Pose3d,
-        candidate: NodeId,
-        measurement: &LoopMeasurement,
-    ) -> Result<(), PoseGraphError> {
-        let Some(anchor) = self.anchor else {
-            return Ok(());
-        };
-        let (since_anchor, odo_sigma_m, odo_sigma_rad) = self.odometry_since_anchor(odometry);
-        let edge = Edge {
-            from: anchor.node,
-            to: candidate,
-            measurement: measurement
-                .candidate_to_query
-                .inverse()
-                .compose(&since_anchor),
-            sigma_m: odo_sigma_m.hypot(measurement.sigma_m),
-            sigma_rad: odo_sigma_rad.hypot(measurement.sigma_rad),
-            kind: EdgeKind::Loop,
-        };
-        let odometry_ref = *odometry;
-        let offset = measurement.candidate_to_query;
-        self.commit_loops(vec![edge], |graph| {
-            graph.anchor = Some(Anchor {
-                node: candidate,
-                offset,
-                odometry_ref,
-                path_m: 0.0,
-                turn_rad: 0.0,
-                t_s,
-            });
-        })?;
-        self.nodes[candidate.0].visited_at_path_m = self.path_m;
-        Ok(())
     }
 
     /// Insert `loops` and solve; on a solver error nothing of them stays.
@@ -976,18 +740,6 @@ fn whitened_squared(poses: &[Pose3d], edge: &InformationEdge) -> Option<f64> {
             })
             .sum(),
     )
-}
-
-/// Camera-centre distance, in the plane normal to gravity on a gravity manifold.
-fn distance_between(manifold: &GraphManifold, a: &Pose3d, b: &Pose3d) -> f64 {
-    let offset = camera_centre(b) - camera_centre(a);
-    match manifold {
-        GraphManifold::Se3 => offset.length(),
-        GraphManifold::Gravity(gravity) => {
-            let axis = gravity.normalize();
-            (offset - axis * offset.dot(axis)).length()
-        }
-    }
 }
 
 /// The world-frame turn from `a` to `b`: its twist about gravity on a gravity manifold, so it

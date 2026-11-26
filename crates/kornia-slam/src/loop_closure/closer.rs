@@ -24,8 +24,8 @@ use crate::loop_closure::{
     LoopCorrection, LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker, LoopFusionConfig,
     LoopGate, LoopMeasurement, LoopOdometryGate, LoopProposal, LoopTemporalConsistency,
     LoopVerificationConfig, OdometryConsistencyGate, PgoConfig, PgoError, PgoResult, PoseGraph,
-    PoseGraphConfig, PoseGraphError, RejectAll, TemporalConsistencyGate, VerifiedLoopEdge,
-    fuse_verified_loop, verify_loop_candidate,
+    PoseGraphConfig, PoseGraphError, TemporalConsistencyGate, VerifiedLoopEdge, fuse_verified_loop,
+    verify_loop_candidate,
 };
 use crate::mapping::Map;
 use crate::mapping::map::KeyframePoseChange;
@@ -1295,7 +1295,7 @@ pub(super) fn sync_graph(
                 graph.add_linked_keyframe(kf, 0.0, pose, (), link)?;
             }
             None => {
-                graph.add_keyframe(kf, 0.0, pose, (), &mut RejectAll)?;
+                graph.add_keyframe(kf, 0.0, pose, ())?;
             }
         }
     }
@@ -1342,7 +1342,6 @@ pub(super) fn snapshot_graph_config(
     information: LoopGraphInformation,
     inertial: Option<InertialPgoContext>,
 ) -> PoseGraphConfig {
-    let defaults = PoseGraphConfig::default();
     let (walk_m2_per_m, walk_rad2_per_m, min_sigma_m, min_sigma_rad, loop_cauchy_scale) =
         match information {
             LoopGraphInformation::ScalarWeights => (0.0, 0.0, 1.0, 1.0, None),
@@ -1362,7 +1361,6 @@ pub(super) fn snapshot_graph_config(
         manifold: inertial.map_or(GraphManifold::Se3, |context| {
             GraphManifold::Gravity(context.gravity_world)
         }),
-        node_spacing: None,
         drift_m_per_m: 0.0,
         drift_rad_per_rad: 0.0,
         drift_rad_per_m: 0.0,
@@ -1370,13 +1368,11 @@ pub(super) fn snapshot_graph_config(
         walk_rad2_per_m,
         min_sigma_m,
         min_sigma_rad,
-        loop_max_candidates: 0,
         loop_cauchy_scale,
         max_iterations: config.max_iterations,
         cost_tolerance: config.cost_tolerance,
         gradient_tolerance: config.gradient_tolerance,
         initial_lambda: config.initial_lambda,
-        ..defaults
     }
 }
 
