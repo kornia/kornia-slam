@@ -23,6 +23,15 @@ sits behind config knobs that default to the old behaviour, and nothing in it ha
 
 ### 2026-11-26
 
+- **#180, EuRoC checkpoint (`experiments/euroc-checkpoint-2026-11-26.md`).** Two independent read-only reviews, one on
+  accuracy and one on speed, plus D5b, merged into one ranked action list (A1-A10), a stop list and 8 owner decisions.
+  - Robustly below Basalt: 4 of 11, not 6.
+  - 0.5x lies at or below the ground-truth floor on V1_01 and V2_01, and below every result on disk on V2_02 and MH_04.
+  - No p99 speed verdict is supportable on today's protocol (unshielded cores, decode outside our latency but inside
+    Basalt's).
+  - MH_04's 0.356 rep is G60, not G63.
+  - V2_03 coasts start after cam0's 100 ms frame gaps.
+  - D5b: the background loop path loses 2 late loops at acceptance, not in recognition.
 - **#180, final EuRoC bench on the tip (95bc33c `bin-fold`, single variation RT3EF, causal SE(3) ATE on `traj.txt`,
   paced, 2 cores, median of 3 reps).** 6 of 11 are below Basalt; none is at 0.5x. MH_01 0.043 (0.64x), MH_02 0.036
   (0.75x), MH_03 0.050 (0.81x), MH_04 0.228 (2.00x), MH_05 0.094 (0.65x), V1_01 0.047 (1.09x, within 0.004 of Basalt,
