@@ -355,3 +355,23 @@ Binary `bin-ab1` (a4a2f4b code, md5 6631c7a7), SYNC, `taskset -c 2-5,8-11`, star
 | knob off: V1_02 `traj_vio.txt` cmp against `VO-ds_V1_02_medium_s0_r1` | identical | | identical (r8 on `bin-ab1`) | holds |
 
 The FEJ form is part of the yaw drift, not all of it. With current-pose visual Jacobians, MH_02 yaw drift halves and its ratio falls 37 %; V2_01 falls 27 %. V1_02 does not move. That fits K1-a, where V1_02's excess is vertical drift and an accel-bias error, not yaw. The remaining MH_02 yaw is 0.68° against Basalt's 0.04°, so a second yaw cause is open. Next, per the card: VO-dsJ on the other 8 sequences (start 0, running). Promotion waits for those runs and the batch gate.
+
+### A/B 1 on all 11 (VO-dsJ against VO-ds, start 0, one run each, 2026-11-26)
+
+| seq | VO-ds | VO-dsJ | change |
+|---|---|---|---|
+| MH_01 | 0.83 | 0.65 | −22 % |
+| MH_02 | 3.01 | 1.90 | −37 % |
+| MH_03 | 2.06 | 1.99 | −3 % |
+| MH_04 | 1.08 | 0.91 | −16 % |
+| MH_05 | 1.05 | 1.18 | +12 % |
+| V1_01 | 1.24 | 1.19 | −4 % |
+| V1_02 | 1.76 | 1.72 | −2 % |
+| V1_03 | 1.89 | 1.95 | +3 % |
+| V2_01 | 1.81 | 1.33 | −27 % |
+| V2_02 | 1.90 | 1.92 | +1 % |
+| V2_03 | 4.01 | **diverged** (position 2.9e21 m) | |
+
+- **V2_03 diverges at 9.8 s.** The run logs `solve_failures=423`, `resets=0`, and `imu_chi2_nav` of 6e29, while the state stays finite. This is the K1-c failure class: divergence with no reset, because the reset rule needs a non-finite state. Current-pose visual Jacobians make it start earlier on the fastest sequence. A plausible reason: on fast motion the current estimate is poor, and relinearising the visual rows there feeds the error back into the solve. This is not tested.
+- **Verdict:** not promotable as it stands. It wins on 4 sequences beyond noise (MH_01, MH_02, MH_04, V2_01). It loses MH_05 (+12 %) and diverges on V2_03. The other 5 are within ±4 %.
+- **Next:** K1-c must first give the estimator a divergence reset (a chi² or solve-failure trigger, not only a non-finite one). Then A/B 1 is re-run on V2_03 and MH_05. A second yaw cause is still open (MH_02 0.68° against Basalt's 0.04°).
