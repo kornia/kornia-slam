@@ -338,3 +338,20 @@ V1_01 start 30 hit the 900 s cap at machine load 30-47 and are in a rerun pass (
 ## Pipeline reference, final tip bench (2026-11-26)
 
 The estimator results above compare against this pipeline baseline: `bin-fold` RT3EF, real time, median of 3 reps. 6 of 11 are below Basalt (best MH_01 0.64x); worst V2_03 2.47x, V1_03 2.38x, V2_02 2.15x, MH_04 2.00x. Speed is not faster than Basalt (G57). Full table: `experiments/euroc-why-not-basalt.md`.
+
+## K1-b A/B 1: `visual_jacobians: Current` (VO-dsJ), screen (2026-11-26)
+
+Binary `bin-ab1` (a4a2f4b code, md5 6631c7a7), SYNC, `taskset -c 2-5,8-11`, start 0, one run each (deterministic). Ratio = `traj_vio.txt` SE(3) ATE ÷ Basalt's, over the same frames (`twox/vio_score.py`). Yaw counter = the world-yaw error change from 10 s to 110 s against GT, rotation aligned at 10 s (scratch `yawgrow.py`). Its sign convention is opposite to K1-a's; the magnitudes agree (VO-ds MH_02: 1.53°). Basalt over the same span: MH_02 0.04°, V2_01 0.13°.
+
+| P/K | prediction | baseline (VO-ds) | measured (VO-dsJ) | verdict |
+|---|---|---|---|---|
+| MH_02 yaw counter | ≤ 0.5° | 1.53° | 0.68° | missed (halved) |
+| V1_02 ratio | ≤ 1.3 | 1.76 | 1.72 | missed; inside ±5 % (not the cause) |
+| MH_02 ratio | ≤ 1.6 | 3.01 | 1.90 | missed (−37 %) |
+| V2_01 ratio | ≤ 1.3 | 1.81 | 1.33 | missed by 0.03 (−27 %) |
+| guard `nullspace_yaw_log10_max` | ≤ −9 | −12.34 (MH_02) | −11.71 / −12.92 / −12.91 | holds |
+| KJ1: yaw ≤ 0.5° with ratios within ±10 % | | | yaw 0.68°, ratios −27 to −37 % | not fired |
+| KJ2: ratios > 10 % lower with yaw > 1.2° | | | yaw 0.68° | not fired |
+| knob off: V1_02 `traj_vio.txt` cmp against `VO-ds_V1_02_medium_s0_r1` | identical | | identical (r8 on `bin-ab1`) | holds |
+
+The FEJ form is part of the yaw drift, not all of it. With current-pose visual Jacobians, MH_02 yaw drift halves and its ratio falls 37 %; V2_01 falls 27 %. V1_02 does not move. That fits K1-a, where V1_02's excess is vertical drift and an accel-bias error, not yaw. The remaining MH_02 yaw is 0.68° against Basalt's 0.04°, so a second yaw cause is open. Next, per the card: VO-dsJ on the other 8 sequences (start 0, running). Promotion waits for those runs and the batch gate.
