@@ -22,7 +22,7 @@
 
 mod keypoint_grid;
 
-use crate::features::RBrief;
+use crate::features::{Clidd, CliddMatchConfig, RBrief};
 use std::collections::HashMap;
 
 use kornia_3d::camera::PinholeCamera;
@@ -110,6 +110,32 @@ impl Default for MapProjectionConfig {
             search_widen_per_sec: 1.0,
             min_inliers_with_prediction: 15,
             geometric_filter_threshold_px: 1.0,
+        }
+    }
+}
+
+impl Default for MapProjectionConfig<Clidd> {
+    /// ORB's settings with tighter distance caps. Guided search has no ratio
+    /// test, so ORB-equivalent caps (0.37 / 0.52) accept lookalikes and let a
+    /// drifting prediction confirm itself: 48 degrees of drift over V2_01's
+    /// first 400 frames, against 0.7 at 0.15 / 0.22.
+    fn default() -> Self {
+        let orb = MapProjectionConfig::<RBrief>::default();
+        let rethreshold =
+            |projection: ProjectionMatchConfig, max_distance: f32| ProjectionMatchConfig {
+                min_depth: projection.min_depth,
+                search_radius: projection.search_radius,
+                max_distance,
+            };
+        Self {
+            match_config: CliddMatchConfig::default(),
+            pnp: orb.pnp,
+            projection: rethreshold(orb.projection, 0.15),
+            local_projection: rethreshold(orb.local_projection, 0.22),
+            lost_search_scale: orb.lost_search_scale,
+            search_widen_per_sec: orb.search_widen_per_sec,
+            min_inliers_with_prediction: orb.min_inliers_with_prediction,
+            geometric_filter_threshold_px: orb.geometric_filter_threshold_px,
         }
     }
 }
@@ -640,7 +666,7 @@ mod estimator_tests {
 
     #[test]
     fn the_search_widens_once_tracking_has_failed() {
-        let config = MapProjectionConfig::default();
+        let config: MapProjectionConfig = MapProjectionConfig::default();
         assert_eq!(config.search_scale_for(0.0, true), 1.0);
         assert_eq!(
             config.search_scale_for(0.05, true),

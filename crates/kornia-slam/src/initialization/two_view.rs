@@ -12,7 +12,7 @@
 //    '-----------' '-----------'
 //      frame 1        frame 2
 
-use crate::features::RBrief;
+use crate::features::{Clidd, CliddMatchConfig, RBrief};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 pub use kornia_3d::pose::TwoViewError;
@@ -65,6 +65,17 @@ impl Default for TwoViewInitConfig {
                 ..TriangulationConfig::default()
             },
             acceptance_config: TwoViewAcceptanceConfig::default(),
+        }
+    }
+}
+
+impl Default for TwoViewInitConfig<Clidd> {
+    fn default() -> Self {
+        let orb = TwoViewInitConfig::<RBrief>::default();
+        Self {
+            match_config: CliddMatchConfig::default(),
+            triangulation_config: orb.triangulation_config,
+            acceptance_config: orb.acceptance_config,
         }
     }
 }

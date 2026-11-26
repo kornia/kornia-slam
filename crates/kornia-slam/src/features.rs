@@ -10,6 +10,9 @@ use kornia_imgproc::features::{
     OrbFeatures, OrbMatchConfig, hamming_distance, match_orb_descriptors,
 };
 
+mod clidd;
+pub use clidd::{CLIDD_DIM, Clidd, CliddMatchConfig};
+
 /// A descriptor type kornia-slam can match and aggregate into landmarks.
 pub trait Descriptor: Copy + Debug + PartialEq + Send + Sync + 'static {
     /// Dissimilarity between two descriptors; smaller is more alike.
@@ -154,6 +157,12 @@ impl ScalePyramid {
     pub const ORB: Self = Self {
         factor: 1.2,
         n_levels: 8,
+    };
+
+    /// A single-scale detector: every octave is 0, and `factor` is unused.
+    pub const SINGLE_SCALE: Self = Self {
+        factor: 1.2,
+        n_levels: 1,
     };
 }
 
