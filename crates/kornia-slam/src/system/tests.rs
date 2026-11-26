@@ -2011,20 +2011,14 @@ mod recovery_after_loss {
     fn card_i_defaults_keep_the_cold_start_and_the_young_map_reset() {
         let recovery = RecoveryConfig::default();
         assert_eq!(recovery.min_cold_start_points, MIN_STEREO_POINTS);
-        assert_eq!(recovery.young_map_grace_sec, 0.0);
     }
 
     #[test]
-    fn a_young_map_is_reset_at_once_unless_given_grace() {
+    fn a_young_map_is_reset_at_once() {
         for lost_for in [0.0, 0.1, 0.6] {
-            assert!(
-                gives_up(false, lost_for, 0.5, 0.0),
-                "grace 0.0, lost {lost_for}"
-            );
-            assert_eq!(gives_up(true, lost_for, 0.5, 0.0), lost_for >= 0.5);
+            assert!(gives_up(false, lost_for, 0.5), "lost {lost_for}");
+            assert_eq!(gives_up(true, lost_for, 0.5), lost_for >= 0.5);
         }
-        assert!(!gives_up(false, 0.2, 5.0, 0.5));
-        assert!(gives_up(false, 0.5, 5.0, 0.5));
     }
 
     /// The first loss of a re-seeded segment gets its first anchor within

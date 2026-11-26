@@ -52,9 +52,6 @@ pub struct RecoveryConfig {
     /// its own keyframes until it holds `N` of them (ORB-SLAM3 starts a new
     /// Atlas map when lost). `0` is off.
     pub own_window_keyframes: usize,
-    /// Seconds a map too young for the grace period may stay lost before it
-    /// is reset; `0.0` resets it at its first lost frame (card I).
-    pub young_map_grace_sec: f64,
     /// Fewest stereo points that seed a map from a cold start (card I).
     pub min_cold_start_points: usize,
     /// Where a re-seed that keeps the inertial state starts (card AC).
@@ -88,7 +85,6 @@ impl Default for RecoveryConfig {
             max_tilt_deg: 10.0,
             relocalize_when_lost: false,
             own_window_keyframes: 0,
-            young_map_grace_sec: 0.0,
             min_cold_start_points: crate::initialization::bootstrap::MIN_STEREO_POINTS,
             seed: SeedPlacement::CoastedIfPlausible,
         }

@@ -238,11 +238,6 @@ fn validate_recovery(recovery: &RecoveryConfig, imu: bool) -> Result<(), ConfigE
         AT_LEAST_ONE,
     )?;
     check(
-        at("young_map_grace_sec"),
-        recovery.young_map_grace_sec,
-        NON_NEGATIVE,
-    )?;
-    check(
         at("min_cold_start_points"),
         recovery.min_cold_start_points as f64,
         AT_LEAST_ONE,

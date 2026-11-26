@@ -2334,18 +2334,7 @@ impl SlamSystem {
             let map_established = lock_map(&self.map, &self.map_wait).keyframes().len()
                 > policy.min_keyframes_for_grace;
 
-            if !map_established && recently_lost_for < self.recovery.young_map_grace_sec {
-                self.dbg(format!(
-                    "[lost] frame={} young map held after {recently_lost_for:.2}s",
-                    frame.idx
-                ));
-            }
-            if gives_up(
-                map_established,
-                recently_lost_for,
-                grace_period_sec,
-                self.recovery.young_map_grace_sec,
-            ) {
+            if gives_up(map_established, recently_lost_for, grace_period_sec) {
                 self.dbg(format!(
                     "[lost] frame={} giving up after {:.2}s (map_established={}): resetting",
                     frame.idx, recently_lost_for, map_established,
@@ -3737,18 +3726,9 @@ fn rig_flow_cameras(
 }
 
 /// Whether a lost map is reset now: an established one after its grace
-/// period, a young one after `young_map_grace_sec` (at once when `0.0`).
-fn gives_up(
-    map_established: bool,
-    lost_for_sec: f64,
-    grace_period_sec: f64,
-    young_map_grace_sec: f64,
-) -> bool {
-    if map_established {
-        lost_for_sec >= grace_period_sec
-    } else {
-        lost_for_sec >= young_map_grace_sec
-    }
+/// period, a young one at once (card I).
+fn gives_up(map_established: bool, lost_for_sec: f64, grace_period_sec: f64) -> bool {
+    !map_established || lost_for_sec >= grace_period_sec
 }
 
 /// A bridged re-seed's gap: the one-sigma bounds of the preintegrated position
