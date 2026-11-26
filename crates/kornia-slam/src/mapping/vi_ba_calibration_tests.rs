@@ -1,4 +1,4 @@
-//! Card G (`experiments/pr180-G-card.md`), tests GT0-GT7: online calibration
+//! Tests GT0-GT7: online calibration
 //! in the local VI-BA, on windows from the varying-motion generator.
 
 use std::f64::consts::PI;

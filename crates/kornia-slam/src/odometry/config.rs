@@ -9,8 +9,7 @@ pub enum Odometry {
     /// Visual tracking against the map (today's pipeline).
     #[default]
     MapTracking,
-    /// A fixed-lag visual-inertial smoother over the rectified stereo pair
-    /// (`experiments/euroc-2x-vio-design.md`).
+    /// A fixed-lag visual-inertial smoother over the rectified stereo pair (Basalt-style).
     SlidingWindow(SlidingWindowConfig),
 }
 

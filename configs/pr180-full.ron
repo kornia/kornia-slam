@@ -1,5 +1,5 @@
 // PR #180 round 2: pr180-frontend-1ms.ron plus the cards A-D estimator bundle
-// (experiments/pr180-A-card.md, "Experiment A0") and the card B recovery
+// (card A, "Experiment A0") and the card B recovery
 // knobs. UNTESTED: it has never run, and no accuracy or speed figure is
 // claimed. Raw fisheye and `keyframe_orb: Mapping` are deferred.
 //
@@ -53,7 +53,7 @@
             inertial: ( sample_interpolation: Midpoint ),
             // G11: `refine_monotone` makes the analytic refine never adopt an uphill step.
             // `pose_inertial` stays Off: with OrbSlam3 this bundle lost scale on
-            // LaMAria R_01 (0.08-0.82 over 4 runs); see experiments/pr180-H-card.md.
+            // LaMAria R_01 (0.08-0.82 over 4 runs; card H).
             tracking: ( pose_inertial: Off, local_map: OrbSlam3, refine_monotone: true ),
             keyframes: ( rules: OrbSlam3(max_frames: 10) ),
             loop_closing: Enabled(vocabulary: "../weights/ORBvoc.txt"),

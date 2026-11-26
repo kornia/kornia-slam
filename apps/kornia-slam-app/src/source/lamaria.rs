@@ -422,8 +422,7 @@ mod tests {
         assert!(max_error <= 8, "{max_error}");
     }
 
-    /// B1-P2 of `experiments/pr180-B-card.md`: the shared helper keeps the
-    /// expression this source composed inline.
+    /// The shared helper keeps the expression this source composed inline.
     #[test]
     fn rig_cameras_keep_the_inline_composition() {
         let camera = |fx| PinholeCamera {

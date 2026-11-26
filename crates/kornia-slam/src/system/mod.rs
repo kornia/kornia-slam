@@ -2006,8 +2006,7 @@ impl SlamSystem {
         })
     }
 
-    /// `[vel]`: the velocity this frame's prediction starts from, for
-    /// `experiments/quick-eval/velgt.py`.
+    /// `[vel]`: the velocity this frame's prediction starts from, for comparison with GT velocity.
     fn report_frame_velocity(&mut self, frame_idx: usize, source: FrameVelocitySource) {
         let Some(kf_idx) = self.state.current_keyframe_idx else {
             return;

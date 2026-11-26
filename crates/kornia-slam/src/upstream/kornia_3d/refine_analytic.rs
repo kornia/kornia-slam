@@ -268,8 +268,7 @@ mod tests {
     use super::*;
     use kornia_3d::pnp::refine_pose_lm;
 
-    /// Test-only oracles: the local bodies the kornia-rs calls replaced (P4 and P6 of
-    /// `experiments/pr180-review-swaps-plan.md`).
+    /// Test-only oracles: the local bodies the kornia-rs calls replaced.
     mod oracle {
         fn skew(w: [f64; 3]) -> [[f64; 3]; 3] {
             [[0.0, -w[2], w[1]], [w[2], 0.0, -w[0]], [-w[1], w[0], 0.0]]
@@ -445,7 +444,7 @@ mod tests {
         }
     }
 
-    /// P5 of `experiments/pr180-C-card.md`: J read directly, not through `JᵀJ`.
+    /// J read directly, not through `JᵀJ`.
     #[test]
     fn pose_jacobian_2x6_matches_central_differences() {
         let pose = Pose {

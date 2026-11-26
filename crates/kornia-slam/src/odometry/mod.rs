@@ -1,5 +1,5 @@
 //! Sliding-window visual-inertial odometry: a Basalt-style fixed-lag
-//! smoother over the rectified stereo pair (`experiments/euroc-2x-vio-design.md`).
+//! smoother over the rectified stereo pair.
 //!
 //! [`SlidingWindowOdometry`] owns its IMU queue, a two-camera flow frontend
 //! and the window; it reads only its own state and the images it is given,

@@ -656,7 +656,7 @@ mod tests {
             .length()
     }
 
-    /// B3-P2 of `experiments/pr180-B-card.md`: one match in five is an inlier.
+    /// One match in five is an inlier.
     /// A clean 3-point sample in 300 draws: 1 - (1 - 0.2^3)^300 = 0.91; for 5
     /// points 0.09.
     #[test]

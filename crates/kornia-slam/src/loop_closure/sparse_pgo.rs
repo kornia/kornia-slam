@@ -1882,7 +1882,7 @@ mod information_tests {
         (i64::from(a.to_bits() as i32) - i64::from(b.to_bits() as i32)).abs()
     }
 
-    /// P7 of `experiments/pr180-review-swaps-plan.md`: the f64 kernel against the old f32 bodies.
+    /// The f64 kernel against the f32 bodies it replaced.
     #[test]
     fn cauchy_weight_and_rho_match_the_f32_bodies() {
         use super::sealed::EdgeTerm;
