@@ -24,7 +24,6 @@ use config::RunConfig;
 use evaluation::associate_gt;
 use kornia_algebra::{SO3F64, Vec3F64};
 use kornia_sensors::rig_calibration::RigCalibration;
-use kornia_slam::loop_closure::{LoopOdometryGate, LoopTemporalConsistency};
 use kornia_slam::system::PipelineDefinition;
 use kornia_slam::{LoopClosureEvent, SkipKind, SlamSystem};
 use source::{FrameItem, OpenedSource};
@@ -198,40 +197,6 @@ struct SessionSliceArgs {
     out: String,
 }
 
-/// Evaluation switches for loop-closure tuning that configuration files do not
-/// expose: `KORNIA_SLAM_LOOP_GATE=off` disables the odometry gate, and
-/// `KORNIA_SLAM_LOOP_TEMPORAL=<n>` requires `n` agreeing detections before the
-/// first loop in a place.
-fn apply_loop_gate_overrides(
-    pipeline: &mut PipelineDefinition,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let PipelineDefinition::OrbSlam(orb) = pipeline;
-    let loop_correction = &mut orb.tuning.loop_correction;
-    if let Some(value) = std::env::var_os("KORNIA_SLAM_LOOP_GATE") {
-        match value.to_str() {
-            Some("off") => loop_correction.odometry_gate = LoopOdometryGate::Disabled,
-            Some("on") => {}
-            _ => return Err("KORNIA_SLAM_LOOP_GATE must be `on` or `off`".into()),
-        }
-    }
-    if let Some(value) = std::env::var_os("KORNIA_SLAM_LOOP_TEMPORAL") {
-        let min_detections: usize = value
-            .to_str()
-            .and_then(|text| text.parse().ok())
-            .ok_or("KORNIA_SLAM_LOOP_TEMPORAL must be a detection count")?;
-        loop_correction.temporal_consistency = LoopTemporalConsistency::enabled(min_detections);
-    }
-    if std::env::var_os("KORNIA_SLAM_LOOP_GATE").is_some()
-        || std::env::var_os("KORNIA_SLAM_LOOP_TEMPORAL").is_some()
-    {
-        eprintln!(
-            "  loop gate: {:?}; temporal: {:?}",
-            loop_correction.odometry_gate, loop_correction.temporal_consistency
-        );
-    }
-    Ok(())
-}
-
 /// ` orb=[..] ov= klt=build/track ps= cf= pnp= lr= kf=` in ms, for `--debug`.
 fn stage_times(
     frontend: &kornia_slam::FrontendObservation,
@@ -271,11 +236,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(Command::SessionSlice(slice)) = &args.command {
         return run_session_slice(slice);
     }
-    let mut run = RunConfig::from_ron_file(&args.config)?;
+    let run = RunConfig::from_ron_file(&args.config)?;
     if let Some(Command::OfflineBa(offline)) = &args.command {
         return run_offline_ba(&run, offline);
     }
-    apply_loop_gate_overrides(&mut run.system.pipeline)?;
     if !tui_active {
         eprint!("{}", run.system);
     }
