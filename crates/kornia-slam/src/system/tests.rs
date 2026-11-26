@@ -1780,7 +1780,7 @@ mod recovery_after_loss {
             panic!("one bridge edge, got {}", map.imu_factors().len());
         };
         assert_eq!((bridge.prev_kf_idx, bridge.curr_kf_idx), (40, 141));
-        let scale = system.recovery.bridge_covariance_scale;
+        let scale = crate::system::recovery::BRIDGE_COVARIANCE_SCALE;
         crate::system::recovery::tests::assert_scaled(
             plain.preintegrated.covariance.as_slice(),
             bridge.preintegrated.covariance.as_slice(),

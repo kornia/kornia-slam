@@ -380,8 +380,8 @@ impl SlamSystem {
             keyframes_while_lost: settings.keyframes_while_lost,
             recovery: settings.recovery,
             runaway: RunawayDetector::new(
-                settings.recovery.runaway_window_sec,
-                settings.recovery.max_coast_speed_mps,
+                recovery::RUNAWAY_WINDOW_SEC,
+                recovery::MAX_COAST_SPEED_MPS,
             ),
             tilt: TiltMonitor::default(),
             segments: Segments::default(),
@@ -1393,7 +1393,7 @@ impl SlamSystem {
         if !self.reseed_held {
             self.runaway
                 .record(timestamp_sec, recovery::camera_centre(&coasted));
-            let starved = timestamp_sec - self.reseed_coast_from_sec > self.recovery.max_bridge_sec;
+            let starved = timestamp_sec - self.reseed_coast_from_sec > recovery::MAX_BRIDGE_SEC;
             if !self.runaway.runaway() && !starved {
                 self.state.pose_world_to_cam = coasted;
                 return inertial.is_some();
@@ -1401,7 +1401,7 @@ impl SlamSystem {
             self.dbg(if starved {
                 format!(
                     "[recover] frame={frame_idx} re-seed starved past {:.1}s: translation held",
-                    self.recovery.max_bridge_sec
+                    recovery::MAX_BRIDGE_SEC
                 )
             } else {
                 format!(
@@ -2936,7 +2936,7 @@ impl SlamSystem {
                 &before,
                 &coasted,
                 coast_sec,
-                self.recovery.max_coast_speed_mps,
+                recovery::MAX_COAST_SPEED_MPS,
             );
         if !plausible {
             self.runaway.clear();
@@ -2959,7 +2959,7 @@ impl SlamSystem {
         let gravity_world = self.inertial.gravity_world;
         let measured_up = self.tilt.measured_up();
         let tilt = measured_up.map_or(f64::NAN, |up| recovery::tilt_deg(up, gravity_world));
-        let relevel = tilt > self.recovery.max_tilt_deg;
+        let relevel = tilt > recovery::MAX_TILT_DEG;
         if let Some(up) = measured_up.filter(|_| relevel) {
             seed = recovery::leveled(&seed, up, gravity_world);
             velocity_world = Vec3F64::ZERO;
@@ -3014,7 +3014,7 @@ impl SlamSystem {
     /// The pending bridge anchor, dropped once the gap outgrows
     /// `max_bridge_sec`: preintegration over a longer coast says nothing.
     fn live_bridge_anchor(&mut self, timestamp_sec: f64) -> Option<BridgeAnchor> {
-        let max_gap = self.recovery.max_bridge_sec;
+        let max_gap = recovery::MAX_BRIDGE_SEC;
         if self
             .state
             .bridge_anchor
@@ -3035,7 +3035,7 @@ impl SlamSystem {
         timestamp_sec: f64,
     ) -> Option<KeyframeGap> {
         let noise =
-            recovery::inflated_noise(self.rig.imu_noise(), self.recovery.bridge_covariance_scale);
+            recovery::inflated_noise(self.rig.imu_noise(), recovery::BRIDGE_COVARIANCE_SCALE);
         let edge = self.inertial.keyframe_edge(
             noise,
             anchor.kf_idx,
@@ -3074,7 +3074,7 @@ impl SlamSystem {
             .last_keyframe_timestamp_sec
             .map_or(0.0, |t| (timestamp_sec - t).max(0.0));
         KeyframeGap::Reseeded {
-            sigma_m: self.recovery.max_coast_speed_mps * gap_sec,
+            sigma_m: recovery::MAX_COAST_SPEED_MPS * gap_sec,
             sigma_rad: 0.0,
         }
     }

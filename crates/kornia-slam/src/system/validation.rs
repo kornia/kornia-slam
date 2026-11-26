@@ -10,7 +10,6 @@ use super::config::{
     TrackingLossConfig,
 };
 use super::recovery::{RecoveryConfig, SeedPlacement};
-use crate::inertial::MAX_BUFFERED_SEC;
 use crate::inertial::trust::ImuTrustMode;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{
@@ -213,26 +212,6 @@ fn validate_recovery(recovery: &RecoveryConfig, imu: bool) -> Result<(), ConfigE
     }
     let at = |field| format!("tracking_loss.reseed.{field}");
     check(
-        at("max_coast_speed_mps"),
-        recovery.max_coast_speed_mps,
-        POSITIVE,
-    )?;
-    check(
-        at("runaway_window_sec"),
-        recovery.runaway_window_sec,
-        POSITIVE,
-    )?;
-    check(
-        at("bridge_covariance_scale"),
-        recovery.bridge_covariance_scale,
-        AT_LEAST_ONE,
-    )?;
-    check(
-        at("max_bridge_sec"),
-        recovery.max_bridge_sec,
-        WITHIN_IMU_BUFFER,
-    )?;
-    check(
         at("min_seed_points"),
         recovery.min_seed_points as f64,
         AT_LEAST_ONE,
@@ -241,8 +220,7 @@ fn validate_recovery(recovery: &RecoveryConfig, imu: bool) -> Result<(), ConfigE
         at("min_cold_start_points"),
         recovery.min_cold_start_points as f64,
         AT_LEAST_ONE,
-    )?;
-    check(at("max_tilt_deg"), recovery.max_tilt_deg, POSITIVE)
+    )
 }
 
 /// Each relocalization knob is inert without the loop closer's vocabulary.
@@ -1007,12 +985,6 @@ const AT_LEAST_ONE: Requirement = Requirement("finite and >= 1", |v| v >= 1.0);
 const UNIT_INTERVAL: Requirement = Requirement("in [0, 1]", |v| (0.0..=1.0).contains(&v));
 const OPEN_UNIT: Requirement = Requirement("in (0, 1)", |v| v > 0.0 && v < 1.0);
 const OPEN_UNIT_UPPER: Requirement = Requirement("in (0, 1]", |v| v > 0.0 && v <= 1.0);
-/// A span the IMU buffer still holds whole: a bridge edge integrated over a
-/// longer one would come from a truncated buffer (R-C8).
-const WITHIN_IMU_BUFFER: Requirement =
-    Requirement("in (0, 30] s, the span of the IMU buffer", |v| {
-        v > 0.0 && v <= MAX_BUFFERED_SEC
-    });
 
 fn check(
     setting: impl Into<String>,

@@ -26,24 +26,10 @@ pub struct RecoveryConfig {
     /// Keep the inertial state across a give-up when the map is metric and
     /// inertially initialized; otherwise the next map starts from scratch.
     pub keep_inertial: bool,
-    /// Fastest average speed, m/s, a coast may imply and still be trusted; a
-    /// walker does not hold 4 m/s (visloc-rs `runaway`).
-    pub max_coast_speed_mps: f64,
-    /// Seconds of trajectory the runaway speed is averaged over.
-    pub runaway_window_sec: f64,
-    /// Factor on the covariance of the IMU edge that bridges a give-up: the
-    /// coast it spans had no visual support.
-    pub bridge_covariance_scale: f64,
-    /// Longest gap, seconds, a bridge edge spans.
-    pub max_bridge_sec: f64,
     /// Fewest stereo points that start a segment while the inertial state is
     /// kept; a cold start needs 50. The LaMAria rig overlap gives a median
     /// 1-5 on lost frames.
     pub min_seed_points: usize,
-    /// Largest angle, degrees, between the mean measured specific force and
-    /// world up at a give-up before the seed is levelled: about 3 deg is
-    /// walking noise, and 10 deg leaks 1.7 m/s^2 into the coast.
-    pub max_tilt_deg: f64,
     /// Relocalize once lost (after a give-up) even with the IMU kept, against
     /// any older segment of the map whatever the jump. Needs loop closing's
     /// vocabulary.
@@ -57,6 +43,23 @@ pub struct RecoveryConfig {
     /// Where a re-seed that keeps the inertial state starts (card AC).
     pub seed: SeedPlacement,
 }
+
+/// Fastest average speed, m/s, a coast may imply and still be trusted; a
+/// walker does not hold 4 m/s (visloc-rs `runaway`).
+pub(crate) const MAX_COAST_SPEED_MPS: f64 = 4.0;
+/// Seconds of trajectory the runaway speed is averaged over.
+pub(crate) const RUNAWAY_WINDOW_SEC: f64 = 10.0;
+/// Factor on the covariance of the IMU edge that bridges a give-up: the
+/// coast it spans had no visual support.
+pub(crate) const BRIDGE_COVARIANCE_SCALE: f64 = 100.0;
+/// Longest gap, seconds, a bridge edge spans; within the IMU buffer, or the
+/// edge would be integrated from a truncated one (R-C8).
+pub(crate) const MAX_BRIDGE_SEC: f64 = 10.0;
+const _: () = assert!(MAX_BRIDGE_SEC <= crate::inertial::MAX_BUFFERED_SEC);
+/// Largest angle, degrees, between the mean measured specific force and
+/// world up at a give-up before the seed is levelled: about 3 deg is
+/// walking noise, and 10 deg leaks 1.7 m/s^2 into the coast.
+pub(crate) const MAX_TILT_DEG: f64 = 10.0;
 
 /// Where a re-seed with the inertial state kept places the next segment.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -77,12 +80,7 @@ impl Default for RecoveryConfig {
     fn default() -> Self {
         Self {
             keep_inertial: false,
-            max_coast_speed_mps: 4.0,
-            runaway_window_sec: 10.0,
-            bridge_covariance_scale: 100.0,
-            max_bridge_sec: 10.0,
             min_seed_points: 50,
-            max_tilt_deg: 10.0,
             relocalize_when_lost: false,
             own_window_keyframes: 0,
             min_cold_start_points: crate::initialization::bootstrap::MIN_STEREO_POINTS,

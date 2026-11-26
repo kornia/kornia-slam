@@ -316,16 +316,6 @@ fn invalid_setting(config: &SystemConfig) -> Option<String> {
 }
 
 #[test]
-fn the_reseed_tilt_limit_must_be_positive() {
-    let mut config = SystemConfig::default();
-    orb_mut(&mut config).tracking_loss.reseed.max_tilt_deg = 0.0;
-    assert_eq!(
-        invalid_setting(&config).as_deref(),
-        Some("tracking_loss.reseed.max_tilt_deg")
-    );
-}
-
-#[test]
 fn relocalization_knobs_are_off_by_default_and_need_loop_closing() {
     use crate::tracking::relocalization::RelocalizationSolver;
     let mut defaults = SystemConfig::default();
@@ -2164,10 +2154,6 @@ mod ron_files {
         let reseed = orb(&config).tracking_loss.reseed;
         assert!(reseed.keep_inertial);
         assert_eq!(reseed.min_seed_points, 10);
-        assert_eq!(
-            reseed.max_coast_speed_mps,
-            crate::system::RecoveryConfig::default().max_coast_speed_mps
-        );
         assert!(
             !orb(&parse("(version: 1)").unwrap())
                 .tracking_loss
@@ -2230,22 +2216,17 @@ mod ron_files {
         let defaults = crate::system::RecoveryConfig::default();
         assert!(!defaults.keep_inertial);
         assert_eq!(defaults.min_seed_points, 50);
-        assert_eq!(defaults.max_tilt_deg, 10.0);
-        assert_eq!(defaults.max_coast_speed_mps, 4.0);
-        assert_eq!(defaults.runaway_window_sec, 10.0);
-        assert_eq!(defaults.max_bridge_sec, 10.0);
-        assert_eq!(defaults.bridge_covariance_scale, 100.0);
         assert_eq!(
             defaults.seed,
             crate::system::SeedPlacement::CoastedIfPlausible
         );
 
         let config = parse(
-            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (reseed: (keep_inertial: true, min_seed_points: 10, max_tilt_deg: 7.5)))))",
+            "(version: 1, sensors: (imu: true), pipeline: OrbSlam((tracking_loss: (reseed: (keep_inertial: true, min_seed_points: 10)))))",
         )
         .unwrap();
         let reseed = orb(&config).tracking_loss.reseed;
-        assert_eq!(reseed.max_tilt_deg, 7.5);
+        assert_eq!(reseed.min_seed_points, 10);
         assert_eq!(
             orb(&parse(&ron(&config)).unwrap()).tracking_loss.reseed,
             reseed
@@ -2487,24 +2468,6 @@ fn the_frame_velocity_needs_the_imu_and_no_pose_inertial_solve() {
             Err(ConfigError::FrameVelocityWithPoseInertial),
             "{mode:?}"
         );
-    }
-}
-
-/// R-C8: a bridge edge longer than the IMU buffer would be integrated from
-/// a truncated buffer.
-#[test]
-fn the_bridge_is_bounded_by_the_imu_buffer() {
-    use crate::inertial::MAX_BUFFERED_SEC;
-    let with = |max_bridge_sec: f64| {
-        let mut config = SystemConfig::default();
-        orb_mut(&mut config).tracking_loss.reseed.max_bridge_sec = max_bridge_sec;
-        invalid_setting(&config)
-    };
-    assert_eq!(MAX_BUFFERED_SEC, 30.0, "the error message names 30 s");
-    assert_eq!(with(MAX_BUFFERED_SEC), None);
-    let refused = Some("tracking_loss.reseed.max_bridge_sec".to_string());
-    for value in [0.0, MAX_BUFFERED_SEC + 0.1, f64::INFINITY] {
-        assert_eq!(with(value), refused, "{value}");
     }
 }
 
