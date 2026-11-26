@@ -1793,21 +1793,6 @@ mod ron_files {
         let default = parse("(version: 1)").unwrap();
         assert_eq!(orb(&default).keyframes.stillness, Stillness::Off);
         assert!(!default.to_string().contains("stillness"));
-
-        let edges = |imu: bool| {
-            parse(&format!(
-                "(version: 1, sensors: (imu: {imu}), pipeline: OrbSlam((keyframes: \
-                 (stillness: StationaryEdges))))"
-            ))
-        };
-        assert!(matches!(
-            edges(false),
-            Err(LoadError::Invalid(ConfigError::StationaryEdgesWithoutImu))
-        ));
-        assert!(matches!(
-            edges(true),
-            Err(LoadError::Invalid(ConfigError::StationaryEdgesNotBuilt))
-        ));
     }
 
     #[test]

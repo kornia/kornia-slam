@@ -53,9 +53,6 @@ pub enum Stillness {
     /// Bound asks (frame, time and lost-interval keyframes) are withheld
     /// while still, up to a heartbeat; quality asks still insert.
     Gate,
-    /// [`Self::Gate`] with still intervals linked by stationary factors
-    /// (stage 2, not built: refused by validation).
-    StationaryEdges,
 }
 
 impl Stillness {
@@ -66,7 +63,7 @@ impl Stillness {
 
     /// Whether still frames change keyframe decisions.
     pub fn gates(self) -> bool {
-        matches!(self, Self::Gate | Self::StationaryEdges)
+        self == Self::Gate
     }
 }
 

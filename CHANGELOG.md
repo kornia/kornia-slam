@@ -41,8 +41,7 @@ still-device detector (image displacement against the last keyframe in pixel-noi
 chunk means against the noise model, wheels when enabled) and reports it on a new
 `[summary] stillness` line without changing any decision; `Gate` also withholds the frame, time
 and lost-interval keyframes while still, up to a 3 s heartbeat (0.5 s before the inertial
-schedule settles); keyframes earned by tracking quality still insert. `StationaryEdges` is
-refused until it is built. `KeyframePolicy::asks` splits a decision into its bound and quality
+schedule settles); keyframes earned by tracking quality still insert. `KeyframePolicy::asks` splits a decision into its bound and quality
 asks. A keyframe inserted on a still frame no longer restarts the IMU still run (card AB-1b), so
 the IMU can vouch for a lost still rig right after a heartbeat; `[summary] stillness` gains
 `runs_carried`.
