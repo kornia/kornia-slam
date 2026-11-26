@@ -1473,8 +1473,6 @@ struct CalibratedSolve<'a> {
     stream: Vec<ImuMeasurement>,
     /// The map edge of each IMU edge of the solve.
     map_edges: &'a [&'a MapImuFactor],
-    /// Report each state's marginal sigma from the last linearization.
-    marginal_sigma: bool,
 }
 
 /// What a solve returns besides [`ViBaResult`]; empty without calibration.
@@ -1483,10 +1481,6 @@ struct CalibratedOutcome {
     /// Edges re-integrated from the stream, and edges that had no samples.
     reintegrated: usize,
     edges_without_samples: usize,
-    /// Per calibration column, when asked for and the gate was open; the
-    /// card G tests read it.
-    #[cfg_attr(not(test), allow(dead_code))]
-    marginal_sigma: Option<Vec<f64>>,
 }
 
 impl<'a> CalibratedSolve<'a> {
@@ -1516,7 +1510,6 @@ impl<'a> CalibratedSolve<'a> {
             free_keyframes,
             stream,
             map_edges: &input.map_edges,
-            marginal_sigma: false,
         }
     }
 
@@ -1904,22 +1897,6 @@ fn prior_cost(solve: &CalibratedSolve<'_>, values: &Calibration) -> f64 {
         .iter()
         .map(|row| 0.5 * row.residual * row.residual)
         .sum()
-}
-
-/// Marginal sigma of each column from `base` on, from the undamped reduced
-/// system; `None` when it is not positive definite.
-fn border_marginal_sigma(information: &Mat<f64>, base: usize, par: Par) -> Option<Vec<f64>> {
-    let dim = information.nrows();
-    let n = dim.checked_sub(base)?;
-    let mut chol = DenseLlt::new(dim, par);
-    chol.factor(information).ok()?;
-    let mut unit = Mat::<f64>::zeros(dim, n);
-    for c in 0..n {
-        unit[(base + c, c)] = 1.0;
-    }
-    chol.solve_in_place(&mut unit);
-    let sigma: Vec<f64> = (0..n).map(|c| unit[(base + c, c)].sqrt()).collect();
-    sigma.iter().all(|s| s.is_finite()).then_some(sigma)
 }
 
 /// Where one VI-BA solve's iterations spent their time, milliseconds in the
@@ -3089,10 +3066,9 @@ fn solve_vi_ba(
     }
 
     let prior_residual_final = prior.and_then(|(i, p)| prior_velocity_residual(p, &kfs[i]));
-    // The marginals are of the solution: the undamped system at the
-    // accepted state, not the last iteration's damped one before its step.
-    let border_sigma = n_cal > 0 && calibration.is_some_and(|c| c.marginal_sigma);
-    let information = (params.newest_marginal || border_sigma).then(|| {
+    // The marginal is of the solution: the undamped system at the accepted
+    // state, not the last iteration's damped one before its step.
+    let information = params.newest_marginal.then(|| {
         let state = SystemState {
             kfs: &kfs,
             se3s: &se3s,
@@ -3187,12 +3163,6 @@ fn solve_vi_ba(
         values: calib,
         reintegrated,
         edges_without_samples,
-        marginal_sigma: information
-            .as_ref()
-            .filter(|_| border_sigma)
-            .and_then(|information| {
-                border_marginal_sigma(information, cal_base, params.dense_parallelism.par())
-            }),
     };
 
     Ok((

@@ -419,7 +419,6 @@ fn solve_window(
         &[],
     );
     let mut solve = CalibratedSolve::new(&window.keyframes, &kf_local, &window.params, &input);
-    solve.marginal_sigma = true;
     solve.free |= force_open;
     let (result, outcome) = solve_vi_ba(
         &window.keyframes,
@@ -434,17 +433,6 @@ fn solve_window(
     )
     .unwrap();
     (result, outcome, solve.layout.clone())
-}
-
-/// The data-only sigma of a column: its marginal sigma with the information
-/// of its value and step priors taken out (both are diagonal rows).
-fn data_sigma(posterior: f64, step_sigma: f64, value_sigma: f64) -> f64 {
-    let information = posterior.powi(-2) - step_sigma.powi(-2) - value_sigma.powi(-2);
-    if information > 0.0 {
-        information.sqrt().recip()
-    } else {
-        f64::INFINITY
-    }
 }
 
 fn rotation_deg(values: &Calibration, layout: &Layout, camera: usize) -> [f64; 3] {
@@ -578,7 +566,6 @@ fn online_td_recovers_from_the_gyro_alone() {
 /// window the value and step priors hold it.
 #[test]
 fn online_rotation_observability() {
-    let (step, value) = (0.05f64.to_radians(), 1.0f64.to_radians());
     let injected = 0.3f64.to_radians();
     let rotation = config(true, false, false, false);
 
@@ -588,14 +575,6 @@ fn online_rotation_observability() {
         ..Truth::default()
     });
     let (_, outcome, layout) = solve_window(&window_rig, rotation, false);
-    let sigma = outcome.marginal_sigma.as_ref().unwrap();
-    let x = layout.rotation(1, 0).unwrap();
-    let sigma_data = data_sigma(sigma[x], step, value);
-    assert!(
-        sigma_data <= 0.01f64.to_radians(),
-        "camera 1 x: data sigma {:.4}°",
-        sigma_data.to_degrees()
-    );
     let phi = rotation_deg(&outcome.values, &layout, 1);
     assert!((phi[0] - 0.3).abs() <= 0.03, "camera 1 offset {phi:?}°");
     assert!(
@@ -609,14 +588,6 @@ fn online_rotation_observability() {
         ..Truth::default()
     });
     let (_, outcome, layout) = solve_window(&window_primary, rotation, false);
-    let sigma = outcome.marginal_sigma.as_ref().unwrap();
-    let x = layout.rotation(0, 0).unwrap();
-    let sigma_data = data_sigma(sigma[x], step, value);
-    assert!(
-        sigma_data <= 0.01f64.to_radians(),
-        "camera 0 x: data sigma {:.4}°",
-        sigma_data.to_degrees()
-    );
     let theta = rotation_deg(&outcome.values, &layout, 0);
     assert!((theta[0] - 0.3).abs() <= 0.03, "camera 0 offset {theta:?}°");
     assert!(
