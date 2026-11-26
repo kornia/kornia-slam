@@ -7,7 +7,7 @@
 //! local map. A pose is accepted only with as much support as normal tracking
 //! would need from a cold start.
 
-use crate::features::RBrief;
+use crate::features::{Clidd, CliddMatchConfig, RBrief};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pnp::{PnPMethod, RansacParams, solve_pnp_ransac};
 use kornia_3d::pose::Pose3d;
@@ -52,6 +52,20 @@ impl Default for RelocalizationConfig {
             min_inliers: 50,
             ransac_threshold_px: 4.0,
             ransac_iterations: 300,
+        }
+    }
+}
+
+impl Default for RelocalizationConfig<Clidd> {
+    fn default() -> Self {
+        let orb = RelocalizationConfig::<RBrief>::default();
+        Self {
+            match_config: CliddMatchConfig::default(),
+            min_correspondences: orb.min_correspondences,
+            min_ransac_inliers: orb.min_ransac_inliers,
+            min_inliers: orb.min_inliers,
+            ransac_threshold_px: orb.ransac_threshold_px,
+            ransac_iterations: orb.ransac_iterations,
         }
     }
 }

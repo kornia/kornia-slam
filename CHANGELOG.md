@@ -10,6 +10,13 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**A `Clidd` descriptor joins ORB's `RBrief`.** `kornia_slam::Clidd` is
+CLIDD's L2-normalised 64-D float descriptor (Yao et al., 2026), compared by
+squared L2 distance, with default matching settings for two-view
+initialization, map-projection tracking and relocalization. Its guided-search
+caps (0.15 / 0.22) are tighter than ORB-equivalent ones, which on EuRoC V2_01
+let a drifting prediction confirm itself on lookalike keypoints.
+
 **IMU, wheel-odometry and stationary factors move to a new `kornia-factors` crate.**
 Their residuals, Jacobians, information matrices and the Huber cost the VI-BA
 factors share no longer live inside `kornia-slam`'s mapping module, so another
