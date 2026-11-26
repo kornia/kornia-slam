@@ -219,8 +219,8 @@ against 47 on the sim recording), which is not explained yet. A background resul
 created or refined by bundle adjustment during the solve keep their relative
 pose, and a result from another world frame is solved again. The map then jumps
 once per correction: `SlamSystem::correction_epoch()` advances with each one,
-so consumers publishing odometry as `T_map * map_correction()` can re-anchor,
-and `loop_solve_in_flight()` reports a pending solve. The landmark geometry
+so consumers publishing odometry as `T_map * map_correction()` can re-anchor.
+The landmark geometry
 refresh after a correction no longer scans the keyframe list per observer.
 In the background modes the loop's landmark fusion is searched on the worker,
 on a copy of both loop neighbourhoods moved by the solve, and the writeback

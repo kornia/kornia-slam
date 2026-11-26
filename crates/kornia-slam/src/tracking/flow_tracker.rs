@@ -10,7 +10,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::Mat3F64;
 use kornia_image::Image;
 
-use crate::system::{ForwardBackward, GyroGuess, KltRetry, OrbFrontendConfig, TrackRefill};
+use crate::system::{ForwardBackward, GyroGuess, KltRetry, TrackRefill};
 use crate::tracking::flow_pool::{FlowFrames, FlowPool, FlowPoolError};
 use crate::tracking::optical_flow::{
     FlowSurvivor, KltTracker, SurvivorFilterConfig, Track, TrackId, TrackSet,
@@ -554,27 +554,6 @@ pub struct RigFlowSettings {
     pub refill: TrackRefill,
     pub gyro_guess: GyroGuess,
     pub refill_cameras: RefillCameras,
-}
-
-impl RigFlowSettings {
-    /// The settings `frontend` selects; without a prediction search LK runs
-    /// kornia-imgproc's default pyramid.
-    pub fn from_frontend(frontend: &OrbFrontendConfig) -> Self {
-        let default = kornia_imgproc::optical_flow_pyr_lk::PyrLKParams::default();
-        let unpredicted = (default.max_level, default.max_iter);
-        Self {
-            threads: frontend.flow_threads,
-            window: frontend.klt_window,
-            predicted: frontend.klt_prediction.search().unwrap_or(unpredicted),
-            unpredicted,
-            epsilon: default.epsilon,
-            retry: frontend.klt_retry,
-            forward_backward: frontend.forward_backward,
-            refill: frontend.track_refill,
-            gyro_guess: frontend.gyro_guess,
-            refill_cameras: RefillCameras::RoundRobin,
-        }
-    }
 }
 
 /// What the tracking core knows about a frame before its flow step.

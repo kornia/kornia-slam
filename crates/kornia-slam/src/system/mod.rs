@@ -285,7 +285,6 @@ pub struct SlamSystem {
     // Card A's per-frame estimator state.
     estimator: estimator::EstimatorState,
     // The keyframe bound and the culling that enforces it first, when set.
-    map_bound: Option<(usize, crate::mapping::culling::KeyframeCullingConfig)>,
     // `WindowedU8` flow: level-0 frames, shards and workers of the 1 ms
     // frontend; `None` on today's kernels.
     rig_flow: Option<RigFlow>,
@@ -425,7 +424,6 @@ impl SlamSystem {
             last_skip: None,
             wheel: None,
             estimator: estimator::EstimatorState::default(),
-            map_bound: None,
             rig_flow,
             flow,
             gyro_rotation: None,
@@ -434,17 +432,6 @@ impl SlamSystem {
             adopted_keyframe: None,
             odometry: None,
         }
-    }
-
-    /// Holds the map to `max_keyframes` after each keyframe: redundant keyframes are culled first,
-    /// then the oldest evicted (see [`crate::mapping::culling::bound_keyframes`]). Unbounded until
-    /// called; a bounded map trades loops past the bound for a per-frame cost that stops growing.
-    pub fn set_map_bound(
-        &mut self,
-        max_keyframes: usize,
-        culling: crate::mapping::culling::KeyframeCullingConfig,
-    ) {
-        self.map_bound = Some((max_keyframes, culling));
     }
 
     /// Records a session for an offline pass: each keyframe a map bound removes
@@ -487,46 +474,6 @@ impl SlamSystem {
     /// initialization has aligned the map.
     pub fn gravity_world(&self) -> Vec3F64 {
         self.inertial.gravity_world
-    }
-
-    /// Runs inside a frame, which already holds the map publication gate.
-    fn enforce_map_bound(&mut self) {
-        let Some((max_keyframes, culling)) = self.map_bound.clone() else {
-            return;
-        };
-        let report = {
-            let mut map = lock_map(&self.map, &self.map_wait);
-            // Only a map above the bound loses keyframes, so only then is a copy owed.
-            let before = (self.session_recording && map.keyframes().len() > max_keyframes)
-                .then(|| map.keyframes().to_vec());
-            let wheel_factors = self.wheel.as_mut().map(|w| w.factors_mut());
-            let report = crate::mapping::culling::bound_keyframes(
-                &mut map,
-                max_keyframes,
-                &culling,
-                wheel_factors,
-            );
-            if let Some(before) = before {
-                let removed: std::collections::HashSet<usize> = report.removed().collect();
-                self.evicted_keyframes.extend(
-                    before
-                        .into_iter()
-                        .filter(|kf| removed.contains(&kf.frame.idx)),
-                );
-            }
-            report
-        };
-        if report.culled.is_empty() && report.evicted.is_empty() {
-            return;
-        }
-        if let Some(loop_closer) = self.loop_closer.as_mut() {
-            loop_closer.forget_keyframes(report.removed());
-        }
-        self.dbg(format!(
-            "[map_bound] culled={} evicted={} (bound {max_keyframes})",
-            report.culled.len(),
-            report.evicted.len()
-        ));
     }
 
     /// Adds wheel odometry to local BA: each keyframe interval the readings cover becomes a
@@ -647,14 +594,6 @@ impl SlamSystem {
         self.loop_closer
             .as_ref()
             .map_or(0, LoopCloser::correction_epoch)
-    }
-
-    /// Whether a background loop solve is running or waiting for its
-    /// writeback at a frame boundary.
-    pub fn loop_solve_in_flight(&self) -> bool {
-        self.loop_closer
-            .as_ref()
-            .is_some_and(LoopCloser::solve_in_flight)
     }
 
     /// The system's sensor calibration, restricted to the selected sensors.
@@ -3402,7 +3341,6 @@ impl SlamSystem {
         }
         self.tracking_timings.keyframe_growth += growth_start.elapsed();
         if anchor {
-            self.enforce_map_bound();
             self.refresh_track_positions();
             return true;
         }
@@ -3430,7 +3368,6 @@ impl SlamSystem {
         let recognition_start = Instant::now();
         self.register_place_recognition(frame.idx);
         self.tracking_timings.loop_recognition += recognition_start.elapsed();
-        self.enforce_map_bound();
         // Growth, fusion and an inertial refinement moved landmarks; an
         // asynchronous result refreshes only when it arrives (T3).
         self.refresh_track_positions();

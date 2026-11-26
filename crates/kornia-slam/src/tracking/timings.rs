@@ -95,18 +95,6 @@ impl TrackingTimings {
             + self.flow_bookkeeping
             + self.flow_map_wait
     }
-
-    /// The flow frame's critical path: the tracking-core stages, dispatch,
-    /// the slowest shard and the join.
-    pub fn critical_path(&self) -> Duration {
-        let slowest_shard = self
-            .shards
-            .iter()
-            .map(ShardTimings::total)
-            .max()
-            .unwrap_or_default();
-        self.total().saturating_sub(self.flow_parallel) + slowest_shard
-    }
 }
 
 /// Runs `f`, adding its wall time to `slot`.
