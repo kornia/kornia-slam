@@ -2,9 +2,9 @@
 //! the keyframe and loss-recovery policies, relocalization, and the parallax
 //! measure the keyframe policy can key off.
 
-pub mod local_map;
 pub(crate) mod flow_pool;
 pub(crate) mod flow_tracker;
+pub mod local_map;
 pub(crate) mod motion;
 pub mod optical_flow;
 pub(crate) mod parallax;
