@@ -15,8 +15,8 @@ mod validation;
 pub use build::BuildError;
 pub use config::{
     CameraSelection, FrontendConfig, LoopClosingMode, MappingConfig, OrbFrontendConfig,
-    OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection,
-    StereoCloseDepth, SystemConfig,
+    OrbSlamPipeline, OrbTuning, PipelineDefinition, PrecomputedFrontendConfig,
+    SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth, SystemConfig,
 };
 #[cfg(feature = "serde")]
 pub use file::LoadError;
@@ -24,8 +24,8 @@ pub use input::ProcessError;
 pub use state::{TrackingResult, TrackingStatus};
 pub use validation::ConfigError;
 
-use crate::features::{Descriptor, RBrief};
-use crate::frontend::{FeatureFrontend, FrontendObservation, OrbFrontend};
+use crate::features::{Clidd, Descriptor, RBrief};
+use crate::frontend::{FeatureFrontend, FrontendObservation, OrbFrontend, PrecomputedFrontend};
 use state::{SystemMode, SystemState};
 
 use crate::tracking::{
@@ -55,7 +55,7 @@ use crate::mapping::map::{
 };
 use crate::mapping::{KeyframeJob, LocalMapping};
 use crate::pose_conversion::apply_reference_pose_correction;
-use build::SystemSettings;
+use build::{MatchingSettings, SystemSettings};
 use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
 use kornia_sensors::SensorRig;
@@ -99,7 +99,7 @@ impl SlamSystem {
         config.validate()?;
         let rig = config.sensors.select_rig(rig)?;
         let settings = config.settings(&rig, config.orb_matching());
-        let frontend = OrbFrontend::new(config.orb_detector(), &rig);
+        let frontend = OrbFrontend::new(config.orb_detector()?, &rig);
         let loop_closer = config.loop_closer(&rig)?;
         Ok(Self::assemble(
             rig,
@@ -107,6 +107,19 @@ impl SlamSystem {
             Box::new(frontend),
             loop_closer,
         ))
+    }
+}
+
+impl SlamSystem<Clidd> {
+    /// Like [`SlamSystem::build`] for a configuration whose frontend is
+    /// [`FrontendConfig::Precomputed`]: frames take their CLIDD features from
+    /// the feature file by timestamp instead of extracting ORB.
+    pub fn build_precomputed(config: SystemConfig, rig: SensorRig) -> Result<Self, BuildError> {
+        config.validate()?;
+        let rig = config.sensors.select_rig(rig)?;
+        let frontend = PrecomputedFrontend::open(config.precomputed_features()?, &rig)?;
+        let settings = config.settings(&rig, MatchingSettings::default());
+        Ok(Self::assemble(rig, settings, Box::new(frontend), None))
     }
 }
 

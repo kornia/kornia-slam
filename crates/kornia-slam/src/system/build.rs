@@ -1,12 +1,15 @@
+use std::path::Path;
+
 use kornia_imgproc::features::OrbDetector;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    CameraSelection, FrontendConfig, OrbSlamPipeline, PipelineDefinition, SensorSelection,
-    SystemConfig,
+    CameraSelection, FrontendConfig, OrbFrontendConfig, OrbSlamPipeline, PipelineDefinition,
+    SensorSelection, SystemConfig,
 };
 use super::validation::ConfigError;
-use crate::features::{Descriptor, RBrief};
+use crate::features::{Clidd, Descriptor, RBrief};
+use crate::frontend::FeatureFileError;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopCloser;
 use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabulary};
@@ -23,6 +26,8 @@ pub enum BuildError {
     Config(#[from] ConfigError),
     #[error(transparent)]
     Vocabulary(#[from] VocabularyLoadError),
+    #[error(transparent)]
+    FeatureFile(#[from] FeatureFileError),
 }
 
 /// Settings a [`SlamSystem`](crate::SlamSystem) is assembled from, resolved
@@ -43,6 +48,16 @@ pub(crate) struct MatchingSettings<D: Descriptor> {
     pub two_view_init: TwoViewInitConfig<D>,
     pub map_projection: MapProjectionConfig<D>,
     pub relocalization: RelocalizationConfig<D>,
+}
+
+impl Default for MatchingSettings<Clidd> {
+    fn default() -> Self {
+        Self {
+            two_view_init: TwoViewInitConfig::default(),
+            map_projection: MapProjectionConfig::default(),
+            relocalization: RelocalizationConfig::default(),
+        }
+    }
 }
 
 impl SensorSelection {
@@ -69,7 +84,10 @@ impl SystemConfig {
         matching: MatchingSettings<D>,
     ) -> SystemSettings<D> {
         let orb = self.orb();
-        let FrontendConfig::Orb(frontend) = orb.frontend;
+        let stereo_close_depth = match &orb.frontend {
+            FrontendConfig::Orb(frontend) => Some(frontend.stereo_close_depth),
+            FrontendConfig::Precomputed(_) => None,
+        };
         SystemSettings {
             matching,
             keyframe_policy: orb.keyframes,
@@ -77,7 +95,8 @@ impl SystemConfig {
             local_mapping: orb.mapping.execution,
             stereo_close_depth_m: rig
                 .stereo_baseline_m
-                .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
+                .zip(stereo_close_depth)
+                .and_then(|(baseline, close)| close.metres(baseline)),
         }
     }
 
@@ -91,12 +110,28 @@ impl SystemConfig {
         }
     }
 
-    /// Feature extractor settings for the configured frontend.
-    pub(crate) fn orb_detector(&self) -> OrbDetector {
-        let FrontendConfig::Orb(frontend) = self.orb().frontend;
-        OrbDetector {
-            n_keypoints: frontend.n_keypoints,
+    /// Feature extractor settings for the configured ORB frontend.
+    pub(crate) fn orb_detector(&self) -> Result<OrbDetector, ConfigError> {
+        let FrontendConfig::Orb(OrbFrontendConfig { n_keypoints, .. }) = self.orb().frontend else {
+            return Err(ConfigError::FrontendMismatch {
+                configured: "precomputed",
+                system: "ORB",
+            });
+        };
+        Ok(OrbDetector {
+            n_keypoints,
             ..OrbDetector::default()
+        })
+    }
+
+    /// The feature file of the configured precomputed frontend.
+    pub(crate) fn precomputed_features(&self) -> Result<&Path, ConfigError> {
+        match &self.orb().frontend {
+            FrontendConfig::Precomputed(precomputed) => Ok(&precomputed.path),
+            FrontendConfig::Orb(_) => Err(ConfigError::FrontendMismatch {
+                configured: "ORB",
+                system: "precomputed CLIDD",
+            }),
         }
     }
 

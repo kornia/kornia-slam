@@ -87,10 +87,14 @@ pub struct OrbSlamPipeline {
     pub tuning: OrbTuning,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum FrontendConfig {
     Orb(OrbFrontendConfig),
+    /// CLIDD features exported offline, for a monocular system without loop
+    /// closing; build it with
+    /// [`SlamSystem::build_precomputed`](crate::SlamSystem::build_precomputed).
+    Precomputed(PrecomputedFrontendConfig),
 }
 
 impl Default for FrontendConfig {
@@ -122,6 +126,16 @@ impl Default for OrbFrontendConfig {
             stereo_close_depth: StereoCloseDepth::default(),
         }
     }
+}
+
+/// Features read from a file instead of extracted; see
+/// `scripts/export_clidd_features.py` for the format. A relative `path` in a
+/// file is resolved against that file's directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+pub struct PrecomputedFrontendConfig {
+    pub path: PathBuf,
 }
 
 /// Near/far depth threshold for stereo keypoints (ORB-SLAM3's `ThDepth`).
@@ -204,6 +218,11 @@ impl SystemConfig {
         {
             *vocabulary = base_dir.join(&*vocabulary);
         }
+        if let FrontendConfig::Precomputed(precomputed) = &mut orb.frontend
+            && precomputed.path.is_relative()
+        {
+            precomputed.path = base_dir.join(&precomputed.path);
+        }
     }
 }
 
@@ -223,20 +242,19 @@ pub struct OrbTuning {
 impl fmt::Display for SystemConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let PipelineDefinition::OrbSlam(orb) = &self.pipeline;
-        let FrontendConfig::Orb(frontend) = orb.frontend;
         writeln!(f, "OrbSlam pipeline (config version {})", self.version)?;
-        writeln!(f, "  frontend: ORB, {} keypoints", frontend.n_keypoints)?;
-        if self.sensors.cameras == CameraSelection::Stereo {
-            match frontend.stereo_close_depth {
-                StereoCloseDepth::Baselines(n) => writeln!(
-                    f,
-                    "  stereo depth: rectified pair, close within {n} baselines"
-                )?,
-                StereoCloseDepth::Metres(m) => {
-                    writeln!(f, "  stereo depth: rectified pair, close within {m} m")?
+        match &orb.frontend {
+            FrontendConfig::Orb(frontend) => {
+                writeln!(f, "  frontend: ORB, {} keypoints", frontend.n_keypoints)?;
+                if self.sensors.cameras == CameraSelection::Stereo {
+                    write_stereo_depth(f, frontend.stereo_close_depth)?;
                 }
-                StereoCloseDepth::Disabled => writeln!(f, "  stereo depth: rectified pair")?,
             }
+            FrontendConfig::Precomputed(precomputed) => writeln!(
+                f,
+                "  frontend: precomputed CLIDD from {}",
+                precomputed.path.display()
+            )?,
         }
         if self.sensors.imu {
             writeln!(f, "  IMU integration")?;
@@ -266,6 +284,19 @@ impl fmt::Display for SystemConfig {
             writeln!(f, "  loop closing: {}", vocabulary.display())?;
         }
         Ok(())
+    }
+}
+
+fn write_stereo_depth(f: &mut fmt::Formatter<'_>, close: StereoCloseDepth) -> fmt::Result {
+    match close {
+        StereoCloseDepth::Baselines(n) => writeln!(
+            f,
+            "  stereo depth: rectified pair, close within {n} baselines"
+        ),
+        StereoCloseDepth::Metres(m) => {
+            writeln!(f, "  stereo depth: rectified pair, close within {m} m")
+        }
+        StereoCloseDepth::Disabled => writeln!(f, "  stereo depth: rectified pair"),
     }
 }
 

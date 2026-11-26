@@ -3,8 +3,8 @@ use kornia_sensors::SensorRig;
 
 use super::config::{
     CameraSelection, FrontendConfig, LoopClosingMode, OrbFrontendConfig, OrbSlamPipeline,
-    OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth,
-    SystemConfig,
+    OrbTuning, PipelineDefinition, PrecomputedFrontendConfig, SYSTEM_CONFIG_VERSION,
+    SensorSelection, StereoCloseDepth, SystemConfig,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopClosingConfig;
@@ -47,6 +47,19 @@ pub enum ConfigError {
     MissingSensor(&'static str),
     #[error("stereo cameras need rectified images; the source supplies raw fisheye images")]
     FisheyeStereo,
+    #[error(
+        "the configuration selects the {configured} frontend, but this builds the {system} system"
+    )]
+    FrontendMismatch {
+        configured: &'static str,
+        system: &'static str,
+    },
+    #[error("precomputed feature path is empty")]
+    EmptyFeaturePath,
+    #[error("precomputed features are monocular: select mono cameras")]
+    PrecomputedStereo,
+    #[error("loop closing needs an ORB vocabulary: disable it with precomputed features")]
+    PrecomputedLoopClosing,
 }
 
 impl SystemConfig {
@@ -76,6 +89,9 @@ impl OrbSlamPipeline {
     fn validate(&self, sensors: &SensorSelection) -> Result<(), ConfigError> {
         match &self.frontend {
             FrontendConfig::Orb(orb) => orb.validate()?,
+            FrontendConfig::Precomputed(precomputed) => {
+                precomputed.validate(sensors, &self.loop_closing)?
+            }
         }
         validate_keyframes(&self.keyframes, sensors.imu)?;
         validate_loop_closing(&self.loop_closing, sensors)?;
@@ -108,6 +124,25 @@ impl OrbFrontendConfig {
             }
             StereoCloseDepth::Disabled => Ok(()),
         }
+    }
+}
+
+impl PrecomputedFrontendConfig {
+    fn validate(
+        &self,
+        sensors: &SensorSelection,
+        loop_closing: &LoopClosingMode,
+    ) -> Result<(), ConfigError> {
+        if self.path.as_os_str().is_empty() {
+            return Err(ConfigError::EmptyFeaturePath);
+        }
+        if sensors.cameras == CameraSelection::Stereo {
+            return Err(ConfigError::PrecomputedStereo);
+        }
+        if loop_closing.is_enabled() {
+            return Err(ConfigError::PrecomputedLoopClosing);
+        }
+        Ok(())
     }
 }
 

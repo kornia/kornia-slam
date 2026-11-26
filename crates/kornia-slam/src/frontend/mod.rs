@@ -1,5 +1,15 @@
-//! Feature preparation for one input frame: ORB extraction, stereo depth and,
-//! for raw fisheye images, keypoint mapping into the rig's virtual pinhole.
+//! Feature preparation for one input frame: ORB extraction or precomputed
+//! features, stereo depth and, for raw fisheye images, keypoint mapping into
+//! the rig's virtual pinhole.
+
+mod feature_file;
+mod precomputed;
+
+pub use feature_file::FeatureFileError;
+pub(crate) use precomputed::PrecomputedFrontend;
+
+#[cfg(test)]
+pub(crate) use feature_file::tests as feature_file_tests;
 
 use std::time::{Duration, Instant};
 
@@ -36,6 +46,12 @@ pub struct FrontendObservation {
 pub enum FrontendError {
     #[error(transparent)]
     Image(#[from] ImageError),
+    #[error("no precomputed features within 1 ms of t = {timestamp_sec} s")]
+    MissingFeatures { timestamp_sec: f64 },
+    #[error("precomputed keypoints at t = {timestamp_sec} s fall outside the image")]
+    KeypointsOutsideImage { timestamp_sec: f64 },
+    #[error(transparent)]
+    FeatureFile(#[from] FeatureFileError),
 }
 
 /// Turns one validated image, or rectified stereo pair, into the frame

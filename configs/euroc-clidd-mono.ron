@@ -1,0 +1,18 @@
+// EuRoC MH_01, monocular, with CLIDD L64 features exported offline by
+// scripts/export_clidd_features.py instead of ORB. Everything else matches
+// euroc.ron, so the two runs compare the features alone.
+(
+    source: Euroc((
+        data: "../data/euroc/MH_01_easy",
+    )),
+    system: (
+        version: 1,
+        pipeline: OrbSlam((
+            frontend: Precomputed((
+                path: "../data/features/MH_01_easy.clidd_l64.kfeat",
+            )),
+            // No vocabulary exists for CLIDD descriptors.
+            loop_closing: Disabled,
+        )),
+    ),
+)
