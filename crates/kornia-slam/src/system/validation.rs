@@ -660,11 +660,6 @@ fn validate_local_ba(config: &LocalBaConfig) -> Result<(), ConfigError> {
         AT_LEAST_ONE,
     )?;
     check(
-        at("boundary_imu_info_scale"),
-        config.boundary_imu_info_scale,
-        NON_NEGATIVE,
-    )?;
-    check(
         at("max_iterations"),
         config.max_iterations as f64,
         AT_LEAST_ONE,

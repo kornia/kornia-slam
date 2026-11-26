@@ -502,13 +502,6 @@ fn settings_are_range_checked() {
         ),
         (
             LocalBaConfig {
-                boundary_imu_info_scale: f64::NAN,
-                ..LocalBaConfig::default()
-            },
-            "mapping.local_ba.boundary_imu_info_scale",
-        ),
-        (
-            LocalBaConfig {
                 max_iterations: 0,
                 ..LocalBaConfig::default()
             },

@@ -29,6 +29,7 @@ use crate::tracking::relocalization::RelocalizationSolver;
 use crate::tracking::{KeyframePolicy, KeyframesWhileLost, TrackingLossRecoveryPolicy};
 use kornia_sensors::imu::SampleInterpolation;
 
+use super::build::BOUNDARY_IMU_INFO_SCALE;
 use super::recovery::RecoveryConfig;
 use super::stillness::{HEARTBEAT_SETTLED_SEC, HEARTBEAT_UNSETTLED_SEC};
 
@@ -575,8 +576,6 @@ pub struct LocalBaConfig {
     /// Newest keyframes optimized; older ones enter as fixed context.
     /// ORB-SLAM3's `LocalInertialBA` uses 10.
     pub active_keyframes: usize,
-    /// Information scale of the IMU edge from the fixed past into the window.
-    pub boundary_imu_info_scale: f64,
     /// Levenberg-Marquardt iteration cap of one VI-BA solve. ORB-SLAM3's
     /// `LocalInertialBA` runs 10.
     pub max_iterations: usize,
@@ -638,7 +637,6 @@ impl Default for LocalBaConfig {
     fn default() -> Self {
         Self {
             active_keyframes: 3,
-            boundary_imu_info_scale: 1e-2,
             max_iterations: 50,
             initial_lambda: 1.0,
             boundary_scales_bias_rows: true,
@@ -923,7 +921,7 @@ impl fmt::Display for SystemConfig {
                 ba.active_keyframes,
                 ba.max_iterations,
                 ba.initial_lambda,
-                ba.boundary_imu_info_scale,
+                BOUNDARY_IMU_INFO_SCALE,
                 if ba.boundary_scales_bias_rows {
                     "scaled"
                 } else {

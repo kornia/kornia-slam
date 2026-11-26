@@ -144,6 +144,10 @@ fn stereo_baseline_m(rig: &SensorRig) -> Option<f64> {
     rig.stereo_baseline_m.or_else(|| rig_baseline_m(rig))
 }
 
+/// Information scale of the IMU edge from the fixed past into the local BA
+/// window; 1.0 was worse (card O).
+pub(crate) const BOUNDARY_IMU_INFO_SCALE: f64 = 1e-2;
+
 impl LocalBaConfig {
     /// Solver parameters for a rig whose stereo depth comes from focal length
     /// times baseline `focal_baseline` (pixel·metres).
@@ -157,7 +161,7 @@ impl LocalBaConfig {
         };
         LocalBaParams {
             active_keyframes: self.active_keyframes,
-            boundary_imu_info_scale: self.boundary_imu_info_scale,
+            boundary_imu_info_scale: BOUNDARY_IMU_INFO_SCALE,
             max_iterations: self.max_iterations,
             boundary_scales_bias_rows: self.boundary_scales_bias_rows,
             boundary: self.boundary,
