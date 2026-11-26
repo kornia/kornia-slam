@@ -28,8 +28,8 @@ pub use crate::odometry::{
 pub use build::BuildError;
 pub use config::{
     BoundedFanOut, CameraSelection, FanOut, FlowBookkeeping, FlowPose, ForwardBackward,
-    FrameVelocity, FrontendConfig, GyroGuess, InertialConfig, KeyframeOrb, KltFirst, KltPrediction,
-    KltRetry, KltRig, LocalBaConfig, LoopClosingExecution, LoopClosingMode, LostRelocalization,
+    FrameVelocity, FrontendConfig, GyroGuess, InertialConfig, KltFirst, KltPrediction, KltRetry,
+    KltRig, LocalBaConfig, LoopClosingExecution, LoopClosingMode, LostRelocalization,
     MAX_FLOW_THREADS, MappingConfig, OnlineCalibrationConfig, OrbFrontendConfig, OrbSlamPipeline,
     OrbTuning, PipelineDefinition, PoseInertial, PoseInertialMinInliers, SYSTEM_CONFIG_VERSION,
     SensorSelection, SnapbackFix, StereoCloseDepth, StereoDepthSigma, SystemConfig, TrackRefill,
@@ -314,13 +314,6 @@ impl SlamSystem {
         config.validate_flow_threads(&rig)?;
         config.validate_raw_fisheye(&rig)?;
         let settings = config.settings(&rig);
-        if let Some(knob) = settings.frontend_flow.unbuilt_knob() {
-            return Err(ConfigError::FrontendKnobNeeds {
-                knob,
-                needs: validation::UNBUILT,
-            }
-            .into());
-        }
         let frontend = OrbFrontend::new(config.orb_detector(), &rig)
             .with_fisheye_weight(config.fisheye_weight(&rig));
         let loop_closer = config.loop_closer(&rig)?;

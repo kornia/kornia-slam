@@ -15,10 +15,7 @@ use crate::mapping::bundle_adjustment::{
     LocalBaParams, local_window_of, run_local_ba_with, run_local_inertial_ba_calibrated,
     run_local_inertial_ba_with,
 };
-use crate::mapping::keyframe_mapping::{
-    DeferredKeyframe, DeferredKeyframeContext, DeferredKeyframeResult, KeyframeGrowthPlan,
-    KeyframeGrowthResult, grow_keyframe,
-};
+use crate::mapping::keyframe_mapping::{KeyframeGrowthPlan, KeyframeGrowthResult, grow_keyframe};
 use crate::mapping::map::{
     BaOutcome, BaSnapshot, BaSolve, BaUpdate, BaUpdateError, LocalBaMergeResult, LocalBaStats, Map,
 };
@@ -301,8 +298,6 @@ enum LocalMappingBackend {
         /// The online calibration the next solve starts from; boxed, as it
         /// dwarfs the asynchronous variant.
         calibration: Box<Mutex<OnlineCalibrationState>>,
-        /// Set by [`LocalMapping::with_deferred`].
-        deferred: Option<DeferredKeyframeContext>,
     },
     Asynchronous {
         handle: LocalMappingHandle,
@@ -371,7 +366,6 @@ impl LocalMapping {
                 results: Mutex::new(Vec::new()),
                 growth_results: Mutex::new(Vec::new()),
                 calibration: Box::new(Mutex::new(OnlineCalibrationState::default())),
-                deferred: None,
             },
             LocalMappingMode::Asynchronous => {
                 let publication_gate = Arc::new(Mutex::new(()));
@@ -389,56 +383,6 @@ impl LocalMapping {
             }
         };
         Self { backend, counters }
-    }
-
-    /// Enables the deferred keyframe path; the build calls it only with
-    /// `keyframe_orb: Mapping`.
-    #[allow(dead_code)] // skeleton: the build calls it once lane T builds the path
-    pub(crate) fn with_deferred(mut self, context: DeferredKeyframeContext) -> Self {
-        match &mut self.backend {
-            LocalMappingBackend::Synchronous { deferred, .. } => *deferred = Some(context),
-            LocalMappingBackend::Asynchronous { handle, .. } => {
-                // The worker is already running: the context goes into the
-                // shared state before any job is submitted.
-                handle
-                    .pending
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .deferred_context = Some(Arc::new(context));
-            }
-        }
-        self
-    }
-
-    /// Queues `job` (FIFO, never replaced, unlike `submit`'s latest-wins
-    /// job); `false` without [`Self::with_deferred`].
-    #[allow(dead_code)] // skeleton: lane T calls it
-    pub(crate) fn submit_deferred(&self, _job: DeferredKeyframe) -> bool {
-        // Lane T builds the queue; until then nothing is accepted.
-        if self.has_deferred_context() {
-            debug_eprintln!("[local_mapping] deferred keyframe refused: path not built");
-        }
-        false
-    }
-
-    /// The deferred keyframes finished since the last call, in queue order.
-    #[allow(dead_code)] // skeleton: lane T calls it
-    pub(crate) fn drain_deferred(&self) -> Vec<DeferredKeyframeResult> {
-        Vec::new()
-    }
-
-    fn has_deferred_context(&self) -> bool {
-        match &self.backend {
-            LocalMappingBackend::Synchronous { deferred, .. } => deferred.is_some(),
-            LocalMappingBackend::Asynchronous { handle, .. } => handle
-                .pending
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .deferred_context
-                .is_some(),
-        }
     }
 
     /// Grows `job`'s keyframe: inline in synchronous mode, else queued to the
@@ -616,9 +560,6 @@ struct PendingState {
     growth: VecDeque<GrowthJob>,
     growing: bool,
     growth_generation: u64,
-    /// Keyframes whose ORB runs here, in order; never replaced.
-    deferred: VecDeque<DeferredKeyframe>,
-    deferred_context: Option<Arc<DeferredKeyframeContext>>,
     shutdown: bool,
 }
 
@@ -641,7 +582,6 @@ impl Drop for WorkerExit {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.shutdown = true;
         state.latest = None;
-        state.deferred.clear();
         state.growth.clear();
         self.pending.ready.notify_all();
     }
@@ -682,11 +622,7 @@ impl LocalMappingHandle {
                             .state
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        while state.latest.is_none()
-                            && state.deferred.is_empty()
-                            && state.growth.is_empty()
-                            && !state.shutdown
-                        {
+                        while state.latest.is_none() && state.growth.is_empty() && !state.shutdown {
                             state = worker_pending
                                 .ready
                                 .wait(state)
@@ -695,9 +631,6 @@ impl LocalMappingHandle {
                         if state.shutdown {
                             break;
                         }
-                        // `submit_deferred` queues nothing until lane T builds
-                        // the path; nothing would serve a deferred entry.
-                        state.deferred.clear();
                         if let Some(growth) = state.growth.pop_front() {
                             state.growing = true;
                             Err((growth, state.growth_generation))
@@ -868,7 +801,6 @@ impl Drop for LocalMappingHandle {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.shutdown = true;
             state.latest = None;
-            state.deferred.clear();
             state.growth.clear();
         }
         self.pending.ready.notify_one();

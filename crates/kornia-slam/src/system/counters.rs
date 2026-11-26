@@ -177,10 +177,6 @@ pub struct RunCounters {
     pub flow_reconcile_clears: u64,
     /// Track positions rewritten after a local-mapping result or a map correction.
     pub flow_position_refreshes: u64,
-    /// Frames between a deferred keyframe falling due and its insert, summed.
-    pub deferred_keyframe_lag_frames: u64,
-    /// Longest the deferred keyframe queue has been.
-    pub deferred_keyframe_queue_max: u64,
     /// Longest the growth queue has been (`mapping.keyframe_growth: Mapping`).
     pub growth_queue_max: u64,
     /// Most frames between a keyframe and the frame that saw its growth done.

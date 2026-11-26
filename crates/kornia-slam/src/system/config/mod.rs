@@ -192,7 +192,6 @@ pub struct OrbFrontendConfig {
     /// How a frame tracked from flow alone gets its pose.
     pub flow_pose: FlowPose,
     pub flow_bookkeeping: FlowBookkeeping,
-    pub keyframe_orb: KeyframeOrb,
     /// Weights and search radius of raw fisheye rig views; `Uniform` on a
     /// rig without raw images whatever is set.
     pub fisheye_weight: FisheyeWeight,
@@ -286,16 +285,6 @@ pub enum FlowBookkeeping {
     KeyframesOnly,
 }
 
-/// Where a flow frame that is due as a keyframe extracts its ORB features.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum KeyframeOrb {
-    #[default]
-    Tracking,
-    /// On the mapping thread, in keyframe order (`LocalMapping.cc:284-287`).
-    Mapping,
-}
-
 /// Optical flow from a trusted inertial prediction: each track starts at
 /// its map point projected at the predicted pose, and LK searches pyramid
 /// levels `0..=max_level` with `max_iter` iterations each instead of the
@@ -382,7 +371,6 @@ impl Default for OrbFrontendConfig {
             gyro_guess: GyroGuess::default(),
             flow_pose: FlowPose::default(),
             flow_bookkeeping: FlowBookkeeping::default(),
-            keyframe_orb: KeyframeOrb::default(),
             fisheye_weight: FisheyeWeight::default(),
         }
     }
@@ -994,9 +982,6 @@ fn write_flow_knobs(f: &mut fmt::Formatter<'_>, frontend: &OrbFrontendConfig) ->
     }
     if frontend.flow_bookkeeping != default.flow_bookkeeping {
         writeln!(f, "  flow bookkeeping: {:?}", frontend.flow_bookkeeping)?;
-    }
-    if frontend.keyframe_orb != default.keyframe_orb {
-        writeln!(f, "  keyframe ORB: {:?}", frontend.keyframe_orb)?;
     }
     if frontend.fisheye_weight != default.fisheye_weight {
         writeln!(f, "  fisheye weight: {:?}", frontend.fisheye_weight)?;

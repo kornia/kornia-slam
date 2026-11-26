@@ -3,9 +3,9 @@ use kornia_sensors::SensorRig;
 
 use super::config::{
     CameraSelection, FanOut, FlowBookkeeping, FlowPose, ForwardBackward, FrontendConfig, GyroGuess,
-    InertialConfig, KeyframeOrb, KltRetry, KltRig, LocalBaConfig, LoopClosingExecution,
-    LoopClosingMode, LostRelocalization, OrbFrontendConfig, OrbSlamPipeline, PipelineDefinition,
-    SensorSelection, StereoDepthSigma, SystemConfig, TrackRefill, TrackingConfig,
+    InertialConfig, KltRetry, KltRig, LocalBaConfig, LoopClosingExecution, LoopClosingMode,
+    LostRelocalization, OrbFrontendConfig, OrbSlamPipeline, PipelineDefinition, SensorSelection,
+    StereoDepthSigma, SystemConfig, TrackRefill, TrackingConfig,
 };
 use super::recovery::RecoveryConfig;
 use super::validation::ConfigError;
@@ -85,7 +85,6 @@ pub(crate) struct FlowSettings {
     pub gyro_guess: GyroGuess,
     pub pose: FlowPose,
     pub bookkeeping: FlowBookkeeping,
-    pub keyframe_orb: KeyframeOrb,
 }
 
 impl FlowSettings {
@@ -101,17 +100,7 @@ impl FlowSettings {
             gyro_guess: frontend.gyro_guess,
             pose: frontend.flow_pose,
             bookkeeping: frontend.flow_bookkeeping,
-            keyframe_orb: frontend.keyframe_orb,
         }
-    }
-
-    /// The first knob set away from today's behaviour that no tracking path
-    /// reads yet. Knobs that need `WindowedU8` stop inside its flow path.
-    pub(crate) fn unbuilt_knob(&self) -> Option<&'static str> {
-        let today = Self::new(&OrbFrontendConfig::default());
-        [("keyframe_orb", self.keyframe_orb != today.keyframe_orb)]
-            .into_iter()
-            .find_map(|(knob, set)| set.then_some(knob))
     }
 }
 

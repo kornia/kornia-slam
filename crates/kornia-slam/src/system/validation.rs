@@ -2,12 +2,11 @@ use kornia_imgproc::features::OrbMatchConfig;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    CameraSelection, FanOut, FlowPose, ForwardBackward, FrameVelocity, FrontendConfig, KeyframeOrb,
-    KltFirst, KltRetry, KltRig, LocalBaConfig, LoopClosingMode, MAX_FLOW_THREADS,
-    OnlineCalibrationConfig, OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition,
-    PoseInertial, PoseInertialMinInliers, SYSTEM_CONFIG_VERSION, SensorSelection, SnapbackFix,
-    StereoCloseDepth, StereoDepthSigma, SystemConfig, TrackRefill, TrackingConfig,
-    TrackingLossConfig,
+    CameraSelection, FanOut, FlowPose, ForwardBackward, FrameVelocity, FrontendConfig, KltFirst,
+    KltRetry, KltRig, LocalBaConfig, LoopClosingMode, MAX_FLOW_THREADS, OnlineCalibrationConfig,
+    OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition, PoseInertial,
+    PoseInertialMinInliers, SYSTEM_CONFIG_VERSION, SensorSelection, SnapbackFix, StereoCloseDepth,
+    StereoDepthSigma, SystemConfig, TrackRefill, TrackingConfig, TrackingLossConfig,
 };
 use super::recovery::{RecoveryConfig, SeedPlacement};
 use crate::inertial::trust::ImuTrustMode;
@@ -463,14 +462,6 @@ fn validate_flow(
         if let Some((knob, _)) = windowed.into_iter().find(|&(_, on)| on) {
             return needs(knob, "klt_kernel WindowedU8");
         }
-    }
-    // Only a flow frame defers its keyframe ORB.
-    if frontend.keyframe_orb == KeyframeOrb::Mapping && frontend.klt_first == KltFirst::Disabled {
-        return needs("keyframe_orb", "klt_first Enabled");
-    }
-    // `SlamSystem::build` has no tracking path for it yet (R-C6).
-    if frontend.keyframe_orb == KeyframeOrb::Mapping {
-        return needs("keyframe_orb", UNBUILT);
     }
     Ok(())
 }

@@ -1,7 +1,7 @@
 // PR #180 round 2: pr180-frontend-1ms.ron plus the cards A-D estimator bundle
 // (card A, "Experiment A0") and the card B recovery
 // knobs. UNTESTED: it has never run, and no accuracy or speed figure is
-// claimed. Raw fisheye and `keyframe_orb: Mapping` are deferred.
+// claimed. Raw fisheye is deferred.
 //
 // Run from the repository root, pinned to two cores:
 //   taskset -c 0,1 cargo run --release -p kornia-slam-app -- --config configs/pr180-full.ron
@@ -35,8 +35,6 @@
                 gyro_guess: RotatedRay,
                 flow_pose: AnalyticGn(max_iter: 3),
                 flow_bookkeeping: KeyframesOnly,
-                // Mapping is not built (lane T step 12).
-                keyframe_orb: Tracking,
             )),
             // Card A, bundle A0.
             mapping: (

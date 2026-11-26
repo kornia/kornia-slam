@@ -34,8 +34,6 @@
                 gyro_guess: RotatedRay,
                 flow_pose: AnalyticGn(max_iter: 3),
                 flow_bookkeeping: KeyframesOnly,
-                // Mapping is not built (lane T step 12).
-                keyframe_orb: Tracking,
             )),
             // Card K: no map points from keyframe pairs whose baseline is
             // under tan(1 deg) of the median depth (they only pass the

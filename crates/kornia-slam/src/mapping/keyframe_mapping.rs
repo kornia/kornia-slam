@@ -17,62 +17,23 @@
 //! shared mutex and keeps the existing boundaries. It never touches the
 //! publication gate — the caller already holds it.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use kornia_3d::camera::PinholeCamera;
-use kornia_3d::pose::{Pose3d, TriangulationConfig};
-use kornia_image::Image;
-use kornia_imgproc::features::{OrbDetector, OrbMatchConfig};
+use kornia_3d::pose::TriangulationConfig;
+use kornia_imgproc::features::OrbMatchConfig;
 
 use crate::mapping::growth;
 use crate::mapping::map::{
     ImuFactor, Keyframe, LandmarkTarget, Map, MapInsertion, MapMutationError, ObservationKey,
     ObservationLink,
 };
-use crate::rig::RigGeometry;
-use crate::tracking::optical_flow::Track;
 
 /// The core request for an accepted keyframe, and how many of its landmarks
 /// are close stereo seeds.
 pub(crate) struct KeyframeInsertion {
     pub insertion: MapInsertion,
     pub close_points: usize,
-}
-
-/// A keyframe accepted on its flow pose whose ORB, overlap match, projection
-/// search and insert run on the mapping thread (`keyframe_orb: Mapping`).
-#[allow(dead_code)] // skeleton: lane T fills the deferred path
-pub(crate) struct DeferredKeyframe {
-    pub frame_idx: usize,
-    pub timestamp_sec: f64,
-    pub pose_world_to_cam: Pose3d,
-    /// One level-0 plane per rig camera, from a reused pool.
-    pub planes: Vec<Image<u8, 1>>,
-    pub tracks: Vec<Track>,
-    pub tracked_inliers: usize,
-    pub matches: Vec<(usize, usize)>,
-}
-
-/// What the mapping thread made of a [`DeferredKeyframe`].
-#[allow(dead_code)] // skeleton: lane T fills the deferred path
-pub(crate) struct DeferredKeyframeResult {
-    pub frame_idx: usize,
-    pub keyframe_idx: Option<usize>,
-    /// Map points created at this keyframe, for `adopt_landmarks`.
-    pub new_map_points: Vec<usize>,
-    /// The planes, returned to the pool.
-    pub planes: Vec<Image<u8, 1>>,
-}
-
-/// What the mapping worker needs to finish a deferred keyframe.
-#[allow(dead_code)] // skeleton: lane T fills the deferred path
-pub(crate) struct DeferredKeyframeContext {
-    /// The primary camera's detector (`OrbFrontend::detector`).
-    pub detector: OrbDetector,
-    /// The other rig cameras' detector (`OrbFrontend::secondary`).
-    pub secondary: OrbDetector,
-    /// The overlap match reads only the rig (`match_overlap`).
-    pub rig: Arc<RigGeometry>,
 }
 
 /// A tracked keyframe's `(landmark, feature)` matches: `linked` become

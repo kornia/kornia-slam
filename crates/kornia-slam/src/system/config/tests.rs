@@ -738,8 +738,6 @@ fn orin_preset(threads: usize, per_camera: usize) -> SystemConfig {
         gyro_guess: GyroGuess::RotatedRay,
         flow_pose: FlowPose::AnalyticGn { max_iter: 3 },
         flow_bookkeeping: FlowBookkeeping::KeyframesOnly,
-        // Card E's `Mapping` has no tracking path yet, so validation refuses it.
-        keyframe_orb: KeyframeOrb::Tracking,
         ..OrbFrontendConfig::default()
     });
     config
@@ -770,7 +768,6 @@ fn the_flow_knobs_default_to_todays_frontend() {
     assert_eq!(frontend.gyro_guess, GyroGuess::Off);
     assert_eq!(frontend.flow_pose, FlowPose::RansacPnp);
     assert_eq!(frontend.flow_bookkeeping, FlowBookkeeping::EveryFrame);
-    assert_eq!(frontend.keyframe_orb, KeyframeOrb::Tracking);
     assert_eq!(frontend.fisheye_weight, FisheyeWeight::Uniform);
     for threads in [2, 3] {
         let preset = orin_preset(threads, 48);
@@ -1017,14 +1014,6 @@ fn flow_knobs_are_refused_without_the_knobs_they_need() {
             "{knob}"
         );
     }
-    assert_eq!(
-        on_rig(OrbFrontendConfig {
-            keyframe_orb: KeyframeOrb::Mapping,
-            klt_first: KltFirst::Disabled,
-            ..OrbFrontendConfig::default()
-        }),
-        needs("keyframe_orb", "klt_first Enabled")
-    );
 }
 
 #[test]
@@ -2239,7 +2228,6 @@ mod ron_files {
                     gyro_guess: RotatedRay,
                     flow_pose: AnalyticGn(max_iter: 3),
                     flow_bookkeeping: KeyframesOnly,
-                    keyframe_orb: Tracking,
                 )),
                 mapping: ( execution: Asynchronous ),
             )),
@@ -2356,29 +2344,6 @@ fn knobs_that_read_the_imu_are_refused_without_it() {
         );
     }
     assert_eq!(with(false, &|_| {}), Ok(()), "the defaults need no IMU");
-}
-
-/// R-C6: `keyframe_orb: Mapping` parses, but no tracking path reads it, so it
-/// is a config error rather than a panic in `SlamSystem::build`.
-#[test]
-fn keyframe_orb_mapping_is_a_config_error() {
-    let mapping = OrbFrontendConfig {
-        keyframe_orb: KeyframeOrb::Mapping,
-        ..OrbFrontendConfig::default()
-    };
-    let unbuilt = Err(ConfigError::FrontendKnobNeeds {
-        knob: "keyframe_orb",
-        needs: crate::system::validation::UNBUILT,
-    });
-    assert_eq!(
-        with_frontend(mapping, CameraSelection::Rig).validate(),
-        unbuilt
-    );
-    let mut built = orin_preset(2, 48);
-    assert_eq!(built.validate(), Ok(()));
-    let FrontendConfig::Orb(frontend) = &mut orb_mut(&mut built).frontend;
-    frontend.keyframe_orb = KeyframeOrb::Mapping;
-    assert_eq!(built.validate(), unbuilt);
 }
 
 /// Card H: the inertial bar is read only after a pose-inertial solve.

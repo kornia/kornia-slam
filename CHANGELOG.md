@@ -48,8 +48,7 @@ the IMU can vouch for a lost still rig right after a heartbeat; `[summary] still
 
 **New settings for a 1 ms frontend frame and for online calibration, all off by
 default.** Every default is today's behaviour, so existing run files load and
-run unchanged. Built, not validated: no benchmark has run on them. Not built:
-`frontend.keyframe_orb: Mapping` stops with `todo!`.
+run unchanged. Built, not validated: no benchmark has run on them.
 - `frontend.flow_threads` (`1`): threads the flow step runs on, the tracking
   thread included; 1, the rig's camera count or one more, at most 4.
 - `frontend.klt_rig` (`PrimaryOnly`): `AllCameras` tracks every rig camera, so
@@ -73,8 +72,6 @@ run unchanged. Built, not validated: no benchmark has run on them. Not built:
   frame's pose by Gauss-Newton from the IMU prediction, RANSAC PnP as fallback.
 - `frontend.flow_bookkeeping` (`EveryFrame`): `KeyframesOnly` counts landmark
   visibility only on frames that run ORB, as ORB-SLAM3.
-- `frontend.keyframe_orb` (`Tracking`): `Mapping` runs a flow keyframe's ORB,
-  overlap match and insert on the mapping thread; needs `klt_first`.
 - `frontend.fisheye_weight` (`Uniform`): `Magnification` scales the local VI-BA
   pixel sigma, the rig-overlap gates and the projection search radius of raw
   fisheye rig views by the raw-to-pinhole magnification; `Uniform` on a rig
