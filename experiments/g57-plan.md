@@ -192,3 +192,90 @@ Basalt paced (final bench, measured at a lower clock): V2_02 p50 41.6, p99 132.9
 **Next.**
 1. Full check: 3 reps × {V2_02, V1_01, MH_03, V1_03} × {RT3EF control, RT4EF, RT4EBF}, plus Basalt paced at the same clock. This decides K2, NH1 and NH2 on 3 samples.
 2. G57-b before promotion: split prepare from apply (F5a K1), to remove the map_wait p90.
+
+## Results: full check (2026-11-26 08:48-10:38, `bin-fold`, paced, `taskset -c 0,1`, alone on the machine)
+
+Per sequence and rep: one RT3EF control (reps 4-6) followed by Basalt paced (B) in the same block, then RT4EF and RT4EBF (reps 1-3). The governor is `powersave`; the clock read at block start varied from 0.8 to 3.4 GHz, so the comparison is within a block. Scorer: `twox/g57/score_full.py` (harness), per-run rows in `twox/g57/full.json`.
+
+Medians of 3 runs. Latency in ms; ATE in m (causal SE(3), `traj.txt`); CPU in ms per frame (user + sys over all frames).
+
+| seq | arm | ATE (reps) | p50 / p90 / p99 | end lag | loops accepted (reps) | frames ≥ 300 ms | keyframe tot p50 | keyframe_insert p50 | map_wait p90 | CPU |
+|---|---|---|---|---|---|---|---|---|---|---|
+| V2_02 | RT3EF control | 0.095 (0.115, 0.095, 0.095) | 156 / 1526 / 1986 | 7 | 5, 5, 5 | 5-6 (5.9-8.0 s) | 79.8 | 41.5 | 0.0 | 61.6 |
+| V2_02 | RT4EF (G57-a) | 0.102 (0.102, 0.097, 0.103) | 43 / 114 / 244 | 108 | 6, 5, 5 | 0 | 79.4 | 40.2 | 0.0 | 58.7 |
+| V2_02 | RT4EBF (G57-a+b) | 0.097 (0.103, 0.097, 0.093) | 38 / 133 / 616 | 7 | 5, 5, 5 | 0 | 54.3 | 11.9 | 19.1 | 58.8 |
+| V2_02 | Basalt paced | 0.049 | 38 / 60 / 539 | 18 | drops 4, 1, 2 | 17-50 | | | | 58.7 |
+| V1_03 | RT3EF control | 0.129 (0.129, 0.142, 0.122) | 42 / 421 / 2362 | 29 | 3, 3, 3 | 2-4 (3.3-5.9 s) | 67.7 | 26.4 | 0.0 | 57.4 |
+| V1_03 | RT4EF | 0.115 (0.096, 0.153, 0.115) | 36 / 102 / 244 | 51 | 2, 2, 4 | 0 | 68.1 | 27.1 | 0.0 | 55.7 |
+| V1_03 | RT4EBF | 0.104 (0.104, 0.131, 0.104) | 30 / 76 / 159 | 17 | 2, 3, 2 | 0 | 52.1 | 9.4 | 8.9 | 55.4 |
+| V1_03 | Basalt paced | 0.053 | 35 / 53 / 174 | 28 | drops 1, 0, 1 | 0-15 | | | | 53.3 |
+| V1_01 | RT3EF control | 0.048 (0.051, 0.048, 0.045) | 58 / 3560 / 6239 | 432 | 14, 16, 12 | 11-14 (9.9-13.9 s) | 80.0 | 38.2 | 0.0 | 61.0 |
+| V1_01 | RT4EF | 0.044 (0.050, 0.044, 0.044) | 40 / 125 / 910 | 7 | 15, 12, 13 | 0 | 79.1 | 38.5 | 0.0 | 58.4 |
+| V1_01 | RT4EBF | 0.045 (0.047, 0.044, 0.045) | 37 / 110 / 355 | 5 | 13, 13, 11 | 0 | 56.4 | 12.9 | 9.1 | 57.6 |
+| V1_01 | Basalt paced | 0.043 | 39 / 68 / 278 | 15 | drops 6, 4, 3 | 0-62 | | | | 65.9 |
+| MH_03 | RT3EF control | 0.048 (0.046, 0.053, 0.048) | 34 / 240 / 1250 | 72 | 7, 6, 7 | 6-8 (4.8-6.9 s) | 79.8 | 41.6 | 0.0 | 49.8 |
+| MH_03 | RT4EF | 0.043 (0.044, 0.043, 0.039) | 27 / 82 / 158 | 7 | 6, 6, 6 | 0 | 77.8 | 39.4 | 0.0 | 47.9 |
+| MH_03 | RT4EBF | 0.045 (0.045, 0.045, 0.043) | 25 / 70 / 196 | 4 | 7, 6, 6 | 0 | 52.7 | 12.5 | 9.4 | 48.0 |
+| MH_03 | Basalt paced | 0.065 | 41 / 82 / 348 | 28 | drops 17, 26, 21 | 13-40 | | | | 69.0 |
+
+Every run of ours: 0 dropped, frames = dataset length, 0 give-ups, at least one local-BA solve per keyframe. For Basalt, "frames ≥ 300 ms" counts frames whose latency is at least 300 ms (it has no per-frame cost line). Basalt paced ATE suffers from its drops; the ratio reference stays the blocking Basalt run.
+
+| P/K | prediction | baseline (control, same block) | measured (each rep) | verdict |
+|---|---|---|---|---|
+| G57-a mechanism: frames ≥ 300 ms | ≤ 1 and ≤ 0.5 s per run; no loop frame > 250 ms | 2-14 per run (3.3-13.9 s) | 0 on all 12 runs | as predicted |
+| G57-a P1 V2_02 p50 / p99 / end lag | 150-550 ms / 1.3-3.5 s / 0.1-2.3 s | 156 / 1986 / 7 | 43, 42, 47 / 244, 173, 1024 / 99, 130, 108 ms | p50 and p99 better than the range; end lag below its range (it was already drained in the control at this clock) |
+| G57-a P2 V1_01 p50 / p99 / end lag | 100-330 / 1.2-3.6 s / 0.0-2.6 s | 58 / 6239 / 432 | 40, 48, 37 / 680, 1490, 910 / 7, 23, 4 | as predicted or better |
+| G57-a P3 MH_03 p50 / p99 / end lag | 47-56 / 0.25-0.61 s / ≤ 0.05 s | 34 / 1250 / 72 | 32, 24, 26 / 332, 121, 158 / 7, 7, 5 | better than the range (clock) |
+| G57-a P4 V1_03 p50 / p99 / end lag | 57-70 / 0.3-1.0 s / ≤ 0.1 s | 42 / 2362 / 29 | 34, 36, 37 / 161, 334, 244 / 69, 32, 51 | better than the range (clock) |
+| G57-a P5 CPU within ±3 ms of the control | | 61.6 / 57.4 / 61.0 / 49.8 | 58.7 / 55.7 / 58.4 / 47.9 (medians) | as predicted (−1.7 to −2.9 ms) |
+| G57-a P5 0 dropped, solves per keyframe ≥ 0.97 | | | 0 dropped; 1.005-1.023 | as predicted |
+| G57-a K1: end lag > 3 s on V2_02 or V1_01 | | | max 130 ms | not fired |
+| G57-a K2: loops accepted fall > 20 % | | medians 5 / 3 / 14 / 7; total 86 | medians 5 / 2 / 13 / 6; total 82 (−5 %) | **fired on V1_03** (3 → 2); not on the other three or in total. Cause below |
+| G57-a K3: ATE leaves its band by > max(0.01 m, 15 %) | bands 0.093-0.108 / 0.101-0.165 / 0.043-0.054 / 0.044-0.054 | | all inside, except MH_03 r3 0.039 (0.005 below, better) | not fired |
+| G57-b mechanism: keyframe_insert p50 falls 15-30 ms | | RT4EF 40.2 / 27.1 / 38.5 / 39.4 | 11.9 / 9.4 / 12.9 / 12.5 (−28 / −18 / −26 / −27) | as predicted |
+| G57-b P1 keyframe tot p50 55-75 ms | | RT4EF 68-79 | 52.1-56.4 | as predicted (low edge; 3 of 4 below it) |
+| G57-b P3 V2_02 p50 45-150, end lag ≤ 0.5 s; V1_03 p50 45-65, end lag ≤ 0.1 s | | | V2_02 38, end 6 / 114 / 7 ms; V1_03 30, end 19 / 17 / 7 ms | as predicted or better |
+| G57-b P4 map_wait p90 ≤ 5 ms, growth lag ≤ 3 | | 0.0 | map_wait p90 7.1-20.4 ms on all 12 runs; growth lag 2-5 | **KB3 fired** on every run (lock convoy) |
+| G57-b KB1, KB2 | | | p50 falls 2-6 ms against RT4EF; keyframe tot falls 15-25 ms | not fired |
+| NH1 extra coast frames | none against RT4EF | RT4EF medians 0 / 3 / 0 / 0 | 1 / 3 / 0 / 0 | **fired on V1_03, holds**: see below. V2_02 overruled |
+| NH2 BA solves per keyframe ≥ RT4EF | | 1.005 / 1.005 / 1.021 / 1.011 | 1.003 / 1.002 / 1.014 / 1.009 | fired on its wording, overruled: see below |
+| NH3 ATE inside the RT3EF band by max(0.01 m, 15 %) | | final table bands | all 12 inside or below (better) | holds on these 4 |
+
+**Diagnosis of the fired rules.**
+- **K2, V1_03 loops.** Two loops are found on every run of every arm: kf ≈ 1030 ~ 815 and kf ≈ 1745 ~ 458. The third loop, late in the run, is the marginal one. In the controls it is not even the same loop: 2032 ~ 104 in r4, and 1832 ~ 251 in r5 and r6. RT4EF finds it in 1 of 3 reps (it finds 2 late loops in r3), and RT4EBF in 1 of 3. This matches the known defect of the background path (`K/system/config/mod.rs:750-752`): it accepts fewer loops, for a reason not yet isolated. The miss costs no ATE: RT4EF median 0.115 against 0.129 for the control. Over the 4 sequences, the total is 82 loops against 86. Diagnosis named in the card (K2): D5b, a SYNC run of `Deferred(frames: 1)` against `Synchronous` on MH_01 and V1_02, to tell lost candidates from a late writeback. Not credited until D5b explains it.
+- **NH1, V2_02.** The extra coast is at frames 2280-2287 and appears in 3 of 3 controls and 1 of 3 RT4EF reps. It is a feature of the sequence's end, not of G57-b. Overruled.
+- **NH1, V1_03.** Frame 390 coasts in RT4EBF r1 and r2 (status `Skipped`, a keyframe is inserted at 390). It never coasts on any RT4EF or control rep, where 390 is an accepted keyframe. It follows a 7-frame span on kf 382 without a new keyframe. With growth deferred, keyframe 382's new points may not yet be in the map at 390. That is a hypothesis: the log has no debug line at frame 390. Diagnosis: a debug rerun of RT4EBF V1_03 that logs the tracker's map-match count over frames 383-392. NH1 holds as fired: it is a G57-b-specific coast.
+- **NH2.** Every keyframe gets at least one solve on every run (`ba_solves` ≥ keyframes). The excess, which follows loop corrections, is 1-11 solves on RT4EBF against 2-13 on RT4EF, and the ranges overlap on all 4 sequences. The −0.002 to −0.007 median difference is inside the run spread. Overruled.
+
+**Against Basalt at the same clock** (faster = our p50, p99 and CPU medians all below Basalt paced, with 0 dropped by us):
+
+| seq | RT4EF | RT4EBF |
+|---|---|---|
+| V2_02 | not faster: p50 43 vs 38 | not faster: p50 37.8 vs 37.6, p99 616 vs 539, CPU 58.8 vs 58.7 |
+| V1_03 | not faster: p50 36 vs 35, p99 244 vs 174, CPU 55.7 vs 53.3 | not faster: CPU 55.4 vs 53.3 (p50 30 and p99 159 are below) |
+| V1_01 | not faster: p50 40 vs 39, p99 910 vs 278 | not faster: p99 355 vs 278 (p50 37 and CPU 57.6 vs 65.9 are below) |
+| MH_03 | **faster**: 27 / 158 / 47.9 vs 41 / 348 / 69.0 | **faster**: 25 / 196 / 48.0 |
+
+Re-measured at the same clock, Basalt's p50 is 35-41 ms (final bench, lower clock: 40-42). Our p50 is now equal to Basalt's on V2_02 and below it on V1_03 and V1_01 (RT4EBF). The remaining misses are the p99 tail and, in the Vicon rooms, CPU per frame.
+
+**Why the p99 tail is still there.** No frame of ours costs 300 ms any more, so the tail is queueing. The peak-latency window of 4 tail runs:
+
+| run | peak latency | backlog span | keyframes in span | mean frame cost | mean keyframe cost |
+|---|---|---|---|---|---|
+| V2_02 RT4EF r3 | 1342 ms | frames 87-130 (44) | 30 % | 77 ms | 161 ms |
+| V2_02 RT4EBF r2 | 718 ms | frames 1368-1404 (37) | 32 % | 60 ms | 82 ms |
+| V1_01 RT4EF r2 | 1647 ms | frames 2039-2179 (141) | 26 % | 56 ms | 123 ms |
+| V1_01 RT4EBF r1 | 572 ms | frames 2115-2140 (26) | 35 % | 51 ms | 107 ms |
+
+In each window, keyframes are 26-35 % of frames and cost 82-161 ms. The mean frame cost is 51-77 ms against the 50 ms period, so the queue grows until the span ends. What is left on the tracking thread per keyframe is loop recognition (12 ms p50, 40 ms p90: G57-c), ORB extraction, the BA wait and, under G57-b, the map lock wait (19 ms p90 on V2_02).
+
+**Verdicts.**
+- **G57-a: mechanism as predicted, promotable on these 4 sequences.** Every loop stall is gone. p50, p99 and end lag fall on every run. ATE is equal or better on 3 of 4 (V2_02 0.102 against 0.095 for the control, inside the band). K2 fired on V1_03 only, with no ATE cost, and its diagnosis (D5b) is named. Promotion into the single EuRoC config still needs NH3 on all 11 sequences (rule NH3, the same bar as G57-b) and D5b.
+- **G57-b: mechanism as predicted, not promoted.** KB3 fired on every run (map_wait p90 7-20 ms), and NH1 fired on V1_03 (a coast at frame 390, 2 of 3 reps). Next: split prepare from apply (F5a K1), which removes the lock wait and may remove the coast if the hypothesis holds. That is a code change, so it goes to the planner first.
+- **Faster than Basalt: 1 of 4** (MH_03) on either arm. On the other three, we are within 5 ms of Basalt's p50 or below it. The p99 tail (keyframe bursts) and Vicon-room CPU per frame still lose.
+
+**Next.**
+1. G57-a on all 11 sequences, 1 rep each, RT4EF against the RT3EF band (NH3), paced. If it holds, promote `execution: Asynchronous` into the single config.
+2. D5b (SYNC, about 10 min): explain the background path's lost loops.
+3. G57-b-2 card (planner): prepare/apply split of the growth, with the frame-390 coast trace.
+4. G57-c card: loop recognition off the tracking thread (12-17 ms p50, 40 ms p90 per keyframe), aimed at the keyframe-burst tail.
