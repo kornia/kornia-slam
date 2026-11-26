@@ -4,7 +4,6 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::inertial::VibaWindow;
 use crate::inertial::still::RUN_CHUNK_SEC;
 use crate::inertial::trust::ImuTrustMode;
 use crate::initialization::two_view::TwoViewInitConfig;
@@ -538,11 +537,6 @@ pub enum SnapbackFix {
 #[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct InertialConfig {
     pub sample_interpolation: SampleInterpolation,
-    /// Keyframes the VIBA solves cover (card J4).
-    pub viba_window: VibaWindow,
-    /// Multiple of the median edge velocity cost above which a VIBA edge is
-    /// dropped and the solve repeated (card J1); `0.0` is off.
-    pub viba_velocity_gate: f64,
 }
 
 /// Local mapping (keyframe insertion, culling and local BA / VI-BA).

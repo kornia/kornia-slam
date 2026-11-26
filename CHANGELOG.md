@@ -124,11 +124,6 @@ has been scored on a benchmark sequence yet.
   step inside the cost tolerance, as kornia-3d's generic solver does.
 - `tracking_loss.reseed.min_cold_start_points` (`50`): fewest stereo points
   that seed a map from a cold start (card I).
-- `inertial.viba_window` (`All`): `VisualOnly` keeps keyframes inserted while
-  lost out of every VIBA solve and of the VIBA0 readiness count (card J).
-- `inertial.viba_velocity_gate` (`0.0`, off): drops the VIBA edges whose
-  velocity cost exceeds this multiple of the median, at most a quarter of the
-  edges, then one re-solve (card J).
   **Breaking (library):** `ImuInitResult::velocities_world` is now
   `keyframe_velocities` plus `gated_edges`; `ImuInitConfig` gains two fields;
   `InertialConfig` loses `Eq`; `ImuInitializer::inertial_optimizer` is private.

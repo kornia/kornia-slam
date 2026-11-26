@@ -76,13 +76,6 @@ impl InertialState {
         }
     }
 
-    /// Sets which keyframes VIBA solves cover and its velocity gate (card J).
-    pub(crate) fn with_viba(mut self, window: VibaWindow, velocity_gate: f64) -> Self {
-        self.initializer.config.viba_window = window;
-        self.initializer.config.viba_velocity_gate = velocity_gate;
-        self
-    }
-
     /// Inserts samples in time order, then drops those more than
     /// [`MAX_BUFFERED_SEC`] older than the latest image (the newest sample
     /// before the first image). Samples more than that ahead of the latest
@@ -400,17 +393,13 @@ mod tests {
     }
 
     #[test]
-    fn the_viba_knobs_default_off_and_with_viba_sets_both() {
+    fn the_viba_knobs_default_off() {
         let config = &InertialState::new().initializer.config;
         assert_eq!(config.min_keyframes, 10);
         assert_eq!(config.min_time_sec, 1.0);
         assert_eq!(config.min_motion, 0.05);
         assert_eq!(config.viba_window, VibaWindow::All);
         assert_eq!(config.viba_velocity_gate, 0.0);
-
-        let state = InertialState::new().with_viba(VibaWindow::VisualOnly, 10.0);
-        assert_eq!(state.initializer.config.viba_window, VibaWindow::VisualOnly);
-        assert_eq!(state.initializer.config.viba_velocity_gate, 10.0);
     }
 
     /// A refused alignment must not be reported as applied, nor change the

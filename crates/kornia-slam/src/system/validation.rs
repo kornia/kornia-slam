@@ -166,11 +166,6 @@ impl OrbSlamPipeline {
             FrontendConfig::Orb(orb) => validate_lock_free_flow(orb, &self.tracking)?,
         }
         check(
-            "inertial.viba_velocity_gate",
-            self.inertial.viba_velocity_gate,
-            NON_NEGATIVE,
-        )?;
-        check(
             "mapping.growth_min_baseline_ratio",
             self.mapping.growth_min_baseline_ratio,
             NON_NEGATIVE,
