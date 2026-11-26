@@ -5,6 +5,7 @@
 use std::fmt::Write as _;
 
 use crate::mapping::calibration_states::{Calibration, Layout};
+#[cfg(test)]
 use crate::mapping::global_vi_ba::CalibrationEstimate;
 use crate::mapping::map::ImuFactor as MapImuFactor;
 use crate::system::OnlineCalibrationConfig;
@@ -29,7 +30,8 @@ pub(crate) struct OnlineCalibrationState {
 
 impl OnlineCalibrationState {
     /// The solved values in the offline report's shape (one slice per camera);
-    /// `None` before any ungated solve.
+    /// `None` before any ungated solve; the calibration tests read it.
+    #[cfg(test)]
     pub(crate) fn estimate(&self) -> Option<CalibrationEstimate> {
         (self.solves > 0).then(|| self.calibration().estimate(&self.layout()))
     }
@@ -38,6 +40,7 @@ impl OnlineCalibrationState {
         Layout::online(&self.config, self.cameras)
     }
 
+    #[cfg(test)]
     fn calibration(&self) -> Calibration {
         Calibration {
             values: self.values.clone(),
