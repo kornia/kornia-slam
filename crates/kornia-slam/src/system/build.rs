@@ -173,7 +173,6 @@ impl LocalBaConfig {
             fisheye_weight: FisheyeWeight::Uniform,
             merge: self.merge,
             lost_keyframes: self.lost_keyframes,
-            visual_kernel: self.visual_kernel,
             large_window: self.large_window,
             online_calibration: self.online_calibration,
             initial_lambda: self.initial_lambda,
