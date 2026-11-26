@@ -53,8 +53,6 @@ run unchanged. Built, not validated: no benchmark has run on them. Not built:
 `frontend.keyframe_orb: Mapping` stops with `todo!`.
 - `frontend.flow_threads` (`1`): threads the flow step runs on, the tracking
   thread included; 1, the rig's camera count or one more, at most 4.
-- `frontend.flow_first_core` (`None`): pins the flow workers from this core on;
-  read only in builds with the new `pin_threads` feature.
 - `frontend.klt_rig` (`PrimaryOnly`): `AllCameras` tracks every rig camera, so
   a rig frame can be tracked from flow alone.
 - `frontend.klt_kernel: WindowedU8`: window-only fixed-point LK from the
@@ -93,8 +91,8 @@ run unchanged. Built, not validated: no benchmark has run on them. Not built:
   the clock offset, a rotation and a focal scale per camera, and the gyro
   intrinsics online; camera 0's rotation is the IMU-camera extrinsic inside the
   IMU residual. Needs the IMU.
-- Cargo features `bench_internals`, `opencv_bench` and `pin_threads`, for the
-  kernel benches and the flow-worker pinning.
+- Cargo features `bench_internals` and `opencv_bench`, for the kernel
+  benches.
 - Two untested run files for the robot test, `configs/pr180-frontend-1ms.ron`
   (the Orin 2-core frontend preset) and `configs/pr180-full.ron` (the same plus
   the estimator and recovery settings below).

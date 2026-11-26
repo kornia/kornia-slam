@@ -3772,7 +3772,6 @@ fn rig_flow_settings(settings: &SystemSettings) -> RigFlowSettings {
     let unpredicted = (default.max_level, default.max_iter);
     RigFlowSettings {
         threads: flow.threads,
-        first_core: flow.first_core,
         window: flow.window,
         predicted: settings.klt_prediction.unwrap_or(unpredicted),
         unpredicted,

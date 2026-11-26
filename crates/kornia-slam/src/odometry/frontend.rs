@@ -49,7 +49,6 @@ fn settings(tuning: &OdometryTuning) -> RigFlowSettings {
     let search = (tuning.klt_levels, tuning.klt_iterations);
     RigFlowSettings {
         threads: 1,
-        first_core: None,
         window: tuning.klt_window,
         predicted: search,
         unpredicted: search,

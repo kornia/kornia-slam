@@ -33,7 +33,6 @@ serde = { version = "1", features = ["derive"], optional = true }
 # version kornia-rs pins.
 wide = "1.4"
 opencv = { version = "0.100", optional = true }
-core_affinity = { version = "0.8", optional = true }
 
 [dev-dependencies]
 criterion = "0.8"
@@ -45,8 +44,6 @@ serde = ["dep:serde", "dep:ron", "kornia-sensors/serde"]
 bench_internals = []
 # OpenCV arms of the kernel benches.
 opencv_bench = ["dep:opencv"]
-# Pins the flow workers to `frontend.flow_first_core` onwards.
-pin_threads = ["dep:core_affinity"]
 
 [package.metadata.docs.rs]
 features = ["serde"]

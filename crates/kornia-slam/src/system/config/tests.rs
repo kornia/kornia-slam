@@ -876,7 +876,6 @@ fn with_frontend(frontend: OrbFrontendConfig, cameras: CameraSelection) -> Syste
 fn the_flow_knobs_default_to_todays_frontend() {
     let frontend = OrbFrontendConfig::default();
     assert_eq!(frontend.flow_threads, 1);
-    assert_eq!(frontend.flow_first_core, None);
     assert_eq!(frontend.klt_rig, KltRig::PrimaryOnly);
     assert_eq!(frontend.klt_kernel, LkKernel::FixedPointU8);
     assert_eq!(frontend.klt_window, 21);

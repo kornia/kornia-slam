@@ -185,9 +185,6 @@ pub struct OrbFrontendConfig {
     /// Threads the flow step runs on, the tracking thread included: 1, the
     /// rig's camera count, or one more (see `FlowPool`).
     pub flow_threads: usize,
-    /// Core the first flow worker is pinned to, the rest following; read only
-    /// in builds with the `pin_threads` feature.
-    pub flow_first_core: Option<usize>,
     /// Which rig cameras optical flow tracks.
     pub klt_rig: KltRig,
     /// LK window side, odd; the f32 kernel supports 21 only.
@@ -396,7 +393,6 @@ impl Default for OrbFrontendConfig {
             secondary_n_keypoints: None,
             klt_kernel: LkKernel::FixedPointU8,
             flow_threads: 1,
-            flow_first_core: None,
             klt_rig: KltRig::default(),
             klt_window: 21,
             klt_retry: KltRetry::default(),
@@ -1035,9 +1031,6 @@ fn write_flow_knobs(f: &mut fmt::Formatter<'_>, frontend: &OrbFrontendConfig) ->
     }
     if frontend.flow_threads != default.flow_threads {
         writeln!(f, "  flow threads: {}", frontend.flow_threads)?;
-    }
-    if let Some(core) = frontend.flow_first_core {
-        writeln!(f, "  flow workers pinned from core {core}")?;
     }
     if frontend.klt_rig != default.klt_rig {
         writeln!(f, "  klt rig: {:?}", frontend.klt_rig)?;

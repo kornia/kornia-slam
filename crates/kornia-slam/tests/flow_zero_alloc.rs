@@ -98,7 +98,6 @@ fn shift(frame: usize) -> [i64; 2] {
 fn settings(threads: usize) -> RigFlowSettings {
     RigFlowSettings {
         threads,
-        first_core: None,
         window: 11,
         predicted: (0, 8),
         unpredicted: (0, 8),

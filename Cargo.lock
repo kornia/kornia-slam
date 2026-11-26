@@ -2243,17 +2243,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "core_affinity"
-version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a034b3a7b624016c6e13f5df875747cc25f884156aad2abd12b6c46797971342"
-dependencies = [
- "libc",
- "num_cpus",
- "winapi",
-]
-
-[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6181,7 +6170,6 @@ dependencies = [
 name = "kornia-slam"
 version = "0.2.0"
 dependencies = [
- "core_affinity",
  "criterion",
  "faer 0.22.6",
  "kornia-3d",

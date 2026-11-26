@@ -1,6 +1,6 @@
 //! Long-lived flow workers, one shard each, joined every frame (plan section
-//! 3). Not rayon: `rayon::scope` allocates per frame, cannot pin, and shares
-//! the global pool ORB runs on.
+//! 3). Not rayon: `rayon::scope` allocates per frame and shares the global
+//! pool ORB runs on.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
@@ -24,8 +24,6 @@ pub enum FlowPoolError {
     Spawn(#[from] std::io::Error),
     #[error("flow worker {0} is gone")]
     WorkerGone(usize),
-    #[error("core {0} could not be pinned")]
-    Pin(usize),
     #[error("a flow frame is still shared after the join")]
     FrameShared,
     #[error("flow frame: {0}")]
@@ -77,18 +75,11 @@ pub(crate) struct FlowPool {
 
 impl FlowPool {
     /// `threads - 1` named workers `klt-flow-<n>`; `threads == 1` spawns nothing.
-    pub(crate) fn new(threads: usize, first_core: Option<usize>) -> Result<Self, FlowPoolError> {
-        if first_core.is_some() && !cfg!(feature = "pin_threads") {
-            eprintln!(
-                "kornia-slam: frontend.flow_first_core is set, but this build has no pin_threads \
-                 feature; flow workers are not pinned"
-            );
-        }
+    pub(crate) fn new(threads: usize) -> Result<Self, FlowPoolError> {
         let threads = threads.max(1);
         let mut workers = Vec::with_capacity(threads - 1);
         for n in 1..threads {
-            let core = first_core.map(|first| first + n - 1);
-            workers.push(FlowWorker::spawn(n, core)?);
+            workers.push(FlowWorker::spawn(n)?);
         }
         Ok(Self {
             threads,
@@ -163,18 +154,13 @@ impl FlowPool {
 }
 
 impl FlowWorker {
-    /// Starts worker `n`, pinned to `core` when given; waits until it runs.
-    fn spawn(n: usize, core: Option<usize>) -> Result<Self, FlowPoolError> {
+    /// Starts worker `n`; waits until it runs.
+    fn spawn(n: usize) -> Result<Self, FlowPoolError> {
         let (jobs, inbox) = sync_channel::<FlowJob>(1);
         let (outbox, done) = sync_channel::<FlowJob>(1);
-        let (ready_tx, ready) = sync_channel::<bool>(1);
         let handle = std::thread::Builder::new()
             .name(format!("klt-flow-{n}"))
             .spawn(move || {
-                let pinned = core.is_none_or(pin_current_thread);
-                if ready_tx.send(pinned).is_err() || !pinned {
-                    return;
-                }
                 // The first blocking receive on `done` grows std's waker
                 // list; spend it here, not in a warm step's join.
                 std::thread::sleep(WARM_RECEIVE_DELAY);
@@ -193,11 +179,6 @@ impl FlowWorker {
                     }
                 }
             })?;
-        match ready.recv() {
-            Ok(true) => {}
-            Ok(false) => return Err(FlowPoolError::Pin(core.unwrap_or_default())),
-            Err(_) => return Err(FlowPoolError::WorkerGone(n)),
-        }
         let job = done.recv().map_err(|_| FlowPoolError::WorkerGone(n))?;
         Ok(Self {
             jobs,
@@ -244,18 +225,6 @@ impl FlowWorker {
         self.job = Some(job.ok_or(FlowPoolError::WorkerGone(n))?);
         Ok(())
     }
-}
-
-/// Pins the calling thread to `core`; `false` when the OS refuses.
-#[cfg(feature = "pin_threads")]
-fn pin_current_thread(core: usize) -> bool {
-    core_affinity::set_for_current(core_affinity::CoreId { id: core })
-}
-
-/// Without `pin_threads` the deployment confines the process instead.
-#[cfg(not(feature = "pin_threads"))]
-fn pin_current_thread(_core: usize) -> bool {
-    true
 }
 
 impl Drop for FlowPool {

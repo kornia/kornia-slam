@@ -541,7 +541,6 @@ pub enum RefillCameras {
 pub struct RigFlowSettings {
     /// Flow threads, the calling thread included.
     pub threads: usize,
-    pub first_core: Option<usize>,
     /// LK window side, odd.
     pub window: usize,
     /// `(max_level, max_iter)` from a trusted prediction.
@@ -565,7 +564,6 @@ impl RigFlowSettings {
         let unpredicted = (default.max_level, default.max_iter);
         Self {
             threads: frontend.flow_threads,
-            first_core: frontend.flow_first_core,
             window: frontend.klt_window,
             predicted: frontend.klt_prediction.search().unwrap_or(unpredicted),
             unpredicted,
@@ -654,7 +652,7 @@ impl RigFlow {
         settings: RigFlowSettings,
         cameras: Vec<RigFlowCamera>,
     ) -> Result<Self, FlowPoolError> {
-        let pool = FlowPool::new(settings.threads, settings.first_core)?;
+        let pool = FlowPool::new(settings.threads)?;
         let shards = (0..pool.threads())
             .map(|index| FlowShard {
                 index,
@@ -1213,7 +1211,6 @@ mod tests {
     fn rig_flow(gyro_guess: GyroGuess) -> RigFlow {
         let settings = RigFlowSettings {
             threads: 1,
-            first_core: None,
             window: 11,
             predicted: (0, 8),
             unpredicted: (0, 8),

@@ -76,7 +76,6 @@ pub(crate) struct SystemSettings {
 #[allow(dead_code)] // skeleton: lane T reads the rest
 pub(crate) struct FlowSettings {
     pub threads: usize,
-    pub first_core: Option<usize>,
     pub rig: KltRig,
     pub window: usize,
     pub retry: KltRetry,
@@ -93,7 +92,6 @@ impl FlowSettings {
     fn new(frontend: &OrbFrontendConfig) -> Self {
         Self {
             threads: frontend.flow_threads,
-            first_core: frontend.flow_first_core,
             rig: frontend.klt_rig,
             window: frontend.klt_window,
             retry: frontend.klt_retry,
