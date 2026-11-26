@@ -1,6 +1,6 @@
 # G57: real time on 2 cores (latency against Basalt)
 
-Status: card written 2026-11-26, not yet reviewed by the owner, nothing run. Paths: `K` = `crates/kornia-slam/src`; the harness lives outside the repo.
+Status: card written 2026-11-26 and reviewed by the owner (answers below). The screen is running. Paths: `K` = `crates/kornia-slam/src`; the harness lives outside the repo.
 
 ## Evidence (final tip bench, reps 2-3 of the FOLDF-RT3E runs, per-frame `[i] status … tot= lat=` lines in err.log)
 
@@ -110,7 +110,43 @@ Run order:
   - Tracking load on V2_02 falls from about 0.87 to about 0.67.
 - **G57-c:** loop verification off the tracking thread (12-17 ms p50, 46 ms p90 per keyframe; card F5b).
 
-## Open questions for the owner
+## Owner answers (2026-11-26)
+1. Asynchronous loop closing is acceptable: a correction may land 1-4 s after acceptance.
+2. "0 dropped" stays a rule for us. The bar is Basalt's paced latency as measured, with its drops.
+3. Screen first: V2_02 and V1_03, one rep per arm, with an RT3EF control at the same clock. The full 3 × 4 check follows only if the screen passes.
+4. G57-b stacks in this card after G57-a. It must not hurt the other tests (rules below).
+
+## Experiment: G57-b, keyframe growth on the mapping thread (stacked on G57-a)
+```
+Gap tested: G57      Base: G57-a (arm RT4EF)      Binary tag: bin-fold (md5 aefd2aca…), arm RT4EBF
+Mechanism: after G57-a, a keyframe frame still costs 85-100 ms p50 against a 50 ms period. Growth (triangulation and forward fusion,
+  K/mapping/keyframe_mapping.rs:330-397) is 23-37 ms of it, run inside insert_keyframe on the tracking thread (K/system/mod.rs:3475-3498).
+  Keyframes are 27-28 % of frames on V2_02 and V1_03, so tracking load without loops is 0.86-0.88 of real time.
+Theory: ORB-SLAM3 runs CreateNewMapPoints and SearchInNeighbors on the local-mapping thread, outside mMutexMapUpdate
+  (LocalMapping.cc:101-108). The F5a lock audit (euroc-top1-card.md, "F5a lock audit") shows every append is safe against tracking.
+Knob: mapping: ( keyframe_growth: Mapping ). Exists (F5a); default Tracking = today. No library code.
+Baselines: the RT4EF screen runs (same clock), and the RT3EF control.
+Predictions:
+  P1 keyframe-frame tot p50: 85-100 -> 55-75 ms (V2_02, V1_03)              measured by: per-frame [i] lines, keyframe frames
+  P2 tracking wall / sensor time without loop frames: 0.86-0.88 -> 0.62-0.75 (V2_02)
+  P3 V2_02 latency p50 -> 45-150 ms, end lag <= 0.5 s; V1_03 p50 -> 45-65 ms, end lag <= 0.1 s
+  P4 map_wait_ms p90 <= 5 ms; growth_lag_frames_max <= 3
+  Mechanism counter: keyframe_insert p50 (or the growth share of tot) falls by 15-30 ms on the tracking thread.
+Kill rules:
+  KB1 keyframe-frame tot falls >= 15 ms but end lag or p50 does not move beyond the RT4EF screen run -> the rest of the backlog
+     is elsewhere (ORB on keyframes, loop recognition 12-17 ms: G57-c). Keep the knob only if the "no harm" rules hold.
+  KB2 latency improves but keyframe-frame tot is unchanged (< 10 ms) -> clock luck or another cause; not credited.
+  KB3 map_wait p90 > 5 ms -> lock convoy; split prepare from apply (F5a K1).
+"No harm" rules (owner: it must not hurt other tests). Any one fails -> G57-b is not promoted:
+  NH1 tracked frames drop by more than 3, or keyframes rise more than 10 %, or any give-up or extra coast frame (F5a K2).
+  NH2 local-BA solves per keyframe fall below the RT4EF run (F5a K3).
+  NH3 ATE inside its band on the screen; then, before promotion, on all 11 sequences: ATE inside the RT3EF 3-rep band
+      (euroc-why-not-basalt.md, final table) by max(0.01 m, 15 %).
+  NH4 knob off is the same binary and the same default config, so the identity trio (IDENT_V102_OK, HEADER_OK, IDENT_R01_OK)
+      and the repo tests do not change; rerun the trio once on the promoted config's binary.
+```
+
+## Open questions for the owner (answered above)
 1. With `Asynchronous`, a loop correction lands 1-4 s after acceptance, and the map jumps at a frame boundary. Is that acceptable for the causal score and for consumers?
 2. Basalt paced drops 1-131 frames per run. Does "0 dropped" bind only us, and is Basalt's latency with drops still the bar?
 3. The full check is about 27 min of serial paced runs plus controls. Does it count as a batch gate, or must it fit the 5-minute rule (screen only)?
