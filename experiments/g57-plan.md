@@ -302,3 +302,37 @@ Every run: 0 give-ups, 0 dropped. V1_02's 22 untracked frames are bootstrap skip
 - **Latency:** p99 falls on every sequence, to 156-685 ms against 392-3894 ms. These are not same-clock pairs, so they are no speed claim.
 
 **Verdict.** On ATE, G57-a passes its promotion bar on all 11. It is held for D5b, since K2 (lost loops) is not yet explained. If D5b shows the loss is late application with no lost information, promote `execution: Asynchronous` into the single EuRoC config.
+
+## Results: D5b (2026-11-26 11:00-11:25, `bin-fold`, SYNC, unpaced, `taskset -c 2-5,8-11`, alone)
+
+Arms (harness `mkcfg.sh`): S0E (`Synchronous`), S0ED (`Deferred(frames: 1)`: inline solve, written back one frame later), S0EA (`Asynchronous`: background solve). Mapping is synchronous in all three. Start 0, rep 7.
+
+| seq | arm | ATE | loops accepted (all applied) | loop pairs (query ~ candidate) |
+|---|---|---|---|---|
+| MH_01 | S0E | 0.0719 | 6 | 2660~1954, 2780~2090, 2900~2469, 3499~3140, 3531~1067, 3606~119 |
+| MH_01 | S0ED | 0.0692 | 5 | 2660~1954, 2780~2090, 2916~2469, 3520~1075, 3597~95 |
+| MH_01 | S0EA | 0.0687 | 5 | 2660~1954, 2777~2097, 2911~2461, 3520~1075, 3597~95 |
+| V1_02 | S0E | 0.0404 | 6 | 751~438, 901~790, 1393~679, 1510~923, 1551~1328, 1681~91 |
+| V1_02 | S0ED | 0.0528 | 6 | 751~438, 907~795, 1340~826, 1390~685, 1551~1328, 1696~91 |
+| V1_02 | S0EA | 0.0360 | 5 | 751~438, 901~789, 1342~828, 1399~685, 1552~1330 |
+| V1_03 | S0E | 0.0716 | 3 | 1039~813, 1820~454, 2049~72 |
+| V1_03 | S0ED | 0.0757 | 3 | 1039~813, 1760~454, 2049~72 |
+| V1_03 | S0EA | 0.0917 | 2 | 1039~813, 1754~458 |
+
+Totals: S0E 15, S0ED 14, S0EA 12 loops.
+
+**D5c, debug pair on V1_03 (S0E and S0EA with `--debug`, same binary).**
+- **Not a lost candidate.** Place recognition returns the same best candidates in both arms over keyframes 2049-2065. The last of them is kf 2065 → kf 72 (score 0.057, 16 candidates). S0E accepts it (81 inliers, `[loop-time] kf=2065 … verify_ms=103.8`). S0EA does not.
+- **Not a solve cut off at the end of the run.** S0EA's last accepted loop (1754~458) is written back at frame 1770, 117 ms after acceptance. Nothing is in flight later.
+- **What differs is the map at the time of the check.** Before kf 2065, S0E has corrected its map with 1820~454 (inline), and S0EA with 1754~458 (written back at frame 1770). The candidate is then rejected by one of four stages, and none of them logs:
+  - geometric verification (`verify_loop_candidate`);
+  - the odometry gate;
+  - the temporal gate;
+  - the episode tracker (`K/loop_closure/closer.rs:541-599`).
+
+**Reading.**
+- **Card prediction (F5b):** "loops accepted within ±1 of Synchronous in SYNC Deferred(1)". As predicted: −1, 0, 0.
+- **After the first timing difference, the loop sets diverge** in both late arms, because each later decision sees a differently corrected map. MH_01 S0ED and S0EA end with the same loops.
+- **The background path loses 2 more loops** (V1_02 1681~91, V1_03 2049~72), both late closures to keyframes from the first seconds of the run. ATE moves both ways: V1_02 −0.004, V1_03 +0.020, on one SYNC run each.
+- **K2 is explained only in part.** The loss is a rejection at acceptance on a map corrected by a different loop. It is not lost recognition and not a cut-off solve. The rejecting stage is not yet known.
+- **Next, D5d (small code):** one debug line per rejected candidate in `accept()`, naming the stage and its value. Then rerun the S0E/S0EA debug pair on V1_03.
