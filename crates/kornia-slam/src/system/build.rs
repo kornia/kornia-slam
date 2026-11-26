@@ -14,6 +14,7 @@ use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabular
 use crate::loop_closure::{LoopCloser, LoopClosingConfig, LoopSolver};
 use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
 use crate::mapping::visual_information::FisheyeWeight;
+use crate::mapping::vi_ba_schur::ImuHuber;
 use crate::mapping::{GrowthNeighbours, KeyframeGrowth, LocalMappingMode};
 use crate::tracking::flow_pool::FlowPoolError;
 use crate::tracking::optical_flow::LkKernel;
@@ -165,7 +166,7 @@ impl LocalBaConfig {
             max_iterations: self.max_iterations,
             boundary_scales_bias_rows: self.boundary_scales_bias_rows,
             boundary: self.boundary,
-            imu_huber: self.imu_huber,
+            imu_huber: ImuHuber::AllEdges,
             depth_sigma,
             visual_information: self.visual_information,
             // Resolved against the rig in `SystemConfig::settings`.

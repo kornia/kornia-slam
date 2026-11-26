@@ -17,7 +17,6 @@ use crate::mapping::global_vi_ba::{
 use crate::mapping::map::{LocalBaMerge, StateEnvelope};
 use crate::mapping::marginalization::BoundaryPrior;
 use crate::mapping::outlier_erase::OutlierErase;
-use crate::mapping::vi_ba_schur::ImuHuber;
 use crate::mapping::visual_information::{FisheyeWeight, VisualInformation};
 use crate::mapping::{GrowthNeighbours, KeyframeGrowth, LocalMappingMode};
 use crate::odometry::{Odometry, OdometryImuNoise, OdometryTuning, VisualJacobians};
@@ -587,7 +586,6 @@ pub struct LocalBaConfig {
     pub boundary_scales_bias_rows: bool,
     /// The scaled boundary edge, or a marginal prior in its place.
     pub boundary: BoundaryPrior,
-    pub imu_huber: ImuHuber,
     pub stereo_depth_sigma: StereoDepthSigma,
     /// Reprojection weight by keypoint octave, in VI-BA and in the tracking
     /// PnP gates; with `Disparity` it also scales the stereo depth sigma.
@@ -641,7 +639,6 @@ impl Default for LocalBaConfig {
             initial_lambda: 1.0,
             boundary_scales_bias_rows: true,
             boundary: BoundaryPrior::ScaledEdge,
-            imu_huber: ImuHuber::AllEdges,
             stereo_depth_sigma: StereoDepthSigma::default(),
             visual_information: VisualInformation::default(),
             state_envelope: StateEnvelope::Off,
@@ -916,7 +913,7 @@ impl fmt::Display for SystemConfig {
                 f,
                 "  local BA: {} active keyframes, {} iterations from lambda {}, \
                  boundary IMU scale {} (bias rows {}), \
-                 boundary {:?}, IMU Huber {:?}, depth sigma {:?}, visual information {:?}, \
+                 boundary {:?}, IMU Huber AllEdges, depth sigma {:?}, visual information {:?}, \
                  state envelope {:?}, lost keyframes {:?}, visual kernel {:?}",
                 ba.active_keyframes,
                 ba.max_iterations,
@@ -928,7 +925,6 @@ impl fmt::Display for SystemConfig {
                     "full"
                 },
                 ba.boundary,
-                ba.imu_huber,
                 ba.stereo_depth_sigma,
                 ba.visual_information,
                 ba.state_envelope,

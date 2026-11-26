@@ -1947,12 +1947,11 @@ mod ron_files {
         assert_eq!(orb(&config).keyframes.max_interval_sec, Some(0.5));
 
         let config = parse(
-            "(version: 1, pipeline: OrbSlam((mapping: (local_ba: (active_keyframes: 10, imu_huber: BoundaryOnly, stereo_depth_sigma: Disparity(px: 1.0))))))",
+            "(version: 1, pipeline: OrbSlam((mapping: (local_ba: (active_keyframes: 10, stereo_depth_sigma: Disparity(px: 1.0))))))",
         )
         .unwrap();
         let local_ba = orb(&config).mapping.local_ba;
         assert_eq!(local_ba.active_keyframes, 10);
-        assert_eq!(local_ba.imu_huber, ImuHuber::BoundaryOnly);
         assert_eq!(
             local_ba.stereo_depth_sigma,
             StereoDepthSigma::Disparity { px: 1.0 }

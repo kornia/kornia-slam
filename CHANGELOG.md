@@ -101,8 +101,6 @@ has been scored on a benchmark sequence yet.
 - `mapping.local_ba.large_window` (`Off`): ORB-SLAM3's longer window when the
   keyframe was tracked strongly, `Enabled(min_tracked_inliers, active_keyframes,
   max_iterations, initial_lambda)`.
-- `mapping.local_ba.imu_huber: BoundaryOrRecentInit`: Huber on the boundary edge,
-  and on every IMU edge until VIBA2 has run.
 - `mapping.local_ba.dense_parallelism` (`Global`): `Sequential` factors and
   solves the local VI-BA's reduced system on the calling thread instead of
   faer's global thread pool (card T). **Breaking (library):** `ViBaParams`,
