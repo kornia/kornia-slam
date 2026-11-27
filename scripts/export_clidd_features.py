@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Export CLIDD features for every cam0 image of a EuRoC sequence, for
+"""Export CLIDD features for every image of a EuRoC sequence, for
 kornia-slam's `Precomputed` frontend.
 
     export_clidd_features.py ~/datasets/euroc/MH_01_easy -o MH_01_easy.clidd_l64.kfeat
+    export_clidd_features.py ~/datasets/euroc/MH_01_easy --view left -o MH_01_easy.clidd_l64.left.kfeat
+    export_clidd_features.py ~/datasets/euroc/MH_01_easy --view right -o MH_01_easy.clidd_l64.right.kfeat
 
 Needs torch, kornia (with `kornia.feature.CLIDD`), opencv-python and numpy.
-Keypoints are in pixels of the raw (distorted) cam0 image, as the monocular
-EuRoC source hands images to the system. CLIDD detects on the image resized to a
+Keypoints are in the pixels of the image the system is given: the raw
+(distorted) cam0 image for monocular runs (`--view raw`), and for stereo the
+rectified cam0 and cam1 images (`--view left`, `--view right`), rectified as
+the EuRoC stereo source does it. CLIDD detects on the image resized to a
 multiple of 32 (736 wide for EuRoC's 752), so x is an integer scaled by
 752/736 and y, at 480 rows, an integer.
 
@@ -25,6 +29,7 @@ Little-endian layout, read by `crates/kornia-slam/src/frontend/feature_file.rs`:
 """
 
 import argparse
+import re
 import struct
 import sys
 from pathlib import Path
@@ -37,16 +42,76 @@ MAGIC = b"KSLMFEAT"
 VERSION = 1
 
 
-def cam0_frames(root: Path) -> list[tuple[int, Path]]:
-    """Every (timestamp ns, image path) in mav0/cam0/data.csv, in time order."""
-    cam0 = root / "mav0" / "cam0"
+def camera_frames(root: Path, camera: str) -> list[tuple[int, Path]]:
+    """Every (timestamp ns, image path) in mav0/<camera>/data.csv, in time order."""
+    folder = root / "mav0" / camera
     frames = []
-    for line in (cam0 / "data.csv").read_text().splitlines():
+    for line in (folder / "data.csv").read_text().splitlines():
         if not line.strip() or line.startswith("#"):
             continue
         stamp, name = line.split(",")[:2]
-        frames.append((int(stamp), cam0 / "data" / name.strip()))
+        frames.append((int(stamp), folder / "data" / name.strip()))
     return sorted(frames)
+
+
+def calibration(root: Path, camera: str) -> dict:
+    """K, distortion (k1, k2, p1, p2), size and T_BS from mav0/<camera>/sensor.yaml."""
+    text = (root / "mav0" / camera / "sensor.yaml").read_text()
+    text = re.sub(r"#[^\n]*", "", text)
+
+    def numbers(key: str) -> np.ndarray:
+        found = re.search(rf"^\s*{key}:\s*\[([^\]]*)\]", text, re.MULTILINE)
+        if found is None:
+            raise SystemExit(f"{camera}/sensor.yaml has no {key}")
+        return np.array([float(v) for v in found.group(1).split(",")])
+
+    fu, fv, cu, cv_ = numbers("intrinsics")
+    width, height = (int(v) for v in numbers("resolution"))
+    return {
+        "K": np.array([[fu, 0, cu], [0, fv, cv_], [0, 0, 1]]),
+        "D": numbers("distortion_coefficients"),
+        "size": (width, height),
+        "T_BS": numbers("data").reshape(4, 4),
+    }
+
+
+def rodrigues(v: np.ndarray) -> np.ndarray:
+    return cv2.Rodrigues(np.asarray(v, dtype=np.float64).reshape(3, 1))[0]
+
+
+def rectification_maps(root: Path) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Per-view undistort + rectify remap tables, as kornia-3d's
+    `StereoRectifier::from_calib` builds them from EuRoC's calibration:
+    Bouguet's rotations, a shared focal length (the mean of both cameras' fx
+    and fy) and the principal point at the image centre."""
+    left, right = calibration(root, "cam0"), calibration(root, "cam1")
+    if left["size"] != right["size"]:
+        raise SystemExit("cam0 and cam1 resolutions differ")
+    r_l, t_l = left["T_BS"][:3, :3], left["T_BS"][:3, 3]
+    r_r, t_r = right["T_BS"][:3, :3], right["T_BS"][:3, 3]
+    r_rel = r_r.T @ r_l
+    t_rel = r_r.T @ (t_l - t_r)
+
+    half = rodrigues(-0.5 * cv2.Rodrigues(r_rel)[0].ravel())
+    t = half @ t_rel
+    axis = 0 if abs(t[0]) > abs(t[1]) else 1
+    target = np.zeros(3)
+    target[axis] = 1.0 if t[axis] > 0 else -1.0
+    w = np.cross(t, target)
+    norm = np.linalg.norm(w)
+    if norm > 0:
+        w *= np.arccos(np.clip(abs(t[axis]) / np.linalg.norm(t), -1.0, 1.0)) / norm
+    align = rodrigues(w)
+
+    width, height = left["size"]
+    f = (left["K"][0, 0] + left["K"][1, 1] + right["K"][0, 0] + right["K"][1, 1]) / 4.0
+    rectified = np.array([[f, 0, (width - 1) / 2], [0, f, (height - 1) / 2], [0, 0, 1]])
+    maps = {}
+    for view, calib, rotation in (("left", left, align @ half.T), ("right", right, align @ half)):
+        maps[view] = cv2.initUndistortRectifyMap(
+            calib["K"], calib["D"], rotation, rectified, (width, height), cv2.CV_32FC1
+        )
+    return maps
 
 
 def load_model(variant: str, top_k: int, device: str):
@@ -90,12 +155,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("sequence", type=Path, help="EuRoC sequence root (contains mav0/)")
     parser.add_argument("-o", "--output", type=Path, required=True)
+    parser.add_argument(
+        "--view",
+        choices=["raw", "left", "right"],
+        default="raw",
+        help="raw cam0 images (monocular), or the rectified cam0 / cam1 images (stereo)",
+    )
     parser.add_argument("--variant", default="L64", help="CLIDD variant, 64-D only")
     parser.add_argument("--top-k", type=int, default=1000, help="keypoints per frame")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
-    frames = cam0_frames(args.sequence)
+    frames = camera_frames(args.sequence, "cam1" if args.view == "right" else "cam0")
+    remap = None if args.view == "raw" else rectification_maps(args.sequence)[args.view]
     model = load_model(args.variant, args.top_k, args.device)
     clipped = 0
     with open(args.output, "wb") as out:
@@ -107,6 +179,8 @@ def main() -> int:
             gray = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
             if gray is None:
                 raise SystemExit(f"cannot read {path}")
+            if remap is not None:
+                gray = cv2.remap(gray, *remap, cv2.INTER_LINEAR)
             keypoints, scores, desc = extract(model, gray, args.device)
             if dim is None:
                 dim = desc.shape[1]

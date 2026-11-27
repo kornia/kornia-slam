@@ -52,6 +52,8 @@ pub enum FrontendError {
     KeypointsOutsideImage { timestamp_sec: f64 },
     #[error(transparent)]
     FeatureFile(#[from] FeatureFileError),
+    #[error(transparent)]
+    Stereo(#[from] kornia_3d::stereo::StereoMatchError),
 }
 
 /// Turns one validated image, or rectified stereo pair, into the frame

@@ -398,9 +398,7 @@ mod keyframe_evidence {
 fn precomputed_mono(path: &std::path::Path) -> SystemConfig {
     let mut config = mono();
     let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
-    orb.frontend = FrontendConfig::Precomputed(PrecomputedFrontendConfig {
-        path: path.to_path_buf(),
-    });
+    orb.frontend = FrontendConfig::Precomputed(PrecomputedFrontendConfig::mono(path));
     config
 }
 
@@ -500,4 +498,30 @@ fn precomputed_features_drive_their_own_system() {
             FrontendError::MissingFeatures { .. }
         ))
     ));
+}
+
+#[test]
+fn precomputed_stereo_matches_the_right_views_features() {
+    let descriptor = Clidd([0.125; CLIDD_DIM]);
+    let view = |name, x: f32| {
+        feature_file_tests::write(
+            name,
+            &feature_file_tests::encode(
+                CLIDD_DIM as u32,
+                &[(0, vec![[x, 60.0]], vec![descriptor])],
+            ),
+        )
+    };
+    let (left, right) = (view("stereo-left", 100.0), view("stereo-right", 92.0));
+    let mut config = config(CameraSelection::Stereo, false, LoopClosingMode::Disabled);
+    let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+    orb.frontend =
+        FrontendConfig::Precomputed(PrecomputedFrontendConfig::stereo(&left.0, &right.0));
+    let rig = SensorRig::new(camera()).with_stereo_baseline(0.11);
+
+    let mut system = SlamSystem::build_precomputed(config, rig).unwrap();
+    system
+        .process_stereo(stamp(0), &textured(0), &textured(8))
+        .unwrap();
+    assert_eq!(system.frontend_observation().stereo_matched, Some(1));
 }
