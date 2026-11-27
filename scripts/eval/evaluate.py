@@ -8,7 +8,8 @@ evo does the association, the Umeyama alignment and the APE.
 Output: one JSON line with
   n_est, n_assoc   : estimated poses, and those associated with a ground-truth pose
   total_frames     : cam0 frames with a cam1 partner when cam1/data.csv exists, else all cam0 frames
-  tracked_pct      : n_assoc / total_frames
+  tracked_pct      : n_assoc / total_frames (null when total_frames is 0)
+  assoc_error      : evo's reason when no pose associates (for example no stamp within --max-diff)
   ate_se3_*        : ATE RMSE / mean (m) after SE(3) alignment (scale fixed): the primary number,
                      the ORB-SLAM3 stereo-inertial convention
   ate_sim3_*       : the same after Sim(3) alignment, and its sim3_scale
@@ -39,9 +40,17 @@ GT_FILES = ('mav0/state_groundtruth_estimate0/data.csv', 'mav0/mocap0/data.csv')
 STATUS_LINE = re.compile(r'^\[\s*(\d+)\] \w')
 
 
+class BadInput(SystemExit):
+    """Exit status 2; .reason keeps the message for callers that catch it (score.py)."""
+
+    def __init__(self, reason):
+        super().__init__(2)
+        self.reason = reason
+
+
 def fail(msg):
     print(f'evaluate.py: {msg}', file=sys.stderr)
-    raise SystemExit(2)
+    raise BadInput(msg)
 
 
 def lines(path):
@@ -83,6 +92,11 @@ def status_frame_indices(log):
 
 def load_kornia(seq, path, log):
     rows = [r for r in csv_rows(path) if r[0] != 'idx']
+    if not rows:
+        fail(f'{path}: no poses')
+    short = next((r for r in rows if len(r) < 4), None)
+    if short is not None:
+        fail(f'{path}: row has {len(short)} fields, expected idx,x,y,z')
     frames = status_frame_indices(log)
     if len(rows) != len(frames):
         fail(f'{path} has {len(rows)} rows but {log} has {len(frames)} status lines')
@@ -101,7 +115,12 @@ def load_tum(path):
         line = line.strip()
         if not line or line.startswith('#'):
             continue
-        rows.append([float(x) for x in line.replace(',', ' ').split()[:8]])
+        row = line.replace(',', ' ').split()[:8]
+        if len(row) < 8:
+            fail(f'{path}: row has {len(row)} fields, expected t x y z qx qy qz qw')
+        rows.append([float(x) for x in row])
+    if not rows:
+        fail(f'{path}: no poses')
     a = np.array(rows)
     a = a[np.argsort(a[:, 0])]
     t = a[:, 0] * (1e-9 if a[0, 0] > 1e12 else 1.0)
@@ -180,13 +199,13 @@ def keep_near(traj, stamps_ns, tol=0.005):
 
 
 def associate(gt, est, max_diff):
-    """Associated (gt, est), or None when nothing associates."""
+    """(associated (gt, est) or None, evo's reason when nothing associates)."""
     if est is None:
-        return None
+        return None, None
     try:
-        return sync.associate_trajectories(gt, est, max_diff=max_diff)
-    except sync.SyncException:
-        return None
+        return sync.associate_trajectories(gt, est, max_diff=max_diff), None
+    except sync.SyncException as e:
+        return None, str(e)
 
 
 def evaluate(seq, traj, fmt='tum', log=None, max_diff=0.005, nearest_gt=False, total=None,
@@ -208,14 +227,19 @@ def evaluate(seq, traj, fmt='tum', log=None, max_diff=0.005, nearest_gt=False, t
     if keep is not None:
         mask = keep_near(est, keep)
         n_est = int(mask.sum())
-        est = PoseTrajectory3D(est.positions_xyz[mask], est.orientations_quat_wxyz[mask],
-                               est.timestamps[mask]) if n_est else None
-    pair = associate(gt, est, max_diff)
+        if not n_est:
+            # Usually a unit or clock mismatch between the crop file and TRAJ, not lost tracking.
+            fail(f'{traj}: no pose within 5 ms of the {len(keep)} crop stamps')
+        est = PoseTrajectory3D(est.positions_xyz[mask], est.orientations_quat_wxyz[mask], est.timestamps[mask])
+    pair, assoc_error = associate(gt, est, max_diff)
     n_assoc = len(pair[1].timestamps) if pair else 0
-    total = total or frame_count(seq)
+    if total is None:
+        total = frame_count(seq)
     out = {'pose': 'camera_centre' if fmt == 'kornia' else 'body',
            'n_est': n_est, 'n_assoc': n_assoc, 'total_frames': total,
-           'tracked_pct': round(100.0 * n_assoc / total, 2)}
+           'tracked_pct': round(100.0 * n_assoc / total, 2) if total else None}
+    if assoc_error:
+        out['assoc_error'] = assoc_error
     if n_assoc >= 3:
         g2, e2 = pair
         r, m, _, aligned = ate(e2, g2, False)

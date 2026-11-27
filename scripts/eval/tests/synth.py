@@ -44,14 +44,14 @@ def write_csv(path, header, rows):
             f.write(','.join(str(x) for x in r) + '\n')
 
 
-def make_sequence(root, n, gt_dir='state_groundtruth_estimate0', cam1=True):
+def make_sequence(root, n, gt_dir='state_groundtruth_estimate0', cam1=True, gt_offset_ns=0):
     ts = stamps(n)
     write_csv(os.path.join(root, 'mav0/cam0/data.csv'), '#timestamp [ns],filename', [[t, f'{t}.png'] for t in ts])
     if cam1:
         write_csv(os.path.join(root, 'mav0/cam1/data.csv'), '#timestamp [ns],filename', [[t, f'{t}.png'] for t in ts])
     rows = []
     for t, (r, p) in zip(ts, poses(n)):
-        rows.append([t, *p, *quat_wxyz(r), *([0.0] * 9)])
+        rows.append([t + gt_offset_ns, *p, *quat_wxyz(r), *([0.0] * 9)])
     write_csv(os.path.join(root, 'mav0', gt_dir, 'data.csv'), '#timestamp,p_x,p_y,p_z,q_w,q_x,q_y,q_z', rows)
     return ts
 
