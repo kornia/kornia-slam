@@ -99,6 +99,8 @@ A run file names the source and the system to run on it; see
 
 More sources and options: [apps/kornia-slam-app](apps/kornia-slam-app/README.md).
 
+To run and score benchmark series on EuRoC and TUM-VI, see [scripts/eval](scripts/eval/README.md).
+
 ## Library
 
 A system configuration and the source's calibrated rig build a `SlamSystem`,
