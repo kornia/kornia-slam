@@ -130,6 +130,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let (mut est_positions, mut gt_positions): (Vec<Vec3F64>, Vec<Vec3F64>) =
         (Vec::new(), Vec::new());
+    let mut segment_labels: Vec<Option<u64>> = Vec::new();
+    let mut segment_labeler = evaluation::SegmentLabeler::default();
     let mut trajectory: Vec<[f32; 3]> = Vec::new();
     let mut processed: usize = 0;
 
@@ -202,6 +204,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let traj_pt = trajectory_point_from_pose(&result.pose_world_to_cam);
         trajectory.push(traj_pt);
+        let segment = segment_labeler.label(
+            system.map_id(),
+            result.status != kornia_slam::TrackingStatus::Skipped,
+        );
 
         // Evaluation pairs each estimate with the nearest ground-truth pose.
         if args.evaluate
@@ -215,6 +221,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 traj_pt[2] as f64,
             ));
             gt_positions.push(Vec3F64::new(gt.tx, gt.ty, gt.tz));
+            segment_labels.push(segment);
         }
         #[cfg(feature = "viz")]
         if let Some(ref rec) = rec {
@@ -283,6 +290,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         evaluation::report(
             &est_positions,
             &gt_positions,
+            &segment_labels,
             std::path::Path::new(&args.eval_out),
         )?;
     }

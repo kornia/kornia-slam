@@ -1,5 +1,5 @@
 //! Trajectory evaluation: ground-truth association, Sim3 alignment,
-//! ATE/RPE/drift metrics, and CSV reporting.
+//! ATE/RPE/drift metrics, per-map ATE, and CSV reporting.
 
 use std::io::Write;
 use std::path::Path;
@@ -27,6 +27,12 @@ pub struct Sim3Alignment {
     pub scale: f64,
     pub rotation: Mat3F64,
     pub translation: Vec3F64,
+}
+
+impl Sim3Alignment {
+    pub fn apply(&self, p: Vec3F64) -> Vec3F64 {
+        self.translation + (self.rotation * p) * self.scale
+    }
 }
 
 /// Umeyama Sim3 fit mapping `est` onto `gt` (least-squares scale, rotation,
@@ -122,14 +128,87 @@ pub fn compute_drift(est: &[Vec3F64], gt: &[Vec3F64]) -> f64 {
     final_error / length
 }
 
+// ── Per-map ATE ──────────────────────────────────────────────────────────
+
+/// Shortest map that gets its own alignment: a Sim3 fit to a handful of
+/// frames is near-exact and would flatter the score.
+pub const MIN_SEGMENT_FRAMES: usize = 20;
+
+/// Labels frames with the map they were tracked in, from the first frame
+/// that map tracked. Bootstrap frames before it carry the previous map's
+/// pose, so they get no label.
+#[derive(Debug, Default)]
+pub struct SegmentLabeler {
+    live_map: Option<u64>,
+}
+
+impl SegmentLabeler {
+    pub fn label(&mut self, map_id: u64, tracked: bool) -> Option<u64> {
+        if tracked {
+            self.live_map = Some(map_id);
+        }
+        self.live_map.filter(|&id| id == map_id)
+    }
+}
+
+/// ATE with one Sim3 per map, pooled over every frame of the maps long
+/// enough to align. A reset starts a new monocular gauge, which a single
+/// alignment over the whole run can't fit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SegmentAte {
+    pub segments: usize,
+    /// Fraction of evaluated frames inside an aligned map.
+    pub coverage: f64,
+    pub rmse: f64,
+}
+
+pub fn compute_segment_ate(
+    est: &[Vec3F64],
+    gt: &[Vec3F64],
+    labels: &[Option<u64>],
+) -> Option<SegmentAte> {
+    let mut start = 0;
+    let (mut segments, mut covered, mut sq_sum) = (0, 0, 0.0);
+    for run in labels.chunk_by(|a, b| a == b) {
+        let range = start..start + run.len();
+        start = range.end;
+        if run[0].is_none() || run.len() < MIN_SEGMENT_FRAMES {
+            continue;
+        }
+        let (est, gt) = (&est[range.clone()], &gt[range]);
+        let alignment = align_sim3(est, gt);
+        sq_sum += est
+            .iter()
+            .zip(gt)
+            .map(|(e, g)| {
+                let d = alignment.apply(*e) - *g;
+                d.dot(d)
+            })
+            .sum::<f64>();
+        segments += 1;
+        covered += run.len();
+    }
+    (covered > 0).then(|| SegmentAte {
+        segments,
+        coverage: covered as f64 / labels.len() as f64,
+        rmse: (sq_sum / covered as f64).sqrt(),
+    })
+}
+
 // ── Reporting ────────────────────────────────────────────────────────────
 
 /// Aligns the estimated trajectory to ground truth (Sim3), writes the raw and
 /// aligned trajectories as CSVs under `out_dir` (created if missing), and
-/// prints ATE/RPE/drift. A no-op for fewer than two samples or a length
+/// prints ATE/RPE/drift plus the per-map ATE over `labels` (one per sample,
+/// from [`SegmentLabeler`]). A no-op for fewer than two samples or a length
 /// mismatch.
-pub fn report(est: &[Vec3F64], gt: &[Vec3F64], out_dir: &Path) -> std::io::Result<()> {
-    if est.len() < 2 || gt.len() != est.len() {
+pub fn report(
+    est: &[Vec3F64],
+    gt: &[Vec3F64],
+    labels: &[Option<u64>],
+    out_dir: &Path,
+) -> std::io::Result<()> {
+    if est.len() < 2 || gt.len() != est.len() || labels.len() != est.len() {
         return Ok(());
     }
     std::fs::create_dir_all(out_dir)?;
@@ -142,10 +221,7 @@ pub fn report(est: &[Vec3F64], gt: &[Vec3F64], out_dir: &Path) -> std::io::Resul
     }
 
     let a = align_sim3(est, gt);
-    let aligned: Vec<Vec3F64> = est
-        .iter()
-        .map(|p| a.translation + (a.rotation * *p) * a.scale)
-        .collect();
+    let aligned: Vec<Vec3F64> = est.iter().map(|p| a.apply(*p)).collect();
 
     let mut af = std::fs::File::create(out_dir.join("kornia_slam_aligned.csv"))?;
     writeln!(af, "idx,x,y,z,gt_x,gt_y,gt_z")?;
@@ -167,6 +243,88 @@ pub fn report(est: &[Vec3F64], gt: &[Vec3F64], out_dir: &Path) -> std::io::Resul
         "Final Drift      : {:.4} %",
         compute_drift(&aligned, gt) * 100.0
     );
+    match compute_segment_ate(est, gt, labels) {
+        Some(s) => {
+            eprintln!(
+                "Segments         : {} covering {:.1} % of frames",
+                s.segments,
+                s.coverage * 100.0
+            );
+            eprintln!("Segment ATE RMSE : {:.4} m", s.rmse);
+        }
+        None => eprintln!("Segment ATE RMSE : n/a (no map tracked {MIN_SEGMENT_FRAMES}+ frames)"),
+    }
     eprintln!("=======================================================");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn helix(n: usize) -> Vec<Vec3F64> {
+        (0..n)
+            .map(|i| {
+                let t = i as f64 * 0.1;
+                Vec3F64::new(t.cos(), t.sin(), 0.05 * t)
+            })
+            .collect()
+    }
+
+    fn similarity(points: &[Vec3F64], scale: f64, offset: Vec3F64) -> Vec<Vec3F64> {
+        let rotation = Mat3F64::from_cols(
+            Vec3F64::new(0.0, 1.0, 0.0),
+            Vec3F64::new(-1.0, 0.0, 0.0),
+            Vec3F64::new(0.0, 0.0, 1.0),
+        );
+        points
+            .iter()
+            .map(|p| rotation * *p * scale + offset)
+            .collect()
+    }
+
+    #[test]
+    fn each_map_gets_its_own_alignment() {
+        let gt = helix(80);
+        let mut est = similarity(&gt[..40], 0.3, Vec3F64::new(1.0, 2.0, 3.0));
+        est.extend(similarity(&gt[40..], 2.0, Vec3F64::new(-5.0, 0.0, 1.0)));
+        let labels: Vec<_> = (0..80).map(|i| Some(u64::from(i >= 40))).collect();
+
+        let a = align_sim3(&est, &gt);
+        let global: Vec<_> = est.iter().map(|p| a.apply(*p)).collect();
+        assert!(compute_ate(&global, &gt) > 0.1);
+
+        let s = compute_segment_ate(&est, &gt, &labels).unwrap();
+        assert_eq!(s.segments, 2);
+        assert_eq!(s.coverage, 1.0);
+        assert!(s.rmse < 1e-9, "rmse {}", s.rmse);
+    }
+
+    #[test]
+    fn unlabelled_and_short_maps_are_left_out() {
+        let gt = helix(60);
+        let est = similarity(&gt, 0.5, Vec3F64::ZERO);
+        let mut labels = vec![None; 10];
+        labels.extend(vec![Some(0); MIN_SEGMENT_FRAMES - 1]);
+        labels.extend(vec![Some(1); 60 - labels.len()]);
+
+        let s = compute_segment_ate(&est, &gt, &labels).unwrap();
+        assert_eq!(s.segments, 1);
+        assert_eq!(
+            s.coverage,
+            (60 - 10 - (MIN_SEGMENT_FRAMES - 1)) as f64 / 60.0
+        );
+        assert!(compute_segment_ate(&est, &gt, &[None; 60]).is_none());
+    }
+
+    #[test]
+    fn bootstrap_frames_after_a_reset_are_unlabelled() {
+        let mut labeler = SegmentLabeler::default();
+        let frames = [(0, false), (0, true), (0, false), (1, false), (1, true)];
+        let labels: Vec<_> = frames
+            .iter()
+            .map(|&(map_id, tracked)| labeler.label(map_id, tracked))
+            .collect();
+        assert_eq!(labels, [None, Some(0), Some(0), None, Some(1)]);
+    }
 }

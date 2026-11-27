@@ -58,6 +58,8 @@ pub(crate) struct SystemState {
     /// bootstrap reference.
     pub bootstrap_low_match_rejections: usize,
     pub bootstrap_frame: Option<Frame>,
+    /// Number of resets so far; see [`SlamSystem::map_id`](super::SlamSystem::map_id).
+    pub map_id: u64,
     pub mode: SystemMode,
 }
 
@@ -86,11 +88,13 @@ impl SystemState {
             imu_initialized: false,
             imu_init_timestamp_sec: None,
             last_frame_timestamp_sec: 0.0,
+            map_id: 0,
             mode: SystemMode::Bootstrap,
         }
     }
 
     pub fn reset(&mut self) {
+        self.map_id += 1;
         self.mode = SystemMode::Bootstrap;
         self.current_keyframe_idx = None;
         self.last_keyframe_idx = None;
@@ -178,5 +182,14 @@ mod tests {
             assert!(!state.bootstrap_reference_lost(&TwoViewRejectReason::LowMatches, 3));
         }
         assert!(state.bootstrap_reference_lost(&TwoViewRejectReason::LowMatches, 3));
+    }
+
+    #[test]
+    fn every_reset_starts_a_new_map_id() {
+        let mut state = SystemState::new();
+        assert_eq!(state.map_id, 0);
+        state.reset();
+        state.reset();
+        assert_eq!(state.map_id, 2);
     }
 }

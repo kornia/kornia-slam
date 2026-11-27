@@ -10,6 +10,13 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**`--evaluate` also reports ATE per map.** A monocular reset starts a new map with
+its own scale and origin, which one Sim3 over the whole run can't fit, so a run
+that reset mid-sequence scored worse than its tracking was. Each map's tracked
+frames now get their own alignment; the report adds `Segment ATE RMSE` and the
+share of frames the aligned maps cover, next to the unchanged global ATE.
+`SlamSystem::map_id` tells which map the reported pose belongs to.
+
 **IMU, wheel-odometry and stationary factors move to a new `kornia-factors` crate.**
 Their residuals, Jacobians, information matrices and the Huber cost the VI-BA
 factors share no longer live inside `kornia-slam`'s mapping module, so another
