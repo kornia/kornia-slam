@@ -303,6 +303,13 @@ impl SlamSystem {
         f(self.map.lock().unwrap().map_points())
     }
 
+    /// Identifies the map the reported pose belongs to. It changes on every
+    /// reset; poses under different ids come from separately initialised
+    /// maps, so in monocular runs they share no scale or origin.
+    pub fn map_id(&self) -> u64 {
+        self.state.map_id
+    }
+
     /// Returns the index of the current reference keyframe, if tracking has one.
     pub fn current_keyframe_idx(&self) -> Option<usize> {
         self.state.current_keyframe_idx.and_then(|ki| {
