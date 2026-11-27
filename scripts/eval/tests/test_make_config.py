@@ -20,13 +20,23 @@ class MakeConfigTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def make(self, preset, *knobs, vocab='/abs/ORBvoc.txt'):
+    def make(self, preset, *knobs, vocab='/abs/ORBvoc.txt', seq=None):
         env = dict(os.environ, START_FRAME='7', MAX_FRAMES='50')
         env.pop('VOCAB', None)
         if vocab:
             env['VOCAB'] = vocab
-        return subprocess.run(['bash', SCRIPT, os.path.join(CONFIGS, preset), self.seq, self.out, *knobs],
+        return subprocess.run(['bash', SCRIPT, os.path.join(CONFIGS, preset), seq or self.seq, self.out, *knobs],
                               env=env, capture_output=True, text=True)
+
+    def raw(self):
+        with open(self.out) as f:
+            return f.read()
+
+    def preset(self, text):
+        path = os.path.join(self.tmp.name, 'preset.ron')
+        with open(path, 'w') as f:
+            f.write(text)
+        return path
 
     def code(self):
         with open(self.out) as f:
@@ -66,6 +76,34 @@ class MakeConfigTest(unittest.TestCase):
 
     def test_vocabulary_preset_without_vocab_exits_2(self):
         self.assertEqual(self.make('euroc-stereo-imu-loop.ron', vocab=None).returncode, 2)
+
+    def test_vocabulary_in_a_comment_needs_no_vocab(self):
+        r = self.make('euroc.ron', vocab=None)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(CONFIGS, 'euroc.ron')) as f:
+            comment = next(line for line in f if 'vocabulary:' in line)
+        self.assertIn(comment, self.raw())
+
+    def test_values_are_copied_verbatim(self):
+        seq = os.path.join(self.tmp.name, 'se&q\\n')
+        os.makedirs(seq)
+        knob = 'name: "a\\nb & \\"c\\"",'
+        preset = self.preset('(\n    source: Euroc(( data: "x" )),\n    pipeline: OrbSlam((\n    )),\n)\n')
+        r = self.make(preset, knob, seq=seq)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        text = self.raw()
+        self.assertIn(f'data: "{seq}", start_frame: 7, max_frames: 50', text)
+        self.assertIn('            ' + knob + '\n', text)
+
+    def test_only_exact_frame_keys_are_dropped(self):
+        preset = self.preset('( source: Euroc(( data: "x", start_frame: 2, max_frames: 9 )),\n'
+                             '  other: ( my_max_frames: 3, max_frames_between: 8, xstart_frame: 4 ) )\n')
+        r = self.make(preset)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        text = self.raw()
+        self.assertIn('my_max_frames: 3, max_frames_between: 8, xstart_frame: 4', text)
+        self.assertEqual(len(re.findall(r'(?<![A-Za-z0-9_])max_frames:', text)), 1)
+        self.assertNotIn('start_frame: 2', text)
 
     def test_two_data_paths_exit_3(self):
         preset = os.path.join(self.tmp.name, 'two.ron')

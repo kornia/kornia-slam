@@ -15,8 +15,13 @@ shift 3
 vocab=""
 [ -n "${VOCAB:-}" ] && vocab=$(realpath -m "$VOCAB")
 rc=0
-awk -v data="$seq" -v vocab="$vocab" -v start="${START_FRAME:-0}" -v maxf="${MAX_FRAMES:-0}" \
-    -v knobs="$(printf '%s\n' "$@")" '
+# Values go through ENVIRON: awk -v would expand backslash escapes in paths and knob lines.
+MC_DATA=$seq MC_VOCAB=$vocab MC_START=${START_FRAME:-0} MC_MAXF=${MAX_FRAMES:-0} \
+  MC_KNOBS=$(printf '%s\n' "$@") awk '
+  BEGIN {
+    data = ENVIRON["MC_DATA"]; vocab = ENVIRON["MC_VOCAB"]; start = ENVIRON["MC_START"]
+    maxf = ENVIRON["MC_MAXF"]; knobs = ENVIRON["MC_KNOBS"]
+  }
   # Replaces the first match of re in s with literal text r (sub() would expand & in paths).
   function put(s, re, r) { return match(s, re) ? substr(s, 1, RSTART - 1) r substr(s, RSTART + RLENGTH) : s }
   {
