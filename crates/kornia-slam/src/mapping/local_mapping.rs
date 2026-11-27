@@ -39,12 +39,12 @@ pub struct KeyframeJob {
 }
 
 fn capture_local_window(map: &Map) -> BaSnapshot {
-    map.ba_snapshot(&super::bundle_adjustment::local_window(map))
+    map.ba_snapshot(&super::ba::local_window(map))
 }
 
 fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJob) -> BaUpdate {
     if job.imu_initialized {
-        super::bundle_adjustment::run_local_inertial_ba(
+        super::ba::run_local_inertial_ba(
             snapshot,
             camera,
             job.imu_t_bc,
@@ -53,7 +53,7 @@ fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJo
             &[],
         )
     } else {
-        super::bundle_adjustment::run_local_ba(snapshot, camera)
+        super::ba::run_local_ba(snapshot, camera)
     }
 }
 

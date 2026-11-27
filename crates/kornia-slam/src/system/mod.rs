@@ -591,10 +591,8 @@ impl SlamSystem {
         keyframes: [usize; 2],
     ) -> Result<(), MapMutationError> {
         self.map.lock().unwrap().apply_insertion(insertion)?;
-        let refined = crate::mapping::bundle_adjustment::run_initial_ba(
-            &mut self.map.lock().unwrap(),
-            &self.rig.camera,
-        );
+        let refined =
+            crate::mapping::ba::run_initial_ba(&mut self.map.lock().unwrap(), &self.rig.camera);
         if let Err(error) = refined {
             self.dbg(format!("[init_ba] {error}; keeping the unrefined map"));
         }

@@ -178,7 +178,7 @@ pub struct KeyframeCullReport {
 /// never removed. Candidates are judged oldest first against the live map, so
 /// each removal is seen by the next judgement. IMU edges through a removed
 /// keyframe are merged by [`Map::remove_keyframe`]; `wheel_factors`, keyed by
-/// `Frame::idx` as [`super::bundle_adjustment::run_local_inertial_ba`] takes
+/// `Frame::idx` as [`super::ba::run_local_inertial_ba`] takes
 /// them, have the pair through it composed into one. A keyframe either chain
 /// cannot be merged across is kept, so no edge is ever cut.
 ///

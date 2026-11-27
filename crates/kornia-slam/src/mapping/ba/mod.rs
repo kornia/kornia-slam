@@ -3,10 +3,12 @@
 //! Solvers consume immutable map snapshots and return numerical updates. The
 //! map owns capture and writeback; the local-mapping worker owns scheduling.
 
+pub mod schur;
+
+use crate::mapping::ba::schur::ViBaKeyframe;
 use crate::mapping::map::{
     BaSnapshot, BaUpdate, BaUpdateError, BaWindow, Keyframe, LocalBaStats, Map,
 };
-use crate::mapping::vi_ba_schur::ViBaKeyframe;
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
 use kornia_3d::camera::PinholeCamera;
@@ -329,7 +331,7 @@ pub fn run_local_inertial_ba(
 ) -> BaUpdate {
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
-    use crate::mapping::vi_ba_schur::{ViBaParams, visual_inertial_bundle_adjust};
+    use crate::mapping::ba::schur::{ViBaParams, visual_inertial_bundle_adjust};
 
     const MIN_OBSERVATIONS: usize = 8;
 
@@ -752,5 +754,5 @@ fn initial_ba_diagnostics(
 }
 
 #[cfg(test)]
-#[path = "bundle_adjustment_tests.rs"]
+#[path = "tests/bundle_adjustment.rs"]
 mod tests;

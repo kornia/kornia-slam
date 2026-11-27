@@ -11,7 +11,7 @@ use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::{ImuBias, PreintegratedImu};
 use std::collections::HashSet;
 
-/// The entities a BA capture copies, chosen by `mapping::bundle_adjustment`.
+/// The entities a BA capture copies, chosen by `mapping::ba`.
 #[derive(Debug, Clone, Default)]
 pub struct BaWindow {
     /// Keyframe slots in [`Map::keyframes`] order.
@@ -57,7 +57,7 @@ pub struct BaUpdate<D = RBrief> {
 }
 
 /// What a local solve did, for the caller to log; set by
-/// `mapping::bundle_adjustment::run_local_inertial_ba` when its solver ran.
+/// `mapping::ba::run_local_inertial_ba` when its solver ran.
 /// `#[non_exhaustive]`, so a figure can be added without a semver break.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 #[non_exhaustive]

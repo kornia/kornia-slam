@@ -10,6 +10,12 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**Bundle adjustment is grouped under `mapping::ba`.** A move with no change in
+behaviour: `kornia_slam::mapping::bundle_adjustment` is now
+`kornia_slam::mapping::ba`, and `kornia_slam::mapping::vi_ba_schur` is
+`kornia_slam::mapping::ba::schur`. Item names are unchanged, so only the module
+path in a `use` needs editing.
+
 **IMU, wheel-odometry and stationary factors move to a new `kornia-factors` crate.**
 Their residuals, Jacobians, information matrices and the Huber cost the VI-BA
 factors share no longer live inside `kornia-slam`'s mapping module, so another

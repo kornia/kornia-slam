@@ -50,7 +50,7 @@
 //! Callers are unaffected by the grouping: the methods stay inherent on `Map`,
 //! so `map.keyframes()` and `map::MapPoint` resolve exactly as before. Culling
 //! policy lives in [`crate::mapping::culling`], BA selection and solving in
-//! [`crate::mapping::bundle_adjustment`], and scheduling in
+//! [`crate::mapping::ba`], and scheduling in
 //! [`crate::mapping::local_mapping`].
 
 mod imu_factor;

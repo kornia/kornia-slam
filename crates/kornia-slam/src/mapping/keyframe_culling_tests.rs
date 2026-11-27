@@ -1,5 +1,5 @@
 use super::*;
-use crate::mapping::bundle_adjustment::{
+use crate::mapping::ba::{
     local_window, local_window_with_neighbors, run_local_ba, run_local_inertial_ba,
 };
 use crate::mapping::map::tests::{assert_map_consistent, test_frame_with_pose};

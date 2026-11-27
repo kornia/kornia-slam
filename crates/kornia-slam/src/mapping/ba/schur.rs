@@ -1806,13 +1806,13 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "vi_ba_wheel_tests.rs"]
+#[path = "tests/wheel.rs"]
 mod wheel_tests;
 
 #[cfg(test)]
-#[path = "vi_ba_stationary_tests.rs"]
+#[path = "tests/stationary.rs"]
 mod stationary_tests;
 
 #[cfg(test)]
-#[path = "vi_ba_flung_landmark_tests.rs"]
+#[path = "tests/flung_landmark.rs"]
 mod flung_landmark_tests;
