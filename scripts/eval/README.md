@@ -29,22 +29,29 @@ python scripts/eval/table.py scores.jsonl --key kornia_slam_raw.csv@nearest --me
 `run.sh` takes its settings from the environment; the header of each script lists them. `RUNS`
 repeats each sequence, `JOBS` caps concurrent runs, `START_FRAME` and `MAX_FRAMES` set the frame
 window, `PACE` selects the replay pacing, `CPUS` pins the run with `taskset`. A run directory whose
-`done` file holds `rc=0` is skipped, so an interrupted series resumes where it stopped.
+`done` file holds `rc=0` is skipped, so an interrupted series resumes where it stopped. `run.sh`
+exits 1 when any run failed to configure, ended with a non-zero `rc` or went `invalid`.
 
 A run directory holds `run.ron` (the run file), `meta.txt` (arm, sequence, data path, start frame,
 repetition, binary md5, pacing, load), `out.log`, `err.log`, the `--evaluate` CSVs, then `done`
 (`rc`, `wall`, `load_end`). The lines `err.log` prints before `Dataset:` are the system
-configuration; when they differ from the arm's first run (`<OUTDIR>/<ARM>.header`), the run gets
-`invalid` in place of `done`, because a knob did not reach it.
+configuration; when they differ from the arm's header (`<OUTDIR>/<ARM>.header`, copied from the
+arm's first run that printed `Dataset:` and ended with `rc=0`), the run gets `invalid` in place of
+`done`, because a knob did not reach it. A run that stopped before `Dataset:` has no header to
+compare and keeps its `rc` in `done`.
 
 The protocol is causal paced replay: each frame is processed once, in order, with only the data
 before it, at the pace `PACE` selects (`app`: the app's own pacing, the default).
 
 ## Output keys
 
-`score.py` writes `status` (`ok`, `invalid` or `not done`), `rc`, `wall`, `meta`, `s` (counters from
-`err.log`: `[summary]` fields, the per-frame time sum, accepted and applied loop closures, failed
-pose-graph solves), and one object per scored file:
+`score.py` writes `status`, `rc`, `wall`, `meta`, `s` (counters from `err.log`: the per-frame time
+sum, accepted and applied loop closures, failed pose-graph solves, and the fields of any
+`[summary]` line, which the app on main does not print), and one object per scored file. The
+status is `ok`, `failed` (`rc` is not 0: a timeout or crash; its partial trajectory is scored but
+kept out of tables), `invalid`, `not done`, or `error` (the run directory could not be read; the
+reason is in `error`, and `score.py` exits 1 after scoring the rest). A file that cannot be scored
+gets `{"error": reason}`.
 
 | key | meaning |
 |---|---|
@@ -54,6 +61,7 @@ pose-graph solves), and one object per scored file:
 | `ate_se3_rmse`, `ate_se3_mean` | ATE (m) after SE(3) alignment, scale fixed: the primary number |
 | `ate_sim3_rmse`, `ate_sim3_mean`, `sim3_scale` | ATE (m) after Sim(3) alignment, and its scale |
 | `jumps` | consecutive associated pairs whose relative motion differs from ground truth by more than 0.3 m |
+| `assoc_error` | present when no pose associates: evo's reason (often a clock or unit mismatch) |
 | `rpe1`, `rpe10` | TUM files only: translation RMSE (m) and yaw RMSE (deg) over pose pairs 1 s and 10 s apart |
 
 Scored files:
@@ -70,7 +78,8 @@ Scored files:
 
 Camera-centre and body trajectories differ by the constant cam0 lever arm, so their ATEs differ
 too (by a few millimetres to centimetres on EuRoC). Never put the two in one table: `table.py`
-takes one `--key` per table for this reason.
+takes one `--key` per table for this reason. Its footer counts each status, plus the ok runs with
+no entry for the key or no value for the metric, which are in no median.
 
 `evaluate.py` scores a single trajectory without a run directory:
 
