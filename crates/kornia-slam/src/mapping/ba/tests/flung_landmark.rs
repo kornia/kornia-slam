@@ -756,7 +756,7 @@ impl ParkedChain {
         )
         .unwrap();
         let keep = if guard {
-            crate::mapping::bundle_adjustment::landmarks_to_write_back(
+            crate::mapping::ba::landmarks_to_write_back(
                 &observations,
                 (&keyframes, &self.points),
                 (&result.keyframes, &result.points),
