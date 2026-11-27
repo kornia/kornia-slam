@@ -2,11 +2,14 @@
 """table.py SCORES.jsonl [--key FILE] [--metric NAME]: markdown table of score.py output.
 
 Rows are sequences, columns arms, cells "median (min-max, n)" of the metric over the ok runs.
-One --key per table, so body and camera-centre numbers never share one.
+One --key per table, so body and camera-centre numbers never share one. The footer counts every
+status, and the ok runs that have no --key entry or no --metric value: those runs are not in any
+median, so a cell's n can be smaller than its ok runs. Exits 1 when no record has --key.
 """
 import argparse
 import json
 import statistics
+import sys
 from collections import defaultdict
 
 
@@ -21,13 +24,25 @@ def main():
     arms, seqs = [], []
     with open(a.scores) as f:
         records = [json.loads(line) for line in f if line.strip()]
+    has_key = 0
     for r in records:
+        status[r['status']] += 1
+        has_key += a.key in r
+        if r['status'] == 'error':
+            continue
         arm, seq = r['arm'], r['seq']
         arms += [arm] if arm not in arms else []
         seqs += [seq] if seq not in seqs else []
-        status[r['status']] += 1
-        v = r.get(a.key, {}).get(a.metric) if r['status'] == 'ok' else None
-        if v is not None:
+        if r['status'] != 'ok':
+            continue
+        if a.key not in r:
+            status['ok without key'] += 1
+            continue
+        v = r[a.key].get(a.metric)
+        if v is None:
+            # an evaluate error, or fewer than 3 associated poses
+            status['ok without metric'] += 1
+        else:
             values[seq, arm].append(v)
 
     def cell(v):
@@ -40,7 +55,10 @@ def main():
     print('|---' * (len(arms) + 1) + '|')
     for seq in seqs:
         print(f'| {seq} | ' + ' | '.join(cell(values[seq, arm]) for arm in arms) + ' |')
-    print(f"\nok {status['ok']}, invalid {status['invalid']}, not done {status['not done']}")
+    print('\n' + ', '.join(f'{k} {status[k]}' for k in
+                            ('ok', 'ok without key', 'ok without metric', 'failed', 'invalid', 'not done', 'error')))
+    if not has_key:
+        sys.exit(f'table.py: no record has key {a.key!r}')
 
 
 if __name__ == '__main__':
