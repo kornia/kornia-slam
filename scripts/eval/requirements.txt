@@ -1,0 +1,4 @@
+evo==1.38.1
+numpy==2.5.5
+PyYAML==6.0.4
+opencv-python-headless==5.1.0.95
