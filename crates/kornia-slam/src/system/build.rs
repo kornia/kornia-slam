@@ -1,15 +1,13 @@
-use std::path::Path;
-
 use kornia_imgproc::features::OrbDetector;
 use kornia_sensors::SensorRig;
 
 use super::config::{
     CameraSelection, FrontendConfig, OrbFrontendConfig, OrbSlamPipeline, PipelineDefinition,
-    SensorSelection, SystemConfig,
+    PrecomputedFrontendConfig, SensorSelection, SystemConfig,
 };
 use super::validation::ConfigError;
 use crate::features::{Clidd, Descriptor, RBrief};
-use crate::frontend::FeatureFileError;
+use crate::frontend::FrontendError;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopCloser;
 use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabulary};
@@ -27,7 +25,7 @@ pub enum BuildError {
     #[error(transparent)]
     Vocabulary(#[from] VocabularyLoadError),
     #[error(transparent)]
-    FeatureFile(#[from] FeatureFileError),
+    Frontend(#[from] FrontendError),
 }
 
 /// Settings a [`SlamSystem`](crate::SlamSystem) is assembled from, resolved
@@ -86,7 +84,7 @@ impl SystemConfig {
         let orb = self.orb();
         let stereo_close_depth = match &orb.frontend {
             FrontendConfig::Orb(frontend) => Some(frontend.stereo_close_depth),
-            FrontendConfig::Precomputed(_) => None,
+            FrontendConfig::Precomputed(precomputed) => Some(precomputed.stereo_close_depth),
         };
         SystemSettings {
             matching,
@@ -124,10 +122,10 @@ impl SystemConfig {
         })
     }
 
-    /// The feature file of the configured precomputed frontend.
-    pub(crate) fn precomputed_features(&self) -> Result<&Path, ConfigError> {
+    /// The configured precomputed frontend.
+    pub(crate) fn precomputed_frontend(&self) -> Result<&PrecomputedFrontendConfig, ConfigError> {
         match &self.orb().frontend {
-            FrontendConfig::Precomputed(precomputed) => Ok(&precomputed.path),
+            FrontendConfig::Precomputed(precomputed) => Ok(precomputed),
             FrontendConfig::Orb(_) => Err(ConfigError::FrontendMismatch {
                 configured: "ORB",
                 system: "precomputed CLIDD",

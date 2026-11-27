@@ -113,11 +113,14 @@ impl SlamSystem {
 impl SlamSystem<Clidd> {
     /// Like [`SlamSystem::build`] for a configuration whose frontend is
     /// [`FrontendConfig::Precomputed`]: frames take their CLIDD features from
-    /// the feature file by timestamp instead of extracting ORB.
+    /// the feature file by timestamp instead of extracting ORB, and stereo
+    /// pairs match them against the right view's.
     pub fn build_precomputed(config: SystemConfig, rig: SensorRig) -> Result<Self, BuildError> {
         config.validate()?;
         let rig = config.sensors.select_rig(rig)?;
-        let frontend = PrecomputedFrontend::open(config.precomputed_features()?, &rig)?;
+        let precomputed = config.precomputed_frontend()?;
+        let frontend =
+            PrecomputedFrontend::open(&precomputed.path, precomputed.right_path.as_deref(), &rig)?;
         let settings = config.settings(&rig, MatchingSettings::default());
         Ok(Self::assemble(rig, settings, Box::new(frontend), None))
     }

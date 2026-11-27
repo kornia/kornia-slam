@@ -91,8 +91,8 @@ pub struct OrbSlamPipeline {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum FrontendConfig {
     Orb(OrbFrontendConfig),
-    /// CLIDD features exported offline, for a monocular system without loop
-    /// closing; build it with
+    /// CLIDD features exported offline, for a system without loop closing;
+    /// build it with
     /// [`SlamSystem::build_precomputed`](crate::SlamSystem::build_precomputed).
     Precomputed(PrecomputedFrontendConfig),
 }
@@ -129,13 +129,41 @@ impl Default for OrbFrontendConfig {
 }
 
 /// Features read from a file instead of extracted; see
-/// `scripts/export_clidd_features.py` for the format. A relative `path` in a
-/// file is resolved against that file's directory.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `scripts/export_clidd_features.py` for the format. Relative paths in a
+/// file are resolved against that file's directory.
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct PrecomputedFrontendConfig {
+    /// Features of the images the system is given: the rectified left view
+    /// with stereo cameras.
     pub path: PathBuf,
+    /// Features of the rectified right view, looked up by the left image's
+    /// timestamp. Required with stereo cameras, unused without.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub right_path: Option<PathBuf>,
+    /// As [`OrbFrontendConfig::stereo_close_depth`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub stereo_close_depth: StereoCloseDepth,
+}
+
+impl PrecomputedFrontendConfig {
+    /// Monocular features from `path`.
+    pub fn mono(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            right_path: None,
+            stereo_close_depth: StereoCloseDepth::default(),
+        }
+    }
+
+    /// Rectified stereo features, `left` and `right`.
+    pub fn stereo(left: impl Into<PathBuf>, right: impl Into<PathBuf>) -> Self {
+        Self {
+            right_path: Some(right.into()),
+            ..Self::mono(left)
+        }
+    }
 }
 
 /// Near/far depth threshold for stereo keypoints (ORB-SLAM3's `ThDepth`).
@@ -218,10 +246,12 @@ impl SystemConfig {
         {
             *vocabulary = base_dir.join(&*vocabulary);
         }
-        if let FrontendConfig::Precomputed(precomputed) = &mut orb.frontend
-            && precomputed.path.is_relative()
-        {
-            precomputed.path = base_dir.join(&precomputed.path);
+        if let FrontendConfig::Precomputed(precomputed) = &mut orb.frontend {
+            for path in std::iter::once(&mut precomputed.path).chain(&mut precomputed.right_path) {
+                if path.is_relative() {
+                    *path = base_dir.join(&*path);
+                }
+            }
         }
     }
 }
@@ -250,11 +280,19 @@ impl fmt::Display for SystemConfig {
                     write_stereo_depth(f, frontend.stereo_close_depth)?;
                 }
             }
-            FrontendConfig::Precomputed(precomputed) => writeln!(
-                f,
-                "  frontend: precomputed CLIDD from {}",
-                precomputed.path.display()
-            )?,
+            FrontendConfig::Precomputed(precomputed) => {
+                writeln!(
+                    f,
+                    "  frontend: precomputed CLIDD from {}",
+                    precomputed.path.display()
+                )?;
+                if self.sensors.cameras == CameraSelection::Stereo {
+                    if let Some(right) = &precomputed.right_path {
+                        writeln!(f, "  right view: {}", right.display())?;
+                    }
+                    write_stereo_depth(f, precomputed.stereo_close_depth)?;
+                }
+            }
         }
         if self.sensors.imu {
             writeln!(f, "  IMU integration")?;

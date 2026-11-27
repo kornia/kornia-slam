@@ -342,23 +342,35 @@ fn precomputed(path: &str, sensors: SensorSelection) -> SystemConfig {
         sensors,
         ..SystemConfig::default()
     };
-    orb_mut(&mut config).frontend = FrontendConfig::Precomputed(PrecomputedFrontendConfig {
-        path: PathBuf::from(path),
-    });
+    orb_mut(&mut config).frontend =
+        FrontendConfig::Precomputed(PrecomputedFrontendConfig::mono(path));
+    config
+}
+
+fn precomputed_stereo(left: &str, right: &str) -> SystemConfig {
+    let mut config = precomputed(left, sensors(CameraSelection::Stereo, true));
+    orb_mut(&mut config).frontend =
+        FrontendConfig::Precomputed(PrecomputedFrontendConfig::stereo(left, right));
     config
 }
 
 #[test]
-fn precomputed_features_are_monocular_without_loop_closing() {
+fn precomputed_features_need_both_views_for_stereo_and_no_loop_closing() {
     let mono = sensors(CameraSelection::Mono, true);
+    let stereo = sensors(CameraSelection::Stereo, true);
     assert_eq!(precomputed("mh01.kfeat", mono).validate(), Ok(()));
     assert_eq!(
         precomputed("", mono).validate(),
         Err(ConfigError::EmptyFeaturePath)
     );
     assert_eq!(
-        precomputed("mh01.kfeat", sensors(CameraSelection::Stereo, true)).validate(),
-        Err(ConfigError::PrecomputedStereo)
+        precomputed("mh01.kfeat", stereo).validate(),
+        Err(ConfigError::MissingRightFeatures)
+    );
+    assert_eq!(precomputed_stereo("l.kfeat", "r.kfeat").validate(), Ok(()));
+    assert_eq!(
+        precomputed_stereo("l.kfeat", "").validate(),
+        Err(ConfigError::EmptyFeaturePath)
     );
     let mut looping = precomputed("mh01.kfeat", mono);
     orb_mut(&mut looping).loop_closing = loop_closing();
@@ -373,22 +385,27 @@ fn each_frontend_has_its_own_builder() {
         Err(ConfigError::FrontendMismatch { .. })
     ));
     assert_eq!(
-        config.precomputed_features().unwrap(),
+        config.precomputed_frontend().unwrap().path,
         std::path::Path::new("mh01.kfeat")
     );
     assert!(matches!(
-        SystemConfig::default().precomputed_features(),
+        SystemConfig::default().precomputed_frontend(),
         Err(ConfigError::FrontendMismatch { .. })
     ));
 }
 
 #[test]
 fn precomputed_feature_paths_resolve_against_the_file() {
-    let mut config = precomputed("features/mh01.kfeat", SensorSelection::default());
+    let mut config = precomputed_stereo("features/l.kfeat", "/abs/r.kfeat");
     config.resolve_paths(std::path::Path::new("/runs"));
+    let precomputed = config.precomputed_frontend().unwrap();
     assert_eq!(
-        config.precomputed_features().unwrap(),
-        std::path::Path::new("/runs/features/mh01.kfeat")
+        precomputed.path,
+        std::path::Path::new("/runs/features/l.kfeat")
+    );
+    assert_eq!(
+        precomputed.right_path.as_deref(),
+        Some(std::path::Path::new("/abs/r.kfeat"))
     );
 }
 
@@ -551,11 +568,24 @@ mod ron_files {
         .unwrap();
         assert_eq!(
             orb(&config).frontend,
-            FrontendConfig::Precomputed(PrecomputedFrontendConfig {
-                path: PathBuf::from("/runs/mh01.kfeat"),
-            })
+            FrontendConfig::Precomputed(PrecomputedFrontendConfig::mono("/runs/mh01.kfeat"))
         );
         assert_eq!(ron(&parse(&ron(&config)).unwrap()), ron(&config));
+
+        let stereo = SystemConfig::from_ron_str(
+            r#"(version: 1, sensors: (cameras: Stereo), pipeline: OrbSlam((
+                frontend: Precomputed((path: "l.kfeat", right_path: Some("r.kfeat"))),
+            )))"#,
+            Path::new("/runs"),
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&stereo).frontend,
+            FrontendConfig::Precomputed(PrecomputedFrontendConfig::stereo(
+                "/runs/l.kfeat",
+                "/runs/r.kfeat"
+            ))
+        );
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use kornia_imgproc::features::OrbMatchConfig;
 use kornia_sensors::SensorRig;
 
@@ -56,8 +58,8 @@ pub enum ConfigError {
     },
     #[error("precomputed feature path is empty")]
     EmptyFeaturePath,
-    #[error("precomputed features are monocular: select mono cameras")]
-    PrecomputedStereo,
+    #[error("stereo cameras need the right view's precomputed features: set `right_path`")]
+    MissingRightFeatures,
     #[error("loop closing needs an ORB vocabulary: disable it with precomputed features")]
     PrecomputedLoopClosing,
 }
@@ -118,12 +120,7 @@ impl OrbFrontendConfig {
                 max: *range.end(),
             });
         }
-        match self.stereo_close_depth {
-            StereoCloseDepth::Baselines(value) | StereoCloseDepth::Metres(value) => {
-                check("frontend.stereo_close_depth", value, POSITIVE)
-            }
-            StereoCloseDepth::Disabled => Ok(()),
-        }
+        self.stereo_close_depth.validate()
     }
 }
 
@@ -133,16 +130,28 @@ impl PrecomputedFrontendConfig {
         sensors: &SensorSelection,
         loop_closing: &LoopClosingMode,
     ) -> Result<(), ConfigError> {
-        if self.path.as_os_str().is_empty() {
+        let empty = |path: &PathBuf| path.as_os_str().is_empty();
+        if empty(&self.path) || self.right_path.as_ref().is_some_and(empty) {
             return Err(ConfigError::EmptyFeaturePath);
         }
-        if sensors.cameras == CameraSelection::Stereo {
-            return Err(ConfigError::PrecomputedStereo);
+        if sensors.cameras == CameraSelection::Stereo && self.right_path.is_none() {
+            return Err(ConfigError::MissingRightFeatures);
         }
         if loop_closing.is_enabled() {
             return Err(ConfigError::PrecomputedLoopClosing);
         }
-        Ok(())
+        self.stereo_close_depth.validate()
+    }
+}
+
+impl StereoCloseDepth {
+    fn validate(self) -> Result<(), ConfigError> {
+        match self {
+            Self::Baselines(value) | Self::Metres(value) => {
+                check("frontend.stereo_close_depth", value, POSITIVE)
+            }
+            Self::Disabled => Ok(()),
+        }
     }
 }
 

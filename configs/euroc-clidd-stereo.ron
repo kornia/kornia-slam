@@ -1,0 +1,18 @@
+// EuRoC MH_01, stereo, with CLIDD L64 features of the rectified left and
+// right images, exported by scripts/export_clidd_features.py --view left and
+// --view right. Everything else matches a stereo ORB run.
+(
+    source: Euroc(( data: "../data/euroc/MH_01_easy" )),
+    system: (
+        version: 1,
+        sensors: ( cameras: Stereo, imu: false ),
+        pipeline: OrbSlam((
+            frontend: Precomputed((
+                path: "../data/features/MH_01_easy.clidd_l64.left.kfeat",
+                right_path: Some("../data/features/MH_01_easy.clidd_l64.right.kfeat"),
+            )),
+            // No vocabulary exists for CLIDD descriptors.
+            loop_closing: Disabled,
+        )),
+    ),
+)

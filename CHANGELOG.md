@@ -10,6 +10,17 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**Stereo runs can use precomputed CLIDD features.** With stereo cameras,
+`Precomputed` takes the rectified left view's features in `path` and the right
+view's in `right_path`, and pairs them with ORB-SLAM3's row search and SAD
+refinement through kornia-3d's `StereoMatcher`; `stereo_close_depth` works as
+in the ORB frontend. `scripts/export_clidd_features.py --view left|right`
+exports features of the images rectified as the EuRoC stereo source does it,
+and `configs/euroc-clidd-stereo.ron` runs MH_01 this way.
+`ConfigError::PrecomputedStereo` is now `MissingRightFeatures`,
+`BuildError::FeatureFile` is `BuildError::Frontend`, and
+`PrecomputedFrontendConfig` gains `mono` and `stereo` constructors.
+
 **A monocular map lost before it is established no longer passes on its drift.**
 When tracking gives up on a map that never grew past the grace keyframe count,
 or its bootstrap publication or initial-map gate is rejected, the pose returns
