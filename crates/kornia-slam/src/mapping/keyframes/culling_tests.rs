@@ -2,6 +2,7 @@ use super::*;
 use crate::mapping::bundle_adjustment::{
     local_window, local_window_with_neighbors, run_local_ba, run_local_inertial_ba,
 };
+use crate::mapping::culling::evict_oldest_keyframes;
 use crate::mapping::map::tests::{assert_map_consistent, test_frame_with_pose};
 use crate::mapping::map::{ImuFactor, MapInsertion};
 use crate::mapping::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
@@ -45,7 +46,7 @@ fn point(i: usize) -> Vec3F64 {
 /// A camera translating 0.1 m per keyframe; every keyframe sees the shared
 /// points at octave 0, `LONER` also sees its own. Landmarks start a few cm
 /// off the truth so BA has something to do.
-fn culling_fixture() -> Map {
+pub(crate) fn culling_fixture() -> Map {
     culling_fixture_with_depth(|_, _| None)
 }
 
@@ -96,7 +97,7 @@ fn culling_fixture_with_depth(depth: impl Fn(usize, usize) -> Option<f32>) -> Ma
     map
 }
 
-fn enabled() -> KeyframeCullingConfig {
+pub(crate) fn enabled() -> KeyframeCullingConfig {
     KeyframeCullingConfig {
         min_keyframes: 0,
         ..KeyframeCullingConfig::default()

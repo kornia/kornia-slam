@@ -3,6 +3,7 @@
 //! literal of one is E0639 here, so every value below goes through a
 //! constructor, `Default` or a public field assignment.
 
+use kornia_slam::KeyframePolicy as RootKeyframePolicy;
 use kornia_slam::mapping::culling::KeyframeCullingConfig;
 use kornia_slam::mapping::map::{StillNeighbour, StillSide};
 use kornia_slam::tracking::{KeyframeEvidence, KeyframePolicy};
@@ -19,6 +20,7 @@ fn keyframe_evidence_and_culling_config_from_outside() {
         max_frames_between: usize::MAX,
         ..KeyframePolicy::default()
     };
+    let _: RootKeyframePolicy = policy;
     let _ = policy.should_insert_with(&e);
 
     let mut cfg = KeyframeCullingConfig::default();
@@ -27,7 +29,7 @@ fn keyframe_evidence_and_culling_config_from_outside() {
     cfg.protect_newest = 5;
     cfg.max_merged_imu_span_sec = 11.0;
     cfg.merge_imu_edges = false;
-    let copy = cfg.clone();
+    let copy = cfg;
     assert_eq!(
         (copy.min_keyframes, copy.max_removals, copy.protect_newest),
         (4, 1, 5)

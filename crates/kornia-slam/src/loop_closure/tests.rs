@@ -691,6 +691,21 @@ fn loop_closer_skips_an_already_verified_pair() {
 }
 
 #[test]
+fn forgetting_culled_keyframes_purges_loop_closure_state() {
+    let mut config = closing_config();
+    config.optimizer.loop_edge_weight = 100.0;
+    let (mut closer, mut map) = closing_fixture(config, false);
+    let context = closing_context(&map);
+    let _ = closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert_eq!(closer.indexed_keyframes(), 2);
+    assert_eq!(closer.verified_loop_count(), 1);
+
+    closer.forget_keyframes(&[10]);
+    assert_eq!(closer.indexed_keyframes(), 1);
+    assert_eq!(closer.verified_loop_count(), 0);
+}
+
+#[test]
 fn loop_closer_missing_reference_records_acceptance_without_mutating_map() {
     let (mut closer, mut map) = closing_fixture(closing_config(), false);
     let before = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;

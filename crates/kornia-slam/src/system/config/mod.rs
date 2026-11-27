@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopClosingConfig;
-use crate::mapping::LocalMappingMode;
+use crate::mapping::keyframes::{KeyframeInsertionStrategy, KeyframePolicy};
+use crate::mapping::{KeyframeCullingStrategy, LocalMappingMode};
+use crate::tracking::TrackingLossRecoveryPolicy;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
-use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
 /// Schema version of [`SystemConfig`] this crate reads and writes.
 pub const SYSTEM_CONFIG_VERSION: u32 = 1;
@@ -153,13 +154,16 @@ impl StereoCloseDepth {
 }
 
 /// Local mapping (keyframe insertion, culling and local BA / VI-BA).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct MappingConfig {
     /// `Synchronous` maps on the tracking thread before each frame returns,
     /// which makes runs replay identically.
     pub execution: LocalMappingMode,
+    /// Redundant-keyframe culling. Disabled preserves the historical runtime
+    /// behaviour while landmark culling and local BA remain active.
+    pub keyframe_culling: KeyframeCullingStrategy,
 }
 
 /// Loop closing: place recognition over every keyframe, and verification,
@@ -250,7 +254,10 @@ impl fmt::Display for SystemConfig {
             write!(f, "{}", k.max_frames_between)?;
         }
         write!(f, " frames, ref ratio {}", k.ref_ratio)?;
-        if let Some(px) = k.min_parallax_px {
+        if let KeyframeInsertionStrategy::Parallax {
+            min_parallax_px: px,
+        } = k.insertion
+        {
             write!(f, ", parallax {px} px")?;
         }
         match k.max_interval_sec {
@@ -262,6 +269,12 @@ impl fmt::Display for SystemConfig {
             LocalMappingMode::Asynchronous => "asynchronous",
         };
         writeln!(f, "  local mapping: {execution}")?;
+        if matches!(
+            orb.mapping.keyframe_culling,
+            KeyframeCullingStrategy::Redundancy(_)
+        ) {
+            writeln!(f, "  keyframe culling: redundancy")?;
+        }
         if let Some(vocabulary) = orb.loop_closing.vocabulary() {
             writeln!(f, "  loop closing: {}", vocabulary.display())?;
         }
