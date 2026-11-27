@@ -4,6 +4,7 @@
 # Each run writes OUTDIR/<ARM>_<seq>_s<start>_r<k>/ with run.ron, meta.txt, out.log, err.log,
 # header.txt, the --evaluate CSVs and traj.txt (when the binary has --trajectory-out), then
 # `done` (rc, wall, load) or `invalid` (header guard). A directory whose `done` holds rc=0 is skipped.
+# Exits 1 when any run failed to configure, ended with rc != 0 or went invalid; 2 on a usage error.
 # Env: BIN (kornia-slam binary, required), RUNS (1), JOBS (1), START_FRAME (0), MAX_FRAMES (0), VOCAB,
 #      KNOBS (newline-separated knob lines), PACE=app (no flag: the app default) | none (--no-pace) |
 #      timestamps (--pace-timestamps), CPUS (taskset CPU list), TIMEOUT (900 s), DEBUG (0 | 1: --debug
@@ -15,8 +16,9 @@ fi
 arm=$1 preset=$2 out=$3; shift 3
 here=$(cd "$(dirname "$0")" && pwd)
 : "${BIN:?set BIN to the kornia-slam binary}"
+[ -f "$BIN" ] && [ -x "$BIN" ] || { echo "run.sh: BIN=$BIN is not an executable file" >&2; exit 2; }
 start=${START_FRAME:-0}
-help=$("$BIN" --help 2>&1)
+help=$("$BIN" --help 2>&1) || { echo "run.sh: $BIN --help failed: $help" >&2; exit 2; }
 has_flag() { grep -q -- "$1" <<< "$help"; }
 case ${PACE:-app} in
   app) pace_flag="" ;;
@@ -38,6 +40,8 @@ taskset_cmd=(); [ -n "${CPUS:-}" ] && taskset_cmd=(taskset -c "$CPUS")
 knobs=(); [ -n "${KNOBS:-}" ] && mapfile -t knobs <<< "$KNOBS"
 md5=$(md5sum "$BIN" | cut -d' ' -f1)
 mkdir -p "$out"
+# Background jobs cannot set a variable here, so each failed run appends its directory.
+failed=$(mktemp); trap 'rm -f "$failed"' EXIT
 load() { cut -d' ' -f1-3 /proc/loadavg; }
 
 one() {
@@ -46,9 +50,12 @@ one() {
   d=$out/${arm}_${seq}_s${start}_r$k
   grep -qs '^rc=0 ' "$d/done" && return 0
   rm -rf "$d"; mkdir -p "$d"
-  "$here/make_config.sh" "$preset" "$seq_dir" "$d/run.ron" "${knobs[@]}" || return
+  # meta.txt first: a run that fails to configure still scores as `not done`.
   printf '%s\n' "arm=$arm" "seq=$seq" "data=$(cd "$seq_dir" && pwd)" "start=$start" "rep=$k" \
     "bin_md5=$md5" "pace=${PACE:-app}" "load_start=$(load)" > "$d/meta.txt"
+  if ! "$here/make_config.sh" "$preset" "$seq_dir" "$d/run.ron" "${knobs[@]}"; then
+    echo "$d (make_config.sh)" >> "$failed"; return
+  fi
   flags=(--config "$d/run.ron" --no-tui)
   [ -n "$pace_flag" ] && flags+=("$pace_flag")
   [ -n "$debug_flag" ] && flags+=("$debug_flag")
@@ -58,14 +65,19 @@ one() {
   # shellcheck disable=SC2086
   timeout "${TIMEOUT:-900}" "${taskset_cmd[@]}" "$BIN" "${flags[@]}" ${RUN_FLAGS:-} > "$d/out.log" 2> "$d/err.log"
   rc=$?; wall=$(( $(date +%s) - s0 ))
-  # The lines before `Dataset:` print the system configuration: equal across one arm's runs.
-  sed '/^Dataset:/,$d' "$d/err.log" > "$d/header.txt"
-  [ -s "$out/$arm.header" ] || cp "$d/header.txt" "$out/$arm.header"
-  if ! hd=$(diff -u "$out/$arm.header" "$d/header.txt"); then
-    { echo "$hd"; echo "rc=$rc wall=$wall"; } > "$d/invalid"
-    echo "run.sh: INVALID header $d" >&2; return
+  # The lines before `Dataset:` print the system configuration: equal across one arm's runs. A run
+  # that died before `Dataset:` has no header, only its error, so it neither seeds nor meets the guard.
+  if grep -q '^Dataset:' "$d/err.log"; then
+    sed '/^Dataset:/,$d' "$d/err.log" > "$d/header.txt"
+    [ -s "$out/$arm.header" ] || [ "$rc" -ne 0 ] || cp "$d/header.txt" "$out/$arm.header"
+    if [ -s "$out/$arm.header" ] && ! hd=$(diff -u "$out/$arm.header" "$d/header.txt"); then
+      { echo "$hd"; echo "rc=$rc wall=$wall"; } > "$d/invalid"
+      echo "$d (invalid header)" >> "$failed"
+      echo "run.sh: INVALID header $d" >&2; return
+    fi
   fi
   echo "rc=$rc wall=$wall load_end=$(load)" > "$d/done"
+  [ "$rc" -eq 0 ] || echo "$d (rc=$rc)" >> "$failed"
   echo "run.sh: $d rc=$rc wall=${wall}s" >&2
 }
 
@@ -76,3 +88,6 @@ for seq_dir in "$@"; do
   done
 done
 wait
+if [ -s "$failed" ]; then
+  echo "run.sh: $(wc -l < "$failed") runs failed:" >&2; cat "$failed" >&2; exit 1
+fi
