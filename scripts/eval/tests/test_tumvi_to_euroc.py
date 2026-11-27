@@ -40,6 +40,46 @@ def equidistant(calib, focal, size, u, v):
     return fx * th_d / r * x + cx, fy * th_d / r * y + cy
 
 
+class PixelTest(unittest.TestCase):
+    """Remap on the 16-bit image, bilinear, then the high byte."""
+
+    def convert(self, img):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = os.path.join(tmp, 'a.png'), os.path.join(tmp, 'b.png')
+            cv2.imwrite(src, img)
+            calib = dict(CALIB, intrinsics=[24.0, 24.0, 31.5, 31.5])
+            maps = conv.undistort_maps(calib, 24.0, 64)
+            conv.convert_image(src, dst, maps)
+            return cv2.imread(dst, cv2.IMREAD_UNCHANGED), maps
+
+    def test_high_byte_of_a_constant_image(self):
+        out, _ = self.convert(np.full((64, 64), 0x1234, dtype=np.uint16))
+        self.assertEqual(out[32, 32], 0x12)
+
+    def test_bilinear_on_a_ramp(self):
+        # 1024 per source column: the 8-bit output is 4 x (source x), floored; nearest would be up to 2 off.
+        ramp = np.tile(np.arange(64, dtype=np.uint16) * 1024, (64, 1))
+        out, (mx, _) = self.convert(ramp)
+        frac = mx[8:56, 8:56] - np.floor(mx[8:56, 8:56])
+        v, u = np.argwhere((frac > 0.4) & (frac < 0.6))[0] + 8
+        self.assertLess(abs(float(out[v, u]) - 4 * float(mx[v, u])), 1.1)
+
+    def test_missing_source_image_is_named(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit) as e:
+                conv.convert_image(os.path.join(tmp, 'gone.png'), os.path.join(tmp, 'b.png'), None)
+            self.assertIn('does not exist', str(e.exception))
+
+    def test_unwritable_destination_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, 'a.png')
+            cv2.imwrite(src, np.zeros((64, 64), dtype=np.uint16))
+            maps = conv.undistort_maps(dict(CALIB, intrinsics=[24.0, 24.0, 31.5, 31.5]), 24.0, 64)
+            with self.assertRaises(SystemExit) as e:
+                conv.convert_image(src, os.path.join(tmp, 'no', 'dir', 'b.png'), maps)
+            self.assertIn('cannot write', str(e.exception))
+
+
 class MapTest(unittest.TestCase):
     def test_map_matches_closed_form_equidistant(self):
         # An odd size puts the principal point (size - 1) / 2 on a pixel.

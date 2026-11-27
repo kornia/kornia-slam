@@ -42,11 +42,14 @@ def undistort_maps(calib, focal, size):
 
 
 def convert_image(src_path, dst_path, maps):
+    if not os.path.exists(src_path):
+        raise SystemExit(f'tumvi_to_euroc.py: {src_path} is listed in data.csv but does not exist')
     wide = cv2.imread(src_path, cv2.IMREAD_UNCHANGED)
     if wide is None or wide.dtype != np.uint16 or wide.ndim != 2:
         raise SystemExit(f'tumvi_to_euroc.py: {src_path} is not a 16-bit grayscale image')
     out = cv2.remap(wide, maps[0], maps[1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    cv2.imwrite(dst_path, (out >> 8).astype(np.uint8))
+    if not cv2.imwrite(dst_path, (out >> 8).astype(np.uint8)):
+        raise SystemExit(f'tumvi_to_euroc.py: cannot write {dst_path}')
 
 
 def sensor_yaml(calib, focal, size):
