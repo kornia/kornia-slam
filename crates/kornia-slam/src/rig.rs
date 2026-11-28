@@ -5,17 +5,20 @@
 //! Poses tracked by the system stay those of the primary camera; a feature of
 //! camera `c` is projected with `camera_from_primary[c] ∘ pose_world_to_primary`.
 
+use kornia_3d::camera::CameraModel;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::Vec3F64;
+use kornia_algebra::{Vec2F64, Vec3F64};
 use kornia_sensors::{RigCamera, SensorRig};
 
 /// Depths (metres) sampled when mapping where two cameras' views overlap.
 const OVERLAP_DEPTHS_M: [f64; 5] = [1.0, 2.0, 5.0, 15.0, 50.0];
 /// Pixel step of the overlap sampling grid.
 const OVERLAP_GRID_STEP_PX: usize = 8;
+/// Nearest point (metres) a camera counts as imaging.
+const OVERLAP_MIN_DEPTH_M: f64 = 0.05;
 
-/// An axis-aligned pixel box `[x0, y0, x1, y1)`.
+/// An axis-aligned box `[x0, y0, x1, y1)` in raw image pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PixelBox {
     pub min: [f32; 2],
@@ -36,8 +39,9 @@ pub struct RigView<'a> {
     pub pinhole: &'a PinholeCamera,
     /// `T_CP`: `X_camera = T_CP * X_primary`.
     pub camera_from_primary: &'a Pose3d,
-    /// Pixels of this camera that some other camera also sees, between 1 and
-    /// 50 m; `None` when no other camera shares its view.
+    /// Raw image pixels of this camera that some other camera also sees,
+    /// between 1 and 50 m, to test raw keypoints against; `None` when no other
+    /// camera shares its view.
     pub overlap: Option<PixelBox>,
 }
 
@@ -111,8 +115,21 @@ impl RigGeometry {
     }
 }
 
-/// Bounding box of the pixels of camera `c` whose rays, at some sampled
-/// depth, land inside another camera's image.
+/// Whether `view` images the camera-frame point `p_cam` inside its raw image.
+fn images(view: &RigView<'_>, p_cam: &Vec3F64) -> bool {
+    let size = view.camera.size;
+    p_cam.z > OVERLAP_MIN_DEPTH_M
+        && view.camera.model.project(p_cam).is_some_and(|pixel| {
+            pixel.x >= 0.0
+                && pixel.y >= 0.0
+                && pixel.x < size.width as f64
+                && pixel.y < size.height as f64
+        })
+}
+
+/// Bounding box of the raw pixels of camera `c` whose rays, through the
+/// camera's model and at some sampled depth, land inside another camera's
+/// raw image.
 fn overlap_box(rig: &RigGeometry, c: usize) -> Option<PixelBox> {
     let view = rig.view(c)?;
     let primary_from_c = &view.camera.primary_from_camera;
@@ -120,20 +137,21 @@ fn overlap_box(rig: &RigGeometry, c: usize) -> Option<PixelBox> {
     let mut found: Option<PixelBox> = None;
     for y in (0..size.height).step_by(OVERLAP_GRID_STEP_PX) {
         for x in (0..size.width).step_by(OVERLAP_GRID_STEP_PX) {
-            let ray = Vec3F64::new(
-                (x as f64 - view.pinhole.cx) / view.pinhole.fx,
-                (y as f64 - view.pinhole.cy) / view.pinhole.fy,
-                1.0,
-            );
+            // Scaled to z = 1, so `ray * depth` sits at z = depth.
+            let ray = match view
+                .camera
+                .model
+                .unproject(&Vec2F64::new(x as f64, y as f64))
+            {
+                Some(bearing) if bearing.z > 0.0 => bearing * (1.0 / bearing.z),
+                _ => continue,
+            };
             let seen = rig.views().enumerate().any(|(o, other)| {
                 o != c
                     && OVERLAP_DEPTHS_M.iter().any(|&depth| {
                         let p_primary = primary_from_c.transform_point(&(ray * depth));
                         let p_other = other.camera_from_primary.transform_point(&p_primary);
-                        other
-                            .pinhole
-                            .project_to_image(&p_other, 0.05, other.camera.size)
-                            .is_ok()
+                        images(&other, &p_other)
                     })
             });
             if seen {
@@ -235,6 +253,79 @@ pub(crate) mod tests {
             ),
         ]);
         assert!(rig.needs_undistortion());
+    }
+
+    /// Two EuRoC radtan cameras, camera 1 yawed 40 deg and 0.11 m along x.
+    fn euroc_radtan_rig() -> RigGeometry {
+        let euroc = PinholeCamera {
+            fx: 458.654,
+            fy: 457.296,
+            cx: 367.215,
+            cy: 248.375,
+            k1: -0.28340811,
+            k2: 0.07395907,
+            p1: 0.00019359,
+            p2: 1.76187114e-05,
+        };
+        let size = ImageSize {
+            width: 752,
+            height: 480,
+        };
+        rig_of(vec![
+            RigCamera::primary(euroc.clone(), size),
+            RigCamera::new(
+                euroc,
+                size,
+                Pose3d::new(yaw(40.0), Vec3F64::new(0.11, 0.0, 0.0)),
+            ),
+        ])
+    }
+
+    #[test]
+    fn a_point_both_distorted_cameras_see_lies_in_both_boxes() {
+        let rig = euroc_radtan_rig();
+        let views: Vec<RigView<'_>> = rig.views().collect();
+        let inside = |view: &RigView<'_>, p_cam: &Vec3F64| {
+            let pixel = view.camera.model.project(p_cam)?;
+            let size = view.camera.size;
+            let margin = 8.0;
+            (pixel.x >= margin
+                && pixel.y >= margin
+                && pixel.x < size.width as f64 - margin
+                && pixel.y < size.height as f64 - margin)
+                .then_some([pixel.x as f32, pixel.y as f32])
+        };
+        let mut checked = 0;
+        for depth in [1.0, 2.0, 5.0, 15.0] {
+            for i in -40..=40 {
+                for j in -25..=25 {
+                    let p_primary =
+                        Vec3F64::new(i as f64 * 0.025 * depth, j as f64 * 0.025 * depth, depth);
+                    let seen: Vec<Option<[f32; 2]>> = views
+                        .iter()
+                        .map(|view| {
+                            let p_cam = view.camera_from_primary.transform_point(&p_primary);
+                            if p_cam.z <= 0.0 {
+                                return None;
+                            }
+                            inside(view, &p_cam)
+                        })
+                        .collect();
+                    let (Some(pixel0), Some(pixel1)) = (seen[0], seen[1]) else {
+                        continue;
+                    };
+                    checked += 1;
+                    for (view, pixel) in views.iter().zip([pixel0, pixel1]) {
+                        let overlap = view.overlap.unwrap();
+                        assert!(
+                            overlap.contains(pixel),
+                            "{p_primary:?} at {pixel:?} outside {overlap:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(checked > 100, "only {checked} points in both images");
     }
 
     #[test]
