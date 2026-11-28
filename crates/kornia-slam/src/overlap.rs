@@ -13,7 +13,7 @@ use kornia_3d::pose::{Pose3d, TriangulationConfig, triangulate_matched_points_tw
 use kornia_algebra::{Vec2F64, Vec3F64};
 use kornia_imgproc::features::OrbMatchConfig;
 
-use crate::features::{Features, RBrief};
+use crate::features::{Descriptor, Features, RBrief};
 use crate::frame::{is_finite_xy, undistorted_camera};
 use crate::guided_match::{EpipolarGeometry, GuidedView, guided_matches};
 use crate::mapping::growth::accepted_pair_claims;
@@ -60,6 +60,8 @@ struct Scratch {
     pts0: Vec<Vec2F64>,
     pts1: Vec<Vec2F64>,
     thresholds: Vec<[f64; 2]>,
+    /// `(Hamming distance, index into the triangulated points)`.
+    ranked: Vec<(u32, usize)>,
     triangulated: Vec<(usize, usize)>,
 }
 
@@ -196,13 +198,30 @@ impl OverlapMatcher {
             return out;
         };
 
-        // A feature holds one match in each camera: first claim wins.
-        scratch.triangulated.clear();
+        // A feature holds one match in each camera. The matcher lets two
+        // primary features pick the same camera-1 feature, so the closest
+        // descriptor claims it first; a stable sort keeps feature order on ties.
+        scratch.ranked.clear();
         scratch
-            .triangulated
-            .extend(triangulated.iter().map(|tp| pairs[tp.pair_index]));
-        for k in accepted_pair_claims(&scratch.triangulated) {
-            let (i, j) = scratch.triangulated[k];
+            .ranked
+            .extend(triangulated.iter().enumerate().map(|(k, tp)| {
+                let (i, j) = pairs[tp.pair_index];
+                (
+                    features.descriptors[i].distance(&features.descriptors[j]),
+                    k,
+                )
+            }));
+        scratch.ranked.sort_by_key(|&(distance, _)| distance);
+        scratch.triangulated.clear();
+        scratch.triangulated.extend(
+            scratch
+                .ranked
+                .iter()
+                .map(|&(_, k)| pairs[triangulated[k].pair_index]),
+        );
+        for accepted in accepted_pair_claims(&scratch.triangulated) {
+            let (i, j) = scratch.triangulated[accepted];
+            let k = scratch.ranked[accepted].1;
             let slot = i - left.start;
             out.left_to_right[slot] = Some(j);
             out.points[slot] = Some(triangulated[k].position);
@@ -389,8 +408,9 @@ mod tests {
     }
 
     /// Camera 1 sits 0.3 m ahead of the primary, so the epipole is the
-    /// principal point: a point on the optical axis lies on every epipolar
-    /// line there and is refused; one off the axis still matches.
+    /// principal point. A point 1.8 px from it lies on its epipolar line,
+    /// which is not degenerate, and only the epipole guard refuses it; one far
+    /// off the axis still matches.
     #[test]
     fn overlap_rejects_a_match_at_the_epipole() {
         let size = ImageSize {
@@ -408,7 +428,7 @@ mod tests {
         .unwrap();
         let rig = RigGeometry::from_rig(&sensor_rig).unwrap();
         let right_from_left = sensor_rig.b_from_a(0, 1).unwrap();
-        let scene = [Vec3F64::new(0.0, 0.0, 3.0), Vec3F64::new(1.5, 0.5, 3.0)];
+        let scene = [Vec3F64::new(0.02, 0.0, 3.0), Vec3F64::new(1.5, 0.5, 3.0)];
         let mut keypoints_xy = Vec::new();
         let mut right_xy = Vec::new();
         for p in &scene {
@@ -491,6 +511,41 @@ mod tests {
             format!("{fundamental:?}"),
             format!("{:?}", matcher.epipolar)
         );
+    }
+
+    /// Two primary features on camera 1's ray through one of its features
+    /// both match it and both triangulate, at different depths: the exact
+    /// descriptor claims it, not the earlier feature 40 bits away.
+    #[test]
+    fn the_closest_descriptor_claims_a_shared_feature() {
+        let sensor_rig = sensor_rig();
+        let rig = RigGeometry::from_rig(&sensor_rig).unwrap();
+        let right_from_left = sensor_rig.b_from_a(0, 1).unwrap();
+        let p = Vec3F64::new(1.5, -0.3, 4.0);
+        let centre1 = right_from_left.camera_centre();
+        let q = centre1 + (p - centre1) * 0.6;
+        let pixel = |p: &Vec3F64| {
+            let px = camera().project_to_pixel(p, 0.0).unwrap();
+            [px.x as f32, px.y as f32]
+        };
+        let r = pixel(&right_from_left.transform_point(&p));
+        let exact = descriptor(0);
+        let mut near = exact;
+        for byte in &mut near.0[..5] {
+            *byte = !*byte;
+        }
+        assert_eq!(near.distance(&exact), 40);
+        let features = features(vec![pixel(&q), pixel(&p), r], vec![near, exact, exact]);
+        let matches = match_overlap(
+            &features,
+            &features.keypoints_xy,
+            &[0..2, 2..3],
+            &rig,
+            &right_from_left,
+        );
+        assert_eq!(matches.left_to_right, vec![None, Some(2)]);
+        let got = matches.points[1].unwrap();
+        assert!((got - p).length() < 0.05 * p.z, "{got:?} vs {p:?}");
     }
 
     #[test]
