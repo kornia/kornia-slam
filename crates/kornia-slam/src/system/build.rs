@@ -47,9 +47,10 @@ pub(crate) struct SystemSettings {
     /// keypoints directly into metric map points.
     pub stereo_close_depth_m: Option<f64>,
     /// Survivors with a map point a frame needs to be tracked by optical flow
-    /// alone; `None` without `klt_first`, and on a multi-camera rig unless
-    /// flow tracks every camera: a primary-only flow frame would drop the
-    /// other cameras.
+    /// alone; `None` without `klt_first`, on a multi-camera rig unless flow
+    /// tracks every camera (a primary-only flow frame would drop the other
+    /// cameras), and on a raw fisheye primary, whose flow pixels are raw
+    /// while its frame's keypoints are virtual-pinhole ones.
     pub klt_min_tracks: Option<usize>,
     pub klt_kernel: LkKernel,
     /// `(max_level, max_iter)` of the predicted flow search; `None` when
@@ -142,7 +143,10 @@ impl SystemConfig {
             klt_min_tracks: frontend
                 .klt_first
                 .min_tracks()
-                .filter(|_| !multi_camera || frontend.klt_rig == KltRig::AllCameras),
+                .filter(|_| {
+                    (!multi_camera || frontend.klt_rig == KltRig::AllCameras)
+                        && !rig.primary().is_fisheye()
+                }),
             klt_kernel: frontend.klt_kernel,
             klt_prediction: frontend
                 .klt_prediction

@@ -248,7 +248,7 @@ impl Default for OrbFrontendConfig {
 /// alone, without ORB, unless a keyframe is due, the flow-only pose is
 /// refused, or fewer than `min_tracks` survivors carry a map point.
 /// A multi-camera rig extracts ORB on every frame unless `klt_rig` is
-/// `AllCameras`.
+/// `AllCameras`; a raw fisheye primary does regardless.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum KltFirst {
@@ -405,11 +405,18 @@ impl fmt::Display for SystemConfig {
             LkKernel::FixedPointU8 => writeln!(f, "  klt kernel: fixed-point u8")?,
             LkKernel::WindowedU8 => writeln!(f, "  klt kernel: window-only fixed-point u8")?,
         }
-        if let Some(min_tracks) = frontend.klt_first.min_tracks() {
-            writeln!(
+        match frontend.klt_first.min_tracks() {
+            Some(_)
+                if self.sensors.cameras == CameraSelection::Rig
+                    && frontend.klt_rig != KltRig::AllCameras =>
+            {
+                writeln!(f, "  klt-first: inactive on a rig, ORB on every frame")?;
+            }
+            Some(min_tracks) => writeln!(
                 f,
-                "  klt-first: ORB only when a keyframe is due or fewer than {min_tracks} tracks survive"
-            )?;
+                "  klt-first: ORB when a keyframe is due, the flow pose is refused or fewer than {min_tracks} tracks survive"
+            )?,
+            None => {}
         }
         if let Some((max_level, max_iter)) = frontend.klt_prediction.search() {
             writeln!(

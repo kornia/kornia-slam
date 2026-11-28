@@ -6,8 +6,8 @@ use kornia_algebra::Vec3F64;
 use kornia_image::{Image, ImageSize};
 use kornia_imgproc::filter::scharr_spatial_gradient_float;
 use kornia_imgproc::optical_flow_pyr_lk::{
-    LkPyramidU8, PyrLKError, PyrLKParams, PyrLKPrecomputed, PyrLKResult, PyrLkU8Error,
-    calc_optical_flow_pyr_lk, calc_optical_flow_pyr_lk_u8,
+    LkPyramidU8, PYR_LK_MAX_LEVEL, PyrLKError, PyrLKParams, PyrLKPrecomputed, PyrLKResult,
+    PyrLkU8Error, calc_optical_flow_pyr_lk, calc_optical_flow_pyr_lk_u8,
     calc_optical_flow_pyr_lk_with_precomputed,
 };
 use kornia_imgproc::pyramid::pyrdown_f32;
@@ -662,8 +662,17 @@ impl KltTracker {
             return self.track_cached_u8(cache, tracks, prediction, previous, current, timings);
         }
         let max_level = self.params.max_level;
+        // Checked before `max_level + 1` sizes any pyramid, as the uncached
+        // path does.
+        if max_level > PYR_LK_MAX_LEVEL {
+            return Err(PyrLKError::InvalidMaxLevel {
+                max_level,
+                max_supported: PYR_LK_MAX_LEVEL,
+            }
+            .into());
+        }
         let (mut precomputed, next_image) = timed(&mut timings.klt_build, || {
-            let (prev_pyr, grad_x_pyr, grad_y_pyr) = match cache.take_for(previous) {
+            let (prev_pyr, grad_x_pyr, grad_y_pyr) = match cache.take_for(previous, max_level) {
                 Some(cached) => cached.into_parts()?,
                 None => LevelPyramid::build(previous, max_level)?.into_parts()?,
             };
@@ -730,16 +739,21 @@ impl KltTracker {
     ) -> Result<Vec<FlowSurvivor>, FlowError> {
         let (win, max_level) = (self.params.win_size, self.params.max_level);
         let (prev_pyr, next_pyr) = timed(&mut timings.klt_build, || {
-            let prev_pyr = match cache.take_u8_for(previous) {
-                Some(cached) => cached,
-                None => LkPyramidU8::new(previous, win, max_level, true)?,
-            };
+            let cached = cache.take_u8_for(previous);
             let next_pyr = match cache.u8_spare.take() {
                 Some(mut spare) => {
                     spare.rebuild(current, win, max_level, true)?;
                     spare
                 }
                 None => LkPyramidU8::new(current, win, max_level, true)?,
+            };
+            // A pyramid cached by a tracker of another depth or window is
+            // rebuilt: LK needs both pyramids alike.
+            let prev_pyr = match cached.filter(|pyr| {
+                pyr.win_size() == next_pyr.win_size() && pyr.num_levels() == next_pyr.num_levels()
+            }) {
+                Some(cached) => cached,
+                None => LkPyramidU8::new(previous, win, max_level, true)?,
             };
             Ok::<_, PyrLkU8Error>((prev_pyr, next_pyr))
         })?;
@@ -923,10 +937,12 @@ impl KltPyramidCache {
     /// Takes the cached pyramid if it was built from exactly `image`'s
     /// pixels; a byte compare is cheap next to a pyramid and makes a stale
     /// cache impossible to use.
-    fn take_for(&mut self, image: &Image<u8, 1>) -> Option<LevelPyramid> {
+    fn take_for(&mut self, image: &Image<u8, 1>, max_level: usize) -> Option<LevelPyramid> {
         let entry = self.entry.take()?;
-        (entry.image.size() == image.size() && entry.image.as_slice() == image.as_slice())
-            .then_some(entry)
+        (entry.levels.len() == max_level + 1
+            && entry.image.size() == image.size()
+            && entry.image.as_slice() == image.as_slice())
+        .then_some(entry)
     }
 
     /// Like [`Self::take_for`] for the fixed-point kernel's pyramid; a stale
@@ -1533,6 +1549,87 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cold, cached[1]);
+    }
+
+    /// One cache passed between trackers of different pyramid depths: an
+    /// entry of the wrong depth is rebuilt, not handed to LK.
+    #[test]
+    fn a_cache_of_another_depth_is_rebuilt() {
+        let frames = [
+            square_image([90, 90]),
+            square_image([93, 92]),
+            square_image([95, 95]),
+        ];
+        let mut tracks = TrackSet::new();
+        tracks.spawn([90.0, 90.0]);
+        let mut timings = TrackingTimings::default();
+        for kernel in [LkKernel::F32, LkKernel::FixedPointU8] {
+            let tracker = |max_level| {
+                KltTracker::new(
+                    PyrLKParams {
+                        max_level,
+                        ..PyrLKParams::default()
+                    },
+                    SurvivorFilterConfig::default(),
+                )
+                .with_kernel(kernel)
+            };
+            let (shallow, deep) = (tracker(0), tracker(3));
+            let mut cache = KltPyramidCache::new();
+            shallow
+                .track_cached(
+                    &mut cache,
+                    tracks.tracks(),
+                    None,
+                    &frames[0],
+                    &frames[1],
+                    &mut timings,
+                )
+                .unwrap();
+            let shared = deep.track_cached(
+                &mut cache,
+                tracks.tracks(),
+                None,
+                &frames[1],
+                &frames[2],
+                &mut timings,
+            );
+            let cold = deep.track_cached(
+                &mut KltPyramidCache::new(),
+                tracks.tracks(),
+                None,
+                &frames[1],
+                &frames[2],
+                &mut timings,
+            );
+            assert_eq!(shared.unwrap(), cold.unwrap(), "{kernel:?}");
+        }
+    }
+
+    #[test]
+    fn an_unsupported_depth_is_an_error() {
+        let frames = [square_image([90, 90]), square_image([93, 92])];
+        let mut tracks = TrackSet::new();
+        tracks.spawn([90.0, 90.0]);
+        let tracker = KltTracker::new(
+            PyrLKParams {
+                max_level: usize::MAX,
+                ..PyrLKParams::default()
+            },
+            SurvivorFilterConfig::default(),
+        );
+        let tracked = tracker.track_cached(
+            &mut KltPyramidCache::new(),
+            tracks.tracks(),
+            None,
+            &frames[0],
+            &frames[1],
+            &mut TrackingTimings::default(),
+        );
+        assert!(matches!(
+            tracked,
+            Err(FlowError::F32(PyrLKError::InvalidMaxLevel { .. }))
+        ));
     }
 
     #[test]

@@ -17,7 +17,7 @@ header prints a line only for a knob away from its default:
   keyframes is tracked from its optical-flow survivors alone, without ORB,
   when at least `N` of them carry a map point; ORB runs when that pose is
   refused, too few survivors remain, or a keyframe is due. A multi-camera rig
-  extracts ORB on every frame. `SlamSystem::flow_counters` reports what became
+  and a raw fisheye primary extract ORB on every frame. `SlamSystem::flow_counters` reports what became
   of the deferred frames, and the CLI prints them as one `[summary] flow` line
   at the end of a `klt_first` run.
 - `klt_kernel: F32` (default, kornia-imgproc's f32 LK) or `FixedPointU8`.

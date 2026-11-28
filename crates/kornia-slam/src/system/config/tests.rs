@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_image::ImageSize;
-use kornia_sensors::SensorRig;
+use kornia_sensors::{RigCamera, SensorRig};
 
 use super::*;
 use crate::mapping::LocalMappingMode;
@@ -464,12 +464,18 @@ fn frontend_defaults_reproduce_main() {
         "OrbSlam pipeline (config version 1)
   frontend: ORB, 1000 keypoints
   klt kernel: fixed-point u8
-  klt-first: ORB only when a keyframe is due or fewer than 80 tracks survive
+  klt-first: ORB when a keyframe is due, the flow pose is refused or fewer than 80 tracks survive
   klt prediction: levels 0..=1, 10 iterations when trusted
   tracking
   keyframes: every 3..=8 frames, ref ratio 0.6
   local mapping: asynchronous
 "
+    );
+    flow.sensors = sensors(CameraSelection::Rig, false);
+    assert!(
+        flow.to_string()
+            .contains("  klt-first: inactive on a rig, ORB on every frame\n"),
+        "{flow}"
     );
     assert!(flow.validate().is_ok());
     let FrontendConfig::Orb(frontend) = &mut orb_mut(&mut flow).frontend;
@@ -869,6 +875,40 @@ mod runtime_settings {
             sensors(CameraSelection::Rig, false).select_rig(rig()),
             Err(ConfigError::MissingSensor(_))
         ));
+    }
+
+    /// Flow-only tracking and the predicted search need flow pixels in the
+    /// frame's pinhole: a raw fisheye primary keeps both off.
+    #[test]
+    fn a_fisheye_primary_runs_orb_on_every_frame() {
+        let mut config = SystemConfig {
+            sensors: sensors(CameraSelection::Mono, false),
+            ..SystemConfig::default()
+        };
+        orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
+            klt_first: KltFirst::Enabled { min_tracks: 30 },
+            klt_prediction: KltPrediction::Enabled {
+                max_level: 1,
+                max_iter: 10,
+            },
+            ..OrbFrontendConfig::default()
+        });
+        let size = ImageSize {
+            width: 640,
+            height: 480,
+        };
+        let pinhole = SensorRig::from_cameras(vec![RigCamera::primary(camera(), size)]).unwrap();
+        let settings = config.settings(&pinhole);
+        assert_eq!(settings.klt_min_tracks, Some(30));
+        assert_eq!(settings.klt_prediction, Some((1, 10)));
+        let fisheye = SensorRig::from_cameras(vec![RigCamera::primary(
+            crate::rig::tests::aria_lens(),
+            size,
+        )])
+        .unwrap();
+        let settings = config.settings(&fisheye);
+        assert_eq!(settings.klt_min_tracks, None);
+        assert_eq!(settings.klt_prediction, None);
     }
 }
 

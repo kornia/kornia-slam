@@ -1274,7 +1274,8 @@ impl SlamSystem {
             .lost_since_sec
             .map_or(0.0, |t0| timestamp_sec - t0);
         let trusted_prediction = self.imu_confident(timestamp_sec);
-        let survivors = self.flow(previous_image, images, &candidate_pose, trusted_prediction);
+        let search = self.predicted_flow_search(trusted_prediction, predicted_velocity.is_some());
+        let survivors = self.flow(previous_image, images, &candidate_pose, search);
         let estimation = Estimation {
             candidate_pose,
             pose_before,
@@ -1720,24 +1721,36 @@ impl SlamSystem {
         *counter += 1;
     }
 
+    /// The `(max_level, max_iter)` of `klt_prediction` when this frame's
+    /// pose comes from a trusted inertial prediction; a trusted IMU whose
+    /// window held no samples falls back to the visual model, too weak a
+    /// start for the shallow search.
+    fn predicted_flow_search(
+        &self,
+        trusted_prediction: bool,
+        inertial_prediction: bool,
+    ) -> Option<(usize, usize)> {
+        self.klt_prediction
+            .filter(|_| trusted_prediction && inertial_prediction)
+    }
+
     /// The optical-flow survivors of the current frame, searched from the
-    /// predicted pose when `klt_prediction` is set and the prediction trusted.
+    /// predicted pose with `search` levels and iterations when given.
     fn flow(
         &mut self,
         previous_image: Option<&Image<u8, 1>>,
         images: &[&Image<u8, 1>],
         candidate_pose: &Pose3d,
-        trusted_prediction: bool,
+        search: Option<(usize, usize)>,
     ) -> Option<Vec<FlowSurvivor>> {
         if self.rig_flow.is_some() {
-            return self.flow_windowed(candidate_pose, trusted_prediction);
+            return self.flow_windowed(candidate_pose, search.is_some());
         }
-        let prediction = self.klt_prediction.filter(|_| trusted_prediction);
         if self.tracker.flows_rig() {
-            return self.flow_cameras(previous_image, images, candidate_pose, prediction);
+            return self.flow_cameras(previous_image, images, candidate_pose, search);
         }
         let current_image = images.first()?;
-        let Some((max_level, max_iter)) = prediction else {
+        let Some((max_level, max_iter)) = search else {
             return self.tracker.flow(
                 previous_image,
                 current_image,
@@ -1794,18 +1807,17 @@ impl SlamSystem {
     }
 
     /// [`Self::flow`] on the `WindowedU8` shards, from the predicted pose
-    /// when `klt_prediction` is set and the prediction trusted.
+    /// when `predicted` (the shallow predicted search applies).
     fn flow_windowed(
         &mut self,
         candidate_pose: &Pose3d,
-        trusted_prediction: bool,
+        predicted: bool,
     ) -> Option<Vec<FlowSurvivor>> {
         let rig_flow = self.rig_flow.as_mut()?;
         let frame_idx = self.next_frame_idx - 1;
         let input = FlowStepInput {
             frame_idx: frame_idx as u64,
-            pose_world_to_primary: (trusted_prediction && self.klt_prediction.is_some())
-                .then_some(*candidate_pose),
+            pose_world_to_primary: predicted.then_some(*candidate_pose),
             primary_rotation: self.gyro_rotation,
         };
         let survivors = self
