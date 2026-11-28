@@ -44,6 +44,11 @@ pub(crate) struct OrbFrontend {
     /// overlap of its first two cameras.
     rig: Option<OverlapMatcher>,
     observation: FrontendObservation,
+    /// Filled by the preparation in progress and swapped into `observation`
+    /// only when it succeeds, so a failed frame leaves the last one intact.
+    staging: FrontendObservation,
+    #[cfg(test)]
+    fail_next_extraction: bool,
 }
 
 impl OrbFrontend {
@@ -80,11 +85,34 @@ impl OrbFrontend {
                 .then(|| rig_overlap(rig, scale_factor))
                 .flatten(),
             observation: FrontendObservation::default(),
+            staging: FrontendObservation::default(),
+            #[cfg(test)]
+            fail_next_extraction: false,
         }
     }
 
     pub(crate) fn observation(&self) -> &FrontendObservation {
         &self.observation
+    }
+
+    /// Makes the next ORB extraction fail, to test the error paths.
+    #[cfg(test)]
+    pub(crate) fn fail_next_extraction(&mut self) {
+        self.fail_next_extraction = true;
+    }
+
+    fn extract(&mut self, image: &Image<u8, 1>) -> Result<OrbFeatures, ImageError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_extraction) {
+            return Err(ImageError::ImageDataNotInitialized);
+        }
+        self.detector.detect_and_extract_u8(image)
+    }
+
+    /// Publishes the staged observation of a frame that was prepared.
+    fn publish(&mut self, frame: Frame) -> Frame {
+        std::mem::swap(&mut self.observation, &mut self.staging);
+        frame
     }
 
     /// Extracts and prepares the features of one validated image, numbering
@@ -95,8 +123,13 @@ impl OrbFrontend {
         idx: usize,
         image: &Image<u8, 1>,
     ) -> Result<Frame, ImageError> {
+        let frame = self.image_frame(idx, image)?;
+        Ok(self.publish(frame))
+    }
+
+    fn image_frame(&mut self, idx: usize, image: &Image<u8, 1>) -> Result<Frame, ImageError> {
         let start = Instant::now();
-        let features = self.detector.detect_and_extract_u8(image)?;
+        let features = self.extract(image)?;
         Ok(self.finish_frame(idx, image, features, None, start))
     }
 
@@ -110,11 +143,15 @@ impl OrbFrontend {
         right: &Image<u8, 1>,
     ) -> Result<Frame, ImageError> {
         let start = Instant::now();
-        let features = self.detector.detect_and_extract_u8(left)?;
-        let Some(config) = &self.stereo else {
-            return Ok(self.finish_frame(idx, left, features, None, start));
+        let features = self.extract(left)?;
+        let right_features = match self.stereo {
+            Some(_) => Some(self.extract(right)?),
+            None => None,
         };
-        let right_features = self.detector.detect_and_extract_u8(right)?;
+        let (Some(config), Some(right_features)) = (&self.stereo, right_features) else {
+            let frame = self.finish_frame(idx, left, features, None, start);
+            return Ok(self.publish(frame));
+        };
         let left_pyramid = self.build_pyramid(left)?;
         let right_pyramid = self.build_pyramid(right)?;
         let matches = compute_stereo_matches(
@@ -124,7 +161,8 @@ impl OrbFrontend {
             &right_features,
             config,
         );
-        Ok(self.finish_frame(idx, left, features, Some(matches), start))
+        let frame = self.finish_frame(idx, left, features, Some(matches), start);
+        Ok(self.publish(frame))
     }
 
     /// Extracts features on every image of a validated rig capture, one image
@@ -139,9 +177,9 @@ impl OrbFrontend {
         let Some(primary) = images.first() else {
             return Err(ImageError::ImageDataNotInitialized);
         };
-        let Some(rig) = self.rig.as_mut() else {
+        if self.rig.is_none() {
             return self.prepare_image(idx, primary);
-        };
+        }
         let mut features = OrbFeatures {
             keypoints_xy: Vec::new(),
             orientations: Vec::new(),
@@ -151,7 +189,7 @@ impl OrbFrontend {
         let mut camera_ranges = Vec::with_capacity(images.len());
         let mut keypoint_colors = Vec::new();
         for image in images {
-            let camera_features = self.detector.detect_and_extract_u8(image)?;
+            let camera_features = self.extract(image)?;
             let begin = features.keypoints_xy.len();
             keypoint_colors.extend(sample_colors(image, &camera_features.keypoints_xy));
             features.keypoints_xy.extend(camera_features.keypoints_xy);
@@ -160,9 +198,12 @@ impl OrbFrontend {
             features.octaves.extend(camera_features.octaves);
             camera_ranges.push(begin..features.keypoints_xy.len());
         }
-        self.observation.keypoints_xy.clear();
+        let Some(rig) = self.rig.as_mut() else {
+            return Err(ImageError::ImageDataNotInitialized);
+        };
+        self.staging.keypoints_xy.clear();
         if let Some(range) = camera_ranges.first() {
-            self.observation
+            self.staging
                 .keypoints_xy
                 .extend_from_slice(&features.keypoints_xy[range.clone()]);
         }
@@ -194,11 +235,11 @@ impl OrbFrontend {
             &frame.keypoints_undist
         };
         let matches = rig.run(&frame.features, pixels, &frame.rig.camera_ranges);
-        self.observation.stereo_matched = Some(matches.num_matched());
+        self.staging.stereo_matched = Some(matches.num_matched());
         frame.rig.left_to_right = matches.left_to_right;
         frame.rig.stereo_points = matches.points;
-        self.observation.duration = start.elapsed();
-        Ok(frame)
+        self.staging.duration = start.elapsed();
+        Ok(self.publish(frame))
     }
 
     fn finish_frame(
@@ -213,8 +254,8 @@ impl OrbFrontend {
         let stereo_matched = stereo.as_ref().map(StereoMatches::num_matched);
         let StereoMatches { u_right, depth } = stereo.unwrap_or_default();
 
-        self.observation.keypoints_xy.clear();
-        self.observation
+        self.staging.keypoints_xy.clear();
+        self.staging
             .keypoints_xy
             .extend_from_slice(&features.keypoints_xy);
         // Every per-feature array, stereo included, must stay aligned, so the
@@ -224,8 +265,8 @@ impl OrbFrontend {
         }
         let keypoint_colors = sample_colors(image, &features.keypoints_xy);
 
-        self.observation.stereo_matched = stereo_matched;
-        self.observation.duration = start.elapsed();
+        self.staging.stereo_matched = stereo_matched;
+        self.staging.duration = start.elapsed();
         Frame {
             idx,
             features,
