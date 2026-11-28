@@ -191,7 +191,8 @@ pub enum TrackRefill {
     #[default]
     Off,
     /// Refill to `per_camera` tracks when fewer than `refill_below` of them
-    /// are left, `min_spacing_px` apart and `border_px` from the edge.
+    /// are left, `min_spacing_px` apart and `border_px` from the edge. It
+    /// runs inside a flow step, so a rig with no track left waits for ORB.
     Enabled {
         per_camera: usize,
         min_spacing_px: f32,

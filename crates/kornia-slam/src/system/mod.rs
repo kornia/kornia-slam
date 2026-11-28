@@ -309,7 +309,9 @@ impl SlamSystem {
     ///
     /// Invalid input, a stereo rig (use [`Self::process_stereo`]) or a
     /// feature-extraction failure; the system state, including image history,
-    /// is then unchanged. IMU samples already buffered are kept.
+    /// is then unchanged, except that `klt_kernel: WindowedU8` keeps the
+    /// failed image as its previous flow frame and so drops its tracks on the
+    /// next call. IMU samples already buffered are kept.
     pub fn process_image(
         &mut self,
         timestamp_sec: f64,
@@ -427,7 +429,8 @@ impl SlamSystem {
     }
 
     /// Takes a prepared or deferred frame as the next one and tracks it. On
-    /// an error, from a deferred extraction, the system is left as it was.
+    /// an error, from a deferred extraction, the system is left as it was,
+    /// but for `WindowedU8`'s flow frames, which already hold this capture.
     fn track_frame(
         &mut self,
         source: FrameSource<'_>,
@@ -516,7 +519,8 @@ impl SlamSystem {
     }
 
     /// Per-stage times of the latest successfully processed frame's
-    /// tracking; zero for stages it did not run (all of them in bootstrap).
+    /// tracking; zero for stages it did not run (in bootstrap all but
+    /// `WindowedU8`'s `flow_prepare`).
     pub fn tracking_timings(&self) -> &TrackingTimings {
         &self.tracking_timings
     }
