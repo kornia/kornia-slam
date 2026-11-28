@@ -2083,3 +2083,26 @@ fn a_loop_whose_query_keyframe_departed_no_longer_exempts_its_region() {
 
     assert!(!closer.region_has_loop_for_test(&map, 1));
 }
+
+/// Writeback holds a planned match to the search radius as well as the reprojection limit, as
+/// synchronous fusion does: with a 1 px radius, a keyframe that moved by about 2 px since the plan
+/// takes no fusion, though every match is still within the 3 px reprojection limit.
+#[test]
+fn fusion_writeback_holds_matches_to_the_search_radius() {
+    let (map, ops, config) = planned_fusion();
+    let mut moved = map.clone();
+    let mut pose = moved.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    // About 2 px at the landmarks' 4-4.4 m depth and fx = 400.
+    pose.translation.x += 0.021;
+    moved.set_keyframe_pose_for_test(10, pose);
+    let tight = LoopFusionConfig {
+        search_radius_px: 1.0,
+        ..config.clone()
+    };
+
+    let loose = apply_fusion(&mut moved.clone(), &camera(), &ops, &config);
+    let held = apply_fusion(&mut moved, &camera(), &ops, &tight);
+
+    assert_eq!(loose.stale, 0, "{loose:?}");
+    assert_eq!(held.stale, ops.len(), "{held:?}");
+}

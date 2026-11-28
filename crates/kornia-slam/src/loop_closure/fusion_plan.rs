@@ -543,15 +543,15 @@ fn live_landmark<D: Descriptor>(map: &Map<D>, landmark: usize) -> Option<Vec3F64
         .map(|point| point.position)
 }
 
-/// Whether `landmark`, live, projects onto `keyframe`'s live primary-camera `feature`: fusion
-/// matches primary-camera features only.
+/// Whether `landmark`, live, projects within `limit_px` of `keyframe`'s live primary-camera
+/// `feature`: fusion matches primary-camera features only.
 fn lands_on<D: Descriptor>(
     map: &Map<D>,
     camera: &PinholeCamera,
     landmark: usize,
     keyframe: usize,
     feature: usize,
-    config: &LoopFusionConfig<D::Distance>,
+    limit_px: f64,
 ) -> bool {
     let (Some(position), Some(keyframe)) =
         (live_landmark(map, landmark), map.get_keyframe(keyframe))
@@ -566,8 +566,14 @@ fn lands_on<D: Descriptor>(
             frame.image_size,
             position,
             frame.undistorted_xy(feature, camera),
-            config.max_reprojection_error_px,
+            limit_px,
         )
+}
+
+/// The forward search's limit: synchronous fusion holds a match to both the search radius and
+/// the reprojection limit. Its reciprocal check holds the reprojection limit only.
+fn forward_limit_px<T>(config: &LoopFusionConfig<T>) -> f64 {
+    f64::from(config.search_radius_px).min(config.max_reprojection_error_px)
 }
 
 fn link_is_current<D: Descriptor>(
@@ -586,7 +592,16 @@ fn link_is_current<D: Descriptor>(
         kf.map_point(feature)
             .is_none_or(|held| live_landmark(map, held).is_none())
     });
-    !observed && slot_free && lands_on(map, camera, landmark, keyframe, feature, config)
+    !observed
+        && slot_free
+        && lands_on(
+            map,
+            camera,
+            landmark,
+            keyframe,
+            feature,
+            forward_limit_px(config),
+        )
 }
 
 fn merge_is_current<D: Descriptor>(
@@ -608,6 +623,20 @@ fn merge_is_current<D: Descriptor>(
         && source_unseen
         && holds(source_keyframe, source_feature, source)
         && holds(target_keyframe, target_feature, target)
-        && lands_on(map, camera, source, target_keyframe, target_feature, config)
-        && lands_on(map, camera, target, source_keyframe, source_feature, config)
+        && lands_on(
+            map,
+            camera,
+            source,
+            target_keyframe,
+            target_feature,
+            forward_limit_px(config),
+        )
+        && lands_on(
+            map,
+            camera,
+            target,
+            source_keyframe,
+            source_feature,
+            config.max_reprojection_error_px,
+        )
 }
