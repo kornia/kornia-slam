@@ -1983,3 +1983,40 @@ fn finish_reports_loops_left_without_inertial_initialization() {
     ] if reason.contains("inertial initialization pending")));
     assert!(!outcome.pgo_applied);
 }
+
+/// A queued loop whose keyframe leaves the map before its solve is reported unapplied, not
+/// carried through a solve that no longer holds its edge.
+#[test]
+fn a_queued_loop_whose_keyframe_departed_is_reported_unapplied() {
+    let (closer, mut map, context) = lap_closer(23);
+    let mut closer = closer.with_solver(LoopSolver::replay(1));
+    let first = lap_loop(1, 23, &map);
+    assert!(
+        closer
+            .handle_accepted_for_test(&mut map, &camera(), first, context)
+            .queued
+    );
+    let applied = closer.on_frame(&mut map, &camera(), context);
+    assert!(applied_alone(&applied.events), "{:?}", applied.events);
+
+    let between_keyframes = LoopClosingContext {
+        current_keyframe_idx: None,
+        ..context
+    };
+    let second = lap_loop(2, 22, &map);
+    closer.handle_accepted_for_test(&mut map, &camera(), second, between_keyframes);
+    assert_eq!(closer.queued_for_test(), 1);
+    map.remove_keyframe(2).unwrap();
+    let mut events = closer.on_frame(&mut map, &camera(), context).events;
+    events.extend(closer.on_frame(&mut map, &camera(), context).events);
+
+    assert!(
+        matches!(events.as_slice(), [
+        LoopClosureEvent::PgoFailed { candidate_kf_idx: 2, reason, .. },
+        LoopClosureEvent::Accepted { applied: false, edge }
+    ] if reason.contains("left the map") && edge.candidate_kf_idx == 2),
+        "{events:?}"
+    );
+    assert!(!closer.solve_in_flight());
+    assert_eq!(closer.queued_for_test(), 0);
+}

@@ -713,6 +713,10 @@ impl<D: Descriptor> LoopAcceptance<D> {
             return;
         }
         self.forget_departed_loops(map);
+        self.report_departed_queued(map, outcome);
+        if self.queued.is_empty() {
+            return;
+        }
         let capture_started = Instant::now();
         let fusion = FusionSnapshot::capture(map, camera, &self.queued, &self.config.fusion);
         outcome.timing.fuse_capture = capture_started.elapsed();
@@ -722,6 +726,30 @@ impl<D: Descriptor> LoopAcceptance<D> {
         if let Err(WorkerStopped) = self.solver.submit(job) {
             self.stop(outcome);
         }
+    }
+
+    /// Reports the queued loops whose keyframes left the map unapplied: the solve drops their
+    /// edges, so it cannot apply them.
+    fn report_departed_queued(&mut self, map: &Map<D>, outcome: &mut LoopClosingOutcome) {
+        let live = |kf: usize| map.get_keyframe(kf).is_some();
+        let (live_loops, departed): (Vec<_>, Vec<_>) = std::mem::take(&mut self.queued)
+            .into_iter()
+            .partition(|edge| live(edge.query_kf_idx) && live(edge.candidate_kf_idx));
+        self.queued = live_loops;
+        let Some(newest) = departed.last() else {
+            return;
+        };
+        outcome.events.push(LoopClosureEvent::PgoFailed {
+            query_kf_idx: newest.query_kf_idx,
+            candidate_kf_idx: newest.candidate_kf_idx,
+            reason: "loop keyframe left the map before its solve".into(),
+        });
+        outcome
+            .events
+            .extend(departed.into_iter().map(|edge| LoopClosureEvent::Accepted {
+                edge,
+                applied: false,
+            }));
     }
 
     fn on_frame(
