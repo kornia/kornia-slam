@@ -2106,3 +2106,24 @@ fn fusion_writeback_holds_matches_to_the_search_radius() {
     assert_eq!(loose.stale, 0, "{loose:?}");
     assert_eq!(held.stale, ops.len(), "{held:?}");
 }
+
+/// A landmark whose representative descriptor local mapping re-selected since the plan, now far
+/// from the planned feature, is neither linked nor merged.
+#[test]
+fn fusion_writeback_rechecks_the_live_descriptor() {
+    let (mut map, ops, config) = planned_fusion();
+    for op in &ops {
+        let landmark = match *op {
+            FusionOp::Link { landmark, .. } => landmark,
+            FusionOp::Merge { source, .. } => source,
+        };
+        let mut far = map.map_points()[landmark].descriptor.0;
+        far.iter_mut().for_each(|byte| *byte = !*byte);
+        map.set_landmark_descriptor_for_test(landmark, RBrief(far));
+    }
+
+    let applied = apply_fusion(&mut map, &camera(), &ops, &config);
+
+    assert_eq!((applied.linked, applied.merged), (0, 0));
+    assert_eq!(applied.stale, ops.len());
+}

@@ -494,8 +494,8 @@ fn reprojects_onto(
 }
 
 /// Applies planned operations to the live map in order. Each is checked against the map as it
-/// now stands and skipped as stale when a landmark is gone, a slot changed hands, or the live
-/// poses no longer put the landmark on the feature.
+/// now stands and skipped as stale when a landmark is gone, a slot changed hands, its descriptor
+/// no longer matches the feature, or the live poses no longer put the landmark on the feature.
 pub(crate) fn apply_fusion<D: Descriptor>(
     map: &mut Map<D>,
     camera: &PinholeCamera,
@@ -579,6 +579,24 @@ fn forward_limit_px<T>(config: &LoopFusionConfig<T>) -> f64 {
     f64::from(config.search_radius_px).min(config.max_reprojection_error_px)
 }
 
+/// Whether `landmark`'s live representative descriptor still matches `keyframe`'s `feature`:
+/// local mapping may have re-selected it since the plan.
+fn matches_descriptor<D: Descriptor>(
+    map: &Map<D>,
+    landmark: usize,
+    keyframe: usize,
+    feature: usize,
+    config: &LoopFusionConfig<D::Distance>,
+) -> bool {
+    let target = map
+        .get_keyframe(keyframe)
+        .and_then(|kf| kf.frame.features.descriptors.get(feature));
+    match (map.map_points().get(landmark), target) {
+        (Some(point), Some(target)) => point.descriptor.distance(target) <= config.max_distance,
+        _ => false,
+    }
+}
+
 fn link_is_current<D: Descriptor>(
     map: &Map<D>,
     camera: &PinholeCamera,
@@ -597,6 +615,7 @@ fn link_is_current<D: Descriptor>(
     });
     !observed
         && slot_free
+        && matches_descriptor(map, landmark, keyframe, feature, config)
         && lands_on(
             map,
             camera,
@@ -626,6 +645,7 @@ fn merge_is_current<D: Descriptor>(
         && source_unseen
         && holds(source_keyframe, source_feature, source)
         && holds(target_keyframe, target_feature, target)
+        && matches_descriptor(map, source, target_keyframe, target_feature, config)
         && lands_on(
             map,
             camera,

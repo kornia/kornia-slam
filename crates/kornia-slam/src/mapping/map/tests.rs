@@ -23,6 +23,18 @@ impl Map {
         }
     }
 
+    /// Overrides a landmark's representative descriptor, as a re-selection after a new
+    /// observation would.
+    pub(crate) fn set_landmark_descriptor_for_test(
+        &mut self,
+        mp_idx: usize,
+        descriptor: crate::features::RBrief,
+    ) {
+        if let Some(mp) = self.map_points_mut().get_mut(mp_idx) {
+            mp.descriptor = descriptor;
+        }
+    }
+
     /// Overrides a stored keyframe's pose, for fixtures that need a specific
     /// geometry rather than one produced by an estimator.
     pub(crate) fn set_keyframe_pose_for_test(
