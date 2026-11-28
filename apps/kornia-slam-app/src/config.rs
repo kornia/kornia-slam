@@ -18,7 +18,7 @@ use kornia_slam::system::ConfigError;
 use kornia_slam::{CameraSelection, SystemConfig};
 use serde::Deserialize;
 
-use crate::source::SourceConfig;
+use crate::source::{Rectification, SourceConfig};
 
 /// One run: where the data comes from and how it is processed.
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +33,9 @@ pub struct RunConfig {
     /// source's own calibration is used.
     #[serde(default)]
     pub rig_calibration: Option<PathBuf>,
+    /// How a raw stereo pair is rectified.
+    #[serde(default)]
+    pub rectification: Rectification,
 }
 
 /// A run file that cannot be read or does not describe a valid run.

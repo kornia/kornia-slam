@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mut source,
         ground_truth,
         summary,
-    } = run.source.open(run.system.sensors)?;
+    } = run.source.open(run.system.sensors, run.rectification)?;
     if args.evaluate && ground_truth.is_none() {
         return Err("--evaluate needs ground truth, and this source has none".into());
     }
@@ -116,8 +116,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     if !tui_active && let Some(baseline) = system.rig().rectified_stereo_baseline_m() {
+        // Printed only when non-default, so the golden headers stay valid.
+        let tables = match run.rectification {
+            source::Rectification::RemapF32 => "",
+            source::Rectification::FixedPoint => " rectification=FixedPoint",
+        };
         eprintln!(
-            "Stereo: rectified fx={:.2} baseline={baseline:.4}m bf={:.2}",
+            "Stereo: rectified fx={:.2} baseline={baseline:.4}m bf={:.2}{tables}",
             camera.fx,
             baseline * camera.fx,
         );

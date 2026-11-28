@@ -34,6 +34,13 @@ cameras as the source yields images per frame), and its IMU extrinsic and noise 
 the source has an IMU; `--write-rig-calibration <path>` writes the opened source's rig
 as such a file and exits. Omitted, every source keeps its own calibration.
 
+**Fixed-point table rectification.** `kornia_slam::rectify::StereoRemap` rectifies a
+raw stereo pair through precomputed kornia-imgproc remap tables on the calling thread,
+without allocating; `RemapQuantisation::Q10Trunc` gives the same bytes as
+`StereoRectifier::rectify_left` / `rectify_right`. The app's run-file key
+`rectification: FixedPoint` selects it for the EuRoC, MCAP and OAK-D stereo sources;
+the default, `RemapF32`, is the previous path.
+
 **Bundle adjustment is grouped under `mapping::ba`.** A move with no change in
 behaviour: `kornia_slam::mapping::bundle_adjustment` is now
 `kornia_slam::mapping::ba`, and `kornia_slam::mapping::vi_ba_schur` is

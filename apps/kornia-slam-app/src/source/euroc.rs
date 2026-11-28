@@ -12,12 +12,12 @@ use kornia_sensors::imu::ImuMeasurement;
 use serde::Deserialize;
 
 use super::{
-    FrameItem, FrameSource, OpenedSource, SourceError, dataset_summary, non_empty, rectify_pair,
-    resolve,
+    FrameItem, FrameSource, OpenedSource, PairRectifier, Rectification, SourceError,
+    dataset_summary, non_empty, resolve,
 };
 use crate::datasets::EurocDataset;
 use crate::datasets::euroc::{GroundTruthPose, ImuSample};
-use crate::datasets::{StereoRectifier, rectifier_from_euroc};
+use crate::datasets::rectifier_from_euroc;
 
 /// An EuRoC MAV sequence; stereo and IMU calibration come from its `sensor.yaml` files.
 #[derive(Debug, Clone, Deserialize)]
@@ -37,8 +37,17 @@ impl EurocConfig {
         resolve(&mut self.data, base_dir);
     }
 
-    pub(super) fn open(&self, stereo: bool) -> Result<OpenedSource, SourceError> {
-        let source = EurocSource::open(&self.data, self.start_frame, self.max_frames, stereo)?;
+    pub(super) fn open(
+        &self,
+        stereo: bool,
+        rectification: Rectification,
+    ) -> Result<OpenedSource, SourceError> {
+        let source = EurocSource::open(
+            &self.data,
+            self.start_frame,
+            self.max_frames,
+            stereo.then_some(rectification),
+        )?;
         Ok(OpenedSource {
             summary: Some(dataset_summary(
                 source.dataset_len(),
@@ -60,7 +69,7 @@ pub struct EurocSource {
     /// Frames the window yields.
     n_frames: usize,
     /// When `Some`, the source rectifies the left+right pair and yields stereo.
-    rectifier: Option<StereoRectifier>,
+    rectifier: Option<PairRectifier>,
     /// Left image size; rectified images keep it.
     size: ImageSize,
     with_imu: bool,
@@ -73,22 +82,22 @@ impl EurocSource {
     /// `max_frames == 0` means "until the dataset is exhausted". `start_frame`
     /// is the index into the left-camera samples of the first sample to yield; later
     /// samples retain their absolute index in `FrameItem::idx`. With `stereo`,
-    /// the left+right pair is rectified and yielded together; the dataset must
-    /// then have a usable right camera.
+    /// the left+right pair is rectified that way and yielded together; the
+    /// dataset must then have a usable right camera.
     pub fn open(
         root: impl AsRef<Path>,
         start_frame: usize,
         max_frames: usize,
-        stereo: bool,
+        stereo: Option<Rectification>,
     ) -> Result<Self, SourceError> {
         let dataset = EurocDataset::open(root).map_err(SourceError::other)?;
         let n = dataset.samples().len();
         let start = start_frame.min(n);
-        let yields = |idx: usize| yields_frame(&dataset, stereo, idx);
+        let yields = |idx: usize| yields_frame(&dataset, stereo.is_some(), idx);
         let end = window_end(start, n, max_frames, yields);
         let n_frames = (start..end).filter(|&idx| yields(idx)).count();
 
-        let rectifier = if stereo {
+        let rectifier = if let Some(rectification) = stereo {
             if !dataset.is_stereo() {
                 return Err(SourceError::other(
                     "stereo requested but dataset has no usable right camera",
@@ -97,10 +106,9 @@ impl EurocSource {
             let right = dataset
                 .right_calibration
                 .expect("is_stereo() guarantees right-camera calibration");
-            Some(
-                rectifier_from_euroc(&dataset.left_calibration, &right)
-                    .map_err(SourceError::other)?,
-            )
+            let rectifier = rectifier_from_euroc(&dataset.left_calibration, &right)
+                .map_err(SourceError::other)?;
+            Some(PairRectifier::new(rectifier, rectification)?)
         } else {
             None
         };
@@ -181,7 +189,7 @@ impl FrameSource for EurocSource {
                 let right_raw = read_image_png_mono8(right_path)
                     .map_err(SourceError::other)?
                     .into_inner();
-                let (left, right) = rectify_pair(rect, &left_raw, &right_raw)?;
+                let (left, right) = rect.rectify(&left_raw, &right_raw)?;
                 (left, Some(right))
             }
             None => (left_raw, None),
