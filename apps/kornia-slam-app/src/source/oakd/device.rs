@@ -183,10 +183,11 @@ impl OakdSource {
 
 impl FrameSource for OakdSource {
     fn rig(&self) -> SensorRig {
-        let rig = SensorRig::new(self.camera.clone());
         match self.stereo_baseline_m {
-            Some(baseline_m) => rig.with_stereo_baseline(baseline_m),
-            None => rig,
+            Some(baseline_m) => {
+                SensorRig::rectified_stereo(self.camera.clone(), self.image_size, baseline_m)
+            }
+            None => SensorRig::mono(self.camera.clone(), self.image_size),
         }
     }
 

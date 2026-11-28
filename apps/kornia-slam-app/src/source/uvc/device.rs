@@ -95,7 +95,7 @@ impl UvcSource {
 
 impl FrameSource for UvcSource {
     fn rig(&self) -> SensorRig {
-        SensorRig::new(self.camera.clone())
+        SensorRig::mono(self.camera.clone(), self.image_size)
     }
 
     fn n_frames_hint(&self) -> Option<usize> {

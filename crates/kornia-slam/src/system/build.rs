@@ -31,6 +31,9 @@ pub(crate) struct SystemSettings {
     pub keyframe_policy: KeyframePolicy,
     pub tracking_loss_recovery: TrackingLossRecoveryPolicy,
     pub local_mapping: LocalMappingMode,
+    /// Metric baseline of the rectified pair under [`CameraSelection::Stereo`];
+    /// `None` for every other selection, whatever the rig could offer.
+    pub stereo_baseline_m: Option<f64>,
     /// Near/far depth threshold `mThDepth` (metres). When `Some`, each new
     /// keyframe back-projects its unassociated "close" (`z < threshold`) stereo
     /// keypoints directly into metric map points.
@@ -42,7 +45,7 @@ impl SensorSelection {
     pub(crate) fn select_rig(&self, mut rig: SensorRig) -> Result<SensorRig, ConfigError> {
         self.validate_rig(&rig)?;
         if self.cameras == CameraSelection::Mono {
-            rig.stereo_baseline_m = None;
+            rig = rig.truncated_to_primary();
         }
         if !self.imu {
             rig.imu = None;
@@ -57,6 +60,10 @@ impl SystemConfig {
     /// Stereo close depth is resolved against the rig's baseline.
     pub(crate) fn settings(&self, rig: &SensorRig) -> SystemSettings {
         let orb = self.orb();
+        let stereo_baseline_m = match self.sensors.cameras {
+            CameraSelection::Stereo => rig.rectified_stereo_baseline_m(),
+            CameraSelection::Mono => None,
+        };
         let FrontendConfig::Orb(frontend) = orb.frontend;
         let tuning = &orb.tuning;
         SystemSettings {
@@ -65,8 +72,8 @@ impl SystemConfig {
             keyframe_policy: orb.keyframes,
             tracking_loss_recovery: tuning.loss_recovery,
             local_mapping: orb.mapping.execution,
-            stereo_close_depth_m: rig
-                .stereo_baseline_m
+            stereo_baseline_m,
+            stereo_close_depth_m: stereo_baseline_m
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
         }
     }

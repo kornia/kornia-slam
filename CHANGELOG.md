@@ -10,6 +10,20 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**A sensor rig is a list of cameras.** `SensorRig` now holds `cameras()`, the
+primary first, each a `RigCamera` with its lens model (`kornia_3d::camera::Camera`:
+pinhole, Kannala-Brandt or Fisheye624), its image size and its pose
+`primary_from_camera` in the primary frame. Build one with
+`SensorRig::mono(model, size)`, `SensorRig::rectified_stereo(camera, size, baseline_m)`
+or `SensorRig::from_cameras(cameras)`, which refuses a list that is not a rig
+(`RigError`). The fields `camera`, `stereo_baseline_m` and `fisheye` and the
+constructors `new`, `with_stereo_baseline` and `with_fisheye` are removed:
+read `rig.primary().pinhole()`, `rig.rectified_stereo_baseline_m()` and
+`rig.primary().is_fisheye()` instead. A rig is stereo only when it is exactly a
+rectified pair, and only `cameras: Stereo` runs it as one. `ConfigError::FisheyeStereo`
+is removed: a fisheye camera is never part of a rectified pair, so stereo over it
+is `MissingSensor("stereo cameras")`. Mono, stereo and fisheye runs are unchanged.
+
 **Bundle adjustment is grouped under `mapping::ba`.** A move with no change in
 behaviour: `kornia_slam::mapping::bundle_adjustment` is now
 `kornia_slam::mapping::ba`, and `kornia_slam::mapping::vi_ba_schur` is

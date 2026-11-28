@@ -50,8 +50,8 @@ pub trait FrameSource {
     /// Calibration of the sensors behind this source. Must be valid before the
     /// first `next_frame` call. For a stereo source the camera is the rectified
     /// one shared by both views, and the IMU extrinsic (when present) refers to it.
-    /// A source of raw fisheye images declares their model with
-    /// [`SensorRig::with_fisheye`].
+    /// A source of raw fisheye images declares their model as the camera's
+    /// model, with the raw image size.
     fn rig(&self) -> SensorRig;
 
     /// Total frames the source will yield, if known.

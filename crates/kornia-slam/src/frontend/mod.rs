@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use kornia_3d::camera::{CameraModel, FisheyeCamera, PinholeCamera};
+use kornia_3d::camera::{Camera, CameraModel, PinholeCamera};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec2F64;
 use kornia_image::{Image, ImageError, ImageSize, InterpolationMode};
@@ -40,20 +40,26 @@ pub(crate) struct OrbFrontend {
 }
 
 impl OrbFrontend {
-    /// A rig with a stereo baseline enables matching against the right image;
-    /// `rig` must already be restricted to the selected sensors.
-    pub(crate) fn new(detector: OrbDetector, rig: &SensorRig) -> Self {
-        let stereo = rig.stereo_baseline_m.map(|baseline| {
+    /// A stereo baseline enables matching against the right image; `rig`
+    /// must already be restricted to the selected sensors.
+    pub(crate) fn new(
+        detector: OrbDetector,
+        rig: &SensorRig,
+        stereo_baseline_m: Option<f64>,
+    ) -> Self {
+        let primary = rig.primary();
+        let camera = primary.pinhole();
+        let stereo = stereo_baseline_m.map(|baseline| {
             StereoMatchConfig::new(
                 baseline as f32,
-                rig.camera.fx as f32,
+                camera.fx as f32,
                 detector.downscale,
                 detector.n_scales,
             )
         });
-        let fisheye = rig.fisheye.clone().map(|fisheye| FisheyeMapping {
-            fisheye,
-            camera: rig.camera.clone(),
+        let fisheye = primary.is_fisheye().then(|| FisheyeMapping {
+            model: primary.model.clone(),
+            camera,
             min_bearing_z: MAX_INCIDENCE_DEG.to_radians().cos(),
         });
         Self {
@@ -171,10 +177,10 @@ impl OrbFrontend {
 }
 
 /// Maps raw fisheye keypoints into a virtual pinhole by unprojecting each to a
-/// bearing through the Kannala-Brandt model, as ORB-SLAM3 does for fisheye
-/// cameras, instead of resampling the whole image.
+/// bearing through the fisheye model, as ORB-SLAM3 does for fisheye cameras,
+/// instead of resampling the whole image.
 struct FisheyeMapping {
-    fisheye: FisheyeCamera,
+    model: Camera,
     camera: PinholeCamera,
     /// `cos` of the maximum incidence angle.
     min_bearing_z: f64,
@@ -188,7 +194,7 @@ impl FisheyeMapping {
         let mut keypoints_xy = Vec::with_capacity(features.len());
         for (i, &[u, v]) in features.keypoints_xy.iter().enumerate() {
             let Some(bearing) = self
-                .fisheye
+                .model
                 .unproject(&Vec2F64::new(u as f64, v as f64))
                 .filter(|bearing| bearing.z > self.min_bearing_z)
             else {

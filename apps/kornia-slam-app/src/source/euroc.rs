@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
+use kornia_image::ImageSize;
 use kornia_io::png::read_image_png_mono8;
 use kornia_sensors::SensorRig;
 use kornia_sensors::imu::ImuMeasurement;
@@ -60,6 +61,8 @@ pub struct EurocSource {
     n_frames: usize,
     /// When `Some`, the source rectifies the left+right pair and yields stereo.
     rectifier: Option<StereoRectifier>,
+    /// Left image size; rectified images keep it.
+    size: ImageSize,
     with_imu: bool,
     imu_cursor: usize,
 }
@@ -102,6 +105,8 @@ impl EurocSource {
             None
         };
 
+        let size = image_size(&dataset)?;
+
         // IMU samples are yielded whenever the dataset ships them (`imu0`);
         // skip those preceding the first yielded camera frame.
         let with_imu = dataset.has_imu();
@@ -124,6 +129,7 @@ impl EurocSource {
             end,
             n_frames,
             rectifier,
+            size,
             with_imu,
             imu_cursor,
         })
@@ -141,10 +147,10 @@ impl EurocSource {
 
 impl FrameSource for EurocSource {
     fn rig(&self) -> SensorRig {
-        let mut rig = SensorRig::new(self.camera());
-        if let Some(rect) = &self.rectifier {
-            rig = rig.with_stereo_baseline(rect.baseline());
-        }
+        let mut rig = match &self.rectifier {
+            Some(rect) => SensorRig::rectified_stereo(self.camera(), self.size, rect.baseline()),
+            None => SensorRig::mono(self.camera(), self.size),
+        };
         if let Some(t_bc) = self.camera_to_body() {
             rig = rig.with_imu(t_bc);
         }
@@ -246,6 +252,25 @@ impl EurocSource {
             .map(imu_measurement)
             .collect()
     }
+}
+
+/// The `sensor.yaml` resolution of the left camera, or the first left image's
+/// size when the file gives none.
+fn image_size(dataset: &EurocDataset) -> Result<ImageSize, SourceError> {
+    let calibration = &dataset.left_calibration;
+    if calibration.width > 0 && calibration.height > 0 {
+        return Ok(ImageSize {
+            width: calibration.width,
+            height: calibration.height,
+        });
+    }
+    let first = dataset
+        .left_samples
+        .first()
+        .ok_or_else(|| SourceError::other("the dataset has no left images"))?;
+    Ok(read_image_png_mono8(&first.image_path)
+        .map_err(SourceError::other)?
+        .size())
 }
 
 /// Whether the left sample `idx` is yielded: any sample in mono mode, and in

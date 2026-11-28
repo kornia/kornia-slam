@@ -95,14 +95,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(std::path::Path::to_path_buf);
     let mut system = SlamSystem::build(run.system, source.rig()).map_err(|e| e.to_string())?;
     system.set_debug(args.debug);
-    let camera = system.rig().camera.clone();
+    let camera = system.rig().primary().pinhole();
     if let Some(path) = vocabulary {
         eprintln!(
             "[place-recognition] loaded vocabulary from {}",
             path.display()
         );
     }
-    if !tui_active && let Some(baseline) = system.rig().stereo_baseline_m {
+    if !tui_active && let Some(baseline) = system.rig().rectified_stereo_baseline_m() {
         eprintln!(
             "Stereo: rectified fx={:.2} baseline={baseline:.4}m bf={:.2}",
             camera.fx,

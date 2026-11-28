@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
+use kornia_image::ImageSize;
 use kornia_sensors::SensorRig;
 
 use super::*;
@@ -35,8 +36,8 @@ fn sensors(cameras: CameraSelection, imu: bool) -> SensorSelection {
     SensorSelection { cameras, imu }
 }
 
-fn rig() -> SensorRig {
-    SensorRig::new(PinholeCamera {
+fn camera() -> PinholeCamera {
+    PinholeCamera {
         fx: 458.0,
         fy: 457.0,
         cx: 367.0,
@@ -45,7 +46,20 @@ fn rig() -> SensorRig {
         k2: 0.0,
         p1: 0.0,
         p2: 0.0,
-    })
+    }
+}
+
+const SIZE: ImageSize = ImageSize {
+    width: 752,
+    height: 480,
+};
+
+fn rig() -> SensorRig {
+    SensorRig::mono(camera(), SIZE)
+}
+
+fn stereo_rig() -> SensorRig {
+    SensorRig::rectified_stereo(camera(), SIZE, 0.11)
 }
 
 #[test]
@@ -298,7 +312,7 @@ fn loop_closing_requires_metric_input() {
 #[test]
 fn rig_must_provide_selected_sensors() {
     let mono = rig();
-    let stereo_imu = rig().with_stereo_baseline(0.11).with_imu(Pose3d::IDENTITY);
+    let stereo_imu = stereo_rig().with_imu(Pose3d::IDENTITY);
 
     let stereo = sensors(CameraSelection::Stereo, false);
     let imu = sensors(CameraSelection::Mono, true);
@@ -317,31 +331,11 @@ fn rig_must_provide_selected_sensors() {
     );
 }
 
-#[test]
-fn stereo_rejects_raw_fisheye_images() {
-    let fisheye = kornia_3d::camera::FisheyeCamera {
-        fx: 460.0,
-        fy: 460.0,
-        cx: 367.0,
-        cy: 248.0,
-        k1: 0.03,
-        k2: -0.02,
-        k3: 0.003,
-        k4: -0.0005,
-    };
-    let rig = rig().with_stereo_baseline(0.11).with_fisheye(fisheye);
-    assert_eq!(
-        sensors(CameraSelection::Stereo, false).validate_rig(&rig),
-        Err(ConfigError::FisheyeStereo)
-    );
-    assert_eq!(SensorSelection::default().validate_rig(&rig), Ok(()));
-}
-
 mod runtime_settings {
     use super::*;
 
     fn stereo_imu_rig() -> SensorRig {
-        rig().with_stereo_baseline(0.11).with_imu(Pose3d::IDENTITY)
+        stereo_rig().with_imu(Pose3d::IDENTITY)
     }
 
     #[test]
@@ -380,11 +374,13 @@ mod runtime_settings {
 
     #[test]
     fn stereo_close_depth_resolves_against_the_baseline() {
-        let selected = sensors(CameraSelection::Stereo, false)
-            .select_rig(stereo_imu_rig())
-            .unwrap();
+        let stereo = sensors(CameraSelection::Stereo, false);
+        let selected = stereo.select_rig(stereo_imu_rig()).unwrap();
         let close_depth = |depth| {
-            let mut config = SystemConfig::default();
+            let mut config = SystemConfig {
+                sensors: stereo,
+                ..SystemConfig::default()
+            };
             orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
                 stereo_close_depth: depth,
                 ..OrbFrontendConfig::default()
@@ -394,6 +390,15 @@ mod runtime_settings {
         assert_eq!(close_depth(StereoCloseDepth::default()), Some(0.11 * 35.0));
         assert_eq!(close_depth(StereoCloseDepth::Metres(2.5)), Some(2.5));
         assert_eq!(close_depth(StereoCloseDepth::Disabled), None);
+    }
+
+    /// The selection, not the rig, decides the layout: a rectified pair run as
+    /// mono has no baseline and no close depth.
+    #[test]
+    fn a_stereo_rig_run_as_mono_has_no_baseline() {
+        let settings = SystemConfig::default().settings(&stereo_imu_rig());
+        assert_eq!(settings.stereo_baseline_m, None);
+        assert_eq!(settings.stereo_close_depth_m, None);
     }
 }
 
