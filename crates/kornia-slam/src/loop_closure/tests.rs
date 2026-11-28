@@ -2068,3 +2068,18 @@ fn a_capped_scalar_weight_solve_that_did_not_improve_is_refused() {
     );
     assert!(!refused.pgo_applied && !refused.pgo_capped);
 }
+
+/// An accepted loop exempts its region from temporal consistency only while both its keyframes
+/// are in the map, as the next solve, which drops a departed loop, sees it.
+#[test]
+fn a_loop_whose_query_keyframe_departed_no_longer_exempts_its_region() {
+    let (mut closer, mut map, context) = lap_closer(23);
+    let first = lap_loop(1, 23, &map);
+    let outcome = closer.handle_accepted_for_test(&mut map, &camera(), first, context);
+    assert!(applied_alone(&outcome.events), "{:?}", outcome.events);
+    assert!(closer.region_has_loop_for_test(&map, 1));
+
+    map.remove_keyframe(23).unwrap();
+
+    assert!(!closer.region_has_loop_for_test(&map, 1));
+}

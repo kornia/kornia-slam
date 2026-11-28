@@ -365,6 +365,10 @@ impl<D: Descriptor> LoopCloser<D> {
         self.acceptance.queued.len()
     }
 
+    pub(crate) fn region_has_loop_for_test(&self, map: &Map<D>, candidate_order: usize) -> bool {
+        self.acceptance.region_has_loop(map, candidate_order)
+    }
+
     pub(crate) fn mark_verified_for_test(&mut self, a: usize, b: usize) {
         self.acceptance
             .verified_loop_pairs
@@ -976,15 +980,17 @@ impl<D: Descriptor> LoopAcceptance<D> {
         Ok(())
     }
 
-    /// Whether an accepted loop already matched a keyframe within the episode
-    /// neighbourhood of `candidate_order`.
+    /// Whether an accepted loop, both its keyframes still in the map, already matched a keyframe
+    /// within the episode neighbourhood of `candidate_order`.
     fn region_has_loop(&self, map: &Map<D>, candidate_order: usize) -> bool {
         let radius = self.config.episode.candidate_neighborhood_radius;
         self.verified_loops.iter().any(|accepted| {
-            map.keyframes()
-                .iter()
-                .position(|keyframe| keyframe.frame.idx == accepted.candidate_kf_idx)
-                .is_some_and(|order| order.abs_diff(candidate_order) <= radius)
+            map.get_keyframe(accepted.query_kf_idx).is_some()
+                && map
+                    .keyframes()
+                    .iter()
+                    .position(|keyframe| keyframe.frame.idx == accepted.candidate_kf_idx)
+                    .is_some_and(|order| order.abs_diff(candidate_order) <= radius)
         })
     }
 }
