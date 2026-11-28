@@ -347,10 +347,12 @@ impl<D: Descriptor> MapProjectionEstimator<D> {
         let Some(current_kf) = current_kf else {
             return correspondences.to_vec();
         };
+        // One fundamental matrix relates only primary-camera views.
         let mp_to_desc: HashMap<usize, usize> = current_kf
             .map_point_by_desc_idx
             .iter()
             .enumerate()
+            .filter(|&(desc_idx, _)| current_kf.frame.camera_of(desc_idx) == 0)
             .filter_map(|(desc_idx, mp_idx)| mp_idx.map(|mp_idx| (mp_idx, desc_idx)))
             .collect();
 
@@ -361,8 +363,7 @@ impl<D: Descriptor> MapProjectionEstimator<D> {
             let Some(&desc_idx) = mp_to_desc.get(&mp_idx) else {
                 continue;
             };
-            // One fundamental matrix relates only primary-camera views.
-            if current_kf.frame.camera_of(desc_idx) != 0 || current.camera_of(kp_idx) != 0 {
+            if current.camera_of(kp_idx) != 0 {
                 continue;
             }
             let Some(reference) = current_kf.frame.undistorted_xy(desc_idx, camera) else {
@@ -919,6 +920,36 @@ mod matching_tests {
         assert!(!filtered.contains(&(29, 29)));
         assert!(filtered.contains(&uncheckable));
         assert_eq!(filtered.len(), 30);
+    }
+
+    /// The outlier's landmark is also held by a later secondary-camera
+    /// feature of the keyframe; its primary observation still gets checked.
+    #[test]
+    fn geometric_filter_checks_the_primary_observation_of_a_rig_landmark() {
+        let estimator = make_test_estimator();
+        let camera = test_camera();
+        let (mut reference, mut current) = two_view_keypoints(&camera, 30);
+        current[29] = [80.0, 430.0];
+        reference.push([5.0, 5.0]);
+
+        let mut keyframe = Keyframe::from_frame(test_frame(reference));
+        keyframe.frame.rig.camera_ranges = vec![0..30, 30..31];
+        for index in 0..30 {
+            keyframe.associate_map_point(index, index);
+        }
+        keyframe.associate_map_point(30, 29);
+        let correspondences: Vec<(usize, usize)> = (0..30).map(|i| (i, i)).collect();
+
+        let filtered = estimator.geometric_consistency_filter(
+            Some(&keyframe),
+            &correspondences,
+            &test_frame(current.clone()),
+            &current,
+            &camera,
+        );
+
+        assert!(!filtered.contains(&(29, 29)));
+        assert_eq!(filtered.len(), 29);
     }
 
     #[test]

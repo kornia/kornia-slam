@@ -9,7 +9,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use kornia_image::ImageSize;
 
-use crate::features::Features;
+use crate::features::{DescriptorSet, Features};
 use crate::rig::{RigGeometry, RigView};
 
 /// A camera observation: features extracted at a known pose. `D` is the
@@ -62,8 +62,9 @@ pub struct RigFeatures {
 }
 
 impl<D> Frame<D> {
-    /// Whether the frame carries metric depth: rectified stereo or rig
-    /// overlap triangulation (scale is then observable from one frame).
+    /// Whether the frame comes from a capture that can supply metric depth:
+    /// rectified stereo or a multi-camera rig. A rig frame may still hold no
+    /// overlap points; callers needing depth count them.
     pub fn is_metric(&self) -> bool {
         self.is_stereo() || self.is_rig()
     }
@@ -121,6 +122,24 @@ impl<D> Frame<D> {
             Some(range) => range.clone(),
             None if camera == 0 && !self.is_rig() => 0..self.features.keypoints_xy.len(),
             None => 0..0,
+        }
+    }
+
+    /// Descriptors (and orientations) of the primary camera's features. They
+    /// come first, so an index into the set is a frame feature index.
+    pub fn primary_descriptor_set(&self) -> DescriptorSet<'_, D> {
+        if !self.is_rig() {
+            return self.features.descriptor_set();
+        }
+        let end = self.camera_range(0).end;
+        let descriptors = &self.features.descriptors;
+        DescriptorSet {
+            orientations: self
+                .features
+                .orientations
+                .as_deref()
+                .map(|o| &o[..end.min(o.len())]),
+            descriptors: &descriptors[..end.min(descriptors.len())],
         }
     }
 
@@ -385,6 +404,19 @@ mod tests {
         assert_eq!(frame.stereo_depth(0), Some(2.5));
         assert_eq!(frame.stereo_depth(1), None); // sentinel
         assert_eq!(frame.stereo_depth(2), None); // out of range
+    }
+
+    #[test]
+    fn the_primary_descriptor_set_holds_only_primary_features() {
+        let mut frame = empty_frame(Vec::new(), Vec::new());
+        frame.features.keypoints_xy = vec![[0.0; 2]; 5];
+        frame.features.descriptors = (0..5).map(|i| RBrief([i; 32])).collect();
+        frame.features.orientations = Some(vec![0.0; 5]);
+        assert_eq!(frame.primary_descriptor_set().descriptors.len(), 5);
+        frame.rig.camera_ranges = vec![0..3, 3..5];
+        let set = frame.primary_descriptor_set();
+        assert_eq!(set.descriptors, &frame.features.descriptors[..3]);
+        assert_eq!(set.orientations.map(<[f32]>::len), Some(3));
     }
 
     #[test]

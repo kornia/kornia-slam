@@ -13,10 +13,12 @@ use crate::guided_match::{EpipolarGeometry, GuidedView, guided_matches};
 use crate::mapping::map::{
     Keyframe, LandmarkSeed, LandmarkTarget, Map, MapInsertion, ObservationKey, ObservationLink,
 };
+use crate::rig::project_in_view;
 use crate::stereo::unproject_stereo;
-use kornia_3d::camera::PinholeCamera;
+use kornia_3d::camera::{Camera, PinholeCamera};
 use kornia_3d::pose::{Pose3d, TriangulationConfig, triangulate_matched_points};
 use kornia_algebra::Vec2F64;
+use kornia_image::ImageSize;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
@@ -355,7 +357,7 @@ pub fn neighbor_fusion_links<D: Descriptor>(
 
         // (keypoint in neighbour, landmark, camera, descriptor distance)
         let mut proposals: Vec<(usize, usize, usize, D::Distance)> = Vec::new();
-        for (view, view_camera, pose, size) in neighbour_views(nb_kf, camera) {
+        for (view, view_camera, raw, pose, size) in neighbour_views(nb_kf, camera) {
             for &mp_idx in &curr_mp_indices {
                 let mp = match map.map_points().get(mp_idx) {
                     Some(mp) if !mp.culled => mp,
@@ -365,7 +367,7 @@ pub fn neighbor_fusion_links<D: Descriptor>(
                     continue;
                 }
                 let p_cam = pose.transform_point(&mp.position);
-                let Ok(pixel) = view_camera.project_to_image(&p_cam, 0.0, size) else {
+                let Some(pixel) = project_in_view(view_camera, raw, size, &p_cam, 0.0) else {
                     continue;
                 };
                 let (u, v) = (pixel.x as f32, pixel.y as f32);
@@ -419,26 +421,44 @@ pub fn neighbor_fusion_links<D: Descriptor>(
     links
 }
 
-/// `(camera index, model, world-to-camera pose, image size)` of each camera
-/// of a keyframe: every rig camera, or the one camera outside a rig.
+/// `(camera index, model, raw fisheye model, world-to-camera pose, image
+/// size)` of each camera of a keyframe: every rig camera, or the one camera
+/// outside a rig.
 fn neighbour_views<'a, D>(
     keyframe: &'a Keyframe<D>,
     camera: &'a PinholeCamera,
-) -> Vec<(usize, &'a PinholeCamera, Pose3d, kornia_image::ImageSize)> {
+) -> Vec<(
+    usize,
+    &'a PinholeCamera,
+    Option<&'a Camera>,
+    Pose3d,
+    ImageSize,
+)> {
     let frame = &keyframe.frame;
-    let primary = (0, camera, frame.pose_world_to_cam, frame.image_size);
     let Some(rig) = frame.rig.geometry.as_ref().filter(|_| frame.is_rig()) else {
-        return vec![primary];
+        return vec![(0, camera, None, frame.pose_world_to_cam, frame.image_size)];
     };
-    std::iter::once(primary)
-        .chain(rig.views().enumerate().skip(1).map(|(c, view)| {
-            (
-                c,
-                view.pinhole,
-                view.pose(&frame.pose_world_to_cam),
-                view.camera.size,
-            )
-        }))
+    rig.views()
+        .enumerate()
+        .map(|(c, view)| {
+            if c == 0 {
+                (
+                    0,
+                    camera,
+                    view.fisheye_model(),
+                    frame.pose_world_to_cam,
+                    frame.image_size,
+                )
+            } else {
+                (
+                    c,
+                    view.pinhole,
+                    view.fisheye_model(),
+                    view.pose(&frame.pose_world_to_cam),
+                    view.camera.size,
+                )
+            }
+        })
         .collect()
 }
 
@@ -754,6 +774,46 @@ mod tests {
         assert_eq!(links[0].landmark, LandmarkTarget::Existing(best));
         assert_eq!(links[0].observation.feature_idx, 0);
         assert_ne!(links[0].landmark, LandmarkTarget::Existing(worse));
+    }
+
+    /// A landmark 70° off a raw fisheye neighbour's axis lies outside its
+    /// virtual-pinhole window yet inside the raw image: fusion links it, as
+    /// tracking's projection search would match it.
+    #[test]
+    fn fusion_reaches_wide_landmarks_of_a_raw_fisheye_neighbour() {
+        let rig = std::sync::Arc::new(crate::rig::tests::raw_two_camera_rig(75.0));
+        let pinhole = rig.view(0).map(|view| view.pinhole.clone()).unwrap();
+        let (s, c) = 70f64.to_radians().sin_cos();
+        let position = Vec3F64::new(s, 0.0, c) * 4.0;
+        let virtual_px = pinhole.project_to_pixel(&position, 0.0).unwrap();
+        assert!(virtual_px.x > 640.0);
+
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(10, vec![[0; 32]])))
+            .unwrap();
+        let mut neighbor = test_frame(20, vec![[0; 32]]);
+        neighbor.keypoints_undist = vec![[virtual_px.x as f32, virtual_px.y as f32]];
+        neighbor.rig = crate::frame::RigFeatures {
+            geometry: Some(rig),
+            camera_ranges: vec![0..1, 1..1],
+            ..Default::default()
+        };
+        map.insert_keyframe(Keyframe::from_frame(neighbor)).unwrap();
+        let landmark = map
+            .insert_landmark(LandmarkSeed {
+                position,
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 10,
+                    feature_idx: 0,
+                },
+            })
+            .unwrap();
+
+        let links = neighbor_fusion_links(&map, 10, &[20], &pinhole);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].landmark, LandmarkTarget::Existing(landmark));
+        assert_eq!(links[0].observation.feature_idx, 0);
     }
 
     #[test]

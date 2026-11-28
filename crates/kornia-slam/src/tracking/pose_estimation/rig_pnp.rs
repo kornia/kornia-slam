@@ -3,12 +3,12 @@
 //! Each residual is ORB-SLAM3's `EdgeSE3ProjectXYZOnlyPoseToBody`: the world
 //! point goes through the primary-camera pose and then the fixed
 //! camera-from-primary extrinsic of the camera that observed it. The solve
-//! mirrors [`super::pnp::solve_pnp`]: gate on the prior, Huber Gauss-Newton
-//! with Levenberg damping, hard outlier rounds, then count final inliers.
+//! mirrors [`super::pnp::solve_pnp`]: gate on the prior, robust (the
+//! configured kernel) Gauss-Newton with Levenberg damping, hard outlier rounds, then count final inliers.
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-use kornia_3d::ransac::{HuberKernel, RobustKernel};
+use kornia_3d::ransac::{RobustKernel, RobustKernelKind};
 use kornia_algebra::{Mat3F64, Mat6F64, SO3F64, Vec3F64, Vec6F64};
 
 use super::pnp::PnpConfig;
@@ -80,7 +80,7 @@ pub fn solve_rig_pnp(
             observations,
             &active,
             pose_init,
-            c_sq,
+            (config.robust, c_sq),
             config.lm_max_iterations.max(1),
         )?;
         if round + 1 < rounds {
@@ -98,27 +98,28 @@ pub fn solve_rig_pnp(
     Some((pose, inliers))
 }
 
-/// Huber-weighted Levenberg-Marquardt over the pose, from `start`, with a
-/// left perturbation `T <- Exp([rho; omega]) T`.
+/// Robustly weighted Levenberg-Marquardt over the pose, from `start`, with a
+/// left perturbation `T <- Exp([rho; omega]) T`. `robust` is the kernel and
+/// its squared scale.
 fn refine(
     observations: &[RigObservation<'_>],
     active: &[usize],
     start: &Pose3d,
-    c_sq: f64,
+    robust: (RobustKernelKind, f64),
     max_iterations: usize,
 ) -> Option<Pose3d> {
     let mut pose = *start;
-    let mut cost = robust_cost(observations, active, &pose, c_sq);
+    let mut cost = robust_cost(observations, active, &pose, robust);
     let mut lambda = 1e-3;
     for _ in 0..max_iterations {
-        let (h, g) = normal_equations(observations, active, &pose, c_sq);
+        let (h, g) = normal_equations(observations, active, &pose, robust);
         let mut damped = h;
         for d in 0..6 {
             damped[(d, d)] += lambda * h[(d, d)].max(1e-9);
         }
         let step = solve_damped(damped, &g)?;
         let candidate = apply_step(&pose, &step);
-        let candidate_cost = robust_cost(observations, active, &candidate, c_sq);
+        let candidate_cost = robust_cost(observations, active, &candidate, robust);
         if candidate_cost < cost {
             let decrease = (cost - candidate_cost) / cost.max(1e-12);
             pose = candidate;
@@ -141,7 +142,7 @@ fn robust_cost(
     observations: &[RigObservation<'_>],
     active: &[usize],
     pose: &Pose3d,
-    c_sq: f64,
+    (kernel, c_sq): (RobustKernelKind, f64),
 ) -> f64 {
     active
         .iter()
@@ -150,7 +151,7 @@ fn robust_cost(
             let Some(r) = residual(&observations[i], &p) else {
                 return c_sq * 1e3;
             };
-            HuberKernel.rho(r[0] * r[0] + r[1] * r[1], c_sq)
+            kernel.rho(r[0] * r[0] + r[1] * r[1], c_sq)
         })
         .sum()
 }
@@ -169,7 +170,7 @@ fn normal_equations(
     observations: &[RigObservation<'_>],
     active: &[usize],
     pose: &Pose3d,
-    c_sq: f64,
+    (kernel, c_sq): (RobustKernelKind, f64),
 ) -> (Mat6F64, Vec6F64) {
     let mut h = Mat6F64::zeros();
     let mut g = Vec6F64::zeros();
@@ -179,7 +180,7 @@ fn normal_equations(
         let Some(r) = residual(observation, &p_camera) else {
             continue;
         };
-        let w = HuberKernel.weight(r[0] * r[0] + r[1] * r[1], c_sq);
+        let w = kernel.weight(r[0] * r[0] + r[1] * r[1], c_sq);
         let z = p_camera.z.max(MIN_DEPTH_M);
         let (fx, fy) = (observation.camera.fx, observation.camera.fy);
         let j_proj = [
@@ -306,6 +307,23 @@ mod tests {
 
     fn yaw(deg: f64) -> Mat3F64 {
         SO3F64::exp(Vec3F64::new(0.0, deg.to_radians(), 0.0)).matrix()
+    }
+
+    /// A 10 px residual at a 5 px scale is an outlier Tukey drops entirely,
+    /// while Huber still weights it.
+    #[test]
+    fn the_configured_kernel_weights_the_residuals() {
+        let camera = camera();
+        let observation = RigObservation {
+            point_world: Vec3F64::new(0.0, 0.0, 4.0),
+            pixel: [330.0, 240.0],
+            camera: &camera,
+            camera_from_primary: None,
+        };
+        let h =
+            |kernel| normal_equations(&[observation], &[0], &Pose3d::IDENTITY, (kernel, 25.0)).0;
+        assert_eq!(h(RobustKernelKind::Tukey), Mat6F64::zeros());
+        assert!(h(RobustKernelKind::Huber)[(0, 0)] > 0.0);
     }
 
     #[test]
