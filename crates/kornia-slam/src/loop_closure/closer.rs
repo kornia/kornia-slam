@@ -494,7 +494,11 @@ impl<D: Descriptor> LoopAcceptance<D> {
                 .position(|keyframe| keyframe.frame.idx == candidate.kf_idx)
                 .expect("verified candidate keyframe must be in the map");
             let gravity = context.imu_initialized.then_some(context.gravity_world);
-            let correction = loop_correction(map, query_order, candidate_order, &edge, gravity);
+            // Only the gates read the correction, and it walks the whole loop span.
+            let gated = self.odometry_gate.is_enabled() || self.temporal_gate.is_enabled();
+            let correction = gated
+                .then(|| loop_correction(map, query_order, candidate_order, &edge, gravity))
+                .flatten();
             if let Some(correction) = correction {
                 let proposal = LoopProposal {
                     edge: &edge,

@@ -34,6 +34,12 @@ pub(crate) trait LoopGate {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct OdometryConsistencyGate(pub(crate) LoopOdometryGate);
 
+impl OdometryConsistencyGate {
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.0 != LoopOdometryGate::Disabled
+    }
+}
+
 impl LoopGate for OdometryConsistencyGate {
     fn decide(&mut self, proposal: &LoopProposal<'_>, log: &mut Vec<String>) -> GateDecision {
         let Some(verdict) = self.0.judge(&proposal.correction) else {
