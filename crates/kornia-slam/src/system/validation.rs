@@ -9,9 +9,9 @@ use super::config::{
 };
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopClosingConfig;
-use crate::tracking::KeyframePolicy;
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
+use crate::tracking::{KeyframeInsertionStrategy, KeyframePolicy};
 
 /// A system configuration that cannot be built or does not fit its source.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -270,8 +270,11 @@ fn validate_keyframes(policy: &KeyframePolicy, imu: bool) -> Result<(), ConfigEr
     if !(0.0..=1.0).contains(&policy.ref_ratio) {
         return Err(ConfigError::InvalidRefRatio(policy.ref_ratio));
     }
-    if let Some(px) = policy.min_parallax_px {
-        check("keyframes.min_parallax_px", px, POSITIVE)?;
+    if let KeyframeInsertionStrategy::Parallax {
+        min_parallax_px: px,
+    } = policy.insertion
+    {
+        check("keyframes.insertion.Parallax.min_parallax_px", px, POSITIVE)?;
     }
     if let Some(secs) = policy.max_interval_sec {
         check("keyframes.max_interval_sec", secs, POSITIVE)?;

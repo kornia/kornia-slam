@@ -1,22 +1,29 @@
 //! Policies controlling keyframe insertion and short tracking-loss recovery.
 
-/// Keyframe insertion heuristics.
-///
-/// The defaults are the frame-count policy: a keyframe at least every
-/// `max_frames_between` frames. Setting `max_frames_between` to `usize::MAX`
-/// and `min_parallax_px` to a threshold gives ORB-SLAM3 / VINS-Mono style
-/// insertion instead, where a keyframe is earned by motion (parallax) or by
-/// losing the reference keyframe's landmarks, and a parked camera adds none.
-/// With inertial input that mode also needs `max_interval_sec`, as ORB-SLAM3
-/// forces a keyframe every 0.5 s in its inertial modes: IMU samples are
-/// buffered until the next keyframe, so without a time bound a parked rig
-/// buffers (and rescans) every sample of the stop and then bridges it with
-/// one IMU edge. [`SlamSystem::build`](crate::system::SlamSystem::build)
-/// refuses an inertial system with neither bound.
+/// Selects the motion-specific part of keyframe admission. The frame-gap and
+/// weak-reference guards in [`KeyframePolicy`] always apply.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+pub enum KeyframeInsertionStrategy {
+    /// Admit from frame spacing and reference-tracking evidence only.
+    FrameBased,
+    /// Also admit once rotation-compensated median parallax reaches this
+    /// threshold in pixels.
+    Parallax { min_parallax_px: f64 },
+}
+
+/// Keyframe insertion heuristics.
+///
+/// Defaults preserve the historical frame-count policy: at least every eight
+/// frames, with no parallax computation. Inertial systems that remove the
+/// frame bound still require a finite [`Self::max_interval_sec`] bound; that
+/// safety rule is enforced by [`SlamSystem::build`](crate::system::SlamSystem::build).
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct KeyframePolicy {
+    /// Motion-specific admission selection.
+    pub insertion: KeyframeInsertionStrategy,
     /// Minimum frame gap before allowing keyframe insertion.
     pub min_frames_between: usize,
     /// Force a keyframe if this frame gap is reached; `usize::MAX` disables
@@ -24,11 +31,6 @@ pub struct KeyframePolicy {
     pub max_frames_between: usize,
     /// Relative inlier ratio threshold (vs reference keyframe tracked map points).
     pub ref_ratio: f64,
-    /// Insert once the median rotation-compensated parallax since the last
-    /// keyframe reaches this many pixels ([`KeyframeEvidence::median_parallax_px`]).
-    /// `None` (the default) ignores parallax. VINS-Mono uses 10 px at a
-    /// 460 px focal length.
-    pub min_parallax_px: Option<f64>,
     /// Force a keyframe once this many seconds have passed since the last
     /// one (outside `min_frames_between`). `None` (the default) sets no time
     /// bound. `SlamSystem` applies it from the frame timestamps;
@@ -39,10 +41,10 @@ pub struct KeyframePolicy {
 impl Default for KeyframePolicy {
     fn default() -> Self {
         Self {
+            insertion: KeyframeInsertionStrategy::FrameBased,
             min_frames_between: 3,
             max_frames_between: 8,
             ref_ratio: 0.6,
-            min_parallax_px: None,
             max_interval_sec: None,
         }
     }
@@ -102,6 +104,14 @@ impl KeyframeEvidence {
 const MIN_INLIERS_FOR_RATIO_INSERT: usize = 15;
 
 impl KeyframePolicy {
+    /// Returns the parallax threshold selected by this policy, if any.
+    pub const fn parallax_threshold_px(&self) -> Option<f64> {
+        match self.insertion {
+            KeyframeInsertionStrategy::FrameBased => None,
+            KeyframeInsertionStrategy::Parallax { min_parallax_px } => Some(min_parallax_px),
+        }
+    }
+
     /// Decide whether a new keyframe should be inserted.
     ///
     /// Equivalent to [`Self::should_insert_with`] without a parallax measurement.
@@ -126,7 +136,8 @@ impl KeyframePolicy {
     /// `min_frames_between`; always at `max_frames_between`; always when the
     /// reference keyframe holds no map points (tracking is weak); when the
     /// tracked ratio against the reference falls below `ref_ratio`; and, if
-    /// `min_parallax_px` is set, when the measured parallax reaches it.
+    /// [`KeyframeInsertionStrategy::Parallax`] is selected, when the measured
+    /// parallax reaches its threshold.
     pub fn should_insert_with(&self, evidence: &KeyframeEvidence) -> bool {
         let Some(last_kf_idx) = evidence.last_keyframe_idx else {
             return true;
@@ -151,10 +162,9 @@ impl KeyframePolicy {
             return true;
         }
 
-        matches!(
-            (self.min_parallax_px, evidence.median_parallax_px),
-            (Some(threshold), Some(parallax)) if parallax >= threshold
-        )
+        self.parallax_threshold_px()
+            .zip(evidence.median_parallax_px)
+            .is_some_and(|(threshold, parallax)| parallax >= threshold)
     }
 }
 
@@ -170,6 +180,116 @@ impl KeyframePolicy {
             && self
                 .max_interval_sec
                 .is_some_and(|max| secs_since_last_kf >= max)
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct KeyframePolicyCompat {
+    insertion: InsertionField,
+    min_frames_between: usize,
+    max_frames_between: usize,
+    ref_ratio: f64,
+    min_parallax_px: LegacyParallaxField,
+    max_interval_sec: Option<f64>,
+}
+
+#[cfg(feature = "serde")]
+impl Default for KeyframePolicyCompat {
+    fn default() -> Self {
+        let policy = KeyframePolicy::default();
+        Self {
+            insertion: InsertionField::default(),
+            min_frames_between: policy.min_frames_between,
+            max_frames_between: policy.max_frames_between,
+            ref_ratio: policy.ref_ratio,
+            min_parallax_px: LegacyParallaxField::default(),
+            max_interval_sec: policy.max_interval_sec,
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for KeyframePolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let raw = KeyframePolicyCompat::deserialize(deserializer)?;
+        let insertion = match (raw.insertion, raw.min_parallax_px) {
+            (InsertionField { present: true, .. }, LegacyParallaxField { present: true, .. }) => {
+                return Err(D::Error::custom(
+                    "keyframes.insertion and legacy keyframes.min_parallax_px are ambiguous",
+                ));
+            }
+            (
+                InsertionField {
+                    value: Some(insertion),
+                    ..
+                },
+                _,
+            ) => insertion,
+            (
+                InsertionField { present: false, .. },
+                LegacyParallaxField {
+                    value: Some(min_parallax_px),
+                    ..
+                },
+            ) => KeyframeInsertionStrategy::Parallax { min_parallax_px },
+            (InsertionField { present: false, .. }, _) => KeyframeInsertionStrategy::FrameBased,
+            _ => KeyframeInsertionStrategy::FrameBased,
+        };
+
+        Ok(Self {
+            insertion,
+            min_frames_between: raw.min_frames_between,
+            max_frames_between: raw.max_frames_between,
+            ref_ratio: raw.ref_ratio,
+            max_interval_sec: raw.max_interval_sec,
+        })
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(Default)]
+struct InsertionField {
+    present: bool,
+    value: Option<KeyframeInsertionStrategy>,
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for InsertionField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self {
+            present: true,
+            value: Some(KeyframeInsertionStrategy::deserialize(deserializer)?),
+        })
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(Default)]
+struct LegacyParallaxField {
+    present: bool,
+    value: Option<f64>,
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for LegacyParallaxField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self {
+            present: true,
+            value: Option::<f64>::deserialize(deserializer)?,
+        })
     }
 }
 
@@ -255,8 +375,10 @@ mod tests {
     /// Opt-in motion policy: no frame-count bound, 10 px of parallax.
     fn parallax_policy() -> KeyframePolicy {
         KeyframePolicy {
+            insertion: KeyframeInsertionStrategy::Parallax {
+                min_parallax_px: 10.0,
+            },
             max_frames_between: usize::MAX,
-            min_parallax_px: Some(10.0),
             ..KeyframePolicy::default()
         }
     }
@@ -264,6 +386,7 @@ mod tests {
     #[test]
     fn the_default_keeps_the_frame_count_and_ratio_decision_and_ignores_parallax() {
         let policy = KeyframePolicy::default();
+        assert_eq!(policy.insertion, KeyframeInsertionStrategy::FrameBased);
         // (inliers, n_ref, first frame gap that inserts). The ratio rule
         // inserts from min_frames_between (3) when 15 <= inliers <
         // 0.6 * n_ref, an empty reference always does, anything else waits
@@ -292,7 +415,7 @@ mod tests {
                 assert_eq!(
                     policy.should_insert_with(&with_parallax(e, 1e6)),
                     expected,
-                    "{case}: parallax is ignored without min_parallax_px"
+                    "{case}: parallax is ignored by FrameBased"
                 );
             }
         }
@@ -331,8 +454,13 @@ mod tests {
             max_interval_sec: Some(0.5),
             ..parallax_policy()
         };
+        let frame_based = KeyframePolicy {
+            max_interval_sec: Some(0.5),
+            ..KeyframePolicy::default()
+        };
         assert!(!policy.interval_elapsed(1000, 0.49));
         assert!(policy.interval_elapsed(1000, 0.5));
+        assert!(frame_based.interval_elapsed(1000, 0.5));
         assert!(
             !policy.interval_elapsed(2, 10.0),
             "min_frames_between still applies"

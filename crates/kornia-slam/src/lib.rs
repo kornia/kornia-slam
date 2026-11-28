@@ -69,4 +69,6 @@ pub use system::{
     BuildError, CameraSelection, ConfigError, LoopClosingMode, ProcessError, SensorSelection,
     SlamSystem, SystemConfig, TrackingResult, TrackingStatus,
 };
-pub use tracking::{KeyframePolicy, MapProjectionEstimator, TrackingTimings};
+pub use tracking::{
+    KeyframeInsertionStrategy, KeyframePolicy, MapProjectionEstimator, TrackingTimings,
+};

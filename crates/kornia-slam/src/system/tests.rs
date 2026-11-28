@@ -344,7 +344,9 @@ mod keyframe_evidence {
     fn system_tracked_at(min_parallax_px: Option<f64>, tracked: Pose3d) -> SlamSystem {
         let mut config = mono();
         let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
-        orb.keyframes.min_parallax_px = min_parallax_px;
+        orb.keyframes.insertion = min_parallax_px
+            .map(|min_parallax_px| crate::KeyframeInsertionStrategy::Parallax { min_parallax_px })
+            .unwrap_or(crate::KeyframeInsertionStrategy::FrameBased);
         let mut system = SlamSystem::build(config, SensorRig::mono(camera(), IMAGE_SIZE)).unwrap();
         let mut map = map_with_keyframe_at(Pose3d::IDENTITY);
         let ref_pose = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.5, 0.0, 0.0));
@@ -479,7 +481,9 @@ mod keyframe_evidence {
         let mut config = mono();
         let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
         orb.keyframes.max_frames_between = usize::MAX;
-        orb.keyframes.min_parallax_px = Some(10.0);
+        orb.keyframes.insertion = crate::KeyframeInsertionStrategy::Parallax {
+            min_parallax_px: 10.0,
+        };
         orb.keyframes.max_interval_sec = Some(0.5);
         let mut system = SlamSystem::build(config, SensorRig::mono(camera(), IMAGE_SIZE)).unwrap();
         system.state.last_keyframe_idx = Some(100);
