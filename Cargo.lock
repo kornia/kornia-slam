@@ -5996,7 +5996,7 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 [[package]]
 name = "kornia-3d"
 version = "0.2.0"
-source = "git+https://github.com/kornia/kornia-rs?rev=11b4951719d3b702b6ede25d082874fdd23d05c3#11b4951719d3b702b6ede25d082874fdd23d05c3"
+source = "git+https://github.com/kornia/kornia-rs?rev=1740a10877f8812607008d4ff2e79b0a13c2fb84#1740a10877f8812607008d4ff2e79b0a13c2fb84"
 dependencies = [
  "bincode 2.0.1",
  "faer 0.24.4",
@@ -6015,7 +6015,7 @@ dependencies = [
 [[package]]
 name = "kornia-algebra"
 version = "0.2.0"
-source = "git+https://github.com/kornia/kornia-rs?rev=11b4951719d3b702b6ede25d082874fdd23d05c3#11b4951719d3b702b6ede25d082874fdd23d05c3"
+source = "git+https://github.com/kornia/kornia-rs?rev=1740a10877f8812607008d4ff2e79b0a13c2fb84#1740a10877f8812607008d4ff2e79b0a13c2fb84"
 dependencies = [
  "glam 0.33.2",
  "nalgebra 0.35.0",
@@ -6026,7 +6026,7 @@ dependencies = [
 [[package]]
 name = "kornia-bow"
 version = "0.2.0"
-source = "git+https://github.com/kornia/kornia-rs?rev=11b4951719d3b702b6ede25d082874fdd23d05c3#11b4951719d3b702b6ede25d082874fdd23d05c3"
+source = "git+https://github.com/kornia/kornia-rs?rev=1740a10877f8812607008d4ff2e79b0a13c2fb84#1740a10877f8812607008d4ff2e79b0a13c2fb84"
 dependencies = [
  "bincode 2.0.1",
  "rand 0.10.2",
@@ -6048,7 +6048,7 @@ dependencies = [
 [[package]]
 name = "kornia-image"
 version = "0.2.0"
-source = "git+https://github.com/kornia/kornia-rs?rev=11b4951719d3b702b6ede25d082874fdd23d05c3#11b4951719d3b702b6ede25d082874fdd23d05c3"
+source = "git+https://github.com/kornia/kornia-rs?rev=1740a10877f8812607008d4ff2e79b0a13c2fb84#1740a10877f8812607008d4ff2e79b0a13c2fb84"
 dependencies = [
  "kornia-tensor",
  "num-traits",
@@ -6059,7 +6059,7 @@ dependencies = [
 [[package]]
 name = "kornia-imgproc"
 version = "0.2.0"
-source = "git+https://github.com/kornia/kornia-rs?rev=11b4951719d3b702b6ede25d082874fdd23d05c3#11b4951719d3b702b6ede25d082874fdd23d05c3"
+source = "git+https://github.com/kornia/kornia-rs?rev=1740a10877f8812607008d4ff2e79b0a13c2fb84#1740a10877f8812607008d4ff2e79b0a13c2fb84"
 dependencies = [
  "kornia-algebra",
  "kornia-image",
@@ -6073,7 +6073,7 @@ dependencies = [
 [[package]]
 name = "kornia-io"
 version = "0.2.0"
-source = "git+https://github.com/kornia/kornia-rs?rev=11b4951719d3b702b6ede25d082874fdd23d05c3#11b4951719d3b702b6ede25d082874fdd23d05c3"
+source = "git+https://github.com/kornia/kornia-rs?rev=1740a10877f8812607008d4ff2e79b0a13c2fb84#1740a10877f8812607008d4ff2e79b0a13c2fb84"
 dependencies = [
  "image-webp",
  "jpeg-encoder",
@@ -6148,7 +6148,7 @@ dependencies = [
 [[package]]
 name = "kornia-tensor"
 version = "0.2.0"
-source = "git+https://github.com/kornia/kornia-rs?rev=11b4951719d3b702b6ede25d082874fdd23d05c3#11b4951719d3b702b6ede25d082874fdd23d05c3"
+source = "git+https://github.com/kornia/kornia-rs?rev=1740a10877f8812607008d4ff2e79b0a13c2fb84#1740a10877f8812607008d4ff2e79b0a13c2fb84"
 dependencies = [
  "num-traits",
  "rayon",
