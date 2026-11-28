@@ -43,7 +43,7 @@ impl ShardLayout {
         // thread bound, so neither sizes an allocation past it.
         Self {
             threads: threads.clamp(1, MAX_FLOW_SHARDS),
-            cameras,
+            cameras: cameras.min(MAX_FLOW_SHARDS),
             spawned: vec![0; cameras.min(MAX_FLOW_SHARDS)],
         }
     }
@@ -59,10 +59,14 @@ impl ShardLayout {
         if self.shards() == 1 {
             return 0;
         }
-        let shard = if self.threads == self.cameras + 1 {
+        let shard = if self.threads == self.cameras.saturating_add(1) {
             match self.spawned.get_mut(camera) {
                 Some(k) => {
-                    let shard = if *k % 3 == 0 { 0 } else { camera + 1 };
+                    let shard = if *k % 3 == 0 {
+                        0
+                    } else {
+                        camera.saturating_add(1)
+                    };
                     *k += 1;
                     shard
                 }
@@ -78,7 +82,7 @@ impl ShardLayout {
     pub(crate) fn refill_shard(&self, camera: usize) -> usize {
         let shard = match self.shards() {
             1 => 0,
-            threads if threads == self.cameras + 1 => camera + 1,
+            threads if threads == self.cameras.saturating_add(1) => camera.saturating_add(1),
             _ => camera,
         };
         shard.min(self.shards() - 1)
