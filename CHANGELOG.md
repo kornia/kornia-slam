@@ -42,8 +42,8 @@ the header prints a line only for a knob away from its default:
   camera, and `klt_first` then reaches a multi-camera rig. `klt_first` with
   `AllCameras` is refused on raw fisheye rig cameras; the default frontend and
   `PrimaryOnly` build on them.
-- `klt_window: 21` (default): LK window side; other sizes need `FixedPointU8`
-  or `WindowedU8`.
+- `klt_window: 21` (default): LK window side, odd, at most 63; other sizes
+  need `FixedPointU8` or `WindowedU8`.
 - `klt_retry: Off` (default) or `CoarseLevel(max_level)`,
   `forward_backward: Off` (default) or `Enabled(max_round_trip_px, max_iter,
   every_n_frames)`, `track_refill: Off` (default) or `Enabled(per_camera,

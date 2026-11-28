@@ -16,9 +16,9 @@ mod validation;
 pub use build::BuildError;
 pub use config::{
     CameraSelection, FlowPose, ForwardBackward, FrontendConfig, GyroGuess, KltFirst, KltPrediction,
-    KltRetry, KltRig, LoopClosingMode, MAX_FLOW_THREADS, MappingConfig, OrbFrontendConfig,
-    OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection,
-    StereoCloseDepth, SystemConfig, TrackRefill,
+    KltRetry, KltRig, LoopClosingMode, MAX_FLOW_THREADS, MAX_KLT_WINDOW, MappingConfig,
+    OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION,
+    SensorSelection, StereoCloseDepth, SystemConfig, TrackRefill,
 };
 #[cfg(feature = "serde")]
 pub use file::LoadError;

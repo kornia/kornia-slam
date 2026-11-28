@@ -140,6 +140,11 @@ pub struct OrbFrontendConfig {
 /// Most flow threads a frontend runs, the tracking thread included.
 pub const MAX_FLOW_THREADS: usize = 4;
 
+/// Largest LK window side: three times OpenCV's and VINS-Fusion's 21. The
+/// fixed-point pyramid pads every level by the window, so an unbounded one
+/// allocates without bound.
+pub const MAX_KLT_WINDOW: usize = 63;
+
 /// Which rig cameras optical flow tracks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

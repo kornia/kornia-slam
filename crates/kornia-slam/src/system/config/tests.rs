@@ -317,6 +317,29 @@ fn flow_knob_ranges_are_checked() {
     }
 }
 
+/// The fixed-point pyramid pads every level by the window, so an odd window
+/// past the bound must be refused before a system allocates by it; `2^53 + 1`
+/// is odd and exact in f64.
+#[test]
+fn klt_window_is_bounded() {
+    for klt_kernel in [LkKernel::FixedPointU8, LkKernel::WindowedU8] {
+        let frontend = |klt_window| OrbFrontendConfig {
+            klt_kernel,
+            klt_window,
+            ..OrbFrontendConfig::default()
+        };
+        let config = with_frontend(frontend(MAX_KLT_WINDOW), CameraSelection::Mono);
+        assert_eq!(config.validate(), Ok(()));
+        for klt_window in [MAX_KLT_WINDOW + 2, (1 << 53) + 1] {
+            let config = with_frontend(frontend(klt_window), CameraSelection::Mono);
+            assert_eq!(
+                invalid_setting(&config).as_deref(),
+                Some("frontend.klt_window")
+            );
+        }
+    }
+}
+
 #[test]
 fn flow_knobs_are_refused_without_the_knobs_they_need() {
     let needs = |knob: &'static str, needs: &'static str| -> Result<(), ConfigError> {

@@ -3,8 +3,9 @@ use kornia_sensors::SensorRig;
 
 use super::config::{
     CameraSelection, FlowPose, ForwardBackward, FrontendConfig, KltRetry, KltRig, LoopClosingMode,
-    MAX_FLOW_THREADS, OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition,
-    SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth, SystemConfig, TrackRefill,
+    MAX_FLOW_THREADS, MAX_KLT_WINDOW, OrbFrontendConfig, OrbSlamPipeline, OrbTuning,
+    PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth, SystemConfig,
+    TrackRefill,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopClosingConfig;
@@ -162,7 +163,9 @@ fn validate_flow(
     check(
         at("klt_window"),
         frontend.klt_window as f64,
-        Requirement("odd and >= 3", |v| v >= 3.0 && v % 2.0 == 1.0),
+        Requirement("odd and in 3..=MAX_KLT_WINDOW", |v| {
+            (3.0..=MAX_KLT_WINDOW as f64).contains(&v) && v % 2.0 == 1.0
+        }),
     )?;
     if let KltRetry::CoarseLevel { max_level } = frontend.klt_retry {
         check(at("klt_retry.max_level"), max_level as f64, AT_LEAST_ONE)?;
