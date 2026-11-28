@@ -555,7 +555,7 @@ pub(super) fn landmarks_to_write_back(
     let n = after.1.len();
     let mut behind = vec![false; n];
     let mut nearest = vec![(f64::INFINITY, f64::INFINITY); n];
-    let camera_centre = |pose: &Pose3d| pose.inverse().translation;
+    let camera_centre = |pose: &Pose3d| pose.camera_centre();
     for obs in observations {
         let (Some(kf_before), Some(kf_after)) =
             (before.0.get(obs.pose_idx), after.0.get(obs.pose_idx))

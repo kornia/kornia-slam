@@ -46,7 +46,7 @@ impl<D: Descriptor> Map<D> {
         let mut n = 0usize;
         for kf_idx in &kf_indices {
             if let Some(kf) = self.get_keyframe(*kf_idx) {
-                let cam_center = kf.frame.pose_world_to_cam.inverse().translation;
+                let cam_center = kf.frame.pose_world_to_cam.camera_centre();
                 let dir = position - cam_center;
                 let len = dir.length();
                 if len > 1e-9 {
@@ -59,7 +59,7 @@ impl<D: Descriptor> Map<D> {
         let Some(ref_kf) = self.get_keyframe(ref_kf_idx) else {
             return;
         };
-        let ref_center = ref_kf.frame.pose_world_to_cam.inverse().translation;
+        let ref_center = ref_kf.frame.pose_world_to_cam.camera_centre();
         let dist = (position - ref_center).length();
         let level_scale = scale_factor.powi(ref_octave as i32);
         let max_dist = dist * level_scale;

@@ -16,8 +16,8 @@ use kornia_image::{Image, ImageSize};
 
 use kornia_sensors::SensorRig;
 
-use crate::datasets::{StereoCalib, StereoRectifier};
-use crate::source::{FrameItem, FrameSource, SourceError, rectify_pair};
+use crate::datasets::StereoCalib;
+use crate::source::{FrameItem, FrameSource, PairRectifier, Rectification, SourceError};
 
 /// Live OAK-D frame source. `right_queue`/`rectifier`/`stereo_baseline_m` are populated
 /// when the source was opened via `open_stereo`; in mono mode they're `None`.
@@ -33,7 +33,7 @@ pub struct OakdSource {
     image_size: ImageSize,
     n_pixels: usize,
     camera: PinholeCamera,
-    rectifier: Option<StereoRectifier>,
+    rectifier: Option<PairRectifier>,
     stereo_baseline_m: Option<f64>,
     max_frames: usize,
     cursor: usize,
@@ -115,10 +115,14 @@ impl OakdSource {
         fps: f32,
         calib_path: &Path,
         max_frames: usize,
+        rectification: Rectification,
     ) -> Result<Self, SourceError> {
         let calib = StereoCalib::load(calib_path).map_err(SourceError::other)?;
         let (width, height) = (calib.width as u32, calib.height as u32);
-        let rectifier = calib.rectifier().map_err(SourceError::other)?;
+        let rectifier = PairRectifier::new(
+            calib.rectifier().map_err(SourceError::other)?,
+            rectification,
+        )?;
 
         eprintln!("[oakd] opening device (stereo)…");
         let device = Device::new().map_err(SourceError::other)?;
@@ -183,10 +187,11 @@ impl OakdSource {
 
 impl FrameSource for OakdSource {
     fn rig(&self) -> SensorRig {
-        let rig = SensorRig::new(self.camera.clone());
         match self.stereo_baseline_m {
-            Some(baseline_m) => rig.with_stereo_baseline(baseline_m),
-            None => rig,
+            Some(baseline_m) => {
+                SensorRig::rectified_stereo(self.camera.clone(), self.image_size, baseline_m)
+            }
+            None => SensorRig::mono(self.camera.clone(), self.image_size),
         }
     }
 
@@ -208,7 +213,7 @@ impl FrameSource for OakdSource {
         let (image, right_image) =
             if let (Some(rq), Some(rect)) = (self.right_queue.as_mut(), self.rectifier.as_ref()) {
                 let right_raw = pull_gray8(rq, &self.image_size, self.n_pixels)?;
-                let (left, right) = rectify_pair(rect, &left_raw, &right_raw)?;
+                let (left, right) = rect.rectify(&left_raw, &right_raw)?;
                 (left, Some(right))
             } else {
                 (left_raw, None)

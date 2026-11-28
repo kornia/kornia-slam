@@ -24,7 +24,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use kornia_3d::camera::{FisheyeCamera, PinholeCamera};
+use kornia_3d::camera::FisheyeCamera;
 
 use super::euroc::{DatasetError, DatasetSample, GroundTruthPose};
 
@@ -54,26 +54,6 @@ pub struct KannalaBrandtCalibration {
 }
 
 impl KannalaBrandtCalibration {
-    /// Virtual pinhole camera that fisheye keypoints are undistorted into.
-    ///
-    /// Keeps the calibrated focal and principal point and drops distortion. ORB
-    /// runs on the raw fisheye image; each keypoint is unprojected through the
-    /// Kannala-Brandt model to a bearing and reprojected through this pinhole,
-    /// so the existing pinhole geometry (PnP, triangulation, BA) stays valid.
-    /// The focal only sets the pixel scale of the undistorted coordinates.
-    pub fn to_undistorted_pinhole(self) -> PinholeCamera {
-        PinholeCamera {
-            fx: self.fx,
-            fy: self.fy,
-            cx: self.cx,
-            cy: self.cy,
-            k1: 0.0,
-            k2: 0.0,
-            p1: 0.0,
-            p2: 0.0,
-        }
-    }
-
     /// Kannala-Brandt fisheye camera used to unproject raw keypoints to bearings.
     pub fn to_fisheye_camera(self) -> FisheyeCamera {
         FisheyeCamera {

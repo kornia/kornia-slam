@@ -27,7 +27,11 @@ fn slam_system_builds_and_processes_through_the_public_api() {
         },
         ..SystemConfig::default()
     };
-    let rig = SensorRig::new(test_camera()).with_imu(Pose3d::IDENTITY);
+    let size = ImageSize {
+        width: 640,
+        height: 480,
+    };
+    let rig = SensorRig::mono(test_camera(), size).with_imu(Pose3d::IDENTITY);
     let mut system = SlamSystem::build(config, rig).unwrap();
     assert_eq!(system.rig().camera_to_body(), Some(Pose3d::IDENTITY));
 

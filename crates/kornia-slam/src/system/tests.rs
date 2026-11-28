@@ -31,10 +31,18 @@ fn camera() -> PinholeCamera {
     }
 }
 
+/// Size of the [`synthetic_pair`] images the tests feed.
+const IMAGE_SIZE: ImageSize = ImageSize {
+    width: 376,
+    height: 240,
+};
+
+fn mono_rig() -> SensorRig {
+    SensorRig::mono(camera(), IMAGE_SIZE)
+}
+
 fn stereo_imu_rig() -> SensorRig {
-    SensorRig::new(camera())
-        .with_stereo_baseline(0.11)
-        .with_imu(Pose3d::IDENTITY)
+    SensorRig::rectified_stereo(camera(), IMAGE_SIZE, 0.11).with_imu(Pose3d::IDENTITY)
 }
 
 fn config(cameras: CameraSelection, imu: bool, loop_closing: LoopClosingMode) -> SystemConfig {
@@ -84,7 +92,7 @@ impl Drop for SavedVocabulary {
 /// A vocabulary trained on the texture's descriptors, saved where a
 /// configuration can name it.
 fn saved_vocabulary(name: &str) -> SavedVocabulary {
-    let features = OrbFrontend::new(mono().orb_detector(), &SensorRig::new(camera()))
+    let features = OrbFrontend::new(mono().orb_detector(), &mono_rig(), None)
         .prepare_image(0, &textured(0))
         .unwrap()
         .features;
@@ -120,7 +128,7 @@ fn build_validates_programmatic_configs() {
 fn build_rejects_sensors_the_rig_lacks() {
     let stereo = config(CameraSelection::Stereo, false, LoopClosingMode::Disabled);
     assert!(matches!(
-        SlamSystem::build(stereo, SensorRig::new(camera())),
+        SlamSystem::build(stereo, mono_rig()),
         Err(BuildError::Config(ConfigError::MissingSensor(
             "stereo cameras"
         )))
@@ -130,7 +138,7 @@ fn build_rejects_sensors_the_rig_lacks() {
 #[test]
 fn build_restricts_the_rig_to_selected_sensors() {
     let system = SlamSystem::build(mono(), stereo_imu_rig()).unwrap();
-    assert!(system.rig().stereo_baseline_m.is_none());
+    assert_eq!(system.rig().cameras().len(), 1);
     assert!(system.rig().imu.is_none());
 }
 
@@ -318,7 +326,7 @@ mod keyframe_evidence {
         let mut config = mono();
         let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
         orb.keyframes.min_parallax_px = min_parallax_px;
-        let mut system = SlamSystem::build(config, SensorRig::new(camera())).unwrap();
+        let mut system = SlamSystem::build(config, SensorRig::mono(camera(), IMAGE_SIZE)).unwrap();
         let mut map = map_with_keyframe_at(Pose3d::IDENTITY);
         let ref_pose = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.5, 0.0, 0.0));
         map.insert_keyframe(Keyframe::from_frame(frame_seeing_points(1, ref_pose, &[])))
@@ -376,7 +384,7 @@ mod keyframe_evidence {
         orb.keyframes.max_frames_between = usize::MAX;
         orb.keyframes.min_parallax_px = Some(10.0);
         orb.keyframes.max_interval_sec = Some(0.5);
-        let mut system = SlamSystem::build(config, SensorRig::new(camera())).unwrap();
+        let mut system = SlamSystem::build(config, SensorRig::mono(camera(), IMAGE_SIZE)).unwrap();
         system.state.last_keyframe_idx = Some(100);
         system.inertial.last_keyframe_timestamp_sec = Some(10.0);
         let parked = KeyframeEvidence {

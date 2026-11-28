@@ -32,6 +32,8 @@ impl Default for ImuBias {
 
 /// IMU noise parameters from the sensor datasheet.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct ImuCalib {
     /// Gyroscope white noise density (rad/s/√Hz).
     pub gyro_noise: f64,

@@ -55,6 +55,7 @@ use crate::mapping::map::{
 use crate::mapping::{KeyframeJob, LocalMapping};
 use crate::pose_conversion::apply_reference_pose_correction;
 use build::SystemSettings;
+use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
 use kornia_sensors::SensorRig;
@@ -63,6 +64,10 @@ use kornia_sensors::imu::ImuMeasurement;
 /// Top-level ORB-SLAM system: orchestrates tracking, mapping, and state transitions.
 pub struct SlamSystem {
     rig: SensorRig,
+    /// The primary camera's measurement pinhole, cached once.
+    camera: PinholeCamera,
+    /// Baseline of the selected rectified pair; `None` unless stereo is selected.
+    stereo_baseline_m: Option<f64>,
     tracker: Tracker,
     two_view_init_config: TwoViewInitConfig,
     keyframe_policy: KeyframePolicy,
@@ -97,7 +102,7 @@ impl SlamSystem {
         config.validate()?;
         let rig = config.sensors.select_rig(rig)?;
         let settings = config.settings(&rig);
-        let frontend = OrbFrontend::new(config.orb_detector(), &rig);
+        let frontend = OrbFrontend::new(config.orb_detector(), &rig, settings.stereo_baseline_m);
         let loop_closer = config.loop_closer(&rig)?;
         Ok(Self::assemble(rig, settings, frontend, loop_closer))
     }
@@ -108,13 +113,15 @@ impl SlamSystem {
         frontend: OrbFrontend,
         loop_closer: Option<LoopCloser>,
     ) -> Self {
-        let camera = rig.camera.clone();
+        let camera = rig.primary().pinhole();
         let map = Arc::new(Mutex::new(Map::new()));
         let local_mapping =
             LocalMapping::new(settings.local_mapping, Arc::clone(&map), camera.clone());
         let map_publication_gate = local_mapping.publication_gate();
         Self {
             rig,
+            camera,
+            stereo_baseline_m: settings.stereo_baseline_m,
             tracker: Tracker::new(settings.map_projection),
             two_view_init_config: settings.two_view_init,
             keyframe_policy: settings.keyframe_policy,
@@ -176,7 +183,7 @@ impl SlamSystem {
         image: &Image<u8, 1>,
     ) -> Result<TrackingResult, ProcessError> {
         input::validate_image(timestamp_sec, image)?;
-        if self.rig.stereo_baseline_m.is_some() {
+        if self.stereo_baseline_m.is_some() {
             return Err(ProcessError::StereoRequired);
         }
         let frame = self
@@ -195,7 +202,7 @@ impl SlamSystem {
         right: &Image<u8, 1>,
     ) -> Result<TrackingResult, ProcessError> {
         input::validate_stereo_pair(timestamp_sec, left, right)?;
-        if self.rig.stereo_baseline_m.is_none() {
+        if self.stereo_baseline_m.is_none() {
             return Err(ProcessError::MonoPipeline);
         }
         let frame = self
@@ -283,7 +290,7 @@ impl SlamSystem {
         self.apply_local_mapping_results();
         // Fill the per-frame undistortion cache once; tracking, BA gathering,
         // growth, and fuse all read from it.
-        frame.ensure_undistorted(&self.rig.camera);
+        frame.ensure_undistorted(&self.camera);
 
         match self.state.mode {
             SystemMode::Bootstrap => self.bootstrap_step(frame, timestamp_sec),
@@ -389,8 +396,7 @@ impl SlamSystem {
         let curr_idx = curr_frame.idx;
 
         let insertion =
-            match bootstrap::stereo_initial_map(Keyframe::from_frame(curr_frame), &self.rig.camera)
-            {
+            match bootstrap::stereo_initial_map(Keyframe::from_frame(curr_frame), &self.camera) {
                 Ok(insertion) => insertion,
                 Err(TooFewStereoPoints { found }) => {
                     self.dbg(format!(
@@ -436,7 +442,7 @@ impl SlamSystem {
         let decision = evaluate_bootstrap(
             self.state.bootstrap_frame.as_ref(),
             &curr_frame,
-            &self.rig.camera,
+            &self.camera,
             &self.two_view_init_config,
         );
         let two_view_estimate = match decision {
@@ -592,7 +598,7 @@ impl SlamSystem {
     ) -> Result<(), MapMutationError> {
         self.map.lock().unwrap().apply_insertion(insertion)?;
         let refined =
-            crate::mapping::ba::run_initial_ba(&mut self.map.lock().unwrap(), &self.rig.camera);
+            crate::mapping::ba::run_initial_ba(&mut self.map.lock().unwrap(), &self.camera);
         if let Err(error) = refined {
             self.dbg(format!("[init_ba] {error}; keeping the unrefined map"));
         }
@@ -830,7 +836,7 @@ impl SlamSystem {
                     trusted_prediction: self.imu_confident(timestamp_sec),
                 },
                 &map,
-                &self.rig.camera,
+                &self.camera,
             )
         };
 
@@ -901,7 +907,7 @@ impl SlamSystem {
                 let visible = crate::tracking::local_map::landmarks_in_frustum(
                     &map_guard,
                     &local_indices,
-                    &self.rig.camera,
+                    &self.camera,
                     &candidate_pose,
                     image_size,
                 );
@@ -991,7 +997,7 @@ impl SlamSystem {
                     frame,
                     &self.state.pose_world_to_cam,
                     matches,
-                    &self.rig.camera,
+                    &self.camera,
                 )
             });
         KeyframeEvidence {
@@ -1039,7 +1045,7 @@ impl SlamSystem {
         // A pose far from where the motion model put the camera belongs to a
         // part of the map that has drifted from here; adopting it would
         // teleport the trajectory.
-        let predicted_position = self.state.pose_world_to_cam.inverse().translation;
+        let predicted_position = self.state.pose_world_to_cam.camera_centre();
         let mut refused = Vec::new();
         let found = {
             let map = self.map.lock().unwrap();
@@ -1049,9 +1055,8 @@ impl SlamSystem {
                 MAX_CANDIDATES,
             );
             self.tracker
-                .relocalize(frame, &candidates, &map, &self.rig.camera, |found| {
-                    let jump =
-                        (found.estimate.pose.inverse().translation - predicted_position).length();
+                .relocalize(frame, &candidates, &map, &self.camera, |found| {
+                    let jump = (found.estimate.pose.camera_centre() - predicted_position).length();
                     let near = jump <= RELOCALIZATION_MAX_JUMP_M;
                     if !near {
                         refused.push((found.keyframe_idx, jump));
@@ -1161,7 +1166,7 @@ impl SlamSystem {
             curr_kf,
             matches,
             self.stereo_close_depth,
-            &self.rig.camera,
+            &self.camera,
             imu_edge,
         );
 
@@ -1194,7 +1199,7 @@ impl SlamSystem {
         let growth = keyframe_mapping::grow_keyframe(
             &self.map,
             growth_plan,
-            &self.rig.camera,
+            &self.camera,
             &self.two_view_init_config.match_config,
             &self.two_view_init_config.triangulation_config,
         );
@@ -1310,7 +1315,7 @@ impl SlamSystem {
         };
         let outcome = {
             let mut map = self.map.lock().unwrap();
-            loop_closer.on_keyframe(&mut map, &self.rig.camera, kf_idx, context)
+            loop_closer.on_keyframe(&mut map, &self.camera, kf_idx, context)
         };
         if let Some(message) = outcome.debug_message {
             self.dbg(message);

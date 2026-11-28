@@ -45,8 +45,6 @@ pub enum ConfigError {
     LoopClosingWithoutMetricScale,
     #[error("configuration requests {0}, but the source does not provide it")]
     MissingSensor(&'static str),
-    #[error("stereo cameras need rectified images; the source supplies raw fisheye images")]
-    FisheyeStereo,
 }
 
 impl SystemConfig {
@@ -384,13 +382,8 @@ fn check(
 impl SensorSelection {
     /// Checks that the source's rig provides every selected sensor.
     pub fn validate_rig(&self, rig: &SensorRig) -> Result<(), ConfigError> {
-        if self.cameras == CameraSelection::Stereo {
-            if rig.stereo_baseline_m.is_none() {
-                return Err(ConfigError::MissingSensor("stereo cameras"));
-            }
-            if rig.fisheye.is_some() {
-                return Err(ConfigError::FisheyeStereo);
-            }
+        if self.cameras == CameraSelection::Stereo && rig.rectified_stereo_baseline_m().is_none() {
+            return Err(ConfigError::MissingSensor("stereo cameras"));
         }
         if self.imu && rig.imu.is_none() {
             return Err(ConfigError::MissingSensor("an IMU"));

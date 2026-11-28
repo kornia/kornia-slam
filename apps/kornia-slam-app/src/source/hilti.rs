@@ -17,10 +17,10 @@
 
 use std::path::{Path, PathBuf};
 
-use kornia_3d::camera::{FisheyeCamera, PinholeCamera};
+use kornia_3d::camera::FisheyeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, Vec3F64};
-use kornia_image::Image;
+use kornia_image::{Image, ImageSize};
 use kornia_io::png::{read_image_png_mono8, read_image_png_mono16};
 
 use kornia_sensors::SensorRig;
@@ -94,10 +94,9 @@ impl HiltiConfig {
 /// order.
 pub struct HiltiSource {
     dataset: HiltiDataset,
-    /// Virtual pinhole that keypoints are mapped into.
-    camera: PinholeCamera,
     /// Kannala-Brandt model of the upright raw image.
     fisheye: FisheyeCamera,
+    size: ImageSize,
     rotate_180: bool,
     /// `T_BC` of the virtual pinhole, when the IMU is read.
     camera_to_body: Option<Pose3d>,
@@ -146,8 +145,11 @@ impl HiltiSource {
         }
 
         let calib = &dataset.cam0_calibration;
-        let camera = calib.to_undistorted_pinhole();
         let fisheye = calib.to_fisheye_camera();
+        let size = ImageSize {
+            width: calib.width as usize,
+            height: calib.height as usize,
+        };
         let camera_to_body = imu.then(|| camera_to_body(&dataset.t_cam0_imu));
         // IMU samples before the first yielded frame belong to no window.
         let imu_cursor = match start.checked_sub(1) {
@@ -162,8 +164,8 @@ impl HiltiSource {
 
         Ok(Self {
             dataset,
-            camera,
             fisheye,
+            size,
             rotate_180,
             camera_to_body,
             imu_cursor,
@@ -242,7 +244,7 @@ fn rotate_180_mono(img: &Image<u8, 1>) -> Image<u8, 1> {
 
 impl FrameSource for HiltiSource {
     fn rig(&self) -> SensorRig {
-        let rig = SensorRig::new(self.camera.clone()).with_fisheye(self.fisheye.clone());
+        let rig = SensorRig::mono(self.fisheye.clone(), self.size);
         match self.camera_to_body {
             Some(t_bc) => rig.with_imu(t_bc),
             None => rig,

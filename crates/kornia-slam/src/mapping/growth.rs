@@ -124,7 +124,7 @@ pub fn pair_growth_request<D: Descriptor>(
     // there: wrong matches survive and triangulate to depth-garbage points that
     // still reproject well in both views. Mirrors ORB-SLAM3's epipole-proximity
     // rejection; RANSAC consensus used to absorb these.
-    let prev_center_world = prev_kf.frame.pose_world_to_cam.inverse().translation;
+    let prev_center_world = prev_kf.frame.pose_world_to_cam.camera_centre();
     let epipole_cam = curr_kf
         .frame
         .pose_world_to_cam

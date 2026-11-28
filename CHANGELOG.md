@@ -10,6 +10,38 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**A sensor rig is a list of cameras.** `SensorRig` now holds `cameras()`, the
+primary first, each a `RigCamera` with its lens model (`kornia_3d::camera::Camera`:
+pinhole, Kannala-Brandt or Fisheye624), its image size and its pose
+`primary_from_camera` in the primary frame. Build one with
+`SensorRig::mono(model, size)`, `SensorRig::rectified_stereo(camera, size, baseline_m)`
+or `SensorRig::from_cameras(cameras)`, which refuses a list that is not a rig
+(`RigError`). The fields `camera`, `stereo_baseline_m` and `fisheye` and the
+constructors `new`, `with_stereo_baseline` and `with_fisheye` are removed:
+read `rig.primary().pinhole()`, `rig.rectified_stereo_baseline_m()` and
+`rig.primary().is_fisheye()` instead. A rig is stereo only when it is exactly a
+rectified pair, and only `cameras: Stereo` runs it as one. `ConfigError::FisheyeStereo`
+is removed: a fisheye camera is never part of a rectified pair, so stereo over it
+is `MissingSensor("stereo cameras")`. Mono, stereo and fisheye runs are unchanged.
+
+**A rig calibration file any source can load.** `kornia_sensors::rig_calibration`
+(feature `serde`) reads and writes a RON file with each camera's lens model
+(`Pinhole`, `KannalaBrandt` or `Fisheye624`), image size and `primary_from_camera`,
+plus the primary's `camera_to_body` and the IMU noise; `RigCalibration::to_sensor_rig`
+builds a rig from the file alone, refusing non-rigid transforms, unusable intrinsics or
+IMU noise, and a written file reads back bit-equal. In the app,
+a run file's `rig_calibration` replaces the source's cameras (it must hold as many
+cameras as the source yields images per frame, each of the source's image size), and its IMU extrinsic and noise when
+the source has an IMU; `--write-rig-calibration <path>` writes the opened source's rig
+as such a file and exits. Omitted, every source keeps its own calibration.
+
+**Fixed-point table rectification.** `kornia_slam::rectify::StereoRemap` rectifies a
+raw stereo pair through precomputed kornia-imgproc remap tables on the calling thread,
+without allocating; `RemapQuantisation::Q10Trunc` gives the same bytes as
+`StereoRectifier::rectify_left` / `rectify_right`. The app's run-file key
+`rectification: FixedPoint` selects it for the EuRoC, MCAP and OAK-D stereo sources;
+the default, `RemapF32`, is the previous path.
+
 **Bundle adjustment is grouped under `mapping::ba`.** A move with no change in
 behaviour: `kornia_slam::mapping::bundle_adjustment` is now
 `kornia_slam::mapping::ba`, and `kornia_slam::mapping::vi_ba_schur` is

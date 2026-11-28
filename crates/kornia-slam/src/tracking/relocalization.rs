@@ -142,7 +142,7 @@ fn ransac_pose<D: Descriptor>(
     config: &RelocalizationConfig<D>,
 ) -> Option<(Pose3d, Vec<(usize, usize)>)> {
     let keyframe_pose = keyframe.frame.pose_world_to_cam;
-    let center = keyframe_pose.inverse().translation;
+    let center = keyframe_pose.camera_centre();
     let mut depths: Vec<f64> = correspondences
         .iter()
         .map(|&(mp, _)| {

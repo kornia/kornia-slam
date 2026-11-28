@@ -3,6 +3,7 @@ use std::f32::consts::{PI, TAU};
 use super::*;
 use crate::features::RBrief;
 use bytemuck::TransparentWrapper;
+use kornia_3d::camera::FisheyeCamera;
 
 const FRONTEND_FIXTURE: &str = include_str!("../../tests/fixtures/frontend/frontend.txt");
 const HILTI_FIXTURE: &str = include_str!("../../tests/fixtures/frontend/hilti.txt");
@@ -103,7 +104,7 @@ fn hilti_mapping() -> FisheyeMapping {
     let fisheye = hilti_fisheye();
     FisheyeMapping {
         camera: pinhole(fisheye.fx, fisheye.fy, fisheye.cx, fisheye.cy),
-        fisheye,
+        model: fisheye.into(),
         min_bearing_z: MAX_INCIDENCE_DEG.to_radians().cos(),
     }
 }
@@ -126,12 +127,16 @@ fn indexed_features(keypoints_xy: Vec<[f32; 2]>) -> Features {
 }
 
 fn stereo_frontend() -> OrbFrontend {
-    let rig = SensorRig::new(pinhole(435.0, 435.0, 188.0, 120.0)).with_stereo_baseline(0.11);
+    let size = ImageSize {
+        width: 376,
+        height: 240,
+    };
+    let rig = SensorRig::rectified_stereo(pinhole(435.0, 435.0, 188.0, 120.0), size, 0.11);
     let detector = OrbDetector {
         n_keypoints: 1000,
         ..OrbDetector::default()
     };
-    OrbFrontend::new(detector, &rig)
+    OrbFrontend::new(detector, &rig, rig.rectified_stereo_baseline_m())
 }
 
 #[test]
@@ -265,9 +270,8 @@ fn unrelated_stereo_views_prepare_without_matches() {
 fn fisheye_observation_keeps_raw_image_keypoints() {
     let (image, _) = synthetic_pair(1472, 1440, 0);
     let fisheye = hilti_fisheye();
-    let rig = SensorRig::new(pinhole(fisheye.fx, fisheye.fy, fisheye.cx, fisheye.cy))
-        .with_fisheye(fisheye);
-    let mut frontend = OrbFrontend::new(OrbDetector::default(), &rig);
+    let rig = SensorRig::mono(fisheye, image.size());
+    let mut frontend = OrbFrontend::new(OrbDetector::default(), &rig, None);
     let frame = frontend.prepare_image(3, &image).unwrap();
 
     let observed = &frontend.observation().keypoints_xy;

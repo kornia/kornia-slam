@@ -18,6 +18,7 @@ use serde::Deserialize;
 
 use crate::datasets::StereoRectifier;
 use crate::datasets::euroc::GroundTruthPose;
+use kornia_slam::rectify::{RemapQuantisation, StereoRemap};
 use kornia_slam::{CameraSelection, SensorSelection};
 
 use euroc::EurocConfig;
@@ -50,8 +51,8 @@ pub trait FrameSource {
     /// Calibration of the sensors behind this source. Must be valid before the
     /// first `next_frame` call. For a stereo source the camera is the rectified
     /// one shared by both views, and the IMU extrinsic (when present) refers to it.
-    /// A source of raw fisheye images declares their model with
-    /// [`SensorRig::with_fisheye`].
+    /// A source of raw fisheye images declares their model as the camera's
+    /// model, with the raw image size.
     fn rig(&self) -> SensorRig;
 
     /// Total frames the source will yield, if known.
@@ -132,14 +133,19 @@ impl SourceConfig {
         }
     }
 
-    /// Opens the source in the mode the selected sensors need.
-    pub fn open(&self, sensors: SensorSelection) -> Result<OpenedSource, SourceError> {
+    /// Opens the source in the mode the selected sensors need; stereo pairs
+    /// from raw cameras are rectified as `rectification` says.
+    pub fn open(
+        &self,
+        sensors: SensorSelection,
+        rectification: Rectification,
+    ) -> Result<OpenedSource, SourceError> {
         let stereo = sensors.cameras == CameraSelection::Stereo;
         match self {
-            Self::Euroc(euroc) => euroc.open(stereo),
+            Self::Euroc(euroc) => euroc.open(stereo, rectification),
             Self::Hilti(hilti) => hilti.open(sensors.imu),
-            Self::Mcap(mcap) => mcap.open(stereo),
-            Self::Oakd(oakd) => oakd.open(stereo),
+            Self::Mcap(mcap) => mcap.open(stereo, rectification),
+            Self::Oakd(oakd) => oakd.open(stereo, rectification),
             Self::TumVi(tumvi) => tumvi.open(sensors.imu),
             Self::Uvc(uvc) => uvc.open(),
         }
@@ -207,19 +213,64 @@ fn non_empty(poses: Vec<GroundTruthPose>) -> Option<Vec<GroundTruthPose>> {
     (!poses.is_empty()).then_some(poses)
 }
 
-/// Rectify a raw stereo pair into freshly allocated `(left, right)` images.
-fn rectify_pair(
-    rectifier: &StereoRectifier,
-    left: &Image<u8, 1>,
-    right: &Image<u8, 1>,
-) -> Result<(Image<u8, 1>, Image<u8, 1>), SourceError> {
-    let mut left_rect = Image::from_size_val(left.size(), 0).map_err(SourceError::other)?;
-    let mut right_rect = Image::from_size_val(right.size(), 0).map_err(SourceError::other)?;
-    rectifier
-        .rectify_left(left, &mut left_rect)
-        .map_err(SourceError::other)?;
-    rectifier
-        .rectify_right(right, &mut right_rect)
-        .map_err(SourceError::other)?;
-    Ok((left_rect, right_rect))
+/// How a raw stereo pair is rectified (`RunConfig.rectification`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum Rectification {
+    /// kornia-rs `remap_u8` on the f32 maps, on rayon rows.
+    #[default]
+    RemapF32,
+    /// Precomputed fixed-point tables, on the source thread. The same bytes
+    /// as `RemapF32`.
+    FixedPoint,
+}
+
+/// A [`StereoRectifier`] and, for [`Rectification::FixedPoint`], its tables.
+pub struct PairRectifier {
+    rectifier: StereoRectifier,
+    tables: Option<StereoRemap>,
+}
+
+impl PairRectifier {
+    pub fn new(rectifier: StereoRectifier, mode: Rectification) -> Result<Self, SourceError> {
+        let tables = match mode {
+            Rectification::RemapF32 => None,
+            Rectification::FixedPoint => Some(
+                StereoRemap::new(&rectifier, RemapQuantisation::Q10Trunc)
+                    .map_err(SourceError::other)?,
+            ),
+        };
+        Ok(Self { rectifier, tables })
+    }
+
+    /// Rectify a raw stereo pair into freshly allocated `(left, right)` images.
+    fn rectify(
+        &self,
+        left: &Image<u8, 1>,
+        right: &Image<u8, 1>,
+    ) -> Result<(Image<u8, 1>, Image<u8, 1>), SourceError> {
+        let mut left_rect = Image::from_size_val(left.size(), 0).map_err(SourceError::other)?;
+        let mut right_rect = Image::from_size_val(right.size(), 0).map_err(SourceError::other)?;
+        match &self.tables {
+            Some(tables) => tables
+                .rectify(left, right, &mut left_rect, &mut right_rect)
+                .map_err(SourceError::other)?,
+            None => {
+                self.rectifier
+                    .rectify_left(left, &mut left_rect)
+                    .map_err(SourceError::other)?;
+                self.rectifier
+                    .rectify_right(right, &mut right_rect)
+                    .map_err(SourceError::other)?;
+            }
+        }
+        Ok((left_rect, right_rect))
+    }
+}
+
+impl std::ops::Deref for PairRectifier {
+    type Target = StereoRectifier;
+
+    fn deref(&self) -> &StereoRectifier {
+        &self.rectifier
+    }
 }

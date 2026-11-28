@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use kornia_slam::SensorSelection;
 use serde::Deserialize;
 
-use super::{OpenedSource, SourceError, no_imu, positive, resolve, stereo_needs_calib};
+use super::{
+    OpenedSource, Rectification, SourceError, no_imu, positive, resolve, stereo_needs_calib,
+};
 
 #[cfg(feature = "oakd")]
 mod device;
@@ -61,9 +63,15 @@ impl OakdConfig {
     }
 
     #[cfg(feature = "oakd")]
-    pub(super) fn open(&self, stereo: bool) -> Result<OpenedSource, SourceError> {
+    pub(super) fn open(
+        &self,
+        stereo: bool,
+        rectification: Rectification,
+    ) -> Result<OpenedSource, SourceError> {
         let source = match (&self.calib, stereo) {
-            (Some(calib), true) => OakdSource::open_stereo(self.fps, calib, self.max_frames)?,
+            (Some(calib), true) => {
+                OakdSource::open_stereo(self.fps, calib, self.max_frames, rectification)?
+            }
             _ => OakdSource::open(self.width, self.height, self.fps, self.max_frames)?,
         };
         Ok(OpenedSource {
@@ -74,7 +82,11 @@ impl OakdConfig {
     }
 
     #[cfg(not(feature = "oakd"))]
-    pub(super) fn open(&self, _stereo: bool) -> Result<OpenedSource, SourceError> {
+    pub(super) fn open(
+        &self,
+        _stereo: bool,
+        _rectification: Rectification,
+    ) -> Result<OpenedSource, SourceError> {
         Err(SourceError::other(
             "this build has no OAK-D support; rebuild with `--features oakd`",
         ))

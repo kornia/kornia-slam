@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use ciborium::value::Value as CborValue;
 use kornia_3d::camera::PinholeCamera;
-use kornia_image::Image;
+use kornia_image::{Image, ImageSize};
 use kornia_imgproc::color::gray_from_rgb_u8;
 use kornia_io::jpeg::{decode_image_jpeg_layout, decode_image_jpeg_mono8, decode_image_jpeg_rgb8};
 use mcap::McapError;
@@ -27,8 +27,8 @@ use kornia_slam::SensorSelection;
 use serde::Deserialize;
 
 use super::{
-    FrameItem, FrameSource, OpenedSource, SourceError, no_imu, rectify_pair, resolve,
-    stereo_needs_calib,
+    FrameItem, FrameSource, OpenedSource, PairRectifier, Rectification, SourceError, no_imu,
+    resolve, stereo_needs_calib,
 };
 use crate::datasets::StereoCalib;
 
@@ -72,7 +72,11 @@ impl McapConfig {
         }
     }
 
-    pub(super) fn open(&self, stereo: bool) -> Result<OpenedSource, SourceError> {
+    pub(super) fn open(
+        &self,
+        stereo: bool,
+        rectification: Rectification,
+    ) -> Result<OpenedSource, SourceError> {
         let source = match (&self.calib, stereo) {
             (Some(calib), true) => McapSource::open_stereo(
                 &self.path,
@@ -81,6 +85,7 @@ impl McapConfig {
                 calib,
                 self.start_frame,
                 self.max_frames,
+                rectification,
             )?,
             _ => McapSource::open(&self.path, &self.channel, self.start_frame, self.max_frames)?,
         };
@@ -112,6 +117,7 @@ pub struct McapSource {
     n_total: usize,
     cursor: usize,
     camera: PinholeCamera,
+    size: ImageSize,
     stereo_baseline_m: Option<f64>,
 }
 
@@ -170,6 +176,10 @@ impl McapSource {
             n_total,
             cursor: 0,
             camera,
+            size: ImageSize {
+                width: w,
+                height: h,
+            },
             stereo_baseline_m: None,
         })
     }
@@ -185,10 +195,14 @@ impl McapSource {
         calib_path: &Path,
         start_frame: usize,
         max_frames: usize,
+        rectification: Rectification,
     ) -> Result<Self, SourceError> {
         let bytes = fs::read(path).map_err(SourceError::Io)?;
         let calib = StereoCalib::load(calib_path).map_err(SourceError::other)?;
-        let rectifier = calib.rectifier().map_err(SourceError::other)?;
+        let rectifier = PairRectifier::new(
+            calib.rectifier().map_err(SourceError::other)?,
+            rectification,
+        )?;
         let rect_cam = rectifier.rectified_camera();
 
         let left = read_channel(&bytes, left_suffix)?;
@@ -215,7 +229,7 @@ impl McapSource {
         let prepared: Vec<PreparedFrame> = sel
             .into_iter()
             .map(|(t, limg, rimg)| {
-                let (image, right_image) = rectify_pair(&rectifier, &limg, &rimg)?;
+                let (image, right_image) = rectifier.rectify(&limg, &rimg)?;
                 Ok(PreparedFrame {
                     timestamp_sec: t - t0,
                     image,
@@ -238,6 +252,10 @@ impl McapSource {
             n_total,
             cursor: 0,
             camera: rect_cam,
+            size: ImageSize {
+                width: w,
+                height: h,
+            },
             stereo_baseline_m: Some(rectifier.baseline()),
         })
     }
@@ -245,10 +263,11 @@ impl McapSource {
 
 impl FrameSource for McapSource {
     fn rig(&self) -> SensorRig {
-        let rig = SensorRig::new(self.camera.clone());
         match self.stereo_baseline_m {
-            Some(baseline_m) => rig.with_stereo_baseline(baseline_m),
-            None => rig,
+            Some(baseline_m) => {
+                SensorRig::rectified_stereo(self.camera.clone(), self.size, baseline_m)
+            }
+            None => SensorRig::mono(self.camera.clone(), self.size),
         }
     }
 

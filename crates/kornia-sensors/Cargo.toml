@@ -22,5 +22,5 @@ thiserror = "1"
 ron = "0.12"
 
 [features]
-# Serialization of the wheel kinematics and noise parameters.
+# Serialization of the wheel kinematics and noise parameters, and rig calibration files.
 serde = ["dep:serde"]

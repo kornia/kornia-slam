@@ -12,11 +12,14 @@
 
 use std::path::{Path, PathBuf};
 
-use kornia_slam::SystemConfig;
+use kornia_image::ImageSize;
+use kornia_sensors::rig_calibration::{RigCalibration, RigCalibrationError};
+use kornia_sensors::{ImuCalibration, SensorRig};
 use kornia_slam::system::ConfigError;
+use kornia_slam::{CameraSelection, SystemConfig};
 use serde::Deserialize;
 
-use crate::source::SourceConfig;
+use crate::source::{Rectification, SourceConfig};
 
 /// One run: where the data comes from and how it is processed.
 #[derive(Debug, Clone, Deserialize)]
@@ -26,6 +29,14 @@ pub struct RunConfig {
     /// Omitted, the default monocular pipeline runs.
     #[serde(default)]
     pub system: SystemConfig,
+    /// A rig calibration file (RON) whose cameras, and IMU extrinsic and
+    /// noise, replace the source's; relative to the run file. Omitted, the
+    /// source's own calibration is used.
+    #[serde(default)]
+    pub rig_calibration: Option<PathBuf>,
+    /// How a raw stereo pair is rectified.
+    #[serde(default)]
+    pub rectification: Rectification,
 }
 
 /// A run file that cannot be read or does not describe a valid run.
@@ -45,6 +56,42 @@ pub enum RunConfigError {
     System { path: PathBuf, source: ConfigError },
     #[error("{}: source: {message}", path.display())]
     Source { path: PathBuf, message: String },
+}
+
+/// A rig calibration file that cannot replace the source's calibration.
+#[derive(Debug, thiserror::Error)]
+pub enum RigCalibrationFileError {
+    #[error("{}: {source}", path.display())]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("{}: {source}", path.display())]
+    Parse {
+        path: PathBuf,
+        source: Box<ron::error::SpannedError>,
+    },
+    #[error("{}: {in_file} cameras, the source yields {in_source} images per frame", path.display())]
+    CameraCount {
+        path: PathBuf,
+        in_file: usize,
+        in_source: usize,
+    },
+    #[error(
+        "{}: camera {camera} is {}x{}, the source's images are {}x{}",
+        path.display(), in_file.width, in_file.height, in_source.width, in_source.height
+    )]
+    ImageSize {
+        path: PathBuf,
+        camera: usize,
+        in_file: ImageSize,
+        in_source: ImageSize,
+    },
+    #[error("{}: {source}", path.display())]
+    Invalid {
+        path: PathBuf,
+        source: RigCalibrationError,
+    },
 }
 
 /// Reads only the system version, so a system written for another schema
@@ -106,6 +153,71 @@ impl RunConfig {
     fn resolve_paths(&mut self, base_dir: &Path) {
         self.source.resolve_paths(base_dir);
         self.system.resolve_paths(base_dir);
+        if let Some(path) = &mut self.rig_calibration
+            && path.is_relative()
+        {
+            *path = base_dir.join(&*path);
+        }
+    }
+
+    /// `rig` with the run's rig calibration file applied; `rig` unchanged
+    /// without one. The file's cameras replace the source's; they must be as
+    /// many as the images the source yields per frame under the selection, and
+    /// of the same image sizes.
+    /// Its `camera_to_body` and IMU noise apply only when `rig` has an IMU.
+    pub fn apply_rig_calibration(
+        &self,
+        rig: SensorRig,
+    ) -> Result<SensorRig, RigCalibrationFileError> {
+        let Some(path) = &self.rig_calibration else {
+            return Ok(rig);
+        };
+        let text =
+            std::fs::read_to_string(path).map_err(|source| RigCalibrationFileError::Read {
+                path: path.clone(),
+                source,
+            })?;
+        let calibration: RigCalibration = ron::Options::default()
+            .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME)
+            .from_str(&text)
+            .map_err(|error| RigCalibrationFileError::Parse {
+                path: path.clone(),
+                source: Box::new(error),
+            })?;
+        let in_source = match self.system.sensors.cameras {
+            CameraSelection::Mono => 1,
+            CameraSelection::Stereo => 2,
+        };
+        if calibration.cameras.len() != in_source {
+            return Err(RigCalibrationFileError::CameraCount {
+                path: path.clone(),
+                in_file: calibration.cameras.len(),
+                in_source,
+            });
+        }
+        let mut calibrated =
+            calibration
+                .to_sensor_rig()
+                .map_err(|source| RigCalibrationFileError::Invalid {
+                    path: path.clone(),
+                    source,
+                })?;
+        // Intrinsics of another resolution would be applied to these images unnoticed.
+        let mut sizes = calibrated.cameras().iter().zip(rig.cameras()).enumerate();
+        if let Some((camera, (file, source))) = sizes.find(|(_, (f, s))| f.size != s.size) {
+            return Err(RigCalibrationFileError::ImageSize {
+                path: path.clone(),
+                camera,
+                in_file: file.size,
+                in_source: source.size,
+            });
+        }
+        calibrated.imu = rig.imu.map(|imu| ImuCalibration {
+            camera_to_body: calibrated.camera_to_body().unwrap_or(imu.camera_to_body),
+            noise: calibration.imu_noise.unwrap_or(imu.noise),
+        });
+        calibrated.wheels = rig.wheels;
+        Ok(calibrated)
     }
 }
 

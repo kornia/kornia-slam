@@ -123,7 +123,7 @@ pub fn solve_pnp_with_diagnostics(
     // translation in the tens), the unnormalized solve goes singular
     // ("LU solve failed") on perfectly well-posed problems. With
     // `center = -R^T t` the normalized prior translation is exactly zero.
-    let center = pose_init.inverse().translation;
+    let center = pose_init.camera_centre();
     let mut depths: Vec<f64> = prior_inlier_indices
         .iter()
         .map(|&i| pose_init.transform_point(&points_world_f64[i]).z)
