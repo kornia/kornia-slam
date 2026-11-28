@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_image::ImageSize;
-use kornia_sensors::SensorRig;
+use kornia_sensors::{RigCamera, SensorRig};
 
 use super::*;
 use crate::mapping::LocalMappingMode;
@@ -524,6 +524,40 @@ mod runtime_settings {
             sensors(CameraSelection::Rig, false).select_rig(rig()),
             Err(ConfigError::MissingSensor(_))
         ));
+    }
+
+    /// Flow-only tracking and the predicted search need flow pixels in the
+    /// frame's pinhole: a raw fisheye primary keeps both off.
+    #[test]
+    fn a_fisheye_primary_runs_orb_on_every_frame() {
+        let mut config = SystemConfig {
+            sensors: sensors(CameraSelection::Mono, false),
+            ..SystemConfig::default()
+        };
+        orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
+            klt_first: KltFirst::Enabled { min_tracks: 30 },
+            klt_prediction: KltPrediction::Enabled {
+                max_level: 1,
+                max_iter: 10,
+            },
+            ..OrbFrontendConfig::default()
+        });
+        let size = ImageSize {
+            width: 640,
+            height: 480,
+        };
+        let pinhole = SensorRig::from_cameras(vec![RigCamera::primary(camera(), size)]).unwrap();
+        let settings = config.settings(&pinhole);
+        assert_eq!(settings.klt_min_tracks, Some(30));
+        assert_eq!(settings.klt_prediction, Some((1, 10)));
+        let fisheye = SensorRig::from_cameras(vec![RigCamera::primary(
+            crate::rig::tests::aria_lens(),
+            size,
+        )])
+        .unwrap();
+        let settings = config.settings(&fisheye);
+        assert_eq!(settings.klt_min_tracks, None);
+        assert_eq!(settings.klt_prediction, None);
     }
 }
 

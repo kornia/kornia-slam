@@ -141,7 +141,8 @@ impl Default for OrbFrontendConfig {
 /// Optical-flow-first tracking: a frame is tracked from its flow survivors
 /// alone, without ORB, unless a keyframe is due, the flow-only pose is
 /// refused, or fewer than `min_tracks` survivors carry a map point.
-/// Multi-camera rigs extract ORB on every frame regardless.
+/// Multi-camera rigs and raw fisheye primaries extract ORB on every frame
+/// regardless.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum KltFirst {
