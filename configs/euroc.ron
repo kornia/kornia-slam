@@ -35,7 +35,9 @@
             // makes runs replay identically; Asynchronous uses a background worker.
             mapping: ( execution: Asynchronous ),
             // Disabled | Enabled(vocabulary: "…"): detection with pose-graph
-            // correction; needs stereo or IMU input.
+            // correction; needs stereo or IMU input. Optional fields:
+            // graph: (information: ScalarWeights | Drift(…)) and
+            // execution: Synchronous | AsynchronousReplay(frames: N) | Asynchronous | FollowMapping.
             loop_closing: Disabled,
         )),
     ),

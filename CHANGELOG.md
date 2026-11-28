@@ -10,6 +10,52 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**Loop closing solves through a pose graph and can run in the background.**
+Accepted loops are solved on a pose graph of the map's keyframes, built at each
+solve. With the default `graph: (information: ScalarWeights)` the solve is
+bit-identical to `optimize_pose_graph`'s; `Drift(odometry, loop_sigma_m,
+loop_sigma_rad, loop_cauchy_scale)` makes odometry edges a random walk in path
+and puts loop edges under a Cauchy kernel. `Drift` has no defaults: every field
+is written out, and the sigmas are range-checked. `execution` picks where the
+solve runs: `Synchronous` (default) as before; `Asynchronous` on a
+`slam-loop-closing` thread, written back at a frame boundary; and
+`AsynchronousReplay(frames: N)`, solved inline and written back `N` frames
+later through the background path, so background runs replay identically;
+`FollowMapping` follows the local-mapping execution. The background modes are
+opt-in: they differ from `Synchronous` in that the camera follows the
+correction most of its local landmarks take, fusion is planned on a copy of the
+loop neighbourhoods and re-checked at writeback, and keyframes created during
+the solve are not fused. `SlamSystem::finish()` writes back a solve still in
+flight at the end of a run; the CLI calls it after the last frame.
+`LoopClosingConfig` gains an odometry consistency gate (`odometry_gate`) and a
+temporal consistency rule (`temporal_consistency`), both `Disabled` by default
+and set from Rust only; `LoopOdometryGate::sim_fitted()` is fitted on one
+simulated run. With debug on, `[loop-reject]`, `[loop-time]` and, for the
+background modes, `[loop-apply]` lines report each rejected candidate and
+where a loop's time went. `Map::apply_graph_correction` writes a solve made
+from an earlier snapshot, and `Map::merge_map_points_by_records` merges two
+landmarks at a cost independent of the map's size.
+
+Behaviour changes on the default path:
+- A solve that is not usable now reports `PgoFailed` with the reason before
+  `Accepted { applied: false }`; before, it was a silent `applied: false`.
+- A solve stopped at the iteration cap is written back when its cost and the
+  new loop's residual both fell: the f32 solve reaches its optimum, then trades
+  noise near its stop rule until the cap. Solves that converge are unchanged.
+- After a map reset or a keyframe removal, loops whose keyframes left the map
+  are dropped before the next solve; before, every later solve failed with
+  `MissingLoopKeyframe`.
+
+Breaking: `LoopClosingMode::Enabled` gains the `graph` and `execution` fields
+(both optional in RON), and `LoopClosingMode` is no longer `Eq`. The
+replayed background execution is `AsynchronousReplay`; the name `Deferred`
+used on development branches is refused.
+`PoseGraphCorrectionError::ObsoleteWorldFrame` and `BuildError::LoopWorker` are
+new variants. `LoopClosingConfig` gains `odometry_gate`, `temporal_consistency`
+and `graph`. The configuration header prints the pose-graph information and a
+non-default execution on the loop-closing line. None of this has been
+evaluated on datasets in this change.
+
 **Optical-flow-first tracking, off by default.** Three new `frontend: Orb(..)`
 knobs; each default reproduces the previous behaviour, and the configuration
 header prints a line only for a knob away from its default:
