@@ -2,10 +2,9 @@ use kornia_imgproc::features::OrbMatchConfig;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    CameraSelection, FlowPose, ForwardBackward, FrontendConfig, KltRetry, KltRig,
-    LoopClosingMode, MAX_FLOW_THREADS, OrbFrontendConfig, OrbSlamPipeline, OrbTuning,
-    PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth, SystemConfig,
-    TrackRefill,
+    CameraSelection, FlowPose, ForwardBackward, FrontendConfig, KltRetry, KltRig, LoopClosingMode,
+    MAX_FLOW_THREADS, OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition,
+    SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth, SystemConfig, TrackRefill,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopClosingConfig;
@@ -145,7 +144,10 @@ impl OrbFrontendConfig {
 }
 
 /// The optical-flow knobs: ranges, and the knobs each one needs.
-fn validate_flow(frontend: &OrbFrontendConfig, sensors: &SensorSelection) -> Result<(), ConfigError> {
+fn validate_flow(
+    frontend: &OrbFrontendConfig,
+    sensors: &SensorSelection,
+) -> Result<(), ConfigError> {
     let at = |field| format!("frontend.{field}");
     let needs = |knob: &'static str, needs: &'static str| -> Result<(), ConfigError> {
         Err(ConfigError::FrontendKnobNeeds { knob, needs })
@@ -176,7 +178,11 @@ fn validate_flow(frontend: &OrbFrontendConfig, sensors: &SensorSelection) -> Res
             max_round_trip_px.into(),
             POSITIVE,
         )?;
-        check(at("forward_backward.max_iter"), max_iter as f64, AT_LEAST_ONE)?;
+        check(
+            at("forward_backward.max_iter"),
+            max_iter as f64,
+            AT_LEAST_ONE,
+        )?;
         check(
             at("forward_backward.every_n_frames"),
             every_n_frames as f64,
@@ -190,7 +196,11 @@ fn validate_flow(frontend: &OrbFrontendConfig, sensors: &SensorSelection) -> Res
         ..
     } = frontend.track_refill
     {
-        check(at("track_refill.per_camera"), per_camera as f64, AT_LEAST_ONE)?;
+        check(
+            at("track_refill.per_camera"),
+            per_camera as f64,
+            AT_LEAST_ONE,
+        )?;
         check(
             at("track_refill.min_spacing_px"),
             min_spacing_px.into(),

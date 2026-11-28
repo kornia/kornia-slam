@@ -170,7 +170,10 @@ fn the_window_only_flow_knobs_default_off() {
     for (knob, default) in [
         (KltRig::default() == KltRig::PrimaryOnly, "klt_rig"),
         (KltRetry::default() == KltRetry::Off, "klt_retry"),
-        (ForwardBackward::default() == ForwardBackward::Off, "forward_backward"),
+        (
+            ForwardBackward::default() == ForwardBackward::Off,
+            "forward_backward",
+        ),
         (TrackRefill::default() == TrackRefill::Off, "track_refill"),
         (GyroGuess::default() == GyroGuess::Off, "gyro_guess"),
         (FlowPose::default() == FlowPose::RansacPnp, "flow_pose"),

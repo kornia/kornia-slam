@@ -747,7 +747,11 @@ mod windowed_flow {
         *system.map.lock().unwrap() = map_with_keyframe_at(shifted);
         let moved: Vec<Option<Vec3F64>> =
             system.with_map_points(|mps| mps.iter().map(|mp| Some(mp.position)).collect());
-        assert_ne!(positions(&system), moved, "the tracks hold the old positions");
+        assert_ne!(
+            positions(&system),
+            moved,
+            "the tracks hold the old positions"
+        );
         let frame = frame_seeing_points(4, Pose3d::IDENTITY, &[]);
         assert!(system.insert_keyframe(&frame, 0.2, &[]));
         // Mapping ran too, so the landmarks are where the map now holds them.

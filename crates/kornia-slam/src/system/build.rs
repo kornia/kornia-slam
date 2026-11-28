@@ -140,13 +140,10 @@ impl SystemConfig {
             multi_camera,
             stereo_close_depth_m: close_depth_baseline_m
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
-            klt_min_tracks: frontend
-                .klt_first
-                .min_tracks()
-                .filter(|_| {
-                    (!multi_camera || frontend.klt_rig == KltRig::AllCameras)
-                        && !rig.primary().is_fisheye()
-                }),
+            klt_min_tracks: frontend.klt_first.min_tracks().filter(|_| {
+                (!multi_camera || frontend.klt_rig == KltRig::AllCameras)
+                    && !rig.primary().is_fisheye()
+            }),
             klt_kernel: frontend.klt_kernel,
             klt_prediction: frontend
                 .klt_prediction
