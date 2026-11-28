@@ -778,6 +778,74 @@ mod runtime_settings {
         assert_eq!(settings.stereo_close_depth_m, None);
     }
 
+    fn raw_fisheye_rig() -> SensorRig {
+        let fisheye = kornia_3d::camera::Fisheye624Camera {
+            f: 240.0,
+            cx: 320.0,
+            cy: 240.0,
+            k: [-0.025, 0.096, -0.063, 0.0062, 0.0035, -0.00073],
+            p: [0.0009, 0.00036],
+            s: [-0.0014, -0.0001, -0.00046, -0.0001],
+        };
+        SensorRig::from_cameras(vec![
+            kornia_sensors::RigCamera::primary(fisheye, SIZE),
+            kornia_sensors::RigCamera::new(
+                fisheye,
+                SIZE,
+                Pose3d::new(
+                    kornia_algebra::Mat3F64::IDENTITY,
+                    kornia_algebra::Vec3F64::new(0.1, 0.0, 0.0),
+                ),
+            ),
+        ])
+        .unwrap()
+    }
+
+    /// The flow tracker reads raw pixels as pinhole pixels only when it
+    /// flows the rig cameras; with the primary alone `klt_first` stays inert
+    /// on a raw primary, so nothing needs refusing.
+    #[test]
+    fn klt_first_on_a_raw_rig_is_refused_only_with_rig_flow() {
+        let rig_config = |klt_first, klt_rig| {
+            let mut config = SystemConfig {
+                sensors: sensors(CameraSelection::Rig, false),
+                ..SystemConfig::default()
+            };
+            orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
+                klt_first,
+                klt_rig,
+                ..OrbFrontendConfig::default()
+            });
+            config
+        };
+        let enabled = KltFirst::Enabled { min_tracks: 80 };
+        let selected = sensors(CameraSelection::Rig, false)
+            .select_rig(raw_fisheye_rig())
+            .unwrap();
+        assert!(
+            crate::SlamSystem::build(
+                rig_config(KltFirst::Disabled, KltRig::PrimaryOnly),
+                raw_fisheye_rig()
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            rig_config(enabled, KltRig::PrimaryOnly).validate_raw_fisheye(&selected),
+            Ok(())
+        );
+        assert_eq!(
+            rig_config(enabled, KltRig::AllCameras).validate_raw_fisheye(&selected),
+            Err(ConfigError::FrontendKnobNeeds {
+                knob: "klt_first",
+                needs: "pinhole rig images",
+            })
+        );
+        assert_eq!(
+            rig_config(enabled, KltRig::AllCameras).validate_raw_fisheye(&rig()),
+            Ok(())
+        );
+    }
+
     #[test]
     fn a_rig_may_hold_raw_fisheye_cameras() {
         let fisheye = kornia_3d::camera::Fisheye624Camera {

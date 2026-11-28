@@ -167,12 +167,14 @@ impl SystemConfig {
         frontend.validate_flow_threads(cameras)
     }
 
-    /// Rejects `frontend.klt_first` on raw fisheye rig cameras: the flow
-    /// tracker reads raw pixels as pinhole pixels.
+    /// Rejects `frontend.klt_first` with `klt_rig: AllCameras` on raw
+    /// fisheye rig cameras: flowing them reads raw pixels as pinhole pixels.
+    /// On the primary alone `klt_first` stays inert on a raw primary.
     pub(crate) fn validate_raw_fisheye(&self, rig: &SensorRig) -> Result<(), ConfigError> {
         let FrontendConfig::Orb(frontend) = self.orb().frontend;
         let raw = rig.cameras().iter().any(|camera| camera.is_fisheye());
-        if raw && frontend.klt_first.min_tracks().is_some() {
+        let flowed = frontend.klt_rig == KltRig::AllCameras;
+        if raw && flowed && frontend.klt_first.min_tracks().is_some() {
             return Err(ConfigError::FrontendKnobNeeds {
                 knob: "klt_first",
                 needs: "pinhole rig images",
