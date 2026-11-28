@@ -444,11 +444,15 @@ fn validate_drift_information(
         odometry.rotation_rad2_per_m,
         NON_NEGATIVE,
     )?;
-    check(at("odometry.floor_m"), odometry.floor_m, POSITIVE)?;
-    check(at("odometry.floor_rad"), odometry.floor_rad, POSITIVE)?;
-    check(at("loop_sigma_m"), loop_sigma_m, POSITIVE)?;
-    check(at("loop_sigma_rad"), loop_sigma_rad, POSITIVE)?;
-    check(at("loop_cauchy_scale"), loop_cauchy_scale, POSITIVE)
+    check(at("odometry.floor_m"), odometry.floor_m, SOLVER_POSITIVE)?;
+    check(
+        at("odometry.floor_rad"),
+        odometry.floor_rad,
+        SOLVER_POSITIVE,
+    )?;
+    check(at("loop_sigma_m"), loop_sigma_m, SOLVER_POSITIVE)?;
+    check(at("loop_sigma_rad"), loop_sigma_rad, SOLVER_POSITIVE)?;
+    check(at("loop_cauchy_scale"), loop_cauchy_scale, SOLVER_POSITIVE)
 }
 
 fn validate_correction(config: &LoopClosingConfig) -> Result<(), ConfigError> {
@@ -589,6 +593,14 @@ fn validate_correction(config: &LoopClosingConfig) -> Result<(), ConfigError> {
 struct Requirement(&'static str, fn(f64) -> bool);
 
 const POSITIVE: Requirement = Requirement("finite and > 0", |v| v > 0.0);
+/// The pose-graph solver narrows sigmas and scales, and their reciprocals, to `f32`.
+const SOLVER_POSITIVE: Requirement = Requirement(
+    "finite and > 0, with a finite non-zero f32 value and reciprocal",
+    |v| {
+        let (value, reciprocal) = (v as f32, (1.0 / v) as f32);
+        value > 0.0 && value.is_finite() && reciprocal > 0.0 && reciprocal.is_finite()
+    },
+);
 const NON_NEGATIVE: Requirement = Requirement("finite and >= 0", |v| v >= 0.0);
 const AT_LEAST_ONE: Requirement = Requirement("finite and >= 1", |v| v >= 1.0);
 const UNIT_INTERVAL: Requirement = Requirement("in [0, 1]", |v| (0.0..=1.0).contains(&v));

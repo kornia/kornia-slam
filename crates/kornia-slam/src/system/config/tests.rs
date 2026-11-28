@@ -771,6 +771,16 @@ fn loop_graph_information_is_range_checked() {
     assert_eq!(drift(|_, values| values[0] = 0.0), at("loop_sigma_m"));
     assert_eq!(drift(|_, values| values[1] = -1.0), at("loop_sigma_rad"));
     assert_eq!(drift(|_, values| values[2] = 0.0), at("loop_cauchy_scale"));
+    // Positive in f64, but zero or infinite where the solver reads them as f32.
+    assert_eq!(
+        drift(|_, values| values[2] = 1e-50),
+        at("loop_cauchy_scale")
+    );
+    assert_eq!(drift(|_, values| values[0] = 1e-40), at("loop_sigma_m"));
+    assert_eq!(
+        drift(|walk, _| walk.floor_rad = 1e50),
+        at("odometry.floor_rad")
+    );
 }
 
 /// Loop closing solves inline unless a configuration asks for the worker, whatever the mapping
