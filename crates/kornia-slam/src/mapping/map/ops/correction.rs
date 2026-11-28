@@ -270,7 +270,7 @@ impl<D: Descriptor> Map<D> {
         {
             return Err(PoseGraphCorrectionError::LengthMismatch);
         }
-        if !solved.iter().all(finite_pose) {
+        if !snapshot.iter().chain(solved).all(finite_pose) {
             return Err(PoseGraphCorrectionError::NonFinitePose);
         }
         let corrections: Vec<Pose3d> = snapshot

@@ -202,13 +202,14 @@ fn the_world_epoch_guards_both_directions() {
 fn removed_keyframes_and_culled_landmarks_are_skipped() {
     let mut map = three_keyframe_map();
     let (ids, before, after) = snapshot_and_solve(&map);
+    let epoch = map.world_epoch;
     map.remove_keyframe(2).unwrap();
     let culled = map.keyframes()[0].map_point(0).unwrap();
     map.remove_landmark(culled).unwrap();
     let culled_position = map.map_points()[culled].position;
 
     let result = map
-        .apply_graph_correction(map.world_epoch, &ids, &before, &after)
+        .apply_graph_correction(epoch, &ids, &before, &after)
         .unwrap();
 
     assert_eq!(
@@ -225,4 +226,21 @@ fn removed_keyframes_and_culled_landmarks_are_skipped() {
     );
     assert_eq!(map.map_points()[culled].position, culled_position);
     assert_map_consistent(&map);
+}
+
+/// A non-finite snapshot pose is refused without a write, even for a keyframe the map dropped.
+#[test]
+fn a_non_finite_snapshot_is_refused() {
+    let mut map = three_keyframe_map();
+    let (ids, mut before, after) = snapshot_and_solve(&map);
+    map.remove_keyframe(1).unwrap();
+    before[1].translation.x = f64::NAN;
+    let untouched = map.state_fingerprint_for_test();
+
+    let error = map
+        .apply_graph_correction(map.world_epoch, &ids, &before, &after)
+        .unwrap_err();
+
+    assert!(matches!(error, PoseGraphCorrectionError::NonFinitePose));
+    assert_eq!(map.state_fingerprint_for_test(), untouched);
 }
