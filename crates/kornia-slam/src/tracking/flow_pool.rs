@@ -6,6 +6,7 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::system::MAX_KLT_WINDOW;
 use crate::tracking::flow_tracker::{FlowShard, ShardGuess};
 use crate::tracking::timings::{MAX_FLOW_SHARDS, ShardTimings, TrackingTimings};
 use kornia_imgproc::optical_flow_pyr_lk::{LkFrame, LkWindowError};
@@ -27,6 +28,10 @@ pub enum FlowPoolError {
     FrameShared,
     #[error("flow frame: {0}")]
     Frame(#[from] LkWindowError),
+    #[error("LK window {0} is above {MAX_KLT_WINDOW}")]
+    Window(usize),
+    #[error("{images} images for {cameras} flow cameras")]
+    MissingImages { cameras: usize, images: usize },
 }
 
 /// How long the join spins on a worker before it parks: a shard takes about
@@ -76,7 +81,8 @@ pub(crate) struct FlowPool {
 impl FlowPool {
     /// `threads - 1` named workers `klt-flow-<n>`; `threads == 1` spawns nothing.
     pub(crate) fn new(threads: usize) -> Result<Self, FlowPoolError> {
-        let threads = threads.max(1);
+        // Validation bounds the config's; `RigFlow::new` is public.
+        let threads = threads.clamp(1, MAX_FLOW_SHARDS);
         let mut workers = Vec::with_capacity(threads - 1);
         for n in 1..threads {
             workers.push(FlowWorker::spawn(n)?);

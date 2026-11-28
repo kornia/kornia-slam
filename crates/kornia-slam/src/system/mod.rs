@@ -16,9 +16,9 @@ mod validation;
 pub use build::BuildError;
 pub use config::{
     CameraSelection, FlowPose, ForwardBackward, FrontendConfig, GyroGuess, KltFirst, KltPrediction,
-    KltRetry, KltRig, LoopClosingExecution, LoopClosingMode, MAX_FLOW_THREADS, MappingConfig,
-    OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION,
-    SensorSelection, StereoCloseDepth, SystemConfig, TrackRefill,
+    KltRetry, KltRig, LoopClosingExecution, LoopClosingMode, MAX_FLOW_THREADS, MAX_KLT_WINDOW,
+    MappingConfig, OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition,
+    SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth, SystemConfig, TrackRefill,
 };
 #[cfg(feature = "serde")]
 pub use file::LoadError;
@@ -311,7 +311,9 @@ impl SlamSystem {
     ///
     /// Invalid input, a stereo rig (use [`Self::process_stereo`]) or a
     /// feature-extraction failure; the system state, including image history,
-    /// is then unchanged. IMU samples already buffered are kept.
+    /// is then unchanged, except that `klt_kernel: WindowedU8` keeps the
+    /// failed image as its previous flow frame and so drops its tracks on the
+    /// next call. IMU samples already buffered are kept.
     pub fn process_image(
         &mut self,
         timestamp_sec: f64,
@@ -429,7 +431,8 @@ impl SlamSystem {
     }
 
     /// Takes a prepared or deferred frame as the next one and tracks it. On
-    /// an error, from a deferred extraction, the system is left as it was.
+    /// an error, from a deferred extraction, the system is left as it was,
+    /// but for `WindowedU8`'s flow frames, which already hold this capture.
     fn track_frame(
         &mut self,
         source: FrameSource<'_>,
@@ -518,7 +521,8 @@ impl SlamSystem {
     }
 
     /// Per-stage times of the latest successfully processed frame's
-    /// tracking; zero for stages it did not run (all of them in bootstrap).
+    /// tracking; zero for stages it did not run (in bootstrap all but
+    /// `WindowedU8`'s `flow_prepare`).
     pub fn tracking_timings(&self) -> &TrackingTimings {
         &self.tracking_timings
     }
@@ -768,8 +772,15 @@ impl SlamSystem {
                 })
                 .collect()
         };
+        // The index alone is not enough: a failed prepare leaves a fresh
+        // pair of the next capture, where the keyframe's pixels do not hold.
+        let at_keyframe = previous_idx == Some(kf_idx)
+            && self.rig_flow.as_ref().is_none_or(|flow| {
+                flow.previous_frame(0)
+                    .is_some_and(|previous| previous.frame_id() == kf_idx as u64)
+            });
         for (pixel, camera, mp_idx, position) in landmarks {
-            let pixel = if previous_idx == Some(kf_idx) {
+            let pixel = if at_keyframe {
                 Some(pixel)
             } else {
                 self.carry_landmark(kf_idx, camera, pixel, &pose, &position)
@@ -1823,10 +1834,12 @@ impl SlamSystem {
             pose_world_to_primary: predicted.then_some(*candidate_pose),
             primary_rotation: self.gyro_rotation,
         };
+        // Without tracks no step runs, and the output is the last frame's.
+        let stepped = !self.tracker.tracks().is_empty();
         let survivors = self
             .tracker
             .flow_windowed(rig_flow, &input, &mut self.tracking_timings);
-        if self.debug {
+        if self.debug && stepped {
             let output = rig_flow.output();
             let counts = output.counts;
             for (shard, tracks) in output

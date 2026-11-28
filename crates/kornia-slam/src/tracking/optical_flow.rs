@@ -46,9 +46,9 @@ pub struct Track {
     /// shards predict without the map lock; `None` once the point is culled.
     position: Option<Vec3F64>,
     /// Rig camera the track lives in; 0 outside a rig.
-    camera: u8,
+    camera: usize,
     /// Flow shard fixed at spawn.
-    shard: u8,
+    shard: usize,
 }
 
 impl Track {
@@ -93,12 +93,12 @@ impl Track {
 
     /// Rig camera the track lives in.
     pub fn camera(&self) -> usize {
-        usize::from(self.camera)
+        self.camera
     }
 
     /// Flow shard the track runs on.
     pub fn shard(&self) -> usize {
-        usize::from(self.shard)
+        self.shard
     }
 }
 
@@ -218,8 +218,8 @@ impl TrackSet {
             map_point_idx: None,
             age: 1,
             position: None,
-            camera: camera as u8,
-            shard: shard as u8,
+            camera,
+            shard,
         });
         id
     }
@@ -504,8 +504,8 @@ impl TrackSet {
                     map_point_idx: Some(matched.map_point_idx),
                     age: 1,
                     position: None,
-                    camera: camera as u8,
-                    shard: self.layout.assign(camera) as u8,
+                    camera,
+                    shard: self.layout.assign(camera),
                 }
             };
             tracks.push(track);
@@ -1192,6 +1192,21 @@ mod tests {
         windowed.spawn([1.0, 1.0]);
         windowed.clear();
         assert_eq!(windowed.spawn([1.0, 1.0]).as_u64(), 1);
+    }
+
+    /// Camera and shard indices are kept whole, so a track never reads
+    /// another camera's image.
+    #[test]
+    fn camera_and_shard_indices_do_not_wrap() {
+        let mut tracks = TrackSet::with_flow_threads(1, 257);
+        tracks.spawn_on([1.0, 1.0], 256);
+        tracks.spawn_in([1.0, 1.0], 300, 256);
+        let ids: Vec<_> = tracks
+            .tracks()
+            .iter()
+            .map(|t| (t.camera(), t.shard()))
+            .collect();
+        assert_eq!(ids, [(256, 0), (300, 256)]);
     }
 
     /// A map point now seen by another rig camera starts a new track there.

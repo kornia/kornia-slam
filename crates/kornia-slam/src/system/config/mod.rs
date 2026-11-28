@@ -140,6 +140,11 @@ pub struct OrbFrontendConfig {
 /// Most flow threads a frontend runs, the tracking thread included.
 pub const MAX_FLOW_THREADS: usize = 4;
 
+/// Largest LK window side: three times OpenCV's and VINS-Fusion's 21. The
+/// fixed-point pyramid pads every level by the window, so an unbounded one
+/// allocates without bound.
+pub const MAX_KLT_WINDOW: usize = 63;
+
 /// Which rig cameras optical flow tracks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -147,7 +152,8 @@ pub enum KltRig {
     /// The primary camera; a multi-camera rig extracts ORB on every frame.
     #[default]
     PrimaryOnly,
-    /// Every rig camera, so a flow-only rig frame keeps each camera's rays.
+    /// Every rig camera, so a flow-only rig frame keeps each camera's rays;
+    /// needs `sensors.cameras: Rig`.
     AllCameras,
 }
 
@@ -185,7 +191,8 @@ pub enum TrackRefill {
     #[default]
     Off,
     /// Refill to `per_camera` tracks when fewer than `refill_below` of them
-    /// are left, `min_spacing_px` apart and `border_px` from the edge.
+    /// are left, `min_spacing_px` apart and `border_px` from the edge. It
+    /// runs inside a flow step, so a rig with no track left waits for ORB.
     Enabled {
         per_camera: usize,
         min_spacing_px: f32,
@@ -201,7 +208,9 @@ pub enum GyroGuess {
     /// The previous pixel.
     #[default]
     Off,
-    /// The previous ray rotated by the preintegrated gyro rotation.
+    /// The previous ray rotated by the preintegrated gyro rotation. The
+    /// full-pyramid kernels read it on the trusted predicted search only, so
+    /// they need `klt_prediction`.
     RotatedRay,
 }
 

@@ -18,7 +18,7 @@ use kornia_imgproc::optical_flow_pyr_lk::{
 
 use crate::Frame;
 use crate::mapping::Map;
-use crate::system::{ForwardBackward, GyroGuess, KltRetry, TrackRefill};
+use crate::system::{ForwardBackward, GyroGuess, KltRetry, MAX_KLT_WINDOW, TrackRefill};
 use crate::tracking::flow_pool::{FlowFrames, FlowPool, FlowPoolError};
 use crate::tracking::optical_flow::{
     FlowSurvivor, KltTracker, SurvivorFilterConfig, Track, TrackId, TrackSet,
@@ -39,10 +39,12 @@ impl ShardLayout {
     /// Shards for `threads` flow threads on `cameras` cameras; validation
     /// allows 1, `cameras` or `cameras + 1` threads.
     pub(crate) fn new(threads: usize, cameras: usize) -> Self {
+        // Public inputs; the `cameras + 1` split needs `cameras` below the
+        // thread bound, so neither sizes an allocation past it.
         Self {
-            threads,
-            cameras,
-            spawned: vec![0; cameras],
+            threads: threads.clamp(1, MAX_FLOW_SHARDS),
+            cameras: cameras.min(MAX_FLOW_SHARDS),
+            spawned: vec![0; cameras.min(MAX_FLOW_SHARDS)],
         }
     }
 
@@ -57,10 +59,14 @@ impl ShardLayout {
         if self.shards() == 1 {
             return 0;
         }
-        let shard = if self.threads == self.cameras + 1 {
+        let shard = if self.threads == self.cameras.saturating_add(1) {
             match self.spawned.get_mut(camera) {
                 Some(k) => {
-                    let shard = if *k % 3 == 0 { 0 } else { camera + 1 };
+                    let shard = if *k % 3 == 0 {
+                        0
+                    } else {
+                        camera.saturating_add(1)
+                    };
                     *k += 1;
                     shard
                 }
@@ -76,7 +82,7 @@ impl ShardLayout {
     pub(crate) fn refill_shard(&self, camera: usize) -> usize {
         let shard = match self.shards() {
             1 => 0,
-            threads if threads == self.cameras + 1 => camera + 1,
+            threads if threads == self.cameras.saturating_add(1) => camera.saturating_add(1),
             _ => camera,
         };
         shard.min(self.shards() - 1)
@@ -146,6 +152,8 @@ impl Clone for ShardGuess {
 const NO_TEMPLATE: u64 = u64::MAX;
 /// Frame id of a slot whose template moved to the aligned list.
 const TAKEN: u64 = u64::MAX - 1;
+/// Frame id of a new track's slot until it takes a spare template.
+const NEW: u64 = u64::MAX - 2;
 
 /// Templates keyed by track, the frame they were cut from and the pixel they
 /// were cut at, since ORB can move a track's pixel between frames. Templates
@@ -175,17 +183,22 @@ impl TemplateCache {
                     let frame_id = std::mem::replace(&mut entry.1, TAKEN);
                     (frame_id, entry.2, std::mem::take(&mut entry.3))
                 }
-                Err(_) => (
-                    NO_TEMPLATE,
-                    [f32::NAN; 2],
-                    self.spare.pop().unwrap_or_default(),
-                ),
+                // An empty template, which does not allocate; filled below.
+                Err(_) => (NEW, [f32::NAN; 2], LkTemplate::default()),
             };
             self.scratch.push((track.id(), frame_id, source, template));
         }
+        // The dropped tracks' templates go spare before the new tracks take
+        // theirs, so a track replaced in the same frame reuses its buffers.
         for (_, frame_id, _, template) in self.entries.drain(..) {
             if frame_id != TAKEN {
                 self.spare.push(template);
+            }
+        }
+        for entry in &mut self.scratch {
+            if entry.1 == NEW {
+                entry.1 = NO_TEMPLATE;
+                entry.3 = self.spare.pop().unwrap_or_default();
             }
         }
         std::mem::swap(&mut self.entries, &mut self.scratch);
@@ -617,6 +630,9 @@ impl RigFlow {
         settings: RigFlowSettings,
         cameras: Vec<RigFlowCamera>,
     ) -> Result<Self, FlowPoolError> {
+        if settings.window > MAX_KLT_WINDOW {
+            return Err(FlowPoolError::Window(settings.window));
+        }
         let pool = FlowPool::new(settings.threads)?;
         let shards = (0..pool.threads())
             .map(|index| FlowShard {
@@ -726,7 +742,8 @@ impl RigFlow {
 
     /// Makes `images` (one per camera, primary first) the current frames and
     /// the last ones the previous: one padded level-0 copy per camera, in
-    /// place. Images past the rig's cameras are ignored.
+    /// place. Images past the rig's cameras are ignored; fewer images than
+    /// cameras are refused, and the frames dropped.
     pub fn prepare(
         &mut self,
         images: &[&Image<u8, 1>],
@@ -744,7 +761,13 @@ impl RigFlow {
 
     fn rebuild(&mut self, images: &[&Image<u8, 1>], frame_idx: u64) -> Result<(), FlowPoolError> {
         let cameras = self.cameras();
-        let images = &images[..images.len().min(cameras)];
+        // A short capture would leave a camera's pair two frames apart.
+        let Some(images) = images.get(..cameras) else {
+            return Err(FlowPoolError::MissingImages {
+                cameras,
+                images: images.len(),
+            });
+        };
         let Some(frames) = self.frames.as_mut() else {
             // Two copies of the first frame, so each side can be rebuilt in place.
             let mut frames = FlowFrames {
@@ -1205,6 +1228,86 @@ mod tests {
             camera_from_primary: None,
         };
         RigFlow::new(settings, vec![camera]).unwrap()
+    }
+
+    /// A track dropped in the frame a new one starts hands over its
+    /// template, so a shard at its peak track count does not allocate one.
+    #[test]
+    fn a_new_track_reuses_a_dropped_tracks_template() {
+        let mut tracks = TrackSet::new().with_monotonic_ids();
+        tracks.spawn([60.0, 60.0]);
+        let mut cache = TemplateCache::default();
+        cache.align(tracks.tracks());
+        assert!(extract_template(
+            &frame(0.0, 0),
+            [60.0, 60.0],
+            0,
+            11,
+            &mut cache.entries[0].3
+        ));
+        cache.sort();
+
+        tracks.clear();
+        tracks.spawn([80.0, 60.0]);
+        cache.align(tracks.tracks());
+
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].1, NO_TEMPLATE);
+        assert!(cache.spare.is_empty());
+    }
+
+    /// A short capture between two complete ones is refused, so no camera
+    /// tracks between frames two captures apart.
+    #[test]
+    fn a_short_capture_is_refused() {
+        let camera = || RigFlowCamera {
+            camera: pinhole(),
+            camera_from_primary: None,
+        };
+        let settings = rig_flow(GyroGuess::Off).settings;
+        let mut flow = RigFlow::new(settings, vec![camera(), camera()]).unwrap();
+        let mut timings = TrackingTimings::default();
+        let image = textured(0.0);
+        flow.prepare(&[&image, &image], 0, &mut timings).unwrap();
+        assert!(matches!(
+            flow.prepare(&[&image], 1, &mut timings),
+            Err(FlowPoolError::MissingImages {
+                cameras: 2,
+                images: 1
+            })
+        ));
+        assert!(!flow.has_frames());
+        flow.prepare(&[&image, &image], 2, &mut timings).unwrap();
+        assert!(flow.previous_frame(1).is_some());
+    }
+
+    /// `RigFlow::new` and `TrackSet::with_flow_threads` are public: their
+    /// thread and camera counts are clamped, and a window past
+    /// `MAX_KLT_WINDOW` is refused, so none sizes an allocation without bound.
+    #[test]
+    fn public_sizes_are_bounded() {
+        let mut tracks = TrackSet::with_flow_threads(usize::MAX, usize::MAX);
+        tracks.spawn_on([1.0, 1.0], 0);
+        assert!(tracks.tracks()[0].shard() < MAX_FLOW_SHARDS);
+        let settings = rig_flow(GyroGuess::Off).settings;
+        let camera = || RigFlowCamera {
+            camera: pinhole(),
+            camera_from_primary: None,
+        };
+        let threads = RigFlowSettings {
+            threads: usize::MAX,
+            ..settings
+        };
+        let flow = RigFlow::new(threads, vec![camera()]).unwrap();
+        assert_eq!(flow.threads(), MAX_FLOW_SHARDS);
+        let window = RigFlowSettings {
+            window: MAX_KLT_WINDOW + 2,
+            ..settings
+        };
+        assert!(matches!(
+            RigFlow::new(window, vec![camera()]),
+            Err(FlowPoolError::Window(_))
+        ));
     }
 
     /// Refill detects on the current frame, so the occupied pixels are

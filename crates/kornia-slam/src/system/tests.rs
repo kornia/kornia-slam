@@ -727,6 +727,50 @@ mod windowed_flow {
             .collect()
     }
 
+    /// A keyframe's pixels start tracks only when the flow's previous frame
+    /// is that keyframe: after a failed prepare on it, the next capture's
+    /// cold pair holds another image.
+    #[test]
+    fn adoption_needs_the_keyframe_as_the_previous_flow_frame() {
+        let adopting = |captures: &[u64]| {
+            let frontend = OrbFrontendConfig {
+                adopt_landmarks: true,
+                ..OrbFrontendConfig::default()
+            };
+            let mut system = SlamSystem::build(windowed(frontend), stereo_rig()).unwrap();
+            *system.map.lock().unwrap() = map_with_keyframe_at(Pose3d::IDENTITY);
+            system.state.last_keyframe_idx = Some(0);
+            system.next_frame_idx = 2;
+            let image = Image::from_size_val(IMAGE_SIZE, 128u8).unwrap();
+            let mut timings = crate::tracking::timings::TrackingTimings::default();
+            let flow = system.rig_flow.as_mut().unwrap();
+            for &capture in captures {
+                flow.prepare(&[&image], capture, &mut timings).unwrap();
+            }
+            system.adopt_landmarks();
+            system.tracker.tracks().len()
+        };
+        assert_eq!(adopting(&[0, 1]), 9);
+        assert_eq!(adopting(&[1]), 0);
+    }
+
+    /// A frame without tracks runs no flow step, so it reports none: the
+    /// output still holds the last step's counts.
+    #[test]
+    fn a_frame_without_tracks_reports_no_flow_step() {
+        let mut system =
+            SlamSystem::build(windowed(OrbFrontendConfig::default()), stereo_rig()).unwrap();
+        system.set_debug(true);
+        system.next_frame_idx = 1;
+        assert!(system.tracker.tracks().is_empty());
+        assert!(system.flow_windowed(&Pose3d::IDENTITY, false).is_none());
+        let messages = system.drain_debug_messages();
+        assert!(
+            messages.iter().all(|m| !m.starts_with("[flow]")),
+            "{messages:?}"
+        );
+    }
+
     /// The default frontend builds no window-only flow, so tracking runs the
     /// full-pyramid path it ran before.
     #[test]
@@ -815,6 +859,9 @@ mod windowed_flow {
         system.state.last_keyframe_idx = Some(0);
         // Frame 1 is being processed, so tracks refer to keyframe 0's frame.
         system.next_frame_idx = 2;
+        let image = Image::from_size_val(IMAGE_SIZE, 128u8).unwrap();
+        system.prepare_flow(&[&image], 0);
+        system.prepare_flow(&[&image], 1);
 
         system.adopt_landmarks();
 
@@ -868,10 +915,19 @@ mod windowed_flow {
                 stereo_rig(),
             )
             .unwrap();
+            system.set_debug(true);
             run(&mut system, 0..40);
             let counters = system.flow_counters();
             assert!(counters.flow_frames > 20, "{flow_pose:?}: {counters:?}");
             assert_eq!(counters.klt_errors, 0, "{flow_pose:?}");
+            // The analytic run must accept analytic poses, not only fall back.
+            let analytic = system
+                .drain_debug_messages()
+                .iter()
+                .filter(|m| m.starts_with("[klt-first]") && m.ends_with("analytic=1"))
+                .count();
+            let expected_analytic = matches!(flow_pose, FlowPose::AnalyticGn { .. });
+            assert_eq!(analytic > 0, expected_analytic, "{flow_pose:?}: {analytic}");
             let map = system.map.lock().unwrap();
             for keyframe in map.keyframes() {
                 assert!(

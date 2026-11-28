@@ -319,6 +319,29 @@ fn flow_knob_ranges_are_checked() {
     }
 }
 
+/// The fixed-point pyramid pads every level by the window, so an odd window
+/// past the bound must be refused before a system allocates by it; `2^53 + 1`
+/// is odd and exact in f64.
+#[test]
+fn klt_window_is_bounded() {
+    for klt_kernel in [LkKernel::FixedPointU8, LkKernel::WindowedU8] {
+        let frontend = |klt_window| OrbFrontendConfig {
+            klt_kernel,
+            klt_window,
+            ..OrbFrontendConfig::default()
+        };
+        let config = with_frontend(frontend(MAX_KLT_WINDOW), CameraSelection::Mono);
+        assert_eq!(config.validate(), Ok(()));
+        for klt_window in [MAX_KLT_WINDOW + 2, (1 << 53) + 1] {
+            let config = with_frontend(frontend(klt_window), CameraSelection::Mono);
+            assert_eq!(
+                invalid_setting(&config).as_deref(),
+                Some("frontend.klt_window")
+            );
+        }
+    }
+}
+
 #[test]
 fn flow_knobs_are_refused_without_the_knobs_they_need() {
     let needs = |knob: &'static str, needs: &'static str| -> Result<(), ConfigError> {
@@ -345,6 +368,40 @@ fn flow_knobs_are_refused_without_the_knobs_they_need() {
     assert_eq!(
         with_frontend(threaded, CameraSelection::Mono).validate(),
         needs("flow_threads", "klt_rig AllCameras on a rig")
+    );
+    // Off a rig the knob would track the primary alone, silently.
+    let all_cameras = OrbFrontendConfig {
+        klt_rig: KltRig::AllCameras,
+        ..OrbFrontendConfig::default()
+    };
+    for cameras in [CameraSelection::Mono, CameraSelection::Stereo] {
+        assert_eq!(
+            with_frontend(all_cameras, cameras).validate(),
+            needs("klt_rig", "sensors.cameras Rig")
+        );
+    }
+    assert_eq!(on_rig(all_cameras), Ok(()));
+    // The full-pyramid kernels read the gyro on the predicted search only.
+    let gyro = |klt_kernel, klt_prediction| OrbFrontendConfig {
+        klt_kernel,
+        klt_prediction,
+        gyro_guess: GyroGuess::RotatedRay,
+        ..OrbFrontendConfig::default()
+    };
+    let predicted = KltPrediction::Enabled {
+        max_level: 1,
+        max_iter: 10,
+    };
+    for kernel in [LkKernel::F32, LkKernel::FixedPointU8] {
+        assert_eq!(
+            on_rig(gyro(kernel, KltPrediction::Disabled)),
+            needs("gyro_guess", "klt_prediction or klt_kernel WindowedU8")
+        );
+        assert_eq!(on_rig(gyro(kernel, predicted)), Ok(()));
+    }
+    assert_eq!(
+        on_rig(gyro(LkKernel::WindowedU8, KltPrediction::Disabled)),
+        Ok(())
     );
     assert_eq!(
         on_rig(OrbFrontendConfig {
@@ -1378,8 +1435,10 @@ mod ron_files {
                 max_iter: 10,
             },
             klt_kernel: LkKernel::WindowedU8,
-            // Several flow threads need a rig; this one is stereo.
+            // Several flow threads and every camera need a rig; this one is
+            // stereo.
             flow_threads: 1,
+            klt_rig: KltRig::PrimaryOnly,
             ..windowed_frontend()
         });
         settings.keyframes.ref_ratio = 0.75;
@@ -1401,6 +1460,7 @@ mod ron_files {
                 },
                 klt_kernel: LkKernel::WindowedU8,
                 flow_threads: 1,
+                klt_rig: KltRig::PrimaryOnly,
                 ..windowed_frontend()
             })
         );

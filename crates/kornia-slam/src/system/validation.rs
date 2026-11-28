@@ -2,9 +2,10 @@ use kornia_imgproc::features::OrbMatchConfig;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    CameraSelection, FlowPose, ForwardBackward, FrontendConfig, KltRetry, KltRig, LoopClosingMode,
-    MAX_FLOW_THREADS, OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition,
-    SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth, SystemConfig, TrackRefill,
+    CameraSelection, FlowPose, ForwardBackward, FrontendConfig, GyroGuess, KltRetry, KltRig,
+    LoopClosingMode, MAX_FLOW_THREADS, MAX_KLT_WINDOW, OrbFrontendConfig, OrbSlamPipeline,
+    OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth,
+    SystemConfig, TrackRefill,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::{
@@ -165,7 +166,9 @@ fn validate_flow(
     check(
         at("klt_window"),
         frontend.klt_window as f64,
-        Requirement("odd and >= 3", |v| v >= 3.0 && v % 2.0 == 1.0),
+        Requirement("odd and in 3..=MAX_KLT_WINDOW", |v| {
+            (3.0..=MAX_KLT_WINDOW as f64).contains(&v) && v % 2.0 == 1.0
+        }),
     )?;
     if let KltRetry::CoarseLevel { max_level } = frontend.klt_retry {
         check(at("klt_retry.max_level"), max_level as f64, AT_LEAST_ONE)?;
@@ -223,6 +226,19 @@ fn validate_flow(
         && (frontend.klt_rig != KltRig::AllCameras || sensors.cameras != CameraSelection::Rig)
     {
         return needs("flow_threads", "klt_rig AllCameras on a rig");
+    }
+    // Only a rig frontend has the other cameras' geometry; elsewhere the
+    // knob would silently track the primary alone.
+    if frontend.klt_rig == KltRig::AllCameras && sensors.cameras != CameraSelection::Rig {
+        return needs("klt_rig", "sensors.cameras Rig");
+    }
+    // The full-pyramid kernels start from a guess only on the predicted
+    // search, so without one the gyro would never be read.
+    if frontend.gyro_guess == GyroGuess::RotatedRay
+        && frontend.klt_kernel != LkKernel::WindowedU8
+        && frontend.klt_prediction.search().is_none()
+    {
+        return needs("gyro_guess", "klt_prediction or klt_kernel WindowedU8");
     }
     // kornia-imgproc's f32 LK supports this window only.
     if frontend.klt_window != 21 && frontend.klt_kernel == LkKernel::F32 {

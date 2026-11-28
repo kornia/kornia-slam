@@ -37,13 +37,14 @@ fixed-point LK, on long-lived flow workers, one shard each. Nine new
 `frontend: Orb(..)` knobs; each default reproduces the previous behaviour, and
 the header prints a line only for a knob away from its default:
 - `flow_threads: 1` (default): threads of the `WindowedU8` flow step, the
-  tracking thread included: 1, the rig's camera count, or one more.
+  tracking thread included: 1, the rig's camera count, or one more. Above 1
+  it needs `WindowedU8` and `klt_rig: AllCameras` on a rig.
 - `klt_rig: PrimaryOnly` (default) or `AllCameras`: flow tracks every rig
-  camera, and `klt_first` then reaches a multi-camera rig. `klt_first` with
-  `AllCameras` is refused on raw fisheye rig cameras; the default frontend and
-  `PrimaryOnly` build on them.
-- `klt_window: 21` (default): LK window side; other sizes need `FixedPointU8`
-  or `WindowedU8`.
+  camera, and `klt_first` then reaches a multi-camera rig; `AllCameras` needs
+  `sensors.cameras: Rig`. `klt_first` with `AllCameras` is refused on raw
+  fisheye rig cameras; the default frontend and `PrimaryOnly` build on them.
+- `klt_window: 21` (default): LK window side, odd, at most 63; other sizes
+  need `FixedPointU8` or `WindowedU8`.
 - `klt_retry: Off` (default) or `CoarseLevel(max_level)`,
   `forward_backward: Off` (default) or `Enabled(max_round_trip_px, max_iter,
   every_n_frames)`, `track_refill: Off` (default) or `Enabled(per_camera,
@@ -51,12 +52,14 @@ the header prints a line only for a knob away from its default:
   from kornia-imgproc): need `WindowedU8`.
 - `adopt_landmarks: false` (default): new keyframe landmarks become tracks.
 - `gyro_guess: Off` (default) or `RotatedRay`: a track without a map point
-  starts at its last ray rotated by the gyro.
+  starts at its last ray rotated by the gyro; on `F32` and `FixedPointU8` it
+  rides the trusted predicted search, so it needs `klt_prediction`.
 - `flow_pose: RansacPnp` (default) or `AnalyticGn(max_iter)`: a flow-only
   frame's pose by Gauss-Newton from the prediction (kornia-3d's
   `refine_pose_lm_analytic`), RANSAC PnP below `min_inliers`; on `WindowedU8`
-  it reads the tracks' stored landmark positions without the map lock, and a
-  warm frame allocates nothing outside the pose solve.
+  it reads the tracks' stored landmark positions without the map lock, and
+  the flow step, the seeds and the track update of a warm flow-only frame
+  allocate nothing (landmark adoption after a keyframe does).
 
 `TrackingTimings` gains the `flow_*` stages and per-shard `shards`;
 `BuildError::FlowPool` reports a flow worker that cannot start. These knobs
