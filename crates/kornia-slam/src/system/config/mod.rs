@@ -152,7 +152,8 @@ pub enum KltRig {
     /// The primary camera; a multi-camera rig extracts ORB on every frame.
     #[default]
     PrimaryOnly,
-    /// Every rig camera, so a flow-only rig frame keeps each camera's rays.
+    /// Every rig camera, so a flow-only rig frame keeps each camera's rays;
+    /// needs `sensors.cameras: Rig`.
     AllCameras,
 }
 
@@ -206,7 +207,9 @@ pub enum GyroGuess {
     /// The previous pixel.
     #[default]
     Off,
-    /// The previous ray rotated by the preintegrated gyro rotation.
+    /// The previous ray rotated by the preintegrated gyro rotation. The
+    /// full-pyramid kernels read it on the trusted predicted search only, so
+    /// they need `klt_prediction`.
     RotatedRay,
 }
 

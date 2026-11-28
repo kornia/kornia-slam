@@ -367,6 +367,40 @@ fn flow_knobs_are_refused_without_the_knobs_they_need() {
         with_frontend(threaded, CameraSelection::Mono).validate(),
         needs("flow_threads", "klt_rig AllCameras on a rig")
     );
+    // Off a rig the knob would track the primary alone, silently.
+    let all_cameras = OrbFrontendConfig {
+        klt_rig: KltRig::AllCameras,
+        ..OrbFrontendConfig::default()
+    };
+    for cameras in [CameraSelection::Mono, CameraSelection::Stereo] {
+        assert_eq!(
+            with_frontend(all_cameras, cameras).validate(),
+            needs("klt_rig", "sensors.cameras Rig")
+        );
+    }
+    assert_eq!(on_rig(all_cameras), Ok(()));
+    // The full-pyramid kernels read the gyro on the predicted search only.
+    let gyro = |klt_kernel, klt_prediction| OrbFrontendConfig {
+        klt_kernel,
+        klt_prediction,
+        gyro_guess: GyroGuess::RotatedRay,
+        ..OrbFrontendConfig::default()
+    };
+    let predicted = KltPrediction::Enabled {
+        max_level: 1,
+        max_iter: 10,
+    };
+    for kernel in [LkKernel::F32, LkKernel::FixedPointU8] {
+        assert_eq!(
+            on_rig(gyro(kernel, KltPrediction::Disabled)),
+            needs("gyro_guess", "klt_prediction or klt_kernel WindowedU8")
+        );
+        assert_eq!(on_rig(gyro(kernel, predicted)), Ok(()));
+    }
+    assert_eq!(
+        on_rig(gyro(LkKernel::WindowedU8, KltPrediction::Disabled)),
+        Ok(())
+    );
     assert_eq!(
         on_rig(OrbFrontendConfig {
             klt_window: 11,
