@@ -119,6 +119,103 @@ pub struct OrbFrontendConfig {
     pub klt_prediction: KltPrediction,
     /// The pyramidal LK implementation optical flow runs on.
     pub klt_kernel: LkKernel,
+    /// Threads the `WindowedU8` flow step runs on, the tracking thread
+    /// included: 1, the rig's camera count, or one more.
+    pub flow_threads: usize,
+    /// Which rig cameras optical flow tracks.
+    pub klt_rig: KltRig,
+    /// LK window side, odd; the f32 kernel supports 21 only.
+    pub klt_window: usize,
+    /// A second, coarser search for the tracks that failed at the first.
+    pub klt_retry: KltRetry,
+    pub forward_backward: ForwardBackward,
+    pub track_refill: TrackRefill,
+    /// Tracks start from the landmarks each new keyframe creates.
+    pub adopt_landmarks: bool,
+    pub gyro_guess: GyroGuess,
+    /// How a frame tracked from flow alone gets its pose.
+    pub flow_pose: FlowPose,
+}
+
+/// Most flow threads a frontend runs, the tracking thread included.
+pub const MAX_FLOW_THREADS: usize = 4;
+
+/// Which rig cameras optical flow tracks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum KltRig {
+    /// The primary camera; a multi-camera rig extracts ORB on every frame.
+    #[default]
+    PrimaryOnly,
+    /// Every rig camera, so a flow-only rig frame keeps each camera's rays.
+    AllCameras,
+}
+
+/// The search for `WindowedU8` tracks that failed at the first level.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum KltRetry {
+    #[default]
+    Off,
+    /// Re-run the failed tracks over levels `0..=max_level` after the join
+    /// (VINS-Fusion's retry, `feature_tracker.cpp:118-133`).
+    CoarseLevel { max_level: usize },
+}
+
+/// Round-trip check of `WindowedU8` flow: each track is solved back into the
+/// previous frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ForwardBackward {
+    #[default]
+    Off,
+    /// Drop a track whose round trip exceeds `max_round_trip_px`, checked on
+    /// frames whose index is a multiple of `every_n_frames`.
+    Enabled {
+        max_round_trip_px: f32,
+        max_iter: usize,
+        every_n_frames: usize,
+    },
+}
+
+/// Shi-Tomasi refill of a camera's `WindowedU8` tracks, one camera per frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TrackRefill {
+    #[default]
+    Off,
+    /// Refill to `per_camera` tracks when fewer than `refill_below` of them
+    /// are left, `min_spacing_px` apart and `border_px` from the edge.
+    Enabled {
+        per_camera: usize,
+        min_spacing_px: f32,
+        refill_below: f32,
+        border_px: usize,
+    },
+}
+
+/// Start pixel of a track with no map-point prediction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum GyroGuess {
+    /// The previous pixel.
+    #[default]
+    Off,
+    /// The previous ray rotated by the preintegrated gyro rotation.
+    RotatedRay,
+}
+
+/// Pose of a frame tracked from flow alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum FlowPose {
+    /// Epipolar filter, then RANSAC PnP.
+    #[default]
+    RansacPnp,
+    /// Gauss-Newton from the prediction, no RANSAC; RANSAC PnP below
+    /// `min_inliers`. On `WindowedU8` it reads the tracks' stored landmark
+    /// positions, not the map.
+    AnalyticGn { max_iter: usize },
 }
 
 impl OrbFrontendConfig {
@@ -134,6 +231,15 @@ impl Default for OrbFrontendConfig {
             klt_first: KltFirst::default(),
             klt_prediction: KltPrediction::default(),
             klt_kernel: LkKernel::default(),
+            flow_threads: 1,
+            klt_rig: KltRig::default(),
+            klt_window: 21,
+            klt_retry: KltRetry::default(),
+            forward_backward: ForwardBackward::default(),
+            track_refill: TrackRefill::default(),
+            adopt_landmarks: false,
+            gyro_guess: GyroGuess::default(),
+            flow_pose: FlowPose::default(),
         }
     }
 }
@@ -141,7 +247,8 @@ impl Default for OrbFrontendConfig {
 /// Optical-flow-first tracking: a frame is tracked from its flow survivors
 /// alone, without ORB, unless a keyframe is due, the flow-only pose is
 /// refused, or fewer than `min_tracks` survivors carry a map point.
-/// Multi-camera rigs extract ORB on every frame regardless.
+/// A multi-camera rig extracts ORB on every frame unless `klt_rig` is
+/// `AllCameras`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum KltFirst {
@@ -293,8 +400,10 @@ impl fmt::Display for SystemConfig {
         let FrontendConfig::Orb(frontend) = orb.frontend;
         writeln!(f, "OrbSlam pipeline (config version {})", self.version)?;
         writeln!(f, "  frontend: ORB, {} keypoints", frontend.n_keypoints)?;
-        if frontend.klt_kernel == LkKernel::FixedPointU8 {
-            writeln!(f, "  klt kernel: fixed-point u8")?;
+        match frontend.klt_kernel {
+            LkKernel::F32 => {}
+            LkKernel::FixedPointU8 => writeln!(f, "  klt kernel: fixed-point u8")?,
+            LkKernel::WindowedU8 => writeln!(f, "  klt kernel: window-only fixed-point u8")?,
         }
         if let Some(min_tracks) = frontend.klt_first.min_tracks() {
             writeln!(
@@ -308,6 +417,7 @@ impl fmt::Display for SystemConfig {
                 "  klt prediction: levels 0..={max_level}, {max_iter} iterations when trusted"
             )?;
         }
+        write_flow_knobs(f, &frontend)?;
         if self.sensors.cameras == CameraSelection::Stereo {
             match frontend.stereo_close_depth {
                 StereoCloseDepth::Baselines(n) => writeln!(
@@ -352,6 +462,39 @@ impl fmt::Display for SystemConfig {
         }
         Ok(())
     }
+}
+
+/// One line per optical-flow knob that is not at its default.
+fn write_flow_knobs(f: &mut fmt::Formatter<'_>, frontend: &OrbFrontendConfig) -> fmt::Result {
+    let default = OrbFrontendConfig::default();
+    if frontend.flow_threads != default.flow_threads {
+        writeln!(f, "  flow threads: {}", frontend.flow_threads)?;
+    }
+    if frontend.klt_rig != default.klt_rig {
+        writeln!(f, "  klt rig: {:?}", frontend.klt_rig)?;
+    }
+    if frontend.klt_window != default.klt_window {
+        writeln!(f, "  klt window: {}", frontend.klt_window)?;
+    }
+    if frontend.klt_retry != default.klt_retry {
+        writeln!(f, "  klt retry: {:?}", frontend.klt_retry)?;
+    }
+    if frontend.forward_backward != default.forward_backward {
+        writeln!(f, "  forward-backward: {:?}", frontend.forward_backward)?;
+    }
+    if frontend.track_refill != default.track_refill {
+        writeln!(f, "  track refill: {:?}", frontend.track_refill)?;
+    }
+    if frontend.adopt_landmarks {
+        writeln!(f, "  flow adopts new landmarks")?;
+    }
+    if frontend.gyro_guess != default.gyro_guess {
+        writeln!(f, "  gyro guess: {:?}", frontend.gyro_guess)?;
+    }
+    if frontend.flow_pose != default.flow_pose {
+        writeln!(f, "  flow pose: {:?}", frontend.flow_pose)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

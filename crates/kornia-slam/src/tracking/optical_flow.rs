@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use kornia_algebra::Vec3F64;
 use kornia_image::{Image, ImageSize};
 use kornia_imgproc::filter::scharr_spatial_gradient_float;
 use kornia_imgproc::optical_flow_pyr_lk::{
@@ -12,7 +13,15 @@ use kornia_imgproc::optical_flow_pyr_lk::{
 use kornia_imgproc::pyramid::pyrdown_f32;
 use thiserror::Error;
 
+use crate::mapping::Map;
+use crate::tracking::flow_tracker::ShardLayout;
 use crate::tracking::timings::{TrackingTimings, timed};
+
+// The `WindowedU8` flow step, public for the zero-allocation test only.
+#[doc(hidden)]
+pub use crate::tracking::flow_tracker::{
+    FlowOutput, FlowStepCounts, FlowStepInput, RigFlow, RigFlowCamera, RigFlowSettings,
+};
 
 /// Stable identity for a feature track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -32,9 +41,31 @@ pub struct Track {
     pixel: [f32; 2],
     map_point_idx: Option<usize>,
     age: u32,
+    /// The associated map point's world position, copied when the track is
+    /// associated and refreshed after every map change, so `WindowedU8`
+    /// shards predict without the map lock; `None` once the point is culled.
+    position: Option<Vec3F64>,
+    /// Rig camera the track lives in; 0 outside a rig.
+    camera: u8,
+    /// Flow shard fixed at spawn.
+    shard: u8,
 }
 
 impl Track {
+    /// An unassociated track at `pixel`, outside any set: what the survivor
+    /// filter measures a solve's movement from.
+    pub(crate) fn at(pixel: [f32; 2]) -> Self {
+        Self {
+            id: TrackId(0),
+            pixel,
+            map_point_idx: None,
+            age: 1,
+            position: None,
+            camera: 0,
+            shard: 0,
+        }
+    }
+
     /// Stable identity across frames.
     pub fn id(&self) -> TrackId {
         self.id
@@ -53,6 +84,21 @@ impl Track {
     /// Number of consecutive frames represented by this track.
     pub fn age(&self) -> u32 {
         self.age
+    }
+
+    /// World position of the associated map point, as last refreshed.
+    pub fn position(&self) -> Option<Vec3F64> {
+        self.position
+    }
+
+    /// Rig camera the track lives in.
+    pub fn camera(&self) -> usize {
+        usize::from(self.camera)
+    }
+
+    /// Flow shard the track runs on.
+    pub fn shard(&self) -> usize {
+        usize::from(self.shard)
     }
 }
 
@@ -100,11 +146,45 @@ pub enum TrackSetError {
 pub struct TrackSet {
     next_id: u64,
     tracks: Vec<Track>,
+    /// Flow shard of each new track; every track on shard 0 by default.
+    layout: ShardLayout,
+    /// Identities never restart, since flow shards cache templates by them.
+    monotonic_ids: bool,
 }
 
 impl TrackSet {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty set whose new tracks are spread over `threads` flow shards
+    /// of a `cameras`-camera rig.
+    pub fn with_flow_threads(threads: usize, cameras: usize) -> Self {
+        Self {
+            layout: ShardLayout::new(threads, cameras),
+            ..Self::default()
+        }
+    }
+
+    /// Keeps identities unique across [`Self::clear`], for flow shards that
+    /// cache templates by track identity.
+    pub(crate) fn with_monotonic_ids(mut self) -> Self {
+        self.monotonic_ids = true;
+        self
+    }
+
+    /// Drops every track, keeping the shard layout. Identities restart, as
+    /// in a new set, unless they must stay unique.
+    pub fn clear(&mut self) {
+        self.tracks.clear();
+        if !self.monotonic_ids {
+            self.next_id = 0;
+        }
+    }
+
+    /// Flow shard that refills `camera`.
+    pub(crate) fn refill_shard(&self, camera: usize) -> usize {
+        self.layout.refill_shard(camera)
     }
 
     pub fn tracks(&self) -> &[Track] {
@@ -121,14 +201,147 @@ impl TrackSet {
 
     /// Inserts a new, unassociated track and returns its identity.
     pub fn spawn(&mut self, pixel: [f32; 2]) -> TrackId {
+        self.spawn_in(pixel, 0, 0)
+    }
+
+    /// As [`Self::spawn`], in rig camera `camera`, on flow shard `shard`.
+    pub fn spawn_in(&mut self, pixel: [f32; 2], camera: usize, shard: usize) -> TrackId {
         let id = self.allocate_id();
         self.tracks.push(Track {
             id,
             pixel,
             map_point_idx: None,
             age: 1,
+            position: None,
+            camera: camera as u8,
+            shard: shard as u8,
         });
         id
+    }
+
+    /// As [`Self::spawn_in`], on the shard the layout gives `camera`.
+    pub fn spawn_on(&mut self, pixel: [f32; 2], camera: usize) -> TrackId {
+        let shard = self.layout.assign(camera);
+        self.spawn_in(pixel, camera, shard)
+    }
+
+    /// A new track already associated with map point `map_point_idx` at
+    /// `position` (world frame).
+    pub(crate) fn spawn_associated(
+        &mut self,
+        pixel: [f32; 2],
+        camera: usize,
+        map_point_idx: usize,
+        position: Vec3F64,
+    ) -> TrackId {
+        let id = self.spawn_on(pixel, camera);
+        if let Some(track) = self.tracks.last_mut() {
+            track.map_point_idx = Some(map_point_idx);
+            track.position = Some(position);
+        }
+        id
+    }
+
+    /// Rewrites every associated track's `position` from `map`, `None` for a
+    /// culled point; returns how many it rewrote.
+    pub fn refresh_positions(&mut self, map: &Map) -> u64 {
+        let mut rewritten = 0;
+        for track in &mut self.tracks {
+            let Some(idx) = track.map_point_idx else {
+                continue;
+            };
+            track.position = map
+                .map_points()
+                .get(idx)
+                .filter(|mp| !mp.culled)
+                .map(|mp| mp.position);
+            rewritten += 1;
+        }
+        rewritten
+    }
+
+    /// Gives map point `map_point_idx` at `position` to the unassociated
+    /// track of `camera` nearest `pixel`, within `max_distance_px`; keeps its
+    /// identity, so its shard and template. Returns whether one was found.
+    pub(crate) fn associate_nearest(
+        &mut self,
+        pixel: [f32; 2],
+        camera: usize,
+        max_distance_px: f32,
+        map_point_idx: usize,
+        position: Vec3F64,
+    ) -> bool {
+        let distance = |track: &Track| (track.pixel[0] - pixel[0]).hypot(track.pixel[1] - pixel[1]);
+        let nearest = self
+            .tracks
+            .iter_mut()
+            .filter(|track| track.map_point_idx.is_none() && track.camera() == camera)
+            .filter(|track| distance(track) <= max_distance_px)
+            .min_by(|a, b| distance(a).total_cmp(&distance(b)));
+        let Some(track) = nearest else {
+            return false;
+        };
+        track.map_point_idx = Some(map_point_idx);
+        track.position = Some(position);
+        true
+    }
+
+    /// The tracks without a map point that `survivors` advance, one frame on,
+    /// for [`Self::restore`] after a reconcile drops them.
+    pub(crate) fn advanced_unassociated(&self, survivors: &[FlowSurvivor]) -> Vec<Track> {
+        let unassociated: HashMap<TrackId, Track> = self
+            .tracks
+            .iter()
+            .filter(|track| track.map_point_idx.is_none())
+            .map(|track| (track.id, *track))
+            .collect();
+        survivors
+            .iter()
+            .filter_map(|survivor| {
+                let previous = unassociated.get(&survivor.track_id)?;
+                Some(Track {
+                    pixel: survivor.pixel,
+                    age: previous.age.saturating_add(1),
+                    ..*previous
+                })
+            })
+            .collect()
+    }
+
+    /// Adds back tracks of [`Self::advanced_unassociated`]; their identities
+    /// predate any reconcile, so they cannot collide with its new ones.
+    pub(crate) fn restore(&mut self, tracks: Vec<Track>) {
+        self.tracks.extend(tracks);
+    }
+
+    /// Keeps per camera at most `per_camera` tracks, each `min_spacing_px`
+    /// from every kept one, oldest first; the kept tracks stay in order.
+    pub(crate) fn thin(&mut self, per_camera: usize, min_spacing_px: f32) {
+        let mut by_age: Vec<usize> = (0..self.tracks.len()).collect();
+        by_age.sort_unstable_by_key(|&k| (std::cmp::Reverse(self.tracks[k].age), self.tracks[k].id));
+        let mut keep = vec![false; self.tracks.len()];
+        let mut kept: Vec<Track> = Vec::with_capacity(self.tracks.len());
+        for k in by_age {
+            let track = self.tracks[k];
+            let mut same_camera = kept.iter().filter(|t| t.camera == track.camera);
+            let full = same_camera.clone().count() >= per_camera;
+            let crowded = same_camera.any(|t| {
+                (t.pixel[0] - track.pixel[0]).hypot(t.pixel[1] - track.pixel[1]) < min_spacing_px
+            });
+            if !full && !crowded {
+                keep[k] = true;
+                kept.push(track);
+            }
+        }
+        let mut keep = keep.into_iter();
+        self.tracks.retain(|_| keep.next().unwrap_or(false));
+    }
+
+    /// Whether some track follows map point `map_point_idx`.
+    pub(crate) fn follows(&self, map_point_idx: usize) -> bool {
+        self.tracks
+            .iter()
+            .any(|track| track.map_point_idx == Some(map_point_idx))
     }
 
     /// Advances the active set to the supplied KLT survivors.
@@ -153,10 +366,9 @@ impl TrackSet {
             .map(|survivor| {
                 let previous = by_id[&survivor.track_id];
                 Track {
-                    id: survivor.track_id,
                     pixel: survivor.pixel,
-                    map_point_idx: previous.map_point_idx,
                     age: previous.age.saturating_add(1),
+                    ..previous
                 }
             })
             .collect();
@@ -172,6 +384,19 @@ impl TrackSet {
         &mut self,
         matches: &[MapKeypointMatch],
         keypoints: &[[f32; 2]],
+    ) -> Result<(), TrackSetError> {
+        self.reconcile_in_cameras(matches, keypoints, |_| 0)
+    }
+
+    /// As [`Self::reconcile_from_matches`] over every rig camera's keypoints:
+    /// `camera_of` gives the camera of a keypoint index. A map point now seen
+    /// by another camera starts a new track, since its template and shard
+    /// belong to the old camera.
+    pub(crate) fn reconcile_in_cameras(
+        &mut self,
+        matches: &[MapKeypointMatch],
+        keypoints: &[[f32; 2]],
+        camera_of: impl Fn(usize) -> usize,
     ) -> Result<(), TrackSetError> {
         let mut seen_map_points = HashSet::with_capacity(matches.len());
         let mut seen_keypoints = HashSet::with_capacity(matches.len());
@@ -192,35 +417,45 @@ impl TrackSet {
             .iter()
             .filter_map(|track| track.map_point_idx.map(|idx| (idx, *track)))
             .collect();
+        let retained = |matched: &MapKeypointMatch| {
+            old_by_map_point
+                .get(&matched.map_point_idx)
+                .filter(|previous| previous.camera() == camera_of(matched.keypoint_idx))
+        };
         let new_count = matches
             .iter()
-            .filter(|matched| !old_by_map_point.contains_key(&matched.map_point_idx))
+            .filter(|matched| retained(matched).is_none())
             .count();
         let start_id = self.reserve_ids(new_count);
         let mut next_new_id = start_id;
 
-        self.tracks = matches
-            .iter()
-            .map(|matched| {
-                if let Some(previous) = old_by_map_point.get(&matched.map_point_idx) {
-                    Track {
-                        id: previous.id,
-                        pixel: keypoints[matched.keypoint_idx],
-                        map_point_idx: Some(matched.map_point_idx),
-                        age: previous.age.saturating_add(1),
-                    }
-                } else {
-                    let id = TrackId(next_new_id);
-                    next_new_id += 1;
-                    Track {
-                        id,
-                        pixel: keypoints[matched.keypoint_idx],
-                        map_point_idx: Some(matched.map_point_idx),
-                        age: 1,
-                    }
+        let mut tracks = Vec::with_capacity(matches.len());
+        for matched in matches {
+            let pixel = keypoints[matched.keypoint_idx];
+            let track = if let Some(previous) = retained(matched) {
+                Track {
+                    pixel,
+                    map_point_idx: Some(matched.map_point_idx),
+                    age: previous.age.saturating_add(1),
+                    ..*previous
                 }
-            })
-            .collect();
+            } else {
+                let id = TrackId(next_new_id);
+                next_new_id += 1;
+                let camera = camera_of(matched.keypoint_idx);
+                Track {
+                    id,
+                    pixel,
+                    map_point_idx: Some(matched.map_point_idx),
+                    age: 1,
+                    position: None,
+                    camera: camera as u8,
+                    shard: self.layout.assign(camera) as u8,
+                }
+            };
+            tracks.push(track);
+        }
+        self.tracks = tracks;
         Ok(())
     }
 
@@ -290,6 +525,9 @@ pub enum LkKernel {
     F32,
     /// OpenCV's scheme: u8 pyramid, i16 Scharr, Q14 fixed-point windows.
     FixedPointU8,
+    /// Window-only fixed-point LK on cached per-track templates, run by the
+    /// flow shards of `RigFlow`.
+    WindowedU8,
 }
 
 /// A failed flow solve, from either kernel.
@@ -319,6 +557,12 @@ impl KltTracker {
     /// Tracks with `kernel` in [`Self::track_cached`].
     pub fn with_kernel(mut self, kernel: LkKernel) -> Self {
         self.kernel = kernel;
+        self
+    }
+
+    /// Tracks with `win × win` LK windows; the f32 kernel supports 21 only.
+    pub fn with_window(mut self, win: usize) -> Self {
+        self.params.win_size = win;
         self
     }
 
@@ -412,7 +656,9 @@ impl KltTracker {
             return Ok(Vec::new());
         }
         check_same_size(previous, current)?;
-        if self.kernel == LkKernel::FixedPointU8 {
+        // `WindowedU8` runs on `RigFlow`'s shards; here it means the same
+        // fixed-point scheme on a full pyramid.
+        if matches!(self.kernel, LkKernel::FixedPointU8 | LkKernel::WindowedU8) {
             return self.track_cached_u8(cache, tracks, prediction, previous, current, timings);
         }
         let max_level = self.params.max_level;
@@ -565,7 +811,8 @@ impl KltTracker {
         survivors
     }
 
-    fn accepts(
+    /// Whether a flow result for `track` survives `filter`.
+    pub(crate) fn accepts(
         track: &Track,
         status: u8,
         error: f32,
@@ -781,7 +1028,7 @@ pub fn snap_unique(
 /// re-seeds from the next successful frame.
 pub(crate) fn carry_klt_survivors(track_set: &mut TrackSet, survivors: Option<Vec<FlowSurvivor>>) {
     if survivors.is_none_or(|survivors| track_set.advance(survivors).is_err()) {
-        *track_set = TrackSet::new();
+        track_set.clear();
     }
 }
 
@@ -789,6 +1036,116 @@ pub(crate) fn carry_klt_survivors(track_set: &mut TrackSet, survivors: Option<Ve
 mod tests {
     use super::*;
     use kornia_image::ImageSize;
+
+    /// A map with one keyframe and a landmark per position, each seen by
+    /// its own feature.
+    fn map_with(positions: &[Vec3F64]) -> Map {
+        use crate::mapping::map::tests::test_frame;
+        use crate::mapping::map::{Keyframe, LandmarkSeed, ObservationKey};
+        let mut map = Map::new();
+        let descriptors = (0..positions.len()).map(|i| [i as u8; 32]).collect();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(0, descriptors)))
+            .unwrap();
+        for (feature, &position) in positions.iter().enumerate() {
+            map.insert_landmark(LandmarkSeed {
+                position,
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 0,
+                    feature_idx: feature,
+                },
+            })
+            .unwrap();
+        }
+        map
+    }
+
+    #[test]
+    fn refresh_positions_follows_moved_and_culled_points() {
+        let before = Vec3F64::new(0.0, 0.0, 4.0);
+        let moved = Vec3F64::new(0.5, 0.0, 4.0);
+        let mut tracks = TrackSet::new();
+        tracks
+            .reconcile_from_matches(
+                &[
+                    MapKeypointMatch {
+                        map_point_idx: 0,
+                        keypoint_idx: 0,
+                    },
+                    MapKeypointMatch {
+                        map_point_idx: 1,
+                        keypoint_idx: 1,
+                    },
+                ],
+                &[[10.0, 10.0], [20.0, 20.0]],
+            )
+            .unwrap();
+        tracks.spawn([30.0, 30.0]);
+
+        assert_eq!(tracks.refresh_positions(&map_with(&[before, before])), 2);
+        assert!(
+            tracks.tracks()[..2]
+                .iter()
+                .all(|t| t.position() == Some(before))
+        );
+        assert_eq!(tracks.tracks()[2].position(), None);
+
+        // The map changed under the tracks: one point moved, the other merged away.
+        let mut map = map_with(&[moved, before]);
+        let merged = map.merge_map_points(0, 1).unwrap();
+        assert_eq!(tracks.refresh_positions(&map), 2);
+        let position_of = |idx: usize| {
+            tracks
+                .tracks()
+                .iter()
+                .find(|t| t.map_point_idx() == Some(idx))
+                .unwrap()
+                .position()
+        };
+        assert_eq!(position_of(merged.replaced), None);
+        assert_eq!(
+            position_of(merged.survivor),
+            Some(map.map_points()[merged.survivor].position)
+        );
+    }
+
+    /// A set for `WindowedU8` shards never reuses an identity after a clear,
+    /// since templates are cached by it; the default set restarts at 0.
+    #[test]
+    fn monotonic_identities_survive_a_clear() {
+        let mut plain = TrackSet::new();
+        plain.spawn([1.0, 1.0]);
+        plain.clear();
+        assert_eq!(plain.spawn([1.0, 1.0]).as_u64(), 0);
+        let mut windowed = TrackSet::new().with_monotonic_ids();
+        windowed.spawn([1.0, 1.0]);
+        windowed.clear();
+        assert_eq!(windowed.spawn([1.0, 1.0]).as_u64(), 1);
+    }
+
+    /// A map point now seen by another rig camera starts a new track there.
+    #[test]
+    fn a_map_point_seen_by_another_camera_starts_a_new_track() {
+        let mut tracks = TrackSet::with_flow_threads(2, 2);
+        let matched = [MapKeypointMatch {
+            map_point_idx: 7,
+            keypoint_idx: 0,
+        }];
+        tracks
+            .reconcile_in_cameras(&matched, &[[10.0, 10.0], [50.0, 10.0]], |_| 0)
+            .unwrap();
+        let first = tracks.tracks()[0];
+        let moved = [MapKeypointMatch {
+            map_point_idx: 7,
+            keypoint_idx: 1,
+        }];
+        tracks
+            .reconcile_in_cameras(&moved, &[[10.0, 10.0], [50.0, 10.0]], |kp| kp)
+            .unwrap();
+        let second = tracks.tracks()[0];
+        assert_ne!(first.id(), second.id());
+        assert_eq!((second.camera(), second.shard(), second.age()), (1, 1, 1));
+    }
 
     #[test]
     fn spawn_inserts_tracks_with_unique_ids() {
@@ -966,7 +1323,11 @@ mod tests {
                 pixel: [1.0, 2.0],
                 map_point_idx: None,
                 age: u32::MAX,
+                position: None,
+                camera: 0,
+                shard: 0,
             }],
+            ..TrackSet::default()
         };
 
         tracks
@@ -1224,6 +1585,9 @@ mod tests {
             pixel: [50.0, 50.0],
             map_point_idx: None,
             age: 1,
+            position: None,
+            camera: 0,
+            shard: 0,
         };
 
         assert!(!KltTracker::accepts(
@@ -1376,14 +1740,21 @@ mod tests {
                     pixel: [10.0, 10.0],
                     map_point_idx: Some(42),
                     age: 1,
+                    position: None,
+                    camera: 0,
+                    shard: 0,
                 },
                 Track {
                     id: b,
                     pixel: [20.0, 20.0],
                     map_point_idx: Some(42),
                     age: 1,
+                    position: None,
+                    camera: 0,
+                    shard: 0,
                 },
             ],
+            ..TrackSet::default()
         };
         let survivors = [
             FlowSurvivor {

@@ -2,14 +2,16 @@ use kornia_imgproc::features::OrbDetector;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    CameraSelection, FrontendConfig, OrbSlamPipeline, PipelineDefinition, SensorSelection,
-    SystemConfig,
+    CameraSelection, FlowPose, ForwardBackward, FrontendConfig, GyroGuess, KltRetry, KltRig,
+    OrbFrontendConfig, OrbSlamPipeline, PipelineDefinition, SensorSelection, SystemConfig,
+    TrackRefill,
 };
 use super::validation::ConfigError;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopCloser;
 use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabulary};
 use crate::mapping::LocalMappingMode;
+use crate::tracking::flow_pool::FlowPoolError;
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
@@ -22,6 +24,8 @@ pub enum BuildError {
     Config(#[from] ConfigError),
     #[error(transparent)]
     Vocabulary(#[from] VocabularyLoadError),
+    #[error(transparent)]
+    FlowPool(#[from] FlowPoolError),
 }
 
 /// Settings a [`SlamSystem`](crate::SlamSystem) is assembled from, resolved
@@ -43,14 +47,46 @@ pub(crate) struct SystemSettings {
     /// keypoints directly into metric map points.
     pub stereo_close_depth_m: Option<f64>,
     /// Survivors with a map point a frame needs to be tracked by optical flow
-    /// alone; `None` without `klt_first` and on a multi-camera rig, whose flow
-    /// follows the primary camera only and would drop the other cameras.
+    /// alone; `None` without `klt_first`, and on a multi-camera rig unless
+    /// flow tracks every camera: a primary-only flow frame would drop the
+    /// other cameras.
     pub klt_min_tracks: Option<usize>,
     pub klt_kernel: LkKernel,
     /// `(max_level, max_iter)` of the predicted flow search; `None` when
     /// disabled or on a raw fisheye primary, whose raw pixels the pinhole
     /// prediction cannot place.
     pub klt_prediction: Option<(usize, usize)>,
+    pub flow: FlowSettings,
+}
+
+/// The optical-flow knobs the tracking path reads.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FlowSettings {
+    pub threads: usize,
+    pub rig: KltRig,
+    pub window: usize,
+    pub retry: KltRetry,
+    pub forward_backward: ForwardBackward,
+    pub refill: TrackRefill,
+    pub adopt_landmarks: bool,
+    pub gyro_guess: GyroGuess,
+    pub pose: FlowPose,
+}
+
+impl FlowSettings {
+    fn new(frontend: &OrbFrontendConfig) -> Self {
+        Self {
+            threads: frontend.flow_threads,
+            rig: frontend.klt_rig,
+            window: frontend.klt_window,
+            retry: frontend.klt_retry,
+            forward_backward: frontend.forward_backward,
+            refill: frontend.track_refill,
+            adopt_landmarks: frontend.adopt_landmarks,
+            gyro_guess: frontend.gyro_guess,
+            pose: frontend.flow_pose,
+        }
+    }
 }
 
 impl SensorSelection {
@@ -103,13 +139,42 @@ impl SystemConfig {
             multi_camera,
             stereo_close_depth_m: close_depth_baseline_m
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
-            klt_min_tracks: frontend.klt_first.min_tracks().filter(|_| !multi_camera),
+            klt_min_tracks: frontend
+                .klt_first
+                .min_tracks()
+                .filter(|_| !multi_camera || frontend.klt_rig == KltRig::AllCameras),
             klt_kernel: frontend.klt_kernel,
             klt_prediction: frontend
                 .klt_prediction
                 .search()
                 .filter(|_| !rig.primary().is_fisheye()),
+            flow: FlowSettings::new(&frontend),
         }
+    }
+
+    /// Checks `frontend.flow_threads` against a rig returned by
+    /// [`SensorSelection::select_rig`].
+    pub(crate) fn validate_flow_threads(&self, rig: &SensorRig) -> Result<(), ConfigError> {
+        let FrontendConfig::Orb(frontend) = self.orb().frontend;
+        let cameras = match self.sensors.cameras {
+            CameraSelection::Rig => rig.cameras().len(),
+            CameraSelection::Mono | CameraSelection::Stereo => 1,
+        };
+        frontend.validate_flow_threads(cameras)
+    }
+
+    /// Rejects `frontend.klt_first` on raw fisheye rig cameras: the flow
+    /// tracker reads raw pixels as pinhole pixels.
+    pub(crate) fn validate_raw_fisheye(&self, rig: &SensorRig) -> Result<(), ConfigError> {
+        let FrontendConfig::Orb(frontend) = self.orb().frontend;
+        let raw = rig.cameras().iter().any(|camera| camera.is_fisheye());
+        if raw && frontend.klt_first.min_tracks().is_some() {
+            return Err(ConfigError::FrontendKnobNeeds {
+                knob: "klt_first",
+                needs: "pinhole rig images",
+            });
+        }
+        Ok(())
     }
 
     /// Feature extractor settings for the configured frontend.

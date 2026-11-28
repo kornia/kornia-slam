@@ -91,6 +91,11 @@ impl OrbFrontend {
         }
     }
 
+    /// The rig a multi-camera frontend extracts on.
+    pub(crate) fn rig_geometry(&self) -> Option<&Arc<RigGeometry>> {
+        self.rig.as_ref().map(OverlapMatcher::rig)
+    }
+
     pub(crate) fn observation(&self) -> &FrontendObservation {
         &self.observation
     }

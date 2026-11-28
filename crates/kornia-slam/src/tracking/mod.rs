@@ -2,6 +2,8 @@
 //! the keyframe and loss-recovery policies, relocalization, and the parallax
 //! measure the keyframe policy can key off.
 
+pub(crate) mod flow_pool;
+pub(crate) mod flow_tracker;
 pub mod local_map;
 pub(crate) mod motion;
 pub mod optical_flow;
@@ -12,6 +14,7 @@ pub mod relocalization;
 pub mod timings;
 pub(crate) mod tracker;
 
+pub use flow_pool::FlowPoolError;
 pub use local_map::{LocalMapSelectionConfig, select_local_map_points};
 pub use parallax::{median_compensated_parallax_px, median_parallax_px};
 pub use policy::{KeyframeEvidence, KeyframePolicy, TrackingLossRecoveryPolicy};

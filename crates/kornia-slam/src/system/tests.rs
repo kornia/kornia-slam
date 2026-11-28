@@ -650,3 +650,208 @@ mod klt_first {
         assert_eq!(system.flow_counters(), twin.flow_counters());
     }
 }
+
+mod windowed_flow {
+    use super::*;
+    use crate::system::config::KltFirst;
+    use crate::tracking::optical_flow::LkKernel;
+    use crate::tracking::parallax::tests::{frame_seeing_points, map_with_keyframe_at};
+
+    fn windowed(frontend: OrbFrontendConfig) -> SystemConfig {
+        let mut config = config(CameraSelection::Stereo, false, LoopClosingMode::Disabled);
+        let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+        orb.frontend = FrontendConfig::Orb(OrbFrontendConfig {
+            klt_kernel: LkKernel::WindowedU8,
+            klt_window: 11,
+            ..frontend
+        });
+        config
+    }
+
+    fn stereo_rig() -> SensorRig {
+        SensorRig::rectified_stereo(camera(), IMAGE_SIZE, 0.11)
+    }
+
+    /// A stereo system on `WindowedU8` whose tracks follow the 9 landmarks
+    /// of keyframe 0.
+    fn system() -> SlamSystem {
+        let mut system =
+            SlamSystem::build(windowed(OrbFrontendConfig::default()), stereo_rig()).unwrap();
+        *system.map.lock().unwrap() = map_with_keyframe_at(Pose3d::IDENTITY);
+        system.state.current_keyframe_idx = Some(0);
+        system.state.last_keyframe_idx = Some(0);
+        adopt_all(&mut system);
+        system
+    }
+
+    fn adopt_all(system: &mut SlamSystem) {
+        let landmarks: Vec<Vec3F64> =
+            system.with_map_points(|mps| mps.iter().map(|mp| mp.position).collect());
+        for (i, position) in landmarks.into_iter().enumerate() {
+            system
+                .tracker
+                .adopt([10.0 * i as f32 + 20.0, 20.0], 0, i, position);
+        }
+    }
+
+    fn positions(system: &SlamSystem) -> Vec<Option<Vec3F64>> {
+        system
+            .tracker
+            .tracks()
+            .iter()
+            .map(|t| t.position())
+            .collect()
+    }
+
+    /// The default frontend builds no window-only flow, so tracking runs the
+    /// full-pyramid path it ran before.
+    #[test]
+    fn the_default_frontend_builds_no_window_only_flow() {
+        let system = SlamSystem::build(mono(), mono_rig()).unwrap();
+        assert!(system.rig_flow.is_none());
+        assert!(!system.tracker.flows_rig());
+        assert_eq!(system.flow.gyro_guess, GyroGuess::Off);
+        assert!(!system.flow.adopt_landmarks);
+        assert_eq!(system.flow.pose, FlowPose::RansacPnp);
+    }
+
+    /// A keyframe insertion that moved the map (here the whole map shifted,
+    /// as an inertial alignment rescales and rotates it) leaves the tracks'
+    /// stored positions on the new landmarks, not the old ones.
+    #[test]
+    fn a_keyframe_insertion_refreshes_the_track_positions() {
+        let mut system = system();
+        let shifted = Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            Vec3F64::new(0.3, 0.0, 0.0),
+        );
+        *system.map.lock().unwrap() = map_with_keyframe_at(shifted);
+        let moved: Vec<Option<Vec3F64>> =
+            system.with_map_points(|mps| mps.iter().map(|mp| Some(mp.position)).collect());
+        assert_ne!(positions(&system), moved, "the tracks hold the old positions");
+        let frame = frame_seeing_points(4, Pose3d::IDENTITY, &[]);
+        assert!(system.insert_keyframe(&frame, 0.2, &[]));
+        // Mapping ran too, so the landmarks are where the map now holds them.
+        let in_map: Vec<Option<Vec3F64>> = system.with_map_points(|mps| {
+            mps.iter()
+                .map(|mp| (!mp.culled).then_some(mp.position))
+                .collect()
+        });
+        assert_eq!(positions(&system), in_map);
+    }
+
+    /// A failed prepare clears the tracks, and so does the next prepare,
+    /// whose previous frame is then a copy of its own capture; consecutive
+    /// prepares keep them.
+    #[test]
+    fn a_failed_prepare_clears_the_tracks() {
+        let image = textured(0);
+        let size = ImageSize {
+            width: 4,
+            height: 4,
+        };
+        let too_small = Image::<u8, 1>::new(size, vec![0; 16]).unwrap();
+        let mut system = system();
+        system.prepare_flow(&[&image], 3);
+        adopt_all(&mut system);
+        system.prepare_flow(&[&image], 4);
+        assert_eq!(system.tracker.tracks().len(), 9, "consecutive captures");
+
+        system.prepare_flow(&[&too_small], 5);
+        assert!(system.tracker.tracks().is_empty(), "the prepare failed");
+
+        adopt_all(&mut system);
+        system.prepare_flow(&[&image], 6);
+        assert!(
+            system.tracker.tracks().is_empty(),
+            "capture 5 was never prepared"
+        );
+        adopt_all(&mut system);
+        system.prepare_flow(&[&image], 7);
+        assert_eq!(system.tracker.tracks().len(), 9, "back to consecutive");
+    }
+
+    /// The landmarks a keyframe created are adopted on the next frame, from
+    /// its keypoints, once.
+    #[test]
+    fn a_keyframes_landmarks_are_adopted_on_the_next_frame() {
+        let mut system = SlamSystem::build(
+            windowed(OrbFrontendConfig {
+                adopt_landmarks: true,
+                ..OrbFrontendConfig::default()
+            }),
+            stereo_rig(),
+        )
+        .unwrap();
+        *system.map.lock().unwrap() = map_with_keyframe_at(Pose3d::IDENTITY);
+        system.state.last_keyframe_idx = Some(0);
+        // Frame 1 is being processed, so tracks refer to keyframe 0's frame.
+        system.next_frame_idx = 2;
+
+        system.adopt_landmarks();
+
+        let landmarks = system.num_active_map_points();
+        let tracks = system.tracker.tracks().to_vec();
+        assert!(landmarks > 0);
+        assert_eq!(tracks.len(), landmarks);
+        assert!(tracks.iter().all(|track| track.position().is_some()));
+        assert_eq!(system.tracker.followed_baseline(), landmarks);
+        system.adopt_landmarks();
+        assert_eq!(system.tracker.tracks(), &tracks[..], "adopted once");
+    }
+
+    /// Frame `k` of a camera sliding sideways one pixel a frame over a
+    /// textured plane 8 px of disparity away.
+    fn sliding_pair(k: usize) -> (Image<u8, 1>, Image<u8, 1>) {
+        (textured(k), textured(k + 8))
+    }
+
+    fn run(system: &mut SlamSystem, frames: std::ops::Range<usize>) {
+        for k in frames {
+            let (left, right) = sliding_pair(k);
+            system.process_stereo(stamp(k), &left, &right).unwrap();
+        }
+    }
+
+    /// Optical-flow-first tracking on the window-only kernel, with refill,
+    /// adoption and the analytic pose, tracks frames between keyframes from
+    /// flow alone, and every keyframe is an ORB frame with stereo depth.
+    #[test]
+    fn window_only_flow_tracks_frames_between_keyframes() {
+        for flow_pose in [FlowPose::RansacPnp, FlowPose::AnalyticGn { max_iter: 3 }] {
+            let mut system = SlamSystem::build(
+                windowed(OrbFrontendConfig {
+                    klt_first: KltFirst::Enabled { min_tracks: 30 },
+                    track_refill: TrackRefill::Enabled {
+                        per_camera: 120,
+                        min_spacing_px: 15.0,
+                        refill_below: 0.8,
+                        border_px: 9,
+                    },
+                    forward_backward: ForwardBackward::Enabled {
+                        max_round_trip_px: 0.6,
+                        max_iter: 4,
+                        every_n_frames: 1,
+                    },
+                    adopt_landmarks: true,
+                    flow_pose,
+                    ..OrbFrontendConfig::default()
+                }),
+                stereo_rig(),
+            )
+            .unwrap();
+            run(&mut system, 0..40);
+            let counters = system.flow_counters();
+            assert!(counters.flow_frames > 20, "{flow_pose:?}: {counters:?}");
+            assert_eq!(counters.klt_errors, 0, "{flow_pose:?}");
+            let map = system.map.lock().unwrap();
+            for keyframe in map.keyframes() {
+                assert!(
+                    keyframe.frame.depth.iter().any(|&d| d > 0.0),
+                    "{flow_pose:?}: keyframe {} has no stereo depth",
+                    keyframe.frame.idx
+                );
+            }
+        }
+    }
+}

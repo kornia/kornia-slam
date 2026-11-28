@@ -23,15 +23,39 @@ pub fn median_parallax_px(
     matches: &[(usize, usize)],
     camera: &PinholeCamera,
 ) -> Option<f64> {
+    // Rotation compensation holds between primary-camera views only.
+    median_parallax_px_with(
+        map,
+        keyframe_idx,
+        current_pose_world_to_cam,
+        matches,
+        camera,
+        |feature| {
+            if current.camera_of(feature) != 0 {
+                return None;
+            }
+            current.undistorted_xy(feature, camera)
+        },
+    )
+}
+
+/// [`median_parallax_px`] with each current feature's undistorted primary
+/// camera pixel from `primary_xy`, `None` for a feature of another camera
+/// or one that cannot be undistorted: for flow seeds outside a [`Frame`].
+pub(crate) fn median_parallax_px_with(
+    map: &Map,
+    keyframe_idx: usize,
+    current_pose_world_to_cam: &Pose3d,
+    matches: &[(usize, usize)],
+    camera: &PinholeCamera,
+    primary_xy: impl Fn(usize) -> Option<[f32; 2]>,
+) -> Option<f64> {
     let keyframe = map.get_keyframe(keyframe_idx)?;
     let rotation_cur_from_kf = current_pose_world_to_cam
         .compose(&keyframe.frame.pose_world_to_cam.inverse())
         .rotation;
-    // Rotation compensation holds between primary-camera views only.
     let pairs = matches.iter().filter_map(|&(mp_idx, feature)| {
-        if current.camera_of(feature) != 0 {
-            return None;
-        }
+        let current = primary_xy(feature)?;
         let mp = map.map_points().get(mp_idx).filter(|mp| !mp.culled)?;
         let kf_feature = mp
             .observations()
@@ -39,10 +63,7 @@ pub fn median_parallax_px(
             .find(|o| o.key.keyframe_idx == keyframe_idx && o.camera == 0)?
             .key
             .feature_idx;
-        Some((
-            keyframe.frame.undistorted_xy(kf_feature, camera)?,
-            current.undistorted_xy(feature, camera)?,
-        ))
+        Some((keyframe.frame.undistorted_xy(kf_feature, camera)?, current))
     });
     median_compensated_parallax_px(camera, &rotation_cur_from_kf, pairs)
 }

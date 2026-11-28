@@ -2,13 +2,15 @@ use kornia_imgproc::features::OrbMatchConfig;
 use kornia_sensors::SensorRig;
 
 use super::config::{
-    CameraSelection, FrontendConfig, LoopClosingMode, OrbFrontendConfig, OrbSlamPipeline,
-    OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth,
-    SystemConfig,
+    CameraSelection, FlowPose, ForwardBackward, FrontendConfig, KltRetry, KltRig,
+    LoopClosingMode, MAX_FLOW_THREADS, OrbFrontendConfig, OrbSlamPipeline, OrbTuning,
+    PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth, SystemConfig,
+    TrackRefill,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopClosingConfig;
 use crate::tracking::KeyframePolicy;
+use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
 
 /// A system configuration that cannot be built or does not fit its source.
@@ -45,6 +47,13 @@ pub enum ConfigError {
     LoopClosingWithoutMetricScale,
     #[error("configuration requests {0}, but the source does not provide it")]
     MissingSensor(&'static str),
+    #[error("frontend.{knob} needs {needs}")]
+    FrontendKnobNeeds {
+        knob: &'static str,
+        needs: &'static str,
+    },
+    #[error("frontend.flow_threads {threads} needs 1, {cameras} or {} threads on this rig", cameras + 1)]
+    FlowThreadsForRig { threads: usize, cameras: usize },
 }
 
 impl SystemConfig {
@@ -73,7 +82,10 @@ impl SystemConfig {
 impl OrbSlamPipeline {
     fn validate(&self, sensors: &SensorSelection) -> Result<(), ConfigError> {
         match &self.frontend {
-            FrontendConfig::Orb(orb) => orb.validate()?,
+            FrontendConfig::Orb(orb) => {
+                orb.validate()?;
+                validate_flow(orb, sensors)?;
+            }
         }
         validate_keyframes(&self.keyframes, sensors.imu)?;
         validate_loop_closing(&self.loop_closing, sensors)?;
@@ -117,6 +129,111 @@ impl OrbFrontendConfig {
             StereoCloseDepth::Disabled => Ok(()),
         }
     }
+}
+
+impl OrbFrontendConfig {
+    /// `flow_threads` against a rig of `cameras` cameras: one shard per
+    /// thread needs 1, one thread per camera, or one more.
+    pub(crate) fn validate_flow_threads(&self, cameras: usize) -> Result<(), ConfigError> {
+        let threads = self.flow_threads;
+        if threads == 1 || threads == cameras || threads == cameras + 1 {
+            Ok(())
+        } else {
+            Err(ConfigError::FlowThreadsForRig { threads, cameras })
+        }
+    }
+}
+
+/// The optical-flow knobs: ranges, and the knobs each one needs.
+fn validate_flow(frontend: &OrbFrontendConfig, sensors: &SensorSelection) -> Result<(), ConfigError> {
+    let at = |field| format!("frontend.{field}");
+    let needs = |knob: &'static str, needs: &'static str| -> Result<(), ConfigError> {
+        Err(ConfigError::FrontendKnobNeeds { knob, needs })
+    };
+    check(
+        at("flow_threads"),
+        frontend.flow_threads as f64,
+        Requirement("in 1..=MAX_FLOW_THREADS", |v| {
+            (1.0..=MAX_FLOW_THREADS as f64).contains(&v)
+        }),
+    )?;
+    check(
+        at("klt_window"),
+        frontend.klt_window as f64,
+        Requirement("odd and >= 3", |v| v >= 3.0 && v % 2.0 == 1.0),
+    )?;
+    if let KltRetry::CoarseLevel { max_level } = frontend.klt_retry {
+        check(at("klt_retry.max_level"), max_level as f64, AT_LEAST_ONE)?;
+    }
+    if let ForwardBackward::Enabled {
+        max_round_trip_px,
+        max_iter,
+        every_n_frames,
+    } = frontend.forward_backward
+    {
+        check(
+            at("forward_backward.max_round_trip_px"),
+            max_round_trip_px.into(),
+            POSITIVE,
+        )?;
+        check(at("forward_backward.max_iter"), max_iter as f64, AT_LEAST_ONE)?;
+        check(
+            at("forward_backward.every_n_frames"),
+            every_n_frames as f64,
+            AT_LEAST_ONE,
+        )?;
+    }
+    if let TrackRefill::Enabled {
+        per_camera,
+        min_spacing_px,
+        refill_below,
+        ..
+    } = frontend.track_refill
+    {
+        check(at("track_refill.per_camera"), per_camera as f64, AT_LEAST_ONE)?;
+        check(
+            at("track_refill.min_spacing_px"),
+            min_spacing_px.into(),
+            POSITIVE,
+        )?;
+        check(
+            at("track_refill.refill_below"),
+            refill_below.into(),
+            OPEN_UNIT_UPPER,
+        )?;
+    }
+    if let FlowPose::AnalyticGn { max_iter } = frontend.flow_pose {
+        check(at("flow_pose.max_iter"), max_iter as f64, AT_LEAST_ONE)?;
+    }
+    let threaded = frontend.flow_threads > 1;
+    if threaded
+        && (frontend.klt_rig != KltRig::AllCameras || sensors.cameras != CameraSelection::Rig)
+    {
+        return needs("flow_threads", "klt_rig AllCameras on a rig");
+    }
+    // kornia-imgproc's f32 LK supports this window only.
+    if frontend.klt_window != 21 && frontend.klt_kernel == LkKernel::F32 {
+        return needs(
+            "klt_window",
+            "klt_kernel FixedPointU8 or WindowedU8 unless it is 21",
+        );
+    }
+    // These run on WindowedU8's per-track template cache.
+    if frontend.klt_kernel != LkKernel::WindowedU8 {
+        let windowed = [
+            ("klt_retry", frontend.klt_retry != KltRetry::Off),
+            (
+                "forward_backward",
+                frontend.forward_backward != ForwardBackward::Off,
+            ),
+            ("track_refill", frontend.track_refill != TrackRefill::Off),
+            ("flow_threads", threaded),
+        ];
+        if let Some((knob, _)) = windowed.into_iter().find(|&(_, on)| on) {
+            return needs(knob, "klt_kernel WindowedU8");
+        }
+    }
+    Ok(())
 }
 
 fn validate_keyframes(policy: &KeyframePolicy, imu: bool) -> Result<(), ConfigError> {
