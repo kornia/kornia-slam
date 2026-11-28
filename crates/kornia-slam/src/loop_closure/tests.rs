@@ -1355,7 +1355,7 @@ fn a_world_change_during_the_solve_discards_and_retries() {
     );
 }
 
-/// One discard is followed by a fresh solve that is applied.
+/// A single discarded result is followed by a fresh solve that is applied.
 #[test]
 fn a_discarded_solve_is_resubmitted_and_applied() {
     let (closer, mut map) = closing_fixture(background_config(), false);
