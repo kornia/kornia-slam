@@ -749,6 +749,23 @@ mod windowed_flow {
         assert_eq!(adopting(&[1]), 0);
     }
 
+    /// A frame without tracks runs no flow step, so it reports none: the
+    /// output still holds the last step's counts.
+    #[test]
+    fn a_frame_without_tracks_reports_no_flow_step() {
+        let mut system =
+            SlamSystem::build(windowed(OrbFrontendConfig::default()), stereo_rig()).unwrap();
+        system.set_debug(true);
+        system.next_frame_idx = 1;
+        assert!(system.tracker.tracks().is_empty());
+        assert!(system.flow_windowed(&Pose3d::IDENTITY, false).is_none());
+        let messages = system.drain_debug_messages();
+        assert!(
+            messages.iter().all(|m| !m.starts_with("[flow]")),
+            "{messages:?}"
+        );
+    }
+
     /// The default frontend builds no window-only flow, so tracking runs the
     /// full-pyramid path it ran before.
     #[test]

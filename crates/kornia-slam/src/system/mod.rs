@@ -1827,10 +1827,12 @@ impl SlamSystem {
             pose_world_to_primary: predicted.then_some(*candidate_pose),
             primary_rotation: self.gyro_rotation,
         };
+        // Without tracks no step runs, and the output is the last frame's.
+        let stepped = !self.tracker.tracks().is_empty();
         let survivors = self
             .tracker
             .flow_windowed(rig_flow, &input, &mut self.tracking_timings);
-        if self.debug {
+        if self.debug && stepped {
             let output = rig_flow.output();
             let counts = output.counts;
             for (shard, tracks) in output
