@@ -258,7 +258,7 @@ impl TemporalConsistencyTracker {
                     <= self.episode.candidate_neighborhood_radius
                 && (correction.translation_world - chain.last_correction.translation_world).length()
                     <= max_translation_m
-                && (correction.yaw_rad - chain.last_correction.yaw_rad).abs() <= max_yaw_rad
+                && angle_between(correction.yaw_rad, chain.last_correction.yaw_rad) <= max_yaw_rad
         });
         let hits = if consistent {
             self.chain.map_or(1, |chain| chain.hits + 1)
@@ -282,6 +282,12 @@ impl TemporalConsistencyTracker {
             TemporalDecision::Pending { hits, required }
         })
     }
+}
+
+/// The shortest angle between two angles (rad), so +179 and -179 degrees are 2 degrees apart.
+fn angle_between(a: f64, b: f64) -> f64 {
+    let difference = (a - b).rem_euclid(std::f64::consts::TAU);
+    difference.min(std::f64::consts::TAU - difference)
 }
 
 #[cfg(test)]
@@ -457,6 +463,19 @@ mod tests {
                 hits: 1,
                 required: 3
             })
+        );
+    }
+
+    #[test]
+    fn temporal_rule_compares_yaw_across_the_half_turn() {
+        let mut tracker = TemporalConsistencyTracker::new(
+            LoopTemporalConsistency::enabled(2),
+            LoopEpisodeConfig::default(),
+        );
+        tracker.observe(100, 10, correction(0.4, 179.0, 20.0));
+        assert_eq!(
+            tracker.observe(101, 11, correction(0.4, -179.0, 20.0)),
+            Some(TemporalDecision::Pass)
         );
     }
 
