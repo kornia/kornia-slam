@@ -119,6 +119,376 @@ fn display_describes_the_pipeline() {
     }
 }
 
+/// Every window-only flow knob on, at the values the flow tests use.
+fn windowed_frontend() -> OrbFrontendConfig {
+    OrbFrontendConfig {
+        klt_kernel: LkKernel::WindowedU8,
+        flow_threads: 3,
+        klt_rig: KltRig::AllCameras,
+        klt_window: 11,
+        klt_retry: KltRetry::CoarseLevel { max_level: 1 },
+        forward_backward: ForwardBackward::Enabled {
+            max_round_trip_px: 0.6,
+            max_iter: 4,
+            every_n_frames: 1,
+        },
+        track_refill: TrackRefill::Enabled {
+            per_camera: 64,
+            min_spacing_px: 23.0,
+            refill_below: 0.8,
+            border_px: 9,
+        },
+        adopt_landmarks: true,
+        gyro_guess: GyroGuess::RotatedRay,
+        flow_pose: FlowPose::AnalyticGn { max_iter: 3 },
+        ..OrbFrontendConfig::default()
+    }
+}
+
+/// A config whose frontend is `frontend` on `cameras`, with the IMU.
+fn with_frontend(frontend: OrbFrontendConfig, cameras: CameraSelection) -> SystemConfig {
+    let mut config = SystemConfig {
+        sensors: sensors(cameras, true),
+        ..SystemConfig::default()
+    };
+    orb_mut(&mut config).frontend = FrontendConfig::Orb(frontend);
+    config
+}
+
+#[test]
+fn the_window_only_flow_knobs_default_off() {
+    let frontend = OrbFrontendConfig::default();
+    assert_eq!(frontend.flow_threads, 1);
+    assert_eq!(frontend.klt_rig, KltRig::PrimaryOnly);
+    assert_eq!(frontend.klt_window, 21);
+    assert_eq!(frontend.klt_retry, KltRetry::Off);
+    assert_eq!(frontend.forward_backward, ForwardBackward::Off);
+    assert_eq!(frontend.track_refill, TrackRefill::Off);
+    assert!(!frontend.adopt_landmarks);
+    assert_eq!(frontend.gyro_guess, GyroGuess::Off);
+    assert_eq!(frontend.flow_pose, FlowPose::RansacPnp);
+    for (knob, default) in [
+        (KltRig::default() == KltRig::PrimaryOnly, "klt_rig"),
+        (KltRetry::default() == KltRetry::Off, "klt_retry"),
+        (
+            ForwardBackward::default() == ForwardBackward::Off,
+            "forward_backward",
+        ),
+        (TrackRefill::default() == TrackRefill::Off, "track_refill"),
+        (GyroGuess::default() == GyroGuess::Off, "gyro_guess"),
+        (FlowPose::default() == FlowPose::RansacPnp, "flow_pose"),
+    ] {
+        assert!(knob, "{default}");
+    }
+    let preset = with_frontend(windowed_frontend(), CameraSelection::Rig);
+    assert_eq!(preset.validate(), Ok(()));
+    let header = preset.to_string();
+    for line in [
+        "  klt kernel: window-only fixed-point u8",
+        "  flow threads: 3",
+        "  klt rig: AllCameras",
+        "  klt window: 11",
+        "  flow adopts new landmarks",
+        "  flow pose: AnalyticGn { max_iter: 3 }",
+    ] {
+        assert!(header.contains(line), "{line} in {header}");
+    }
+}
+
+#[test]
+fn flow_knob_ranges_are_checked() {
+    let windowed = OrbFrontendConfig {
+        klt_kernel: LkKernel::WindowedU8,
+        ..OrbFrontendConfig::default()
+    };
+    let refill = |per_camera, min_spacing_px, refill_below| TrackRefill::Enabled {
+        per_camera,
+        min_spacing_px,
+        refill_below,
+        border_px: 9,
+    };
+    let round_trip = |max_round_trip_px, max_iter, every_n_frames| ForwardBackward::Enabled {
+        max_round_trip_px,
+        max_iter,
+        every_n_frames,
+    };
+    for (frontend, setting) in [
+        (
+            OrbFrontendConfig {
+                flow_threads: 0,
+                ..windowed
+            },
+            "frontend.flow_threads",
+        ),
+        (
+            OrbFrontendConfig {
+                flow_threads: MAX_FLOW_THREADS + 1,
+                ..windowed
+            },
+            "frontend.flow_threads",
+        ),
+        (
+            OrbFrontendConfig {
+                klt_window: 10,
+                ..windowed
+            },
+            "frontend.klt_window",
+        ),
+        (
+            OrbFrontendConfig {
+                klt_window: 1,
+                ..windowed
+            },
+            "frontend.klt_window",
+        ),
+        (
+            OrbFrontendConfig {
+                klt_retry: KltRetry::CoarseLevel { max_level: 0 },
+                ..windowed
+            },
+            "frontend.klt_retry.max_level",
+        ),
+        (
+            OrbFrontendConfig {
+                forward_backward: round_trip(0.0, 4, 1),
+                ..windowed
+            },
+            "frontend.forward_backward.max_round_trip_px",
+        ),
+        (
+            OrbFrontendConfig {
+                forward_backward: round_trip(f32::NAN, 4, 1),
+                ..windowed
+            },
+            "frontend.forward_backward.max_round_trip_px",
+        ),
+        (
+            OrbFrontendConfig {
+                forward_backward: round_trip(0.6, 0, 1),
+                ..windowed
+            },
+            "frontend.forward_backward.max_iter",
+        ),
+        (
+            OrbFrontendConfig {
+                forward_backward: round_trip(0.6, 4, 0),
+                ..windowed
+            },
+            "frontend.forward_backward.every_n_frames",
+        ),
+        (
+            OrbFrontendConfig {
+                track_refill: refill(0, 23.0, 0.8),
+                ..windowed
+            },
+            "frontend.track_refill.per_camera",
+        ),
+        (
+            OrbFrontendConfig {
+                track_refill: refill(48, 0.0, 0.8),
+                ..windowed
+            },
+            "frontend.track_refill.min_spacing_px",
+        ),
+        (
+            OrbFrontendConfig {
+                track_refill: refill(48, 23.0, 0.0),
+                ..windowed
+            },
+            "frontend.track_refill.refill_below",
+        ),
+        (
+            OrbFrontendConfig {
+                track_refill: refill(48, 23.0, 1.5),
+                ..windowed
+            },
+            "frontend.track_refill.refill_below",
+        ),
+        (
+            OrbFrontendConfig {
+                flow_pose: FlowPose::AnalyticGn { max_iter: 0 },
+                ..windowed
+            },
+            "frontend.flow_pose.max_iter",
+        ),
+    ] {
+        let config = with_frontend(frontend, CameraSelection::Rig);
+        assert_eq!(invalid_setting(&config).as_deref(), Some(setting));
+    }
+}
+
+/// The fixed-point pyramid pads every level by the window, so an odd window
+/// past the bound must be refused before a system allocates by it; `2^53 + 1`
+/// is odd and exact in f64.
+#[test]
+fn klt_window_is_bounded() {
+    for klt_kernel in [LkKernel::FixedPointU8, LkKernel::WindowedU8] {
+        let frontend = |klt_window| OrbFrontendConfig {
+            klt_kernel,
+            klt_window,
+            ..OrbFrontendConfig::default()
+        };
+        let config = with_frontend(frontend(MAX_KLT_WINDOW), CameraSelection::Mono);
+        assert_eq!(config.validate(), Ok(()));
+        for klt_window in [MAX_KLT_WINDOW + 2, (1 << 53) + 1] {
+            let config = with_frontend(frontend(klt_window), CameraSelection::Mono);
+            assert_eq!(
+                invalid_setting(&config).as_deref(),
+                Some("frontend.klt_window")
+            );
+        }
+    }
+}
+
+#[test]
+fn flow_knobs_are_refused_without_the_knobs_they_need() {
+    let needs = |knob: &'static str, needs: &'static str| -> Result<(), ConfigError> {
+        Err(ConfigError::FrontendKnobNeeds { knob, needs })
+    };
+    let windowed = OrbFrontendConfig {
+        klt_kernel: LkKernel::WindowedU8,
+        ..OrbFrontendConfig::default()
+    };
+    let threaded = OrbFrontendConfig {
+        flow_threads: 2,
+        klt_rig: KltRig::AllCameras,
+        ..windowed
+    };
+    let on_rig = |frontend| with_frontend(frontend, CameraSelection::Rig).validate();
+    assert_eq!(on_rig(threaded), Ok(()));
+    assert_eq!(
+        on_rig(OrbFrontendConfig {
+            klt_rig: KltRig::PrimaryOnly,
+            ..threaded
+        }),
+        needs("flow_threads", "klt_rig AllCameras on a rig")
+    );
+    assert_eq!(
+        with_frontend(threaded, CameraSelection::Mono).validate(),
+        needs("flow_threads", "klt_rig AllCameras on a rig")
+    );
+    // Off a rig the knob would track the primary alone, silently.
+    let all_cameras = OrbFrontendConfig {
+        klt_rig: KltRig::AllCameras,
+        ..OrbFrontendConfig::default()
+    };
+    for cameras in [CameraSelection::Mono, CameraSelection::Stereo] {
+        assert_eq!(
+            with_frontend(all_cameras, cameras).validate(),
+            needs("klt_rig", "sensors.cameras Rig")
+        );
+    }
+    assert_eq!(on_rig(all_cameras), Ok(()));
+    // The full-pyramid kernels read the gyro on the predicted search only.
+    let gyro = |klt_kernel, klt_prediction| OrbFrontendConfig {
+        klt_kernel,
+        klt_prediction,
+        gyro_guess: GyroGuess::RotatedRay,
+        ..OrbFrontendConfig::default()
+    };
+    let predicted = KltPrediction::Enabled {
+        max_level: 1,
+        max_iter: 10,
+    };
+    for kernel in [LkKernel::F32, LkKernel::FixedPointU8] {
+        assert_eq!(
+            on_rig(gyro(kernel, KltPrediction::Disabled)),
+            needs("gyro_guess", "klt_prediction or klt_kernel WindowedU8")
+        );
+        assert_eq!(on_rig(gyro(kernel, predicted)), Ok(()));
+    }
+    assert_eq!(
+        on_rig(gyro(LkKernel::WindowedU8, KltPrediction::Disabled)),
+        Ok(())
+    );
+    assert_eq!(
+        on_rig(OrbFrontendConfig {
+            klt_window: 11,
+            ..OrbFrontendConfig::default()
+        }),
+        needs(
+            "klt_window",
+            "klt_kernel FixedPointU8 or WindowedU8 unless it is 21"
+        )
+    );
+    assert_eq!(
+        on_rig(OrbFrontendConfig {
+            klt_window: 11,
+            klt_kernel: LkKernel::FixedPointU8,
+            ..OrbFrontendConfig::default()
+        }),
+        Ok(())
+    );
+    let fixed_point = OrbFrontendConfig {
+        klt_kernel: LkKernel::FixedPointU8,
+        ..OrbFrontendConfig::default()
+    };
+    for (frontend, knob) in [
+        (
+            OrbFrontendConfig {
+                klt_retry: KltRetry::CoarseLevel { max_level: 1 },
+                ..fixed_point
+            },
+            "klt_retry",
+        ),
+        (
+            OrbFrontendConfig {
+                forward_backward: windowed_frontend().forward_backward,
+                ..fixed_point
+            },
+            "forward_backward",
+        ),
+        (
+            OrbFrontendConfig {
+                track_refill: windowed_frontend().track_refill,
+                ..fixed_point
+            },
+            "track_refill",
+        ),
+        (
+            OrbFrontendConfig {
+                klt_kernel: LkKernel::FixedPointU8,
+                ..threaded
+            },
+            "flow_threads",
+        ),
+    ] {
+        assert_eq!(
+            on_rig(frontend),
+            needs(knob, "klt_kernel WindowedU8"),
+            "{knob}"
+        );
+    }
+}
+
+#[test]
+fn flow_threads_need_a_shard_layout_for_the_rig() {
+    for (threads, cameras, ok) in [
+        (1, 1, true),
+        (1, 2, true),
+        (2, 2, true),
+        (3, 2, true),
+        (4, 2, false),
+        (2, 1, true),
+        (3, 1, false),
+    ] {
+        let frontend = OrbFrontendConfig {
+            flow_threads: threads,
+            ..OrbFrontendConfig::default()
+        };
+        let expected = if ok {
+            Ok(())
+        } else {
+            Err(ConfigError::FlowThreadsForRig { threads, cameras })
+        };
+        assert_eq!(
+            frontend.validate_flow_threads(cameras),
+            expected,
+            "{threads} threads, {cameras} cameras"
+        );
+    }
+}
+
 /// Every optical-flow knob defaults to the behaviour before it existed, and
 /// the default configuration prints the same header as before.
 #[test]
@@ -468,6 +838,74 @@ mod runtime_settings {
         assert_eq!(settings.stereo_close_depth_m, None);
     }
 
+    fn raw_fisheye_rig() -> SensorRig {
+        let fisheye = kornia_3d::camera::Fisheye624Camera {
+            f: 240.0,
+            cx: 320.0,
+            cy: 240.0,
+            k: [-0.025, 0.096, -0.063, 0.0062, 0.0035, -0.00073],
+            p: [0.0009, 0.00036],
+            s: [-0.0014, -0.0001, -0.00046, -0.0001],
+        };
+        SensorRig::from_cameras(vec![
+            kornia_sensors::RigCamera::primary(fisheye, SIZE),
+            kornia_sensors::RigCamera::new(
+                fisheye,
+                SIZE,
+                Pose3d::new(
+                    kornia_algebra::Mat3F64::IDENTITY,
+                    kornia_algebra::Vec3F64::new(0.1, 0.0, 0.0),
+                ),
+            ),
+        ])
+        .unwrap()
+    }
+
+    /// The flow tracker reads raw pixels as pinhole pixels only when it
+    /// flows the rig cameras; with the primary alone `klt_first` stays inert
+    /// on a raw primary, so nothing needs refusing.
+    #[test]
+    fn klt_first_on_a_raw_rig_is_refused_only_with_rig_flow() {
+        let rig_config = |klt_first, klt_rig| {
+            let mut config = SystemConfig {
+                sensors: sensors(CameraSelection::Rig, false),
+                ..SystemConfig::default()
+            };
+            orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
+                klt_first,
+                klt_rig,
+                ..OrbFrontendConfig::default()
+            });
+            config
+        };
+        let enabled = KltFirst::Enabled { min_tracks: 80 };
+        let selected = sensors(CameraSelection::Rig, false)
+            .select_rig(raw_fisheye_rig())
+            .unwrap();
+        assert!(
+            crate::SlamSystem::build(
+                rig_config(KltFirst::Disabled, KltRig::PrimaryOnly),
+                raw_fisheye_rig()
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            rig_config(enabled, KltRig::PrimaryOnly).validate_raw_fisheye(&selected),
+            Ok(())
+        );
+        assert_eq!(
+            rig_config(enabled, KltRig::AllCameras).validate_raw_fisheye(&selected),
+            Err(ConfigError::FrontendKnobNeeds {
+                knob: "klt_first",
+                needs: "pinhole rig images",
+            })
+        );
+        assert_eq!(
+            rig_config(enabled, KltRig::AllCameras).validate_raw_fisheye(&rig()),
+            Ok(())
+        );
+    }
+
     #[test]
     fn a_rig_may_hold_raw_fisheye_cameras() {
         let fisheye = kornia_3d::camera::Fisheye624Camera {
@@ -494,6 +932,41 @@ mod runtime_settings {
             sensors(CameraSelection::Rig, false).validate_rig(&rig),
             Ok(())
         );
+    }
+
+    /// `klt_rig: AllCameras` lets a rig defer ORB to flow frames; the default
+    /// keeps ORB on every rig frame.
+    #[test]
+    fn klt_first_reaches_a_rig_only_with_every_camera_tracked() {
+        let two_cameras = SensorRig::from_cameras(vec![
+            kornia_sensors::RigCamera::primary(camera(), SIZE),
+            kornia_sensors::RigCamera::new(
+                camera(),
+                SIZE,
+                Pose3d::new(
+                    kornia_algebra::Mat3F64::IDENTITY,
+                    kornia_algebra::Vec3F64::new(0.1, 0.0, 0.0),
+                ),
+            ),
+        ])
+        .unwrap();
+        let selected = sensors(CameraSelection::Rig, false)
+            .select_rig(two_cameras)
+            .unwrap();
+        let klt_min_tracks = |klt_rig| {
+            let mut config = SystemConfig {
+                sensors: sensors(CameraSelection::Rig, false),
+                ..SystemConfig::default()
+            };
+            orb_mut(&mut config).frontend = FrontendConfig::Orb(OrbFrontendConfig {
+                klt_first: KltFirst::Enabled { min_tracks: 80 },
+                klt_rig,
+                ..OrbFrontendConfig::default()
+            });
+            config.settings(&selected).klt_min_tracks
+        };
+        assert_eq!(klt_min_tracks(KltRig::PrimaryOnly), None);
+        assert_eq!(klt_min_tracks(KltRig::AllCameras), Some(80));
     }
 
     #[test]
@@ -772,7 +1245,12 @@ mod ron_files {
                 max_level: 1,
                 max_iter: 10,
             },
-            klt_kernel: LkKernel::FixedPointU8,
+            klt_kernel: LkKernel::WindowedU8,
+            // Several flow threads and every camera need a rig; this one is
+            // stereo.
+            flow_threads: 1,
+            klt_rig: KltRig::PrimaryOnly,
+            ..windowed_frontend()
         });
         settings.keyframes.ref_ratio = 0.75;
         settings.mapping.execution = LocalMappingMode::Synchronous;
@@ -791,7 +1269,10 @@ mod ron_files {
                     max_level: 1,
                     max_iter: 10,
                 },
-                klt_kernel: LkKernel::FixedPointU8,
+                klt_kernel: LkKernel::WindowedU8,
+                flow_threads: 1,
+                klt_rig: KltRig::PrimaryOnly,
+                ..windowed_frontend()
             })
         );
     }
