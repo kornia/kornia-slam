@@ -161,8 +161,8 @@ pub fn landmarks_in_frame_frustum<D: Descriptor>(
 /// A projection test only: it says nothing about occlusion, descriptor
 /// distance, or the scale and viewing-angle gates the matcher applies later.
 ///
-/// `raw` is the camera's raw fisheye model, when its images are raw
-/// ([`crate::rig::project_in_view`]).
+/// `raw` is the camera's fisheye model when its images are raw fisheye: a
+/// point then counts within the 80° incidence cap and inside the raw image.
 pub fn landmarks_in_frustum<D: Descriptor>(
     map: &Map<D>,
     candidates: &[usize],

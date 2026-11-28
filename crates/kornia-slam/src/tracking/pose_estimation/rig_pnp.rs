@@ -232,9 +232,8 @@ fn solve_damped(damped: Mat6F64, g: &Vec6F64) -> Option<Vec6F64> {
 mod tests {
     use super::*;
 
-    /// The solver [`solve_damped`] replaced, kept as its oracle (P5 of
-    /// `experiments/pr180-review-swaps-plan.md`): Gaussian elimination with partial pivoting,
-    /// `None` when singular.
+    /// The solver [`solve_damped`] replaced, kept as its oracle: Gaussian
+    /// elimination with partial pivoting, `None` when singular.
     fn solve6(mut a: [[f64; 6]; 6], mut b: [f64; 6]) -> Option<[f64; 6]> {
         for col in 0..6 {
             let pivot = (col..6).max_by(|&i, &j| a[i][col].abs().total_cmp(&a[j][col].abs()))?;
