@@ -100,6 +100,13 @@ impl OrbFrontendConfig {
                 max: *range.end(),
             });
         }
+        if let Some((_, max_iter)) = self.klt_prediction.search() {
+            check(
+                "frontend.klt_prediction.max_iter",
+                max_iter as f64,
+                POSITIVE,
+            )?;
+        }
         match self.stereo_close_depth {
             StereoCloseDepth::Baselines(value) | StereoCloseDepth::Metres(value) => {
                 check("frontend.stereo_close_depth", value, POSITIVE)

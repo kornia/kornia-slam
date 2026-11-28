@@ -10,6 +10,7 @@ use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopCloser;
 use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabulary};
 use crate::mapping::LocalMappingMode;
+use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
@@ -41,6 +42,11 @@ pub(crate) struct SystemSettings {
     /// keyframe back-projects its unassociated "close" (`z < threshold`) stereo
     /// keypoints directly into metric map points.
     pub stereo_close_depth_m: Option<f64>,
+    pub klt_kernel: LkKernel,
+    /// `(max_level, max_iter)` of the predicted flow search; `None` when
+    /// disabled or on a raw fisheye primary, whose raw pixels the pinhole
+    /// prediction cannot place.
+    pub klt_prediction: Option<(usize, usize)>,
 }
 
 impl SensorSelection {
@@ -93,6 +99,11 @@ impl SystemConfig {
             multi_camera,
             stereo_close_depth_m: close_depth_baseline_m
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
+            klt_kernel: frontend.klt_kernel,
+            klt_prediction: frontend
+                .klt_prediction
+                .search()
+                .filter(|_| !rig.primary().is_fisheye()),
         }
     }
 

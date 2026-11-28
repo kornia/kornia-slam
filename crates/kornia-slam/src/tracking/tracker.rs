@@ -13,8 +13,8 @@ use kornia_image::Image;
 use crate::Frame;
 use crate::mapping::Map;
 use crate::tracking::optical_flow::{
-    FlowSurvivor, KltPyramidCache, KltTracker, MapKeypointMatch, TrackSet, carry_klt_survivors,
-    snap_unique,
+    FlowPrediction, FlowSurvivor, KltPyramidCache, KltTracker, LkKernel, MapKeypointMatch, Track,
+    TrackSet, carry_klt_survivors, snap_unique,
 };
 use crate::tracking::pose_estimation::map_projection::{
     MapProjectionConfig, MapProjectionRejectReason,
@@ -38,6 +38,17 @@ pub(crate) struct FrameInput<'a> {
     pub trusted_prediction: bool,
 }
 
+/// A predicted pose to start optical flow from, and the shallower search a
+/// good start allows.
+pub(crate) struct FlowGuess<'a> {
+    pub map: &'a Map,
+    /// Predicted world-to-camera pose of the current frame.
+    pub pose: &'a Pose3d,
+    pub camera: &'a PinholeCamera,
+    pub max_level: usize,
+    pub max_iter: usize,
+}
+
 pub(crate) struct Tracker {
     estimator: MapProjectionEstimator,
     klt_tracker: KltTracker,
@@ -53,6 +64,12 @@ impl Tracker {
             klt_cache: KltPyramidCache::new(),
             track_set: TrackSet::new(),
         }
+    }
+
+    /// Runs optical flow on `kernel`.
+    pub(crate) fn with_lk_kernel(mut self, kernel: LkKernel) -> Self {
+        self.klt_tracker = self.klt_tracker.with_kernel(kernel);
+        self
     }
 
     /// Recovers the pose against one of the candidate keyframes, taking the
@@ -87,21 +104,36 @@ impl Tracker {
         self.track_set = TrackSet::new();
     }
 
-    /// Follows the tracks from `previous` into `current` by optical flow;
-    /// `None` without tracks, a previous image, or a flow solution.
+    /// Follows the tracks from `previous` into `current` by optical flow,
+    /// starting from `guess`'s predicted pixels when given; `None` without
+    /// tracks, a previous image, or a flow solution.
     pub(crate) fn flow(
         &mut self,
         previous: Option<&Image<u8, 1>>,
         current: &Image<u8, 1>,
+        guess: Option<FlowGuess<'_>>,
         timings: &mut TrackingTimings,
     ) -> Option<Vec<FlowSurvivor>> {
         if self.track_set.is_empty() {
             return None;
         }
+        let initial_pixels = guess.as_ref().map(|guess| {
+            predicted_pixels(self.track_set.tracks(), guess.map, guess.pose, guess.camera)
+        });
+        let prediction =
+            guess
+                .as_ref()
+                .zip(initial_pixels.as_deref())
+                .map(|(guess, initial_pixels)| FlowPrediction {
+                    initial_pixels,
+                    max_level: guess.max_level,
+                    max_iter: guess.max_iter,
+                });
         self.klt_tracker
             .track_cached(
                 &mut self.klt_cache,
                 self.track_set.tracks(),
+                prediction,
                 previous?,
                 current,
                 timings,
@@ -189,4 +221,41 @@ impl Tracker {
             }
         }
     }
+}
+
+/// Where each track is expected at `pose`: its live map point projected, or
+/// its last pixel for a track without one.
+fn predicted_pixels(
+    tracks: &[Track],
+    map: &Map,
+    pose: &Pose3d,
+    camera: &PinholeCamera,
+) -> Vec<[f32; 2]> {
+    tracks
+        .iter()
+        .map(|track| {
+            let raw = track.pixel();
+            track
+                .map_point_idx()
+                .and_then(|idx| map.map_points().get(idx))
+                .filter(|mp| !mp.culled)
+                .and_then(|mp| project_raw(camera, &pose.transform_point(&mp.position), raw))
+                .unwrap_or(raw)
+        })
+        .collect()
+}
+
+/// `p_cam` projected through the ideal pinhole and carried back into raw
+/// pixels by the distortion offset at `raw`, a nearby raw pixel.
+pub(crate) fn project_raw(
+    camera: &PinholeCamera,
+    p_cam: &kornia_algebra::Vec3F64,
+    raw: [f32; 2],
+) -> Option<[f32; 2]> {
+    let uv = camera.project_to_pixel(p_cam, 1e-6)?;
+    let undistorted = camera.undistort(raw[0] as f64, raw[1] as f64)?;
+    Some([
+        (uv.x + raw[0] as f64 - undistorted.x) as f32,
+        (uv.y + raw[1] as f64 - undistorted.y) as f32,
+    ])
 }

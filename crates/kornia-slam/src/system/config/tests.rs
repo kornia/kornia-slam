@@ -119,6 +119,56 @@ fn display_describes_the_pipeline() {
     }
 }
 
+/// Every optical-flow knob defaults to the behaviour before it existed, and
+/// the default configuration prints the same header as before.
+#[test]
+fn frontend_defaults_reproduce_main() {
+    let frontend = OrbFrontendConfig::default();
+    assert_eq!(frontend.klt_kernel, LkKernel::default());
+    assert_eq!(frontend.klt_kernel, LkKernel::F32);
+    assert_eq!(frontend.klt_prediction, KltPrediction::Disabled);
+    assert_eq!(
+        SystemConfig::default().to_string(),
+        "OrbSlam pipeline (config version 1)
+  frontend: ORB, 1000 keypoints
+  tracking
+  keyframes: every 3..=8 frames, ref ratio 0.6
+  local mapping: asynchronous
+"
+    );
+
+    let mut flow = SystemConfig::default();
+    orb_mut(&mut flow).frontend = FrontendConfig::Orb(OrbFrontendConfig {
+        klt_kernel: LkKernel::FixedPointU8,
+        klt_prediction: KltPrediction::Enabled {
+            max_level: 1,
+            max_iter: 10,
+        },
+        ..OrbFrontendConfig::default()
+    });
+    assert_eq!(
+        flow.to_string(),
+        "OrbSlam pipeline (config version 1)
+  frontend: ORB, 1000 keypoints
+  klt kernel: fixed-point u8
+  klt prediction: levels 0..=1, 10 iterations when trusted
+  tracking
+  keyframes: every 3..=8 frames, ref ratio 0.6
+  local mapping: asynchronous
+"
+    );
+    assert!(flow.validate().is_ok());
+    let FrontendConfig::Orb(frontend) = &mut orb_mut(&mut flow).frontend;
+    frontend.klt_prediction = KltPrediction::Enabled {
+        max_level: 1,
+        max_iter: 0,
+    };
+    assert_eq!(
+        invalid_setting(&flow).as_deref(),
+        Some("frontend.klt_prediction.max_iter")
+    );
+}
+
 #[test]
 fn frontend_and_keyframe_settings_are_range_checked() {
     let keypoints = |n_keypoints| {

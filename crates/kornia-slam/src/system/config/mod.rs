@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::LoopClosingConfig;
 use crate::mapping::LocalMappingMode;
+use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
@@ -111,6 +112,10 @@ pub struct OrbFrontendConfig {
     /// Stereo keypoints closer than this are back-projected directly into map
     /// points at each keyframe. Unused without stereo cameras.
     pub stereo_close_depth: StereoCloseDepth,
+    /// Optical-flow search when the inertial prediction is trusted.
+    pub klt_prediction: KltPrediction,
+    /// The pyramidal LK implementation optical flow runs on.
+    pub klt_kernel: LkKernel,
 }
 
 impl OrbFrontendConfig {
@@ -123,6 +128,36 @@ impl Default for OrbFrontendConfig {
         Self {
             n_keypoints: 1000,
             stereo_close_depth: StereoCloseDepth::default(),
+            klt_prediction: KltPrediction::default(),
+            klt_kernel: LkKernel::default(),
+        }
+    }
+}
+
+/// Optical flow from a trusted inertial prediction: each track starts at
+/// its map point projected at the predicted pose, and LK searches pyramid
+/// levels `0..=max_level` with `max_iter` iterations each instead of the
+/// full pyramid. Raw fisheye primaries keep the full search.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum KltPrediction {
+    #[default]
+    Disabled,
+    Enabled {
+        max_level: usize,
+        max_iter: usize,
+    },
+}
+
+impl KltPrediction {
+    /// `(max_level, max_iter)`, or `None` when disabled.
+    pub fn search(self) -> Option<(usize, usize)> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled {
+                max_level,
+                max_iter,
+            } => Some((max_level, max_iter)),
         }
     }
 }
@@ -229,6 +264,15 @@ impl fmt::Display for SystemConfig {
         let FrontendConfig::Orb(frontend) = orb.frontend;
         writeln!(f, "OrbSlam pipeline (config version {})", self.version)?;
         writeln!(f, "  frontend: ORB, {} keypoints", frontend.n_keypoints)?;
+        if frontend.klt_kernel == LkKernel::FixedPointU8 {
+            writeln!(f, "  klt kernel: fixed-point u8")?;
+        }
+        if let Some((max_level, max_iter)) = frontend.klt_prediction.search() {
+            writeln!(
+                f,
+                "  klt prediction: levels 0..={max_level}, {max_iter} iterations when trusted"
+            )?;
+        }
         if self.sensors.cameras == CameraSelection::Stereo {
             match frontend.stereo_close_depth {
                 StereoCloseDepth::Baselines(n) => writeln!(

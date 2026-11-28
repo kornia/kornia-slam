@@ -14,9 +14,9 @@ mod validation;
 
 pub use build::BuildError;
 pub use config::{
-    CameraSelection, FrontendConfig, LoopClosingMode, MappingConfig, OrbFrontendConfig,
-    OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection,
-    StereoCloseDepth, SystemConfig,
+    CameraSelection, FrontendConfig, KltPrediction, LoopClosingMode, MappingConfig,
+    OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION,
+    SensorSelection, StereoCloseDepth, SystemConfig,
 };
 #[cfg(feature = "serde")]
 pub use file::LoadError;
@@ -33,8 +33,9 @@ use crate::tracking::{
 
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 use crate::tracking::motion::{InertialPrediction, predict_pose};
+use crate::tracking::optical_flow::FlowSurvivor;
 use crate::tracking::timings::TrackingTimings;
-use crate::tracking::tracker::{FrameInput, Tracker};
+use crate::tracking::tracker::{FlowGuess, FrameInput, Tracker};
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -94,6 +95,9 @@ pub struct SlamSystem {
     previous_image: Option<Image<u8, 1>>,
     tracking_duration: Duration,
     tracking_timings: TrackingTimings,
+    /// `(max_level, max_iter)` of the optical-flow search from a trusted
+    /// inertial prediction; `None` searches the full pyramid.
+    klt_prediction: Option<(usize, usize)>,
     // Number given to the next frame; it becomes the keyframe's id in the map.
     next_frame_idx: usize,
 }
@@ -132,7 +136,7 @@ impl SlamSystem {
             camera,
             stereo_baseline_m: settings.stereo_baseline_m,
             multi_camera: settings.multi_camera,
-            tracker: Tracker::new(settings.map_projection),
+            tracker: Tracker::new(settings.map_projection).with_lk_kernel(settings.klt_kernel),
             two_view_init_config: settings.two_view_init,
             keyframe_policy: settings.keyframe_policy,
             tracking_loss_recovery: settings.tracking_loss_recovery,
@@ -150,6 +154,7 @@ impl SlamSystem {
             previous_image: None,
             tracking_duration: Duration::ZERO,
             tracking_timings: TrackingTimings::default(),
+            klt_prediction: settings.klt_prediction,
             next_frame_idx: 0,
         }
     }
@@ -885,9 +890,13 @@ impl SlamSystem {
             .state
             .lost_since_sec
             .map_or(0.0, |t0| timestamp_sec - t0);
-        let survivors =
-            self.tracker
-                .flow(previous_image, current_image, &mut self.tracking_timings);
+        let trusted_prediction = self.imu_confident(timestamp_sec);
+        let survivors = self.flow(
+            previous_image,
+            current_image,
+            &candidate_pose,
+            trusted_prediction,
+        );
         let result = {
             let map = self.map.lock().unwrap();
             self.tracker.estimate(
@@ -897,7 +906,7 @@ impl SlamSystem {
                     pose_before,
                     current_keyframe_idx: self.state.current_keyframe_idx,
                     lost_for_sec: currently_lost_for,
-                    trusted_prediction: self.imu_confident(timestamp_sec),
+                    trusted_prediction,
                 },
                 survivors,
                 &map,
@@ -1032,6 +1041,42 @@ impl SlamSystem {
             self.prune_imu_before(kf_ts.min(timestamp_sec));
         }
         self.frame_result(status)
+    }
+
+    /// The optical-flow survivors of the current frame, searched from the
+    /// predicted pose when `klt_prediction` is set and the prediction trusted.
+    fn flow(
+        &mut self,
+        previous_image: Option<&Image<u8, 1>>,
+        current_image: &Image<u8, 1>,
+        candidate_pose: &Pose3d,
+        trusted_prediction: bool,
+    ) -> Option<Vec<FlowSurvivor>> {
+        let Some((max_level, max_iter)) = self.klt_prediction.filter(|_| trusted_prediction) else {
+            return self.tracker.flow(
+                previous_image,
+                current_image,
+                None,
+                &mut self.tracking_timings,
+            );
+        };
+        let map = self
+            .map
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guess = FlowGuess {
+            map: &map,
+            pose: candidate_pose,
+            camera: &self.camera,
+            max_level,
+            max_iter,
+        };
+        self.tracker.flow(
+            previous_image,
+            current_image,
+            Some(guess),
+            &mut self.tracking_timings,
+        )
     }
 
     /// What the keyframe policy is shown for `frame`: the parallax is taken
