@@ -1039,7 +1039,7 @@ impl SlamSystem {
         // A pose far from where the motion model put the camera belongs to a
         // part of the map that has drifted from here; adopting it would
         // teleport the trajectory.
-        let predicted_position = self.state.pose_world_to_cam.inverse().translation;
+        let predicted_position = self.state.pose_world_to_cam.camera_centre();
         let mut refused = Vec::new();
         let found = {
             let map = self.map.lock().unwrap();
@@ -1050,8 +1050,7 @@ impl SlamSystem {
             );
             self.tracker
                 .relocalize(frame, &candidates, &map, &self.rig.camera, |found| {
-                    let jump =
-                        (found.estimate.pose.inverse().translation - predicted_position).length();
+                    let jump = (found.estimate.pose.camera_centre() - predicted_position).length();
                     let near = jump <= RELOCALIZATION_MAX_JUMP_M;
                     if !near {
                         refused.push((found.keyframe_idx, jump));

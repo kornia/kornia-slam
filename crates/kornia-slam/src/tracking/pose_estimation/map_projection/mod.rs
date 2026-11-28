@@ -558,7 +558,7 @@ impl<D: Descriptor> MapProjectionEstimator<D> {
     ) -> Vec<(usize, usize)> {
         let mut matched_kp = vec![false; keypoints_xy.len()];
         let mut matches = Vec::new();
-        let camera_center = pose_world_to_cam.inverse().translation;
+        let camera_center = pose_world_to_cam.camera_centre();
 
         for &mp_idx in candidates {
             let Some(mp) = map_points.get(mp_idx) else {

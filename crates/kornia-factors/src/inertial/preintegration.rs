@@ -61,7 +61,7 @@ pub struct ImuInformation {
 /// world vectors into the body frame, `t_wb` is the body origin in the world.
 pub fn body_frame(pose_cw: &Pose3d, t_bc: Option<&Pose3d>) -> (Mat3F64, Vec3F64) {
     let pose_bw = t_bc.map_or(*pose_cw, |t_bc| t_bc.compose(pose_cw));
-    (pose_bw.rotation, pose_bw.inverse().translation)
+    (pose_bw.rotation, pose_bw.camera_centre())
 }
 
 /// The residual `[r_R, r_v, r_p, r_bg, r_ba]` between states `i` and `j`

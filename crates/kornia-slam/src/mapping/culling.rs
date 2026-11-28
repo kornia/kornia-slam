@@ -42,7 +42,7 @@ fn select_for_culling(map: &Map) -> Vec<usize> {
     // Map point indices are dense, so a slot per point beats a hash map on large maps.
     let mut nearest = vec![f64::INFINITY; map.map_points().len()];
     for kf in map.keyframes() {
-        let centre = kf.frame.pose_world_to_cam.inverse().translation;
+        let centre = kf.frame.pose_world_to_cam.camera_centre();
         for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
             if let Some(mp) = map.map_points().get(*mp_idx)
                 && !mp.culled

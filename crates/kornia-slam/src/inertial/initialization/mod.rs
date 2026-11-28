@@ -120,20 +120,8 @@ impl ImuInitializer {
             return false;
         }
 
-        let t0 = kfs
-            .first()
-            .unwrap()
-            .frame
-            .pose_world_to_cam
-            .inverse()
-            .translation;
-        let t1 = kfs
-            .last()
-            .unwrap()
-            .frame
-            .pose_world_to_cam
-            .inverse()
-            .translation;
+        let t0 = kfs.first().unwrap().frame.pose_world_to_cam.camera_centre();
+        let t1 = kfs.last().unwrap().frame.pose_world_to_cam.camera_centre();
         (t1 - t0).length() >= self.config.min_motion
     }
 }

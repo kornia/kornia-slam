@@ -305,8 +305,8 @@ impl PoseManifold<4> for GravityManifold {
         validate_pose(pose)?;
         validate_delta(delta)?;
 
-        let center = pose.inverse().translation
-            + Vec3F64::new(delta[0] as f64, delta[1] as f64, delta[2] as f64);
+        let center =
+            pose.camera_centre() + Vec3F64::new(delta[0] as f64, delta[1] as f64, delta[2] as f64);
         // Positive world-frame yaw corresponds to a negative right perturbation
         // of the world-to-camera rotation.
         let yaw = SO3F64::exp(self.gravity_axis * -(delta[3] as f64)).matrix();
