@@ -727,6 +727,12 @@ mod ron_files {
         settings.frontend = FrontendConfig::Orb(OrbFrontendConfig {
             n_keypoints: 2000,
             stereo_close_depth: StereoCloseDepth::Metres(4.0),
+            klt_first: KltFirst::Enabled { min_tracks: 80 },
+            klt_prediction: KltPrediction::Enabled {
+                max_level: 1,
+                max_iter: 10,
+            },
+            klt_kernel: LkKernel::FixedPointU8,
         });
         settings.keyframes.ref_ratio = 0.75;
         settings.mapping.execution = LocalMappingMode::Synchronous;
@@ -740,6 +746,12 @@ mod ron_files {
             FrontendConfig::Orb(OrbFrontendConfig {
                 n_keypoints: 2000,
                 stereo_close_depth: StereoCloseDepth::Metres(4.0),
+                klt_first: KltFirst::Enabled { min_tracks: 80 },
+                klt_prediction: KltPrediction::Enabled {
+                    max_level: 1,
+                    max_iter: 10,
+                },
+                klt_kernel: LkKernel::FixedPointU8,
             })
         );
     }
