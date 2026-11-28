@@ -50,7 +50,7 @@ pub struct RigView<'a> {
     pub overlap: Option<PixelBox>,
 }
 
-impl RigView<'_> {
+impl<'a> RigView<'a> {
     /// Pose of this camera for a primary-camera pose (both world-to-camera).
     pub fn pose(&self, pose_world_to_primary: &Pose3d) -> Pose3d {
         self.camera_from_primary.compose(pose_world_to_primary)
@@ -63,7 +63,7 @@ impl RigView<'_> {
     }
 
     /// The raw fisheye model, `None` for a pinhole camera.
-    pub fn fisheye_model(&self) -> Option<&Camera> {
+    pub fn fisheye_model(&self) -> Option<&'a Camera> {
         self.is_raw().then_some(&self.camera.model)
     }
 

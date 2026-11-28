@@ -44,8 +44,10 @@ may be pinhole (with radtan distortion) or raw fisheye. Feed a capture with
 `SlamSystem::process_rig(timestamp, &[images…])`, one image per camera in rig order.
 Breaking for code that matches or builds these types: `CameraSelection::Rig` and
 `ProcessError::{RigRequired, NotARig, RigImageCount, RigSizeMismatch}` are new
-variants, `Frame` gains the field `rig: RigFeatures`, and `LandmarkObservation`
-gains `camera`. The selection, not the rig, decides the layout: a rectified pair
+variants, `Frame` gains the field `rig: RigFeatures`, `LandmarkObservation`
+gains `camera`, `ViBaParams` gains `rig_views` and `observation_views`, and
+`tracking::local_map::landmarks_in_frustum` takes the camera's raw fisheye model
+(`None` keeps the old pinhole test). The selection, not the rig, decides the layout: a rectified pair
 selected as `Rig` takes rig captures only.
 
 **EuRoC as a two-camera rig, and a LaMAria source.** In the app, `cameras: Rig` on
