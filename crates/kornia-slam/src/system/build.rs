@@ -3,13 +3,13 @@ use kornia_sensors::SensorRig;
 
 use super::config::{
     CameraSelection, FlowPose, ForwardBackward, FrontendConfig, GyroGuess, KltRetry, KltRig,
-    OrbFrontendConfig, OrbSlamPipeline, PipelineDefinition, SensorSelection, SystemConfig,
-    TrackRefill,
+    LoopClosingMode, OrbFrontendConfig, OrbSlamPipeline, PipelineDefinition, SensorSelection,
+    SystemConfig, TrackRefill,
 };
 use super::validation::ConfigError;
 use crate::initialization::two_view::TwoViewInitConfig;
-use crate::loop_closure::LoopCloser;
 use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabulary};
+use crate::loop_closure::{LoopCloser, LoopClosingConfig};
 use crate::mapping::LocalMappingMode;
 use crate::tracking::flow_pool::FlowPoolError;
 use crate::tracking::optical_flow::LkKernel;
@@ -197,16 +197,18 @@ impl SystemConfig {
         rig: &SensorRig,
     ) -> Result<Option<LoopCloser>, VocabularyLoadError> {
         let orb = self.orb();
-        orb.loop_closing
-            .vocabulary()
-            .map(|path| {
-                Ok(LoopCloser::new(
-                    load_vocabulary(path)?,
-                    orb.tuning.loop_correction.clone(),
-                    rig.imu.is_some(),
-                ))
-            })
-            .transpose()
+        let LoopClosingMode::Enabled { vocabulary, graph } = &orb.loop_closing else {
+            return Ok(None);
+        };
+        let config = LoopClosingConfig {
+            graph: *graph,
+            ..orb.tuning.loop_correction.clone()
+        };
+        Ok(Some(LoopCloser::new(
+            load_vocabulary(vocabulary)?,
+            config,
+            rig.imu.is_some(),
+        )))
     }
 
     fn orb(&self) -> &OrbSlamPipeline {

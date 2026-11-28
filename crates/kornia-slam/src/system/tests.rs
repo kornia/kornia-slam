@@ -7,6 +7,7 @@ use kornia_image::ImageSize;
 use super::*;
 use crate::frontend::OrbFrontend;
 use crate::frontend::tests::synthetic_pair;
+use crate::loop_closure::LoopGraphSettings;
 use crate::loop_closure::place_recognition::{Vocabulary, VocabularyLoadError};
 use crate::mapping::LocalMappingMode;
 
@@ -150,6 +151,7 @@ fn build_reports_a_missing_vocabulary() {
         false,
         LoopClosingMode::Enabled {
             vocabulary: missing.clone(),
+            graph: LoopGraphSettings::default(),
         },
     );
     match SlamSystem::build(enabled, stereo_imu_rig()) {
@@ -172,6 +174,7 @@ fn loop_closing_constructs_only_when_enabled() {
             imu,
             LoopClosingMode::Enabled {
                 vocabulary: vocabulary.0.clone(),
+                graph: LoopGraphSettings::default(),
             },
         );
         SlamSystem::build(config, stereo_imu_rig()).unwrap()

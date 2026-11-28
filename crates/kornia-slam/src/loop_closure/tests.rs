@@ -796,3 +796,454 @@ fn optimize_pose_graph_output_matches_its_golden_fingerprint() {
     assert_eq!(pgo_result_fingerprint(&se3), 0xc41d_4b73_a9e1_94a0);
     assert_eq!(pgo_result_fingerprint(&inertial), 0xd892_637a_5121_1385);
 }
+
+/// [`optimize_pose_graph`]'s snapshot, edges, solver and usability test through a [`PoseGraph`]
+/// of every keyframe, at `information`.
+fn optimize_through_graph(
+    map: &Map,
+    verified_loops: &[VerifiedLoopEdge],
+    config: &PgoConfig,
+    information: LoopGraphInformation,
+    inertial: Option<InertialPgoContext>,
+) -> Result<PgoResult, PgoError> {
+    solve_in_graph(
+        &keyframe_poses(map),
+        verified_loops,
+        config,
+        LoopGraphSettings { information },
+        inertial,
+    )
+}
+
+/// `Drift` at the worst EuRoC Machine Hall rates with loop closing off: translation from MH_04's
+/// relative-displacement error over 5-40 m, yaw from MH_02's revisit drift; loop edges at the
+/// noise of a stereo PnP pose at 2-3 m depth, under Cauchy at 3 sigma.
+fn machine_hall_drift() -> LoopGraphInformation {
+    LoopGraphInformation::Drift {
+        odometry: OdometryRandomWalk {
+            translation_m2_per_m: 0.0145,
+            rotation_rad2_per_m: 2.7e-6,
+            floor_m: 0.001,
+            floor_rad: 1e-4,
+        },
+        loop_sigma_m: 0.10,
+        loop_sigma_rad: 1.0_f64.to_radians(),
+        loop_cauchy_scale: 3.0,
+    }
+}
+
+/// The closer's PoseGraph path with `w * I` information takes the snapshot optimizer's LM path,
+/// on both manifolds.
+#[test]
+fn pose_graph_with_scalar_information_matches_optimize_pose_graph() {
+    let gravity = Vec3F64::new(0.1, -9.7, 0.4);
+    let (map, loops) = drifting_lap_map(gravity.normalize());
+    for inertial in [
+        None,
+        Some(InertialPgoContext {
+            gravity_world: gravity,
+        }),
+    ] {
+        let expected = optimize_pose_graph(&map, &loops, &PgoConfig::default(), inertial).unwrap();
+        let actual = optimize_through_graph(
+            &map,
+            &loops,
+            &PgoConfig::default(),
+            LoopGraphInformation::ScalarWeights,
+            inertial,
+        )
+        .unwrap();
+        assert_eq!(actual.keyframe_indices, expected.keyframe_indices);
+        assert_eq!(actual.original_poses, expected.original_poses);
+        assert_eq!(actual.usable, expected.usable);
+        assert!(actual.usable);
+        let largest = actual
+            .optimized_poses
+            .iter()
+            .zip(&expected.optimized_poses)
+            .map(|(a, e)| (a.inverse().translation - e.inverse().translation).length())
+            .fold(0.0, f64::max);
+        assert_eq!(actual.iterations, expected.iterations);
+        assert!(largest < 1e-5, "largest centre difference {largest} m");
+        let moved = expected
+            .original_poses
+            .iter()
+            .zip(&expected.optimized_poses)
+            .map(|(b, a)| (b.inverse().translation - a.inverse().translation).length())
+            .fold(0.0, f64::max);
+        assert!(moved > 0.05, "the loops must move the lap: {moved} m");
+    }
+}
+
+/// Map rotations off orthonormal by 1e-6, as bundle adjustment leaves them: the graph must seed
+/// its solve with the map's own poses, not with poses chained through `R^T` as an inverse.
+#[test]
+fn pose_graph_seeds_from_map_poses_that_are_not_quite_rotations() {
+    let gravity = Vec3F64::new(0.1, -9.7, 0.4);
+    let (clean, loops) = drifting_lap_map(gravity.normalize());
+    let mut map = Map::new();
+    for (index, keyframe) in clean.keyframes().iter().enumerate() {
+        let mut pose = keyframe.frame.pose_world_to_cam;
+        let wobble = 1e-6 * ((index * 7919) % 13) as f64 / 13.0;
+        let mut columns = pose.rotation.to_cols_array();
+        columns[..3]
+            .iter_mut()
+            .for_each(|value| *value *= 1.0 + wobble);
+        columns[6..]
+            .iter_mut()
+            .for_each(|value| *value *= 1.0 - wobble);
+        pose.rotation = Mat3F64::from_cols_array(&columns);
+        map.insert_keyframe(Keyframe::from_frame(frame(
+            keyframe.frame.idx,
+            pose,
+            &[],
+            Vec::new(),
+        )))
+        .unwrap();
+    }
+    let inertial = Some(InertialPgoContext {
+        gravity_world: gravity,
+    });
+    let expected = optimize_pose_graph(&map, &loops, &PgoConfig::default(), inertial).unwrap();
+    let actual = optimize_through_graph(
+        &map,
+        &loops,
+        &PgoConfig::default(),
+        LoopGraphInformation::ScalarWeights,
+        inertial,
+    )
+    .unwrap();
+    assert_eq!(actual.iterations, expected.iterations);
+    assert_eq!(actual.optimized_poses, expected.optimized_poses);
+}
+
+/// A 24-keyframe square lap, 0.5 m apart, drifting `drift` rad of yaw and a few mm per
+/// keyframe about gravity; `drift = 0` is the truth.
+fn square_lap(gravity_axis: Vec3F64, drift: f64) -> Vec<Pose3d> {
+    (0..24)
+        .map(|index| {
+            let side = index / 6;
+            let along = (index % 6) as f64 * 0.5;
+            let (x, y) = match side {
+                0 => (along, 0.0),
+                1 => (3.0, along),
+                2 => (3.0 - along, 3.0),
+                _ => (0.0, 3.0 - along),
+            };
+            let walked = index as f64 * drift;
+            let yaw = side as f64 * std::f64::consts::FRAC_PI_2 + walked;
+            let rotation = SO3F64::exp(gravity_axis * -yaw).matrix();
+            let centre = Vec3F64::new(x + 2.5 * walked, y - 1.5 * walked, 0.0);
+            Pose3d::new(rotation, -(rotation * centre))
+        })
+        .collect()
+}
+
+/// Drift information with a loop measured from the truth: the random walk over the 11.5 m lap
+/// chains to ~0.41 m, softer than the loop's 0.10 m / 1 deg, so the true correction sits near
+/// 1 sigma of the pair, Cauchy keeps its weight, and the end goes most of the way to the truth.
+/// The floored per-edge sigmas this replaced chained to ~0.05 m and moved it 0.268 -> 0.255 m.
+#[test]
+fn drift_information_pulls_a_true_loop_towards_the_truth() {
+    let gravity = Vec3F64::new(0.0, -9.81, 0.0);
+    let truth = square_lap(gravity.normalize(), 0.0);
+    let mut map = Map::new();
+    for (index, pose) in square_lap(gravity.normalize(), 0.004)
+        .into_iter()
+        .enumerate()
+    {
+        map.insert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())))
+            .unwrap();
+    }
+    let edge = VerifiedLoopEdge {
+        candidate_to_query: Pose3d::between(&truth[0], &truth[23]),
+        ..verified_edge(23, 0, 40, 0.875, 1.0, 8)
+    };
+    let result = optimize_through_graph(
+        &map,
+        std::slice::from_ref(&edge),
+        &PgoConfig::default(),
+        machine_hall_drift(),
+        Some(InertialPgoContext {
+            gravity_world: gravity,
+        }),
+    )
+    .unwrap();
+    let error = |poses: &[Pose3d]| {
+        (poses[23].inverse().translation - truth[23].inverse().translation).length()
+    };
+    let (before, after) = (
+        error(&result.original_poses),
+        error(&result.optimized_poses),
+    );
+    assert!(result.usable);
+    assert!(after < 0.25 * before, "end error {before} m -> {after} m");
+}
+
+/// `square_lap`'s 3 m square sampled every `spacing_m` from 0 to 11.5 m of path, drifting
+/// `drift_rad_per_m` of yaw (and 2.5 / -1.5 m per rad of it) per metre: one trajectory, any
+/// keyframe density. `drift = 0` is the truth.
+fn square_lap_every(gravity_axis: Vec3F64, spacing_m: f64, drift_rad_per_m: f64) -> Vec<Pose3d> {
+    let keyframes = (11.5 / spacing_m).round() as usize + 1;
+    (0..keyframes)
+        .map(|index| {
+            let path = index as f64 * spacing_m;
+            let side = ((path + 1e-9) / 3.0).floor();
+            let along = path - 3.0 * side;
+            let (x, y) = match side as usize {
+                0 => (along, 0.0),
+                1 => (3.0, along),
+                2 => (3.0 - along, 3.0),
+                _ => (0.0, 3.0 - along),
+            };
+            let walked = path * drift_rad_per_m;
+            let yaw = side * std::f64::consts::FRAC_PI_2 + walked;
+            let rotation = SO3F64::exp(gravity_axis * -yaw).matrix();
+            let centre = Vec3F64::new(x + 2.5 * walked, y - 1.5 * walked, 0.0);
+            Pose3d::new(rotation, -(rotation * centre))
+        })
+        .collect()
+}
+
+/// Solved camera centres at every keyframe of the 0.5 m lap, solving the lap sampled every
+/// `spacing_m` (0.5 m or a divisor of it) with one true loop from its end to its start.
+fn lap_solved_at_half_metre(information: LoopGraphInformation, spacing_m: f64) -> Vec<Vec3F64> {
+    let gravity = Vec3F64::new(0.0, -9.81, 0.0);
+    let mut map = Map::new();
+    for (index, pose) in square_lap_every(gravity.normalize(), spacing_m, 0.008)
+        .into_iter()
+        .enumerate()
+    {
+        map.insert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())))
+            .unwrap();
+    }
+    let truth = square_lap_every(gravity.normalize(), spacing_m, 0.0);
+    let last = truth.len() - 1;
+    let edge = VerifiedLoopEdge {
+        candidate_to_query: Pose3d::between(&truth[0], &truth[last]),
+        ..verified_edge(last, 0, 40, 0.875, 1.0, 8)
+    };
+    let result = optimize_through_graph(
+        &map,
+        std::slice::from_ref(&edge),
+        &PgoConfig::default(),
+        information,
+        Some(InertialPgoContext {
+            gravity_world: gravity,
+        }),
+    )
+    .unwrap();
+    assert!(result.usable);
+    let stride = (0.5 / spacing_m).round() as usize;
+    result
+        .optimized_poses
+        .iter()
+        .step_by(stride)
+        .map(|pose| pose.inverse().translation)
+        .collect()
+}
+
+/// Theory: a random walk's variance adds along a chain, so splitting each 0.5 m edge in two (or
+/// four) leaves the chain between any two 0.5 m keyframes, and so the solve, unchanged. What is
+/// left is second order: rotation noise at the extra nodes reaches translation through their
+/// lever arm (<= 0.25 m), adding about 1e-5 of the translation variance, and the f32 solve's own
+/// convergence. 1 mm against a ~0.3 m correction covers both. Floored per-edge sigmas make the
+/// denser chain stiffer instead, and the same loop moves the lap less.
+#[test]
+fn drift_information_solves_one_trajectory_alike_at_two_keyframe_densities() {
+    let information = machine_hall_drift();
+    let sparse = lap_solved_at_half_metre(information, 0.5);
+    for spacing in [0.25, 0.125] {
+        let dense = lap_solved_at_half_metre(information, spacing);
+        assert_eq!(dense.len(), sparse.len());
+        let largest = dense
+            .iter()
+            .zip(&sparse)
+            .map(|(a, b)| (*a - *b).length())
+            .fold(0.0, f64::max);
+        assert!(largest < 1e-3, "{spacing} m spacing: {largest} m apart");
+    }
+}
+
+#[test]
+fn loop_closer_gate_rejects_correction_beyond_odometry_drift() {
+    let config = LoopClosingConfig {
+        odometry_gate: LoopOdometryGate::sim_fitted(),
+        ..closing_config()
+    };
+    let (mut closer, mut map) = closing_fixture(config, false);
+    let before = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    let context = closing_context(&map);
+    let outcome = closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert!(outcome.events.is_empty());
+    assert!(outcome.tracking_correction.is_none());
+    assert!(matches!(
+        outcome.gate_messages.as_slice(),
+        [line] if line.starts_with("[loop-gate] kf=10~0 ") && line.ends_with(" reject")
+    ));
+    assert_eq!(closer.verified_loop_count(), 0);
+    assert_eq!(
+        map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
+        before
+    );
+}
+
+/// Out 12 m along x and 6 m back: the last keyframe sits 6 m from the first.
+fn out_and_back_map() -> Map {
+    let mut map = Map::new();
+    let centres = (0..=12).chain((6..12).rev()).map(|x| x as f64);
+    for (idx, x) in centres.enumerate() {
+        let centre = Vec3F64::new(x, if idx > 12 { 0.5 } else { 0.0 }, 0.0);
+        let pose = Pose3d::new(Mat3F64::IDENTITY, -centre);
+        map.insert_keyframe(Keyframe::from_frame(frame(idx, pose, &[], Vec::new())))
+            .unwrap();
+    }
+    map
+}
+
+fn edge_placing_query_at(map: &Map, query_kf_idx: usize, centre: Vec3F64) -> VerifiedLoopEdge {
+    let candidate = map.get_keyframe(0).unwrap().frame.pose_world_to_cam;
+    let query = Pose3d::new(Mat3F64::IDENTITY, -centre);
+    VerifiedLoopEdge {
+        candidate_to_query: Pose3d::between(&candidate, &query),
+        ..verified_edge(query_kf_idx, 0, 62, 0.6, 0.73, 10)
+    }
+}
+
+/// A repeated-structure match claims the last keyframe, 6 m from the first
+/// along 18 m of path, is back at the start. Optimizing with that edge drags
+/// the trajectory by metres; the gate refuses it and keeps a drift-sized loop.
+#[test]
+fn false_loop_edge_distorts_pose_graph_and_gate_rejects_it() {
+    let map = out_and_back_map();
+    let query_kf_idx = map.keyframes().last().unwrap().frame.idx;
+    let query = map
+        .get_keyframe(query_kf_idx)
+        .unwrap()
+        .frame
+        .pose_world_to_cam;
+    let candidate = map.get_keyframe(0).unwrap().frame.pose_world_to_cam;
+    let path = || map.keyframes().iter().map(|kf| kf.frame.pose_world_to_cam);
+
+    let false_edge = edge_placing_query_at(&map, query_kf_idx, Vec3F64::new(0.1, 0.0, 0.0));
+    let config = PgoConfig {
+        loop_edge_weight: 10.0,
+        ..PgoConfig::default()
+    };
+    let distorted =
+        optimize_pose_graph(&map, std::slice::from_ref(&false_edge), &config, None).unwrap();
+    let largest_shift = distorted
+        .original_poses
+        .iter()
+        .zip(&distorted.optimized_poses)
+        .map(|(before, after)| {
+            (before.inverse().translation - after.inverse().translation).length()
+        })
+        .fold(0.0, f64::max);
+    assert!(largest_shift > 3.0, "shift {largest_shift}");
+
+    let gate = LoopOdometryGate::sim_fitted();
+    let false_correction = LoopCorrection::measure(candidate, query, path(), &false_edge, None);
+    assert!((false_correction.path_m - (17.0 + 1.25_f64.sqrt())).abs() < 1e-9);
+    assert!((false_correction.translation_m() - 5.92).abs() < 0.01);
+    assert!(!gate.judge(&false_correction).unwrap().accepted);
+
+    let true_edge = edge_placing_query_at(&map, query_kf_idx, Vec3F64::new(6.2, 0.3, 0.0));
+    let true_correction = LoopCorrection::measure(candidate, query, path(), &true_edge, None);
+    assert!(gate.judge(&true_correction).unwrap().accepted);
+}
+
+/// The sim's false loop kf1398~345 in miniature: out 9.65 m along x and 3.65 m back, so the
+/// path is 13.3 m and the last keyframe sits 6.0 m from the first, and a verified edge that
+/// puts it back at the start.
+fn false_loop_fixture() -> (Map, VerifiedLoopEdge) {
+    let centres = (0..=28)
+        .map(|step| 9.65 * step as f64 / 28.0)
+        .chain((0..11).rev().map(|step| 6.0 + 3.65 * step as f64 / 11.0));
+    let mut map = Map::new();
+    for (index, x) in centres.enumerate() {
+        let pose = Pose3d::new(Mat3F64::IDENTITY, -Vec3F64::new(x, 0.0, 0.0));
+        map.insert_keyframe(Keyframe::from_frame(frame(index, pose, &[], Vec::new())))
+            .unwrap();
+    }
+    let query_kf_idx = map.keyframes().last().unwrap().frame.idx;
+    let edge = edge_placing_query_at(&map, query_kf_idx, Vec3F64::ZERO);
+    (map, edge)
+}
+
+/// Theory: the gate's 3 sigma at 13.3 m is 3 * (0.019 * 13.3 + 0.10) = 1.06 m, far below 6 m.
+/// With the gate off, Cauchy bounds the damage but does not remove it: the random-walk chain over
+/// 13.3 m is sqrt(0.0145 * 13.3) = 0.44 m, and the stationary point of
+/// `(6 - r) / 0.44^2 = (r / 0.1^2) / (1 + (r / 0.1)^2 / 9)` leaves the loop at r = 5.7 m, so the far
+/// end moves about 0.3 m. Least squares at `w * I` drags it most of the 6 m.
+#[test]
+fn false_loop_is_gated_and_cauchy_bounds_the_map_when_the_gate_is_off() {
+    let (map, false_edge) = false_loop_fixture();
+    let query = map.keyframes().last().unwrap().frame.pose_world_to_cam;
+    let candidate = map.get_keyframe(0).unwrap().frame.pose_world_to_cam;
+    let path = map.keyframes().iter().map(|kf| kf.frame.pose_world_to_cam);
+    let correction = LoopCorrection::measure(candidate, query, path, &false_edge, None);
+    assert!((correction.path_m - 13.3).abs() < 1e-9);
+    assert!((correction.translation_m() - 6.0).abs() < 1e-9);
+    let proposal = LoopProposal {
+        edge: &false_edge,
+        correction,
+        query_order: map.keyframes().len() - 1,
+        candidate_order: 0,
+    };
+    let mut gate = OdometryConsistencyGate(LoopOdometryGate::sim_fitted());
+    assert!(matches!(
+        gate.decide(&proposal, &mut Vec::new()),
+        GateDecision::Reject(_)
+    ));
+
+    let largest_shift = |information| {
+        let result = optimize_through_graph(
+            &map,
+            std::slice::from_ref(&false_edge),
+            &PgoConfig::default(),
+            information,
+            None,
+        )
+        .unwrap();
+        result
+            .original_poses
+            .iter()
+            .zip(&result.optimized_poses)
+            .map(|(before, after)| {
+                (before.inverse().translation - after.inverse().translation).length()
+            })
+            .fold(0.0, f64::max)
+    };
+    let cauchy = largest_shift(machine_hall_drift());
+    let least_squares = largest_shift(LoopGraphInformation::ScalarWeights);
+    assert!((0.2..0.4).contains(&cauchy), "Cauchy shift {cauchy} m");
+    assert!(least_squares > 3.0, "least-squares shift {least_squares} m");
+}
+
+/// The fixture's loop, strong enough to correct the drift and fuse.
+fn background_config() -> LoopClosingConfig {
+    let mut config = closing_config();
+    config.optimizer.loop_edge_weight = 100.0;
+    config.graph.information = LoopGraphInformation::ScalarWeights;
+    config
+}
+
+/// A solve cut off before it converges is not written back, and says why: an unusable result is
+/// never a silent `applied: false`.
+#[test]
+fn an_unusable_solve_reports_why() {
+    let mut config = background_config();
+    config.optimizer.max_iterations = 1;
+    let unusable = |events: &[LoopClosureEvent]| {
+        matches!(events, [
+            LoopClosureEvent::PgoFailed { reason, .. },
+            LoopClosureEvent::Accepted { applied: false, .. }
+        ] if reason.starts_with("unusable solve") && reason.contains("not converged"))
+    };
+
+    let (mut closer, mut map) = closing_fixture(config, false);
+    let context = closing_context(&map);
+    let inline = closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert!(unusable(&inline.events), "{:?}", inline.events);
+}

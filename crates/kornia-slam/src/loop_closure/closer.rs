@@ -15,11 +15,13 @@ use kornia_algebra::Vec3F64;
 
 use crate::features::Descriptor;
 use crate::loop_closure::place_recognition::{BowEncoder, Candidate, KeyFrameDatabase};
+use crate::loop_closure::pose_graph::{max_gravity_alignment_error, unusable_reason};
 use crate::loop_closure::{
-    GateDecision, InertialPgoContext, LoopCorrection, LoopEpisodeConfig, LoopEpisodeDecision,
-    LoopEpisodeTracker, LoopFusionConfig, LoopGate, LoopOdometryGate, LoopProposal,
-    LoopTemporalConsistency, LoopVerificationConfig, OdometryConsistencyGate, PgoConfig,
-    TemporalConsistencyGate, VerifiedLoopEdge, fuse_verified_loop, optimize_pose_graph,
+    GateDecision, GraphManifold, InertialPgoContext, LoopCorrection, LoopEpisodeConfig,
+    LoopEpisodeDecision, LoopEpisodeTracker, LoopFusionConfig, LoopGate, LoopMeasurement,
+    LoopOdometryGate, LoopProposal, LoopTemporalConsistency, LoopVerificationConfig,
+    OdometryConsistencyGate, PgoConfig, PgoError, PgoResult, PoseGraph, PoseGraphConfig,
+    PoseGraphError, TemporalConsistencyGate, VerifiedLoopEdge, fuse_verified_loop,
     verify_loop_candidate,
 };
 use crate::mapping::Map;
@@ -34,6 +36,10 @@ pub struct LoopClosingConfig<D: Descriptor = RBrief> {
     pub odometry_gate: LoopOdometryGate,
     pub temporal_consistency: LoopTemporalConsistency,
     pub optimizer: PgoConfig,
+    /// Set from [`LoopClosingMode::Enabled`] when the system is built.
+    ///
+    /// [`LoopClosingMode::Enabled`]: crate::system::LoopClosingMode::Enabled
+    pub graph: LoopGraphSettings,
 }
 
 impl Default for LoopClosingConfig {
@@ -45,8 +51,55 @@ impl Default for LoopClosingConfig {
             odometry_gate: LoopOdometryGate::default(),
             temporal_consistency: LoopTemporalConsistency::default(),
             optimizer: PgoConfig::default(),
+            graph: LoopGraphSettings::default(),
         }
     }
+}
+
+/// How accepted loops are solved: a pose graph of the map's keyframes, built at every solve.
+/// The default is [`optimize_pose_graph`]'s computation, `w * I` information.
+///
+/// [`optimize_pose_graph`]: crate::loop_closure::optimize_pose_graph
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct LoopGraphSettings {
+    pub information: LoopGraphInformation,
+}
+
+/// The information odometry and loop edges carry in the pose graph.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum LoopGraphInformation {
+    /// `w * I` from [`PgoConfig`]: the scalar weights of [`optimize_pose_graph`].
+    ///
+    /// [`optimize_pose_graph`]: crate::loop_closure::optimize_pose_graph
+    #[default]
+    ScalarWeights,
+    /// Odometry edges a random walk in path; loop edges at the verified pose's own noise
+    /// (`loop_sigma_m`, `loop_sigma_rad`) under a Cauchy kernel at `loop_cauchy_scale` sigmas.
+    /// Every field must be given.
+    Drift {
+        odometry: OdometryRandomWalk,
+        loop_sigma_m: f64,
+        loop_sigma_rad: f64,
+        loop_cauchy_scale: f64,
+    },
+}
+
+/// Odometry noise between keyframes as a random walk in path: `sigma = sqrt(rate * path)`, so a
+/// chain of odometry edges has the same sigma whatever the keyframe spacing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+pub struct OdometryRandomWalk {
+    pub translation_m2_per_m: f64,
+    /// Applied to every rotation axis; only yaw moves on a gravity manifold.
+    pub rotation_rad2_per_m: f64,
+    /// Conditioning floors for edges that barely move; small, because a per-edge floor
+    /// compounds along the chain like density-dependent noise.
+    pub floor_m: f64,
+    pub floor_rad: f64,
 }
 
 /// Concise externally visible result of a loop-closure attempt.
@@ -356,71 +409,80 @@ impl<D: Descriptor> LoopAcceptance<D> {
         context: LoopClosingContext,
         outcome: &mut LoopClosingOutcome,
     ) {
-        let inertial_pgo = context.imu_initialized.then_some(InertialPgoContext {
+        let inertial = context.imu_initialized.then_some(InertialPgoContext {
             gravity_world: context.gravity_world,
         });
         let mut loops = self.verified_loops.clone();
         loops.push(representative.clone());
-        match optimize_pose_graph(map, &loops, &self.config.optimizer, inertial_pgo) {
-            Ok(result) => {
-                if result.usable {
-                    let tracking_correction = context
-                        .current_keyframe_idx
-                        .and_then(|reference_kf_idx| {
-                            pose_graph_reference_correction(
-                                reference_kf_idx,
-                                &result.keyframe_indices,
-                                &result.original_poses,
-                                &result.optimized_poses,
-                            )
-                        })
-                        .map(|(reference_before, reference_after, world)| {
-                            (
-                                apply_reference_pose_correction(
-                                    context.pose_world_to_cam,
-                                    reference_before,
-                                    reference_after,
-                                ),
-                                world.rotation * context.velocity_world,
-                            )
-                        });
-                    if let Some(tracking_correction) = tracking_correction {
-                        match map.apply_pose_graph_correction(
+        let solved = solve_in_graph(
+            &keyframe_poses(map),
+            &loops,
+            &self.config.optimizer,
+            self.config.graph,
+            inertial,
+        );
+        let failed = |reason: String| LoopClosureEvent::PgoFailed {
+            query_kf_idx: representative.query_kf_idx,
+            candidate_kf_idx: representative.candidate_kf_idx,
+            reason,
+        };
+        match solved {
+            Ok(result) if result.usable => {
+                let tracking_correction = context
+                    .current_keyframe_idx
+                    .and_then(|reference_kf_idx| {
+                        pose_graph_reference_correction(
+                            reference_kf_idx,
                             &result.keyframe_indices,
                             &result.original_poses,
                             &result.optimized_poses,
-                        ) {
-                            Ok(_) => {
-                                fuse_verified_loop(
-                                    map,
-                                    camera,
-                                    &representative,
-                                    &self.config.fusion,
-                                );
-                                outcome.tracking_correction = Some(tracking_correction);
-                                outcome.pgo_applied = true;
-                            }
-                            Err(error) => outcome.events.push(LoopClosureEvent::PgoFailed {
-                                query_kf_idx: representative.query_kf_idx,
-                                candidate_kf_idx: representative.candidate_kf_idx,
-                                reason: format!("live map correction rejected: {error}"),
-                            }),
-                        }
-                    } else {
-                        outcome.events.push(LoopClosureEvent::PgoFailed {
-                            query_kf_idx: representative.query_kf_idx,
-                            candidate_kf_idx: representative.candidate_kf_idx,
-                            reason: "current reference keyframe is outside the PGO snapshot".into(),
-                        });
+                        )
+                    })
+                    .map(|(reference_before, reference_after, world)| {
+                        (
+                            apply_reference_pose_correction(
+                                context.pose_world_to_cam,
+                                reference_before,
+                                reference_after,
+                            ),
+                            world.rotation * context.velocity_world,
+                        )
+                    });
+                let Some(tracking_correction) = tracking_correction else {
+                    outcome.events.push(failed(
+                        "current reference keyframe is outside the PGO snapshot".into(),
+                    ));
+                    return self.report_accepted(representative, outcome);
+                };
+                match map.apply_pose_graph_correction(
+                    &result.keyframe_indices,
+                    &result.original_poses,
+                    &result.optimized_poses,
+                ) {
+                    Ok(_) => {
+                        fuse_verified_loop(map, camera, &representative, &self.config.fusion);
+                        outcome.tracking_correction = Some(tracking_correction);
+                        outcome.pgo_applied = true;
                     }
+                    Err(error) => outcome
+                        .events
+                        .push(failed(format!("live map correction rejected: {error}"))),
                 }
             }
-            Err(error) => outcome.events.push(LoopClosureEvent::PgoFailed {
-                query_kf_idx: representative.query_kf_idx,
-                candidate_kf_idx: representative.candidate_kf_idx,
-                reason: error.to_string(),
-            }),
+            Ok(result) => outcome
+                .events
+                .push(failed(result.unusable_reason.unwrap_or_default())),
+            Err(error) => outcome.events.push(failed(error.to_string())),
         }
+        self.report_accepted(representative, outcome);
+    }
+
+    /// Reports `representative` accepted, applied or not, and records it.
+    fn report_accepted(
+        &mut self,
+        representative: VerifiedLoopEdge,
+        outcome: &mut LoopClosingOutcome,
+    ) {
         outcome.events.push(LoopClosureEvent::Accepted {
             edge: representative.clone(),
             applied: outcome.pgo_applied,
@@ -462,6 +524,127 @@ fn loop_correction<D: Descriptor>(
         edge,
         gravity,
     ))
+}
+
+/// The map's keyframes in map order with their world-to-camera poses: what a solve reads.
+pub(super) fn keyframe_poses<D: Descriptor>(map: &Map<D>) -> Vec<(usize, Pose3d)> {
+    map.keyframes()
+        .iter()
+        .map(|keyframe| (keyframe.frame.idx, keyframe.frame.pose_world_to_cam))
+        .collect()
+}
+
+/// Builds the pose graph of `keyframes` (map order, world-to-camera), adds `loops` (the last is
+/// the new one) and solves. A loop whose keyframe is not among `keyframes` is refused, as
+/// [`optimize_pose_graph`] refuses it.
+///
+/// [`optimize_pose_graph`]: crate::loop_closure::optimize_pose_graph
+pub(super) fn solve_in_graph(
+    keyframes: &[(usize, Pose3d)],
+    loops: &[VerifiedLoopEdge],
+    config: &PgoConfig,
+    settings: LoopGraphSettings,
+    inertial: Option<InertialPgoContext>,
+) -> Result<PgoResult, PgoError> {
+    let information = settings.information;
+    let solver = |error: PoseGraphError| PgoError::Solver(error.to_string());
+    if keyframes.len() < 2 {
+        return Err(PgoError::TooFewKeyframes);
+    }
+    if loops.is_empty() {
+        return Err(PgoError::MissingLoopKeyframe);
+    }
+    let mut graph = PoseGraph::new(snapshot_graph_config(config, information, inertial));
+    for &(kf, pose) in keyframes {
+        graph.add_keyframe(kf, pose).map_err(solver)?;
+    }
+    let (sigma_m, sigma_rad) = loop_sigmas(config, information);
+    let measured = loops.iter().map(|edge| {
+        let measurement = LoopMeasurement {
+            candidate_to_query: edge.candidate_to_query,
+            sigma_m,
+            sigma_rad,
+        };
+        (edge.candidate_kf_idx, edge.query_kf_idx, measurement)
+    });
+    let report = graph
+        .add_loop_edges(measured)
+        .map_err(|error| match error {
+            PoseGraphError::UnknownKeyframe(_) => PgoError::MissingLoopKeyframe,
+            error => PgoError::Solver(error.to_string()),
+        })?;
+    let (keyframe_indices, original_poses, optimized_poses) = graph.poses_before_after();
+    let gravity_error = inertial.map(|context| {
+        max_gravity_alignment_error(&original_poses, &optimized_poses, context.gravity_world)
+    });
+    let unusable_reason = unusable_reason(
+        report.converged,
+        report.iterations,
+        (report.cost_before, report.cost_after),
+        (report.loop_residual_before, report.loop_residual_after),
+        gravity_error,
+    );
+    Ok(PgoResult {
+        keyframe_indices,
+        original_poses,
+        optimized_poses,
+        iterations: report.iterations,
+        usable: unusable_reason.is_none(),
+        capped: !report.converged && unusable_reason.is_none(),
+        unusable_reason,
+    })
+}
+
+/// The loop edges' `(sigma_m, sigma_rad)` at `information`.
+fn loop_sigmas(config: &PgoConfig, information: LoopGraphInformation) -> (f64, f64) {
+    match information {
+        LoopGraphInformation::ScalarWeights => {
+            let sigma = 1.0 / f64::from(config.loop_edge_weight);
+            (sigma, sigma)
+        }
+        LoopGraphInformation::Drift {
+            loop_sigma_m,
+            loop_sigma_rad,
+            ..
+        } => (loop_sigma_m, loop_sigma_rad),
+    }
+}
+
+/// Scalar weights put `sigma = 1 / w = 1` on odometry edges; `Drift` makes them its random walk.
+fn snapshot_graph_config(
+    config: &PgoConfig,
+    information: LoopGraphInformation,
+    inertial: Option<InertialPgoContext>,
+) -> PoseGraphConfig {
+    let (walk_m2_per_m, walk_rad2_per_m, min_sigma_m, min_sigma_rad, loop_cauchy_scale) =
+        match information {
+            LoopGraphInformation::ScalarWeights => (0.0, 0.0, 1.0, 1.0, None),
+            LoopGraphInformation::Drift {
+                odometry,
+                loop_cauchy_scale,
+                ..
+            } => (
+                odometry.translation_m2_per_m,
+                odometry.rotation_rad2_per_m,
+                odometry.floor_m,
+                odometry.floor_rad,
+                Some(loop_cauchy_scale),
+            ),
+        };
+    PoseGraphConfig {
+        manifold: inertial.map_or(GraphManifold::Se3, |context| {
+            GraphManifold::Gravity(context.gravity_world)
+        }),
+        walk_m2_per_m,
+        walk_rad2_per_m,
+        min_sigma_m,
+        min_sigma_rad,
+        loop_cauchy_scale,
+        max_iterations: config.max_iterations,
+        cost_tolerance: config.cost_tolerance,
+        gradient_tolerance: config.gradient_tolerance,
+        initial_lambda: config.initial_lambda,
+    }
 }
 
 fn normalized_loop_pair(a: usize, b: usize) -> (usize, usize) {
