@@ -5,7 +5,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::initialization::two_view::TwoViewInitConfig;
-use crate::loop_closure::LoopClosingConfig;
+use crate::loop_closure::{LoopClosingConfig, LoopGraphInformation, LoopGraphSettings};
 use crate::mapping::LocalMappingMode;
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
@@ -351,7 +351,7 @@ pub struct MappingConfig {
 /// `vocabulary` is a `.bin` from `convert_orbvoc` or a DBoW2 `ORBvoc.txt`,
 /// selected by extension. A relative path in a file is resolved against that
 /// file's directory.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub enum LoopClosingMode {
@@ -360,19 +360,66 @@ pub enum LoopClosingMode {
     Disabled,
     /// Needs metric input: stereo cameras or the IMU. With the IMU selected,
     /// corrections wait for inertial initialization.
-    Enabled { vocabulary: PathBuf },
+    Enabled {
+        vocabulary: PathBuf,
+        /// The pose graph accepted loops solve; the default is the `w * I` solve.
+        #[cfg_attr(feature = "serde", serde(default))]
+        graph: LoopGraphSettings,
+        #[cfg_attr(feature = "serde", serde(default))]
+        execution: LoopClosingExecution,
+    },
+}
+
+/// Where an accepted loop's pose-graph solve runs and when it is written back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum LoopClosingExecution {
+    /// `Synchronous` with synchronous local mapping, else `Asynchronous`.
+    FollowMapping,
+    /// Solved and written back inside the keyframe that accepted the loop. The default: the
+    /// background modes are opt-in.
+    #[default]
+    Synchronous,
+    /// Solved inline, written back through the asynchronous path `frames` frames later (at
+    /// least one): reproducible runs of the background path. It differs from `Synchronous` in
+    /// three ways: the camera follows the correction most of its local landmarks take, not its
+    /// reference keyframe's; fusion is planned on the copy of the loop neighbourhoods taken at
+    /// submit and each operation is checked against the live map at writeback; and keyframes
+    /// created during the solve are not fused.
+    AsynchronousReplay { frames: usize },
+    /// Solved on a background thread and written back at the first frame
+    /// boundary after it ends.
+    Asynchronous,
+}
+
+impl LoopClosingExecution {
+    /// The execution `FollowMapping` stands for under `mapping`.
+    pub fn resolve(self, mapping: LocalMappingMode) -> Self {
+        match (self, mapping) {
+            (Self::FollowMapping, LocalMappingMode::Synchronous) => Self::Synchronous,
+            (Self::FollowMapping, LocalMappingMode::Asynchronous) => Self::Asynchronous,
+            (execution, _) => execution,
+        }
+    }
 }
 
 impl LoopClosingMode {
     pub fn vocabulary(&self) -> Option<&Path> {
         match self {
             Self::Disabled => None,
-            Self::Enabled { vocabulary } => Some(vocabulary),
+            Self::Enabled { vocabulary, .. } => Some(vocabulary),
         }
     }
 
     pub fn is_enabled(&self) -> bool {
         matches!(self, Self::Enabled { .. })
+    }
+
+    pub fn graph(&self) -> Option<LoopGraphSettings> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled { graph, .. } => Some(*graph),
+        }
     }
 }
 
@@ -382,7 +429,7 @@ impl SystemConfig {
     /// from. Absolute paths are kept.
     pub fn resolve_paths(&mut self, base_dir: &Path) {
         let PipelineDefinition::OrbSlam(orb) = &mut self.pipeline;
-        if let LoopClosingMode::Enabled { vocabulary } = &mut orb.loop_closing
+        if let LoopClosingMode::Enabled { vocabulary, .. } = &mut orb.loop_closing
             && vocabulary.is_relative()
         {
             *vocabulary = base_dir.join(&*vocabulary);
@@ -473,8 +520,29 @@ impl fmt::Display for SystemConfig {
             LocalMappingMode::Asynchronous => "asynchronous",
         };
         writeln!(f, "  local mapping: {execution}")?;
-        if let Some(vocabulary) = orb.loop_closing.vocabulary() {
-            writeln!(f, "  loop closing: {}", vocabulary.display())?;
+        if let LoopClosingMode::Enabled {
+            vocabulary,
+            graph,
+            execution,
+        } = &orb.loop_closing
+        {
+            let information = match graph.information {
+                LoopGraphInformation::ScalarWeights => "w*I",
+                LoopGraphInformation::Drift { .. } => "drift",
+            };
+            write!(
+                f,
+                "  loop closing: {} (pose graph: {information})",
+                vocabulary.display()
+            )?;
+            match execution {
+                LoopClosingExecution::FollowMapping => writeln!(f, ", following mapping")?,
+                LoopClosingExecution::Synchronous => writeln!(f)?,
+                LoopClosingExecution::AsynchronousReplay { frames } => {
+                    writeln!(f, ", asynchronous replay after {frames} frames")?
+                }
+                LoopClosingExecution::Asynchronous => writeln!(f, ", asynchronous")?,
+            }
         }
         Ok(())
     }

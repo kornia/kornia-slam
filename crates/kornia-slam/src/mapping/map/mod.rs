@@ -8,7 +8,7 @@
 //! | Group | Examples |
 //! |---|---|
 //! | `mutation` | `insert_keyframe`, `insert_landmark`, `link_observation`, `apply_insertion`, `merge_map_points` |
-//! | `correction` | `apply_pose_graph_correction`, `apply_inertial_alignment`, `apply_ba_update` |
+//! | `correction` | `apply_pose_graph_correction`, `apply_graph_correction`, `apply_inertial_alignment`, `apply_ba_update` |
 //! | `geometry` | derived landmark geometry and the refresh set each correction owes |
 //! | `removal` | `remove_keyframe` — the IMU chain through it is merged, never cut |
 //! | `queries` | `covisible_keyframes`, `covisible_keyframes_min_weight` — thresholds belong to consumers |
@@ -65,9 +65,10 @@ pub use imu_factor::ImuFactor;
 pub use keyframe::Keyframe;
 pub use map_point::{LandmarkObservation, MapPoint, ObservationKey};
 pub use ops::{
-    BaSnapshot, BaUpdate, BaUpdateError, BaWindow, InertialAlignment, InertialAlignmentError,
-    KeyframeBaCorrection, KeyframeVelocity, LocalBaMergeResult, LocalBaStats, MapPointMergeResult,
-    PoseGraphCorrectionError, PoseGraphCorrectionResult,
+    BaSnapshot, BaUpdate, BaUpdateError, BaWindow, GraphCorrectionResult, InertialAlignment,
+    InertialAlignmentError, KeyframeBaCorrection, KeyframePoseChange, KeyframeVelocity,
+    LocalBaMergeResult, LocalBaStats, MapPointMergeResult, PoseGraphCorrectionError,
+    PoseGraphCorrectionResult,
 };
 pub use ops::{
     InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError, ObservationLink,
@@ -169,6 +170,12 @@ impl<D> Map<D> {
     /// Returns the number of non-culled (active) map points.
     pub fn num_active_map_points(&self) -> usize {
         self.map_points.iter().filter(|mp| !mp.culled).count()
+    }
+
+    /// Advances whenever the map's world frame changes; a result computed from an older epoch
+    /// belongs to another world.
+    pub(crate) fn world_epoch(&self) -> u64 {
+        self.world_epoch
     }
 
     /// Returns all keyframe-to-keyframe IMU factors in insertion order.

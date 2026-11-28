@@ -49,6 +49,26 @@ impl<D: Descriptor> Map<D> {
     /// The point with stronger observation support survives. Associations are
     /// deduplicated so a keyframe references the survivor from at most one slot.
     pub fn merge_map_points(&mut self, first: usize, second: usize) -> Option<MapPointMergeResult> {
+        self.merge_landmarks(first, second, LeftoverSweep::EveryKeyframe)
+    }
+
+    /// [`Self::merge_map_points`] that looks for leftover slots only in the replaced point's
+    /// observing keyframes instead of in every keyframe: the same result on a map whose slots and
+    /// observation records agree, at a cost independent of the map's size.
+    pub fn merge_map_points_by_records(
+        &mut self,
+        first: usize,
+        second: usize,
+    ) -> Option<MapPointMergeResult> {
+        self.merge_landmarks(first, second, LeftoverSweep::Observers)
+    }
+
+    fn merge_landmarks(
+        &mut self,
+        first: usize,
+        second: usize,
+        sweep: LeftoverSweep,
+    ) -> Option<MapPointMergeResult> {
         if first == second {
             return None;
         }
@@ -79,6 +99,13 @@ impl<D: Descriptor> Map<D> {
         // per link would retire the duplicate the moment its last observation
         // went, mid-way through a change that is not yet complete.
         let replaced_observations: Vec<_> = self.map_points[replaced].observations().to_vec();
+        let replaced_observers: HashSet<usize> = match sweep {
+            LeftoverSweep::EveryKeyframe => HashSet::new(),
+            LeftoverSweep::Observers => replaced_observations
+                .iter()
+                .map(|observation| observation.key.keyframe_idx)
+                .collect(),
+        };
         let mut redirected_associations = 0;
         for observation in replaced_observations {
             let key = observation.key;
@@ -100,6 +127,11 @@ impl<D: Descriptor> Map<D> {
         // Any remaining slot still pointing at the duplicate (a keyframe that
         // held it without a matching record) is cleared too.
         for keyframe in &mut self.keyframes {
+            if sweep == LeftoverSweep::Observers
+                && !replaced_observers.contains(&keyframe.frame.idx)
+            {
+                continue;
+            }
             for slot in 0..keyframe.map_point_by_desc_idx.len() {
                 if keyframe.map_point(slot) == Some(replaced) {
                     keyframe.clear_map_point(slot);
@@ -723,6 +755,13 @@ impl<D: Descriptor> Map<D> {
         }
         self.update_map_point_geometry(landmark_idx);
     }
+}
+
+/// Where a merge looks for slots that still name the replaced point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeftoverSweep {
+    EveryKeyframe,
+    Observers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -8,7 +8,10 @@ use super::config::{
     SystemConfig, TrackRefill,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
-use crate::loop_closure::LoopClosingConfig;
+use crate::loop_closure::{
+    LoopClosingConfig, LoopGraphInformation, LoopOdometryGate, LoopTemporalConsistency,
+    OdometryRandomWalk,
+};
 use crate::tracking::KeyframePolicy;
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::ProjectionMatchConfig;
@@ -413,7 +416,43 @@ fn validate_loop_closing(
     if mode.is_enabled() && !metric {
         return Err(ConfigError::LoopClosingWithoutMetricScale);
     }
-    Ok(())
+    match mode.graph().map(|graph| graph.information) {
+        Some(LoopGraphInformation::Drift {
+            odometry,
+            loop_sigma_m,
+            loop_sigma_rad,
+            loop_cauchy_scale,
+        }) => {
+            validate_drift_information(&odometry, [loop_sigma_m, loop_sigma_rad, loop_cauchy_scale])
+        }
+        Some(LoopGraphInformation::ScalarWeights) | None => Ok(()),
+    }
+}
+
+fn validate_drift_information(
+    odometry: &OdometryRandomWalk,
+    [loop_sigma_m, loop_sigma_rad, loop_cauchy_scale]: [f64; 3],
+) -> Result<(), ConfigError> {
+    let at = |field| format!("pipeline.loop_closing.graph.information.{field}");
+    check(
+        at("odometry.translation_m2_per_m"),
+        odometry.translation_m2_per_m,
+        NON_NEGATIVE,
+    )?;
+    check(
+        at("odometry.rotation_rad2_per_m"),
+        odometry.rotation_rad2_per_m,
+        NON_NEGATIVE,
+    )?;
+    check(at("odometry.floor_m"), odometry.floor_m, SOLVER_POSITIVE)?;
+    check(
+        at("odometry.floor_rad"),
+        odometry.floor_rad,
+        SOLVER_POSITIVE,
+    )?;
+    check(at("loop_sigma_m"), loop_sigma_m, SOLVER_POSITIVE)?;
+    check(at("loop_sigma_rad"), loop_sigma_rad, SOLVER_POSITIVE)?;
+    check(at("loop_cauchy_scale"), loop_cauchy_scale, SOLVER_POSITIVE)
 }
 
 fn validate_correction(config: &LoopClosingConfig) -> Result<(), ConfigError> {
@@ -466,6 +505,51 @@ fn validate_correction(config: &LoopClosingConfig) -> Result<(), ConfigError> {
         config.episode.min_consistent_edges as f64,
         AT_LEAST_ONE,
     )?;
+    if let LoopOdometryGate::Enabled { drift, k_sigma } = config.odometry_gate {
+        check(at("odometry_gate.k_sigma"), k_sigma, POSITIVE)?;
+        check(
+            at("odometry_gate.drift.translation_per_m"),
+            drift.translation_per_m,
+            NON_NEGATIVE,
+        )?;
+        check(
+            at("odometry_gate.drift.translation_floor_m"),
+            drift.translation_floor_m,
+            POSITIVE,
+        )?;
+        check(
+            at("odometry_gate.drift.yaw_per_m_rad"),
+            drift.yaw_per_m_rad,
+            NON_NEGATIVE,
+        )?;
+        check(
+            at("odometry_gate.drift.yaw_floor_rad"),
+            drift.yaw_floor_rad,
+            POSITIVE,
+        )?;
+    }
+    if let LoopTemporalConsistency::Enabled {
+        min_detections,
+        max_translation_m,
+        max_yaw_rad,
+    } = config.temporal_consistency
+    {
+        check(
+            at("temporal_consistency.min_detections"),
+            min_detections as f64,
+            AT_LEAST_ONE,
+        )?;
+        check(
+            at("temporal_consistency.max_translation_m"),
+            max_translation_m,
+            POSITIVE,
+        )?;
+        check(
+            at("temporal_consistency.max_yaw_rad"),
+            max_yaw_rad,
+            POSITIVE,
+        )?;
+    }
     let fusion = &config.fusion;
     check(
         at("fusion.search_radius_px"),
@@ -509,6 +593,14 @@ fn validate_correction(config: &LoopClosingConfig) -> Result<(), ConfigError> {
 struct Requirement(&'static str, fn(f64) -> bool);
 
 const POSITIVE: Requirement = Requirement("finite and > 0", |v| v > 0.0);
+/// The pose-graph solver narrows sigmas and scales, and their reciprocals, to `f32`.
+const SOLVER_POSITIVE: Requirement = Requirement(
+    "finite and > 0, with a finite non-zero f32 value and reciprocal",
+    |v| {
+        let (value, reciprocal) = (v as f32, (1.0 / v) as f32);
+        value > 0.0 && value.is_finite() && reciprocal > 0.0 && reciprocal.is_finite()
+    },
+);
 const NON_NEGATIVE: Requirement = Requirement("finite and >= 0", |v| v >= 0.0);
 const AT_LEAST_ONE: Requirement = Requirement("finite and >= 1", |v| v >= 1.0);
 const UNIT_INTERVAL: Requirement = Requirement("in [0, 1]", |v| (0.0..=1.0).contains(&v));
