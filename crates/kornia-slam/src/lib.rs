@@ -45,10 +45,12 @@ pub(crate) fn debug_enabled() -> bool {
 pub mod features;
 pub mod frame;
 pub(crate) mod frontend;
+pub(crate) mod guided_match;
 pub mod inertial;
 pub mod initialization;
 pub mod loop_closure;
 pub mod mapping;
+pub(crate) mod overlap;
 mod pose_conversion;
 pub mod rectify;
 pub mod rig;
