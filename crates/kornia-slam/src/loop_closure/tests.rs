@@ -1809,3 +1809,88 @@ fn finish_reports_loops_left_without_a_reference_keyframe() {
     assert_eq!(closer.queued_for_test(), 0);
     assert!(!outcome.pgo_applied);
 }
+
+/// A closer with the fixture's vocabulary, the drifting lap as its map, and a context whose
+/// reference keyframe is `reference`.
+fn lap_closer(reference: usize) -> (LoopCloser, Map, LoopClosingContext) {
+    let (closer, _) = closing_fixture(closing_config(), false);
+    let (map, _) = drifting_lap_map(Vec3F64::new(0.0, -1.0, 0.0));
+    let context = LoopClosingContext {
+        pose_world_to_cam: map.get_keyframe(reference).unwrap().frame.pose_world_to_cam,
+        current_keyframe_idx: Some(reference),
+        ..closing_context(&map)
+    };
+    (closer, map, context)
+}
+
+/// A loop that puts `query_kf_idx` 0.2 m from where the map has it, as drift would.
+fn lap_loop(candidate_kf_idx: usize, query_kf_idx: usize, map: &Map) -> VerifiedLoopEdge {
+    let pose = |kf: usize| map.get_keyframe(kf).unwrap().frame.pose_world_to_cam;
+    let drift = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.2, 0.0, 0.0));
+    VerifiedLoopEdge {
+        candidate_to_query: drift.compose(&Pose3d::between(
+            &pose(candidate_kf_idx),
+            &pose(query_kf_idx),
+        )),
+        ..verified_edge(query_kf_idx, candidate_kf_idx, 40, 0.875, 1.0, 8)
+    }
+}
+
+fn applied_alone(events: &[LoopClosureEvent]) -> bool {
+    matches!(events, [LoopClosureEvent::Accepted { applied: true, .. }])
+}
+
+/// A loop whose keyframe left the map is dropped before the next solve, so it cannot make every
+/// later solve fail with `MissingLoopKeyframe`.
+#[test]
+fn a_removed_loop_keyframe_does_not_block_later_loops() {
+    let (mut closer, mut map, context) = lap_closer(23);
+    let first = lap_loop(1, 23, &map);
+    let outcome = closer.handle_accepted_for_test(&mut map, &camera(), first, context);
+    assert!(applied_alone(&outcome.events), "{:?}", outcome.events);
+    map.remove_keyframe(1).unwrap();
+
+    let context = LoopClosingContext {
+        pose_world_to_cam: map.get_keyframe(22).unwrap().frame.pose_world_to_cam,
+        current_keyframe_idx: Some(22),
+        ..context
+    };
+    let second = lap_loop(2, 22, &map);
+    let outcome = closer.handle_accepted_for_test(&mut map, &camera(), second, context);
+
+    assert!(applied_alone(&outcome.events), "{:?}", outcome.events);
+    assert_eq!(closer.verified_loop_count(), 1);
+}
+
+/// After a map reset every earlier loop names keyframes the new map never held; a loop in the
+/// new map still closes.
+#[test]
+fn a_map_reset_does_not_block_later_loops() {
+    let (mut closer, mut map, context) = lap_closer(23);
+    let first = lap_loop(1, 23, &map);
+    let outcome = closer.handle_accepted_for_test(&mut map, &camera(), first, context);
+    assert!(applied_alone(&outcome.events), "{:?}", outcome.events);
+
+    let (lap, _) = drifting_lap_map(Vec3F64::new(0.0, -1.0, 0.0));
+    map.clear_active();
+    for keyframe in lap.keyframes() {
+        let pose = keyframe.frame.pose_world_to_cam;
+        map.insert_keyframe(Keyframe::from_frame(frame(
+            100 + keyframe.frame.idx,
+            pose,
+            &[],
+            Vec::new(),
+        )))
+        .unwrap();
+    }
+    let context = LoopClosingContext {
+        pose_world_to_cam: map.get_keyframe(122).unwrap().frame.pose_world_to_cam,
+        current_keyframe_idx: Some(122),
+        ..context
+    };
+    let second = lap_loop(100, 122, &map);
+    let outcome = closer.handle_accepted_for_test(&mut map, &camera(), second, context);
+
+    assert!(applied_alone(&outcome.events), "{:?}", outcome.events);
+    assert_eq!(closer.verified_loop_count(), 1);
+}

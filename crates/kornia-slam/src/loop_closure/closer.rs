@@ -524,6 +524,17 @@ impl<D: Descriptor> LoopAcceptance<D> {
         None
     }
 
+    /// Drops the loops whose keyframes left the map, as a reset or a keyframe removal leaves
+    /// them: a graph built from the map has no node for them, so they would refuse every later
+    /// solve.
+    fn forget_departed_loops(&mut self, map: &Map<D>) {
+        let live = |kf: usize| map.get_keyframe(kf).is_some();
+        self.verified_loops
+            .retain(|edge| live(edge.query_kf_idx) && live(edge.candidate_kf_idx));
+        self.verified_loop_pairs
+            .retain(|&(a, b)| live(a) && live(b));
+    }
+
     /// Remembers an accepted loop, so its pair is never verified again and its edge joins every
     /// later solve.
     fn record(&mut self, edge: VerifiedLoopEdge) {
@@ -544,6 +555,7 @@ impl<D: Descriptor> LoopAcceptance<D> {
         outcome: &mut LoopClosingOutcome,
     ) {
         if self.solver.is_synchronous() {
+            self.forget_departed_loops(map);
             self.close_loop(map, camera, representative, context, outcome);
         } else if self.stopped {
             // No solve will run: report the loop now rather than queue it forever.
@@ -692,6 +704,7 @@ impl<D: Descriptor> LoopAcceptance<D> {
         {
             return;
         }
+        self.forget_departed_loops(map);
         let capture_started = Instant::now();
         let fusion = FusionSnapshot::capture(map, camera, &self.queued, &self.config.fusion);
         outcome.timing.fuse_capture = capture_started.elapsed();
