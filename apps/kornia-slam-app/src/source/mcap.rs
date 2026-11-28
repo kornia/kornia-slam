@@ -18,8 +18,6 @@ use std::path::{Path, PathBuf};
 use ciborium::value::Value as CborValue;
 use kornia_3d::camera::PinholeCamera;
 use kornia_image::{Image, ImageSize};
-use kornia_imgproc::color::gray_from_rgb_u8;
-use kornia_io::jpeg::{decode_image_jpeg_layout, decode_image_jpeg_mono8, decode_image_jpeg_rgb8};
 use mcap::McapError;
 
 use kornia_sensors::SensorRig;
@@ -27,8 +25,8 @@ use kornia_slam::SensorSelection;
 use serde::Deserialize;
 
 use super::{
-    FrameItem, FrameSource, OpenedSource, PairRectifier, Rectification, SourceError, no_imu,
-    resolve, stereo_needs_calib,
+    FrameItem, FrameSource, OpenedSource, PairRectifier, Rectification, SourceError,
+    decode_jpeg_to_luma, no_imu, resolve, stereo_needs_calib,
 };
 use crate::datasets::StereoCalib;
 
@@ -286,6 +284,7 @@ impl FrameSource for McapSource {
             timestamp_sec: prepared.timestamp_sec,
             image: prepared.image,
             right_image: prepared.right_image,
+            rig_images: Vec::new(),
             imu_samples: Vec::new(),
         }))
     }
@@ -360,30 +359,6 @@ fn nearest_index(ts: &[f64], t: f64) -> usize {
         .min_by(|(_, a), (_, b)| (*a - t).abs().total_cmp(&(*b - t).abs()))
         .map(|(i, _)| i)
         .unwrap_or(0)
-}
-
-/// Decode a JPEG payload to a luma8 image. Mono JPEGs are decoded directly;
-/// RGB JPEGs (used by the `compressed` channel) are decoded then converted.
-fn decode_jpeg_to_luma(
-    jpeg_bytes: &[u8],
-) -> Result<Image<u8, 1>, Box<dyn std::error::Error + Send + Sync>> {
-    let layout = decode_image_jpeg_layout(jpeg_bytes)?;
-    let size = layout.image_size;
-    match layout.channels {
-        1 => {
-            let mut dst = Image::<u8, 1>::from_size_val(size, 0)?;
-            decode_image_jpeg_mono8(jpeg_bytes, &mut dst)?;
-            Ok(dst)
-        }
-        3 => {
-            let mut rgb = Image::<u8, 3>::from_size_val(size, 0)?;
-            decode_image_jpeg_rgb8(jpeg_bytes, &mut rgb)?;
-            let mut gray = Image::<u8, 1>::from_size_val(size, 0)?;
-            gray_from_rgb_u8(&rgb, &mut gray)?;
-            Ok(gray)
-        }
-        n => Err(format!("unsupported JPEG channel count: {n} (want 1 or 3)").into()),
-    }
 }
 
 /// `{header, body}` envelope → body. Returns None if the value isn't a map
