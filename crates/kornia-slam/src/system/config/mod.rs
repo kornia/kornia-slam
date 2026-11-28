@@ -297,11 +297,15 @@ impl fmt::Display for SystemConfig {
         if frontend.klt_kernel == LkKernel::FixedPointU8 {
             writeln!(f, "  klt kernel: fixed-point u8")?;
         }
-        if let Some(min_tracks) = frontend.klt_first.min_tracks() {
-            writeln!(
+        match frontend.klt_first.min_tracks() {
+            Some(_) if self.sensors.cameras == CameraSelection::Rig => {
+                writeln!(f, "  klt-first: inactive on a rig, ORB on every frame")?;
+            }
+            Some(min_tracks) => writeln!(
                 f,
-                "  klt-first: ORB only when a keyframe is due or fewer than {min_tracks} tracks survive"
-            )?;
+                "  klt-first: ORB when a keyframe is due, the flow pose is refused or fewer than {min_tracks} tracks survive"
+            )?,
+            None => {}
         }
         if let Some((max_level, max_iter)) = frontend.klt_prediction.search() {
             writeln!(

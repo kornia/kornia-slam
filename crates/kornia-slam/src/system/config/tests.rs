@@ -154,12 +154,18 @@ fn frontend_defaults_reproduce_main() {
         "OrbSlam pipeline (config version 1)
   frontend: ORB, 1000 keypoints
   klt kernel: fixed-point u8
-  klt-first: ORB only when a keyframe is due or fewer than 80 tracks survive
+  klt-first: ORB when a keyframe is due, the flow pose is refused or fewer than 80 tracks survive
   klt prediction: levels 0..=1, 10 iterations when trusted
   tracking
   keyframes: every 3..=8 frames, ref ratio 0.6
   local mapping: asynchronous
 "
+    );
+    flow.sensors = sensors(CameraSelection::Rig, false);
+    assert!(
+        flow.to_string()
+            .contains("  klt-first: inactive on a rig, ORB on every frame\n"),
+        "{flow}"
     );
     assert!(flow.validate().is_ok());
     let FrontendConfig::Orb(frontend) = &mut orb_mut(&mut flow).frontend;
