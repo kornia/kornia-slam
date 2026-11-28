@@ -17,6 +17,7 @@ mod utils;
 use config::RunConfig;
 use evaluation::associate_gt;
 use kornia_algebra::Vec3F64;
+use kornia_sensors::rig_calibration::RigCalibration;
 use kornia_slam::system::PipelineDefinition;
 use kornia_slam::{LoopClosureEvent, SlamSystem};
 use source::{FrameItem, OpenedSource};
@@ -58,6 +59,11 @@ struct Args {
     /// map-projection reject reasons, keyframe growth and fuse counters
     #[argh(switch)]
     debug: bool,
+
+    /// write the opened source's rig as a rig calibration file (RON) to this
+    /// path, then exit
+    #[argh(option)]
+    write_rig_calibration: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -81,6 +87,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.evaluate && ground_truth.is_none() {
         return Err("--evaluate needs ground truth, and this source has none".into());
     }
+    if let Some(path) = &args.write_rig_calibration {
+        let calibration = RigCalibration::from_sensor_rig(&source.rig());
+        let text = ron::ser::to_string_pretty(&calibration, ron::ser::PrettyConfig::default())?;
+        std::fs::write(path, text)?;
+        return Ok(());
+    }
+    let rig = run.apply_rig_calibration(source.rig())?;
     if !tui_active && let Some(summary) = summary {
         eprintln!("{summary}");
     }
@@ -93,7 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .loop_closing
         .vocabulary()
         .map(std::path::Path::to_path_buf);
-    let mut system = SlamSystem::build(run.system, source.rig()).map_err(|e| e.to_string())?;
+    let mut system = SlamSystem::build(run.system, rig).map_err(|e| e.to_string())?;
     system.set_debug(args.debug);
     let camera = system.rig().primary().pinhole();
     if let Some(path) = vocabulary {

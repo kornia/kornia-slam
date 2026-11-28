@@ -24,6 +24,16 @@ rectified pair, and only `cameras: Stereo` runs it as one. `ConfigError::Fisheye
 is removed: a fisheye camera is never part of a rectified pair, so stereo over it
 is `MissingSensor("stereo cameras")`. Mono, stereo and fisheye runs are unchanged.
 
+**A rig calibration file any source can load.** `kornia_sensors::rig_calibration`
+(feature `serde`) reads and writes a RON file with each camera's lens model
+(`Pinhole`, `KannalaBrandt` or `Fisheye624`), image size and `primary_from_camera`,
+plus the primary's `camera_to_body` and the IMU noise; `RigCalibration::to_sensor_rig`
+builds a rig from the file alone, and a written file reads back bit-equal. In the app,
+a run file's `rig_calibration` replaces the source's cameras (it must hold as many
+cameras as the source yields images per frame), and its IMU extrinsic and noise when
+the source has an IMU; `--write-rig-calibration <path>` writes the opened source's rig
+as such a file and exits. Omitted, every source keeps its own calibration.
+
 **Bundle adjustment is grouped under `mapping::ba`.** A move with no change in
 behaviour: `kornia_slam::mapping::bundle_adjustment` is now
 `kornia_slam::mapping::ba`, and `kornia_slam::mapping::vi_ba_schur` is

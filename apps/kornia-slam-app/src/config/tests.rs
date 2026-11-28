@@ -231,6 +231,69 @@ fn relative_paths_resolve_against_the_run_file() {
 }
 
 #[test]
+fn a_rig_calibration_file_resolves_and_must_match_the_source() {
+    use kornia_3d::camera::PinholeCamera;
+    use kornia_3d::pose::Pose3d;
+    use kornia_image::ImageSize;
+
+    let (temp, path) = TempRun::new(
+        "rig-calibration",
+        r#"(source: Mcap((path: "r.mcap", calib: "c.yaml")), rig_calibration: "rig.ron")"#,
+    );
+    let run = RunConfig::from_ron_file(&path).unwrap();
+    let file = temp.dir.join("configs").join("rig.ron");
+    assert_eq!(run.rig_calibration.as_deref(), Some(file.as_path()));
+
+    let camera = |fx| PinholeCamera {
+        fx,
+        fy: 240.0,
+        cx: 320.0,
+        cy: 240.0,
+        k1: 0.0,
+        k2: 0.0,
+        p1: 0.0,
+        p2: 0.0,
+    };
+    let size = ImageSize {
+        width: 640,
+        height: 480,
+    };
+    let write = |rig: &SensorRig| {
+        let calibration = RigCalibration::from_sensor_rig(rig);
+        let text =
+            ron::ser::to_string_pretty(&calibration, ron::ser::PrettyConfig::default()).unwrap();
+        std::fs::write(&file, text).unwrap();
+    };
+    let source = SensorRig::mono(camera(240.0), size).with_imu(Pose3d::IDENTITY);
+    let moved = Pose3d::new(
+        kornia_algebra::Mat3F64::IDENTITY,
+        kornia_algebra::Vec3F64::new(0.0, 0.01, 0.0),
+    );
+    write(&SensorRig::mono(camera(250.0), size).with_imu(moved));
+    let applied = run.apply_rig_calibration(source.clone()).unwrap();
+    assert_eq!(applied.primary().pinhole().fx, 250.0);
+    assert_eq!(applied.camera_to_body(), Some(moved));
+    let without_imu = SensorRig::mono(camera(240.0), size);
+    assert!(
+        run.apply_rig_calibration(without_imu)
+            .unwrap()
+            .imu
+            .is_none()
+    );
+
+    // The default selection is Mono: one image per frame, so a pair is refused.
+    write(&SensorRig::rectified_stereo(camera(250.0), size, 0.11));
+    assert!(matches!(
+        run.apply_rig_calibration(source),
+        Err(RigCalibrationFileError::CameraCount {
+            in_file: 2,
+            in_source: 1,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn errors_name_the_run_file() {
     let err = RunConfig::from_ron_file("/nonexistent/run.ron").unwrap_err();
     assert!(
