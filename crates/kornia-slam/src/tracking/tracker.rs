@@ -833,7 +833,6 @@ impl Tracker {
     }
 
     /// The optical-flow tracks carried into the next frame.
-    #[cfg(test)]
     pub(crate) fn tracks(&self) -> &[Track] {
         self.track_set.tracks()
     }
