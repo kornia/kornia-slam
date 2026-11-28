@@ -1718,3 +1718,40 @@ fn fusion_plan_runs_on_a_scalar_descriptor_map() {
         Some(landmarks[1])
     );
 }
+
+/// A background solve that finishes while tracking has no reference keyframe is not lost: its
+/// loops go back to the queue, wait for a reference keyframe, and are solved and applied then.
+#[test]
+fn a_writeback_without_a_reference_keyframe_is_requeued_and_applied() {
+    let (expected_map, _) = synchronous_closure();
+    let (closer, mut map) = closing_fixture(background_config(), false);
+    let mut closer = closer.with_solver(LoopSolver::replay(1));
+    let context = closing_context(&map);
+    let between_keyframes = LoopClosingContext {
+        current_keyframe_idx: None,
+        ..context
+    };
+
+    assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
+    let waiting = closer.on_frame(&mut map, &camera(), between_keyframes);
+    assert!(waiting.events.is_empty(), "{:?}", waiting.events);
+    assert!(!waiting.pgo_applied);
+    assert_eq!(closer.queued_for_test(), 1);
+    assert!(
+        closer
+            .on_frame(&mut map, &camera(), between_keyframes)
+            .events
+            .is_empty()
+    );
+    let (frames, outcome) = frames_until_reported(&mut closer, &mut map, context, 3);
+
+    assert_eq!(frames, 2);
+    assert!(matches!(
+        outcome.events.as_slice(),
+        [LoopClosureEvent::Accepted { applied: true, .. }]
+    ));
+    assert_eq!(
+        map.state_fingerprint_for_test(),
+        expected_map.state_fingerprint_for_test()
+    );
+}

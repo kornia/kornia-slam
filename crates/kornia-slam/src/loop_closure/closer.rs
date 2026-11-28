@@ -653,7 +653,11 @@ impl<D: Descriptor> LoopAcceptance<D> {
         context: LoopClosingContext,
         outcome: &mut LoopClosingOutcome,
     ) {
-        if self.stopped || self.queued.is_empty() || self.solver.in_flight() {
+        if self.stopped
+            || self.queued.is_empty()
+            || self.solver.in_flight()
+            || reference_keyframe(map, context).is_none()
+        {
             return;
         }
         let capture_started = Instant::now();
@@ -727,6 +731,12 @@ impl<D: Descriptor> LoopAcceptance<D> {
         let Some(newest) = report.last().cloned() else {
             return;
         };
+        if reference_keyframe(map, context).is_none() {
+            // Between keyframes nothing tells the camera which correction to take: the loops
+            // wait for the next reference keyframe and a fresh solve.
+            self.queued.splice(0..0, report);
+            return;
+        }
         let failed = |reason: String| LoopClosureEvent::PgoFailed {
             query_kf_idx: newest.query_kf_idx,
             candidate_kf_idx: newest.candidate_kf_idx,
@@ -787,9 +797,7 @@ impl<D: Descriptor> LoopAcceptance<D> {
         context: LoopClosingContext,
         outcome: &mut LoopClosingOutcome,
     ) -> Result<(), String> {
-        let reference = context
-            .current_keyframe_idx
-            .filter(|&kf_idx| map.get_keyframe(kf_idx).is_some())
+        let reference = reference_keyframe(map, context)
             .ok_or("current reference keyframe is not in the map")?;
         let seen = local_landmark_references(map, reference);
         let writeback_started = Instant::now();
@@ -843,6 +851,13 @@ impl<D: Descriptor> LoopAcceptance<D> {
                 .is_some_and(|order| order.abs_diff(candidate_order) <= radius)
         })
     }
+}
+
+/// Tracking's reference keyframe, when it is in the map.
+fn reference_keyframe<D: Descriptor>(map: &Map<D>, context: LoopClosingContext) -> Option<usize> {
+    context
+        .current_keyframe_idx
+        .filter(|&kf_idx| map.get_keyframe(kf_idx).is_some())
 }
 
 /// The keyframes whose views make up the camera's local map: the reference keyframe and its
