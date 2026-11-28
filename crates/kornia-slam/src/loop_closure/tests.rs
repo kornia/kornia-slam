@@ -1935,3 +1935,51 @@ fn capped_solves_are_usable_only_when_improved() {
     );
     assert_eq!(reason((true, 6), fell, residual_fell), None);
 }
+
+/// A queued loop waits for inertial initialization, as a new loop does: after a loss reset the
+/// closer holds loops accepted before it until the new map is initialized again.
+#[test]
+fn a_queued_loop_waits_for_inertial_initialization() {
+    let config = background_config();
+    let (closer, mut map) = closing_fixture(config.clone(), true);
+    let mut closer = closer.with_solver(LoopSolver::replay(1));
+    let uninitialized = closing_context(&map);
+    let edge = verify_loop_candidate(&map, &camera(), 10, 0, &config.verification).unwrap();
+
+    let queued = closer.handle_accepted_for_test(&mut map, &camera(), edge, uninitialized);
+    assert!(queued.queued);
+    assert!(!closer.solve_in_flight());
+    let waiting = closer.on_frame(&mut map, &camera(), uninitialized);
+    assert!(waiting.events.is_empty(), "{:?}", waiting.events);
+    assert!(!closer.solve_in_flight());
+    assert_eq!(closer.queued_for_test(), 1);
+
+    let initialized = LoopClosingContext {
+        imu_initialized: true,
+        gravity_world: Vec3F64::new(0.0, -9.81, 0.0),
+        ..uninitialized
+    };
+    closer.on_frame(&mut map, &camera(), initialized);
+    assert!(closer.solve_in_flight());
+    assert_eq!(closer.queued_for_test(), 0);
+}
+
+/// Loops still waiting for inertial initialization when the run ends are reported unapplied,
+/// with that reason.
+#[test]
+fn finish_reports_loops_left_without_inertial_initialization() {
+    let config = background_config();
+    let (closer, mut map) = closing_fixture(config.clone(), true);
+    let mut closer = closer.with_solver(LoopSolver::replay(1));
+    let context = closing_context(&map);
+    let edge = verify_loop_candidate(&map, &camera(), 10, 0, &config.verification).unwrap();
+    closer.handle_accepted_for_test(&mut map, &camera(), edge, context);
+
+    let outcome = closer.finish(&mut map, &camera(), context);
+
+    assert!(matches!(outcome.events.as_slice(), [
+        LoopClosureEvent::PgoFailed { reason, .. },
+        LoopClosureEvent::Accepted { applied: false, .. }
+    ] if reason.contains("inertial initialization pending")));
+    assert!(!outcome.pgo_applied);
+}

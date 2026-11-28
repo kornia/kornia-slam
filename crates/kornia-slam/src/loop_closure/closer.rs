@@ -275,7 +275,7 @@ impl<D: Descriptor> LoopCloser<D> {
             )
         });
 
-        if self.acceptance.require_imu_initialized && !context.imu_initialized {
+        if self.acceptance.awaits_imu(context) {
             return LoopClosingOutcome {
                 debug_message,
                 ..Default::default()
@@ -305,7 +305,8 @@ impl<D: Descriptor> LoopCloser<D> {
 
     /// At the end of a run: waits for the background solve in flight and writes it back, then
     /// solves and writes back the loops queued meanwhile, until none is left. Loops that cannot
-    /// be written back for lack of a reference keyframe are reported unapplied.
+    /// be written back for lack of a reference keyframe or of inertial initialization are
+    /// reported unapplied.
     pub(crate) fn finish(
         &mut self,
         map: &mut Map<D>,
@@ -418,6 +419,11 @@ impl<D: Descriptor> LoopAcceptance<D> {
             discards: 0,
             stopped: false,
         }
+    }
+
+    /// Whether correction is held back until inertial initialization.
+    fn awaits_imu(&self, context: LoopClosingContext) -> bool {
+        self.require_imu_initialized && !context.imu_initialized
     }
 
     /// Verifies `candidates` against `kf_idx`, and on an accepted closure
@@ -689,7 +695,8 @@ impl<D: Descriptor> LoopAcceptance<D> {
     }
 
     /// Submits every queued loop as one solve when none is in flight: loops accepted during a
-    /// solve coalesce into the next, which is never aborted.
+    /// solve coalesce into the next, which is never aborted. Queued loops wait for inertial
+    /// initialization, as [`LoopCloser::on_keyframe`] holds new ones back.
     fn submit_queued(
         &mut self,
         map: &Map<D>,
@@ -700,6 +707,7 @@ impl<D: Descriptor> LoopAcceptance<D> {
         if self.stopped
             || self.queued.is_empty()
             || self.solver.in_flight()
+            || self.awaits_imu(context)
             || reference_keyframe(map, context).is_none()
         {
             return;
@@ -761,10 +769,15 @@ impl<D: Descriptor> LoopAcceptance<D> {
         }
         let unapplied = std::mem::take(&mut self.queued);
         if let Some(newest) = unapplied.last() {
+            let reason = if self.awaits_imu(context) {
+                "inertial initialization pending at the end of the run"
+            } else {
+                "no reference keyframe at the end of the run"
+            };
             finished.events.push(LoopClosureEvent::PgoFailed {
                 query_kf_idx: newest.query_kf_idx,
                 candidate_kf_idx: newest.candidate_kf_idx,
-                reason: "no reference keyframe at the end of the run".into(),
+                reason: reason.into(),
             });
         }
         finished.events.extend(
