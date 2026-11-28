@@ -64,7 +64,7 @@ impl<D: Descriptor> LoopSolveJob<D> {
             graph_edges: self.keyframe_poses.len().saturating_sub(1) + self.loops.len(),
             solve_time,
             fusion_ops,
-            fusion_plan_time: started.elapsed() - solve_time,
+            fusion_plan_time: started.elapsed().saturating_sub(solve_time),
         }
     }
 }
