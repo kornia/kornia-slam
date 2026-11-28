@@ -722,6 +722,33 @@ mod windowed_flow {
             .collect()
     }
 
+    /// A keyframe's pixels start tracks only when the flow's previous frame
+    /// is that keyframe: after a failed prepare on it, the next capture's
+    /// cold pair holds another image.
+    #[test]
+    fn adoption_needs_the_keyframe_as_the_previous_flow_frame() {
+        let adopting = |captures: &[u64]| {
+            let frontend = OrbFrontendConfig {
+                adopt_landmarks: true,
+                ..OrbFrontendConfig::default()
+            };
+            let mut system = SlamSystem::build(windowed(frontend), stereo_rig()).unwrap();
+            *system.map.lock().unwrap() = map_with_keyframe_at(Pose3d::IDENTITY);
+            system.state.last_keyframe_idx = Some(0);
+            system.next_frame_idx = 2;
+            let image = Image::from_size_val(IMAGE_SIZE, 128u8).unwrap();
+            let mut timings = crate::tracking::timings::TrackingTimings::default();
+            let flow = system.rig_flow.as_mut().unwrap();
+            for &capture in captures {
+                flow.prepare(&[&image], capture, &mut timings).unwrap();
+            }
+            system.adopt_landmarks();
+            system.tracker.tracks().len()
+        };
+        assert_eq!(adopting(&[0, 1]), 9);
+        assert_eq!(adopting(&[1]), 0);
+    }
+
     /// The default frontend builds no window-only flow, so tracking runs the
     /// full-pyramid path it ran before.
     #[test]

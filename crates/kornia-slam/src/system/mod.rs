@@ -765,8 +765,15 @@ impl SlamSystem {
                 })
                 .collect()
         };
+        // The index alone is not enough: a failed prepare leaves a fresh
+        // pair of the next capture, where the keyframe's pixels do not hold.
+        let at_keyframe = previous_idx == Some(kf_idx)
+            && self.rig_flow.as_ref().is_none_or(|flow| {
+                flow.previous_frame(0)
+                    .is_some_and(|previous| previous.frame_id() == kf_idx as u64)
+            });
         for (pixel, camera, mp_idx, position) in landmarks {
-            let pixel = if previous_idx == Some(kf_idx) {
+            let pixel = if at_keyframe {
                 Some(pixel)
             } else {
                 self.carry_landmark(kf_idx, camera, pixel, &pose, &position)
