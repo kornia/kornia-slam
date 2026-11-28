@@ -28,9 +28,10 @@ is `MissingSensor("stereo cameras")`. Mono, stereo and fisheye runs are unchange
 (feature `serde`) reads and writes a RON file with each camera's lens model
 (`Pinhole`, `KannalaBrandt` or `Fisheye624`), image size and `primary_from_camera`,
 plus the primary's `camera_to_body` and the IMU noise; `RigCalibration::to_sensor_rig`
-builds a rig from the file alone, and a written file reads back bit-equal. In the app,
+builds a rig from the file alone, refusing non-rigid transforms, unusable intrinsics or
+IMU noise, and a written file reads back bit-equal. In the app,
 a run file's `rig_calibration` replaces the source's cameras (it must hold as many
-cameras as the source yields images per frame), and its IMU extrinsic and noise when
+cameras as the source yields images per frame, each of the source's image size), and its IMU extrinsic and noise when
 the source has an IMU; `--write-rig-calibration <path>` writes the opened source's rig
 as such a file and exits. Omitted, every source keeps its own calibration.
 

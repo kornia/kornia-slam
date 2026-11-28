@@ -113,7 +113,7 @@ impl EurocSource {
             None
         };
 
-        let size = image_size(&dataset)?;
+        let size = image_size(&dataset, start)?;
 
         // IMU samples are yielded whenever the dataset ships them (`imu0`);
         // skip those preceding the first yielded camera frame.
@@ -262,9 +262,9 @@ impl EurocSource {
     }
 }
 
-/// The `sensor.yaml` resolution of the left camera, or the first left image's
-/// size when the file gives none.
-fn image_size(dataset: &EurocDataset) -> Result<ImageSize, SourceError> {
+/// The `sensor.yaml` resolution of the left camera, or, when the file gives
+/// none, the size of the left image at `start`, the first of the window.
+fn image_size(dataset: &EurocDataset, start: usize) -> Result<ImageSize, SourceError> {
     let calibration = &dataset.left_calibration;
     if calibration.width > 0 && calibration.height > 0 {
         return Ok(ImageSize {
@@ -274,7 +274,8 @@ fn image_size(dataset: &EurocDataset) -> Result<ImageSize, SourceError> {
     }
     let first = dataset
         .left_samples
-        .first()
+        .get(start)
+        .or_else(|| dataset.left_samples.first())
         .ok_or_else(|| SourceError::other("the dataset has no left images"))?;
     Ok(read_image_png_mono8(&first.image_path)
         .map_err(SourceError::other)?

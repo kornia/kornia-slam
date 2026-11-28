@@ -290,6 +290,21 @@ fn a_rig_calibration_file_resolves_and_must_match_the_source() {
             .is_none()
     );
 
+    let vga_crop = ImageSize {
+        width: 640,
+        height: 400,
+    };
+    write(&SensorRig::mono(camera(250.0), vga_crop));
+    assert!(matches!(
+        run.apply_rig_calibration(source.clone()),
+        Err(RigCalibrationFileError::ImageSize {
+            camera: 0,
+            in_file,
+            in_source,
+            ..
+        }) if in_file == vga_crop && in_source == size
+    ));
+
     // The default selection is Mono: one image per frame, so a pair is refused.
     write(&SensorRig::rectified_stereo(camera(250.0), size, 0.11));
     assert!(matches!(

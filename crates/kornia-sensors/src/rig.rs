@@ -18,6 +18,7 @@ pub(crate) const MAX_ROTATION_DEFECT: f64 = 1e-6;
 pub struct RigCamera {
     /// Lens model of this camera's images, in image pixels.
     pub model: Camera,
+    /// Size of this camera's images, in pixels.
     pub size: ImageSize,
     /// `T_PC`: `X_primary = T_PC * X_camera`. Identity for the primary.
     pub primary_from_camera: Pose3d,
