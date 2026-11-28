@@ -89,6 +89,10 @@ pub enum RigCalibrationError {
     NotFinite { camera: usize },
     #[error("camera {camera}: the rotation is a reflection")]
     Reflection { camera: usize },
+    #[error("camera {camera}: an intrinsic is not finite or a focal length is not positive")]
+    InvalidIntrinsics { camera: usize },
+    #[error("imu_noise: every density must be finite and non-negative")]
+    InvalidImuNoise,
     #[error("camera_to_body: {0}")]
     CameraToBody(Box<RigCalibrationError>),
     #[error(transparent)]
@@ -135,6 +139,20 @@ impl RigCalibration {
         };
         for (camera, calibration) in self.cameras.iter().enumerate() {
             check_rigid(&calibration.primary_from_camera, camera)?;
+            if !calibration.model.is_valid() {
+                return Err(RigCalibrationError::InvalidIntrinsics { camera });
+            }
+        }
+        if let Some(noise) = &self.imu_noise {
+            let densities = [
+                noise.gyro_noise,
+                noise.accel_noise,
+                noise.gyro_bias_noise,
+                noise.accel_bias_noise,
+            ];
+            if !densities.iter().all(|d| d.is_finite() && *d >= 0.0) {
+                return Err(RigCalibrationError::InvalidImuNoise);
+            }
         }
         // `camera_to_body` enters every IMU residual; it gets the same checks.
         if let Some(camera_to_body) = &self.camera_to_body {
@@ -207,6 +225,38 @@ impl From<&Camera> for CameraModelCalibration {
 }
 
 impl CameraModelCalibration {
+    /// Finite intrinsics and positive focal lengths; a zero focal would map
+    /// every keypoint onto the principal point.
+    fn is_valid(&self) -> bool {
+        let focal = |f: f64| f.is_finite() && f > 0.0;
+        let finite = |values: &[f64]| values.iter().all(|v| v.is_finite());
+        match self {
+            Self::Pinhole {
+                fx,
+                fy,
+                cx,
+                cy,
+                k1,
+                k2,
+                p1,
+                p2,
+            } => focal(*fx) && focal(*fy) && finite(&[*cx, *cy, *k1, *k2, *p1, *p2]),
+            Self::KannalaBrandt {
+                fx,
+                fy,
+                cx,
+                cy,
+                k1,
+                k2,
+                k3,
+                k4,
+            } => focal(*fx) && focal(*fy) && finite(&[*cx, *cy, *k1, *k2, *k3, *k4]),
+            Self::Fisheye624 { f, cx, cy, k, p, s } => {
+                focal(*f) && finite(&[*cx, *cy]) && finite(k) && finite(p) && finite(s)
+            }
+        }
+    }
+
     fn camera(&self) -> Camera {
         match *self {
             Self::Pinhole {
@@ -643,6 +693,45 @@ mod tests {
             RigCalibrationError::CameraToBody(inner)
                 if matches!(*inner, RigCalibrationError::NotRigid { .. })
         ));
+    }
+
+    #[test]
+    fn intrinsics_and_imu_noise_must_be_usable() {
+        let good = RigCalibration::from_sensor_rig(&yawed_rig());
+        let apply = |calibration: &RigCalibration| calibration.to_sensor_rig().map(|_| ());
+        assert_eq!(apply(&good), Ok(()));
+
+        let mut zero_focal = good.clone();
+        if let CameraModelCalibration::Pinhole { fx, .. } = &mut zero_focal.cameras[1].model {
+            *fx = 0.0;
+        }
+        assert_eq!(
+            apply(&zero_focal),
+            Err(RigCalibrationError::InvalidIntrinsics { camera: 1 })
+        );
+        let mut nan_distortion =
+            RigCalibration::from_sensor_rig(&SensorRig::mono(fisheye624(), SIZE));
+        if let CameraModelCalibration::Fisheye624 { s, .. } = &mut nan_distortion.cameras[0].model {
+            s[3] = f64::NAN;
+        }
+        assert_eq!(
+            apply(&nan_distortion),
+            Err(RigCalibrationError::InvalidIntrinsics { camera: 0 })
+        );
+
+        let mut nan_noise = good.clone();
+        if let Some(noise) = &mut nan_noise.imu_noise {
+            noise.accel_bias_noise = f64::NAN;
+        }
+        assert_eq!(apply(&nan_noise), Err(RigCalibrationError::InvalidImuNoise));
+        let mut negative_noise = good;
+        if let Some(noise) = &mut negative_noise.imu_noise {
+            noise.gyro_noise = -1e-4;
+        }
+        assert_eq!(
+            apply(&negative_noise),
+            Err(RigCalibrationError::InvalidImuNoise)
+        );
     }
 
     #[test]

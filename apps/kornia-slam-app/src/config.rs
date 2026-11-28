@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
+use kornia_image::ImageSize;
 use kornia_sensors::rig_calibration::{RigCalibration, RigCalibrationError};
 use kornia_sensors::{ImuCalibration, SensorRig};
 use kornia_slam::system::ConfigError;
@@ -75,6 +76,16 @@ pub enum RigCalibrationFileError {
         path: PathBuf,
         in_file: usize,
         in_source: usize,
+    },
+    #[error(
+        "{}: camera {camera} is {}x{}, the source's images are {}x{}",
+        path.display(), in_file.width, in_file.height, in_source.width, in_source.height
+    )]
+    ImageSize {
+        path: PathBuf,
+        camera: usize,
+        in_file: ImageSize,
+        in_source: ImageSize,
     },
     #[error("{}: {source}", path.display())]
     Invalid {
@@ -151,7 +162,8 @@ impl RunConfig {
 
     /// `rig` with the run's rig calibration file applied; `rig` unchanged
     /// without one. The file's cameras replace the source's; they must be as
-    /// many as the images the source yields per frame under the selection.
+    /// many as the images the source yields per frame under the selection, and
+    /// of the same image sizes.
     /// Its `camera_to_body` and IMU noise apply only when `rig` has an IMU.
     pub fn apply_rig_calibration(
         &self,
@@ -191,6 +203,16 @@ impl RunConfig {
                     path: path.clone(),
                     source,
                 })?;
+        // Intrinsics of another resolution would be applied to these images unnoticed.
+        let mut sizes = calibrated.cameras().iter().zip(rig.cameras()).enumerate();
+        if let Some((camera, (file, source))) = sizes.find(|(_, (f, s))| f.size != s.size) {
+            return Err(RigCalibrationFileError::ImageSize {
+                path: path.clone(),
+                camera,
+                in_file: file.size,
+                in_source: source.size,
+            });
+        }
         calibrated.imu = rig.imu.map(|imu| ImuCalibration {
             camera_to_body: calibrated.camera_to_body().unwrap_or(imu.camera_to_body),
             noise: calibration.imu_noise.unwrap_or(imu.noise),
