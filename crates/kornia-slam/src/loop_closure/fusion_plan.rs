@@ -431,14 +431,17 @@ fn search_radius_px<T>(config: &LoopFusionConfig<T>) -> f32 {
         .max(1.0)
 }
 
-/// Keypoint indices bucketed in square cells one search radius wide.
+/// Keypoint indices bucketed in square cells a little over one search radius wide.
 struct KeypointGrid {
     cell_px: f32,
     cells: HashMap<(i32, i32), Vec<usize>>,
 }
 
 impl KeypointGrid {
-    fn new(keypoints: &[Option<[f32; 2]>], cell_px: f32) -> Self {
+    fn new(keypoints: &[Option<[f32; 2]>], radius_px: f32) -> Self {
+        // A rounded f32 distance can pass the radius test a few ulps beyond the radius; cells a
+        // little wider keep such a keypoint within one cell, and the pixel test still decides.
+        let cell_px = radius_px * 1.001;
         let mut cells: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
         for (feature, keypoint) in keypoints.iter().enumerate() {
             if let Some([x, y]) = keypoint {
@@ -639,4 +642,20 @@ fn merge_is_current<D: Descriptor>(
             source_feature,
             config.max_reprojection_error_px,
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KeypointGrid;
+
+    /// 2.0 - 0.99999994 rounds to exactly 1.0 in f32, so the 1 px test accepts the keypoint two
+    /// cells of 1 px away from the projection.
+    #[test]
+    fn the_grid_keeps_keypoints_the_rounded_radius_test_accepts() {
+        let x = 1.0_f32 - f32::EPSILON / 2.0;
+        assert_eq!(2.0 - x, 1.0);
+        let grid = KeypointGrid::new(&[Some([2.0, 0.0])], 1.0);
+
+        assert_eq!(grid.near(x, 0.0).collect::<Vec<_>>(), vec![0]);
+    }
 }
