@@ -1106,6 +1106,7 @@ pub(super) fn solve_in_graph(
     let unusable_reason = unusable_reason(
         report.converged,
         report.iterations,
+        config.max_iterations,
         (report.cost_before, report.cost_after),
         (report.loop_residual_before, report.loop_residual_after),
         gravity_error,

@@ -1230,23 +1230,27 @@ fn background_config() -> LoopClosingConfig {
     config
 }
 
-/// A solve cut off before it converges is not written back, and says why: an unusable result is
-/// never a silent `applied: false`.
+/// A solve that cannot improve the map is not written back, and says why: an unusable result is
+/// never a silent `applied: false`. The loop measures the map's own poses, so the cost cannot fall.
 #[test]
 fn an_unusable_solve_reports_why() {
-    let mut config = background_config();
-    config.optimizer.max_iterations = 1;
-    let unusable = |events: &[LoopClosureEvent]| {
-        matches!(events, [
-            LoopClosureEvent::PgoFailed { reason, .. },
-            LoopClosureEvent::Accepted { applied: false, .. }
-        ] if reason.starts_with("unusable solve") && reason.contains("not converged"))
+    let (mut closer, mut map, context) = lap_closer(23);
+    let pose = |kf: usize| map.get_keyframe(kf).unwrap().frame.pose_world_to_cam;
+    let consistent = VerifiedLoopEdge {
+        candidate_to_query: Pose3d::between(&pose(1), &pose(23)),
+        ..verified_edge(23, 1, 40, 0.875, 1.0, 8)
     };
 
-    let (mut closer, mut map) = closing_fixture(config, false);
-    let context = closing_context(&map);
-    let inline = closer.on_keyframe(&mut map, &camera(), 10, context);
-    assert!(unusable(&inline.events), "{:?}", inline.events);
+    let inline = closer.handle_accepted_for_test(&mut map, &camera(), consistent, context);
+
+    assert!(
+        matches!(inline.events.as_slice(), [
+        LoopClosureEvent::PgoFailed { reason, .. },
+        LoopClosureEvent::Accepted { applied: false, .. }
+    ] if reason.starts_with("unusable solve") && reason.contains("cost did not fall")),
+        "{:?}",
+        inline.events
+    );
 }
 
 /// The synchronous closure of the fixture's loop: the map and the tracking correction.
@@ -1893,4 +1897,47 @@ fn a_map_reset_does_not_block_later_loops() {
 
     assert!(applied_alone(&outcome.events), "{:?}", outcome.events);
     assert_eq!(closer.verified_loop_count(), 1);
+}
+
+/// A solve stopped at the iteration cap with its cost and its new loop's residual both fallen is
+/// written back, inline and through the replayed background path, and says it was capped.
+#[test]
+fn a_capped_solve_that_improved_is_applied() {
+    let mut config = background_config();
+    config.optimizer.max_iterations = 1;
+
+    let (mut closer, mut map) = closing_fixture(config.clone(), false);
+    let context = closing_context(&map);
+    let inline = closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert!(applied_alone(&inline.events), "{:?}", inline.events);
+    assert!(inline.pgo_capped);
+
+    let (closer, mut map) = closing_fixture(config, false);
+    let mut closer = closer.with_solver(LoopSolver::replay(1));
+    assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
+    let background = closer.on_frame(&mut map, &camera(), context);
+    assert!(applied_alone(&background.events), "{:?}", background.events);
+    assert!(background.pgo_applied && background.pgo_capped);
+}
+
+/// The cap counts only for a capped solve that improved: one whose cost or loop residual did not
+/// fall, or one that stopped short of the cap, stays unusable.
+#[test]
+fn capped_solves_are_usable_only_when_improved() {
+    let reason = |(converged, iterations), cost, residual| {
+        pose_graph::unusable_reason(converged, iterations, 30, cost, residual, None)
+    };
+    let capped = (false, 30);
+    let (fell, residual_fell) = ((8.9e-2, 1.6e-3), (0.30, 0.01));
+
+    assert_eq!(reason(capped, fell, residual_fell), None);
+    let diverged = reason(capped, (1.6e-3, 8.9e-2), (0.01, 0.30)).unwrap();
+    assert!(diverged.contains("not converged"), "{diverged}");
+    assert!(diverged.contains("cost did not fall"), "{diverged}");
+    assert!(reason(capped, fell, (0.30, 0.30)).is_some_and(|r| r.contains("not converged")));
+    assert!(
+        reason((false, 12), fell, residual_fell)
+            .is_some_and(|r| r.contains("not converged after 12 iterations"))
+    );
+    assert_eq!(reason((true, 6), fell, residual_fell), None);
 }

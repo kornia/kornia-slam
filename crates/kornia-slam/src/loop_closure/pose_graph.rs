@@ -58,16 +58,22 @@ pub struct PgoResult {
 
 /// Why a finished solve must not be written back, or `None` when it may: it converged, its costs
 /// are finite, gravity kept its direction (within 1e-4 rad), the cost fell and the new loop's
-/// residual did not grow.
+/// residual did not grow. A solve stopped at `max_iterations` counts as converged when its cost
+/// and the new loop's residual both fell.
 pub(super) fn unusable_reason(
     converged: bool,
     iterations: usize,
+    max_iterations: usize,
     (cost_before, cost_after): (f64, f64),
     (loop_before, loop_after): (f64, f64),
     gravity_error_rad: Option<f64>,
 ) -> Option<String> {
     let mut reasons = Vec::new();
-    if !converged {
+    // The f32 solve reaches its optimum in a few iterations, then trades about 1e-5 relative cost
+    // noise against the 1e-6 stop rule until the cap; such a stop is not divergence.
+    let capped_improved =
+        iterations >= max_iterations && cost_after < cost_before && loop_after < loop_before;
+    if !converged && !capped_improved {
         reasons.push(format!("not converged after {iterations} iterations"));
     }
     if ![cost_before, cost_after, loop_before, loop_after]
@@ -182,6 +188,7 @@ pub fn optimize_pose_graph<D: Descriptor>(
     let unusable_reason = unusable_reason(
         result.converged,
         result.iterations,
+        config.max_iterations,
         (initial_cost, final_cost),
         (new_loop_residual_before, new_loop_residual_after),
         max_gravity_alignment_error_rad,
