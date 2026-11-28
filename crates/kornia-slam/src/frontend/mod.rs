@@ -185,9 +185,9 @@ impl OrbFrontend {
                 stereo_points: Vec::new(),
             },
         };
-        // Radtan pixels are not pinhole pixels: the overlap's epipolar geometry
-        // and triangulation need the undistorted cache. A zero-distortion
-        // pinhole rig keeps reading raw keypoints.
+        // Raw fisheye or radtan pixels are not pinhole pixels: the overlap's
+        // epipolar geometry and triangulation need the undistorted cache. A
+        // zero-distortion pinhole rig keeps reading raw keypoints.
         if let (true, Some(view0)) = (rig.geometry.needs_undistortion(), rig.geometry.view(0)) {
             frame.ensure_undistorted(view0.pinhole);
         }

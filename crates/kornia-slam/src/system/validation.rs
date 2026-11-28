@@ -385,13 +385,8 @@ impl SensorSelection {
         if self.cameras == CameraSelection::Stereo && rig.rectified_stereo_baseline_m().is_none() {
             return Err(ConfigError::MissingSensor("stereo cameras"));
         }
-        if self.cameras == CameraSelection::Rig {
-            if rig.cameras().len() < 2 {
-                return Err(ConfigError::MissingSensor("a multi-camera rig"));
-            }
-            if rig.cameras().iter().any(|camera| camera.is_fisheye()) {
-                return Err(ConfigError::MissingSensor("a rig of pinhole cameras"));
-            }
+        if self.cameras == CameraSelection::Rig && rig.cameras().len() < 2 {
+            return Err(ConfigError::MissingSensor("a multi-camera rig"));
         }
         if self.imu && rig.imu.is_none() {
             return Err(ConfigError::MissingSensor("an IMU"));

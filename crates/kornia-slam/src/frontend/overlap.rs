@@ -324,6 +324,72 @@ mod tests {
         }
     }
 
+    /// Raw fisheye pair: the overlap triangulates virtual-pinhole pixels, and
+    /// reading the raw pixels as pinhole ones recovers none of the points.
+    #[test]
+    fn raw_fisheye_overlap_triangulates_virtual_pixels() {
+        let raw = crate::rig::tests::raw_model();
+        let sensor_rig = SensorRig::from_cameras(vec![
+            RigCamera::primary(
+                raw,
+                ImageSize {
+                    width: 640,
+                    height: 480,
+                },
+            ),
+            RigCamera::new(
+                raw,
+                ImageSize {
+                    width: 640,
+                    height: 480,
+                },
+                Pose3d::new(crate::rig::tests::yaw(40.0), Vec3F64::new(0.1, 0.0, 0.0)),
+            ),
+        ])
+        .unwrap();
+        let rig = RigGeometry::from_rig(&sensor_rig).unwrap();
+        let (view0, view1) = (rig.view(0).unwrap(), rig.view(1).unwrap());
+        let right_from_left = sensor_rig.b_from_a(0, 1).unwrap();
+        let scene = [
+            Vec3F64::new(3.0, -0.3, 2.0),
+            Vec3F64::new(2.0, 0.4, 3.0),
+            Vec3F64::new(1.2, 0.1, 6.0),
+            Vec3F64::new(2.5, 0.8, 1.5),
+        ];
+        let raw_pixel = |p: &Vec3F64| {
+            let px = raw.project(p).unwrap();
+            [px.x as f32, px.y as f32]
+        };
+        let mut raw_xy: Vec<[f32; 2]> = scene.iter().map(raw_pixel).collect();
+        raw_xy.extend(
+            scene
+                .iter()
+                .map(|p| raw_pixel(&right_from_left.transform_point(p))),
+        );
+        let n = scene.len();
+        let virtual_xy: Vec<[f32; 2]> = raw_xy
+            .iter()
+            .enumerate()
+            .map(|(k, &px)| {
+                let view = if k < n { view0 } else { view1 };
+                view.raw_to_virtual(px).unwrap()
+            })
+            .collect();
+        let descriptors = (0..n as u8).chain(0..n as u8).map(descriptor).collect();
+        let features = features(raw_xy, descriptors);
+        let ranges = [0..n, n..2 * n];
+        let recovered = |pixels: &[[f32; 2]]| {
+            let matches = match_overlap(&features, pixels, &ranges, &rig, &right_from_left);
+            scene
+                .iter()
+                .zip(&matches.points)
+                .filter(|(p, got)| got.is_some_and(|got| (got - **p).length() < 1e-3 * p.length()))
+                .count()
+        };
+        assert_eq!(recovered(&virtual_xy), n);
+        assert_eq!(recovered(&features.keypoints_xy), 0);
+    }
+
     #[test]
     fn a_descriptor_mismatch_is_not_matched() {
         let sensor_rig = sensor_rig();

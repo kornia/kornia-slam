@@ -402,6 +402,34 @@ mod runtime_settings {
     }
 
     #[test]
+    fn a_rig_may_hold_raw_fisheye_cameras() {
+        let fisheye = kornia_3d::camera::Fisheye624Camera {
+            f: 240.0,
+            cx: 320.0,
+            cy: 240.0,
+            k: [-0.025, 0.096, -0.063, 0.0062, 0.0035, -0.00073],
+            p: [0.0009, 0.00036],
+            s: [-0.0014, -0.0001, -0.00046, -0.0001],
+        };
+        let rig = SensorRig::from_cameras(vec![
+            kornia_sensors::RigCamera::primary(fisheye, SIZE),
+            kornia_sensors::RigCamera::new(
+                fisheye,
+                SIZE,
+                Pose3d::new(
+                    kornia_algebra::Mat3F64::IDENTITY,
+                    kornia_algebra::Vec3F64::new(0.1, 0.0, 0.0),
+                ),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            sensors(CameraSelection::Rig, false).validate_rig(&rig),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn only_the_rig_selection_keeps_the_rig_cameras() {
         let two_cameras = SensorRig::from_cameras(vec![
             kornia_sensors::RigCamera::primary(camera(), SIZE),
