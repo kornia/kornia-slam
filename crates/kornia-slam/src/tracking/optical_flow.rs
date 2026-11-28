@@ -20,7 +20,7 @@ use crate::tracking::timings::{TrackingTimings, timed};
 // The `WindowedU8` flow step, public for the zero-allocation test only.
 #[doc(hidden)]
 pub use crate::tracking::flow_tracker::{
-    FlowOutput, FlowStepCounts, FlowStepInput, RigFlow, RigFlowCamera, RigFlowSettings,
+    FlowOutput, FlowSeeds, FlowStepCounts, FlowStepInput, RigFlow, RigFlowCamera, RigFlowSettings,
 };
 
 /// Stable identity for a feature track.
@@ -150,6 +150,11 @@ pub struct TrackSet {
     layout: ShardLayout,
     /// Identities never restart, since flow shards cache templates by them.
     monotonic_ids: bool,
+    /// `(id, index)` of every track, by id, and the advanced tracks, reused
+    /// by [`Self::advance_kept`] so a warm flow-only frame allocates nothing.
+    lookup: Vec<(TrackId, usize)>,
+    advanced: Vec<Track>,
+    seen: Vec<bool>,
 }
 
 impl TrackSet {
@@ -227,7 +232,8 @@ impl TrackSet {
 
     /// A new track already associated with map point `map_point_idx` at
     /// `position` (world frame).
-    pub(crate) fn spawn_associated(
+    #[doc(hidden)]
+    pub fn spawn_associated(
         &mut self,
         pixel: [f32; 2],
         camera: usize,
@@ -318,7 +324,8 @@ impl TrackSet {
     /// from every kept one, oldest first; the kept tracks stay in order.
     pub(crate) fn thin(&mut self, per_camera: usize, min_spacing_px: f32) {
         let mut by_age: Vec<usize> = (0..self.tracks.len()).collect();
-        by_age.sort_unstable_by_key(|&k| (std::cmp::Reverse(self.tracks[k].age), self.tracks[k].id));
+        by_age
+            .sort_unstable_by_key(|&k| (std::cmp::Reverse(self.tracks[k].age), self.tracks[k].id));
         let mut keep = vec![false; self.tracks.len()];
         let mut kept: Vec<Track> = Vec::with_capacity(self.tracks.len());
         for k in by_age {
@@ -335,6 +342,54 @@ impl TrackSet {
         }
         let mut keep = keep.into_iter();
         self.tracks.retain(|_| keep.next().unwrap_or(false));
+    }
+
+    /// Advances the set onto the `survivors` whose track `keep` accepts, as
+    /// [`Self::advance`].
+    /// In place: validation completes before state changes, so an error
+    /// leaves the set unchanged, and once warm nothing allocates.
+    #[doc(hidden)]
+    pub fn advance_kept(
+        &mut self,
+        survivors: &[FlowSurvivor],
+        keep: impl Fn(&Track) -> bool,
+    ) -> Result<(), TrackSetError> {
+        self.lookup.clear();
+        self.lookup.extend(
+            self.tracks
+                .iter()
+                .enumerate()
+                .map(|(k, track)| (track.id, k)),
+        );
+        self.lookup.sort_unstable();
+        self.seen.clear();
+        self.seen.resize(self.tracks.len(), false);
+        let lookup = &self.lookup;
+        let index_of = |id: TrackId| {
+            lookup
+                .binary_search_by_key(&id, |&(id, _)| id)
+                .map(|slot| lookup[slot].1)
+                .map_err(|_| TrackSetError::UnknownTrackId(id))
+        };
+        for survivor in survivors {
+            let k = index_of(survivor.track_id)?;
+            if std::mem::replace(&mut self.seen[k], true) {
+                return Err(TrackSetError::DuplicateTrackId(survivor.track_id));
+            }
+        }
+        self.advanced.clear();
+        for survivor in survivors {
+            let previous = self.tracks[index_of(survivor.track_id)?];
+            if keep(&previous) {
+                self.advanced.push(Track {
+                    pixel: survivor.pixel,
+                    age: previous.age.saturating_add(1),
+                    ..previous
+                });
+            }
+        }
+        std::mem::swap(&mut self.tracks, &mut self.advanced);
+        Ok(())
     }
 
     /// Whether some track follows map point `map_point_idx`.

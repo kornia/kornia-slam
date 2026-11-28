@@ -15,10 +15,10 @@ mod validation;
 
 pub use build::BuildError;
 pub use config::{
-    CameraSelection, FlowPose, ForwardBackward, FrontendConfig, GyroGuess, KltFirst,
-    KltPrediction, KltRetry, KltRig, LoopClosingMode, MAX_FLOW_THREADS, MappingConfig,
-    OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION,
-    SensorSelection, StereoCloseDepth, SystemConfig, TrackRefill,
+    CameraSelection, FlowPose, ForwardBackward, FrontendConfig, GyroGuess, KltFirst, KltPrediction,
+    KltRetry, KltRig, LoopClosingMode, MAX_FLOW_THREADS, MappingConfig, OrbFrontendConfig,
+    OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection,
+    StereoCloseDepth, SystemConfig, TrackRefill,
 };
 #[cfg(feature = "serde")]
 pub use file::LoadError;
@@ -209,7 +209,13 @@ impl SlamSystem {
             )?),
             LkKernel::F32 | LkKernel::FixedPointU8 => None,
         };
-        Ok(Self::assemble(rig, settings, frontend, loop_closer, rig_flow))
+        Ok(Self::assemble(
+            rig,
+            settings,
+            frontend,
+            loop_closer,
+            rig_flow,
+        ))
     }
 
     fn assemble(
@@ -633,13 +639,9 @@ impl SlamSystem {
                 images,
                 timestamp_sec,
             ),
-            SystemMode::Tracking => self.tracking_step(
-                source,
-                previous_image,
-                current_image,
-                images,
-                timestamp_sec,
-            ),
+            SystemMode::Tracking => {
+                self.tracking_step(source, previous_image, current_image, images, timestamp_sec)
+            }
         }
     }
 
@@ -1080,13 +1082,8 @@ impl SlamSystem {
         images: &[&Image<u8, 1>],
         timestamp_sec: f64,
     ) -> Result<TrackingResult, ProcessError> {
-        let result = self.tracking_step(
-            source,
-            previous_image,
-            current_image,
-            images,
-            timestamp_sec,
-        )?;
+        let result =
+            self.tracking_step(source, previous_image, current_image, images, timestamp_sec)?;
 
         if result.status == TrackingStatus::KeyframeAccepted
             && let Some(start_idx) = self.inertial.schedule.start_kf_idx()
@@ -1275,7 +1272,7 @@ impl SlamSystem {
             .map_or(0.0, |t0| timestamp_sec - t0);
         let trusted_prediction = self.imu_confident(timestamp_sec);
         let search = self.predicted_flow_search(trusted_prediction, predicted_velocity.is_some());
-        let survivors = self.flow(previous_image, images, &candidate_pose, search);
+        let mut survivors = self.flow(previous_image, images, &candidate_pose, search);
         let estimation = Estimation {
             candidate_pose,
             pose_before,
@@ -1296,7 +1293,10 @@ impl SlamSystem {
         };
         let flow_due = matches!(flow_only, FlowOnly::KeyframeDue(_));
         let (tracked, result) = match flow_only {
-            FlowOnly::Tracked(estimate) => (TrackedFrame::Flow(source), Ok(estimate)),
+            FlowOnly::Tracked(estimate) => {
+                self.tracker.recycle_survivors(survivors.take());
+                (TrackedFrame::Flow(source), Ok(estimate))
+            }
             outcome => {
                 let frame = match self.resolve(source) {
                     Ok(frame) => frame,
@@ -1324,7 +1324,7 @@ impl SlamSystem {
                             lost_for_sec: currently_lost_for,
                             trusted_prediction,
                         },
-                        survivors,
+                        survivors.take(),
                         &map,
                         &self.camera,
                     )
@@ -1826,7 +1826,12 @@ impl SlamSystem {
         if self.debug {
             let output = rig_flow.output();
             let counts = output.counts;
-            for (shard, tracks) in output.shard_tracks.iter().take(rig_flow.threads()).enumerate() {
+            for (shard, tracks) in output
+                .shard_tracks
+                .iter()
+                .take(rig_flow.threads())
+                .enumerate()
+            {
                 self.debug_messages.push(format!(
                     "[flow] frame={frame_idx} shard={shard} tracks={tracks}"
                 ));
@@ -2337,7 +2342,11 @@ fn rig_flow_settings(settings: &SystemSettings) -> RigFlowSettings {
 
 /// The cameras flow tracks: every rig camera under `klt_rig: AllCameras`,
 /// the primary otherwise.
-fn rig_flow_cameras(rig: &SensorRig, frontend: &OrbFrontend, klt_rig: KltRig) -> Vec<RigFlowCamera> {
+fn rig_flow_cameras(
+    rig: &SensorRig,
+    frontend: &OrbFrontend,
+    klt_rig: KltRig,
+) -> Vec<RigFlowCamera> {
     match (klt_rig, frontend.rig_geometry()) {
         (KltRig::AllCameras, Some(geometry)) => geometry
             .views()

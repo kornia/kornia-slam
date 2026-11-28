@@ -9,7 +9,7 @@
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, Vec2F32, Vec3F64};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use kornia_image::{Image, ImageSize};
@@ -92,6 +92,11 @@ pub(crate) struct Tracker {
     /// `(per_camera, min_spacing_px)` of `track_refill`, which also bounds
     /// the tracks ORB and adoption add on `WindowedU8`.
     track_cap: Option<(usize, f32)>,
+    /// Buffers of a `WindowedU8` flow-only frame, reused so a warm one
+    /// allocates nothing outside the pose solve: the step's survivors and
+    /// the map points its pose kept, sorted.
+    survivor_buffer: Vec<FlowSurvivor>,
+    matched_points: Vec<usize>,
 }
 
 impl Tracker {
@@ -128,6 +133,8 @@ impl Tracker {
             secondary_klt_caches: Vec::new(),
             pending_spawns: Vec::new(),
             track_cap: None,
+            survivor_buffer: Vec::new(),
+            matched_points: Vec::new(),
         }
     }
 
@@ -339,12 +346,23 @@ impl Tracker {
         match flow.step(&self.track_set, input, timings) {
             Ok(output) => {
                 self.pending_spawns.extend_from_slice(&output.spawned);
-                Some(output.survivors.clone())
+                let mut survivors = std::mem::take(&mut self.survivor_buffer);
+                survivors.clear();
+                survivors.extend_from_slice(&output.survivors);
+                Some(survivors)
             }
             Err(_) => {
                 self.klt_errors += 1;
                 None
             }
+        }
+    }
+
+    /// Takes back the survivors of a frame that did not consume them, for
+    /// the next [`Self::flow_windowed`].
+    pub(crate) fn recycle_survivors(&mut self, survivors: Option<Vec<FlowSurvivor>>) {
+        if let Some(survivors) = survivors {
+            self.survivor_buffer = survivors;
         }
     }
 
@@ -537,7 +555,12 @@ impl Tracker {
                     }
                     _ => Vec::new(),
                 };
-                if reconcile(&mut self.track_set, self.rig.is_some(), &estimate.matches, frame) {
+                if reconcile(
+                    &mut self.track_set,
+                    self.rig.is_some(),
+                    &estimate.matches,
+                    frame,
+                ) {
                     self.track_set.restore(carried);
                 }
                 self.thin_tracks();
@@ -618,7 +641,10 @@ impl Tracker {
                 features.descriptors.push(mp.descriptor);
                 features.octaves.push(0);
             }
-            frame.rig.camera_ranges.push(begin..features.keypoints_xy.len());
+            frame
+                .rig
+                .camera_ranges
+                .push(begin..features.keypoints_xy.len());
         }
         if seeded.len() < min_tracks {
             return None;
@@ -791,24 +817,17 @@ impl Tracker {
             );
             return;
         }
-        let matched: HashSet<usize> = estimate.matches.iter().map(|&(mp_idx, _)| mp_idx).collect();
-        let keep: HashMap<TrackId, bool> = self
-            .track_set
-            .tracks()
-            .iter()
-            .map(|track| {
-                let kept = track
-                    .map_point_idx()
-                    .is_none_or(|mp_idx| matched.contains(&mp_idx));
-                (track.id(), kept)
-            })
-            .collect();
-        let advanced: Vec<FlowSurvivor> = survivors
-            .iter()
-            .filter(|survivor| keep.get(&survivor.track_id) == Some(&true))
-            .copied()
-            .collect();
-        if self.track_set.advance(advanced).is_err() {
+        let matched = &mut self.matched_points;
+        matched.clear();
+        matched.extend(estimate.matches.iter().map(|&(mp_idx, _)| mp_idx));
+        matched.sort_unstable();
+        let matched = &self.matched_points;
+        let kept = self.track_set.advance_kept(survivors, |track| {
+            track
+                .map_point_idx()
+                .is_none_or(|mp_idx| matched.binary_search(&mp_idx).is_ok())
+        });
+        if kept.is_err() {
             self.track_set.clear();
         }
     }

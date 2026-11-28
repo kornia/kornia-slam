@@ -2,7 +2,6 @@
 //! with every buffer reused from frame to frame, and [`RigFlow`], the
 //! `WindowedU8` flow step of every camera that runs them.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -988,6 +987,9 @@ pub struct FlowSeeds {
     /// The feature each seed stands for in a pose's matches: its keypoint
     /// in the frame it came from, else its own index.
     pub keypoints: Vec<usize>,
+    /// `(track, map point, world point)` of every associated track, by
+    /// track, reused so assembling allocates nothing once warm.
+    associated: Vec<(TrackId, usize, Vec3F64)>,
 }
 
 impl FlowSeeds {
@@ -1023,29 +1025,42 @@ impl FlowSeeds {
 
     /// The seeds of a `WindowedU8` step's `output` from each track's stored
     /// position, without the map.
-    pub(crate) fn assemble(&mut self, tracks: &TrackSet, output: &FlowOutput) {
+    pub fn assemble(&mut self, tracks: &TrackSet, output: &FlowOutput) {
         self.clear();
-        let associated: HashMap<TrackId, (usize, Vec3F64)> = tracks
-            .tracks()
-            .iter()
-            .filter_map(|track| Some((track.id(), (track.map_point_idx()?, track.position()?))))
-            .collect();
+        let mut associated = std::mem::take(&mut self.associated);
+        associated.clear();
+        associated.extend(
+            tracks
+                .tracks()
+                .iter()
+                .filter_map(|track| Some((track.id(), track.map_point_idx()?, track.position()?))),
+        );
+        associated.sort_unstable_by_key(|&(id, _, _)| id);
         for ((survivor, &camera), &undistorted) in output
             .survivors
             .iter()
             .zip(&output.cameras)
             .zip(&output.undistorted)
         {
-            if let Some(&(map_point, point)) = associated.get(&survivor.track_id) {
-                let seed = self.len();
-                self.push(survivor.pixel, undistorted, camera, map_point, point, seed);
-            }
+            let Ok(slot) = associated.binary_search_by_key(&survivor.track_id, |&(id, _, _)| id)
+            else {
+                continue;
+            };
+            let (_, map_point, point) = associated[slot];
+            let seed = self.len();
+            self.push(survivor.pixel, undistorted, camera, map_point, point, seed);
         }
+        self.associated = associated;
     }
 
     /// The seeds of a flow frame: `seeded[k]` is `(map point, keypoint)` of
     /// `frame`, its world point from `map`.
-    pub(crate) fn assemble_from_frame(&mut self, frame: &Frame, seeded: &[(usize, usize)], map: &Map) {
+    pub(crate) fn assemble_from_frame(
+        &mut self,
+        frame: &Frame,
+        seeded: &[(usize, usize)],
+        map: &Map,
+    ) {
         self.clear();
         for &(map_point, keypoint) in seeded {
             let (Some(&pixel), Some(&undistorted), Some(mp)) = (

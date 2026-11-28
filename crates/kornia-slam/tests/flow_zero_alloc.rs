@@ -7,11 +7,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
+use kornia_algebra::Vec3F64;
 use kornia_image::{Image, ImageSize};
 use kornia_slam::system::{ForwardBackward, GyroGuess, KltRetry, TrackRefill};
 use kornia_slam::tracking::TrackingTimings;
 use kornia_slam::tracking::optical_flow::{
-    FlowOutput, FlowStepInput, RigFlow, RigFlowCamera, RigFlowSettings, TrackSet,
+    FlowOutput, FlowSeeds, FlowStepInput, RigFlow, RigFlowCamera, RigFlowSettings, TrackSet,
 };
 
 /// Counts allocations on every thread while `COUNTING` is set.
@@ -275,4 +276,70 @@ fn survivors_do_not_depend_on_the_thread_count() {
     );
     assert_eq!(run(2).0, one);
     assert_eq!(run(3).0, one);
+}
+
+/// A flow-only frame on the window-only kernel past its pose: the step, the
+/// seeds assembled from the tracks' stored positions and the advance onto
+/// the kept survivors allocate nothing once warm.
+#[test]
+fn a_flow_only_frame_allocates_nothing_once_warm() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ALLOCATIONS.store(0, Ordering::SeqCst);
+    let mut flow = RigFlow::new(settings(2), cameras()).expect("flow workers start");
+    let mut tracks = TrackSet::with_flow_threads(2, CAMERAS);
+    for camera in 0..CAMERAS {
+        let offset = camera as f32 * 30.0;
+        for row in 1..7 {
+            for col in 1..9 {
+                let pixel = [col as f32 * 60.0 + offset, row as f32 * 60.0];
+                if (row + col) % 2 == 0 {
+                    let landmark = tracks.len();
+                    tracks.spawn_associated(pixel, camera, landmark, Vec3F64::new(0.0, 0.0, 4.0));
+                } else {
+                    tracks.spawn_on(pixel, camera);
+                }
+            }
+        }
+    }
+    let mut seeds = FlowSeeds::default();
+    let mut timings = TrackingTimings::default();
+    let mut fewest_seeds = usize::MAX;
+    for frame in 0..WARM_UP + COUNTED {
+        let images: Vec<Image<u8, 1>> = (0..CAMERAS).map(|c| image(c, shift(frame))).collect();
+        let refs: Vec<&Image<u8, 1>> = images.iter().collect();
+        flow.prepare(&refs, frame as u64, &mut timings)
+            .expect("frames prepare");
+        let input = FlowStepInput {
+            frame_idx: frame as u64,
+            // The landmarks sit nowhere in particular: start at the last pixel.
+            pose_world_to_primary: None,
+            primary_rotation: None,
+        };
+        let counting = frame >= WARM_UP;
+        COUNTING.store(counting, Ordering::SeqCst);
+        flow.step(&tracks, &input, &mut timings).expect("flow step");
+        seeds.assemble(&tracks, flow.output());
+        // An inlier set a pose solve kept: every other landmark.
+        let kept = tracks.advance_kept(&flow.output().survivors, |track| {
+            track
+                .map_point_idx()
+                .is_none_or(|landmark| landmark % 4 != 2)
+        });
+        COUNTING.store(false, Ordering::SeqCst);
+        kept.expect("flow survivors must be tracks of the set");
+        if counting {
+            fewest_seeds = fewest_seeds.min(seeds.map_points.len());
+        }
+    }
+    assert_eq!(
+        ALLOCATIONS.load(Ordering::SeqCst),
+        0,
+        "allocations in {COUNTED} warm flow-only frames"
+    );
+    assert!(
+        fewest_seeds > 0 && fewest_seeds != usize::MAX,
+        "a counted frame had no seeds"
+    );
 }
