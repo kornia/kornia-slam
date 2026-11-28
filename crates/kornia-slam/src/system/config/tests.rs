@@ -400,6 +400,42 @@ mod runtime_settings {
         assert_eq!(settings.stereo_baseline_m, None);
         assert_eq!(settings.stereo_close_depth_m, None);
     }
+
+    #[test]
+    fn only_the_rig_selection_keeps_the_rig_cameras() {
+        let two_cameras = SensorRig::from_cameras(vec![
+            kornia_sensors::RigCamera::primary(camera(), SIZE),
+            kornia_sensors::RigCamera::new(
+                camera(),
+                SIZE,
+                Pose3d::new(
+                    crate::rig::tests::yaw(30.0),
+                    kornia_algebra::Vec3F64::new(0.1, 0.0, 0.0),
+                ),
+            ),
+        ])
+        .unwrap();
+        let selected = sensors(CameraSelection::Rig, false)
+            .select_rig(two_cameras.clone())
+            .unwrap();
+        assert_eq!(selected.cameras().len(), 2);
+        let config = SystemConfig {
+            sensors: sensors(CameraSelection::Rig, false),
+            ..SystemConfig::default()
+        };
+        let settings = config.settings(&selected);
+        assert!(settings.multi_camera);
+        assert_eq!(settings.stereo_baseline_m, None);
+        let mono = sensors(CameraSelection::Mono, false)
+            .select_rig(two_cameras)
+            .unwrap();
+        assert_eq!(mono.cameras().len(), 1);
+        assert!(!SystemConfig::default().settings(&mono).multi_camera);
+        assert!(matches!(
+            sensors(CameraSelection::Rig, false).select_rig(rig()),
+            Err(ConfigError::MissingSensor(_))
+        ));
+    }
 }
 
 #[cfg(feature = "serde")]

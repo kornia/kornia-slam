@@ -570,7 +570,12 @@ fn write_back_guard_refuses_landmarks_behind_or_flung() {
             })
         })
         .collect();
-    let keep = landmarks_to_write_back(&observations, (&keyframes, &before), (&keyframes, &after));
+    let keep = landmarks_to_write_back(
+        &observations,
+        |_| None,
+        (&keyframes, &before),
+        (&keyframes, &after),
+    );
     let want: Vec<bool> = cases.iter().map(|c| c.2).collect();
     assert_eq!(keep, want);
 
@@ -581,7 +586,12 @@ fn write_back_guard_refuses_landmarks_behind_or_flung() {
         Vec3F64::ZERO,
     );
     observations.retain(|o| o.point_idx == 0);
-    let keep = landmarks_to_write_back(&observations, (&keyframes, &before), (&moved, &before));
+    let keep = landmarks_to_write_back(
+        &observations,
+        |_| None,
+        (&keyframes, &before),
+        (&moved, &before),
+    );
     assert_eq!(keep, [false, true, true, true, true, true]);
 }
 

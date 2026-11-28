@@ -12,7 +12,7 @@
 //! must never be written back from that stale capture.
 
 use crate::features::Descriptor;
-use crate::mapping::map::Map;
+use crate::mapping::map::{Keyframe, Map};
 use kornia_algebra::Vec3F64;
 use std::collections::HashSet;
 
@@ -27,26 +27,36 @@ impl<D: Descriptor> Map<D> {
     pub(in crate::mapping::map) fn update_map_point_geometry(&mut self, mp_idx: usize) {
         let scale_factor = self.scale_pyramid.factor;
         let n_levels = self.scale_pyramid.n_levels;
-        let (position, kf_indices, ref_kf_idx, ref_octave) = {
+        let (position, observers, ref_kf_idx, ref_camera, ref_octave) = {
             let Some(mp) = self.map_points.get(mp_idx) else {
                 return;
             };
             if mp.culled {
                 return;
             }
+            let observers: Vec<(usize, u8)> = mp
+                .observations()
+                .iter()
+                .map(|o| (o.key.keyframe_idx, o.camera))
+                .collect();
+            let ref_camera = observers
+                .iter()
+                .find(|&&(kf_idx, _)| kf_idx == mp.keyframe_idx)
+                .map_or(0, |&(_, camera)| camera);
             (
                 mp.position,
-                mp.observer_keyframes().collect::<Vec<_>>(),
+                observers,
                 mp.keyframe_idx,
+                ref_camera,
                 mp.reference_octave,
             )
         };
 
         let mut normal = Vec3F64::ZERO;
         let mut n = 0usize;
-        for kf_idx in &kf_indices {
-            if let Some(kf) = self.get_keyframe(*kf_idx) {
-                let cam_center = kf.frame.pose_world_to_cam.camera_centre();
+        for &(kf_idx, camera) in &observers {
+            if let Some(kf) = self.get_keyframe(kf_idx) {
+                let cam_center = camera_centre(kf, camera);
                 let dir = position - cam_center;
                 let len = dir.length();
                 if len > 1e-9 {
@@ -59,7 +69,7 @@ impl<D: Descriptor> Map<D> {
         let Some(ref_kf) = self.get_keyframe(ref_kf_idx) else {
             return;
         };
-        let ref_center = ref_kf.frame.pose_world_to_cam.camera_centre();
+        let ref_center = camera_centre(ref_kf, ref_camera);
         let dist = (position - ref_center).length();
         let level_scale = scale_factor.powi(ref_octave as i32);
         let max_dist = dist * level_scale;
@@ -125,5 +135,21 @@ impl<D: Descriptor> Map<D> {
         for idx in ids {
             self.update_map_point_geometry(idx);
         }
+    }
+}
+
+/// Centre of rig camera `camera` of the keyframe; the primary camera's outside a rig.
+fn camera_centre<D>(keyframe: &Keyframe<D>, camera: u8) -> Vec3F64 {
+    let pose = &keyframe.frame.pose_world_to_cam;
+    match keyframe
+        .frame
+        .rig
+        .geometry
+        .as_ref()
+        .and_then(|rig| rig.view(camera as usize))
+        .filter(|_| camera > 0)
+    {
+        Some(view) => view.pose(pose).camera_centre(),
+        None => pose.camera_centre(),
     }
 }

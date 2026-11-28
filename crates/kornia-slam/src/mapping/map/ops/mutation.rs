@@ -88,9 +88,9 @@ impl<D: Descriptor> Map<D> {
             {
                 kf.clear_map_point(key.feature_idx);
             }
-            if self.map_points[survivor].is_observed_by(key.keyframe_idx) {
-                // The survivor already has a feature in this keyframe; keep it
-                // and its descriptor contribution.
+            if self.map_points[survivor].is_observed_in(key.keyframe_idx, observation.camera) {
+                // The survivor already has a feature in this keyframe camera;
+                // keep it and its descriptor contribution.
                 continue;
             }
             self.link_unchecked(key, survivor, observation.descriptor);
@@ -327,7 +327,7 @@ impl<D: Descriptor> Map<D> {
             .get(landmark_idx)
             .is_some_and(|mp| mp.keyframe_idx == keyframe_idx);
         if let Some(mp) = self.map_points.get_mut(landmark_idx) {
-            mp.remove_observation(keyframe_idx);
+            mp.remove_feature_observation(key);
             if mp.observations().is_empty() {
                 self.retire_landmark(landmark_idx);
             } else {
@@ -389,19 +389,22 @@ impl<D: Descriptor> Map<D> {
             }
             Self::check_detached(kf)?;
         }
-        let feature_count = |this: &Self, key: ObservationKey| -> Option<usize> {
+        // (rig camera, feature count) of a claimed feature's keyframe.
+        let claimed_keyframe = |this: &Self, key: ObservationKey| -> Option<(usize, usize)> {
             keyframes
                 .iter()
                 .find(|kf| kf.frame.idx == key.keyframe_idx)
                 .or_else(|| this.get_keyframe(key.keyframe_idx))
                 .map(|kf| {
-                    kf.frame
-                        .features
-                        .descriptors
-                        .len()
-                        .min(kf.frame.features.keypoints_xy.len())
+                    let features = &kf.frame.features;
+                    (
+                        kf.frame.camera_of(key.feature_idx),
+                        features.descriptors.len().min(features.keypoints_xy.len()),
+                    )
                 })
         };
+        let feature_count =
+            |this: &Self, key: ObservationKey| claimed_keyframe(this, key).map(|(_, n)| n);
 
         // 2. resolve landmark targets; each seed carries an implicit first link.
         let first_new_id = self.map_points.len();
@@ -433,7 +436,8 @@ impl<D: Descriptor> Map<D> {
         // for each landmark/keyframe pair, so an identical repeat is a no-op
         // while a competing target is still a conflict.
         let mut claimed_features: HashMap<ObservationKey, usize> = HashMap::new();
-        let mut claimed_pairs: HashMap<(usize, usize), usize> = HashMap::new();
+        // One feature per (landmark, keyframe, rig camera).
+        let mut claimed_pairs: HashMap<(usize, usize, usize), usize> = HashMap::new();
         let mut accepted: Vec<(ObservationKey, usize)> = Vec::new();
         for &(key, landmark) in &claims {
             let Some(n_features) = feature_count(self, key) else {
@@ -464,7 +468,8 @@ impl<D: Descriptor> Map<D> {
                 }
                 None => {}
             }
-            if let Some(&feature) = claimed_pairs.get(&(landmark, key.keyframe_idx))
+            let camera = claimed_keyframe(self, key).map_or(0, |(camera, _)| camera);
+            if let Some(&feature) = claimed_pairs.get(&(landmark, key.keyframe_idx, camera))
                 && feature != key.feature_idx
             {
                 return Err(MapMutationError::DuplicateObservation {
@@ -473,7 +478,7 @@ impl<D: Descriptor> Map<D> {
                 });
             }
             claimed_features.insert(key, landmark);
-            claimed_pairs.insert((landmark, key.keyframe_idx), key.feature_idx);
+            claimed_pairs.insert((landmark, key.keyframe_idx, camera), key.feature_idx);
             accepted.push((key, landmark));
         }
 
@@ -623,10 +628,11 @@ impl<D: Descriptor> Map<D> {
             }
             None => {}
         }
+        let camera = self.observation_camera(key);
         if self
             .map_points
             .get(landmark_idx)
-            .is_some_and(|mp| mp.is_observed_by(key.keyframe_idx))
+            .is_some_and(|mp| mp.is_observed_in(key.keyframe_idx, camera))
         {
             return Err(MapMutationError::DuplicateObservation {
                 landmark: landmark_idx,
@@ -637,23 +643,40 @@ impl<D: Descriptor> Map<D> {
     }
 
     fn link_unchecked(&mut self, key: ObservationKey, landmark_idx: usize, descriptor: D) {
+        let camera = self.observation_camera(key);
         if let Some(kf) = self.get_keyframe_mut(key.keyframe_idx) {
             kf.associate_map_point(key.feature_idx, landmark_idx);
         }
         if let Some(mp) = self.map_points.get_mut(landmark_idx) {
-            mp.add_observation(key, descriptor);
+            mp.add_observation(key, camera, descriptor);
         }
     }
 
-    /// Smallest `(keyframe_idx, feature_idx)` becomes the reference.
+    /// Rig camera of an observed feature; 0 outside a rig.
+    pub(in crate::mapping::map) fn observation_camera(&self, key: ObservationKey) -> u8 {
+        self.get_keyframe(key.keyframe_idx)
+            .map_or(0, |kf| kf.frame.camera_of(key.feature_idx) as u8)
+    }
+
+    /// The reference keyframe's remaining record with the smallest feature
+    /// stays the reference (another rig camera of that keyframe still sees
+    /// the landmark); without one, the smallest `(keyframe_idx, feature_idx)`
+    /// becomes the reference.
     pub(super) fn adopt_reference(&mut self, landmark_idx: usize) {
         let Some(mp) = self.map_points.get(landmark_idx) else {
             return;
         };
+        let current = mp.keyframe_idx;
         let Some(next) = mp
             .observations()
             .iter()
-            .min_by_key(|o| (o.key.keyframe_idx, o.key.feature_idx))
+            .min_by_key(|o| {
+                (
+                    o.key.keyframe_idx != current,
+                    o.key.keyframe_idx,
+                    o.key.feature_idx,
+                )
+            })
             .map(|o| o.key)
         else {
             return;

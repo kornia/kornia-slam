@@ -68,6 +68,8 @@ pub struct SlamSystem {
     camera: PinholeCamera,
     /// Baseline of the selected rectified pair; `None` unless stereo is selected.
     stereo_baseline_m: Option<f64>,
+    /// Every rig camera is tracked; only under `CameraSelection::Rig`.
+    multi_camera: bool,
     tracker: Tracker,
     two_view_init_config: TwoViewInitConfig,
     keyframe_policy: KeyframePolicy,
@@ -102,7 +104,12 @@ impl SlamSystem {
         config.validate()?;
         let rig = config.sensors.select_rig(rig)?;
         let settings = config.settings(&rig);
-        let frontend = OrbFrontend::new(config.orb_detector(), &rig, settings.stereo_baseline_m);
+        let frontend = OrbFrontend::new(
+            config.orb_detector(),
+            &rig,
+            settings.stereo_baseline_m,
+            settings.multi_camera,
+        );
         let loop_closer = config.loop_closer(&rig)?;
         Ok(Self::assemble(rig, settings, frontend, loop_closer))
     }
@@ -122,6 +129,7 @@ impl SlamSystem {
             rig,
             camera,
             stereo_baseline_m: settings.stereo_baseline_m,
+            multi_camera: settings.multi_camera,
             tracker: Tracker::new(settings.map_projection),
             two_view_init_config: settings.two_view_init,
             keyframe_policy: settings.keyframe_policy,
@@ -186,6 +194,9 @@ impl SlamSystem {
         if self.stereo_baseline_m.is_some() {
             return Err(ProcessError::StereoRequired);
         }
+        if self.multi_camera {
+            return Err(ProcessError::RigRequired);
+        }
         let frame = self
             .frontend
             .prepare_image(self.next_frame_idx, image)
@@ -202,6 +213,9 @@ impl SlamSystem {
         right: &Image<u8, 1>,
     ) -> Result<TrackingResult, ProcessError> {
         input::validate_stereo_pair(timestamp_sec, left, right)?;
+        if self.multi_camera {
+            return Err(ProcessError::RigRequired);
+        }
         if self.stereo_baseline_m.is_none() {
             return Err(ProcessError::MonoPipeline);
         }
@@ -210,6 +224,28 @@ impl SlamSystem {
             .prepare_stereo_pair(self.next_frame_idx, left, right)
             .map_err(ProcessError::Frontend)?;
         Ok(self.track_frame(frame, left, timestamp_sec))
+    }
+
+    /// Like [`Self::process_image`] for one capture of a multi-camera rig:
+    /// `images[c]` comes from rig camera `c` (see [`SensorRig::cameras`]),
+    /// all taken at `timestamp_sec`. Other pipelines reject it.
+    pub fn process_rig(
+        &mut self,
+        timestamp_sec: f64,
+        images: &[&Image<u8, 1>],
+    ) -> Result<TrackingResult, ProcessError> {
+        if !self.multi_camera {
+            return Err(ProcessError::NotARig);
+        }
+        input::validate_rig_images(timestamp_sec, images, self.rig.cameras())?;
+        let frame = self
+            .frontend
+            .prepare_rig(self.next_frame_idx, images)
+            .map_err(ProcessError::Frontend)?;
+        let Some(&primary) = images.first() else {
+            return Err(ProcessError::NotARig);
+        };
+        Ok(self.track_frame(frame, primary, timestamp_sec))
     }
 
     /// Takes a prepared frame as the next one and tracks it.
@@ -255,6 +291,24 @@ impl SlamSystem {
 
     fn report_stereo(&mut self, frame: &Frame) {
         if !self.debug {
+            return;
+        }
+        if frame.is_rig() {
+            let mut depths: Vec<f64> = frame
+                .rig
+                .stereo_points
+                .iter()
+                .flatten()
+                .map(|p| p.z)
+                .collect();
+            depths.sort_by(f64::total_cmp);
+            let median = depths.get(depths.len() / 2).copied().unwrap_or(0.0);
+            let per_camera: Vec<usize> = frame.rig.camera_ranges.iter().map(|r| r.len()).collect();
+            self.dbg(format!(
+                "[overlap] frame={} features={per_camera:?} triangulated={} median_depth={median:.3}m",
+                frame.idx,
+                depths.len()
+            ));
             return;
         }
         let Some(matched) = self.frontend.observation().stereo_matched else {
@@ -377,7 +431,7 @@ impl SlamSystem {
         // Stereo frames carry metric per-keypoint depth, so we can build a
         // metric map from a single keyframe (ORB-SLAM3's StereoInitialization)
         // instead of waiting for two-view parallax.
-        if curr_frame.is_stereo() {
+        if curr_frame.is_metric() {
             return self.bootstrap_stereo(curr_frame, timestamp_sec);
         }
         self.bootstrap_mono(curr_frame, timestamp_sec)
@@ -699,7 +753,7 @@ impl SlamSystem {
                 .keyframes()
                 .iter()
                 .find(|kf| kf.frame.idx >= start_idx)
-                .map(|kf| kf.frame.is_stereo())
+                .map(|kf| kf.frame.is_metric())
                 .unwrap_or(false);
             let prior_a0 = viba0_accel_bias_prior(is_mono);
             // Drop the solve's map lock before applying its result with a new lock.
@@ -783,7 +837,6 @@ impl SlamSystem {
         current_image: &Image<u8, 1>,
         timestamp_sec: f64,
     ) -> TrackingResult {
-        let image_size = frame.image_size;
         let pose_before = self.state.pose_world_to_cam;
         let prev_timestamp = self.state.last_frame_timestamp_sec;
 
@@ -904,12 +957,12 @@ impl SlamSystem {
                     current_kf,
                     LocalMapSelectionConfig::default(),
                 );
-                let visible = crate::tracking::local_map::landmarks_in_frustum(
+                let visible = crate::tracking::local_map::landmarks_in_frame_frustum(
                     &map_guard,
                     &local_indices,
                     &self.camera,
                     &candidate_pose,
-                    image_size,
+                    &frame,
                 );
                 map_guard.update_observation_counts(&visible, &matches);
             }

@@ -111,16 +111,12 @@ impl Tracker {
                     .ok()
             })
         };
+        // Optical flow follows the primary camera only; its keypoints come first.
+        let primary_keypoints = &input.frame.features.keypoints_xy[input.frame.camera_range(0)];
         let pre_seeded = klt_survivors
             .as_ref()
             .and_then(|survivors| {
-                snap_unique(
-                    &self.track_set,
-                    survivors,
-                    &input.frame.features.keypoints_xy,
-                    3.0,
-                )
-                .ok()
+                snap_unique(&self.track_set, survivors, primary_keypoints, 3.0).ok()
             })
             .map(|matches| {
                 matches
@@ -157,6 +153,7 @@ impl Tracker {
                 let track_matches: Vec<MapKeypointMatch> = estimate
                     .matches
                     .iter()
+                    .filter(|&&(_, keypoint_idx)| keypoint_idx < primary_keypoints.len())
                     .map(|&(map_point_idx, keypoint_idx)| MapKeypointMatch {
                         map_point_idx,
                         keypoint_idx,
@@ -164,7 +161,7 @@ impl Tracker {
                     .collect();
                 if self
                     .track_set
-                    .reconcile_from_matches(&track_matches, &input.frame.features.keypoints_xy)
+                    .reconcile_from_matches(&track_matches, primary_keypoints)
                     .is_err()
                 {
                     self.track_set = TrackSet::new();

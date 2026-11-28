@@ -175,6 +175,7 @@ impl RunConfig {
         let in_source = match self.system.sensors.cameras {
             CameraSelection::Mono => 1,
             CameraSelection::Stereo => 2,
+            CameraSelection::Rig => rig.cameras().len(),
         };
         if calibration.cameras.len() != in_source {
             return Err(RigCalibrationFileError::CameraCount {

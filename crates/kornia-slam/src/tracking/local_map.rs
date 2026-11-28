@@ -120,6 +120,31 @@ pub fn select_local_map_points<D: Descriptor>(
     global_indices
 }
 
+/// [`landmarks_in_frustum`] of every camera of `frame`'s rig, or of the
+/// single camera outside one.
+pub fn landmarks_in_frame_frustum<D: Descriptor>(
+    map: &Map<D>,
+    candidates: &[usize],
+    camera: &PinholeCamera,
+    pose_world_to_cam: &Pose3d,
+    frame: &crate::Frame<D>,
+) -> HashSet<usize> {
+    let mut visible =
+        landmarks_in_frustum(map, candidates, camera, pose_world_to_cam, frame.image_size);
+    if let Some(rig) = frame.rig.geometry.as_ref().filter(|_| frame.is_rig()) {
+        for view in rig.views().skip(1) {
+            visible.extend(landmarks_in_frustum(
+                map,
+                candidates,
+                view.pinhole,
+                &view.pose(pose_world_to_cam),
+                view.camera.size,
+            ));
+        }
+    }
+    visible
+}
+
 /// The subset of `candidates` that are active and project inside the image.
 ///
 /// A projection test only: it says nothing about occlusion, descriptor

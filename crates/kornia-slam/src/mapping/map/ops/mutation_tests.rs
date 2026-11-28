@@ -697,6 +697,40 @@ fn unlinking_the_reference_promotes_the_smallest_remaining() {
     assert_map_consistent(&map);
 }
 
+/// On a rig keyframe, unlinking one camera's record of the reference keyframe
+/// keeps that keyframe as the reference while another camera of it still
+/// observes the landmark; its octave follows the remaining feature.
+#[test]
+fn unlinking_one_rig_camera_of_the_reference_keeps_the_reference_keyframe() {
+    let rig_map = || {
+        let mut map = Map::new();
+        for idx in [10usize, 20] {
+            let mut kf = detached(idx, 4);
+            kf.frame.rig.camera_ranges = vec![0..2, 2..4];
+            kf.frame.features.octaves = vec![(idx / 10) as u8, 0, 7, 0];
+            map.insert_keyframe(kf).unwrap();
+        }
+        let point = map.insert_landmark(seed(20, 0, 5.0)).unwrap();
+        map.link_observation(20, 2, point).unwrap();
+        map.link_observation(10, 0, point).unwrap();
+        (map, point)
+    };
+
+    let (mut map, point) = rig_map();
+    map.unlink_observation(20, 2).unwrap();
+    assert_eq!(map.map_points()[point].keyframe_idx, 20);
+    assert_eq!(map.map_points()[point].reference_octave, 2);
+
+    let (mut map, point) = rig_map();
+    map.unlink_observation(20, 0).unwrap();
+    assert_eq!(map.map_points()[point].keyframe_idx, 20);
+    assert_eq!(map.map_points()[point].reference_octave, 7);
+
+    map.unlink_observation(20, 2).unwrap();
+    assert_eq!(map.map_points()[point].keyframe_idx, 10);
+    assert_eq!(map.map_points()[point].reference_octave, 1);
+}
+
 /// R2: a duplicate directed IMU edge inside one request rejects the batch,
 /// leaving nothing behind — it would otherwise double-count integrated
 /// duration in the initialization readiness gate.

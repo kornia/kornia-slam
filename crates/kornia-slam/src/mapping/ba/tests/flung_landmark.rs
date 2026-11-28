@@ -292,14 +292,25 @@ fn the_depth_gate_drops_only_rows_far_from_their_measurement() {
 fn cheirality_flips_are_counted_per_observation() {
     let (keyframes, points, observations) = flung_window();
     assert_eq!(
-        cheirality_flips(&observations, (&keyframes, &points), (&keyframes, &points)).len(),
+        cheirality_flips(
+            &observations,
+            ObservationViews::PRIMARY,
+            (&keyframes, &points),
+            (&keyframes, &points)
+        )
+        .len(),
         0
     );
     let mut behind = points.clone();
     behind[3] = point_at(&parked_pose(), 300.0, 200.0, -1.0);
     // Landmark 3 is seen by all six keyframes.
     assert_eq!(
-        cheirality_flips(&observations, (&keyframes, &points), (&keyframes, &behind)),
+        cheirality_flips(
+            &observations,
+            ObservationViews::PRIMARY,
+            (&keyframes, &points),
+            (&keyframes, &behind)
+        ),
         observations
             .iter()
             .enumerate()
@@ -309,7 +320,13 @@ fn cheirality_flips_are_counted_per_observation() {
     );
     // Already behind before the step: not a flip.
     assert_eq!(
-        cheirality_flips(&observations, (&keyframes, &behind), (&keyframes, &behind)).len(),
+        cheirality_flips(
+            &observations,
+            ObservationViews::PRIMARY,
+            (&keyframes, &behind),
+            (&keyframes, &behind)
+        )
+        .len(),
         0
     );
 }
@@ -446,6 +463,7 @@ fn cheirality_holds_the_landmark_and_refuses_only_for_inliers() {
     after[4] = points[4] + Vec3F64::new(0.0, 0.0, 0.01);
     let out = enforce_cheirality(
         &observations,
+        ObservationViews::PRIMARY,
         &inliers,
         &all_free,
         (&keyframes, &points),
@@ -470,6 +488,7 @@ fn cheirality_holds_the_landmark_and_refuses_only_for_inliers() {
     after[3] = point_at(&pose, 300.0, 200.0, -1.0);
     let out = enforce_cheirality(
         &observations,
+        ObservationViews::PRIMARY,
         &inliers,
         &fixed,
         (&keyframes, &points),
@@ -488,6 +507,7 @@ fn cheirality_holds_the_landmark_and_refuses_only_for_inliers() {
     let outliers: Vec<bool> = observations.iter().map(|o| o.point_idx != 3).collect();
     let out = enforce_cheirality(
         &observations,
+        ObservationViews::PRIMARY,
         &outliers,
         &fixed,
         (&keyframes, &points),
@@ -758,6 +778,7 @@ impl ParkedChain {
         let keep = if guard {
             crate::mapping::ba::landmarks_to_write_back(
                 &observations,
+                |_| None,
                 (&keyframes, &self.points),
                 (&result.keyframes, &result.points),
             )
