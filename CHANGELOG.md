@@ -10,6 +10,36 @@ written for users of the `kornia-slam` and `kornia-sensors` crates and the
 
 ## [Unreleased]
 
+**Optical-flow-first tracking, off by default.** Three new `frontend: Orb(..)`
+knobs; each default reproduces the previous behaviour, and the configuration
+header prints a line only for a knob away from its default:
+- `klt_first: Disabled` (default) or `Enabled(min_tracks: N)`: a frame between
+  keyframes is tracked from its optical-flow survivors alone, without ORB,
+  when at least `N` of them carry a map point; ORB runs when that pose is
+  refused, too few survivors remain, or a keyframe is due. A multi-camera rig
+  and a raw fisheye primary extract ORB on every frame. `SlamSystem::flow_counters` reports what became
+  of the deferred frames, and the CLI prints them as one `[summary] flow` line
+  at the end of a `klt_first` run.
+- `klt_kernel: F32` (default, kornia-imgproc's f32 LK) or `FixedPointU8`.
+- `klt_prediction: Disabled` (default) or `Enabled(max_level, max_iter)`: with
+  a trusted inertial prediction, flow starts each track at its map point
+  projected at the predicted pose and searches fewer pyramid levels. Raw
+  fisheye primaries keep the full search.
+
+The flow pyramid of the current frame is kept for the next one, with
+bit-identical flow; `SlamSystem::tracking_timings` reports the pyramid build
+and the LK solve. These knobs have not been evaluated on datasets in this
+change; `klt_first` stays off in every shipped configuration.
+
+**One guided epipolar matcher for keyframe growth and the rig overlap.** Both
+now match descriptors, guard the epipole and gate on the octave-scaled
+chi-square band with one implementation; keyframe growth is bit-identical.
+The rig overlap triangulates with kornia-3d's two-camera midpoint
+triangulation and per-octave thresholds, and gains the epipole guard, so
+`cameras: Rig` overlap matches and their landmarks change. Mono and stereo
+runs are unchanged. A failed frame preparation now leaves the frontend
+observation of the last frame intact.
+
 **A sensor rig is a list of cameras.** `SensorRig` now holds `cameras()`, the
 primary first, each a `RigCamera` with its lens model (`kornia_3d::camera::Camera`:
 pinhole, Kannala-Brandt or Fisheye624), its image size and its pose

@@ -361,3 +361,39 @@ fn a_distorted_pinhole_rig_frame_undistorts_every_keypoint() {
         frame.features.keypoints_xy.len()
     );
 }
+
+#[test]
+fn a_failed_preparation_keeps_the_previous_observation() {
+    let (left, right) = synthetic_pair(376, 240, 8);
+    let mut frontend = stereo_frontend();
+    frontend.prepare_stereo_pair(0, &left, &right).unwrap();
+    let before = frontend.observation().clone();
+    assert!(before.stereo_matched.is_some_and(|n| n > 0));
+
+    frontend.fail_next_extraction();
+    assert!(frontend.prepare_stereo_pair(1, &left, &right).is_err());
+    let after = frontend.observation();
+    assert_eq!(after.keypoints_xy, before.keypoints_xy);
+    assert_eq!(after.stereo_matched, before.stereo_matched);
+    assert_eq!(after.duration, before.duration);
+
+    let camera = pinhole(240.0, 240.0, 188.0, 120.0);
+    let size = ImageSize {
+        width: 376,
+        height: 240,
+    };
+    let mut rig_frontend = OrbFrontend::new(
+        OrbDetector::default(),
+        &sideways_rig(camera, size),
+        None,
+        true,
+    );
+    rig_frontend.prepare_rig(0, &[&left, &right]).unwrap();
+    let before = rig_frontend.observation().clone();
+    rig_frontend.fail_next_extraction();
+    assert!(rig_frontend.prepare_rig(1, &[&left, &right]).is_err());
+    let after = rig_frontend.observation();
+    assert_eq!(after.keypoints_xy, before.keypoints_xy);
+    assert_eq!(after.stereo_matched, before.stereo_matched);
+    assert_eq!(after.duration, before.duration);
+}

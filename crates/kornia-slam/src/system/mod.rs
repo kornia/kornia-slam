@@ -8,18 +8,20 @@ mod build;
 mod config;
 #[cfg(feature = "serde")]
 mod file;
+mod flow_counters;
 mod input;
 mod state;
 mod validation;
 
 pub use build::BuildError;
 pub use config::{
-    CameraSelection, FrontendConfig, LoopClosingMode, MappingConfig, OrbFrontendConfig,
-    OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection,
-    StereoCloseDepth, SystemConfig,
+    CameraSelection, FrontendConfig, KltFirst, KltPrediction, LoopClosingMode, MappingConfig,
+    OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION,
+    SensorSelection, StereoCloseDepth, SystemConfig,
 };
 #[cfg(feature = "serde")]
 pub use file::LoadError;
+pub use flow_counters::FlowCounters;
 pub use input::ProcessError;
 pub use state::{TrackingResult, TrackingStatus};
 pub use validation::ConfigError;
@@ -33,7 +35,10 @@ use crate::tracking::{
 
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 use crate::tracking::motion::{InertialPrediction, predict_pose};
-use crate::tracking::tracker::{FrameInput, Tracker};
+use crate::tracking::optical_flow::FlowSurvivor;
+use crate::tracking::pose_estimation::Estimate;
+use crate::tracking::timings::TrackingTimings;
+use crate::tracking::tracker::{FlowGuess, FrameInput, Tracker};
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -60,6 +65,64 @@ use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
 use kornia_sensors::SensorRig;
 use kornia_sensors::imu::ImuMeasurement;
+
+/// The images of one capture, kept until its features are extracted.
+#[derive(Clone, Copy)]
+enum Capture<'a> {
+    Mono(&'a Image<u8, 1>),
+    Stereo(&'a Image<u8, 1>, &'a Image<u8, 1>),
+    Rig(&'a [&'a Image<u8, 1>]),
+}
+
+/// A capture numbered as frame `idx`, not yet extracted.
+#[derive(Clone, Copy)]
+struct PendingFrame<'a> {
+    idx: usize,
+    capture: Capture<'a>,
+}
+
+/// A frame's features: extracted, or deferred until tracking needs them.
+enum FrameSource<'a> {
+    Ready(Box<Frame>),
+    Deferred(PendingFrame<'a>),
+}
+
+impl FrameSource<'_> {
+    fn idx(&self) -> usize {
+        match self {
+            Self::Ready(frame) => frame.idx,
+            Self::Deferred(pending) => pending.idx,
+        }
+    }
+}
+
+/// The frame tracking settled on: an ORB frame, or the source of one that
+/// optical flow tracked without ORB.
+enum TrackedFrame<'a> {
+    Orb(Box<Frame>),
+    Flow(FrameSource<'a>),
+}
+
+/// Per-frame estimation inputs from the motion model and loss state.
+struct Estimation {
+    candidate_pose: Pose3d,
+    pose_before: Pose3d,
+    lost_for_sec: f64,
+    trusted_prediction: bool,
+}
+
+/// What tracking a deferred frame from its flow survivors alone gave.
+enum FlowOnly {
+    /// Too few survivors with a map point, or no flow at all.
+    Unavailable,
+    /// The flow-only pose was not accepted.
+    Refused,
+    /// The flow-only pose was accepted, but the frame is due as a keyframe,
+    /// which needs ORB; the pose seeds the full estimate.
+    KeyframeDue(Pose3d),
+    /// Tracked without ORB, on the tracker's flow stand-in frame.
+    Tracked(Estimate),
+}
 
 /// Top-level ORB-SLAM system: orchestrates tracking, mapping, and state transitions.
 pub struct SlamSystem {
@@ -92,6 +155,16 @@ pub struct SlamSystem {
     // The last processed image, for optical-flow tracks into the next frame.
     previous_image: Option<Image<u8, 1>>,
     tracking_duration: Duration,
+    tracking_timings: TrackingTimings,
+    /// Extraction time of a deferred frame, kept out of `tracking_duration`.
+    deferred_extraction: Duration,
+    /// Survivors with a map point a frame needs to be tracked by optical flow
+    /// alone (`klt_first`); `None` extracts ORB on every frame.
+    klt_min_tracks: Option<usize>,
+    flow_counters: FlowCounters,
+    /// `(max_level, max_iter)` of the optical-flow search from a trusted
+    /// inertial prediction; `None` searches the full pyramid.
+    klt_prediction: Option<(usize, usize)>,
     // Number given to the next frame; it becomes the keyframe's id in the map.
     next_frame_idx: usize,
 }
@@ -130,7 +203,7 @@ impl SlamSystem {
             camera,
             stereo_baseline_m: settings.stereo_baseline_m,
             multi_camera: settings.multi_camera,
-            tracker: Tracker::new(settings.map_projection),
+            tracker: Tracker::new(settings.map_projection).with_lk_kernel(settings.klt_kernel),
             two_view_init_config: settings.two_view_init,
             keyframe_policy: settings.keyframe_policy,
             tracking_loss_recovery: settings.tracking_loss_recovery,
@@ -147,6 +220,11 @@ impl SlamSystem {
             frontend,
             previous_image: None,
             tracking_duration: Duration::ZERO,
+            tracking_timings: TrackingTimings::default(),
+            deferred_extraction: Duration::ZERO,
+            klt_min_tracks: settings.klt_min_tracks,
+            flow_counters: FlowCounters::default(),
+            klt_prediction: settings.klt_prediction,
             next_frame_idx: 0,
         }
     }
@@ -197,11 +275,7 @@ impl SlamSystem {
         if self.multi_camera {
             return Err(ProcessError::RigRequired);
         }
-        let frame = self
-            .frontend
-            .prepare_image(self.next_frame_idx, image)
-            .map_err(ProcessError::Frontend)?;
-        Ok(self.track_frame(frame, image, timestamp_sec))
+        self.track_capture(Capture::Mono(image), image, timestamp_sec)
     }
 
     /// Like [`Self::process_image`] for a rectified stereo pair; a mono
@@ -219,11 +293,7 @@ impl SlamSystem {
         if self.stereo_baseline_m.is_none() {
             return Err(ProcessError::MonoPipeline);
         }
-        let frame = self
-            .frontend
-            .prepare_stereo_pair(self.next_frame_idx, left, right)
-            .map_err(ProcessError::Frontend)?;
-        Ok(self.track_frame(frame, left, timestamp_sec))
+        self.track_capture(Capture::Stereo(left, right), left, timestamp_sec)
     }
 
     /// Like [`Self::process_image`] for one capture of a multi-camera rig:
@@ -238,39 +308,130 @@ impl SlamSystem {
             return Err(ProcessError::NotARig);
         }
         input::validate_rig_images(timestamp_sec, images, self.rig.cameras())?;
-        let frame = self
-            .frontend
-            .prepare_rig(self.next_frame_idx, images)
-            .map_err(ProcessError::Frontend)?;
         let Some(&primary) = images.first() else {
             return Err(ProcessError::NotARig);
         };
-        Ok(self.track_frame(frame, primary, timestamp_sec))
+        self.track_capture(Capture::Rig(images), primary, timestamp_sec)
     }
 
-    /// Takes a prepared frame as the next one and tracks it.
-    fn track_frame(
+    /// Extracts the capture's features now, or defers extraction to tracking
+    /// when optical flow may carry the frame alone.
+    fn track_capture(
         &mut self,
-        frame: Frame,
+        capture: Capture<'_>,
         image: &Image<u8, 1>,
         timestamp_sec: f64,
-    ) -> TrackingResult {
+    ) -> Result<TrackingResult, ProcessError> {
+        let pending = PendingFrame {
+            idx: self.next_frame_idx,
+            capture,
+        };
+        let deferrable = self.klt_min_tracks.is_some()
+            && self.state.mode != SystemMode::Bootstrap
+            && self.previous_image.is_some();
+        let source = if deferrable {
+            FrameSource::Deferred(pending)
+        } else {
+            FrameSource::Ready(Box::new(self.extract(pending)?))
+        };
+        self.track_frame(source, image, timestamp_sec)
+    }
+
+    /// ORB features of a capture.
+    fn extract(&mut self, pending: PendingFrame<'_>) -> Result<Frame, ProcessError> {
+        match pending.capture {
+            Capture::Mono(image) => self.frontend.prepare_image(pending.idx, image),
+            Capture::Stereo(left, right) => {
+                self.frontend.prepare_stereo_pair(pending.idx, left, right)
+            }
+            Capture::Rig(images) => self.frontend.prepare_rig(pending.idx, images),
+        }
+        .map_err(ProcessError::Frontend)
+    }
+
+    /// The frame `source` describes, extracting it if it was deferred; the
+    /// extraction time is kept out of `tracking_duration`.
+    fn resolve(&mut self, source: FrameSource<'_>) -> Result<Box<Frame>, ProcessError> {
+        match source {
+            FrameSource::Ready(frame) => Ok(frame),
+            FrameSource::Deferred(pending) => {
+                let mut frame = self.extract(pending)?;
+                self.deferred_extraction += self.frontend.observation().duration;
+                self.report_stereo(&frame);
+                frame.ensure_undistorted(&self.camera);
+                Ok(Box::new(frame))
+            }
+        }
+    }
+
+    /// The ORB frame of `tracked`, extracting it when optical flow tracked
+    /// the frame without one.
+    fn orb_frame(&mut self, tracked: TrackedFrame<'_>) -> Result<Frame, ProcessError> {
+        match tracked {
+            TrackedFrame::Orb(frame) => Ok(*frame),
+            TrackedFrame::Flow(source) => self.resolve(source).map(|frame| *frame),
+        }
+    }
+
+    /// Takes a prepared or deferred frame as the next one and tracks it. On
+    /// an error, from a deferred extraction, the system is left as it was.
+    fn track_frame(
+        &mut self,
+        source: FrameSource<'_>,
+        image: &Image<u8, 1>,
+        timestamp_sec: f64,
+    ) -> Result<TrackingResult, ProcessError> {
+        let next_frame_idx = self.next_frame_idx;
+        let latest_image_timestamp_sec = self.inertial.latest_image_timestamp_sec;
+        let tracking_timings = self.tracking_timings;
         self.next_frame_idx += 1;
         self.inertial.latest_image_timestamp_sec = Some(timestamp_sec);
-        self.report_stereo(&frame);
+        if let FrameSource::Ready(frame) = &source {
+            self.report_stereo(frame);
+        }
         // Taken out for the call so tracking can borrow it alongside `self`.
         let previous_image = self.previous_image.take();
+        self.tracking_timings = TrackingTimings::default();
+        self.deferred_extraction = Duration::ZERO;
         let tracking_start = Instant::now();
-        let result = self.process_prepared(frame, previous_image.as_ref(), image, timestamp_sec);
-        self.tracking_duration = tracking_start.elapsed();
-        self.retain_previous_image(image, previous_image);
-        result
+        match self.process_prepared(source, previous_image.as_ref(), image, timestamp_sec) {
+            Ok(result) => {
+                self.tracking_duration = tracking_start
+                    .elapsed()
+                    .saturating_sub(self.deferred_extraction);
+                self.retain_previous_image(image, previous_image);
+                Ok(result)
+            }
+            Err(error) => {
+                self.next_frame_idx = next_frame_idx;
+                self.inertial.latest_image_timestamp_sec = latest_image_timestamp_sec;
+                self.tracking_timings = tracking_timings;
+                self.previous_image = previous_image;
+                Err(error)
+            }
+        }
     }
 
     /// Time the latest successfully processed frame spent in tracking and
     /// mapping, excluding feature extraction (see [`Self::frontend_observation`]).
     pub fn tracking_duration(&self) -> Duration {
         self.tracking_duration
+    }
+
+    /// Per-stage times of the latest successfully processed frame's
+    /// tracking; zero for stages it did not run (all of them in bootstrap).
+    pub fn tracking_timings(&self) -> &TrackingTimings {
+        &self.tracking_timings
+    }
+
+    /// Tallies of optical-flow-first tracking (`klt_first`) so far.
+    pub fn flow_counters(&self) -> FlowCounters {
+        let (klt_errors, snap_errors) = self.tracker.flow_errors();
+        FlowCounters {
+            klt_errors,
+            snap_errors,
+            ..self.flow_counters
+        }
     }
 
     /// The frontend output of the latest successfully processed frame.
@@ -327,14 +488,14 @@ impl SlamSystem {
         ));
     }
 
-    /// Tracks one frame of prepared features.
+    /// Tracks one frame of prepared or deferred features.
     fn process_prepared(
         &mut self,
-        mut frame: Frame,
+        source: FrameSource<'_>,
         previous_image: Option<&Image<u8, 1>>,
         current_image: &Image<u8, 1>,
         timestamp_sec: f64,
-    ) -> TrackingResult {
+    ) -> Result<TrackingResult, ProcessError> {
         // Local-BA snapshots, merges, and their correction messages can only
         // cross this boundary between complete tracking frames.
         let publication_gate = self.map_publication_gate.clone();
@@ -343,16 +504,26 @@ impl SlamSystem {
             .map(|gate| gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
         self.apply_local_mapping_results();
         // Fill the per-frame undistortion cache once; tracking, BA gathering,
-        // growth, and fuse all read from it.
-        frame.ensure_undistorted(&self.camera);
+        // growth, and fuse all read from it. A deferred frame fills it when
+        // it is extracted.
+        let source = match source {
+            FrameSource::Ready(mut frame) => {
+                frame.ensure_undistorted(&self.camera);
+                FrameSource::Ready(frame)
+            }
+            deferred => deferred,
+        };
 
         match self.state.mode {
-            SystemMode::Bootstrap => self.bootstrap_step(frame, timestamp_sec),
+            SystemMode::Bootstrap => {
+                let frame = self.resolve(source)?;
+                Ok(self.bootstrap_step(*frame, timestamp_sec))
+            }
             SystemMode::ImuInit => {
-                self.inertial_init_step(frame, previous_image, current_image, timestamp_sec)
+                self.inertial_init_step(source, previous_image, current_image, timestamp_sec)
             }
             SystemMode::Tracking => {
-                self.tracking_step(frame, previous_image, current_image, timestamp_sec)
+                self.tracking_step(source, previous_image, current_image, timestamp_sec)
             }
         }
     }
@@ -694,12 +865,12 @@ impl SlamSystem {
     /// window is ready and a retry is due.
     fn inertial_init_step(
         &mut self,
-        frame: Frame,
+        source: FrameSource<'_>,
         previous_image: Option<&Image<u8, 1>>,
         current_image: &Image<u8, 1>,
         timestamp_sec: f64,
-    ) -> TrackingResult {
-        let result = self.tracking_step(frame, previous_image, current_image, timestamp_sec);
+    ) -> Result<TrackingResult, ProcessError> {
+        let result = self.tracking_step(source, previous_image, current_image, timestamp_sec)?;
 
         if result.status == TrackingStatus::KeyframeAccepted
             && let Some(start_idx) = self.inertial.schedule.start_kf_idx()
@@ -743,7 +914,7 @@ impl SlamSystem {
 
         if result.status == TrackingStatus::KeyframeAccepted && due_for_retry && imu_init_ready {
             let Some(start_idx) = self.inertial.schedule.start_kf_idx() else {
-                return result;
+                return Ok(result);
             };
             self.inertial.schedule.record_attempt(timestamp_sec);
             let is_mono = !self
@@ -783,7 +954,7 @@ impl SlamSystem {
             }
         }
 
-        result
+        Ok(result)
     }
 
     /// Applies an inertial initialization to the map and resumes tracking from
@@ -832,13 +1003,17 @@ impl SlamSystem {
 
     fn tracking_step(
         &mut self,
-        frame: Frame,
+        source: FrameSource<'_>,
         previous_image: Option<&Image<u8, 1>>,
         current_image: &Image<u8, 1>,
         timestamp_sec: f64,
-    ) -> TrackingResult {
+    ) -> Result<TrackingResult, ProcessError> {
+        let frame_idx = source.idx();
         let pose_before = self.state.pose_world_to_cam;
         let prev_timestamp = self.state.last_frame_timestamp_sec;
+        // Restored when a deferred extraction fails, with the rest of the
+        // frame's state (see `track_frame`).
+        let (velocity_world_before, bias_before) = (self.state.velocity_world, self.inertial.bias);
 
         // Local BA updates keyframe state asynchronously, so refresh cached IMU state.
         if let Some(kf_idx) = self.state.current_keyframe_idx
@@ -875,23 +1050,66 @@ impl SlamSystem {
             .state
             .lost_since_sec
             .map_or(0.0, |t0| timestamp_sec - t0);
-        let result = {
-            let map = self.map.lock().unwrap();
-            self.tracker.estimate(
-                FrameInput {
-                    frame: &frame,
-                    previous_image,
-                    current_image,
-                    candidate_pose,
-                    pose_before,
-                    current_keyframe_idx: self.state.current_keyframe_idx,
-                    lost_for_sec: currently_lost_for,
-                    trusted_prediction: self.imu_confident(timestamp_sec),
-                },
-                &map,
-                &self.camera,
-            )
+        let trusted_prediction = self.imu_confident(timestamp_sec);
+        let search = self.predicted_flow_search(trusted_prediction, predicted_velocity.is_some());
+        let survivors = self.flow(previous_image, current_image, &candidate_pose, search);
+        let estimation = Estimation {
+            candidate_pose,
+            pose_before,
+            lost_for_sec: currently_lost_for,
+            trusted_prediction,
         };
+        let deferred = matches!(source, FrameSource::Deferred(_));
+        let flow_only = if deferred {
+            self.track_flow_only(
+                frame_idx,
+                current_image,
+                survivors.as_deref(),
+                &estimation,
+                timestamp_sec,
+            )
+        } else {
+            FlowOnly::Unavailable
+        };
+        let flow_due = matches!(flow_only, FlowOnly::KeyframeDue(_));
+        let (tracked, result) = match flow_only {
+            FlowOnly::Tracked(estimate) => (TrackedFrame::Flow(source), Ok(estimate)),
+            outcome => {
+                let frame = match self.resolve(source) {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        self.state.velocity_world = velocity_world_before;
+                        self.inertial.bias = bias_before;
+                        return Err(error);
+                    }
+                };
+                if deferred {
+                    self.count_flow_decision(&outcome);
+                }
+                let candidate_pose = match outcome {
+                    FlowOnly::KeyframeDue(pose) => pose,
+                    _ => candidate_pose,
+                };
+                let result = {
+                    let map = self.map.lock().unwrap();
+                    self.tracker.estimate(
+                        FrameInput {
+                            frame: &frame,
+                            candidate_pose,
+                            pose_before,
+                            current_keyframe_idx: self.state.current_keyframe_idx,
+                            lost_for_sec: currently_lost_for,
+                            trusted_prediction,
+                        },
+                        survivors,
+                        &map,
+                        &self.camera,
+                    )
+                };
+                (TrackedFrame::Orb(frame), result)
+            }
+        };
+        self.flow_counters.flow_due_orb_rejected += u64::from(flow_due && result.is_err());
 
         let (mut status, matches, tracked_inliers, reject_reason) = match result {
             Ok(estimate) => {
@@ -929,10 +1147,10 @@ impl SlamSystem {
         };
         if self.debug {
             let msg = match reject_reason {
-                Some(reason) => format!("[track] frame={} reject: {:?}", frame.idx, reason),
+                Some(reason) => format!("[track] frame={} reject: {:?}", frame_idx, reason),
                 None => format!(
                     "[track] frame={} ok: matches={} inliers={}",
-                    frame.idx,
+                    frame_idx,
                     matches.len(),
                     tracked_inliers,
                 ),
@@ -940,77 +1158,35 @@ impl SlamSystem {
             self.debug_messages.push(msg);
         }
 
-        if status == TrackingStatus::Tracked {
-            // Visibility bookkeeping over the local map only (mirrors
-            // ORB-SLAM3, which counts mnVisible on local-map points): full-map
-            // scans here would grow with trajectory length.
-            // Release this non-reentrant lock before keyframe insertion locks the map.
-            {
-                let mut map_guard = self.map.lock().unwrap();
-                let current_kf = self
-                    .state
-                    .current_keyframe_idx
-                    .and_then(|ki| map_guard.get_keyframe(ki));
-                let local_indices = select_local_map_points(
-                    &map_guard,
-                    &matches,
-                    current_kf,
-                    LocalMapSelectionConfig::default(),
-                );
-                let visible = crate::tracking::local_map::landmarks_in_frame_frustum(
-                    &map_guard,
-                    &local_indices,
-                    &self.camera,
-                    &candidate_pose,
-                    &frame,
-                );
-                map_guard.update_observation_counts(&visible, &matches);
-            }
-
-            if self.try_insert_keyframe(&frame, timestamp_sec, tracked_inliers, &matches) {
+        // A flow-tracked frame counts no visibility, as ORB-SLAM3 counts none
+        // on a frame without a projection search, and its keyframe verdict was
+        // given in `track_flow_only`.
+        if status == TrackingStatus::Tracked
+            && let TrackedFrame::Orb(frame) = &tracked
+        {
+            self.count_visibility(frame, &matches, &candidate_pose);
+            // A flow frame found due is inserted on its first verdict.
+            let pose = self.state.pose_world_to_cam;
+            let inserted = if flow_due {
+                self.insert_keyframe(frame, timestamp_sec, &matches)
+            } else {
+                self.try_insert_keyframe(frame, &pose, timestamp_sec, tracked_inliers, &matches)
+            };
+            if inserted {
                 status = TrackingStatus::KeyframeAccepted;
             }
         }
 
-        // With a settled IMU the system coasts instead (below): a relocalized
-        // pose taken from an older part of a drifted map would jump away from
-        // the inertial state, which ORB-SLAM3 also avoids in inertial mode.
-        if status == TrackingStatus::Skipped
-            && !self.imu_confident(timestamp_sec)
-            && self.relocalize(&frame)
-        {
-            status = TrackingStatus::Tracked;
-        }
         if status == TrackingStatus::Skipped {
-            let policy = &self.tracking_loss_recovery;
-
-            let lost_since = *self.state.lost_since_sec.get_or_insert(timestamp_sec);
-            let recently_lost_for = timestamp_sec - lost_since;
-
-            let imu_confident = self.imu_confident(timestamp_sec);
-            let grace_period_sec = policy.grace_period_sec(imu_confident);
-            let map_established =
-                self.map.lock().unwrap().keyframes().len() > policy.min_keyframes_for_grace;
-
-            if !map_established || recently_lost_for >= grace_period_sec {
-                self.dbg(format!(
-                    "[lost] frame={} giving up after {:.2}s (map_established={}): resetting",
-                    frame.idx, recently_lost_for, map_established,
-                ));
-                self.tracker.reset_tracks();
-                self.state.reset();
-                return self.bootstrap_step(frame, timestamp_sec);
+            // Only a tracked flow frame is left unextracted, so a rejected
+            // frame has its ORB frame already; this extracts only if a later
+            // check rejects a flow-tracked pose.
+            let frame = self.orb_frame(tracked)?;
+            if let Some(result) = self.recover_or_coast(&mut status, frame, timestamp_sec) {
+                return Ok(result);
             }
-            if imu_confident
-                && self.keyframe_due_while_lost(timestamp_sec)
-                && self.insert_keyframe(&frame, timestamp_sec, &[])
-            {
-                self.dbg(format!(
-                    "[lost] frame={} keyframe inserted at the inertial prediction",
-                    frame.idx
-                ));
-            }
-        } else {
+        }
+        if status != TrackingStatus::Skipped {
             self.state.lost_since_sec = None;
         }
         self.state.last_frame_timestamp_sec = timestamp_sec;
@@ -1019,15 +1195,220 @@ impl SlamSystem {
         if let Some(kf_ts) = self.inertial.last_keyframe_timestamp_sec {
             self.prune_imu_before(kf_ts.min(timestamp_sec));
         }
-        self.frame_result(status)
+        Ok(self.frame_result(status))
+    }
+
+    /// A rejected frame: relocalization, which sets `status` to tracked, the
+    /// coast on the IMU with its keyframe while lost, or giving up, which
+    /// returns the bootstrap result.
+    fn recover_or_coast(
+        &mut self,
+        status: &mut TrackingStatus,
+        frame: Frame,
+        timestamp_sec: f64,
+    ) -> Option<TrackingResult> {
+        // With a settled IMU the system coasts instead (below): a relocalized
+        // pose taken from an older part of a drifted map would jump away from
+        // the inertial state, which ORB-SLAM3 also avoids in inertial mode.
+        if !self.imu_confident(timestamp_sec) && self.relocalize(&frame) {
+            *status = TrackingStatus::Tracked;
+            return None;
+        }
+        let policy = &self.tracking_loss_recovery;
+
+        let lost_since = *self.state.lost_since_sec.get_or_insert(timestamp_sec);
+        let recently_lost_for = timestamp_sec - lost_since;
+
+        let imu_confident = self.imu_confident(timestamp_sec);
+        let grace_period_sec = policy.grace_period_sec(imu_confident);
+        let map_established =
+            self.map.lock().unwrap().keyframes().len() > policy.min_keyframes_for_grace;
+
+        if !map_established || recently_lost_for >= grace_period_sec {
+            self.dbg(format!(
+                "[lost] frame={} giving up after {:.2}s (map_established={}): resetting",
+                frame.idx, recently_lost_for, map_established,
+            ));
+            self.tracker.reset_tracks();
+            self.state.reset();
+            return Some(self.bootstrap_step(frame, timestamp_sec));
+        }
+        if imu_confident
+            && self.keyframe_due_while_lost(timestamp_sec)
+            && self.insert_keyframe(&frame, timestamp_sec, &[])
+        {
+            self.dbg(format!(
+                "[lost] frame={} keyframe inserted at the inertial prediction",
+                frame.idx
+            ));
+        }
+        None
+    }
+
+    /// Visibility bookkeeping over the local map only (mirrors ORB-SLAM3,
+    /// which counts mnVisible on local-map points): full-map scans here would
+    /// grow with trajectory length.
+    fn count_visibility(&self, frame: &Frame, matches: &[(usize, usize)], candidate_pose: &Pose3d) {
+        let mut map_guard = self.map.lock().unwrap();
+        let current_kf = self
+            .state
+            .current_keyframe_idx
+            .and_then(|ki| map_guard.get_keyframe(ki));
+        let local_indices = select_local_map_points(
+            &map_guard,
+            matches,
+            current_kf,
+            LocalMapSelectionConfig::default(),
+        );
+        let visible = crate::tracking::local_map::landmarks_in_frame_frustum(
+            &map_guard,
+            &local_indices,
+            &self.camera,
+            candidate_pose,
+            frame,
+        );
+        map_guard.update_observation_counts(&visible, matches);
+    }
+
+    /// Tracks a deferred frame from its flow survivors alone when they carry
+    /// it and no keyframe is due; ORB then never runs for this frame.
+    fn track_flow_only(
+        &mut self,
+        idx: usize,
+        current_image: &Image<u8, 1>,
+        survivors: Option<&[FlowSurvivor]>,
+        estimation: &Estimation,
+        timestamp_sec: f64,
+    ) -> FlowOnly {
+        let (Some(min_tracks), Some(survivors)) = (self.klt_min_tracks, survivors) else {
+            return FlowOnly::Unavailable;
+        };
+        let map = self
+            .map
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(seeded) = self.tracker.flow_frame(
+            idx,
+            survivors,
+            &map,
+            current_image.size(),
+            min_tracks,
+            &self.camera,
+        ) else {
+            return FlowOnly::Unavailable;
+        };
+        let n_seeded = seeded.len();
+        let result = self.tracker.estimate_flow_only(
+            flow_input(
+                self.tracker.flow_stand_in(),
+                estimation,
+                self.state.current_keyframe_idx,
+            ),
+            seeded,
+            &map,
+            &self.camera,
+            &mut self.tracking_timings,
+        );
+        drop(map);
+        let Ok(estimate) = result else {
+            if self.debug {
+                self.dbg(format!("[klt-first] frame={idx} refused seeded={n_seeded}"));
+            }
+            return FlowOnly::Refused;
+        };
+
+        let evidence = self.flow_keyframe_evidence(
+            self.tracker.flow_stand_in(),
+            &estimate.pose,
+            estimate.inliers,
+            &estimate.matches,
+        );
+        if self.keyframe_due(&evidence, timestamp_sec) {
+            if self.debug {
+                self.dbg(format!(
+                    "[klt-first] frame={idx} keyframe due seeded={n_seeded} inliers={}",
+                    estimate.inliers
+                ));
+            }
+            return FlowOnly::KeyframeDue(estimate.pose);
+        }
+        self.tracker.accept_flow_only(&estimate);
+        self.frontend
+            .observe_flow(&self.tracker.flow_stand_in().features.keypoints_xy);
+        self.flow_counters.flow_frames += 1;
+        self.flow_counters.flow_seeds += n_seeded as u64;
+        self.flow_counters.flow_inliers += estimate.inliers as u64;
+        FlowOnly::Tracked(estimate)
+    }
+
+    /// Counts what a deferred frame's flow-only attempt gave; `flow_frames`
+    /// counts the tracked ones where they are accepted.
+    fn count_flow_decision(&mut self, flow_only: &FlowOnly) {
+        let counter = match flow_only {
+            FlowOnly::Unavailable => &mut self.flow_counters.flow_unavailable,
+            FlowOnly::Refused => &mut self.flow_counters.flow_refused,
+            FlowOnly::KeyframeDue(_) => &mut self.flow_counters.flow_keyframe_due,
+            FlowOnly::Tracked(_) => return,
+        };
+        *counter += 1;
+    }
+
+    /// The `(max_level, max_iter)` of `klt_prediction` when this frame's
+    /// pose comes from a trusted inertial prediction; a trusted IMU whose
+    /// window held no samples falls back to the visual model, too weak a
+    /// start for the shallow search.
+    fn predicted_flow_search(
+        &self,
+        trusted_prediction: bool,
+        inertial_prediction: bool,
+    ) -> Option<(usize, usize)> {
+        self.klt_prediction
+            .filter(|_| trusted_prediction && inertial_prediction)
+    }
+
+    /// The optical-flow survivors of the current frame, searched from the
+    /// predicted pose with `search` levels and iterations when given.
+    fn flow(
+        &mut self,
+        previous_image: Option<&Image<u8, 1>>,
+        current_image: &Image<u8, 1>,
+        candidate_pose: &Pose3d,
+        search: Option<(usize, usize)>,
+    ) -> Option<Vec<FlowSurvivor>> {
+        let Some((max_level, max_iter)) = search else {
+            return self.tracker.flow(
+                previous_image,
+                current_image,
+                None,
+                &mut self.tracking_timings,
+            );
+        };
+        let map = self
+            .map
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guess = FlowGuess {
+            map: &map,
+            pose: candidate_pose,
+            camera: &self.camera,
+            max_level,
+            max_iter,
+        };
+        self.tracker.flow(
+            previous_image,
+            current_image,
+            Some(guess),
+            &mut self.tracking_timings,
+        )
     }
 
     /// What the keyframe policy is shown for `frame`: the parallax is taken
-    /// against the last keyframe at the tracked pose `state.pose_world_to_cam`,
-    /// not at the frame's own (pre-tracking) pose.
+    /// against the last keyframe at `pose`, the pose the frame was tracked
+    /// at, not at the frame's own (pre-tracking) pose.
     fn keyframe_evidence(
         &self,
         frame: &Frame,
+        pose: &Pose3d,
         tracked_inliers: usize,
         matches: &[(usize, usize)],
     ) -> KeyframeEvidence {
@@ -1044,14 +1425,7 @@ impl SlamSystem {
             .min_parallax_px
             .zip(self.state.last_keyframe_idx)
             .and_then(|(_, last)| {
-                median_parallax_px(
-                    &map,
-                    last,
-                    frame,
-                    &self.state.pose_world_to_cam,
-                    matches,
-                    &self.camera,
-                )
+                median_parallax_px(&map, last, frame, pose, matches, &self.camera)
             });
         KeyframeEvidence {
             curr_idx: frame.idx,
@@ -1059,6 +1433,23 @@ impl SlamSystem {
             tracked_inliers,
             n_ref_map_points,
             median_parallax_px,
+        }
+    }
+
+    /// [`Self::keyframe_evidence`] for a flow frame: its inliers can only be
+    /// landmarks its tracks follow, so they are compared with the tracks that
+    /// followed one after the last ORB frame, not with the reference
+    /// keyframe's landmarks.
+    fn flow_keyframe_evidence(
+        &self,
+        frame: &Frame,
+        pose: &Pose3d,
+        tracked_inliers: usize,
+        matches: &[(usize, usize)],
+    ) -> KeyframeEvidence {
+        KeyframeEvidence {
+            n_ref_map_points: self.tracker.followed_baseline(),
+            ..self.keyframe_evidence(frame, pose, tracked_inliers, matches)
         }
     }
 
@@ -1149,11 +1540,12 @@ impl SlamSystem {
     fn try_insert_keyframe(
         &mut self,
         frame: &Frame,
+        pose: &Pose3d,
         timestamp_sec: f64,
         tracked_inliers: usize,
         matches: &[(usize, usize)],
     ) -> bool {
-        let evidence = self.keyframe_evidence(frame, tracked_inliers, matches);
+        let evidence = self.keyframe_evidence(frame, pose, tracked_inliers, matches);
         if !self.keyframe_due(&evidence, timestamp_sec) {
             return false;
         }
@@ -1400,6 +1792,22 @@ const RELOCALIZATION_MAX_JUMP_M: f64 = 0.5;
 
 /// Low-match two-view rejections a monocular bootstrap reference survives.
 const MAX_LOW_MATCH_REJECTIONS: usize = 10;
+
+/// The estimation inputs of `frame` from this frame's `estimation`.
+fn flow_input<'a>(
+    frame: &'a Frame,
+    estimation: &Estimation,
+    current_keyframe_idx: Option<usize>,
+) -> FrameInput<'a> {
+    FrameInput {
+        frame,
+        candidate_pose: estimation.candidate_pose,
+        pose_before: estimation.pose_before,
+        current_keyframe_idx,
+        lost_for_sec: estimation.lost_for_sec,
+        trusted_prediction: estimation.trusted_prediction,
+    }
+}
 
 fn format_imu_init_gate(
     start_idx: usize,

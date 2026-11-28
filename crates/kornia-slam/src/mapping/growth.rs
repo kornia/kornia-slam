@@ -7,8 +7,9 @@
 //! The map does not need to know whether a position came from stereo depth or
 //! from pair triangulation — both paths build the same request.
 
-use crate::features::{Descriptor, DescriptorSet, Features};
+use crate::features::Descriptor;
 use crate::frame::{Frame, undistorted_camera};
+use crate::guided_match::{EpipolarGeometry, GuidedView, guided_matches};
 use crate::mapping::map::{
     Keyframe, LandmarkSeed, LandmarkTarget, Map, MapInsertion, ObservationKey, ObservationLink,
 };
@@ -16,16 +17,13 @@ use crate::rig::project_in_view;
 use crate::stereo::unproject_stereo;
 use kornia_3d::camera::{Camera, PinholeCamera};
 use kornia_3d::pose::{Pose3d, TriangulationConfig, triangulate_matched_points};
-use kornia_algebra::{Mat3F64, SO3F64, Vec2F64, Vec3F64};
+use kornia_algebra::Vec2F64;
 use kornia_image::ImageSize;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
 /// Minimum epipolar-consistent matches before a pair is worth triangulating.
 const MIN_GROWTH_MATCHES: usize = 15;
-/// 1-DOF chi-square gate at 95% for point-to-epipolar-line distance
-/// (ORB-SLAM3's `CheckDistEpipolarLine`), scaled per octave.
-const EPIPOLAR_CHI2: f64 = 3.84;
 
 /// Seeds for `frame`'s unassociated close stereo keypoints (`z < mthdepth`).
 ///
@@ -229,109 +227,38 @@ fn pair_growth_in_camera<D: Descriptor>(
         return None;
     }
 
-    // Both poses are known, so the fundamental matrix is fully determined:
-    // F = K^-T [t]x R K^-1 with (R, t) the prev->curr relative pose. Filtering
-    // against it replaces the two-view estimator's F-matrix RANSAC (mirrors
-    // ORB-SLAM3's SearchForTriangulation).
-    let rel = Pose3d::between(prev_pose, curr_pose);
-    if rel.translation.length() <= 1e-8 {
-        // No baseline: epipolar geometry degenerates and triangulation would
-        // reject everything anyway.
-        return None;
-    }
-    let t_skew = SO3F64::hat(rel.translation);
-    let k_inv = Mat3F64::from_cols(
-        Vec3F64::new(1.0 / camera.fx, 0.0, 0.0),
-        Vec3F64::new(0.0, 1.0 / camera.fy, 0.0),
-        Vec3F64::new(-camera.cx / camera.fx, -camera.cy / camera.fy, 1.0),
-    );
-    let f_mat = k_inv.transpose() * (t_skew * rel.rotation) * k_inv;
-
-    // Epipole of the prev camera in the curr image. Near it every keypoint is
-    // close to every epipolar line, so the chi-square gate is uninformative
-    // there: wrong matches survive and triangulate to depth-garbage points that
-    // still reproject well in both views. Mirrors ORB-SLAM3's epipole-proximity
-    // rejection; RANSAC consensus used to absorb these.
-    let prev_center_world = prev_pose.camera_centre();
-    let epipole_cam = curr_pose.transform_point(&prev_center_world);
-    let epipole_px = (epipole_cam.z.abs() > 1e-9).then(|| {
-        Vec2F64::new(
-            camera.fx * epipole_cam.x / epipole_cam.z + camera.cx,
-            camera.fy * epipole_cam.y / epipole_cam.z + camera.cy,
-        )
-    });
-
-    // Brute-force descriptor matching over the unassociated subsets; the global
-    // second-best ratio test and orientation consistency live in the matcher and
-    // are essential for match quality.
-    let (prev_orientations, prev_descriptors) = subset(&prev_kf.frame.features, &prev_unassoc);
-    let (curr_orientations, curr_descriptors) = subset(&curr_kf.frame.features, &curr_unassoc);
-    let sub_matches = D::match_sets(
-        DescriptorSet {
-            orientations: prev_orientations.as_deref(),
-            descriptors: &prev_descriptors,
+    let geometry = EpipolarGeometry::between(camera, prev_pose, camera, curr_pose)?;
+    let prev_pixel = |i: usize| prev_kf.frame.undistorted_xy(i, camera);
+    let curr_pixel = |i: usize| curr_kf.frame.undistorted_xy(i, camera);
+    let pair_indices = guided_matches(
+        &GuidedView {
+            features: &prev_kf.frame.features,
+            candidates: &prev_unassoc,
+            pixel: prev_pixel,
         },
-        DescriptorSet {
-            orientations: curr_orientations.as_deref(),
-            descriptors: &curr_descriptors,
+        &GuidedView {
+            features: &curr_kf.frame.features,
+            candidates: &curr_unassoc,
+            pixel: curr_pixel,
         },
+        &geometry,
+        scale_factor,
         match_config,
+        1.0,
     );
-
-    let mut pair_indices: Vec<(usize, usize)> = Vec::new();
-    let mut matched_prev: Vec<Vec2F64> = Vec::new();
-    let mut matched_curr: Vec<Vec2F64> = Vec::new();
-    for (prev_sub, curr_sub) in sub_matches {
-        let (Some(&prev_idx), Some(&curr_idx)) =
-            (prev_unassoc.get(prev_sub), curr_unassoc.get(curr_sub))
-        else {
-            continue;
-        };
-        let (Some(pu), Some(qu)) = (
-            prev_kf.frame.undistorted_xy(prev_idx, camera),
-            curr_kf.frame.undistorted_xy(curr_idx, camera),
-        ) else {
-            continue;
-        };
-        let p = Vec2F64::new(pu[0] as f64, pu[1] as f64);
-        let q = Vec2F64::new(qu[0] as f64, qu[1] as f64);
-        let octave = curr_kf
-            .frame
-            .features
-            .octaves
-            .get(curr_idx)
-            .copied()
-            .unwrap_or(0);
-
-        // Reject curr keypoints near the epipole; radius grows with octave
-        // (ORB-SLAM3 uses 100 * scaleFactor^octave px^2).
-        if let Some(e) = epipole_px {
-            let dx = q.x - e.x;
-            let dy = q.y - e.y;
-            if dx * dx + dy * dy < 100.0 * scale_factor.powi(octave as i32) {
-                continue;
-            }
-        }
-
-        let l = f_mat * Vec3F64::new(p.x, p.y, 1.0);
-        let line_norm_sq = l.x * l.x + l.y * l.y;
-        if line_norm_sq <= 1e-12 {
-            continue;
-        }
-        let d = l.x * q.x + l.y * q.y + l.z;
-        let sigma_sq = scale_factor.powi(2 * octave as i32);
-        if d * d > EPIPOLAR_CHI2 * sigma_sq * line_norm_sq {
-            continue;
-        }
-
-        pair_indices.push((prev_idx, curr_idx));
-        matched_prev.push(p);
-        matched_curr.push(q);
-    }
     if pair_indices.len() < MIN_GROWTH_MATCHES {
         return None;
     }
 
+    // `guided_matches` keeps only pairs with both pixels, so the two lists stay
+    // parallel to `pair_indices`.
+    let to_vec = |xy: [f32; 2]| Vec2F64::new(xy[0] as f64, xy[1] as f64);
+    let (matched_prev, matched_curr): (Vec<Vec2F64>, Vec<Vec2F64>) = pair_indices
+        .iter()
+        .filter_map(|&(prev_idx, curr_idx)| {
+            Some((to_vec(prev_pixel(prev_idx)?), to_vec(curr_pixel(curr_idx)?)))
+        })
+        .unzip();
     let triangulated = triangulate_matched_points(
         &matched_prev,
         &matched_curr,
@@ -387,16 +314,6 @@ fn pair_growth_in_camera<D: Descriptor>(
         });
     }
     (!request.landmarks.is_empty()).then_some(request)
-}
-
-/// Orientations (when the detector has them) and descriptors of `indices`.
-fn subset<D: Descriptor>(features: &Features<D>, indices: &[usize]) -> (Option<Vec<f32>>, Vec<D>) {
-    let orientations = features
-        .orientations
-        .as_ref()
-        .map(|orientations| indices.iter().map(|&i| orientations[i]).collect());
-    let descriptors = indices.iter().map(|&i| features.descriptors[i]).collect();
-    (orientations, descriptors)
 }
 
 /// Search radius, in pixels, for a landmark's projection into a neighbour.
@@ -577,6 +494,7 @@ mod tests {
     use crate::features::{Features, RBrief};
     use crate::mapping::map::Keyframe;
     use kornia_3d::camera::CameraModel;
+    use kornia_algebra::Vec3F64;
     use kornia_image::ImageSize;
 
     fn camera() -> PinholeCamera {
@@ -953,6 +871,105 @@ mod tests {
         let links = neighbor_fusion_links(&map, 10, &[20], &camera());
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].landmark, LandmarkTarget::Existing(best));
+    }
+
+    /// A keyframe pair seen from `current_pose`: `points` projected into both
+    /// views with a deterministic sub-pixel offset in the current one, every
+    /// feature at `octave`.
+    fn synthetic_pair(points: &[Vec3F64], current_pose: Pose3d, octave: u8) -> Map<RBrief> {
+        let camera = camera();
+        let descriptors: Vec<[u8; 32]> = (0..points.len())
+            .map(|i| {
+                let mut d = [0u8; 32];
+                for (k, byte) in d.iter_mut().enumerate() {
+                    *byte = (i as u8)
+                        .wrapping_mul(37)
+                        .wrapping_add((k as u8).wrapping_mul(11));
+                }
+                d
+            })
+            .collect();
+        let mut previous = test_frame(10, descriptors.clone());
+        let mut current = test_frame(20, descriptors);
+        current.pose_world_to_cam = current_pose;
+        for (f, frame) in [&mut previous, &mut current].into_iter().enumerate() {
+            frame.features.octaves = vec![octave; points.len()];
+            frame.features.keypoints_xy = points
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let p = frame.pose_world_to_cam.transform_point(p);
+                    let jitter = f as f32 * ((i % 7) as f32 - 3.0) * 0.4;
+                    [
+                        (camera.fx * p.x / p.z + camera.cx) as f32 + jitter,
+                        (camera.fy * p.y / p.z + camera.cy) as f32 - jitter,
+                    ]
+                })
+                .collect();
+        }
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(previous)).unwrap();
+        map.insert_keyframe(Keyframe::from_frame(current)).unwrap();
+        map
+    }
+
+    /// The shared guided matcher reproduces the pre-move growth body bit for
+    /// bit: a sideways pair, a forward pair whose epipole lies among the
+    /// keypoints, and a pair detected at octave 2.
+    #[test]
+    fn pair_growth_request_matches_main_bit_for_bit() {
+        let grid = |z: f64, step: f64| -> Vec<Vec3F64> {
+            (0..40)
+                .map(|i| {
+                    // Offsets include (0, 0): on the forward pair that point sits on
+                    // the epipole in both views.
+                    let (x, y) = ((i % 8) as f64 - 3.0, (i / 8) as f64 - 2.0);
+                    Vec3F64::new(x * step, y * step, z + 0.1 * (i % 3) as f64)
+                })
+                .collect()
+        };
+        let sideways = Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            Vec3F64::new(-0.6, 0.05, 0.0),
+        );
+        let forward = Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            Vec3F64::new(0.02, 0.0, -0.8),
+        );
+        let cases = [
+            synthetic_pair(&grid(5.0, 0.35), sideways, 0),
+            synthetic_pair(&grid(6.0, 0.4), forward, 0),
+            synthetic_pair(&grid(5.0, 0.35), sideways, 2),
+        ];
+        let camera = camera();
+        let match_config = kornia_imgproc::features::OrbMatchConfig::default();
+        let triangulation_config = TriangulationConfig::default();
+        for (case, map) in cases.iter().enumerate() {
+            let (prev, curr) = (map.get_keyframe(10).unwrap(), map.get_keyframe(20).unwrap());
+            let poses = (&prev.frame.pose_world_to_cam, &curr.frame.pose_world_to_cam);
+            let scale_factor = map.scale_pyramid().factor;
+            let expected = crate::mapping::growth_reference_tests::reference_pair_growth(
+                (prev, curr),
+                0,
+                &camera,
+                poses,
+                &match_config,
+                &triangulation_config,
+                scale_factor,
+            );
+            let got =
+                pair_growth_request(map, 10, 20, &match_config, &triangulation_config, &camera);
+            let (Some(expected), Some(got)) = (expected, got) else {
+                panic!("case {case}: both bodies must propose landmarks");
+            };
+            assert_eq!(got.landmarks.len(), expected.landmarks.len(), "case {case}");
+            for (g, e) in got.landmarks.iter().zip(&expected.landmarks) {
+                let bits = |p: &Vec3F64| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()];
+                assert_eq!(bits(&g.position), bits(&e.position), "case {case}");
+                assert_eq!(g.reference, e.reference, "case {case}");
+            }
+            assert_eq!(got.observations, expected.observations, "case {case}");
+        }
     }
 
     /// A rejected candidate must reserve nothing. `(0, 1)` is refused because

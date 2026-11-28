@@ -16,6 +16,8 @@
 pub mod ba;
 pub mod culling;
 pub mod growth;
+#[cfg(test)]
+mod growth_reference_tests;
 pub(crate) mod keyframe_mapping;
 pub mod local_mapping;
 pub mod map;
