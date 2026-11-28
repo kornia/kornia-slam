@@ -18,7 +18,7 @@ use kornia_imgproc::optical_flow_pyr_lk::{
 
 use crate::Frame;
 use crate::mapping::Map;
-use crate::system::{ForwardBackward, GyroGuess, KltRetry, TrackRefill};
+use crate::system::{ForwardBackward, GyroGuess, KltRetry, MAX_KLT_WINDOW, TrackRefill};
 use crate::tracking::flow_pool::{FlowFrames, FlowPool, FlowPoolError};
 use crate::tracking::optical_flow::{
     FlowSurvivor, KltTracker, SurvivorFilterConfig, Track, TrackId, TrackSet,
@@ -39,10 +39,12 @@ impl ShardLayout {
     /// Shards for `threads` flow threads on `cameras` cameras; validation
     /// allows 1, `cameras` or `cameras + 1` threads.
     pub(crate) fn new(threads: usize, cameras: usize) -> Self {
+        // Public inputs; the `cameras + 1` split needs `cameras` below the
+        // thread bound, so neither sizes an allocation past it.
         Self {
-            threads,
+            threads: threads.clamp(1, MAX_FLOW_SHARDS),
             cameras,
-            spawned: vec![0; cameras],
+            spawned: vec![0; cameras.min(MAX_FLOW_SHARDS)],
         }
     }
 
@@ -617,6 +619,9 @@ impl RigFlow {
         settings: RigFlowSettings,
         cameras: Vec<RigFlowCamera>,
     ) -> Result<Self, FlowPoolError> {
+        if settings.window > MAX_KLT_WINDOW {
+            return Err(FlowPoolError::Window(settings.window));
+        }
         let pool = FlowPool::new(settings.threads)?;
         let shards = (0..pool.threads())
             .map(|index| FlowShard {
@@ -1205,6 +1210,35 @@ mod tests {
             camera_from_primary: None,
         };
         RigFlow::new(settings, vec![camera]).unwrap()
+    }
+
+    /// `RigFlow::new` and `TrackSet::with_flow_threads` are public: their
+    /// thread and camera counts are clamped, and a window past
+    /// `MAX_KLT_WINDOW` is refused, so none sizes an allocation without bound.
+    #[test]
+    fn public_sizes_are_bounded() {
+        let mut tracks = TrackSet::with_flow_threads(usize::MAX, usize::MAX);
+        tracks.spawn_on([1.0, 1.0], 0);
+        assert!(tracks.tracks()[0].shard() < MAX_FLOW_SHARDS);
+        let settings = rig_flow(GyroGuess::Off).settings;
+        let camera = || RigFlowCamera {
+            camera: pinhole(),
+            camera_from_primary: None,
+        };
+        let threads = RigFlowSettings {
+            threads: usize::MAX,
+            ..settings
+        };
+        let flow = RigFlow::new(threads, vec![camera()]).unwrap();
+        assert_eq!(flow.threads(), MAX_FLOW_SHARDS);
+        let window = RigFlowSettings {
+            window: MAX_KLT_WINDOW + 2,
+            ..settings
+        };
+        assert!(matches!(
+            RigFlow::new(window, vec![camera()]),
+            Err(FlowPoolError::Window(_))
+        ));
     }
 
     /// Refill detects on the current frame, so the occupied pixels are
