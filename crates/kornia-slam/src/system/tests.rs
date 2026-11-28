@@ -567,6 +567,25 @@ mod klt_first {
         );
     }
 
+    /// The shallow search needs the IMU to have predicted the pose: a
+    /// trusted IMU whose window held no samples left the visual model's guess.
+    #[test]
+    fn the_predicted_search_needs_an_inertial_prediction() {
+        let mut config = mono();
+        let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+        orb.frontend = FrontendConfig::Orb(OrbFrontendConfig {
+            klt_prediction: crate::system::config::KltPrediction::Enabled {
+                max_level: 1,
+                max_iter: 10,
+            },
+            ..OrbFrontendConfig::default()
+        });
+        let system = SlamSystem::build(config, SensorRig::mono(camera(), IMAGE_SIZE)).unwrap();
+        assert_eq!(system.predicted_flow_search(true, true), Some((1, 10)));
+        assert_eq!(system.predicted_flow_search(true, false), None);
+        assert_eq!(system.predicted_flow_search(false, true), None);
+    }
+
     fn visibility(system: &SlamSystem) -> Vec<u32> {
         system.with_map_points(|points| points.iter().map(|mp| mp.n_visible).collect())
     }

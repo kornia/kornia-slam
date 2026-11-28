@@ -1051,12 +1051,8 @@ impl SlamSystem {
             .lost_since_sec
             .map_or(0.0, |t0| timestamp_sec - t0);
         let trusted_prediction = self.imu_confident(timestamp_sec);
-        let survivors = self.flow(
-            previous_image,
-            current_image,
-            &candidate_pose,
-            trusted_prediction,
-        );
+        let search = self.predicted_flow_search(trusted_prediction, predicted_velocity.is_some());
+        let survivors = self.flow(previous_image, current_image, &candidate_pose, search);
         let estimation = Estimation {
             candidate_pose,
             pose_before,
@@ -1357,16 +1353,29 @@ impl SlamSystem {
         *counter += 1;
     }
 
+    /// The `(max_level, max_iter)` of `klt_prediction` when this frame's
+    /// pose comes from a trusted inertial prediction; a trusted IMU whose
+    /// window held no samples falls back to the visual model, too weak a
+    /// start for the shallow search.
+    fn predicted_flow_search(
+        &self,
+        trusted_prediction: bool,
+        inertial_prediction: bool,
+    ) -> Option<(usize, usize)> {
+        self.klt_prediction
+            .filter(|_| trusted_prediction && inertial_prediction)
+    }
+
     /// The optical-flow survivors of the current frame, searched from the
-    /// predicted pose when `klt_prediction` is set and the prediction trusted.
+    /// predicted pose with `search` levels and iterations when given.
     fn flow(
         &mut self,
         previous_image: Option<&Image<u8, 1>>,
         current_image: &Image<u8, 1>,
         candidate_pose: &Pose3d,
-        trusted_prediction: bool,
+        search: Option<(usize, usize)>,
     ) -> Option<Vec<FlowSurvivor>> {
-        let Some((max_level, max_iter)) = self.klt_prediction.filter(|_| trusted_prediction) else {
+        let Some((max_level, max_iter)) = search else {
             return self.tracker.flow(
                 previous_image,
                 current_image,
