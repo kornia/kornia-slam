@@ -833,8 +833,8 @@ fn machine_hall_drift() -> LoopGraphInformation {
     }
 }
 
-/// The closer's PoseGraph path with `w * I` information takes the snapshot optimizer's LM path,
-/// on both manifolds.
+/// The closer's PoseGraph path with `w * I` information takes the snapshot optimizer's LM path
+/// bit for bit, on both manifolds.
 #[test]
 fn pose_graph_with_scalar_information_matches_optimize_pose_graph() {
     let gravity = Vec3F64::new(0.1, -9.7, 0.4);
@@ -858,14 +858,8 @@ fn pose_graph_with_scalar_information_matches_optimize_pose_graph() {
         assert_eq!(actual.original_poses, expected.original_poses);
         assert_eq!(actual.usable, expected.usable);
         assert!(actual.usable);
-        let largest = actual
-            .optimized_poses
-            .iter()
-            .zip(&expected.optimized_poses)
-            .map(|(a, e)| (a.inverse().translation - e.inverse().translation).length())
-            .fold(0.0, f64::max);
         assert_eq!(actual.iterations, expected.iterations);
-        assert!(largest < 1e-5, "largest centre difference {largest} m");
+        assert_eq!(actual.optimized_poses, expected.optimized_poses);
         let moved = expected
             .original_poses
             .iter()
