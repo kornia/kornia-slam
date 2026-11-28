@@ -1893,8 +1893,9 @@ fn a_map_reset_does_not_block_later_loops() {
     assert_eq!(closer.verified_loop_count(), 1);
 }
 
-/// A solve stopped at the iteration cap with its cost and its new loop's residual both fallen is
-/// written back, inline and through the replayed background path, and says it was capped.
+/// Under `ScalarWeights`, a solve stopped at the iteration cap with its cost and its new loop's
+/// residual both fallen is written back, inline and through the replayed background path, and
+/// says it was capped.
 #[test]
 fn a_capped_solve_that_improved_is_applied() {
     let mut config = background_config();
@@ -2019,4 +2020,51 @@ fn a_queued_loop_whose_keyframe_departed_is_reported_unapplied() {
     );
     assert!(!closer.solve_in_flight());
     assert_eq!(closer.queued_for_test(), 0);
+}
+
+/// Under the default `ScalarWeights`, a solve capped after one iteration is refused when its new
+/// loop's residual grew: the second loop agrees with the corrected map, and the solve trades it
+/// for the first loop's remaining residual.
+#[test]
+fn a_capped_scalar_weight_solve_that_did_not_improve_is_refused() {
+    let mut config = closing_config();
+    config.optimizer.max_iterations = 1;
+    assert_eq!(
+        config.graph.information,
+        LoopGraphInformation::ScalarWeights
+    );
+    let (mut closer, _) = closing_fixture(config, false);
+    let (mut map, _) = drifting_lap_map(Vec3F64::new(0.0, -1.0, 0.0));
+    let pose = |map: &Map, kf: usize| map.get_keyframe(kf).unwrap().frame.pose_world_to_cam;
+    let context = LoopClosingContext {
+        pose_world_to_cam: pose(&map, 23),
+        current_keyframe_idx: Some(23),
+        ..closing_context(&map)
+    };
+    let first = lap_loop(1, 23, &map);
+    let applied = closer.handle_accepted_for_test(&mut map, &camera(), first, context);
+    assert!(applied_alone(&applied.events), "{:?}", applied.events);
+    assert!(applied.pgo_capped);
+
+    let context = LoopClosingContext {
+        pose_world_to_cam: pose(&map, 22),
+        current_keyframe_idx: Some(22),
+        ..context
+    };
+    let agreeing = VerifiedLoopEdge {
+        candidate_to_query: Pose3d::between(&pose(&map, 2), &pose(&map, 22)),
+        ..verified_edge(22, 2, 40, 0.875, 1.0, 8)
+    };
+    let refused = closer.handle_accepted_for_test(&mut map, &camera(), agreeing, context);
+
+    assert!(
+        matches!(refused.events.as_slice(), [
+        LoopClosureEvent::PgoFailed { reason, .. },
+        LoopClosureEvent::Accepted { applied: false, .. }
+    ] if reason.contains("not converged after 1 iterations")
+        && reason.contains("loop residual grew")),
+        "{:?}",
+        refused.events
+    );
+    assert!(!refused.pgo_applied && !refused.pgo_capped);
 }

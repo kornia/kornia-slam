@@ -39,9 +39,12 @@ landmarks at a cost independent of the map's size.
 Behaviour changes on the default path:
 - A solve that is not usable now reports `PgoFailed` with the reason before
   `Accepted { applied: false }`; before, it was a silent `applied: false`.
-- A solve stopped at the iteration cap is written back when its cost and the
-  new loop's residual both fell: the f32 solve reaches its optimum, then trades
-  noise near its stop rule until the cap. Solves that converge are unchanged.
+- A solve stopped at the iteration cap without converging is now written back
+  when its cost and the new loop's residual both fell, with the default
+  `ScalarWeights` as with `Drift`; before, every capped solve was refused. The
+  f32 solve reaches its optimum, then trades noise near its stop rule until the
+  cap. A capped solve whose cost or new loop's residual did not fall is still
+  refused, and solves that converge are unchanged.
 - After a map reset or a keyframe removal, loops whose keyframes left the map
   are dropped before the next solve; before, every later solve failed with
   `MissingLoopKeyframe`.
