@@ -278,6 +278,21 @@ impl SlamSystem {
         }
     }
 
+    /// Ends the run: a loop solve still in flight, and the loops queued behind it, are written
+    /// back now instead of at a frame boundary that will not come. Call it after the last frame;
+    /// [`Self::drain_loop_closure_events`] then reports them.
+    pub fn finish(&mut self) {
+        let context = self.loop_closing_context();
+        let Some(loop_closer) = self.loop_closer.as_mut() else {
+            return;
+        };
+        let outcome = {
+            let mut map = self.map.lock().unwrap();
+            loop_closer.finish(&mut map, &self.camera, context)
+        };
+        self.adopt_loop_outcome(outcome);
+    }
+
     pub fn drain_loop_closure_events(&mut self) -> Vec<LoopClosureEvent> {
         std::mem::take(&mut self.loop_closure_events)
     }

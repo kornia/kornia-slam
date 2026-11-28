@@ -145,6 +145,16 @@ impl<D: Descriptor> LoopSolver<D> {
             Self::Asynchronous(worker) => worker.poll(),
         }
     }
+
+    /// The outcome of the solve in flight, waiting for it however many frames or how long it
+    /// still needs; `None` when nothing is in flight.
+    pub(crate) fn wait(&mut self) -> Result<Option<LoopSolveOutcome>, WorkerStopped> {
+        match self {
+            Self::Synchronous => Ok(None),
+            Self::Replay { ready, .. } => Ok(ready.take().map(|(_, outcome)| *outcome)),
+            Self::Asynchronous(worker) => worker.wait(),
+        }
+    }
 }
 
 /// The background thread. Dropping it waits for an in-flight solve to end, up to about a second
@@ -199,6 +209,14 @@ impl<D: Descriptor> LoopWorker<D> {
                 Err(WorkerStopped)
             }
         }
+    }
+
+    fn wait(&mut self) -> Result<Option<LoopSolveOutcome>, WorkerStopped> {
+        if !self.in_flight {
+            return Ok(None);
+        }
+        self.in_flight = false;
+        self.results.recv().map(Some).map_err(|_| WorkerStopped)
     }
 }
 
@@ -281,6 +299,17 @@ mod tests {
             .expect("solved within 30 s");
         assert_eq!(outcome.world_epoch, 7);
         assert!(!solver.in_flight());
+    }
+
+    #[test]
+    fn waiting_returns_the_outcome_in_flight() {
+        for mut solver in [LoopSolver::replay(3), LoopSolver::asynchronous().unwrap()] {
+            assert!(solver.wait().unwrap().is_none());
+            solver.submit(empty_job()).unwrap();
+            let outcome = solver.wait().unwrap().expect("a solve was in flight");
+            assert_eq!(outcome.world_epoch, 7);
+            assert!(!solver.in_flight());
+        }
     }
 
     #[test]

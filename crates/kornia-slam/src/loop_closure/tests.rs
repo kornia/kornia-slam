@@ -1755,3 +1755,57 @@ fn a_writeback_without_a_reference_keyframe_is_requeued_and_applied() {
         expected_map.state_fingerprint_for_test()
     );
 }
+
+/// A loop accepted in the last frames of a run is written back by `finish`, with no further frame
+/// boundary, onto the map the synchronous closure leaves.
+#[test]
+fn finish_writes_back_a_solve_with_no_further_frame() {
+    let (expected_map, expected_tracking) = synchronous_closure();
+    for solver in [LoopSolver::replay(3), LoopSolver::asynchronous().unwrap()] {
+        let (closer, mut map) = closing_fixture(background_config(), false);
+        let mut closer = closer.with_solver(solver);
+        let context = closing_context(&map);
+        let drifted = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+
+        assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
+        assert!(closer.solve_in_flight());
+        assert_eq!(
+            map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
+            drifted
+        );
+        let outcome = closer.finish(&mut map, &camera(), context);
+
+        assert!(!closer.solve_in_flight());
+        assert!(matches!(
+            outcome.events.as_slice(),
+            [LoopClosureEvent::Accepted { applied: true, .. }]
+        ));
+        assert_eq!(outcome.tracking_correction, Some(expected_tracking));
+        assert_eq!(
+            map.state_fingerprint_for_test(),
+            expected_map.state_fingerprint_for_test()
+        );
+    }
+}
+
+/// Loops still waiting for a reference keyframe when the run ends are reported unapplied, once.
+#[test]
+fn finish_reports_loops_left_without_a_reference_keyframe() {
+    let (closer, mut map) = closing_fixture(background_config(), false);
+    let mut closer = closer.with_solver(LoopSolver::replay(1));
+    let context = closing_context(&map);
+    let between_keyframes = LoopClosingContext {
+        current_keyframe_idx: None,
+        ..context
+    };
+
+    assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
+    let outcome = closer.finish(&mut map, &camera(), between_keyframes);
+
+    assert!(matches!(outcome.events.as_slice(), [
+        LoopClosureEvent::PgoFailed { reason, .. },
+        LoopClosureEvent::Accepted { applied: false, .. }
+    ] if reason.contains("no reference keyframe")));
+    assert_eq!(closer.queued_for_test(), 0);
+    assert!(!outcome.pgo_applied);
+}

@@ -198,22 +198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let debug_msgs = system.drain_debug_messages();
         processed += 1;
 
-        for event in system.drain_loop_closure_events() {
-            match event {
-                LoopClosureEvent::Accepted { edge, applied } => eprintln!(
-                    "[loop-closure] accepted kf={} ~ kf={} inliers={} rmse={:.2}px applied={applied}",
-                    edge.query_kf_idx,
-                    edge.candidate_kf_idx,
-                    edge.inliers,
-                    edge.reprojection_rmse_px,
-                ),
-                LoopClosureEvent::PgoFailed {
-                    query_kf_idx,
-                    candidate_kf_idx,
-                    reason,
-                } => eprintln!("[pgo] failed kf={query_kf_idx} ~ kf={candidate_kf_idx}: {reason}"),
-            }
-        }
+        print_loop_closure_events(system.drain_loop_closure_events());
 
         if !tui_active {
             for line in &debug_msgs {
@@ -282,6 +267,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some((mut term, _, _guard)) = tui_state.take() {
         tui::restore_terminal(&mut term)?;
     }
+    system.finish();
+    print_loop_closure_events(system.drain_loop_closure_events());
 
     let (total_pts, active_pts, obs_total, obs_max) = system.with_map_points(|map_points| {
         let mut active_pts: usize = 0;
@@ -317,6 +304,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     Ok(())
+}
+
+fn print_loop_closure_events(events: Vec<LoopClosureEvent>) {
+    for event in events {
+        match event {
+            LoopClosureEvent::Accepted { edge, applied } => eprintln!(
+                "[loop-closure] accepted kf={} ~ kf={} inliers={} rmse={:.2}px applied={applied}",
+                edge.query_kf_idx, edge.candidate_kf_idx, edge.inliers, edge.reprojection_rmse_px,
+            ),
+            LoopClosureEvent::PgoFailed {
+                query_kf_idx,
+                candidate_kf_idx,
+                reason,
+            } => eprintln!("[pgo] failed kf={query_kf_idx} ~ kf={candidate_kf_idx}: {reason}"),
+        }
+    }
 }
 
 /// The `[summary] flow` line of a `klt_first` run.

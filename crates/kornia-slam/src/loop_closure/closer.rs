@@ -151,6 +151,21 @@ pub(crate) struct LoopClosingOutcome {
     pub written_back: Option<Duration>,
 }
 
+impl LoopClosingOutcome {
+    /// Adds a later outcome to this one: its messages and events after these, and its tracking
+    /// correction, computed from where this one left the camera, in place of this one's.
+    fn absorb(&mut self, later: Self) {
+        self.gate_messages.extend(later.gate_messages);
+        self.events.extend(later.events);
+        if later.tracking_correction.is_some() {
+            self.tracking_correction = later.tracking_correction;
+        }
+        self.pgo_applied |= later.pgo_applied;
+        self.pgo_capped |= later.pgo_capped;
+        self.written_back = later.written_back.or(self.written_back);
+    }
+}
+
 /// Where one loop-closure attempt spent its time, for the runtime's `[loop-time]` log.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct LoopTiming {
@@ -288,6 +303,18 @@ impl<D: Descriptor> LoopCloser<D> {
         !self.acceptance.solver.is_synchronous()
     }
 
+    /// At the end of a run: waits for the background solve in flight and writes it back, then
+    /// solves and writes back the loops queued meanwhile, until none is left. Loops that cannot
+    /// be written back for lack of a reference keyframe are reported unapplied.
+    pub(crate) fn finish(
+        &mut self,
+        map: &mut Map<D>,
+        camera: &PinholeCamera,
+        context: LoopClosingContext,
+    ) -> LoopClosingOutcome {
+        self.acceptance.finish(map, camera, context)
+    }
+
     /// Called at every frame boundary: writes back a finished background solve, then submits
     /// the loops accepted meanwhile.
     pub(crate) fn on_frame(
@@ -326,6 +353,11 @@ impl<D: Descriptor> LoopCloser<D> {
         self.acceptance
             .handle_accepted(map, camera, representative, context, &mut outcome);
         outcome
+    }
+
+    /// Whether a background solve is running or waiting for its writeback.
+    pub(crate) fn solve_in_flight(&self) -> bool {
+        self.acceptance.solver.in_flight()
     }
 
     pub(crate) fn queued_for_test(&self) -> usize {
@@ -685,6 +717,52 @@ impl<D: Descriptor> LoopAcceptance<D> {
         }
         self.submit_queued(map, camera, context, &mut outcome);
         outcome
+    }
+
+    fn finish(
+        &mut self,
+        map: &mut Map<D>,
+        camera: &PinholeCamera,
+        mut context: LoopClosingContext,
+    ) -> LoopClosingOutcome {
+        let mut finished = LoopClosingOutcome::default();
+        loop {
+            let mut outcome = LoopClosingOutcome::default();
+            match self.solver.wait() {
+                Ok(Some(solved)) => {
+                    self.apply_background(map, camera, solved, context, &mut outcome)
+                }
+                Ok(None) => {}
+                Err(WorkerStopped) => self.stop(&mut outcome),
+            }
+            self.submit_queued(map, camera, context, &mut outcome);
+            // The next writeback moves the camera from where this one put it.
+            if let Some((pose, velocity)) = outcome.tracking_correction {
+                context.pose_world_to_cam = pose;
+                context.velocity_world = velocity;
+            }
+            finished.absorb(outcome);
+            if !self.solver.in_flight() {
+                break;
+            }
+        }
+        let unapplied = std::mem::take(&mut self.queued);
+        if let Some(newest) = unapplied.last() {
+            finished.events.push(LoopClosureEvent::PgoFailed {
+                query_kf_idx: newest.query_kf_idx,
+                candidate_kf_idx: newest.candidate_kf_idx,
+                reason: "no reference keyframe at the end of the run".into(),
+            });
+        }
+        finished.events.extend(
+            unapplied
+                .into_iter()
+                .map(|edge| LoopClosureEvent::Accepted {
+                    edge,
+                    applied: false,
+                }),
+        );
+        finished
     }
 
     /// The worker is gone: loop correction stays off, and tracking carries on uncorrected.
