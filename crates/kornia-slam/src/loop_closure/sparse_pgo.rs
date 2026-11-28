@@ -441,6 +441,18 @@ fn sparse_pose_graph_optimize_impl<const DOF: usize>(
     // One iteration is one evaluated trial. Retrying a failed linear solve
     // changes damping but does not consume the nonlinear iteration budget.
     let mut iterations = 0usize;
+    // Each residual component is computed in f32 and carries machine-epsilon
+    // rounding error (~1.19e-7). When summing M squared residuals, the expected
+    // relative rounding uncertainty in the accumulated cost is on the order of
+    // M * eps. If an unaccepted trial's cost increase is within this f32
+    // precision floor, the solver has reached the noise limit of single-precision
+    // residuals and cannot resolve further descent.
+    let active_edges = edges
+        .iter()
+        .filter(|edge| pose_to_block[edge.pose_a].is_some() || pose_to_block[edge.pose_b].is_some())
+        .count();
+    let residual_components = active_edges * RESIDUAL_DIM;
+    let noise_floor_threshold = residual_components as f64 * f64::from(f32::EPSILON);
     let mut solve_cache = None;
 
     loop {
@@ -524,7 +536,7 @@ fn sparse_pose_graph_optimize_impl<const DOF: usize>(
                         accepted: true,
                         numerical_failure: false,
                     });
-                    if relative_cost_change < params.cost_tolerance {
+                    if relative_cost_change < f64::from(params.cost_tolerance) {
                         return Ok(SparsePgoResult {
                             poses: accepted_poses,
                             iterations,
@@ -533,14 +545,49 @@ fn sparse_pose_graph_optimize_impl<const DOF: usize>(
                     }
                     break;
                 }
-                _rejection @ (TrialOutcome::CostRejected | TrialOutcome::NumericalFailure) => {
+                TrialOutcome::CostRejected { cost } => {
+                    iterations += 1;
+                    let relative_cost_increase = if current_cost > 0.0 {
+                        (cost - current_cost) / current_cost
+                    } else {
+                        cost - current_cost
+                    };
+                    if relative_cost_increase <= noise_floor_threshold {
+                        #[cfg(test)]
+                        test_hooks.iterations.push(SparsePgoTestIteration {
+                            damping,
+                            accepted: false,
+                            numerical_failure: false,
+                        });
+                        return Ok(SparsePgoResult {
+                            poses: accepted_poses,
+                            iterations,
+                            converged: true,
+                        });
+                    }
+                    damping = increased_damping(damping);
+                    #[cfg(test)]
+                    test_hooks.iterations.push(SparsePgoTestIteration {
+                        damping,
+                        accepted: false,
+                        numerical_failure: false,
+                    });
+                    if damping > LAMBDA_MAX || iterations >= params.max_iterations {
+                        return Ok(SparsePgoResult {
+                            poses: accepted_poses,
+                            iterations,
+                            converged: false,
+                        });
+                    }
+                }
+                TrialOutcome::NumericalFailure => {
                     iterations += 1;
                     damping = increased_damping(damping);
                     #[cfg(test)]
                     test_hooks.iterations.push(SparsePgoTestIteration {
                         damping,
                         accepted: false,
-                        numerical_failure: matches!(_rejection, TrialOutcome::NumericalFailure),
+                        numerical_failure: true,
                     });
                     if damping > LAMBDA_MAX || iterations >= params.max_iterations {
                         return Ok(SparsePgoResult {
@@ -556,18 +603,22 @@ fn sparse_pose_graph_optimize_impl<const DOF: usize>(
 }
 
 enum TrialOutcome {
-    Accepted { poses: Vec<Pose3d>, cost: f32 },
-    CostRejected,
+    Accepted { poses: Vec<Pose3d>, cost: f64 },
+    CostRejected { cost: f64 },
     NumericalFailure,
 }
 
+/// Evaluates candidate trial poses for LM step acceptance.
+///
+/// Returns `Accepted` if trial cost strictly decreases, `CostRejected` with candidate
+/// cost if cost increases or stagnates, and `NumericalFailure` on non-finite poses or cost.
 fn evaluate_trial<const DOF: usize>(
     poses: &[Pose3d],
     edges: &[PgoEdge],
     pose_to_block: &[Option<usize>],
     manifold: &impl PoseManifold<DOF>,
     step: &[f32],
-    current_cost: f32,
+    current_cost: f64,
 ) -> Result<TrialOutcome, SparsePgoError> {
     if pose_to_block.len() != poses.len() {
         return Err(SparsePgoError::InvalidInput(
@@ -611,7 +662,7 @@ fn evaluate_trial<const DOF: usize>(
             cost: trial_cost,
         })
     } else {
-        Ok(TrialOutcome::CostRejected)
+        Ok(TrialOutcome::CostRejected { cost: trial_cost })
     }
 }
 
@@ -723,17 +774,21 @@ fn validate_pose_graph(
     Ok(pose_to_block)
 }
 
+/// Computes total squared residual cost across active edges accumulated in `f64`.
+///
+/// Evaluates each residual in `f32` and accumulates in `f64` to prevent machine-epsilon
+/// rounding error accumulation across thousands of residuals from masking descent steps.
 fn active_total_squared_residual_cost(
     poses: &[Pose3d],
     edges: &[PgoEdge],
     pose_to_block: &[Option<usize>],
-) -> Result<f32, SparsePgoError> {
+) -> Result<f64, SparsePgoError> {
     if pose_to_block.len() != poses.len() {
         return Err(SparsePgoError::InvalidInput(
             "pose-to-block map has an invalid dimension".into(),
         ));
     }
-    let mut cost = 0.0f32;
+    let mut cost = 0.0f64;
     for edge in edges {
         if pose_to_block[edge.pose_a].is_some() || pose_to_block[edge.pose_b].is_some() {
             accumulate_edge_squared_cost(poses, edge, &mut cost)?;
@@ -742,10 +797,14 @@ fn active_total_squared_residual_cost(
     Ok(cost)
 }
 
+/// Accumulates one edge's squared residual components into `f64` cost.
+///
+/// Sums squared `f32` residual components into `f64` to avoid catastrophic cancellation
+/// near the single-precision noise floor.
 fn accumulate_edge_squared_cost(
     poses: &[Pose3d],
     edge: &PgoEdge,
-    cost: &mut f32,
+    cost: &mut f64,
 ) -> Result<(), SparsePgoError> {
     let residual = weighted_relative_residual(
         &poses[edge.pose_a],
@@ -754,7 +813,14 @@ fn accumulate_edge_squared_cost(
         edge.weight,
     )?;
     for value in residual {
-        *cost += value * value;
+        let squared_f32 = value * value;
+        if !squared_f32.is_finite() {
+            return Err(SparsePgoError::InvalidInput(
+                "pose-graph cost must be finite".into(),
+            ));
+        }
+        let v = f64::from(value);
+        *cost += v * v;
         if !cost.is_finite() {
             return Err(SparsePgoError::InvalidInput(
                 "pose-graph cost must be finite".into(),
@@ -1068,7 +1134,7 @@ mod tests {
 
     use kornia_3d::pgo::{PgoEdge, PgoParams};
     use kornia_3d::pose::Pose3d;
-    use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
+    use kornia_algebra::{Mat3F64, SE3F32, SO3F64, Vec3F64};
 
     use super::{
         GravityManifold, PoseManifold, Se3Manifold, SparsePgoError, SparsePgoTestHooks,
@@ -1673,8 +1739,11 @@ mod tests {
         assert!(normal_cost(&result.poses, &edges) < normal_cost(&poses, &edges));
     }
 
+    /// Verifies that an uphill trial step far above the noise floor escalates LM damping without modifying poses.
     #[test]
     fn rejected_step_increases_damping_without_mutating_poses() {
+        // Note: forced_step = 100.0 exercises the large-step rejection path where
+        // cost increase is far above the noise floor, asserting damping escalation.
         let (poses, edges) = drifting_loop_graph();
         let mut forced_step = vec![0.0; 18];
         forced_step[0] = 100.0;
@@ -1703,6 +1772,48 @@ mod tests {
         assert_eq!(hooks.iterations[0].damping, params.initial_lambda * 10.0);
         assert_eq!(result.iterations, 1);
         assert!(!result.converged);
+        for (actual, expected) in result.poses.iter().zip(&poses) {
+            assert_eq!(actual.rotation, expected.rotation);
+            assert_eq!(actual.translation, expected.translation);
+        }
+    }
+
+    /// Verifies that a rejected trial step whose relative cost increase is within the `f32` noise floor
+    /// (`6 * num_edges * f32::EPSILON`) triggers convergence and returns the last accepted poses.
+    #[test]
+    fn rejected_step_within_noise_floor_converges_without_mutating_poses() {
+        let (poses, edges) = se3_scaling_graph(100);
+        let block_dim = (poses.len() - 1) * 6;
+        let mut forced_step = vec![0.0; block_dim];
+        forced_step[0] = 1e-4;
+        let mut hooks = SparsePgoTestHooks {
+            forced_step: Some(forced_step),
+            ..SparsePgoTestHooks::default()
+        };
+        let params = PgoParams {
+            max_iterations: 1,
+            gradient_tolerance: 0.0,
+            ..PgoParams::default()
+        };
+
+        let result = sparse_pose_graph_optimize_with_test_hooks(
+            &poses,
+            &edges,
+            &[0],
+            &params,
+            &Se3Manifold,
+            &mut hooks,
+        )
+        .unwrap();
+
+        assert_eq!(hooks.iterations.len(), 1);
+        assert!(!hooks.iterations[0].accepted);
+        assert!(!hooks.iterations[0].numerical_failure);
+        assert!(
+            result.converged,
+            "rejected step within noise floor must report converged=true"
+        );
+        assert_eq!(result.iterations, 1);
         for (actual, expected) in result.poses.iter().zip(&poses) {
             assert_eq!(actual.rotation, expected.rotation);
             assert_eq!(actual.translation, expected.translation);
@@ -1883,5 +1994,408 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Pins LM convergence at the `f32` cost noise floor on large graphs without damping escalation.
+    ///
+    /// Evaluates a 500-keyframe graph where `f64` cost accumulation prevents spurious trial rejections
+    /// caused by single-precision residual summation noise (~`6 * num_edges * f32::EPSILON`).
+    #[test]
+    fn sparse_lm_converges_at_f32_cost_noise_floor_without_damping_escalation() {
+        // Pre-fix baseline on 500 keyframes burned 19 trials (damping escalated
+        // to 1e2), and 1000 keyframes hit max_iterations (30) with converged=false.
+        // With cost accumulation in f64 and noise-floor convergence detection,
+        // the solver converges cleanly in 7 trials without escalating damping.
+        const PRE_FIX_ITERATIONS: usize = 19;
+        const POST_FIX_ITERATION_CAP: usize = 10;
+        let (poses, edges) = se3_scaling_graph(500);
+        let initial_cost = normal_cost(&poses, &edges);
+        let mut hooks = SparsePgoTestHooks::default();
+        let params = PgoParams::default();
+
+        let result = sparse_pose_graph_optimize_with_test_hooks(
+            &poses,
+            &edges,
+            &[0],
+            &params,
+            &Se3Manifold,
+            &mut hooks,
+        )
+        .unwrap();
+
+        let final_cost = normal_cost(&result.poses, &edges);
+        assert!(
+            result.converged,
+            "solver must report converged=true at noise floor"
+        );
+        assert!(
+            result.iterations <= POST_FIX_ITERATION_CAP,
+            "iterations ({}) must be well below max_iterations ({}) and pre-fix baseline ({PRE_FIX_ITERATIONS})",
+            result.iterations,
+            params.max_iterations
+        );
+        assert!(result.iterations < PRE_FIX_ITERATIONS);
+        assert!(
+            final_cost < initial_cost * 0.01,
+            "final cost must be significantly reduced"
+        );
+        assert!(
+            final_cost <= 3e-5,
+            "final cost must be no worse than pre-fix (2.57e-5)"
+        );
+        assert!(
+            !hooks.iterations.iter().any(|it| it.damping >= 1e3),
+            "damping must not escalate up to 1e3 at the noise floor"
+        );
+        assert!(
+            hooks.iterations.iter().all(|it| it.damping <= 1e-3),
+            "damping should remain small throughout optimization"
+        );
+
+        // Verify that optimize_pose_graph produces a usable result for the live map
+        let mut map = crate::mapping::map::Map::new();
+        for (idx, pose) in poses.iter().enumerate() {
+            let frame = crate::Frame {
+                idx,
+                features: kornia_imgproc::features::OrbFeatures {
+                    keypoints_xy: Vec::new(),
+                    orientations: Vec::new(),
+                    descriptors: Vec::new(),
+                    octaves: Vec::new(),
+                },
+                pose_world_to_cam: *pose,
+                image_size: kornia_image::ImageSize {
+                    width: 640,
+                    height: 480,
+                },
+                keypoint_colors: Vec::new(),
+                u_right: Vec::new(),
+                depth: Vec::new(),
+                keypoints_undist: Vec::new(),
+            };
+            map.insert_keyframe(crate::mapping::map::Keyframe::from_frame(frame))
+                .unwrap();
+        }
+        let verified_loops = edges[poses.len() - 1..]
+            .iter()
+            .map(|edge| crate::loop_closure::VerifiedLoopEdge {
+                query_kf_idx: edge.pose_b,
+                candidate_kf_idx: edge.pose_a,
+                candidate_to_query: crate::pose_conversion::se3_to_pose(&edge.t_ab_meas),
+                correspondences: 40,
+                inliers: 35,
+                inlier_ratio: 0.875,
+                reprojection_rmse_px: 1.0,
+                occupied_cells: 8,
+            })
+            .collect::<Vec<_>>();
+        let pgo_result = crate::loop_closure::pose_graph::optimize_pose_graph(
+            &map,
+            &verified_loops,
+            &crate::loop_closure::pose_graph::PgoConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            pgo_result.usable,
+            "pose graph at noise floor must be usable"
+        );
+        assert!(
+            pgo_result.iterations <= POST_FIX_ITERATION_CAP,
+            "PGO iterations ({}) must be <= {POST_FIX_ITERATION_CAP}",
+            pgo_result.iterations
+        );
+    }
+
+    /// Verifies that exhausting the iteration budget without meeting convergence criteria reports `converged: false`.
+    #[test]
+    fn sparse_lm_reports_unconverged_when_max_iterations_exceeded() {
+        let (poses, edges) = se3_scaling_graph(500);
+        let params = PgoParams {
+            max_iterations: 2,
+            ..PgoParams::default()
+        };
+
+        let result =
+            sparse_pose_graph_optimize(&poses, &edges, &[0], &params, &Se3Manifold).unwrap();
+
+        assert!(
+            !result.converged,
+            "solver must report converged=false when iteration budget runs out"
+        );
+        assert_eq!(result.iterations, 2);
+    }
+
+    /// Offline replay hook for dumped pose graphs specified via `KORNIA_PGO_REPLAY=<path>`.
+    #[test]
+    #[ignore = "offline replay hook for graphs dumped via KORNIA_PGO_DUMP"]
+    fn replay_pgo_dump() {
+        let dump_path = match std::env::var("KORNIA_PGO_REPLAY") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => panic!("Set KORNIA_PGO_REPLAY=<path> to replay a dumped pose graph"),
+        };
+        let dump = load_pgo_dump(&dump_path).expect("failed to load dump");
+        let mut hooks = SparsePgoTestHooks::default();
+        let params = PgoParams::default();
+        let result = if let Some(gravity) = dump.gravity {
+            let manifold = GravityManifold::new(gravity).unwrap();
+            sparse_pose_graph_optimize_with_test_hooks(
+                &dump.poses,
+                &dump.edges,
+                &[0],
+                &params,
+                &manifold,
+                &mut hooks,
+            )
+        } else {
+            sparse_pose_graph_optimize_with_test_hooks(
+                &dump.poses,
+                &dump.edges,
+                &[0],
+                &params,
+                &Se3Manifold,
+                &mut hooks,
+            )
+        };
+        println!(
+            "Replay result: converged={:?}",
+            result.as_ref().map(|r| (r.converged, r.iterations))
+        );
+        if let Ok(res) = &result {
+            let final_cost = normal_cost(&res.poses, &dump.edges);
+            println!("Replay final cost: {final_cost:.6e}");
+        }
+        println!("Iterations count: {}", hooks.iterations.len());
+        for (i, it) in hooks.iterations.iter().enumerate() {
+            println!(
+                "  iteration {i}: accepted={}, damping={:e}",
+                it.accepted, it.damping
+            );
+        }
+    }
+
+    /// Deserialized pose-graph dump containing poses, edges, and optional gravity vector.
+    pub(crate) struct PgoDump {
+        pub poses: Vec<Pose3d>,
+        pub edges: Vec<PgoEdge>,
+        pub gravity: Option<Vec3F64>,
+    }
+
+    /// Deserializes a pose graph from a plain-text dump file written by [`dump_pose_graph`].
+    ///
+    /// Parses rotation tokens in column-major file order (`c0r0`..`c2r2`) into `from_cols_array`,
+    /// matching the `to_cols_array()` writer format.
+    pub(crate) fn load_pgo_dump(path: &std::path::Path) -> Result<PgoDump, SparsePgoError> {
+        let content = std::fs::read_to_string(path).map_err(|error| {
+            SparsePgoError::InvalidInput(format!("failed to read dump: {error}"))
+        })?;
+        let mut poses = Vec::new();
+        let mut edges = Vec::new();
+        let mut gravity = None;
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            match tokens.as_slice() {
+                ["GRAVITY", x, y, z] => {
+                    let gx = x
+                        .parse::<f64>()
+                        .map_err(|e| SparsePgoError::InvalidInput(e.to_string()))?;
+                    let gy = y
+                        .parse::<f64>()
+                        .map_err(|e| SparsePgoError::InvalidInput(e.to_string()))?;
+                    let gz = z
+                        .parse::<f64>()
+                        .map_err(|e| SparsePgoError::InvalidInput(e.to_string()))?;
+                    gravity = Some(Vec3F64::new(gx, gy, gz));
+                }
+                [
+                    "POSE",
+                    _node,
+                    c0r0,
+                    c0r1,
+                    c0r2,
+                    c1r0,
+                    c1r1,
+                    c1r2,
+                    c2r0,
+                    c2r1,
+                    c2r2,
+                    tx,
+                    ty,
+                    tz,
+                ] => {
+                    let parse_f64 = |val: &str| {
+                        val.parse::<f64>()
+                            .map_err(|e| SparsePgoError::InvalidInput(e.to_string()))
+                    };
+                    let rot = Mat3F64::from_cols_array(&[
+                        parse_f64(c0r0)?,
+                        parse_f64(c0r1)?,
+                        parse_f64(c0r2)?,
+                        parse_f64(c1r0)?,
+                        parse_f64(c1r1)?,
+                        parse_f64(c1r2)?,
+                        parse_f64(c2r0)?,
+                        parse_f64(c2r1)?,
+                        parse_f64(c2r2)?,
+                    ]);
+                    let translation = Vec3F64::new(parse_f64(tx)?, parse_f64(ty)?, parse_f64(tz)?);
+                    poses.push(Pose3d::new(rot, translation));
+                }
+                [
+                    "EDGE",
+                    a,
+                    b,
+                    weight,
+                    c0r0,
+                    c0r1,
+                    c0r2,
+                    c1r0,
+                    c1r1,
+                    c1r2,
+                    c2r0,
+                    c2r1,
+                    c2r2,
+                    tx,
+                    ty,
+                    tz,
+                ] => {
+                    let pose_a = a
+                        .parse::<usize>()
+                        .map_err(|e| SparsePgoError::InvalidInput(e.to_string()))?;
+                    let pose_b = b
+                        .parse::<usize>()
+                        .map_err(|e| SparsePgoError::InvalidInput(e.to_string()))?;
+                    let parse_f32 = |val: &str| {
+                        val.parse::<f32>()
+                            .map_err(|e| SparsePgoError::InvalidInput(e.to_string()))
+                    };
+                    let w = parse_f32(weight)?;
+                    let rot32 = kornia_algebra::Mat3AF32::from_cols_array(&[
+                        parse_f32(c0r0)?,
+                        parse_f32(c0r1)?,
+                        parse_f32(c0r2)?,
+                        parse_f32(c1r0)?,
+                        parse_f32(c1r1)?,
+                        parse_f32(c1r2)?,
+                        parse_f32(c2r0)?,
+                        parse_f32(c2r1)?,
+                        parse_f32(c2r2)?,
+                    ]);
+                    let translation = kornia_algebra::Vec3AF32::new(
+                        parse_f32(tx)?,
+                        parse_f32(ty)?,
+                        parse_f32(tz)?,
+                    );
+                    let se3 = SE3F32::new(kornia_algebra::SO3F32::from_matrix(&rot32), translation);
+                    edges.push(PgoEdge {
+                        pose_a,
+                        pose_b,
+                        t_ab_meas: se3,
+                        weight: w,
+                    });
+                }
+                _ => {
+                    return Err(SparsePgoError::InvalidInput(format!(
+                        "unrecognized line in dump: {line}"
+                    )));
+                }
+            }
+        }
+        Ok(PgoDump {
+            poses,
+            edges,
+            gravity,
+        })
+    }
+
+    /// Verifies plain-text pose-graph dump serialization and deserialization roundtrip.
+    ///
+    /// Checks that non-symmetric rotations, translations, edge SE(3) measurements, and gravity vectors
+    /// are preserved exactly without transposition across column-major I/O.
+    #[test]
+    fn dump_and_load_roundtrip() {
+        let rot = SO3F64::exp(Vec3F64::new(0.2, -0.3, 0.4)).matrix();
+        let poses = vec![
+            Pose3d::new(rot, Vec3F64::new(1.1, 0.2, -0.3)),
+            Pose3d::new(
+                SO3F64::exp(Vec3F64::new(-0.1, 0.2, 0.3)).matrix(),
+                Vec3F64::new(2.1, -0.4, 0.5),
+            ),
+        ];
+        let edge_rot =
+            kornia_algebra::SO3F32::from_matrix(&kornia_algebra::Mat3AF32::from_cols_array(
+                &SO3F64::exp(Vec3F64::new(0.15, 0.25, -0.35))
+                    .matrix()
+                    .to_cols_array()
+                    .map(|v| v as f32),
+            ));
+        let edges = vec![PgoEdge {
+            pose_a: 0,
+            pose_b: 1,
+            t_ab_meas: SE3F32::new(edge_rot, kornia_algebra::Vec3AF32::new(0.5, -0.2, 0.1)),
+            weight: 1.5,
+        }];
+        let gravity = Vec3F64::new(0.1, -0.2, -9.81);
+
+        let temp_dir = std::env::temp_dir().join(format!("kornia_pgo_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let dump_file =
+            super::super::pose_graph::dump_pose_graph(&temp_dir, &poses, &edges, Some(gravity))
+                .unwrap();
+        assert!(dump_file.exists());
+
+        let second_file =
+            super::super::pose_graph::dump_pose_graph(&temp_dir, &poses, &edges, Some(gravity))
+                .unwrap();
+        assert_ne!(dump_file, second_file);
+        assert!(second_file.exists());
+
+        let loaded = load_pgo_dump(&dump_file).unwrap();
+        assert_eq!(loaded.poses.len(), poses.len());
+        for (loaded_pose, orig_pose) in loaded.poses.iter().zip(&poses) {
+            for (a, b) in loaded_pose
+                .rotation
+                .to_cols_array()
+                .iter()
+                .zip(&orig_pose.rotation.to_cols_array())
+            {
+                assert!((a - b).abs() < 1e-6, "pose rotation mismatch: {a} vs {b}");
+            }
+            assert!((loaded_pose.translation.x - orig_pose.translation.x).abs() < 1e-6);
+            assert!((loaded_pose.translation.y - orig_pose.translation.y).abs() < 1e-6);
+            assert!((loaded_pose.translation.z - orig_pose.translation.z).abs() < 1e-6);
+        }
+
+        assert_eq!(loaded.edges.len(), edges.len());
+        for (loaded_edge, orig_edge) in loaded.edges.iter().zip(&edges) {
+            assert_eq!(loaded_edge.pose_a, orig_edge.pose_a);
+            assert_eq!(loaded_edge.pose_b, orig_edge.pose_b);
+            assert!((loaded_edge.weight - orig_edge.weight).abs() < 1e-5);
+            for (a, b) in loaded_edge
+                .t_ab_meas
+                .r
+                .matrix()
+                .to_cols_array()
+                .iter()
+                .zip(&orig_edge.t_ab_meas.r.matrix().to_cols_array())
+            {
+                assert!((a - b).abs() < 1e-5, "edge rotation mismatch: {a} vs {b}");
+            }
+            assert!((loaded_edge.t_ab_meas.t.x - orig_edge.t_ab_meas.t.x).abs() < 1e-5);
+            assert!((loaded_edge.t_ab_meas.t.y - orig_edge.t_ab_meas.t.y).abs() < 1e-5);
+            assert!((loaded_edge.t_ab_meas.t.z - orig_edge.t_ab_meas.t.z).abs() < 1e-5);
+        }
+
+        let load_g = loaded.gravity.unwrap();
+        assert!((load_g.x - gravity.x).abs() < 1e-6);
+        assert!((load_g.y - gravity.y).abs() < 1e-6);
+        assert!((load_g.z - gravity.z).abs() < 1e-6);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
