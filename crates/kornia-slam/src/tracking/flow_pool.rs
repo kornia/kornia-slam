@@ -30,6 +30,8 @@ pub enum FlowPoolError {
     Frame(#[from] LkWindowError),
     #[error("LK window {0} is above {MAX_KLT_WINDOW}")]
     Window(usize),
+    #[error("{images} images for {cameras} flow cameras")]
+    MissingImages { cameras: usize, images: usize },
 }
 
 /// How long the join spins on a worker before it parks: a shard takes about
