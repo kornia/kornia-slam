@@ -328,7 +328,7 @@ mod tests {
     /// reading the raw pixels as pinhole ones recovers none of the points.
     #[test]
     fn raw_fisheye_overlap_triangulates_virtual_pixels() {
-        let raw = crate::rig::tests::raw_model();
+        let raw = crate::rig::tests::aria_lens();
         let sensor_rig = SensorRig::from_cameras(vec![
             RigCamera::primary(
                 raw,

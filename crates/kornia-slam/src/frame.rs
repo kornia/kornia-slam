@@ -246,7 +246,7 @@ mod tests {
     fn raw_fisheye_keypoints_map_to_the_virtual_pinhole() {
         use kornia_3d::camera::CameraModel;
         let rig = Arc::new(crate::rig::tests::raw_two_camera_rig(75.0));
-        let raw_model = crate::rig::tests::raw_model();
+        let lens = crate::rig::tests::aria_lens();
         let view = rig.view(0).unwrap();
         let pinhole = view.pinhole.clone();
         let mut bearings: Vec<(f64, Vec3F64)> = (0..2000)
@@ -265,7 +265,7 @@ mod tests {
         frame.features.keypoints_xy = bearings
             .iter()
             .map(|(_, ray)| {
-                let raw = raw_model.project(ray).unwrap();
+                let raw = lens.project(ray).unwrap();
                 [raw.x as f32, raw.y as f32]
             })
             .collect();
@@ -287,8 +287,8 @@ mod tests {
             let expected = pinhole.project_to_pixel(ray, 0.0).unwrap();
             // The test's own lens: its raw-to-virtual magnification, scaled to
             // the virtual focal length.
-            let (radial, _) = raw_model.pinhole_magnification(*theta);
-            let radial = radial * pinhole.fx / raw_model.f;
+            let (radial, _) = lens.pinhole_magnification(*theta);
+            let radial = radial * pinhole.fx / lens.f;
             let error = (got[0] as f64 - expected.x).hypot(got[1] as f64 - expected.y);
             assert!(error < 5e-4 + 1e-4 * radial, "θ {theta}: {error} px");
         }

@@ -132,7 +132,7 @@ pub fn landmarks_in_frame_frustum<D: Descriptor>(
 ) -> HashSet<usize> {
     let rig = frame.rig.geometry.as_ref().filter(|_| frame.is_rig());
     let primary = rig.and_then(|rig| rig.view(0));
-    let primary_raw = primary.as_ref().and_then(|view| view.raw_model());
+    let primary_raw = primary.as_ref().and_then(|view| view.fisheye_model());
     let mut visible = landmarks_in_frustum(
         map,
         candidates,
@@ -147,7 +147,7 @@ pub fn landmarks_in_frame_frustum<D: Descriptor>(
                 map,
                 candidates,
                 view.pinhole,
-                view.raw_model(),
+                view.fisheye_model(),
                 &view.pose(pose_world_to_cam),
                 view.camera.size,
             ));
@@ -216,7 +216,7 @@ mod tests {
             })
             .unwrap();
         }
-        let raw = crate::rig::tests::raw_model();
+        let raw = crate::rig::tests::aria_lens();
         let camera = PinholeCamera {
             fx: raw.f,
             fy: raw.f,

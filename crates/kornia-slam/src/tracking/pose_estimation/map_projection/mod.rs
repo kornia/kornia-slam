@@ -744,7 +744,7 @@ fn view_grids<D>(
                 view.pinhole.clone()
             },
             camera_from_primary: (c > 0).then_some(*view.camera_from_primary),
-            raw: view.raw_model().cloned(),
+            raw: view.fisheye_model().cloned(),
             image_size: if c == 0 {
                 frame.image_size
             } else {
@@ -982,7 +982,7 @@ mod matching_tests {
         let pose = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::ZERO);
         let raw = Camera::from(kornia_3d::camera::Fisheye624Camera {
             f: camera.fx,
-            ..crate::rig::tests::raw_model()
+            ..crate::rig::tests::aria_lens()
         });
         let search = |raw: Option<Camera>| {
             let grid = KeypointGrid::new(&keypoints_xy, 640.0, 480.0, 64.0);

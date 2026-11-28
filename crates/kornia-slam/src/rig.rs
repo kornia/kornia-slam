@@ -63,14 +63,14 @@ impl RigView<'_> {
     }
 
     /// The raw fisheye model, `None` for a pinhole camera.
-    pub fn raw_model(&self) -> Option<&Camera> {
+    pub fn fisheye_model(&self) -> Option<&Camera> {
         self.is_raw().then_some(&self.camera.model)
     }
 
     /// Raw image pixel to virtual-pinhole pixel; `None` past the 80° cap or
     /// outside the lens. The identity for a pinhole camera.
     pub fn raw_to_virtual(&self, raw: [f32; 2]) -> Option<[f32; 2]> {
-        let Some(model) = self.raw_model() else {
+        let Some(model) = self.fisheye_model() else {
             return Some(raw);
         };
         let bearing = model.unproject(&Vec2F64::new(raw[0] as f64, raw[1] as f64))?;
@@ -297,7 +297,7 @@ pub(crate) mod tests {
     }
 
     /// Aria-like lens (LaMAria R_11 `cam0` distortion) on [`camera`]'s intrinsics.
-    pub(crate) fn raw_model() -> Fisheye624Camera {
+    pub(crate) fn aria_lens() -> Fisheye624Camera {
         Fisheye624Camera {
             f: 240.0,
             cx: 320.0,
@@ -322,9 +322,9 @@ pub(crate) mod tests {
 
     pub(crate) fn raw_two_camera_rig(yaw_deg: f64) -> RigGeometry {
         rig_of(vec![
-            RigCamera::primary(raw_model(), SIZE),
+            RigCamera::primary(aria_lens(), SIZE),
             RigCamera::new(
-                raw_model(),
+                aria_lens(),
                 SIZE,
                 Pose3d::new(yaw(yaw_deg), Vec3F64::new(0.1, 0.0, 0.0)),
             ),
@@ -344,7 +344,7 @@ pub(crate) mod tests {
     fn raw_fisheye_project_in_view_sees_past_the_pinhole_frustum() {
         let (s, c) = 70f64.to_radians().sin_cos();
         let p = Vec3F64::new(s, 0.0, c) * 3.0;
-        let raw = Camera::from(raw_model());
+        let raw = Camera::from(aria_lens());
         let pixel = project_in_view(&camera(), Some(&raw), SIZE, &p, 0.05).unwrap();
         assert!((pixel - camera().project_to_pixel(&p, 0.05).unwrap()).length() < 1e-12);
         assert!(project_in_view(&camera(), None, SIZE, &p, 0.05).is_none());
