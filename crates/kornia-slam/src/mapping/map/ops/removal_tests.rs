@@ -83,6 +83,26 @@ fn landmark_map() -> Map {
     map
 }
 
+/// Both cameras of a rig keyframe observe the landmark: two records go.
+#[test]
+fn removal_counts_every_rig_camera_record() {
+    let mut map = Map::new();
+    for id in [10, 20] {
+        let mut kf = Keyframe::from_frame(test_frame(id, vec![[id as u8; 32]; 4]));
+        kf.frame.rig.camera_ranges = vec![0..2, 2..4];
+        map.insert_keyframe(kf).unwrap();
+    }
+    let point = map.insert_landmark(seed(20, 0)).unwrap();
+    map.link_observation(20, 2, point).unwrap();
+    map.link_observation(10, 0, point).unwrap();
+
+    let removal = map.remove_keyframe(20).unwrap();
+
+    assert_eq!(removal.observations_removed, 2);
+    assert_eq!(map.map_points()[point].keyframe_idx, 10);
+    assert_map_consistent(&map);
+}
+
 #[test]
 fn removal_unlinks_retires_and_promotes_references() {
     let mut map = landmark_map();

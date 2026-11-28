@@ -230,15 +230,18 @@ fn overlap_box(rig: &RigGeometry, c: usize) -> Option<PixelBox> {
                     })
             });
             if seen {
-                let (x, y) = (x as f32, y as f32);
+                // A seen sample stands for the cells on both sides of it: the
+                // boundary lies anywhere between it and the unseen neighbour.
                 let step = OVERLAP_GRID_STEP_PX as f32;
+                let (x, y) = (x as f32, y as f32);
+                let (x0, y0) = ((x - step).max(0.0), (y - step).max(0.0));
                 found = Some(match found {
                     None => PixelBox {
-                        min: [x, y],
+                        min: [x0, y0],
                         max: [x + step, y + step],
                     },
                     Some(b) => PixelBox {
-                        min: [b.min[0].min(x), b.min[1].min(y)],
+                        min: [b.min[0].min(x0), b.min[1].min(y0)],
                         max: [b.max[0].max(x + step), b.max[1].max(y + step)],
                     },
                 });
@@ -482,6 +485,22 @@ pub(crate) mod tests {
             }
         }
         assert!(checked > 100, "only {checked} points in both images");
+    }
+
+    /// Parallel cameras 0.11 m apart: left pixel x = 6 at 5 m lands at
+    /// x = 0.72 on the right, between the box's sampled columns 0 and 8.
+    #[test]
+    fn the_overlap_box_reaches_past_its_first_seen_sample() {
+        let rig = rig_of(vec![
+            RigCamera::primary(camera(), SIZE),
+            RigCamera::new(
+                camera(),
+                SIZE,
+                Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.11, 0.0, 0.0)),
+            ),
+        ]);
+        let left = rig.view(0).unwrap().overlap.unwrap();
+        assert!(left.contains([6.0, 240.0]), "{left:?}");
     }
 
     #[test]

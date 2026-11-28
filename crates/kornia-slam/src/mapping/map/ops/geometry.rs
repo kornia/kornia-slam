@@ -39,15 +39,11 @@ impl<D: Descriptor> Map<D> {
                 .iter()
                 .map(|o| (o.key.keyframe_idx, o.camera))
                 .collect();
-            let ref_camera = observers
-                .iter()
-                .find(|&&(kf_idx, _)| kf_idx == mp.keyframe_idx)
-                .map_or(0, |&(_, camera)| camera);
             (
                 mp.position,
                 observers,
                 mp.keyframe_idx,
-                ref_camera,
+                mp.reference_camera,
                 mp.reference_octave,
             )
         };

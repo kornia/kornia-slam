@@ -128,7 +128,9 @@ pub fn match_overlap(
             }
         }
         let (dist, j) = best;
-        if dist > MAX_HAMMING || (second != u32::MAX && dist as f64 > NN_RATIO * second as f64) {
+        // ORB-SLAM3's strict ratio: two equally close candidates, exact
+        // copies included, leave the match ambiguous.
+        if dist > MAX_HAMMING || (second != u32::MAX && dist as f64 >= NN_RATIO * second as f64) {
             continue;
         }
         let slot = j - right.start;
@@ -408,6 +410,28 @@ mod tests {
             &features,
             &features.keypoints_xy,
             &[0..1, 1..2],
+            &rig,
+            &right_from_left,
+        );
+        assert_eq!(matches.num_matched(), 0);
+    }
+
+    #[test]
+    fn two_exact_candidates_on_the_line_are_ambiguous() {
+        let sensor_rig = sensor_rig();
+        let rig = RigGeometry::from_rig(&sensor_rig).unwrap();
+        let right_from_left = sensor_rig.b_from_a(0, 1).unwrap();
+        let p = Vec3F64::new(1.5, -0.3, 4.0);
+        let l = camera().project_to_pixel(&p, 0.0).unwrap();
+        let r = camera()
+            .project_to_pixel(&right_from_left.transform_point(&p), 0.0)
+            .unwrap();
+        let (l, r) = ([l.x as f32, l.y as f32], [r.x as f32, r.y as f32]);
+        let features = features(vec![l, r, r], vec![descriptor(3); 3]);
+        let matches = match_overlap(
+            &features,
+            &features.keypoints_xy,
+            &[0..1, 1..3],
             &rig,
             &right_from_left,
         );

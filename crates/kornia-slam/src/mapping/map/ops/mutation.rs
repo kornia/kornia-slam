@@ -258,13 +258,15 @@ impl<D: Descriptor> Map<D> {
         let (descriptor, octave) = self.feature_data(seed.reference)?;
         self.require_free_feature(seed.reference)?;
         let idx = self.map_points.len();
-        self.map_points.push(MapPoint::new(
+        let mut map_point = MapPoint::new(
             seed.position,
             descriptor,
             octave,
             seed.color,
             seed.reference.keyframe_idx,
-        ));
+        );
+        map_point.reference_camera = self.observation_camera(seed.reference);
+        self.map_points.push(map_point);
         self.link_unchecked(seed.reference, idx, descriptor);
         self.refresh_landmark(idx);
         Ok(idx)
@@ -525,13 +527,15 @@ impl<D: Descriptor> Map<D> {
         for seed in &landmarks {
             let (descriptor, octave) = self.feature_data(seed.reference).expect("validated above");
             let idx = self.map_points.len();
-            self.map_points.push(MapPoint::new(
+            let mut map_point = MapPoint::new(
                 seed.position,
                 descriptor,
                 octave,
                 seed.color,
                 seed.reference.keyframe_idx,
-            ));
+            );
+            map_point.reference_camera = self.observation_camera(seed.reference);
+            self.map_points.push(map_point);
             landmark_ids.push(idx);
         }
 
@@ -682,9 +686,11 @@ impl<D: Descriptor> Map<D> {
             return;
         };
         let octave = self.feature_data(next).map(|(_, o)| o).unwrap_or(0);
+        let camera = self.observation_camera(next);
         if let Some(mp) = self.map_points.get_mut(landmark_idx) {
             mp.keyframe_idx = next.keyframe_idx;
             mp.reference_octave = octave;
+            mp.reference_camera = camera;
         }
     }
 

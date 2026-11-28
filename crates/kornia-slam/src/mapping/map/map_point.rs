@@ -51,6 +51,9 @@ pub struct MapPoint<D = RBrief> {
     pub color: [u8; 3],
     /// Reference keyframe for this point's scale geometry.
     pub keyframe_idx: usize,
+    /// Rig camera of the reference feature, whose centre the distance
+    /// bounds are measured from; 0 outside a rig.
+    pub reference_camera: u8,
     /// Frames where the point fell in the frustum, and where it then matched.
     pub n_visible: u32,
     pub n_found: u32,
@@ -76,6 +79,7 @@ impl<D: Descriptor> MapPoint<D> {
             max_distance: 0.0,
             color,
             keyframe_idx,
+            reference_camera: 0,
             n_visible: 1,
             n_found: 1,
             culled: false,

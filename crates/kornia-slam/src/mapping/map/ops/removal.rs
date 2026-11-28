@@ -281,10 +281,16 @@ impl<D: Descriptor> Map<D> {
         let mut dirty = Vec::new();
         for mp_idx in 0..self.map_points.len() {
             let point = &mut self.map_points[mp_idx];
+            // One record per rig camera of the keyframe.
+            let records = point
+                .observations()
+                .iter()
+                .filter(|o| o.key.keyframe_idx == keyframe_idx)
+                .count();
             if point.remove_observation(keyframe_idx).is_none() {
                 continue;
             }
-            removal.observations_removed += 1;
+            removal.observations_removed += records;
             if point.culled {
                 continue;
             }

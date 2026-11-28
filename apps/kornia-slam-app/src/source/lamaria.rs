@@ -159,7 +159,7 @@ impl LamariaConfig {
         let mut start = self.start_frame.min(total);
         let mut end = match self.max_frames {
             0 => total,
-            n => (start + n).min(total),
+            n => start.saturating_add(n).min(total),
         };
         let first = times.first().copied().unwrap_or(0.0);
         if let Some(sec) = self.start_sec {
@@ -331,6 +331,10 @@ mod tests {
         // 10 frames at 0.5 s from t0 = 100 s.
         let times: Vec<f64> = (0..10).map(|i| 100.0 + 0.5 * i as f64).collect();
         assert_eq!(config("").frame_range(&times), (0, 10));
+        assert_eq!(
+            config(&format!(", start_frame: 1, max_frames: {}", usize::MAX)).frame_range(&times),
+            (1, 10)
+        );
         assert_eq!(
             config(", start_frame: 2, max_frames: 3").frame_range(&times),
             (2, 5)

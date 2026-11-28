@@ -731,6 +731,41 @@ fn unlinking_one_rig_camera_of_the_reference_keeps_the_reference_keyframe() {
     assert_eq!(map.map_points()[point].reference_octave, 1);
 }
 
+/// Keyframe 10 links its camera-1 feature before its camera-0 one. When the
+/// seed's keyframe goes, the reference moves to camera 0's feature, and the
+/// distance bounds follow camera 0's centre, not the first record's camera.
+#[test]
+fn an_adopted_reference_measures_from_its_own_rig_camera() {
+    let rig_map = |link_camera_1: bool| {
+        let geometry = std::sync::Arc::new(crate::rig::tests::two_camera_rig(30.0));
+        let mut map = Map::new();
+        for idx in [10usize, 20] {
+            let mut kf = detached(idx, 4);
+            kf.frame.rig.geometry = Some(std::sync::Arc::clone(&geometry));
+            kf.frame.rig.camera_ranges = vec![0..2, 2..4];
+            kf.frame.features.octaves = vec![1, 0, 3, 0];
+            map.insert_keyframe(kf).unwrap();
+        }
+        let point = map.insert_landmark(seed(20, 0, 5.0)).unwrap();
+        if link_camera_1 {
+            map.link_observation(10, 2, point).unwrap();
+        }
+        map.link_observation(10, 0, point).unwrap();
+        map.unlink_observation(20, 0).unwrap();
+        (map, point)
+    };
+
+    let (map, point) = rig_map(true);
+    let (single, single_point) = rig_map(false);
+    let adopted = &map.map_points()[point];
+    assert_eq!((adopted.keyframe_idx, adopted.reference_camera), (10, 0));
+    assert_eq!(adopted.reference_octave, 1);
+    assert_eq!(
+        adopted.max_distance,
+        single.map_points()[single_point].max_distance
+    );
+}
+
 /// R2: a duplicate directed IMU edge inside one request rejects the batch,
 /// leaving nothing behind — it would otherwise double-count integrated
 /// duration in the initialization readiness gate.
