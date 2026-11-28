@@ -907,10 +907,19 @@ mod windowed_flow {
                 stereo_rig(),
             )
             .unwrap();
+            system.set_debug(true);
             run(&mut system, 0..40);
             let counters = system.flow_counters();
             assert!(counters.flow_frames > 20, "{flow_pose:?}: {counters:?}");
             assert_eq!(counters.klt_errors, 0, "{flow_pose:?}");
+            // The analytic run must accept analytic poses, not only fall back.
+            let analytic = system
+                .drain_debug_messages()
+                .iter()
+                .filter(|m| m.starts_with("[klt-first]") && m.ends_with("analytic=1"))
+                .count();
+            let expected_analytic = matches!(flow_pose, FlowPose::AnalyticGn { .. });
+            assert_eq!(analytic > 0, expected_analytic, "{flow_pose:?}: {analytic}");
             let map = system.map.lock().unwrap();
             for keyframe in map.keyframes() {
                 assert!(
