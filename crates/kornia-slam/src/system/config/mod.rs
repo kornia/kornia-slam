@@ -9,7 +9,7 @@ use crate::loop_closure::LoopClosingConfig;
 use crate::mapping::LocalMappingMode;
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
-use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
+use crate::tracking::{KeyframeInsertionStrategy, KeyframePolicy, TrackingLossRecoveryPolicy};
 
 /// Schema version of [`SystemConfig`] this crate reads and writes.
 pub const SYSTEM_CONFIG_VERSION: u32 = 1;
@@ -461,7 +461,10 @@ impl fmt::Display for SystemConfig {
             write!(f, "{}", k.max_frames_between)?;
         }
         write!(f, " frames, ref ratio {}", k.ref_ratio)?;
-        if let Some(px) = k.min_parallax_px {
+        if let KeyframeInsertionStrategy::Parallax {
+            min_parallax_px: px,
+        } = k.insertion
+        {
             write!(f, ", parallax {px} px")?;
         }
         match k.max_interval_sec {

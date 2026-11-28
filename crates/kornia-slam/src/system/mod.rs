@@ -1881,7 +1881,7 @@ impl SlamSystem {
         // Measured only when the policy reads it: it walks every match.
         let median_parallax_px = self
             .keyframe_policy
-            .min_parallax_px
+            .parallax_threshold_px()
             .zip(self.state.last_keyframe_idx)
             .and_then(|(_, last)| {
                 median_parallax_px(&map, last, frame, pose, matches, &self.camera)
@@ -1927,7 +1927,7 @@ impl SlamSystem {
         };
         let median_parallax_px = self
             .keyframe_policy
-            .min_parallax_px
+            .parallax_threshold_px()
             .zip(self.state.last_keyframe_idx)
             .and_then(|(_, last)| {
                 median_parallax_px_with(

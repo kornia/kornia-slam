@@ -17,6 +17,8 @@ pub(crate) mod tracker;
 pub use flow_pool::FlowPoolError;
 pub use local_map::{LocalMapSelectionConfig, select_local_map_points};
 pub use parallax::{median_compensated_parallax_px, median_parallax_px};
-pub use policy::{KeyframeEvidence, KeyframePolicy, TrackingLossRecoveryPolicy};
+pub use policy::{
+    KeyframeEvidence, KeyframeInsertionStrategy, KeyframePolicy, TrackingLossRecoveryPolicy,
+};
 pub use pose_estimation::MapProjectionEstimator;
 pub use timings::TrackingTimings;
