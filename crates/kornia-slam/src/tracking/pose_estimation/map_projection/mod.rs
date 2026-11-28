@@ -37,6 +37,7 @@ use crate::frame::{Frame, is_finite_xy, undistort_keypoint};
 use crate::mapping::map::{Keyframe, Map, MapPoint};
 use crate::rig::project_in_view;
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
+use crate::tracking::timings::{TrackingTimings, timed};
 
 use super::Estimate;
 use super::rig_pnp::{RigObservation, solve_rig_pnp};
@@ -332,6 +333,54 @@ impl<D: Descriptor> MapProjectionEstimator<D> {
         try_track_and_refine(ref_correspondences, pose_before_tracking)
     }
 
+    /// Pose of `frame` from `seeded` `(map point, keypoint)` pairs alone:
+    /// the consistency filter against the reference keyframe, then PnP from
+    /// `candidate_pose`. No projection search or local refinement runs, so
+    /// `frame` needs no descriptors of its own. Accepts at `min_inliers`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn estimate_from_seeds(
+        &self,
+        frame: &Frame<D>,
+        candidate_pose: &Pose3d,
+        map: &Map<D>,
+        camera: &PinholeCamera,
+        current_keyframe_idx: Option<usize>,
+        search_scale: f32,
+        mut seeded: Vec<(usize, usize)>,
+        timings: &mut TrackingTimings,
+    ) -> Result<Estimate, MapProjectionRejectReason> {
+        let pnp = &self.config.pnp;
+        if seeded.len() < pnp.min_correspondences {
+            return Err(MapProjectionRejectReason::LowProjectionMatches);
+        }
+        let current_kf = current_keyframe_idx.and_then(|ki| map.get_keyframe(ki));
+        let keypoints_undist = undistorted_keypoints(frame, camera);
+        seeded.retain(|&(_, kp_idx)| keypoints_undist.get(kp_idx).is_some_and(is_finite_xy));
+        let grids = view_grids(frame, &keypoints_undist, camera);
+        let matches = timed(&mut timings.consistency_filter, || {
+            self.geometric_consistency_filter(current_kf, &seeded, frame, &keypoints_undist, camera)
+        });
+        let (pose, inliers) = timed(&mut timings.pnp, || {
+            self.solve_pnp(
+                map.map_points(),
+                &matches,
+                &keypoints_undist,
+                &grids,
+                candidate_pose,
+                search_scale,
+            )
+        })
+        .ok_or(MapProjectionRejectReason::PnpFailed)?;
+        if inliers < pnp.min_inliers {
+            return Err(MapProjectionRejectReason::LowPnpInliers);
+        }
+        Ok(Estimate {
+            pose,
+            inliers,
+            matches,
+        })
+    }
+
     /// Reject matches that disagree with reference-to-current epipolar geometry.
     /// Matches without a reference-keyframe observation remain unfiltered.
     fn geometric_consistency_filter(
@@ -547,17 +596,7 @@ impl<D: Descriptor> MapProjectionEstimator<D> {
         // Use the frame's undistortion cache when filled (the pipeline fills
         // it once per frame); only frames built outside the pipeline pay the
         // per-keypoint undistortion here.
-        let keypoints_undist: Vec<[f32; 2]> =
-            if frame.keypoints_undist.len() == frame.features.keypoints_xy.len() {
-                frame.keypoints_undist.clone()
-            } else {
-                frame
-                    .features
-                    .keypoints_xy
-                    .iter()
-                    .map(|kp| undistort_keypoint(camera, kp))
-                    .collect()
-            };
+        let keypoints_undist = undistorted_keypoints(frame, camera);
 
         let grids = view_grids(frame, &keypoints_undist, camera);
 
@@ -693,6 +732,19 @@ impl<D: Descriptor> MapProjectionEstimator<D> {
         }
 
         matches
+    }
+}
+
+fn undistorted_keypoints<D>(frame: &Frame<D>, camera: &PinholeCamera) -> Vec<[f32; 2]> {
+    if frame.keypoints_undist.len() == frame.features.keypoints_xy.len() {
+        frame.keypoints_undist.clone()
+    } else {
+        frame
+            .features
+            .keypoints_xy
+            .iter()
+            .map(|kp| undistort_keypoint(camera, kp))
+            .collect()
     }
 }
 

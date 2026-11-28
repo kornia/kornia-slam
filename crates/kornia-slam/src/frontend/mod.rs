@@ -95,6 +95,15 @@ impl OrbFrontend {
         &self.observation
     }
 
+    /// Shows the tracks of a frame tracked by optical flow alone, for which
+    /// no features were extracted.
+    pub(crate) fn observe_flow(&mut self, tracks_xy: &[[f32; 2]]) {
+        self.observation.keypoints_xy.clear();
+        self.observation.keypoints_xy.extend_from_slice(tracks_xy);
+        self.observation.stereo_matched = None;
+        self.observation.duration = Duration::ZERO;
+    }
+
     /// Makes the next ORB extraction fail, to test the error paths.
     #[cfg(test)]
     pub(crate) fn fail_next_extraction(&mut self) {

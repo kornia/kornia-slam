@@ -376,7 +376,7 @@ mod keyframe_evidence {
         frame.pose_world_to_cam = Pose3d::IDENTITY;
 
         let system = system_tracked_at(Some(10.0), yaw);
-        let evidence = system.keyframe_evidence(&frame, 9, &all_matches());
+        let evidence = system.keyframe_evidence(&frame, &yaw, 9, &all_matches());
         assert_eq!(evidence.curr_idx, 7);
         assert_eq!(evidence.last_keyframe_idx, Some(0));
         assert_eq!(evidence.tracked_inliers, 9);
@@ -388,12 +388,90 @@ mod keyframe_evidence {
 
         let off = system_tracked_at(None, yaw);
         assert_eq!(
-            off.keyframe_evidence(&frame, 9, &all_matches())
+            off.keyframe_evidence(&frame, &yaw, 9, &all_matches())
                 .median_parallax_px,
             None,
             "not measured unless the policy reads it"
         );
     }
+    /// A flow frame tracked at a pure 0.08 rad yaw while the state still holds
+    /// the previous frame's pose: measured at the tracked pose there is no
+    /// parallax; at the state pose it would read about 32 px.
+    #[test]
+    fn flow_evidence_measures_parallax_at_the_tracked_pose() {
+        let yaw = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.0, 0.08, 0.0)).matrix(),
+            Vec3F64::ZERO,
+        );
+        let points = map_with_keyframe_at(Pose3d::IDENTITY)
+            .map_points()
+            .iter()
+            .map(|mp| mp.position)
+            .collect::<Vec<_>>();
+        let mut frame = frame_seeing_points(7, yaw, &points);
+        frame.pose_world_to_cam = Pose3d::IDENTITY;
+        let system = system_tracked_at(Some(10.0), Pose3d::IDENTITY);
+
+        let parallax = |pose: &Pose3d| {
+            system
+                .flow_keyframe_evidence(&frame, pose, 9, &all_matches())
+                .median_parallax_px
+                .unwrap()
+        };
+        assert!(parallax(&yaw) < 1e-3, "{}", parallax(&yaw));
+        let at_state = parallax(&system.state.pose_world_to_cam);
+        assert!((25.0..40.0).contains(&at_state), "{at_state}");
+    }
+
+    /// The reference keyframe holds 200 landmarks, 100 of which the tracks
+    /// followed after the last ORB frame, and the flow frame finds 90: it
+    /// is not due, since it could only ever find the 100. Against the 200,
+    /// the ref-ratio rule would ask for a keyframe.
+    #[test]
+    fn flow_keyframe_evidence_counts_followed_landmarks() {
+        let mut system = SlamSystem::build(mono(), SensorRig::mono(camera(), IMAGE_SIZE)).unwrap();
+        let mut map = map_with_keyframe_at(Pose3d::IDENTITY);
+        let landmarks: Vec<Vec3F64> = (0..200)
+            .map(|i| {
+                Vec3F64::new(
+                    (i % 20) as f64 * 0.1 - 1.0,
+                    (i / 20) as f64 * 0.1 - 0.5,
+                    4.0,
+                )
+            })
+            .collect();
+        map.insert_keyframe(Keyframe::from_frame(frame_seeing_points(
+            1,
+            Pose3d::IDENTITY,
+            &landmarks,
+        )))
+        .unwrap();
+        for (i, position) in landmarks.into_iter().enumerate() {
+            map.insert_landmark(crate::mapping::map::LandmarkSeed {
+                position,
+                color: [0; 3],
+                reference: crate::mapping::map::ObservationKey {
+                    keyframe_idx: 1,
+                    feature_idx: i,
+                },
+            })
+            .unwrap();
+        }
+        *system.map.lock().unwrap() = map;
+        system.state.last_keyframe_idx = Some(0);
+        system.state.current_keyframe_idx = Some(1);
+        system.tracker.set_followed_baseline(100);
+        let frame = frame_seeing_points(4, Pose3d::IDENTITY, &[]);
+        let pose = Pose3d::IDENTITY;
+
+        let flow = system.flow_keyframe_evidence(&frame, &pose, 90, &[]);
+        assert_eq!(flow.n_ref_map_points, 100);
+        assert!(!system.keyframe_due(&flow, 0.2));
+        let orb = system.keyframe_evidence(&frame, &pose, 90, &[]);
+        assert_eq!(orb.n_ref_map_points, 200);
+        assert!(system.keyframe_due(&orb, 0.2));
+    }
+
     /// A parked camera earns no keyframe from the motion policy; the time
     /// bound still forces one, measured from the last keyframe's timestamp.
     #[test]
@@ -418,5 +496,157 @@ mod keyframe_evidence {
         assert!(system.keyframe_due(&parked, 10.5));
         system.keyframe_policy.max_interval_sec = None;
         assert!(!system.keyframe_due(&parked, 1e6), "no bound unless set");
+    }
+}
+
+mod klt_first {
+    use super::*;
+    use crate::system::config::KltFirst;
+
+    /// A synchronous stereo system tracking by optical flow first.
+    fn stereo_klt_first(min_tracks: usize) -> SlamSystem {
+        let mut config = config(CameraSelection::Stereo, false, LoopClosingMode::Disabled);
+        let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+        orb.frontend = FrontendConfig::Orb(OrbFrontendConfig {
+            klt_first: KltFirst::Enabled { min_tracks },
+            ..OrbFrontendConfig::default()
+        });
+        SlamSystem::build(
+            config,
+            SensorRig::rectified_stereo(camera(), IMAGE_SIZE, 0.11),
+        )
+        .unwrap()
+    }
+
+    /// Frame `k` of a camera sliding sideways one pixel a frame over a
+    /// textured plane 8 px of disparity away.
+    fn sliding_pair(k: usize) -> (Image<u8, 1>, Image<u8, 1>) {
+        (textured(k), textured(k + 8))
+    }
+
+    /// Runs `frames` sliding frames, returning each frame's status.
+    fn run(system: &mut SlamSystem, frames: std::ops::Range<usize>) -> Vec<TrackingStatus> {
+        frames
+            .map(|k| {
+                let (left, right) = sliding_pair(k);
+                system
+                    .process_stereo(stamp(k), &left, &right)
+                    .unwrap()
+                    .status
+            })
+            .collect()
+    }
+
+    /// Frames between keyframes are tracked by flow, and every keyframe is
+    /// an ORB frame with stereo depth: a due flow frame runs ORB and is
+    /// inserted on its first verdict, so every due frame either became a
+    /// keyframe or saw its ORB estimate rejected.
+    #[test]
+    fn flow_frames_never_become_keyframes() {
+        let mut system = stereo_klt_first(30);
+        let statuses = run(&mut system, 0..40);
+        let counters = system.flow_counters();
+        assert!(counters.flow_frames > 20, "{counters:?}");
+        let map = system.map.lock().unwrap();
+        for keyframe in map.keyframes() {
+            assert!(
+                keyframe.frame.depth.iter().any(|&d| d > 0.0),
+                "keyframe {} has no stereo depth",
+                keyframe.frame.idx
+            );
+        }
+        let due_keyframes = statuses[1..]
+            .iter()
+            .filter(|&&s| s == TrackingStatus::KeyframeAccepted)
+            .count() as u64;
+        assert!(counters.flow_keyframe_due > 0);
+        assert_eq!(
+            counters.flow_keyframe_due,
+            due_keyframes + counters.flow_due_orb_rejected,
+            "{counters:?}"
+        );
+    }
+
+    fn visibility(system: &SlamSystem) -> Vec<u32> {
+        system.with_map_points(|points| points.iter().map(|mp| mp.n_visible).collect())
+    }
+
+    #[test]
+    fn a_flow_frame_leaves_observation_counts_untouched() {
+        let mut system = stereo_klt_first(30);
+        run(&mut system, 0..3);
+        let before = visibility(&system);
+        let flow_frames = system.flow_counters().flow_frames;
+        assert_eq!(run(&mut system, 3..4), vec![TrackingStatus::Tracked]);
+        assert_eq!(system.flow_counters().flow_frames, flow_frames + 1);
+        assert_eq!(visibility(&system), before);
+
+        // Frame 8 is due as a keyframe, so it runs ORB and counts visibility.
+        run(&mut system, 4..8);
+        let before = visibility(&system);
+        run(&mut system, 8..9);
+        let after = visibility(&system);
+        assert!(
+            before.iter().zip(&after).any(|(b, a)| a > b),
+            "an ORB frame counts the landmarks it sees"
+        );
+    }
+
+    #[test]
+    fn orb_frame_extracts_for_a_flow_tracked_frame() {
+        let mut system = stereo_klt_first(30);
+        run(&mut system, 0..3);
+        let (left, right) = sliding_pair(3);
+        let pending = PendingFrame {
+            idx: 3,
+            capture: Capture::Stereo(&left, &right),
+        };
+        let frame = system
+            .orb_frame(TrackedFrame::Flow(FrameSource::Deferred(pending)))
+            .unwrap();
+        assert_eq!(frame.idx, 3);
+        assert!(frame.features.descriptors.iter().any(|d| d.0 != [0; 32]));
+        assert_eq!(frame.depth.len(), frame.features.len());
+        assert!(frame.depth.iter().any(|&d| d > 0.0));
+        assert_eq!(frame.keypoints_undist.len(), frame.features.len());
+    }
+
+    /// Frame 8 is due as a keyframe, so its deferred ORB extraction runs;
+    /// when it fails the system is as before the call, and the retry tracks
+    /// as a twin system that never failed.
+    #[test]
+    fn a_deferred_extraction_failure_changes_nothing() {
+        let mut system = stereo_klt_first(30);
+        let mut twin = stereo_klt_first(30);
+        run(&mut system, 0..8);
+        run(&mut twin, 0..8);
+        let next_frame_idx = system.next_frame_idx;
+        let previous = system.previous_image.as_ref().unwrap().as_slice().to_vec();
+        let velocity_world = system.state.velocity_world;
+        let tracks = system.tracker.tracks().to_vec();
+        let latest = system.inertial.latest_image_timestamp_sec;
+
+        let (left, right) = sliding_pair(8);
+        system.frontend.fail_next_extraction();
+        assert!(system.process_stereo(stamp(8), &left, &right).is_err());
+        assert_eq!(system.next_frame_idx, next_frame_idx);
+        assert_eq!(
+            system.previous_image.as_ref().unwrap().as_slice(),
+            &previous[..]
+        );
+        assert_eq!(system.state.velocity_world, velocity_world);
+        assert_eq!(system.tracker.tracks(), &tracks[..]);
+        assert_eq!(system.inertial.latest_image_timestamp_sec, latest);
+
+        let retried = system.process_stereo(stamp(8), &left, &right).unwrap();
+        let expected = twin.process_stereo(stamp(8), &left, &right).unwrap();
+        assert_eq!(retried.status, TrackingStatus::KeyframeAccepted);
+        assert_eq!(retried.status, expected.status);
+        // Debug prints every f64 in full, so equal text is equal bits.
+        assert_eq!(
+            format!("{:?}", retried.pose_world_to_cam),
+            format!("{:?}", expected.pose_world_to_cam)
+        );
+        assert_eq!(system.flow_counters(), twin.flow_counters());
     }
 }

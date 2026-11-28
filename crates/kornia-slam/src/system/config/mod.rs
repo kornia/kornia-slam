@@ -112,6 +112,9 @@ pub struct OrbFrontendConfig {
     /// Stereo keypoints closer than this are back-projected directly into map
     /// points at each keyframe. Unused without stereo cameras.
     pub stereo_close_depth: StereoCloseDepth,
+    /// Whether frames between keyframes are tracked by optical flow alone,
+    /// extracting ORB only when the flow cannot carry the frame.
+    pub klt_first: KltFirst,
     /// Optical-flow search when the inertial prediction is trusted.
     pub klt_prediction: KltPrediction,
     /// The pyramidal LK implementation optical flow runs on.
@@ -128,8 +131,34 @@ impl Default for OrbFrontendConfig {
         Self {
             n_keypoints: 1000,
             stereo_close_depth: StereoCloseDepth::default(),
+            klt_first: KltFirst::default(),
             klt_prediction: KltPrediction::default(),
             klt_kernel: LkKernel::default(),
+        }
+    }
+}
+
+/// Optical-flow-first tracking: a frame is tracked from its flow survivors
+/// alone, without ORB, unless a keyframe is due, the flow-only pose is
+/// refused, or fewer than `min_tracks` survivors carry a map point.
+/// Multi-camera rigs extract ORB on every frame regardless.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum KltFirst {
+    /// ORB on every frame.
+    #[default]
+    Disabled,
+    Enabled {
+        min_tracks: usize,
+    },
+}
+
+impl KltFirst {
+    /// The survivor floor, or `None` when disabled.
+    pub fn min_tracks(self) -> Option<usize> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled { min_tracks } => Some(min_tracks),
         }
     }
 }
@@ -266,6 +295,12 @@ impl fmt::Display for SystemConfig {
         writeln!(f, "  frontend: ORB, {} keypoints", frontend.n_keypoints)?;
         if frontend.klt_kernel == LkKernel::FixedPointU8 {
             writeln!(f, "  klt kernel: fixed-point u8")?;
+        }
+        if let Some(min_tracks) = frontend.klt_first.min_tracks() {
+            writeln!(
+                f,
+                "  klt-first: ORB only when a keyframe is due or fewer than {min_tracks} tracks survive"
+            )?;
         }
         if let Some((max_level, max_iter)) = frontend.klt_prediction.search() {
             writeln!(

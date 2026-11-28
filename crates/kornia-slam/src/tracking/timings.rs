@@ -10,6 +10,11 @@ pub struct TrackingTimings {
     pub klt_build: Duration,
     /// Pyramidal LK on the prebuilt pyramids.
     pub klt_track: Duration,
+    /// Fundamental-matrix filter of a flow frame's seeds against the
+    /// reference keyframe.
+    pub consistency_filter: Duration,
+    /// PnP solve of a flow frame.
+    pub pnp: Duration,
 }
 
 /// Runs `f`, adding its wall time to `slot`.
