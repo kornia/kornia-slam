@@ -4,6 +4,8 @@
 mod closer;
 mod episode;
 mod fusion;
+mod graph;
+mod odometry_gate;
 pub mod place_recognition;
 mod pose_graph;
 mod sparse_pgo;
@@ -13,6 +15,11 @@ pub(crate) use closer::{LoopCloser, LoopClosingContext};
 pub use closer::{LoopClosingConfig, LoopClosureEvent};
 pub use episode::{LoopEpisodeConfig, LoopEpisodeDecision, LoopEpisodeTracker};
 pub use fusion::{LoopFusionConfig, LoopFusionStats, fuse_verified_loop};
+use graph::{
+    GateDecision, LoopGate, LoopProposal, OdometryConsistencyGate, TemporalConsistencyGate,
+};
+pub use odometry_gate::{DriftModel, LoopOdometryGate, LoopTemporalConsistency};
+use odometry_gate::{LoopCorrection, TemporalDecision};
 pub use pose_graph::{InertialPgoContext, PgoConfig, PgoError, PgoResult, optimize_pose_graph};
 pub use verification::{
     LoopVerificationConfig, LoopVerificationReject, VerifiedLoopEdge, verify_loop_candidate,
