@@ -3,13 +3,13 @@ use kornia_sensors::SensorRig;
 
 use super::config::{
     CameraSelection, FlowPose, ForwardBackward, FrontendConfig, GyroGuess, KltRetry, KltRig,
-    LoopClosingMode, OrbFrontendConfig, OrbSlamPipeline, PipelineDefinition, SensorSelection,
-    SystemConfig, TrackRefill,
+    LoopClosingExecution, LoopClosingMode, OrbFrontendConfig, OrbSlamPipeline, PipelineDefinition,
+    SensorSelection, SystemConfig, TrackRefill,
 };
 use super::validation::ConfigError;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabulary};
-use crate::loop_closure::{LoopCloser, LoopClosingConfig};
+use crate::loop_closure::{LoopCloser, LoopClosingConfig, LoopSolver};
 use crate::mapping::LocalMappingMode;
 use crate::tracking::flow_pool::FlowPoolError;
 use crate::tracking::optical_flow::LkKernel;
@@ -24,6 +24,8 @@ pub enum BuildError {
     Config(#[from] ConfigError),
     #[error(transparent)]
     Vocabulary(#[from] VocabularyLoadError),
+    #[error("could not start the loop-closing worker: {0}")]
+    LoopWorker(#[from] std::io::Error),
     #[error(transparent)]
     FlowPool(#[from] FlowPoolError),
 }
@@ -189,26 +191,32 @@ impl SystemConfig {
         }
     }
 
-    /// The loop closer, with its vocabulary loaded, when loop closing is
-    /// enabled. With the IMU selected, correction waits for inertial
-    /// initialization.
-    pub(crate) fn loop_closer(
-        &self,
-        rig: &SensorRig,
-    ) -> Result<Option<LoopCloser>, VocabularyLoadError> {
+    /// The loop closer, with its vocabulary loaded and its solver started, when
+    /// loop closing is enabled. With the IMU selected, correction waits for
+    /// inertial initialization.
+    pub(crate) fn loop_closer(&self, rig: &SensorRig) -> Result<Option<LoopCloser>, BuildError> {
         let orb = self.orb();
-        let LoopClosingMode::Enabled { vocabulary, graph } = &orb.loop_closing else {
+        let LoopClosingMode::Enabled {
+            vocabulary,
+            graph,
+            execution,
+        } = &orb.loop_closing
+        else {
             return Ok(None);
+        };
+        let solver = match execution.resolve(orb.mapping.execution) {
+            LoopClosingExecution::AsynchronousReplay { frames } => LoopSolver::replay(frames),
+            LoopClosingExecution::Asynchronous => LoopSolver::asynchronous()?,
+            LoopClosingExecution::Synchronous | LoopClosingExecution::FollowMapping => {
+                LoopSolver::Synchronous
+            }
         };
         let config = LoopClosingConfig {
             graph: *graph,
             ..orb.tuning.loop_correction.clone()
         };
-        Ok(Some(LoopCloser::new(
-            load_vocabulary(vocabulary)?,
-            config,
-            rig.imu.is_some(),
-        )))
+        let closer = LoopCloser::new(load_vocabulary(vocabulary)?, config, rig.imu.is_some());
+        Ok(Some(closer.with_solver(solver)))
     }
 
     fn orb(&self) -> &OrbSlamPipeline {

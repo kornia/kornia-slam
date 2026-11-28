@@ -16,9 +16,9 @@ mod validation;
 pub use build::BuildError;
 pub use config::{
     CameraSelection, FlowPose, ForwardBackward, FrontendConfig, GyroGuess, KltFirst, KltPrediction,
-    KltRetry, KltRig, LoopClosingMode, MAX_FLOW_THREADS, MappingConfig, OrbFrontendConfig,
-    OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection,
-    StereoCloseDepth, SystemConfig, TrackRefill,
+    KltRetry, KltRig, LoopClosingExecution, LoopClosingMode, MAX_FLOW_THREADS, MappingConfig,
+    OrbFrontendConfig, OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION,
+    SensorSelection, StereoCloseDepth, SystemConfig, TrackRefill,
 };
 #[cfg(feature = "serde")]
 pub use file::LoadError;
@@ -55,7 +55,9 @@ use crate::initialization::bootstrap::{
     TooFewStereoPoints, evaluate_bootstrap,
 };
 use crate::initialization::two_view::TwoViewInitConfig;
-use crate::loop_closure::{LoopCloser, LoopClosingContext, LoopClosureEvent};
+use crate::loop_closure::{
+    LoopCloser, LoopClosingContext, LoopClosingOutcome, LoopClosureEvent, LoopTiming,
+};
 use crate::mapping::keyframe_mapping::{self, KeyframeGrowthResult, KeyframeInsertion};
 use crate::mapping::map::{
     InertialAlignmentError, Keyframe, Map, MapInsertion, MapMutationError, MapPoint,
@@ -615,6 +617,7 @@ impl SlamSystem {
             .as_ref()
             .map(|gate| gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
         self.apply_local_mapping_results();
+        self.apply_loop_closing_results();
         self.adopt_landmarks();
         // Fill the per-frame undistortion cache once; tracking, BA gathering,
         // growth, and fuse all read from it. A deferred frame fills it when
@@ -2242,24 +2245,71 @@ impl SlamSystem {
 
     /// Offers a freshly inserted keyframe to loop closing, when enabled, and
     /// applies whatever the closer reports back.
-    fn register_place_recognition(&mut self, kf_idx: usize) {
-        let Some(loop_closer) = self.loop_closer.as_mut() else {
-            return;
-        };
-        let context = LoopClosingContext {
+    fn loop_closing_context(&self) -> LoopClosingContext {
+        LoopClosingContext {
             pose_world_to_cam: self.state.pose_world_to_cam,
             velocity_world: self.state.velocity_world,
             current_keyframe_idx: self.state.current_keyframe_idx,
             imu_initialized: self.state.imu_initialized,
             gravity_world: self.inertial.gravity_world,
+        }
+    }
+
+    fn register_place_recognition(&mut self, kf_idx: usize) {
+        let context = self.loop_closing_context();
+        let Some(loop_closer) = self.loop_closer.as_mut() else {
+            return;
         };
+        let started = Instant::now();
         let outcome = {
             let mut map = self.map.lock().unwrap();
             loop_closer.on_keyframe(&mut map, &self.camera, kf_idx, context)
         };
-        if let Some(message) = outcome.debug_message {
-            self.dbg(message);
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        if let Some(message) = &outcome.debug_message {
+            self.dbg(message.clone());
         }
+        if !outcome.events.is_empty() || outcome.queued {
+            self.dbg(format!(
+                "[loop-time] kf={kf_idx} on_keyframe_ms={elapsed_ms:.1} {}",
+                format_loop_timing(&outcome)
+            ));
+        }
+        self.adopt_loop_outcome(outcome);
+    }
+
+    /// Writes back a background loop solve that has finished, at the frame
+    /// boundary, and submits the loops accepted meanwhile. Runs after local
+    /// mapping's results, under the publication gate.
+    fn apply_loop_closing_results(&mut self) {
+        let context = self.loop_closing_context();
+        let Some(loop_closer) = self
+            .loop_closer
+            .as_mut()
+            .filter(|closer| closer.runs_in_background())
+        else {
+            return;
+        };
+        let outcome = {
+            let mut map = self.map.lock().unwrap();
+            loop_closer.on_frame(&mut map, &self.camera, context)
+        };
+        if let Some(latency) = outcome.written_back {
+            self.dbg(format!(
+                "[loop-apply] frame={} applied={} latency_ms={:.1} {}",
+                self.next_frame_idx.saturating_sub(1),
+                outcome.pgo_applied,
+                latency.as_secs_f64() * 1000.0,
+                format_loop_timing(&outcome)
+            ));
+        }
+        self.adopt_loop_outcome(outcome);
+    }
+
+    /// Takes a loop closer's report into the tracking state: the corrected
+    /// pose and velocity, a fresh start for optical flow and local BA after a
+    /// correction, and the events.
+    fn adopt_loop_outcome(&mut self, outcome: LoopClosingOutcome) {
         for message in outcome.gate_messages {
             self.dbg(message);
         }
@@ -2283,6 +2333,29 @@ impl SlamSystem {
         }
         self.loop_closure_events.extend(outcome.events);
     }
+}
+
+/// The `[loop-time]` and `[loop-apply]` fields of one loop-closure outcome.
+fn format_loop_timing(outcome: &LoopClosingOutcome) -> String {
+    let t: &LoopTiming = &outcome.timing;
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    format!(
+        "graph_edges={} iterations={} capped={} detect_ms={:.1} verify_ms={:.1} solve_ms={:.1} \
+         writeback_ms={:.1} fuse_ms={:.1} fuse_capture_ms={:.1} fuse_plan_ms={:.1} \
+         fusion_ops={} fusion_stale={}",
+        t.graph_edges,
+        t.iterations,
+        outcome.pgo_capped,
+        ms(t.detect),
+        ms(t.verify),
+        ms(t.solve),
+        ms(t.writeback),
+        ms(t.fuse),
+        ms(t.fuse_capture),
+        ms(t.fuse_plan),
+        t.fusion_ops,
+        t.fusion_stale,
+    )
 }
 
 /// Largest distance, in metres, between the motion-model pose and a

@@ -30,6 +30,7 @@ fn loop_closing() -> LoopClosingMode {
     LoopClosingMode::Enabled {
         vocabulary: PathBuf::from("ORBvoc.txt"),
         graph: LoopGraphSettings::default(),
+        execution: LoopClosingExecution::default(),
     }
 }
 
@@ -672,6 +673,7 @@ fn loop_graph_information_is_range_checked() {
             LoopClosingMode::Enabled {
                 vocabulary: PathBuf::from("ORBvoc.txt"),
                 graph: LoopGraphSettings { information },
+                execution: LoopClosingExecution::default(),
             },
             sensors(CameraSelection::Stereo, false),
         )
@@ -714,12 +716,49 @@ fn loop_graph_information_is_range_checked() {
     assert_eq!(drift(|_, values| values[2] = 0.0), at("loop_cauchy_scale"));
 }
 
+/// Loop closing solves inline unless a configuration asks for the worker, whatever the mapping
+/// execution.
+#[test]
+fn default_loop_closing_execution_is_synchronous() {
+    for mapping in [
+        LocalMappingMode::Synchronous,
+        LocalMappingMode::Asynchronous,
+    ] {
+        assert_eq!(
+            LoopClosingExecution::default().resolve(mapping),
+            LoopClosingExecution::Synchronous
+        );
+    }
+}
+
+#[test]
+fn follow_mapping_resolves_to_the_mapping_execution() {
+    use LoopClosingExecution::*;
+    assert_eq!(
+        FollowMapping.resolve(LocalMappingMode::Synchronous),
+        Synchronous
+    );
+    assert_eq!(
+        FollowMapping.resolve(LocalMappingMode::Asynchronous),
+        Asynchronous
+    );
+    assert_eq!(
+        AsynchronousReplay { frames: 2 }.resolve(LocalMappingMode::Asynchronous),
+        AsynchronousReplay { frames: 2 }
+    );
+    assert_eq!(
+        Synchronous.resolve(LocalMappingMode::Asynchronous),
+        Synchronous
+    );
+}
+
 #[test]
 fn vocabulary_path_must_not_be_empty() {
     let config = with_loop_closing(
         LoopClosingMode::Enabled {
             vocabulary: PathBuf::new(),
             graph: LoopGraphSettings::default(),
+            execution: LoopClosingExecution::default(),
         },
         SensorSelection::default(),
     );
@@ -1264,6 +1303,36 @@ mod ron_files {
     }
 
     #[test]
+    fn loop_closing_execution_is_optional_and_parses() {
+        let base = Path::new("/configs");
+        let parse = |execution: &str| SystemConfig::from_ron_str(&with_graph(execution), base);
+        let execution = |config: &SystemConfig| match &orb(config).loop_closing {
+            LoopClosingMode::Enabled { execution, .. } => *execution,
+            LoopClosingMode::Disabled => panic!("loop closing is enabled"),
+        };
+        assert_eq!(
+            execution(&parse("").unwrap()),
+            LoopClosingExecution::Synchronous
+        );
+        assert_eq!(
+            execution(&parse(", execution: FollowMapping").unwrap()),
+            LoopClosingExecution::FollowMapping
+        );
+        assert_eq!(
+            execution(&parse(", execution: AsynchronousReplay(frames: 4)").unwrap()),
+            LoopClosingExecution::AsynchronousReplay { frames: 4 }
+        );
+        assert_eq!(
+            execution(&parse(", execution: Asynchronous").unwrap()),
+            LoopClosingExecution::Asynchronous
+        );
+        assert!(matches!(
+            parse(", execution: Deferred(frames: 4)"),
+            Err(LoadError::Parse(_))
+        ));
+    }
+
+    #[test]
     fn file_paths_resolve_against_the_file_directory() {
         let dir = std::env::temp_dir().join(format!("kornia-slam-system-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1295,6 +1364,7 @@ mod ron_files {
             LoopClosingMode::Enabled {
                 vocabulary: PathBuf::from("/weights/ORBvoc.bin"),
                 graph: LoopGraphSettings::default(),
+                execution: LoopClosingExecution::default(),
             },
             sensors(CameraSelection::Stereo, true),
         );

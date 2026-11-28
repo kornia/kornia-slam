@@ -1,6 +1,7 @@
 use super::*;
 use crate::Frame;
 use crate::features::{Features, RBrief};
+use crate::loop_closure::fusion_plan::{FusionOp, FusionSnapshot, apply_fusion};
 use crate::loop_closure::sparse_pgo::{Se3Manifold, sparse_pose_graph_optimize};
 use crate::mapping::map::{Keyframe, LandmarkSeed, Map, ObservationKey};
 use crate::pose_conversion::pose_to_se3;
@@ -1246,4 +1247,474 @@ fn an_unusable_solve_reports_why() {
     let context = closing_context(&map);
     let inline = closer.on_keyframe(&mut map, &camera(), 10, context);
     assert!(unusable(&inline.events), "{:?}", inline.events);
+}
+
+/// The synchronous closure of the fixture's loop: the map and the tracking correction.
+fn synchronous_closure() -> (Map, (Pose3d, Vec3F64)) {
+    let (mut closer, mut map) = closing_fixture(background_config(), false);
+    let context = closing_context(&map);
+    let outcome = closer.on_keyframe(&mut map, &camera(), 10, context);
+    (map, outcome.tracking_correction.unwrap())
+}
+
+/// Frame boundaries until a background outcome reports events, at most `limit` of them.
+fn frames_until_reported(
+    closer: &mut LoopCloser,
+    map: &mut Map,
+    context: LoopClosingContext,
+    limit: usize,
+) -> (usize, LoopClosingOutcome) {
+    for frame in 1..=limit {
+        let outcome = closer.on_frame(map, &camera(), context);
+        if !outcome.events.is_empty() {
+            return (frame, outcome);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("no background outcome within {limit} frames");
+}
+
+/// Replayed after three frames, the loop is queued at the keyframe and written back at the third
+/// frame boundary, onto an unchanged map exactly as the synchronous path writes it.
+#[test]
+fn replayed_writeback_matches_the_synchronous_closure() {
+    let (expected_map, expected_tracking) = synchronous_closure();
+    let (closer, mut map) = closing_fixture(background_config(), false);
+    let mut closer = closer.with_solver(LoopSolver::replay(3));
+    let context = closing_context(&map);
+
+    let queued = closer.on_keyframe(&mut map, &camera(), 10, context);
+    assert!(queued.queued && queued.events.is_empty() && !queued.pgo_applied);
+    let (frames, outcome) = frames_until_reported(&mut closer, &mut map, context, 10);
+
+    assert_eq!(frames, 3);
+    assert!(matches!(
+        outcome.events.as_slice(),
+        [LoopClosureEvent::Accepted { applied: true, .. }]
+    ));
+    assert_eq!(outcome.tracking_correction, Some(expected_tracking));
+    assert_eq!(
+        map.state_fingerprint_for_test(),
+        expected_map.state_fingerprint_for_test()
+    );
+}
+
+/// On the worker thread the same closure arrives and writes the same map.
+#[test]
+fn asynchronous_writeback_matches_the_synchronous_closure() {
+    let (expected_map, _) = synchronous_closure();
+    let (closer, mut map) = closing_fixture(background_config(), false);
+    let mut closer = closer.with_solver(LoopSolver::asynchronous().unwrap());
+    let context = closing_context(&map);
+
+    assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
+    let (_, outcome) = frames_until_reported(&mut closer, &mut map, context, 30_000);
+
+    assert!(outcome.pgo_applied && outcome.written_back.is_some());
+    assert_eq!(
+        map.state_fingerprint_for_test(),
+        expected_map.state_fingerprint_for_test()
+    );
+}
+
+/// A world change during the solve discards the result and solves again; after three in a row
+/// the loop is reported unapplied and the map keeps its pose.
+#[test]
+fn a_world_change_during_the_solve_discards_and_retries() {
+    let (closer, mut map) = closing_fixture(background_config(), false);
+    let mut closer = closer.with_solver(LoopSolver::replay(1));
+    let context = closing_context(&map);
+    let drifted = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+
+    assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
+    for _ in 0..2 {
+        map.advance_world_epoch_for_test();
+        let outcome = closer.on_frame(&mut map, &camera(), context);
+        assert!(outcome.events.is_empty() && outcome.written_back.is_some());
+    }
+    map.advance_world_epoch_for_test();
+    let outcome = closer.on_frame(&mut map, &camera(), context);
+
+    assert!(matches!(outcome.events.as_slice(), [
+        LoopClosureEvent::PgoFailed { reason, .. },
+        LoopClosureEvent::Accepted { applied: false, .. }
+    ] if reason.contains("changed world")));
+    assert_eq!(
+        map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
+        drifted
+    );
+    assert!(
+        closer
+            .on_frame(&mut map, &camera(), context)
+            .events
+            .is_empty()
+    );
+}
+
+/// One discard is followed by a fresh solve that is applied.
+#[test]
+fn a_discarded_solve_is_resubmitted_and_applied() {
+    let (closer, mut map) = closing_fixture(background_config(), false);
+    let mut closer = closer.with_solver(LoopSolver::replay(1));
+    let context = closing_context(&map);
+
+    closer.on_keyframe(&mut map, &camera(), 10, context);
+    map.advance_world_epoch_for_test();
+    assert!(
+        closer
+            .on_frame(&mut map, &camera(), context)
+            .events
+            .is_empty()
+    );
+    let outcome = closer.on_frame(&mut map, &camera(), context);
+
+    assert!(outcome.pgo_applied);
+    assert!(matches!(
+        outcome.events.as_slice(),
+        [LoopClosureEvent::Accepted { applied: true, .. }]
+    ));
+}
+
+/// A worker that died turns loop correction off with an event; the map is left as it was.
+#[test]
+fn a_stopped_worker_turns_loop_correction_off() {
+    let (closer, mut map) = closing_fixture(background_config(), false);
+    let mut closer = closer.with_solver(LoopSolver::panicking_for_test());
+    let context = closing_context(&map);
+    let drifted = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+
+    assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
+    let (_, outcome) = frames_until_reported(&mut closer, &mut map, context, 30_000);
+
+    assert!(matches!(outcome.events.as_slice(), [
+        LoopClosureEvent::PgoFailed { reason, .. },
+        LoopClosureEvent::Accepted { applied: false, .. }
+    ] if reason.contains("worker stopped")));
+    assert!(!outcome.pgo_applied && outcome.tracking_correction.is_none());
+    assert_eq!(
+        map.get_keyframe(10).unwrap().frame.pose_world_to_cam,
+        drifted
+    );
+}
+
+/// A loop accepted after the worker stopped is reported at once as not applied, and nothing is
+/// queued for a solve that will never run.
+#[test]
+fn a_loop_accepted_after_the_worker_stopped_is_reported_unapplied() {
+    let config = background_config();
+    let (closer, mut map) = closing_fixture(config.clone(), false);
+    let mut closer = closer.with_solver(LoopSolver::panicking_for_test());
+    let context = closing_context(&map);
+    assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
+    frames_until_reported(&mut closer, &mut map, context, 30_000);
+    let edge = verify_loop_candidate(&map, &camera(), 10, 0, &config.verification).unwrap();
+
+    let outcome = closer.handle_accepted_for_test(&mut map, &camera(), edge, context);
+
+    assert!(!outcome.queued);
+    assert!(matches!(
+        outcome.events.as_slice(),
+        [LoopClosureEvent::Accepted { applied: false, .. }]
+    ));
+    assert_eq!(closer.queued_for_test(), 0);
+}
+
+/// The fixture with the query keyframe holding its own drifted duplicates of the first 18
+/// landmarks, so fusing the loop merges them as well as linking the rest.
+fn duplicated_fixture(config: LoopClosingConfig) -> (LoopCloser, Map) {
+    let (closer, mut map) = closing_fixture(config, false);
+    let query = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    let true_query = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.15, -0.05, 0.1));
+    for feature in 0..18 {
+        let landmark = map.get_keyframe(0).unwrap().map_point(feature).unwrap();
+        let point = map.map_points()[landmark].position;
+        map.insert_landmark(LandmarkSeed {
+            position: query.untransform_point(&true_query.transform_point(&point)),
+            color: [0; 3],
+            reference: ObservationKey {
+                keyframe_idx: 10,
+                feature_idx: feature,
+            },
+        })
+        .unwrap();
+    }
+    (closer, map)
+}
+
+fn merged_landmarks(map: &Map) -> usize {
+    map.map_points().iter().filter(|point| point.culled).count()
+}
+
+/// Planned on the worker's snapshot and applied at the writeback, fusion of an unchanged map
+/// links and merges exactly what the synchronous closure's `fuse_verified_loop` does.
+#[test]
+fn planned_fusion_matches_the_synchronous_fusion() {
+    let (mut closer, mut expected) = duplicated_fixture(background_config());
+    let context = closing_context(&expected);
+    assert!(
+        closer
+            .on_keyframe(&mut expected, &camera(), 10, context)
+            .pgo_applied
+    );
+    assert_eq!(merged_landmarks(&expected), 18);
+
+    let (closer, mut map) = duplicated_fixture(background_config());
+    let mut closer = closer.with_solver(LoopSolver::replay(1));
+    assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
+    let outcome = closer.on_frame(&mut map, &camera(), context);
+
+    assert!(outcome.pgo_applied);
+    assert_eq!(outcome.timing.fusion_ops, 36);
+    assert_eq!(outcome.timing.fusion_stale, 0);
+    crate::mapping::map::tests::assert_map_consistent(&map);
+    assert_eq!(
+        map.state_fingerprint_for_test(),
+        expected.state_fingerprint_for_test()
+    );
+}
+
+/// On a rig whose earlier visit sees features 18.. through a second camera, the planned
+/// search skips those sources as the synchronous `fuse_verified_loop` does, so planning on the
+/// snapshot and fusing synchronously leave the same map.
+#[test]
+fn the_planned_search_skips_secondary_camera_sources() {
+    let config = background_config();
+    let rig_map = || {
+        let (_, mut map) = duplicated_fixture(config.clone());
+        let edge = verify_loop_candidate(&map, &camera(), 10, 0, &config.verification).unwrap();
+        let solved = optimize_through_graph(
+            &map,
+            std::slice::from_ref(&edge),
+            &config.optimizer,
+            config.graph.information,
+            None,
+        )
+        .unwrap();
+        map.edit_keyframes_for_test(|_, keyframe| {
+            if keyframe.frame.idx != 10 {
+                let n = keyframe.frame.features.descriptors.len();
+                keyframe.frame.rig.camera_ranges = vec![0..18.min(n), 18.min(n)..n];
+            }
+        });
+        (map, edge, solved)
+    };
+    let correct = |map: &mut Map, solved: &PgoResult| {
+        map.apply_graph_correction(
+            map.world_epoch(),
+            &solved.keyframe_indices,
+            &solved.original_poses,
+            &solved.optimized_poses,
+        )
+        .unwrap();
+    };
+
+    let (mut expected, edge, solved) = rig_map();
+    correct(&mut expected, &solved);
+    fuse_verified_loop(&mut expected, &camera(), &edge, &config.fusion);
+
+    let (mut map, edge, solved) = rig_map();
+    let ops = FusionSnapshot::capture(&map, &camera(), &[edge], &config.fusion).plan(&solved);
+    correct(&mut map, &solved);
+    apply_fusion(&mut map, &camera(), &ops, &config.fusion);
+
+    assert!(!ops.is_empty());
+    assert!(ops.len() < 36, "{} ops", ops.len());
+    crate::mapping::map::tests::assert_map_consistent(&map);
+    assert_eq!(
+        map.state_fingerprint_for_test(),
+        expected.state_fingerprint_for_test()
+    );
+}
+
+/// The planned operations, and the map with the solve written back but not yet fused.
+fn planned_fusion() -> (Map, Vec<FusionOp>, LoopFusionConfig) {
+    let config = background_config();
+    let (_, mut map) = duplicated_fixture(config.clone());
+    let edge = verify_loop_candidate(&map, &camera(), 10, 0, &config.verification).unwrap();
+    let solved = optimize_through_graph(
+        &map,
+        std::slice::from_ref(&edge),
+        &config.optimizer,
+        config.graph.information,
+        None,
+    )
+    .unwrap();
+    let ops = FusionSnapshot::capture(&map, &camera(), &[edge], &config.fusion).plan(&solved);
+    map.apply_graph_correction(
+        map.world_epoch(),
+        &solved.keyframe_indices,
+        &solved.original_poses,
+        &solved.optimized_poses,
+    )
+    .unwrap();
+    (map, ops, config.fusion)
+}
+
+/// A landmark culled meanwhile, or a slot that changed hands, leaves its operation stale and
+/// skipped; the others still apply and the map stays consistent.
+#[test]
+fn stale_fusion_operations_are_skipped() {
+    let (mut map, ops, config) = planned_fusion();
+    let link = ops
+        .iter()
+        .find_map(|op| match *op {
+            FusionOp::Link { landmark, .. } => Some(landmark),
+            FusionOp::Merge { .. } => None,
+        })
+        .unwrap();
+    let (keyframe, feature) = ops
+        .iter()
+        .find_map(|op| match *op {
+            FusionOp::Merge {
+                target_keyframe,
+                target_feature,
+                ..
+            } => Some((target_keyframe, target_feature)),
+            FusionOp::Link { .. } => None,
+        })
+        .unwrap();
+    map.remove_landmark(link).unwrap();
+    map.unlink_observation(keyframe, feature).unwrap();
+
+    let applied = apply_fusion(&mut map, &camera(), &ops, &config);
+
+    assert_eq!(applied.stale, 2);
+    assert_eq!(applied.linked + applied.merged, ops.len() - 2);
+    crate::mapping::map::tests::assert_map_consistent(&map);
+}
+
+/// A keyframe bundle adjustment moved away after the snapshot no longer puts the planned
+/// landmarks on its features, so nothing is fused into it.
+#[test]
+fn fusion_into_a_keyframe_that_moved_is_skipped() {
+    let (mut map, ops, config) = planned_fusion();
+    let mut moved = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    moved.translation.x += 0.3;
+    map.set_keyframe_pose_for_test(10, moved);
+
+    let applied = apply_fusion(&mut map, &camera(), &ops, &config);
+
+    assert_eq!((applied.linked, applied.merged), (0, 0));
+    assert_eq!(applied.stale, ops.len());
+}
+
+/// After an earlier loop's fusion the camera's local map is mostly landmarks of the earlier
+/// visit. A later solve moves the reference keyframe but not them, so tracking stays on them;
+/// the tracking correction must follow them too, not the reference keyframe, or the tracked
+/// pose jumps by the reference's correction.
+#[test]
+fn a_background_correction_follows_the_landmarks_the_camera_sees() {
+    let (closer, mut map) = closing_fixture(background_config(), false);
+    let mut closer = closer.with_solver(LoopSolver::replay(1));
+    let context = closing_context(&map);
+    let reference_before = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    assert!(closer.on_keyframe(&mut map, &camera(), 10, context).queued);
+    // Meanwhile local mapping fuses the query keyframe onto the earlier visit's landmarks.
+    for feature in 0..36 {
+        let landmark = map.get_keyframe(0).unwrap().map_point(feature).unwrap();
+        map.link_observation(10, feature, landmark).unwrap();
+    }
+
+    let outcome = closer.on_frame(&mut map, &camera(), context);
+
+    assert!(outcome.pgo_applied);
+    let reference_after = map.get_keyframe(10).unwrap().frame.pose_world_to_cam;
+    let reference_moved =
+        (reference_after.inverse().translation - reference_before.inverse().translation).length();
+    assert!(reference_moved > 0.3, "reference moved {reference_moved} m");
+    let (tracked, _) = outcome.tracking_correction.unwrap();
+    let camera_moved =
+        (tracked.inverse().translation - context.pose_world_to_cam.inverse().translation).length();
+    assert!(camera_moved < 1e-6, "camera moved {camera_moved} m");
+}
+
+/// The planned fusion is generic over the descriptor: on a float descriptor with no orientations
+/// it links the one landmark within `max_distance`, and the writeback applies it.
+#[test]
+fn fusion_plan_runs_on_a_scalar_descriptor_map() {
+    use crate::features::{ScalePyramid, scalar::Scalar};
+
+    let frame = |idx: usize, descriptors: Vec<Scalar>| {
+        let n = descriptors.len();
+        Frame {
+            idx,
+            features: Features {
+                keypoints_xy: vec![[320.0, 240.0]; n],
+                orientations: None,
+                descriptors,
+                octaves: vec![0; n],
+            },
+            pose_world_to_cam: Pose3d::IDENTITY,
+            image_size: ImageSize {
+                width: 640,
+                height: 480,
+            },
+            keypoint_colors: vec![[0; 3]; n],
+            u_right: Vec::new(),
+            depth: Vec::new(),
+            keypoints_undist: Vec::new(),
+            rig: Default::default(),
+        }
+    };
+    let mut map = Map::with_scale_pyramid(ScalePyramid {
+        factor: 1.0,
+        n_levels: 1,
+    });
+    map.insert_keyframe(Keyframe::from_frame(frame(
+        10,
+        vec![Scalar(0.9), Scalar(0.1), Scalar(9.0)],
+    )))
+    .unwrap();
+    map.insert_keyframe(Keyframe::from_frame(frame(20, vec![Scalar(0.0)])))
+        .unwrap();
+    let landmarks: Vec<usize> = (0..3)
+        .map(|feature_idx| {
+            map.insert_landmark(LandmarkSeed {
+                position: Vec3F64::new(0.0, 0.0, 5.0),
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 10,
+                    feature_idx,
+                },
+            })
+            .unwrap()
+        })
+        .collect();
+    let config = LoopFusionConfig {
+        min_covisibility_weight: 15,
+        max_neighbors_per_side: 5,
+        search_radius_px: 7.0,
+        max_distance: 0.5,
+        max_reprojection_error_px: 3.0,
+    };
+    let edge = VerifiedLoopEdge {
+        candidate_to_query: Pose3d::IDENTITY,
+        ..verified_edge(20, 10, 40, 0.875, 1.0, 8)
+    };
+    let unmoved = PgoResult {
+        keyframe_indices: vec![10, 20],
+        original_poses: vec![Pose3d::IDENTITY; 2],
+        optimized_poses: vec![Pose3d::IDENTITY; 2],
+        iterations: 1,
+        usable: true,
+        unusable_reason: None,
+        capped: false,
+    };
+
+    let ops = FusionSnapshot::capture(&map, &camera(), &[edge], &config).plan(&unmoved);
+    let applied = apply_fusion(&mut map, &camera(), &ops, &config);
+
+    assert_eq!(
+        ops,
+        vec![FusionOp::Link {
+            keyframe: 20,
+            feature: 0,
+            landmark: landmarks[1],
+        }]
+    );
+    assert_eq!((applied.linked, applied.stale), (1, 0));
+    assert_eq!(
+        map.get_keyframe(20).unwrap().map_point(0),
+        Some(landmarks[1])
+    );
 }

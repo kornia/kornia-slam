@@ -69,7 +69,7 @@ pub fn fuse_verified_loop<D: Descriptor>(
     stats
 }
 
-fn loop_side_keyframes<D: Descriptor, T>(
+pub(super) fn loop_side_keyframes<D: Descriptor, T>(
     map: &Map<D>,
     anchor: usize,
     config: &LoopFusionConfig<T>,

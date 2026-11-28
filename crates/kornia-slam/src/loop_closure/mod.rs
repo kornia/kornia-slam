@@ -4,14 +4,16 @@
 mod closer;
 mod episode;
 mod fusion;
+mod fusion_plan;
 mod graph;
 mod odometry_gate;
 pub mod place_recognition;
 mod pose_graph;
 mod sparse_pgo;
 mod verification;
+mod worker;
 
-pub(crate) use closer::{LoopCloser, LoopClosingContext};
+pub(crate) use closer::{LoopCloser, LoopClosingContext, LoopClosingOutcome, LoopTiming};
 pub use closer::{
     LoopClosingConfig, LoopClosureEvent, LoopGraphInformation, LoopGraphSettings,
     OdometryRandomWalk,
@@ -28,6 +30,7 @@ pub use pose_graph::{InertialPgoContext, PgoConfig, PgoError, PgoResult, optimiz
 pub use verification::{
     LoopVerificationConfig, LoopVerificationReject, VerifiedLoopEdge, verify_loop_candidate,
 };
+pub(crate) use worker::LoopSolver;
 
 #[cfg(test)]
 use closer::{keyframe_poses, solve_in_graph};

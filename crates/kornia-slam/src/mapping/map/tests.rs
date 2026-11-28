@@ -8,6 +8,12 @@ use super::{Keyframe, Map};
 /// holds which landmark goes through the canonical operations, including in
 /// fixtures.
 impl Map {
+    /// Moves the map to a new world frame without touching its contents, as a reset or an
+    /// alignment would.
+    pub(crate) fn advance_world_epoch_for_test(&mut self) {
+        self.world_epoch = self.world_epoch.wrapping_add(1);
+    }
+
     /// Sets a landmark's per-frame tracking statistics directly, instead of
     /// replaying the frames that would produce them.
     pub(crate) fn set_tracking_stats_for_test(&mut self, mp_idx: usize, visible: u32, found: u32) {

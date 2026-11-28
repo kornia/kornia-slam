@@ -356,7 +356,42 @@ pub enum LoopClosingMode {
         /// The pose graph accepted loops solve; the default is the `w * I` solve.
         #[cfg_attr(feature = "serde", serde(default))]
         graph: LoopGraphSettings,
+        #[cfg_attr(feature = "serde", serde(default))]
+        execution: LoopClosingExecution,
     },
+}
+
+/// Where an accepted loop's pose-graph solve runs and when it is written back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum LoopClosingExecution {
+    /// `Synchronous` with synchronous local mapping, else `Asynchronous`.
+    FollowMapping,
+    /// Solved and written back inside the keyframe that accepted the loop. The default: the
+    /// background modes are opt-in.
+    #[default]
+    Synchronous,
+    /// Solved inline, written back through the asynchronous path `frames` frames later (at
+    /// least one): reproducible runs of the background path. It differs from `Synchronous` in
+    /// three ways: the camera follows the correction most of its local landmarks take, not its
+    /// reference keyframe's; fusion is planned on the copy of the loop neighbourhoods taken at
+    /// submit and each operation is checked against the live map at writeback; and keyframes
+    /// created during the solve are not fused.
+    AsynchronousReplay { frames: usize },
+    /// Solved on a background thread and written back at the first frame
+    /// boundary after it ends.
+    Asynchronous,
+}
+
+impl LoopClosingExecution {
+    /// The execution `FollowMapping` stands for under `mapping`.
+    pub fn resolve(self, mapping: LocalMappingMode) -> Self {
+        match (self, mapping) {
+            (Self::FollowMapping, LocalMappingMode::Synchronous) => Self::Synchronous,
+            (Self::FollowMapping, LocalMappingMode::Asynchronous) => Self::Asynchronous,
+            (execution, _) => execution,
+        }
+    }
 }
 
 impl LoopClosingMode {
@@ -476,16 +511,29 @@ impl fmt::Display for SystemConfig {
             LocalMappingMode::Asynchronous => "asynchronous",
         };
         writeln!(f, "  local mapping: {execution}")?;
-        if let LoopClosingMode::Enabled { vocabulary, graph } = &orb.loop_closing {
+        if let LoopClosingMode::Enabled {
+            vocabulary,
+            graph,
+            execution,
+        } = &orb.loop_closing
+        {
             let information = match graph.information {
                 LoopGraphInformation::ScalarWeights => "w*I",
                 LoopGraphInformation::Drift { .. } => "drift",
             };
-            writeln!(
+            write!(
                 f,
                 "  loop closing: {} (pose graph: {information})",
                 vocabulary.display()
             )?;
+            match execution {
+                LoopClosingExecution::FollowMapping => writeln!(f, ", following mapping")?,
+                LoopClosingExecution::Synchronous => writeln!(f)?,
+                LoopClosingExecution::AsynchronousReplay { frames } => {
+                    writeln!(f, ", asynchronous replay after {frames} frames")?
+                }
+                LoopClosingExecution::Asynchronous => writeln!(f, ", asynchronous")?,
+            }
         }
         Ok(())
     }
