@@ -18,7 +18,7 @@ use config::RunConfig;
 use evaluation::associate_gt;
 use kornia_algebra::Vec3F64;
 use kornia_sensors::rig_calibration::RigCalibration;
-use kornia_slam::system::PipelineDefinition;
+use kornia_slam::system::{FrontendConfig, PipelineDefinition};
 use kornia_slam::{LoopClosureEvent, SlamSystem};
 use source::{FrameItem, OpenedSource};
 use std::time::{Duration, Instant};
@@ -106,6 +106,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .loop_closing
         .vocabulary()
         .map(std::path::Path::to_path_buf);
+    let FrontendConfig::Orb(frontend) = orb.frontend;
+    let klt_first = frontend.klt_first.min_tracks().is_some();
     let mut system = SlamSystem::build(run.system, rig).map_err(|e| e.to_string())?;
     system.set_debug(args.debug);
     let camera = system.rig().primary().pinhole();
@@ -303,6 +305,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
     );
+    // Only with klt_first, so default runs print what they printed before.
+    if klt_first {
+        eprintln!("{}", flow_summary(&system.flow_counters()));
+    }
     if args.evaluate {
         evaluation::report(
             &est_positions,
@@ -311,6 +317,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     Ok(())
+}
+
+/// The `[summary] flow` line of a `klt_first` run.
+fn flow_summary(c: &kornia_slam::system::FlowCounters) -> String {
+    format!(
+        "[summary] flow flow_frames={} flow_keyframe_due={} flow_refused={} flow_unavailable={} \
+         flow_due_orb_rejected={} flow_seeds={} flow_inliers={} klt_errors={} snap_errors={}",
+        c.flow_frames,
+        c.flow_keyframe_due,
+        c.flow_refused,
+        c.flow_unavailable,
+        c.flow_due_orb_rejected,
+        c.flow_seeds,
+        c.flow_inliers,
+        c.klt_errors,
+        c.snap_errors,
+    )
 }
 
 #[cfg(test)]
