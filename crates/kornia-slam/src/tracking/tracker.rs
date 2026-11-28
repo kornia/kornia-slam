@@ -13,19 +13,19 @@ use kornia_image::Image;
 use crate::Frame;
 use crate::mapping::Map;
 use crate::tracking::optical_flow::{
-    KltTracker, MapKeypointMatch, TrackSet, carry_klt_survivors, snap_unique,
+    FlowSurvivor, KltPyramidCache, KltTracker, MapKeypointMatch, TrackSet, carry_klt_survivors,
+    snap_unique,
 };
 use crate::tracking::pose_estimation::map_projection::{
     MapProjectionConfig, MapProjectionRejectReason,
 };
 use crate::tracking::pose_estimation::{Estimate, MapProjectionEstimator};
 use crate::tracking::relocalization::{Relocalization, RelocalizationConfig, relocalize};
+use crate::tracking::timings::TrackingTimings;
 
 /// Everything the tracker needs about the current frame that it does not own.
 pub(crate) struct FrameInput<'a> {
     pub frame: &'a Frame,
-    pub previous_image: Option<&'a Image<u8, 1>>,
-    pub current_image: &'a Image<u8, 1>,
     /// Pose predicted by the motion model, used to seed the projection search.
     pub candidate_pose: Pose3d,
     /// Pose at the end of the previous frame.
@@ -41,6 +41,7 @@ pub(crate) struct FrameInput<'a> {
 pub(crate) struct Tracker {
     estimator: MapProjectionEstimator,
     klt_tracker: KltTracker,
+    klt_cache: KltPyramidCache,
     track_set: TrackSet,
 }
 
@@ -49,6 +50,7 @@ impl Tracker {
         Self {
             estimator: MapProjectionEstimator::new(config),
             klt_tracker: KltTracker::default(),
+            klt_cache: KltPyramidCache::new(),
             track_set: TrackSet::new(),
         }
     }
@@ -85,8 +87,30 @@ impl Tracker {
         self.track_set = TrackSet::new();
     }
 
+    /// Follows the tracks from `previous` into `current` by optical flow;
+    /// `None` without tracks, a previous image, or a flow solution.
+    pub(crate) fn flow(
+        &mut self,
+        previous: Option<&Image<u8, 1>>,
+        current: &Image<u8, 1>,
+        timings: &mut TrackingTimings,
+    ) -> Option<Vec<FlowSurvivor>> {
+        if self.track_set.is_empty() {
+            return None;
+        }
+        self.klt_tracker
+            .track_cached(
+                &mut self.klt_cache,
+                self.track_set.tracks(),
+                previous?,
+                current,
+                timings,
+            )
+            .ok()
+    }
+
     /// Estimates this frame's pose against the map, seeding the projection
-    /// search from optical flow where tracks survived.
+    /// search from the flow `klt_survivors` of [`Self::flow`].
     ///
     /// The track set is left consistent either way: reconciled against the
     /// accepted matches on success, advanced onto the flow survivors on
@@ -94,6 +118,7 @@ impl Tracker {
     pub(crate) fn estimate(
         &mut self,
         input: FrameInput<'_>,
+        klt_survivors: Option<Vec<FlowSurvivor>>,
         map: &Map,
         camera: &PinholeCamera,
     ) -> Result<Estimate, MapProjectionRejectReason> {
@@ -101,16 +126,6 @@ impl Tracker {
             .estimator
             .config()
             .search_scale_for(input.lost_for_sec, input.trusted_prediction);
-
-        let klt_survivors = if self.track_set.is_empty() {
-            None
-        } else {
-            input.previous_image.and_then(|previous_image| {
-                self.klt_tracker
-                    .track(self.track_set.tracks(), previous_image, input.current_image)
-                    .ok()
-            })
-        };
         // Optical flow follows the primary camera only; its keypoints come first.
         let primary_keypoints = &input.frame.features.keypoints_xy[input.frame.camera_range(0)];
         let pre_seeded = klt_survivors

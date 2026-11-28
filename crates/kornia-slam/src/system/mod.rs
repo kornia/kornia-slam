@@ -33,6 +33,7 @@ use crate::tracking::{
 
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 use crate::tracking::motion::{InertialPrediction, predict_pose};
+use crate::tracking::timings::TrackingTimings;
 use crate::tracking::tracker::{FrameInput, Tracker};
 
 use std::sync::{Arc, Mutex};
@@ -92,6 +93,7 @@ pub struct SlamSystem {
     // The last processed image, for optical-flow tracks into the next frame.
     previous_image: Option<Image<u8, 1>>,
     tracking_duration: Duration,
+    tracking_timings: TrackingTimings,
     // Number given to the next frame; it becomes the keyframe's id in the map.
     next_frame_idx: usize,
 }
@@ -147,6 +149,7 @@ impl SlamSystem {
             frontend,
             previous_image: None,
             tracking_duration: Duration::ZERO,
+            tracking_timings: TrackingTimings::default(),
             next_frame_idx: 0,
         }
     }
@@ -260,6 +263,7 @@ impl SlamSystem {
         self.report_stereo(&frame);
         // Taken out for the call so tracking can borrow it alongside `self`.
         let previous_image = self.previous_image.take();
+        self.tracking_timings = TrackingTimings::default();
         let tracking_start = Instant::now();
         let result = self.process_prepared(frame, previous_image.as_ref(), image, timestamp_sec);
         self.tracking_duration = tracking_start.elapsed();
@@ -271,6 +275,12 @@ impl SlamSystem {
     /// mapping, excluding feature extraction (see [`Self::frontend_observation`]).
     pub fn tracking_duration(&self) -> Duration {
         self.tracking_duration
+    }
+
+    /// Per-stage times of the latest successfully processed frame's
+    /// tracking; zero for stages it did not run (all of them in bootstrap).
+    pub fn tracking_timings(&self) -> &TrackingTimings {
+        &self.tracking_timings
     }
 
     /// The frontend output of the latest successfully processed frame.
@@ -875,19 +885,21 @@ impl SlamSystem {
             .state
             .lost_since_sec
             .map_or(0.0, |t0| timestamp_sec - t0);
+        let survivors =
+            self.tracker
+                .flow(previous_image, current_image, &mut self.tracking_timings);
         let result = {
             let map = self.map.lock().unwrap();
             self.tracker.estimate(
                 FrameInput {
                     frame: &frame,
-                    previous_image,
-                    current_image,
                     candidate_pose,
                     pose_before,
                     current_keyframe_idx: self.state.current_keyframe_idx,
                     lost_for_sec: currently_lost_for,
                     trusted_prediction: self.imu_confident(timestamp_sec),
                 },
+                survivors,
                 &map,
                 &self.camera,
             )
