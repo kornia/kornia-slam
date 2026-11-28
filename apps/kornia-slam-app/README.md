@@ -18,7 +18,7 @@ A run is described by one RON file passed with `--config`: the `source` to read 
 cargo run --release -p kornia-slam-app -- --config run.ron
 ```
 
-- **`source`** is one of `Euroc`, `Hilti`, `TumVi`, `Mcap`, `Oakd` or `Uvc`, with the dataset path or device settings, frame range (`start_frame`, `max_frames`; 0 = all) and, where needed, a calibration file. Each source's options are documented in its module under [`src/source/`](src/source).
+- **`source`** is one of `Euroc`, `Hilti`, `Lamaria`, `TumVi`, `Mcap`, `Oakd` or `Uvc`, with the dataset path or device settings, frame range (`start_frame`, `max_frames`; 0 = all) and, where needed, a calibration file. Each source's options are documented in its module under [`src/source/`](src/source).
 - **`system`** selects the sensors, ORB settings, keyframe policy, local-mapping execution and loop closing. Omitted, the default monocular pipeline runs. Lower-level algorithm thresholds are not part of the file; library users set them in Rust.
 - `system.version` is required; other omitted fields keep their defaults. Unknown fields and invalid values are rejected before any data is read, and selecting a sensor the source cannot provide fails with an explicit error.
 - Relative paths (datasets, recordings, calibration, vocabulary) resolve against the run file's directory.
@@ -30,6 +30,9 @@ cargo run --release -p kornia-slam-app -- --config run.ron
 | --- | --- |
 | `euroc.ron` | EuRoC, monocular; lists every system setting with its default |
 | `euroc-stereo-imu-loop.ron` | EuRoC, stereo + IMU with loop closing |
+| `euroc-rig-imu-loop.ron` | EuRoC raw cam0 + cam1 as a two-camera rig, IMU, loop closing |
+| `lamaria-mono-imu.ron` | LaMAria pinhole export, left SLAM camera + IMU |
+| `lamaria-rig-imu.ron` | LaMAria pinhole export, both SLAM cameras as a rig + IMU |
 | `hilti.ron` | Hilti fisheye sequence, 3000 keypoints |
 | `tumvi-imu.ron` | TUM-VI fisheye sequence with the IMU |
 | `mcap-stereo.ron` | MCAP recording, rectified stereo |
@@ -38,14 +41,17 @@ cargo run --release -p kornia-slam-app -- --config run.ron
 
 Sensors each source can provide:
 
-| Source | Stereo | IMU |
-| --- | --- | --- |
-| `Euroc` | yes | yes |
-| `Mcap` | yes, with `calib` | no |
-| `Oakd` | yes, with `calib` | no |
-| `Hilti` | no | with `rotate_180: false` |
-| `TumVi` | no | yes |
-| `Uvc` | no | no |
+| Source | Stereo | Rig | IMU |
+| --- | --- | --- | --- |
+| `Euroc` | yes | yes (raw cam0 + cam1) | yes |
+| `Lamaria` | no | yes (both SLAM cameras) | yes |
+| `Mcap` | yes, with `calib` | no | no |
+| `Oakd` | yes, with `calib` | no | no |
+| `Hilti` | no | no | with `rotate_180: false` |
+| `TumVi` | no | no | yes |
+| `Uvc` | no | no | no |
+
+`cameras: Rig` tracks every camera of the source with its own model and extrinsic, without rectification (ORB-SLAM3's non-rectified stereo).
 
 `Oakd` requires `--features oakd` and `Uvc` requires `--features uvc`; a run file naming them in a build without the feature fails with a message saying which. The default build needs no extra system dependencies.
 

@@ -400,6 +400,70 @@ mod runtime_settings {
         assert_eq!(settings.stereo_baseline_m, None);
         assert_eq!(settings.stereo_close_depth_m, None);
     }
+
+    #[test]
+    fn a_rig_may_hold_raw_fisheye_cameras() {
+        let fisheye = kornia_3d::camera::Fisheye624Camera {
+            f: 240.0,
+            cx: 320.0,
+            cy: 240.0,
+            k: [-0.025, 0.096, -0.063, 0.0062, 0.0035, -0.00073],
+            p: [0.0009, 0.00036],
+            s: [-0.0014, -0.0001, -0.00046, -0.0001],
+        };
+        let rig = SensorRig::from_cameras(vec![
+            kornia_sensors::RigCamera::primary(fisheye, SIZE),
+            kornia_sensors::RigCamera::new(
+                fisheye,
+                SIZE,
+                Pose3d::new(
+                    kornia_algebra::Mat3F64::IDENTITY,
+                    kornia_algebra::Vec3F64::new(0.1, 0.0, 0.0),
+                ),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            sensors(CameraSelection::Rig, false).validate_rig(&rig),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn only_the_rig_selection_keeps_the_rig_cameras() {
+        let two_cameras = SensorRig::from_cameras(vec![
+            kornia_sensors::RigCamera::primary(camera(), SIZE),
+            kornia_sensors::RigCamera::new(
+                camera(),
+                SIZE,
+                Pose3d::new(
+                    crate::rig::tests::yaw(30.0),
+                    kornia_algebra::Vec3F64::new(0.1, 0.0, 0.0),
+                ),
+            ),
+        ])
+        .unwrap();
+        let selected = sensors(CameraSelection::Rig, false)
+            .select_rig(two_cameras.clone())
+            .unwrap();
+        assert_eq!(selected.cameras().len(), 2);
+        let config = SystemConfig {
+            sensors: sensors(CameraSelection::Rig, false),
+            ..SystemConfig::default()
+        };
+        let settings = config.settings(&selected);
+        assert!(settings.multi_camera);
+        assert_eq!(settings.stereo_baseline_m, None);
+        let mono = sensors(CameraSelection::Mono, false)
+            .select_rig(two_cameras)
+            .unwrap();
+        assert_eq!(mono.cameras().len(), 1);
+        assert!(!SystemConfig::default().settings(&mono).multi_camera);
+        assert!(matches!(
+            sensors(CameraSelection::Rig, false).select_rig(rig()),
+            Err(ConfigError::MissingSensor(_))
+        ));
+    }
 }
 
 #[cfg(feature = "serde")]

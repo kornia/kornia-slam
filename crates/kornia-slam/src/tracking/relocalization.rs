@@ -112,9 +112,11 @@ fn keyframe_correspondences<D: Descriptor>(
     map: &Map<D>,
     config: &RelocalizationConfig<D>,
 ) -> Vec<(usize, usize)> {
+    // RANSAC PnP below models the primary camera only, so only its features
+    // compete for a match.
     D::match_sets(
         keyframe.frame.features.descriptor_set(),
-        frame.features.descriptor_set(),
+        frame.primary_descriptor_set(),
         &config.match_config,
     )
     .into_iter()
@@ -256,6 +258,7 @@ mod tests {
             u_right: Vec::new(),
             depth: Vec::new(),
             keypoints_undist: pixels,
+            rig: Default::default(),
         }
     }
 
@@ -325,6 +328,35 @@ mod tests {
         .length();
         assert!(rotation_error < 1e-3, "rotation error {rotation_error}");
         assert!((found.estimate.pose.translation - truth.translation).length() < 1e-2);
+    }
+
+    /// A secondary rig camera's exact descriptor copy must not take the match
+    /// from the primary feature the single-camera PnP can use.
+    #[test]
+    fn secondary_rig_features_do_not_take_primary_matches() {
+        let map = mapped_keyframe();
+        let truth = query_pose();
+        let near = |index: usize| {
+            let mut d = descriptor(index);
+            d[0] ^= 0b1111;
+            d
+        };
+        let mut query = frame(50, truth, (0..LANDMARKS).map(near).collect());
+        let features = &mut query.features;
+        features.keypoints_xy.extend_from_within(..);
+        query.keypoints_undist.extend_from_within(..);
+        if let Some(orientations) = features.orientations.as_mut() {
+            orientations.extend_from_within(..);
+        }
+        features.octaves.extend_from_within(..);
+        features
+            .descriptors
+            .extend((0..LANDMARKS).map(|i| RBrief(descriptor(i))));
+        query.rig.camera_ranges = vec![0..LANDMARKS, LANDMARKS..2 * LANDMARKS];
+
+        let found = relocalize_query(&query, &map, &[0], |_| true)
+            .expect("the primary features still match the keyframe");
+        assert!(found.estimate.inliers >= 50);
     }
 
     #[test]

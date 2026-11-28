@@ -105,6 +105,9 @@ fn fuse_loop_direction<D: Descriptor>(
             let Some(map_point_idx) = map_point_idx else {
                 continue;
             };
+            if source.frame.camera_of(source_desc_idx) != 0 {
+                continue;
+            }
             if seen_points.insert(map_point_idx) {
                 source_points.push((map_point_idx, source_kf_idx, source_desc_idx));
             }
@@ -143,7 +146,11 @@ fn fuse_loop_direction<D: Descriptor>(
                 let projected_x = projected.x as f32;
                 let projected_y = projected.y as f32;
                 let mut best: Option<(usize, D::Distance, f32)> = None;
+                // Projected with the primary camera, so only its features match.
                 for target_desc_idx in 0..target.frame.features.descriptors.len() {
+                    if target.frame.camera_of(target_desc_idx) != 0 {
+                        continue;
+                    }
                     let Some(keypoint) = target.frame.undistorted_xy(target_desc_idx, camera)
                     else {
                         continue;

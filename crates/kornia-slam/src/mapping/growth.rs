@@ -10,12 +10,14 @@
 use crate::features::{Descriptor, DescriptorSet, Features};
 use crate::frame::{Frame, undistorted_camera};
 use crate::mapping::map::{
-    LandmarkSeed, LandmarkTarget, Map, MapInsertion, ObservationKey, ObservationLink,
+    Keyframe, LandmarkSeed, LandmarkTarget, Map, MapInsertion, ObservationKey, ObservationLink,
 };
+use crate::rig::project_in_view;
 use crate::stereo::unproject_stereo;
-use kornia_3d::camera::PinholeCamera;
+use kornia_3d::camera::{Camera, PinholeCamera};
 use kornia_3d::pose::{Pose3d, TriangulationConfig, triangulate_matched_points};
 use kornia_algebra::{Mat3F64, SO3F64, Vec2F64, Vec3F64};
+use kornia_image::ImageSize;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
@@ -67,12 +69,64 @@ pub fn stereo_seeds<D>(
     seeds
 }
 
+/// Seeds and second observations for a rig frame's overlap-triangulated
+/// points nearer than `max_depth` (metres, primary camera), whose primary and
+/// camera-1 features are both unclaimed: each landmark is referenced to its
+/// primary feature and also observed by the camera-1 match (ORB-SLAM3's
+/// `StereoInitialization` and `CreateNewKeyFrame` for non-rectified stereo).
+/// Link targets index the returned seeds.
+pub fn rig_seeds<D>(
+    frame: &Frame<D>,
+    max_depth: f64,
+    claimed: &[Option<usize>],
+) -> (Vec<LandmarkSeed>, Vec<ObservationLink>) {
+    let pose_inv = frame.pose_world_to_cam.inverse();
+    let is_claimed = |i: usize| claimed.get(i).copied().flatten().is_some();
+    let mut seeds = Vec::new();
+    let mut links = Vec::new();
+    for (i, (point, right)) in frame
+        .rig
+        .stereo_points
+        .iter()
+        .zip(&frame.rig.left_to_right)
+        .enumerate()
+    {
+        let (Some(point), Some(right)) = (point, right) else {
+            continue;
+        };
+        let finite = point.x.is_finite() && point.y.is_finite() && point.z.is_finite();
+        if !finite || point.z > max_depth || is_claimed(i) || is_claimed(*right) {
+            continue;
+        }
+        links.push(ObservationLink {
+            observation: ObservationKey {
+                keyframe_idx: frame.idx,
+                feature_idx: *right,
+            },
+            landmark: LandmarkTarget::New(seeds.len()),
+        });
+        seeds.push(LandmarkSeed {
+            position: pose_inv.transform_point(point),
+            color: frame.keypoint_colors.get(i).copied().unwrap_or([128; 3]),
+            reference: ObservationKey {
+                keyframe_idx: frame.idx,
+                feature_idx: i,
+            },
+        });
+    }
+    (seeds, links)
+}
+
 /// Triangulates unassociated features shared by two stored keyframes.
 ///
 /// Both keyframes must already be in the map. Each new landmark is referenced
 /// to its `curr_kf_idx` feature and carries an explicit second observation on
 /// `prev_kf_idx` — without that second observer the point would bias its own
 /// scale and normal geometry and the cull would be over-aggressive.
+///
+/// A rig keyframe pair grows in each camera separately: camera `c`'s features
+/// of both keyframes, triangulated from camera `c`'s poses, so a landmark
+/// may be seen by a secondary camera only.
 pub fn pair_growth_request<D: Descriptor>(
     map: &Map<D>,
     prev_kf_idx: usize,
@@ -84,15 +138,92 @@ pub fn pair_growth_request<D: Descriptor>(
     let prev_kf = map.get_keyframe(prev_kf_idx)?;
     let curr_kf = map.get_keyframe(curr_kf_idx)?;
     let scale_factor = map.scale_pyramid().factor;
+    let geometry = curr_kf
+        .frame
+        .rig
+        .geometry
+        .as_ref()
+        .filter(|_| curr_kf.frame.is_rig() && prev_kf.frame.is_rig());
+    let Some(geometry) = geometry else {
+        return pair_growth_in_camera(
+            (prev_kf, curr_kf),
+            0,
+            camera,
+            (
+                &prev_kf.frame.pose_world_to_cam,
+                &curr_kf.frame.pose_world_to_cam,
+            ),
+            match_config,
+            triangulation_config,
+            scale_factor,
+        );
+    };
+    let mut merged = MapInsertion::default();
+    for (c, view) in geometry.views().enumerate() {
+        let (view_camera, prev_pose, curr_pose) = if c == 0 {
+            (
+                camera,
+                prev_kf.frame.pose_world_to_cam,
+                curr_kf.frame.pose_world_to_cam,
+            )
+        } else {
+            (
+                view.pinhole,
+                view.pose(&prev_kf.frame.pose_world_to_cam),
+                view.pose(&curr_kf.frame.pose_world_to_cam),
+            )
+        };
+        let Some(request) = pair_growth_in_camera(
+            (prev_kf, curr_kf),
+            c,
+            view_camera,
+            (&prev_pose, &curr_pose),
+            match_config,
+            triangulation_config,
+            scale_factor,
+        ) else {
+            continue;
+        };
+        let base = merged.landmarks.len();
+        merged.landmarks.extend(request.landmarks);
+        merged.observations.extend(
+            request
+                .observations
+                .into_iter()
+                .map(|link| ObservationLink {
+                    landmark: match link.landmark {
+                        LandmarkTarget::New(i) => LandmarkTarget::New(base + i),
+                        existing => existing,
+                    },
+                    ..link
+                }),
+        );
+    }
+    (!merged.landmarks.is_empty()).then_some(merged)
+}
+
+/// [`pair_growth_request`] over the features of rig camera `camera_idx`,
+/// with that camera's model and world-to-camera poses of both keyframes.
+fn pair_growth_in_camera<D: Descriptor>(
+    (prev_kf, curr_kf): (&Keyframe<D>, &Keyframe<D>),
+    camera_idx: usize,
+    camera: &PinholeCamera,
+    (prev_pose, curr_pose): (&Pose3d, &Pose3d),
+    match_config: &D::MatchConfig,
+    triangulation_config: &TriangulationConfig,
+    scale_factor: f64,
+) -> Option<MapInsertion<D>> {
+    let prev_kf_idx = prev_kf.frame.idx;
+    let curr_kf_idx = curr_kf.frame.idx;
 
     // Only features without a landmark in either keyframe. Matching the full
     // arrays and filtering afterwards discards almost everything once the
     // keyframes are mature.
     let prev_unassoc: Vec<usize> = (0..prev_kf.frame.features.descriptors.len())
-        .filter(|&i| prev_kf.map_point(i).is_none())
+        .filter(|&i| prev_kf.frame.camera_of(i) == camera_idx && prev_kf.map_point(i).is_none())
         .collect();
     let curr_unassoc: Vec<usize> = (0..curr_kf.frame.features.descriptors.len())
-        .filter(|&i| curr_kf.map_point(i).is_none())
+        .filter(|&i| curr_kf.frame.camera_of(i) == camera_idx && curr_kf.map_point(i).is_none())
         .collect();
     if prev_unassoc.is_empty() || curr_unassoc.is_empty() {
         return None;
@@ -102,10 +233,7 @@ pub fn pair_growth_request<D: Descriptor>(
     // F = K^-T [t]x R K^-1 with (R, t) the prev->curr relative pose. Filtering
     // against it replaces the two-view estimator's F-matrix RANSAC (mirrors
     // ORB-SLAM3's SearchForTriangulation).
-    let rel = Pose3d::between(
-        &prev_kf.frame.pose_world_to_cam,
-        &curr_kf.frame.pose_world_to_cam,
-    );
+    let rel = Pose3d::between(prev_pose, curr_pose);
     if rel.translation.length() <= 1e-8 {
         // No baseline: epipolar geometry degenerates and triangulation would
         // reject everything anyway.
@@ -124,11 +252,8 @@ pub fn pair_growth_request<D: Descriptor>(
     // there: wrong matches survive and triangulate to depth-garbage points that
     // still reproject well in both views. Mirrors ORB-SLAM3's epipole-proximity
     // rejection; RANSAC consensus used to absorb these.
-    let prev_center_world = prev_kf.frame.pose_world_to_cam.camera_centre();
-    let epipole_cam = curr_kf
-        .frame
-        .pose_world_to_cam
-        .transform_point(&prev_center_world);
+    let prev_center_world = prev_pose.camera_centre();
+    let epipole_cam = curr_pose.transform_point(&prev_center_world);
     let epipole_px = (epipole_cam.z.abs() > 1e-9).then(|| {
         Vec2F64::new(
             camera.fx * epipole_cam.x / epipole_cam.z + camera.cx,
@@ -210,8 +335,8 @@ pub fn pair_growth_request<D: Descriptor>(
     let triangulated = triangulate_matched_points(
         &matched_prev,
         &matched_curr,
-        &prev_kf.frame.pose_world_to_cam,
-        &curr_kf.frame.pose_world_to_cam,
+        prev_pose,
+        curr_pose,
         &undistorted_camera(camera),
         triangulation_config,
     )
@@ -313,56 +438,58 @@ pub fn neighbor_fusion_links<D: Descriptor>(
             continue;
         };
 
-        // (keypoint in neighbour, landmark, descriptor distance)
-        let mut proposals: Vec<(usize, usize, D::Distance)> = Vec::new();
-        for &mp_idx in &curr_mp_indices {
-            let mp = match map.map_points().get(mp_idx) {
-                Some(mp) if !mp.culled => mp,
-                _ => continue,
-            };
-            if mp.is_observed_by(nb_kf_idx) {
-                continue;
-            }
-            let p_cam = nb_kf.frame.pose_world_to_cam.transform_point(&mp.position);
-            let Ok(pixel) = camera.project_to_image(&p_cam, 0.0, nb_kf.frame.image_size) else {
-                continue;
-            };
-            let (u, v) = (pixel.x as f32, pixel.y as f32);
-
-            let mut best: Option<(D::Distance, usize)> = None;
-            for kp_idx in 0..nb_kf.frame.features.keypoints_xy.len() {
-                if nb_kf.map_point(kp_idx).is_some() {
+        // (keypoint in neighbour, landmark, camera, descriptor distance)
+        let mut proposals: Vec<(usize, usize, usize, D::Distance)> = Vec::new();
+        for (view, view_camera, raw, pose, size) in neighbour_views(nb_kf, camera) {
+            for &mp_idx in &curr_mp_indices {
+                let mp = match map.map_points().get(mp_idx) {
+                    Some(mp) if !mp.culled => mp,
+                    _ => continue,
+                };
+                if mp.is_observed_in(nb_kf_idx, view as u8) {
                     continue;
                 }
-                let Some(kp) = nb_kf.frame.undistorted_xy(kp_idx, camera) else {
+                let p_cam = pose.transform_point(&mp.position);
+                let Some(pixel) = project_in_view(view_camera, raw, size, &p_cam, 0.0) else {
                     continue;
                 };
-                let (dx, dy) = (kp[0] - u, kp[1] - v);
-                if dx * dx + dy * dy > r2 {
-                    continue;
+                let (u, v) = (pixel.x as f32, pixel.y as f32);
+
+                let mut best: Option<(D::Distance, usize)> = None;
+                for kp_idx in nb_kf.frame.camera_range(view) {
+                    if nb_kf.map_point(kp_idx).is_some() {
+                        continue;
+                    }
+                    let Some(kp) = nb_kf.frame.undistorted_xy(kp_idx, camera) else {
+                        continue;
+                    };
+                    let (dx, dy) = (kp[0] - u, kp[1] - v);
+                    if dx * dx + dy * dy > r2 {
+                        continue;
+                    }
+                    let dist = mp
+                        .descriptor
+                        .distance(&nb_kf.frame.features.descriptors[kp_idx]);
+                    if best.is_none_or(|(best_dist, _)| dist < best_dist) {
+                        best = Some((dist, kp_idx));
+                    }
                 }
-                let dist = mp
-                    .descriptor
-                    .distance(&nb_kf.frame.features.descriptors[kp_idx]);
-                if best.is_none_or(|(best_dist, _)| dist < best_dist) {
-                    best = Some((dist, kp_idx));
+                if let Some((best_dist, best_kp)) = best
+                    && best_dist <= D::TH_LOW
+                {
+                    proposals.push((best_kp, mp_idx, view, best_dist));
                 }
-            }
-            if let Some((best_dist, best_kp)) = best
-                && best_dist <= D::TH_LOW
-            {
-                proposals.push((best_kp, mp_idx, best_dist));
             }
         }
 
         // Closest descriptor wins a contested keypoint; one claim per keypoint
         // and one per landmark, since a landmark may hold only one feature in
         // any keyframe.
-        proposals.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal));
+        proposals.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(Ordering::Equal));
         let mut taken_kp: HashSet<usize> = HashSet::new();
-        let mut taken_mp: HashSet<usize> = HashSet::new();
-        for (kp_idx, mp_idx, _) in proposals {
-            if !taken_kp.insert(kp_idx) || !taken_mp.insert(mp_idx) {
+        let mut taken_mp: HashSet<(usize, usize)> = HashSet::new();
+        for (kp_idx, mp_idx, view, _) in proposals {
+            if !taken_kp.insert(kp_idx) || !taken_mp.insert((mp_idx, view)) {
                 continue;
             }
             links.push(ObservationLink {
@@ -375,6 +502,47 @@ pub fn neighbor_fusion_links<D: Descriptor>(
         }
     }
     links
+}
+
+/// `(camera index, model, raw fisheye model, world-to-camera pose, image
+/// size)` of each camera of a keyframe: every rig camera, or the one camera
+/// outside a rig.
+fn neighbour_views<'a, D>(
+    keyframe: &'a Keyframe<D>,
+    camera: &'a PinholeCamera,
+) -> Vec<(
+    usize,
+    &'a PinholeCamera,
+    Option<&'a Camera>,
+    Pose3d,
+    ImageSize,
+)> {
+    let frame = &keyframe.frame;
+    let Some(rig) = frame.rig.geometry.as_ref().filter(|_| frame.is_rig()) else {
+        return vec![(0, camera, None, frame.pose_world_to_cam, frame.image_size)];
+    };
+    rig.views()
+        .enumerate()
+        .map(|(c, view)| {
+            if c == 0 {
+                (
+                    0,
+                    camera,
+                    view.fisheye_model(),
+                    frame.pose_world_to_cam,
+                    frame.image_size,
+                )
+            } else {
+                (
+                    c,
+                    view.pinhole,
+                    view.fisheye_model(),
+                    view.pose(&frame.pose_world_to_cam),
+                    view.camera.size,
+                )
+            }
+        })
+        .collect()
 }
 
 /// Which of `candidates`, given as `(reference feature, current feature)`, can
@@ -443,6 +611,7 @@ mod tests {
             u_right: Vec::new(),
             depth: Vec::new(),
             keypoints_undist: Vec::new(),
+            rig: Default::default(),
         }
     }
 
@@ -461,6 +630,53 @@ mod tests {
         assert_eq!(seeds.len(), 1);
         assert_eq!(seeds[0].reference.feature_idx, 1);
         assert_eq!(seeds[0].reference.keyframe_idx, 10);
+    }
+
+    #[test]
+    fn rig_seeds_link_both_cameras_of_close_unclaimed_overlap_points() {
+        // Features 0..3 are the primary camera's, 3..6 camera 1's.
+        let mut frame = test_frame(4, vec![[0; 32]; 6]);
+        frame.rig.camera_ranges = vec![0..3, 3..6];
+        frame.rig.left_to_right = vec![Some(3), Some(4), Some(5)];
+        frame.rig.stereo_points = vec![
+            Some(Vec3F64::new(0.0, 0.0, 2.0)),
+            Some(Vec3F64::new(0.0, 0.0, 40.0)),
+            Some(Vec3F64::new(0.0, 0.0, 3.0)),
+        ];
+        frame.pose_world_to_cam.translation = Vec3F64::new(-1.0, 0.0, 0.0);
+        // Camera 1's match of feature 2 is already tracked.
+        let claimed = vec![None, None, None, None, None, Some(9)];
+
+        let (seeds, links) = rig_seeds(&frame, 10.0, &claimed);
+
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].reference.feature_idx, 0);
+        assert_eq!(seeds[0].position, Vec3F64::new(1.0, 0.0, 2.0));
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].observation.feature_idx, 3);
+        assert_eq!(links[0].landmark, LandmarkTarget::New(0));
+    }
+
+    /// A NaN overlap point fails `z > max_depth`; it must still not become a
+    /// seed, which would make the whole insertion batch refused.
+    #[test]
+    fn a_non_finite_stereo_point_is_not_a_seed() {
+        let mut frame = test_frame(4, vec![[0; 32]; 8]);
+        frame.rig.camera_ranges = vec![0..4, 4..8];
+        frame.rig.left_to_right = vec![Some(4), Some(5), Some(6), Some(7)];
+        frame.rig.stereo_points = vec![
+            Some(Vec3F64::new(0.0, 0.0, f64::NAN)),
+            Some(Vec3F64::new(f64::NAN, 0.0, 2.0)),
+            Some(Vec3F64::new(0.0, f64::INFINITY, 2.0)),
+            Some(Vec3F64::new(0.0, 0.0, 2.0)),
+        ];
+
+        let (seeds, links) = rig_seeds(&frame, f64::INFINITY, &[]);
+
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].reference.feature_idx, 3);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].observation.feature_idx, 7);
     }
 
     #[test]
@@ -642,6 +858,46 @@ mod tests {
         assert_ne!(links[0].landmark, LandmarkTarget::Existing(worse));
     }
 
+    /// A landmark 70° off a raw fisheye neighbour's axis lies outside its
+    /// virtual-pinhole window yet inside the raw image: fusion links it, as
+    /// tracking's projection search would match it.
+    #[test]
+    fn fusion_reaches_wide_landmarks_of_a_raw_fisheye_neighbour() {
+        let rig = std::sync::Arc::new(crate::rig::tests::raw_two_camera_rig(75.0));
+        let pinhole = rig.view(0).map(|view| view.pinhole.clone()).unwrap();
+        let (s, c) = 70f64.to_radians().sin_cos();
+        let position = Vec3F64::new(s, 0.0, c) * 4.0;
+        let virtual_px = pinhole.project_to_pixel(&position, 0.0).unwrap();
+        assert!(virtual_px.x > 640.0);
+
+        let mut map = Map::new();
+        map.insert_keyframe(Keyframe::from_frame(test_frame(10, vec![[0; 32]])))
+            .unwrap();
+        let mut neighbor = test_frame(20, vec![[0; 32]]);
+        neighbor.keypoints_undist = vec![[virtual_px.x as f32, virtual_px.y as f32]];
+        neighbor.rig = crate::frame::RigFeatures {
+            geometry: Some(rig),
+            camera_ranges: vec![0..1, 1..1],
+            ..Default::default()
+        };
+        map.insert_keyframe(Keyframe::from_frame(neighbor)).unwrap();
+        let landmark = map
+            .insert_landmark(LandmarkSeed {
+                position,
+                color: [0; 3],
+                reference: ObservationKey {
+                    keyframe_idx: 10,
+                    feature_idx: 0,
+                },
+            })
+            .unwrap();
+
+        let links = neighbor_fusion_links(&map, 10, &[20], &pinhole);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].landmark, LandmarkTarget::Existing(landmark));
+        assert_eq!(links[0].observation.feature_idx, 0);
+    }
+
     #[test]
     fn fusion_runs_on_float_descriptors_without_orientations() {
         use crate::features::{ScalePyramid, scalar::Scalar};
@@ -665,6 +921,7 @@ mod tests {
                 u_right: Vec::new(),
                 depth: Vec::new(),
                 keypoints_undist: Vec::new(),
+                rig: Default::default(),
             }
         };
         let mut map = Map::with_scale_pyramid(ScalePyramid {

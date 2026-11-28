@@ -276,6 +276,7 @@ impl FrameSource for HiltiSource {
             timestamp_sec,
             image,
             right_image: None,
+            rig_images: Vec::new(),
             imu_samples,
         }))
     }

@@ -1,11 +1,16 @@
 //! Core frame-domain types shared across the crate.
 
+use std::ops::Range;
+use std::sync::Arc;
+
 use crate::features::RBrief;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
+use kornia_algebra::Vec3F64;
 use kornia_image::ImageSize;
 
-use crate::features::Features;
+use crate::features::{DescriptorSet, Features};
+use crate::rig::{RigGeometry, RigView};
 
 /// A camera observation: features extracted at a known pose. `D` is the
 /// descriptor type; ORB's by default.
@@ -35,26 +40,136 @@ pub struct Frame<D = RBrief> {
     /// stage that consumes keypoints (tracking, BA gathering, fuse), so it
     /// must not be recomputed per consumer.
     pub keypoints_undist: Vec<[f32; 2]>,
+    /// Per-camera layout of a multi-camera rig frame; empty otherwise.
+    pub rig: RigFeatures,
+}
+
+/// How a multi-camera rig frame's features split over its cameras
+/// (ORB-SLAM3's `Nleft`/`Nright`), and the overlap matches between the first two.
+/// `image_size` and `pose_world_to_cam` of the frame are the primary camera's.
+#[derive(Debug, Clone, Default)]
+pub struct RigFeatures {
+    /// The rig the features were extracted on; `None` outside a rig.
+    pub geometry: Option<Arc<RigGeometry>>,
+    /// Feature index range of each camera, in rig order, covering all features.
+    pub camera_ranges: Vec<Range<usize>>,
+    /// Per primary-camera feature: its match among camera 1's features
+    /// (ORB-SLAM3's `mvLeftToRightMatch`).
+    pub left_to_right: Vec<Option<usize>>,
+    /// Per primary-camera feature: the point its overlap match triangulates
+    /// to, in the primary camera frame (metres).
+    pub stereo_points: Vec<Option<Vec3F64>>,
 }
 
 impl<D> Frame<D> {
+    /// Whether the frame comes from a capture that can supply metric depth:
+    /// rectified stereo or a multi-camera rig. A rig frame may still hold no
+    /// overlap points; callers needing depth count them.
+    pub fn is_metric(&self) -> bool {
+        self.is_stereo() || self.is_rig()
+    }
+
+    /// Whether the features come from several rig cameras.
+    pub fn is_rig(&self) -> bool {
+        self.rig.camera_ranges.len() > 1
+    }
+
+    /// Rig camera of feature `i`; 0 outside a multi-camera rig.
+    pub fn camera_of(&self, i: usize) -> usize {
+        self.rig
+            .camera_ranges
+            .iter()
+            .position(|range| range.contains(&i))
+            .unwrap_or(0)
+    }
+
+    /// The rig view of feature `i`, for a rig frame's non-primary features;
+    /// `None` for primary-camera features and outside a rig, which use the
+    /// system camera and `pose_world_to_cam` unchanged.
+    pub fn secondary_view(&self, i: usize) -> Option<RigView<'_>> {
+        let camera = self.camera_of(i);
+        if camera == 0 {
+            return None;
+        }
+        self.rig.geometry.as_ref()?.view(camera)
+    }
+
+    /// The rig view of feature `i` when its camera supplies raw fisheye
+    /// images, camera 0 included; `None` otherwise.
+    pub fn raw_view(&self, i: usize) -> Option<RigView<'_>> {
+        let view = self.rig.geometry.as_ref()?.view(self.camera_of(i))?;
+        view.is_raw().then_some(view)
+    }
+
+    /// Camera model and world-to-camera pose that observe feature `i`:
+    /// `primary` and `pose` unless `i` belongs to a secondary rig camera.
+    pub fn observing<'a>(
+        &'a self,
+        i: usize,
+        primary: &'a PinholeCamera,
+        pose: &Pose3d,
+    ) -> (&'a PinholeCamera, Pose3d) {
+        match self.secondary_view(i) {
+            Some(view) => (view.pinhole, view.pose(pose)),
+            None => (primary, *pose),
+        }
+    }
+
+    /// Feature indices of rig camera `camera`; every feature for camera 0
+    /// outside a rig.
+    pub fn camera_range(&self, camera: usize) -> Range<usize> {
+        match self.rig.camera_ranges.get(camera) {
+            Some(range) => range.clone(),
+            None if camera == 0 && !self.is_rig() => 0..self.features.keypoints_xy.len(),
+            None => 0..0,
+        }
+    }
+
+    /// Descriptors (and orientations) of the primary camera's features. They
+    /// come first, so an index into the set is a frame feature index.
+    pub fn primary_descriptor_set(&self) -> DescriptorSet<'_, D> {
+        if !self.is_rig() {
+            return self.features.descriptor_set();
+        }
+        let end = self.camera_range(0).end;
+        let descriptors = &self.features.descriptors;
+        DescriptorSet {
+            orientations: self
+                .features
+                .orientations
+                .as_deref()
+                .map(|o| &o[..end.min(o.len())]),
+            descriptors: &descriptors[..end.min(descriptors.len())],
+        }
+    }
+
     /// Whether this frame carries per-keypoint stereo depth.
     pub fn is_stereo(&self) -> bool {
         !self.depth.is_empty()
     }
 
     /// Computes and caches undistorted keypoint coordinates (no-op when
-    /// already computed for the current keypoint set).
+    /// already computed for the current keypoint set). A rig camera's
+    /// features use that camera's model; a raw fisheye camera's map into its
+    /// virtual pinhole.
     pub fn ensure_undistorted(&mut self, camera: &PinholeCamera) {
         if self.keypoints_undist.len() == self.features.keypoints_xy.len() {
             return;
         }
-        self.keypoints_undist = self
+        let undistorted = self
             .features
             .keypoints_xy
             .iter()
-            .map(|kp| undistort_keypoint(camera, kp))
+            .enumerate()
+            .map(|(i, kp)| {
+                if let Some(view) = self.raw_view(i) {
+                    return raw_keypoint(&view, kp);
+                }
+                let camera = self.secondary_view(i).map_or(camera, |view| view.pinhole);
+                undistort_keypoint(camera, kp)
+            })
             .collect();
+        self.keypoints_undist = undistorted;
     }
 
     /// Undistorted coordinates of keypoint `i`, from the cache when present
@@ -67,7 +182,14 @@ impl<D> Frame<D> {
         self.features
             .keypoints_xy
             .get(i)
-            .map(|kp| undistort_keypoint(camera, kp))
+            .map(|kp| match self.raw_view(i) {
+                Some(view) => raw_keypoint(&view, kp),
+                // The feature's own camera, as `ensure_undistorted` uses.
+                None => undistort_keypoint(
+                    self.secondary_view(i).map_or(camera, |view| view.pinhole),
+                    kp,
+                ),
+            })
             .filter(is_finite_xy)
     }
 
@@ -86,6 +208,11 @@ pub(crate) fn undistort_keypoint(camera: &PinholeCamera, kp: &[f32; 2]) -> [f32;
     camera
         .undistort(kp[0] as f64, kp[1] as f64)
         .map_or([f32::NAN; 2], |p| [p.x as f32, p.y as f32])
+}
+
+/// Virtual-pinhole pixel of a raw fisheye keypoint, NaN past the 80° cap.
+fn raw_keypoint(view: &RigView<'_>, kp: &[f32; 2]) -> [f32; 2] {
+    view.raw_to_virtual(*kp).unwrap_or([f32::NAN; 2])
 }
 
 /// The camera that images undistorted keypoints: `camera`'s intrinsics with
@@ -128,7 +255,113 @@ mod tests {
             u_right,
             depth,
             keypoints_undist: Vec::new(),
+            rig: RigFeatures::default(),
         }
+    }
+
+    /// Raw f32 keypoints of 2000 bearings map to their virtual-pinhole pixels;
+    /// slots past 80° are NaN.
+    #[test]
+    fn raw_fisheye_keypoints_map_to_the_virtual_pinhole() {
+        use kornia_3d::camera::CameraModel;
+        let rig = Arc::new(crate::rig::tests::raw_two_camera_rig(75.0));
+        let lens = crate::rig::tests::aria_lens();
+        let view = rig.view(0).unwrap();
+        let pinhole = view.pinhole.clone();
+        let mut bearings: Vec<(f64, Vec3F64)> = (0..2000)
+            .map(|i| {
+                let theta = 79f64.to_radians() * (i as f64 / 1999.0);
+                let phi = i as f64 * 2.399_963_229_728_653;
+                let (s, c) = theta.sin_cos();
+                (theta, Vec3F64::new(s * phi.cos(), s * phi.sin(), c))
+            })
+            .collect();
+        for degrees in [80.5, 85.0] {
+            let theta = f64::to_radians(degrees);
+            bearings.push((theta, Vec3F64::new(theta.sin(), 0.0, theta.cos())));
+        }
+        let mut frame = empty_frame(Vec::new(), Vec::new());
+        frame.features.keypoints_xy = bearings
+            .iter()
+            .map(|(_, ray)| {
+                let raw = lens.project(ray).unwrap();
+                [raw.x as f32, raw.y as f32]
+            })
+            .collect();
+        let n = bearings.len();
+        frame.rig = RigFeatures {
+            geometry: Some(Arc::clone(&rig)),
+            camera_ranges: vec![0..n, n..n],
+            ..RigFeatures::default()
+        };
+        frame.ensure_undistorted(&pinhole);
+        assert_eq!(frame.keypoints_undist.len(), n);
+        for (i, (theta, ray)) in bearings.iter().enumerate() {
+            let got = frame.keypoints_undist[i];
+            if theta.to_degrees() >= crate::rig::RAW_MAX_INCIDENCE_DEG {
+                assert!(got[0].is_nan() && got[1].is_nan(), "{i}: {got:?}");
+                assert_eq!(frame.undistorted_xy(i, &pinhole), None);
+                continue;
+            }
+            let expected = pinhole.project_to_pixel(ray, 0.0).unwrap();
+            // The test's own lens: its raw-to-virtual magnification, scaled to
+            // the virtual focal length.
+            let (radial, _) = lens.pinhole_magnification(*theta);
+            let radial = radial * pinhole.fx / lens.f;
+            let error = (got[0] as f64 - expected.x).hypot(got[1] as f64 - expected.y);
+            assert!(error < 5e-4 + 1e-4 * radial, "θ {theta}: {error} px");
+        }
+    }
+
+    /// Without the cache, a secondary-camera feature is undistorted with its
+    /// own camera's model, the same pixel the cache gives.
+    #[test]
+    fn the_uncached_fallback_uses_the_feature_view() {
+        let pinhole = |fx: f64, k1: f64| PinholeCamera {
+            fx,
+            fy: fx,
+            cx: 320.0,
+            cy: 240.0,
+            k1,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let size = ImageSize {
+            width: 640,
+            height: 480,
+        };
+        let primary = pinhole(400.0, 0.0);
+        let secondary = pinhole(300.0, -0.2);
+        let rig = kornia_sensors::SensorRig::from_cameras(vec![
+            kornia_sensors::RigCamera::primary(primary.clone(), size),
+            kornia_sensors::RigCamera::new(
+                secondary.clone(),
+                size,
+                Pose3d::new(
+                    kornia_algebra::Mat3F64::IDENTITY,
+                    Vec3F64::new(0.1, 0.0, 0.0),
+                ),
+            ),
+        ])
+        .unwrap();
+        let mut frame = empty_frame(Vec::new(), Vec::new());
+        frame.features.keypoints_xy = vec![[500.0, 400.0], [500.0, 400.0]];
+        frame.rig = RigFeatures {
+            geometry: RigGeometry::from_rig(&rig).map(Arc::new),
+            camera_ranges: vec![0..1, 1..2],
+            ..RigFeatures::default()
+        };
+
+        let on_the_fly: Vec<_> = (0..2).map(|i| frame.undistorted_xy(i, &primary)).collect();
+        assert_eq!(
+            on_the_fly[1],
+            Some(undistort_keypoint(&secondary, &[500.0, 400.0]))
+        );
+        assert_ne!(on_the_fly[0], on_the_fly[1]);
+        frame.ensure_undistorted(&primary);
+        let cached: Vec<_> = (0..2).map(|i| frame.undistorted_xy(i, &primary)).collect();
+        assert_eq!(cached, on_the_fly);
     }
 
     #[test]
@@ -171,5 +404,31 @@ mod tests {
         assert_eq!(frame.stereo_depth(0), Some(2.5));
         assert_eq!(frame.stereo_depth(1), None); // sentinel
         assert_eq!(frame.stereo_depth(2), None); // out of range
+    }
+
+    #[test]
+    fn the_primary_descriptor_set_holds_only_primary_features() {
+        let mut frame = empty_frame(Vec::new(), Vec::new());
+        frame.features.keypoints_xy = vec![[0.0; 2]; 5];
+        frame.features.descriptors = (0..5).map(|i| RBrief([i; 32])).collect();
+        frame.features.orientations = Some(vec![0.0; 5]);
+        assert_eq!(frame.primary_descriptor_set().descriptors.len(), 5);
+        frame.rig.camera_ranges = vec![0..3, 3..5];
+        let set = frame.primary_descriptor_set();
+        assert_eq!(set.descriptors, &frame.features.descriptors[..3]);
+        assert_eq!(set.orientations.map(<[f32]>::len), Some(3));
+    }
+
+    #[test]
+    fn rig_features_belong_to_their_camera() {
+        let mut frame = empty_frame(Vec::new(), Vec::new());
+        assert_eq!(frame.camera_of(7), 0);
+        assert!(!frame.is_rig());
+        frame.rig.camera_ranges = vec![0..3, 3..5];
+        assert!(frame.is_rig());
+        assert_eq!(frame.camera_of(2), 0);
+        assert_eq!(frame.camera_of(3), 1);
+        assert_eq!(frame.camera_range(1), 3..5);
+        assert!(!frame.is_stereo(), "a rig frame carries no rectified depth");
     }
 }

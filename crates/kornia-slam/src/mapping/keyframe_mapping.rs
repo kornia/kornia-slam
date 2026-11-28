@@ -81,6 +81,12 @@ pub(crate) fn keyframe_insertion<D>(
         && keyframe.frame.is_stereo()
     {
         insertion.landmarks = growth::stereo_seeds(&keyframe.frame, camera, threshold, &claimed);
+    } else if let Some(threshold) = stereo_close_depth
+        && keyframe.frame.is_rig()
+    {
+        let (seeds, links) = growth::rig_seeds(&keyframe.frame, threshold, &claimed);
+        insertion.landmarks = seeds;
+        insertion.observations.extend(links);
     }
     let close_points = insertion.landmarks.len();
     insertion.keyframes.push(keyframe);
@@ -326,6 +332,7 @@ mod tests {
             u_right: Vec::new(),
             depth: Vec::new(),
             keypoints_undist: Vec::new(),
+            rig: Default::default(),
         }
     }
 
@@ -363,6 +370,7 @@ mod tests {
             u_right: Vec::new(),
             depth: Vec::new(),
             keypoints_undist: Vec::new(),
+            rig: Default::default(),
         }
     }
 

@@ -35,6 +35,32 @@ cameras as the source yields images per frame, each of the source's image size),
 the source has an IMU; `--write-rig-calibration <path>` writes the opened source's rig
 as such a file and exits. Omitted, every source keeps its own calibration.
 
+**Tracking a non-rectified multi-camera rig.** `cameras: Rig` tracks every camera
+of the source's rig, each with its own lens model and extrinsic, without
+rectification (ORB-SLAM3's non-rectified stereo): the first two cameras are matched
+and triangulated inside the image region they share, and tracking, mapping and
+bundle adjustment observe a landmark once per keyframe and rig camera. Rig cameras
+may be pinhole (with radtan distortion) or raw fisheye. Feed a capture with
+`SlamSystem::process_rig(timestamp, &[images…])`, one image per camera in rig order.
+Breaking for code that matches or builds these types: `CameraSelection::Rig` and
+`ProcessError::{RigRequired, NotARig, RigImageCount, RigSizeMismatch}` are new
+variants, `Frame` gains the field `rig: RigFeatures`, `LandmarkObservation`
+gains `camera`, `ViBaParams` gains `rig_views` and `observation_views`, and
+`tracking::local_map::landmarks_in_frustum` takes the camera's raw fisheye model
+(`None` keeps the old pinhole test). The selection, not the rig, decides the layout: a rectified pair
+selected as `Rig` takes rig captures only.
+
+**EuRoC as a two-camera rig, and a LaMAria source.** In the app, `cameras: Rig` on
+EuRoC yields raw cam0 + cam1, each with its own radtan model and `T_BS`. The new
+`Lamaria` source reads the pinhole ASL export (or raw Aria fisheye images with
+`images: RawFisheye`) and offers both SLAM cameras as a rig; both sources build
+their rig through the same checks a rig calibration file passes. Examples:
+`configs/euroc-rig-imu-loop.ron`, `configs/lamaria-mono-imu.ron`,
+`configs/lamaria-rig-imu.ron`. The Hilti reader no longer parses its unused `cam1`
+stream; a calibration file with a `cam1` block still loads.
+
+Every default is unchanged: runs that do not select `Rig` behave as before.
+
 **Fixed-point table rectification.** `kornia_slam::rectify::StereoRemap` rectifies a
 raw stereo pair through precomputed kornia-imgproc remap tables on the calling thread,
 without allocating; `RemapQuantisation::Q10Trunc` gives the same bytes as

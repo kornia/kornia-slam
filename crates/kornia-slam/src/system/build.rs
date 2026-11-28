@@ -34,6 +34,9 @@ pub(crate) struct SystemSettings {
     /// Metric baseline of the rectified pair under [`CameraSelection::Stereo`];
     /// `None` for every other selection, whatever the rig could offer.
     pub stereo_baseline_m: Option<f64>,
+    /// Every camera of the rig is tracked; `true` only under
+    /// [`CameraSelection::Rig`].
+    pub multi_camera: bool,
     /// Near/far depth threshold `mThDepth` (metres). When `Some`, each new
     /// keyframe back-projects its unassociated "close" (`z < threshold`) stereo
     /// keypoints directly into metric map points.
@@ -54,6 +57,14 @@ impl SensorSelection {
     }
 }
 
+/// Distance between the primary rig camera and camera 1, the baseline of
+/// their overlap triangulation.
+fn rig_baseline_m(rig: &SensorRig) -> Option<f64> {
+    rig.cameras()
+        .get(1)
+        .map(|camera| camera.primary_from_camera.translation.length())
+}
+
 impl SystemConfig {
     /// System settings for a rig returned by [`SensorSelection::select_rig`].
     ///
@@ -62,7 +73,13 @@ impl SystemConfig {
         let orb = self.orb();
         let stereo_baseline_m = match self.sensors.cameras {
             CameraSelection::Stereo => rig.rectified_stereo_baseline_m(),
-            CameraSelection::Mono => None,
+            CameraSelection::Mono | CameraSelection::Rig => None,
+        };
+        let multi_camera = self.sensors.cameras == CameraSelection::Rig;
+        let close_depth_baseline_m = if multi_camera {
+            rig_baseline_m(rig)
+        } else {
+            stereo_baseline_m
         };
         let FrontendConfig::Orb(frontend) = orb.frontend;
         let tuning = &orb.tuning;
@@ -73,7 +90,8 @@ impl SystemConfig {
             tracking_loss_recovery: tuning.loss_recovery,
             local_mapping: orb.mapping.execution,
             stereo_baseline_m,
-            stereo_close_depth_m: stereo_baseline_m
+            multi_camera,
+            stereo_close_depth_m: close_depth_baseline_m
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
         }
     }

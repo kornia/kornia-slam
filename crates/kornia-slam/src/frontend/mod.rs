@@ -1,6 +1,9 @@
 //! Feature preparation for one input frame: ORB extraction, stereo depth and,
 //! for raw fisheye images, keypoint mapping into the rig's virtual pinhole.
 
+mod overlap;
+
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kornia_3d::camera::{Camera, CameraModel, PinholeCamera};
@@ -11,8 +14,9 @@ use kornia_imgproc::features::{OrbDetector, OrbFeatures};
 use kornia_imgproc::resize::resize_fast_mono;
 use kornia_sensors::SensorRig;
 
-use crate::Frame;
 use crate::features::Features;
+use crate::frame::{Frame, RigFeatures};
+use crate::rig::RigGeometry;
 use crate::stereo::{StereoMatchConfig, StereoMatches, compute_stereo_matches};
 
 /// Fisheye keypoints beyond this incidence angle are dropped: a pinhole cannot
@@ -25,7 +29,8 @@ pub struct FrontendObservation {
     /// Extracted keypoints in input-image pixels; raw fisheye coordinates for
     /// a fisheye rig, before mapping into the geometry camera.
     pub keypoints_xy: Vec<[f32; 2]>,
-    /// Left keypoints with a stereo match; `None` without stereo.
+    /// Left keypoints with a stereo match (for a rig, primary keypoints
+    /// with a triangulated overlap match); `None` without stereo or a rig.
     pub stereo_matched: Option<usize>,
     /// Feature extraction and stereo matching time.
     pub duration: Duration,
@@ -36,16 +41,26 @@ pub(crate) struct OrbFrontend {
     detector: OrbDetector,
     stereo: Option<StereoMatchConfig>,
     fisheye: Option<FisheyeMapping>,
+    rig: Option<RigOverlap>,
     observation: FrontendObservation,
 }
 
+/// The rig a multi-camera frontend extracts on, with `T_10`, the pose of
+/// camera 1 relative to the primary its overlap is matched with.
+struct RigOverlap {
+    geometry: Arc<RigGeometry>,
+    right_from_left: Pose3d,
+}
+
 impl OrbFrontend {
-    /// A stereo baseline enables matching against the right image; `rig`
-    /// must already be restricted to the selected sensors.
+    /// A stereo baseline enables matching against the right image;
+    /// `multi_camera` extracts on every camera of `rig`, which must already
+    /// be restricted to the selected sensors.
     pub(crate) fn new(
         detector: OrbDetector,
         rig: &SensorRig,
         stereo_baseline_m: Option<f64>,
+        multi_camera: bool,
     ) -> Self {
         let primary = rig.primary();
         let camera = primary.pinhole();
@@ -66,6 +81,7 @@ impl OrbFrontend {
             detector,
             stereo,
             fisheye,
+            rig: multi_camera.then(|| rig_overlap(rig)).flatten(),
             observation: FrontendObservation::default(),
         }
     }
@@ -114,6 +130,86 @@ impl OrbFrontend {
         Ok(self.finish_frame(idx, left, features, Some(matches), start))
     }
 
+    /// Extracts features on every image of a validated rig capture, one image
+    /// per rig camera in rig order, and matches the first two cameras inside
+    /// their overlap. Without a rig only the first image is used.
+    pub(crate) fn prepare_rig(
+        &mut self,
+        idx: usize,
+        images: &[&Image<u8, 1>],
+    ) -> Result<Frame, ImageError> {
+        let start = Instant::now();
+        let (Some(rig), Some(primary)) = (&self.rig, images.first()) else {
+            return match images.first() {
+                Some(image) => self.prepare_image(idx, image),
+                None => Err(ImageError::ImageDataNotInitialized),
+            };
+        };
+        let mut features = OrbFeatures {
+            keypoints_xy: Vec::new(),
+            orientations: Vec::new(),
+            descriptors: Vec::new(),
+            octaves: Vec::new(),
+        };
+        let mut camera_ranges = Vec::with_capacity(images.len());
+        let mut keypoint_colors = Vec::new();
+        for image in images {
+            let camera_features = self.detector.detect_and_extract_u8(image)?;
+            let begin = features.keypoints_xy.len();
+            keypoint_colors.extend(sample_colors(image, &camera_features.keypoints_xy));
+            features.keypoints_xy.extend(camera_features.keypoints_xy);
+            features.orientations.extend(camera_features.orientations);
+            features.descriptors.extend(camera_features.descriptors);
+            features.octaves.extend(camera_features.octaves);
+            camera_ranges.push(begin..features.keypoints_xy.len());
+        }
+        self.observation.keypoints_xy.clear();
+        if let Some(range) = camera_ranges.first() {
+            self.observation
+                .keypoints_xy
+                .extend_from_slice(&features.keypoints_xy[range.clone()]);
+        }
+        let mut frame = Frame {
+            idx,
+            features: Features::from(features),
+            pose_world_to_cam: Pose3d::IDENTITY,
+            image_size: primary.size(),
+            keypoint_colors,
+            u_right: Vec::new(),
+            depth: Vec::new(),
+            keypoints_undist: Vec::new(),
+            rig: RigFeatures {
+                geometry: Some(Arc::clone(&rig.geometry)),
+                camera_ranges,
+                left_to_right: Vec::new(),
+                stereo_points: Vec::new(),
+            },
+        };
+        // Raw fisheye or radtan pixels are not pinhole pixels: the overlap's
+        // epipolar geometry and triangulation need the undistorted cache. A
+        // zero-distortion pinhole rig keeps reading raw keypoints.
+        if let (true, Some(view0)) = (rig.geometry.needs_undistortion(), rig.geometry.view(0)) {
+            frame.ensure_undistorted(view0.pinhole);
+        }
+        let pixels = if frame.keypoints_undist.is_empty() {
+            &frame.features.keypoints_xy
+        } else {
+            &frame.keypoints_undist
+        };
+        let matches = overlap::match_overlap(
+            &frame.features,
+            pixels,
+            &frame.rig.camera_ranges,
+            &rig.geometry,
+            &rig.right_from_left,
+        );
+        self.observation.stereo_matched = Some(matches.num_matched());
+        frame.rig.left_to_right = matches.left_to_right;
+        frame.rig.stereo_points = matches.points;
+        self.observation.duration = start.elapsed();
+        Ok(frame)
+    }
+
     fn finish_frame(
         &mut self,
         idx: usize,
@@ -148,6 +244,7 @@ impl OrbFrontend {
             u_right,
             depth,
             keypoints_undist: Vec::new(),
+            rig: RigFeatures::default(),
         }
     }
 
@@ -174,6 +271,14 @@ impl OrbFrontend {
         }
         Ok(pyramid)
     }
+}
+
+/// The overlap state of a rig of two or more cameras; `None` for one camera.
+fn rig_overlap(rig: &SensorRig) -> Option<RigOverlap> {
+    Some(RigOverlap {
+        geometry: Arc::new(RigGeometry::from_rig(rig)?),
+        right_from_left: rig.b_from_a(0, 1)?,
+    })
 }
 
 /// Maps raw fisheye keypoints into a virtual pinhole by unprojecting each to a

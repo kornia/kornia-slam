@@ -136,7 +136,7 @@ fn stereo_frontend() -> OrbFrontend {
         n_keypoints: 1000,
         ..OrbDetector::default()
     };
-    OrbFrontend::new(detector, &rig, rig.rectified_stereo_baseline_m())
+    OrbFrontend::new(detector, &rig, rig.rectified_stereo_baseline_m(), false)
 }
 
 #[test]
@@ -271,10 +271,93 @@ fn fisheye_observation_keeps_raw_image_keypoints() {
     let (image, _) = synthetic_pair(1472, 1440, 0);
     let fisheye = hilti_fisheye();
     let rig = SensorRig::mono(fisheye, image.size());
-    let mut frontend = OrbFrontend::new(OrbDetector::default(), &rig, None);
+    let mut frontend = OrbFrontend::new(OrbDetector::default(), &rig, None, false);
     let frame = frontend.prepare_image(3, &image).unwrap();
 
     let observed = &frontend.observation().keypoints_xy;
     assert!(observed.len() > frame.features.keypoints_xy.len());
     assert!(frontend.observation().stereo_matched.is_none());
+}
+
+/// Two `camera` rig cameras, the second a pure 11 cm sideways baseline away.
+fn sideways_rig(camera: PinholeCamera, size: ImageSize) -> SensorRig {
+    SensorRig::from_cameras(vec![
+        kornia_sensors::RigCamera::primary(camera.clone(), size),
+        kornia_sensors::RigCamera::new(
+            camera,
+            size,
+            Pose3d::new(
+                kornia_algebra::Mat3F64::IDENTITY,
+                kornia_algebra::Vec3F64::new(0.11, 0.0, 0.0),
+            ),
+        ),
+    ])
+    .unwrap()
+}
+
+#[test]
+fn a_rig_frame_splits_features_per_camera_and_keeps_depth_empty() {
+    let camera = pinhole(240.0, 240.0, 188.0, 120.0);
+    let size = ImageSize {
+        width: 376,
+        height: 240,
+    };
+    // The 11 cm baseline is the synthetic pair's 8 px shift.
+    let rig = sideways_rig(camera, size);
+    let mut frontend = OrbFrontend::new(OrbDetector::default(), &rig, None, true);
+    let (left, right) = synthetic_pair(376, 240, 8);
+    let frame = frontend.prepare_rig(1, &[&left, &right]).unwrap();
+
+    assert!(frame.is_rig());
+    assert!(frame.depth.is_empty() && frame.u_right.is_empty());
+    // A zero-distortion pinhole rig reads raw keypoints.
+    assert!(frame.keypoints_undist.is_empty());
+    let ranges = &frame.rig.camera_ranges;
+    assert_eq!(ranges.len(), 2);
+    assert_eq!(ranges[0].start, 0);
+    assert_eq!(ranges[1].end, frame.features.keypoints_xy.len());
+    assert_eq!(frame.rig.stereo_points.len(), ranges[0].len());
+    assert_eq!(frame.camera_of(ranges[1].start), 1);
+    let matched = frame.rig.stereo_points.iter().flatten().count();
+    assert!(matched > 20, "only {matched} overlap points");
+    let mut depths = Vec::new();
+    for (i, point) in frame.rig.stereo_points.iter().enumerate() {
+        let (Some(point), Some(j)) = (point, frame.rig.left_to_right[i]) else {
+            continue;
+        };
+        assert!(ranges[1].contains(&j));
+        depths.push(point.z);
+    }
+    // bf / d = 240 * 0.11 / 8; coarse-octave keypoints are a pixel or two off.
+    depths.sort_by(f64::total_cmp);
+    let median = depths[depths.len() / 2];
+    assert!((median - 3.3).abs() < 0.2, "median depth {median}");
+    let close = depths.iter().filter(|z| (**z - 3.3).abs() < 0.66).count();
+    assert!(
+        close * 10 >= depths.len() * 8,
+        "{close} of {} near 3.3 m",
+        depths.len()
+    );
+}
+
+#[test]
+fn a_distorted_pinhole_rig_frame_undistorts_every_keypoint() {
+    let camera = PinholeCamera {
+        k1: -0.28,
+        ..pinhole(240.0, 240.0, 188.0, 120.0)
+    };
+    let size = ImageSize {
+        width: 376,
+        height: 240,
+    };
+    let rig = sideways_rig(camera, size);
+    let mut frontend = OrbFrontend::new(OrbDetector::default(), &rig, None, true);
+    let (left, right) = synthetic_pair(376, 240, 8);
+    let frame = frontend.prepare_rig(1, &[&left, &right]).unwrap();
+
+    assert!(!frame.features.keypoints_xy.is_empty());
+    assert_eq!(
+        frame.keypoints_undist.len(),
+        frame.features.keypoints_xy.len()
+    );
 }

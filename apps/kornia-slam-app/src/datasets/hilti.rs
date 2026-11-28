@@ -6,7 +6,7 @@
 //! <sequence>/
 //!   cam0/data.csv
 //!   cam0/data/<timestamp>.png
-//!   cam1/data.csv          # optional
+//!   cam1/data.csv          # optional, not read
 //!   cam1/data/<timestamp>.png
 //!   imu0/data.csv          # optional
 //!   state_groundtruth_estimate0/data.csv   # optional, or mocap0/data.csv
@@ -77,27 +77,21 @@ pub struct HiltiDataset {
     pub root: PathBuf,
     /// Ordered `cam0` image samples.
     pub cam0_samples: Vec<DatasetSample>,
-    /// Ordered `cam1` image samples. Empty if `cam1` is absent.
-    pub cam1_samples: Vec<DatasetSample>,
     /// Ordered IMU samples. Empty if `imu0` is absent.
     pub imu_samples: Vec<ImuMeasurement>,
     /// `cam0` Kannala-Brandt calibration.
     pub cam0_calibration: KannalaBrandtCalibration,
-    /// `cam1` Kannala-Brandt calibration.
-    pub cam1_calibration: KannalaBrandtCalibration,
     /// Transform from IMU to `cam0`.
     pub t_cam0_imu: [[f64; 4]; 4],
-    /// Transform from IMU to `cam1`.
-    pub t_cam1_imu: [[f64; 4]; 4],
     /// Ground-truth poses from `state_groundtruth_estimate0/data.csv`. Empty
     /// when the extraction ran without a `--gt-topic`.
     pub ground_truth: Vec<GroundTruthPose>,
 }
 
+/// The chain's `cam0`; other cameras are not read.
 #[derive(Debug, Deserialize)]
 struct KalibrChain {
     cam0: KalibrCamera,
-    cam1: KalibrCamera,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,24 +116,18 @@ impl HiltiDataset {
 
         let kalibr = read_kalibr_chain(&calibration)?;
         let cam0_calibration = kalibr.cam0.to_calibration("cam0", &calibration)?;
-        let cam1_calibration = kalibr.cam1.to_calibration("cam1", &calibration)?;
         let t_cam0_imu = kalibr.cam0.t_cam_imu_matrix("cam0", &calibration)?;
-        let t_cam1_imu = kalibr.cam1.t_cam_imu_matrix("cam1", &calibration)?;
 
         let cam0_samples = read_image_samples(&root, "cam0")?;
-        let cam1_samples = read_optional_image_samples(&root, "cam1")?;
         let imu_samples = read_optional_imu_samples(&root)?;
         let ground_truth = read_optional_ground_truth(&root)?;
 
         Ok(Self {
             root,
             cam0_samples,
-            cam1_samples,
             imu_samples,
             cam0_calibration,
-            cam1_calibration,
             t_cam0_imu,
-            t_cam1_imu,
             ground_truth,
         })
     }
@@ -152,11 +140,6 @@ impl HiltiDataset {
     /// Returns the ground-truth poses (empty when none were extracted).
     pub fn ground_truth(&self) -> &[GroundTruthPose] {
         &self.ground_truth
-    }
-
-    /// True when a usable `cam1` stream is present.
-    pub fn is_stereo(&self) -> bool {
-        !self.cam1_samples.is_empty()
     }
 }
 
@@ -269,27 +252,6 @@ fn read_image_samples(root: &Path, camera_name: &str) -> Result<Vec<DatasetSampl
     }
     if !data_dir.exists() {
         return Err(DatasetError::FileNotFound(data_dir));
-    }
-
-    parse_image_csv(&csv, &data_dir)
-}
-
-fn read_optional_image_samples(
-    root: &Path,
-    camera_name: &str,
-) -> Result<Vec<DatasetSample>, DatasetError> {
-    let camera_dir = root.join(camera_name);
-    let csv = camera_dir.join("data.csv");
-    let data_dir = camera_dir.join("data");
-
-    if !camera_dir.exists() && !csv.exists() && !data_dir.exists() {
-        return Ok(Vec::new());
-    }
-    if !csv.exists() {
-        return Ok(Vec::new());
-    }
-    if !data_dir.exists() {
-        return Ok(Vec::new());
     }
 
     parse_image_csv(&csv, &data_dir)
@@ -542,12 +504,11 @@ cam1:
         assert_eq!(dataset.cam0_samples.len(), 2);
         assert_eq!(dataset.cam0_samples[0].timestamp_sec, 1.0);
         assert_eq!(dataset.cam0_samples[1].timestamp_sec, 2.0);
-        assert!(dataset.cam1_samples.is_empty());
         assert!(dataset.imu_samples.is_empty());
     }
 
     #[test]
-    fn open_reads_optional_cam1_and_imu_samples() {
+    fn open_reads_optional_imu_samples_and_ignores_cam1() {
         let dir = TestDir::new("optional");
         let calibration = write_calibration(dir.path());
         write_camera(
@@ -569,8 +530,7 @@ cam1:
 
         let dataset = HiltiDataset::open(dir.path(), calibration).unwrap();
 
-        assert_eq!(dataset.cam1_samples.len(), 1);
-        assert_eq!(dataset.cam1_samples[0].timestamp_sec, 2.0);
+        assert_eq!(dataset.cam0_samples.len(), 1);
         assert_eq!(dataset.imu_samples.len(), 2);
         assert_eq!(dataset.imu_samples[0].timestamp, 1.0);
         assert_eq!(dataset.imu_samples[0].gyro, Vec3F64::new(0.1, 0.2, 0.3));
@@ -599,9 +559,7 @@ cam1:
         assert_eq!(dataset.cam0_calibration.k4, -0.0005);
         assert_eq!(dataset.cam0_calibration.width, 1472);
         assert_eq!(dataset.cam0_calibration.height, 1440);
-        assert_eq!(dataset.cam1_calibration.fx, 462.0);
         assert_eq!(dataset.t_cam0_imu[0][3], 0.01);
-        assert_eq!(dataset.t_cam1_imu[0][3], -0.10);
     }
 
     #[test]

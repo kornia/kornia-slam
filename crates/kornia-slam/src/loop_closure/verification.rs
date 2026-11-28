@@ -95,9 +95,11 @@ pub(super) fn verification_input<D: Descriptor>(
     let candidate = map
         .get_keyframe(candidate_kf_idx)
         .ok_or(LoopVerificationReject::MissingCandidateKeyframe)?;
+    // The single-camera PnP below models the primary camera only; matching
+    // only its features also keeps the others out of the rotation histogram.
     let matches = D::match_sets(
         candidate.frame.features.descriptor_set(),
-        query.frame.features.descriptor_set(),
+        query.frame.primary_descriptor_set(),
         &config.descriptor_match,
     );
 

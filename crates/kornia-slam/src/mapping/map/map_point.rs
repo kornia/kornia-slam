@@ -23,6 +23,8 @@ pub struct ObservationKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LandmarkObservation<D = RBrief> {
     pub key: ObservationKey,
+    /// Rig camera of the feature; 0 outside a multi-camera rig.
+    pub camera: u8,
     pub descriptor: D,
 }
 
@@ -34,7 +36,8 @@ pub struct MapPoint<D = RBrief> {
     /// `recompute_representative_descriptor`.
     pub descriptor: D,
     /// Where this landmark has been seen, in insertion order. One record per
-    /// link; a keyframe appears at most once.
+    /// link; a keyframe appears at most once per rig camera (ORB-SLAM3's
+    /// left/right observation pair of one keyframe).
     observations: Vec<LandmarkObservation<D>>,
     /// Octave in the reference keyframe; drives the distance bounds below.
     pub reference_octave: u8,
@@ -48,6 +51,9 @@ pub struct MapPoint<D = RBrief> {
     pub color: [u8; 3],
     /// Reference keyframe for this point's scale geometry.
     pub keyframe_idx: usize,
+    /// Rig camera of the reference feature, whose centre the distance
+    /// bounds are measured from; 0 outside a rig.
+    pub reference_camera: u8,
     /// Frames where the point fell in the frustum, and where it then matched.
     pub n_visible: u32,
     pub n_found: u32,
@@ -73,6 +79,7 @@ impl<D: Descriptor> MapPoint<D> {
             max_distance: 0.0,
             color,
             keyframe_idx,
+            reference_camera: 0,
             n_visible: 1,
             n_found: 1,
             culled: false,
@@ -90,23 +97,33 @@ impl<D: Descriptor> MapPoint<D> {
         self.n_found as f64 / self.n_visible as f64
     }
 
-    /// Records a link. Returns false if this keyframe already observes the
-    /// landmark, leaving the records untouched.
+    /// Records a link from rig camera `camera` (0 outside a rig). Returns
+    /// false if that camera of the keyframe already observes the landmark,
+    /// leaving the records untouched.
     ///
     /// Does not finalize: the representative descriptor is stale until
     /// [`MapPoint::finalize_descriptor`] runs. A batch or a merge changing
     /// several links pays for one O(n^2) selection rather than one per link.
-    pub(crate) fn add_observation(&mut self, key: ObservationKey, descriptor: D) -> bool {
-        if self.is_observed_by(key.keyframe_idx) {
+    pub(crate) fn add_observation(
+        &mut self,
+        key: ObservationKey,
+        camera: u8,
+        descriptor: D,
+    ) -> bool {
+        if self.is_observed_in(key.keyframe_idx, camera) {
             return false;
         }
-        self.observations
-            .push(LandmarkObservation { key, descriptor });
+        self.observations.push(LandmarkObservation {
+            key,
+            camera,
+            descriptor,
+        });
         true
     }
 
-    /// Drops the link from `keyframe_idx`, returning the removed record.
-    /// Like [`MapPoint::add_observation`], leaves finalization to the caller.
+    /// Drops every link from `keyframe_idx`, returning the first removed
+    /// record. Like [`MapPoint::add_observation`], leaves finalization to the
+    /// caller.
     pub(crate) fn remove_observation(
         &mut self,
         keyframe_idx: usize,
@@ -115,6 +132,18 @@ impl<D: Descriptor> MapPoint<D> {
             .observations
             .iter()
             .position(|o| o.key.keyframe_idx == keyframe_idx)?;
+        let first = self.observations.remove(at);
+        self.observations
+            .retain(|o| o.key.keyframe_idx != keyframe_idx);
+        Some(first)
+    }
+
+    /// Drops the link of one feature, returning the removed record.
+    pub(crate) fn remove_feature_observation(
+        &mut self,
+        key: ObservationKey,
+    ) -> Option<LandmarkObservation<D>> {
+        let at = self.observations.iter().position(|o| o.key == key)?;
         Some(self.observations.remove(at))
     }
 
@@ -127,15 +156,37 @@ impl<D: Descriptor> MapPoint<D> {
         &self.observations
     }
 
+    /// Whether any camera of the keyframe observes the landmark.
     pub fn is_observed_by(&self, keyframe_idx: usize) -> bool {
         self.observations
             .iter()
             .any(|o| o.key.keyframe_idx == keyframe_idx)
     }
 
-    /// Observing keyframe ids, in insertion order.
+    /// Whether rig camera `camera` of the keyframe observes the landmark.
+    pub fn is_observed_in(&self, keyframe_idx: usize, camera: u8) -> bool {
+        self.observations
+            .iter()
+            .any(|o| o.key.keyframe_idx == keyframe_idx && o.camera == camera)
+    }
+
+    /// Observing keyframe ids, each once, in insertion order.
+    ///
+    /// A keyframe appears at most once per rig camera, so with every record
+    /// from camera 0 (outside a rig) the records are already one per keyframe
+    /// and are returned as they are. Only a landmark some secondary camera
+    /// observes pays for the prefix scan that drops repeats.
     pub fn observer_keyframes(&self) -> impl Iterator<Item = usize> + '_ {
-        self.observations.iter().map(|o| o.key.keyframe_idx)
+        let rig = self.observations.iter().any(|o| o.camera != 0);
+        self.observations
+            .iter()
+            .enumerate()
+            .filter(move |(i, o)| {
+                !rig || !self.observations[..*i]
+                    .iter()
+                    .any(|p| p.key.keyframe_idx == o.key.keyframe_idx)
+            })
+            .map(|(_, o)| o.key.keyframe_idx)
     }
 
     /// Picks the observation descriptor with the minimum median distance to
@@ -247,8 +298,8 @@ mod tests {
     #[test]
     fn a_repeated_keyframe_is_refused_and_leaves_the_records_untouched() {
         let mut mp = point();
-        assert!(mp.add_observation(key(0, 0), RBrief([1u8; 32])));
-        assert!(!mp.add_observation(key(0, 7), RBrief([9u8; 32])));
+        assert!(mp.add_observation(key(0, 0), 0, RBrief([1u8; 32])));
+        assert!(!mp.add_observation(key(0, 7), 0, RBrief([9u8; 32])));
         mp.finalize_descriptor();
         assert_eq!(mp.observations().len(), 1);
         assert_eq!(mp.observations()[0].key, key(0, 0));
@@ -273,10 +324,10 @@ mod tests {
         d12[1] = 0b0000_1111;
         let [d0, d4, d8, d12] = [d0, d4, d8, d12].map(RBrief);
 
-        mp.add_observation(key(0, 0), d0);
-        mp.add_observation(key(1, 0), d4);
-        mp.add_observation(key(2, 0), d8);
-        mp.add_observation(key(3, 0), d12);
+        mp.add_observation(key(0, 0), 0, d0);
+        mp.add_observation(key(1, 0), 0, d4);
+        mp.add_observation(key(2, 0), 0, d8);
+        mp.add_observation(key(3, 0), 0, d12);
         // Records and finalization are separate now: the representative is
         // stale until asked for, so a batch pays for one selection, not four.
         mp.finalize_descriptor();
@@ -291,9 +342,24 @@ mod tests {
     }
 
     #[test]
+    fn each_rig_camera_of_a_keyframe_observes_once() {
+        let mut mp = point();
+        assert!(mp.add_observation(key(0, 0), 0, RBrief([1u8; 32])));
+        assert!(mp.add_observation(key(0, 7), 1, RBrief([2u8; 32])));
+        assert!(!mp.add_observation(key(0, 8), 1, RBrief([3u8; 32])));
+        assert_eq!(mp.observations().len(), 2);
+        assert_eq!(mp.observer_keyframes().collect::<Vec<_>>(), vec![0]);
+        assert!(mp.remove_feature_observation(key(0, 7)).is_some());
+        assert!(mp.is_observed_in(0, 0) && !mp.is_observed_in(0, 1));
+        mp.add_observation(key(0, 7), 1, RBrief([2u8; 32]));
+        assert!(mp.remove_observation(0).is_some());
+        assert!(mp.observations().is_empty());
+    }
+
+    #[test]
     fn removing_an_absent_keyframe_is_none() {
         let mut mp = point();
-        mp.add_observation(key(0, 0), RBrief([1u8; 32]));
+        mp.add_observation(key(0, 0), 0, RBrief([1u8; 32]));
         assert!(mp.remove_observation(42).is_none());
         assert_eq!(mp.observations().len(), 1);
     }
@@ -302,8 +368,43 @@ mod tests {
     fn observer_order_follows_insertion() {
         let mut mp = point();
         for kf in [5usize, 2, 9] {
-            mp.add_observation(key(kf, 0), RBrief([kf as u8; 32]));
+            mp.add_observation(key(kf, 0), 0, RBrief([kf as u8; 32]));
         }
         assert_eq!(mp.observer_keyframes().collect::<Vec<_>>(), vec![5, 2, 9]);
+    }
+
+    /// The camera-0 fast path returns what the prefix dedupe returned, for
+    /// camera-0 records and for rig records in any interleaving.
+    #[test]
+    fn observer_keyframes_matches_the_prefix_dedupe() {
+        let prefix_dedupe = |mp: &MapPoint| -> Vec<usize> {
+            let obs = mp.observations();
+            obs.iter()
+                .enumerate()
+                .filter(|(i, o)| {
+                    !obs[..*i]
+                        .iter()
+                        .any(|p| p.key.keyframe_idx == o.key.keyframe_idx)
+                })
+                .map(|(_, o)| o.key.keyframe_idx)
+                .collect()
+        };
+        let records: [&[(usize, u8)]; 4] = [
+            &[(5, 0), (2, 0), (9, 0), (1, 0)],
+            &[(5, 0), (5, 1), (2, 0), (9, 1), (2, 1)],
+            &[(3, 1), (3, 0), (4, 2), (1, 0), (4, 0), (1, 1)],
+            &[(7, 1)],
+        ];
+        for case in records {
+            let mut mp = point();
+            for (i, &(kf, camera)) in case.iter().enumerate() {
+                assert!(mp.add_observation(key(kf, i), camera, RBrief([i as u8; 32])));
+            }
+            assert_eq!(
+                mp.observer_keyframes().collect::<Vec<_>>(),
+                prefix_dedupe(&mp),
+                "{case:?}"
+            );
+        }
     }
 }

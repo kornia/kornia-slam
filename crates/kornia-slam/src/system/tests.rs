@@ -92,7 +92,7 @@ impl Drop for SavedVocabulary {
 /// A vocabulary trained on the texture's descriptors, saved where a
 /// configuration can name it.
 fn saved_vocabulary(name: &str) -> SavedVocabulary {
-    let features = OrbFrontend::new(mono().orb_detector(), &mono_rig(), None)
+    let features = OrbFrontend::new(mono().orb_detector(), &mono_rig(), None, false)
         .prepare_image(0, &textured(0))
         .unwrap()
         .features;
@@ -223,6 +223,25 @@ fn a_mono_pipeline_rejects_a_stereo_pair() {
     assert!(matches!(err, ProcessError::MonoPipeline));
     assert!(system.previous_image.is_none());
     assert!(system.frontend_observation().keypoints_xy.is_empty());
+}
+
+/// The selection, not the rig, decides the layout: a rectified pair opened
+/// as a rig takes rig captures only, and a stereo pipeline refuses them.
+#[test]
+fn a_rectified_pair_selected_as_a_rig_needs_rig_captures() {
+    let rig = config(CameraSelection::Rig, true, LoopClosingMode::Disabled);
+    let mut system = SlamSystem::build(rig, stereo_imu_rig()).unwrap();
+    let (left, right) = (textured(0), textured(8));
+    let err = system.process_stereo(stamp(0), &left, &right).unwrap_err();
+    assert!(matches!(err, ProcessError::RigRequired));
+    let err = system.process_image(stamp(0), &left).unwrap_err();
+    assert!(matches!(err, ProcessError::RigRequired));
+    assert!(system.previous_image.is_none());
+
+    let stereo = config(CameraSelection::Stereo, true, LoopClosingMode::Disabled);
+    let mut system = SlamSystem::build(stereo, stereo_imu_rig()).unwrap();
+    let err = system.process_rig(stamp(0), &[&left, &right]).unwrap_err();
+    assert!(matches!(err, ProcessError::NotARig));
 }
 
 /// A rig that never bootstraps (a dark room) inserts no keyframe, yet must
