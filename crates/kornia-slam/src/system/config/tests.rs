@@ -1246,8 +1246,10 @@ mod ron_files {
                 max_iter: 10,
             },
             klt_kernel: LkKernel::WindowedU8,
-            // Several flow threads need a rig; this one is stereo.
+            // Several flow threads and every camera need a rig; this one is
+            // stereo.
             flow_threads: 1,
+            klt_rig: KltRig::PrimaryOnly,
             ..windowed_frontend()
         });
         settings.keyframes.ref_ratio = 0.75;
@@ -1269,6 +1271,7 @@ mod ron_files {
                 },
                 klt_kernel: LkKernel::WindowedU8,
                 flow_threads: 1,
+                klt_rig: KltRig::PrimaryOnly,
                 ..windowed_frontend()
             })
         );

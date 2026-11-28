@@ -854,6 +854,9 @@ mod windowed_flow {
         system.state.last_keyframe_idx = Some(0);
         // Frame 1 is being processed, so tracks refer to keyframe 0's frame.
         system.next_frame_idx = 2;
+        let image = Image::from_size_val(IMAGE_SIZE, 128u8).unwrap();
+        system.prepare_flow(&[&image], 0);
+        system.prepare_flow(&[&image], 1);
 
         system.adopt_landmarks();
 
